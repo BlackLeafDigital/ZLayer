@@ -250,7 +250,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y containerd runc
           sudo systemctl start containerd
-          sudo systemctl status containerd
+          sudo systemctl status containerd --no-pager
 
       - name: Verify containerd is running
         run: |
