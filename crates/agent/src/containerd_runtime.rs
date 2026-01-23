@@ -28,8 +28,8 @@ use oci_spec::runtime::{
     LinuxBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, ProcessBuilder, RootBuilder, Spec,
     SpecBuilder, UserBuilder,
 };
-use spec::ServiceSpec;
 use sha2::{Digest, Sha256};
+use spec::ServiceSpec;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -339,12 +339,14 @@ impl ContainerdRuntime {
             },
             self.config.namespace.as_str()
         );
-        let image_resp = images_client.get(get_req).await.map_err(|e| {
-            AgentError::CreateFailed {
-                id: image.to_string(),
-                reason: format!("failed to get image: {}", e),
-            }
-        })?;
+        let image_resp =
+            images_client
+                .get(get_req)
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: image.to_string(),
+                    reason: format!("failed to get image: {}", e),
+                })?;
 
         let img = image_resp
             .into_inner()
@@ -373,19 +375,25 @@ impl ContainerdRuntime {
             self.config.namespace.as_str()
         );
 
-        let manifest_stream = content_client.read(manifest_req).await.map_err(|e| {
-            AgentError::CreateFailed {
-                id: image.to_string(),
-                reason: format!("failed to read manifest: {}", e),
-            }
-        })?;
+        let manifest_stream =
+            content_client
+                .read(manifest_req)
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: image.to_string(),
+                    reason: format!("failed to read manifest: {}", e),
+                })?;
 
         let mut manifest_bytes = Vec::new();
         let mut stream = manifest_stream.into_inner();
-        while let Some(chunk) = stream.message().await.map_err(|e| AgentError::CreateFailed {
-            id: image.to_string(),
-            reason: format!("failed to read manifest chunk: {}", e),
-        })? {
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: image.to_string(),
+                reason: format!("failed to read manifest chunk: {}", e),
+            })?
+        {
             manifest_bytes.extend_from_slice(&chunk.data);
         }
 
@@ -413,19 +421,25 @@ impl ContainerdRuntime {
             self.config.namespace.as_str()
         );
 
-        let config_stream = content_client.read(config_req).await.map_err(|e| {
-            AgentError::CreateFailed {
-                id: image.to_string(),
-                reason: format!("failed to read config: {}", e),
-            }
-        })?;
+        let config_stream =
+            content_client
+                .read(config_req)
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: image.to_string(),
+                    reason: format!("failed to read config: {}", e),
+                })?;
 
         let mut config_bytes = Vec::new();
         let mut stream = config_stream.into_inner();
-        while let Some(chunk) = stream.message().await.map_err(|e| AgentError::CreateFailed {
-            id: image.to_string(),
-            reason: format!("failed to read config chunk: {}", e),
-        })? {
+        while let Some(chunk) = stream
+            .message()
+            .await
+            .map_err(|e| AgentError::CreateFailed {
+                id: image.to_string(),
+                reason: format!("failed to read config chunk: {}", e),
+            })?
+        {
             config_bytes.extend_from_slice(&chunk.data);
         }
 
