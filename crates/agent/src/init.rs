@@ -23,7 +23,7 @@ impl InitOrchestrator {
         let _start_grace = std::time::Instant::now();
 
         for step in &self.spec.steps {
-            let step_start = std::time::Instant::now();
+            let _step_start = std::time::Instant::now();
 
             // Parse action
             let action = init_actions::from_spec(
@@ -47,12 +47,10 @@ impl InitOrchestrator {
                 Ok(Err(e)) => {
                     // Action failed
                     return match step.on_failure {
-                        spec::FailureAction::Fail => {
-                            Err(AgentError::InitActionFailed {
-                                id: self.id.to_string(),
-                                reason: format!("step '{}' failed: {}", step.id, e),
-                            })
-                        }
+                        spec::FailureAction::Fail => Err(AgentError::InitActionFailed {
+                            id: self.id.to_string(),
+                            reason: format!("step '{}' failed: {}", step.id, e),
+                        }),
                         spec::FailureAction::Warn => {
                             eprintln!("WARNING: Init step '{}' failed: {}", step.id, e);
                             Ok(())
@@ -66,9 +64,7 @@ impl InitOrchestrator {
                 Err(_) => {
                     // Timeout
                     return match step.on_failure {
-                        spec::FailureAction::Fail => {
-                            Err(AgentError::Timeout { timeout })
-                        }
+                        spec::FailureAction::Fail => Err(AgentError::Timeout { timeout }),
                         spec::FailureAction::Warn => {
                             eprintln!("WARNING: Init step '{}' timed out", step.id);
                             Ok(())
@@ -98,10 +94,12 @@ impl InitOrchestrator {
                 id: self.id.to_string(),
                 reason: e.to_string(),
             }),
-            InitAction::WaitHttp(a) => a.execute().await.map_err(|e| AgentError::InitActionFailed {
-                id: self.id.to_string(),
-                reason: e.to_string(),
-            }),
+            InitAction::WaitHttp(a) => {
+                a.execute().await.map_err(|e| AgentError::InitActionFailed {
+                    id: self.id.to_string(),
+                    reason: e.to_string(),
+                })
+            }
             InitAction::Run(a) => a.execute().await.map_err(|e| AgentError::InitActionFailed {
                 id: self.id.to_string(),
                 reason: e.to_string(),

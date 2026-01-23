@@ -340,10 +340,6 @@ services:
       name: postgres:15
 "#;
         let result = from_yaml_str(yaml);
-        assert!(
-            result.is_ok(),
-            "Valid dependency should pass: {:?}",
-            result
-        );
+        assert!(result.is_ok(), "Valid dependency should pass: {:?}", result);
     }
 }

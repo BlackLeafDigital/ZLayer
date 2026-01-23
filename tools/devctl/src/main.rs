@@ -295,10 +295,7 @@ fn handle_token(action: TokenCommands) -> Result<()> {
 
                 // Show roles
                 if let Some(roles) = claims.get("roles").and_then(|v| v.as_array()) {
-                    let role_strs: Vec<&str> = roles
-                        .iter()
-                        .filter_map(|v| v.as_str())
-                        .collect();
+                    let role_strs: Vec<&str> = roles.iter().filter_map(|v| v.as_str()).collect();
                     println!("Roles: {}", role_strs.join(", "));
                 }
             }
@@ -433,7 +430,7 @@ fn handle_dump_spec(spec_path: &str, format: &str) -> Result<()> {
                 serde_json::to_string_pretty(&spec).context("Failed to serialize as JSON")?
             );
         }
-        "yaml" | _ => {
+        _ => {
             println!(
                 "{}",
                 serde_yaml::to_string(&spec).context("Failed to serialize as YAML")?
@@ -449,8 +446,7 @@ fn handle_run(spec_path: &str, dry_run: bool, port_offset: u16, env: &str) -> Re
     println!("==================\n");
 
     // Load and validate spec
-    let content =
-        std::fs::read_to_string(spec_path).context("Failed to read spec file")?;
+    let content = std::fs::read_to_string(spec_path).context("Failed to read spec file")?;
 
     let spec = spec::from_yaml_str(&content).context("Specification validation failed")?;
 
@@ -621,7 +617,13 @@ mod tests {
 
         match cli.command {
             Commands::Token {
-                action: TokenCommands::Create { subject, hours, roles, .. },
+                action:
+                    TokenCommands::Create {
+                        subject,
+                        hours,
+                        roles,
+                        ..
+                    },
             } => {
                 assert_eq!(subject, "testuser");
                 assert_eq!(hours, 48);
@@ -645,8 +647,8 @@ mod tests {
 
     #[test]
     fn test_dump_spec_args() {
-        let cli =
-            Cli::try_parse_from(["devctl", "dump-spec", "./test.yaml", "--format", "json"]).unwrap();
+        let cli = Cli::try_parse_from(["devctl", "dump-spec", "./test.yaml", "--format", "json"])
+            .unwrap();
 
         match cli.command {
             Commands::DumpSpec { spec, format } => {
@@ -740,11 +742,12 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::Generate {
-                what: GenerateCommands::JoinToken {
-                    deployment,
-                    api,
-                    service,
-                },
+                what:
+                    GenerateCommands::JoinToken {
+                        deployment,
+                        api,
+                        service,
+                    },
             } => {
                 assert_eq!(deployment, "my-deploy");
                 assert_eq!(api, "http://localhost:8080");
@@ -768,11 +771,12 @@ mod tests {
         .unwrap();
         match cli.command {
             Commands::Generate {
-                what: GenerateCommands::JoinToken {
-                    deployment,
-                    api,
-                    service,
-                },
+                what:
+                    GenerateCommands::JoinToken {
+                        deployment,
+                        api,
+                        service,
+                    },
             } => {
                 assert_eq!(deployment, "my-deploy");
                 assert_eq!(api, "http://localhost:8080");

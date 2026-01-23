@@ -12,7 +12,10 @@ use std::collections::HashSet;
 // These functions match the signature expected by #[validate(custom(function = "..."))]
 // They return Result<(), validator::ValidationError>
 
-fn make_validation_error(code: &'static str, message: impl Into<std::borrow::Cow<'static, str>>) -> validator::ValidationError {
+fn make_validation_error(
+    code: &'static str,
+    message: impl Into<std::borrow::Cow<'static, str>>,
+) -> validator::ValidationError {
     let mut err = validator::ValidationError::new(code);
     err.message = Some(message.into());
     err
@@ -23,7 +26,10 @@ pub fn validate_version_wrapper(version: &str) -> Result<(), validator::Validati
     if version == "v1" {
         Ok(())
     } else {
-        Err(make_validation_error("invalid_version", format!("version must be 'v1', found '{}'", version)))
+        Err(make_validation_error(
+            "invalid_version",
+            format!("version must be 'v1', found '{}'", version),
+        ))
     }
 }
 
@@ -31,20 +37,29 @@ pub fn validate_version_wrapper(version: &str) -> Result<(), validator::Validati
 pub fn validate_deployment_name_wrapper(name: &str) -> Result<(), validator::ValidationError> {
     // Check length
     if name.len() < 3 || name.len() > 63 {
-        return Err(make_validation_error("invalid_deployment_name", "deployment name must be 3-63 characters"));
+        return Err(make_validation_error(
+            "invalid_deployment_name",
+            "deployment name must be 3-63 characters",
+        ));
     }
 
     // Check first character is alphanumeric
     if let Some(first) = name.chars().next() {
         if !first.is_ascii_alphanumeric() {
-            return Err(make_validation_error("invalid_deployment_name", "deployment name must start with alphanumeric character"));
+            return Err(make_validation_error(
+                "invalid_deployment_name",
+                "deployment name must start with alphanumeric character",
+            ));
         }
     }
 
     // Check all characters are alphanumeric or hyphens
     for c in name.chars() {
         if !c.is_ascii_alphanumeric() && c != '-' {
-            return Err(make_validation_error("invalid_deployment_name", "deployment name can only contain alphanumeric characters and hyphens"));
+            return Err(make_validation_error(
+                "invalid_deployment_name",
+                "deployment name can only contain alphanumeric characters and hyphens",
+            ));
         }
     }
 
@@ -54,7 +69,10 @@ pub fn validate_deployment_name_wrapper(name: &str) -> Result<(), validator::Val
 /// Wrapper for validate_image_name for use with validator crate
 pub fn validate_image_name_wrapper(name: &str) -> Result<(), validator::ValidationError> {
     if name.is_empty() || name.trim().is_empty() {
-        Err(make_validation_error("empty_image_name", "image name cannot be empty"))
+        Err(make_validation_error(
+            "empty_image_name",
+            "image name cannot be empty",
+        ))
     } else {
         Ok(())
     }
@@ -64,7 +82,10 @@ pub fn validate_image_name_wrapper(name: &str) -> Result<(), validator::Validati
 /// Note: For Option<f64> fields, validator crate unwraps and passes the inner f64
 pub fn validate_cpu_option_wrapper(cpu: f64) -> Result<(), validator::ValidationError> {
     if cpu <= 0.0 {
-        Err(make_validation_error("invalid_cpu", format!("CPU limit must be > 0, found {}", cpu)))
+        Err(make_validation_error(
+            "invalid_cpu",
+            format!("CPU limit must be > 0, found {}", cpu),
+        ))
     } else {
         Ok(())
     }
@@ -84,10 +105,19 @@ pub fn validate_memory_option_wrapper(value: &String) -> Result<(), validator::V
             let numeric_part = &value[..value.len() - suffix.len()];
             match numeric_part.parse::<u64>() {
                 Ok(n) if n > 0 => Ok(()),
-                _ => Err(make_validation_error("invalid_memory_format", format!("invalid memory format: '{}'", value))),
+                _ => Err(make_validation_error(
+                    "invalid_memory_format",
+                    format!("invalid memory format: '{}'", value),
+                )),
             }
         }
-        None => Err(make_validation_error("invalid_memory_format", format!("invalid memory format: '{}' (use Ki, Mi, Gi, or Ti suffix)", value))),
+        None => Err(make_validation_error(
+            "invalid_memory_format",
+            format!(
+                "invalid memory format: '{}' (use Ki, Mi, Gi, or Ti suffix)",
+                value
+            ),
+        )),
     }
 }
 
@@ -97,7 +127,10 @@ pub fn validate_port_wrapper(port: u16) -> Result<(), validator::ValidationError
     if port >= 1 {
         Ok(())
     } else {
-        Err(make_validation_error("invalid_port", "port must be between 1-65535"))
+        Err(make_validation_error(
+            "invalid_port",
+            "port must be between 1-65535",
+        ))
     }
 }
 
@@ -105,7 +138,10 @@ pub fn validate_port_wrapper(port: u16) -> Result<(), validator::ValidationError
 pub fn validate_scale_spec(scale: &ScaleSpec) -> Result<(), validator::ValidationError> {
     if let ScaleSpec::Adaptive { min, max, .. } = scale {
         if *min > *max {
-            return Err(make_validation_error("invalid_scale_range", format!("scale min ({}) cannot be greater than max ({})", min, max)));
+            return Err(make_validation_error(
+                "invalid_scale_range",
+                format!("scale min ({}) cannot be greater than max ({})", min, max),
+            ));
         }
     }
     Ok(())
@@ -288,9 +324,7 @@ pub fn validate_port(port: &u16) -> Result<(), ValidationError> {
         Ok(())
     } else {
         Err(ValidationError {
-            kind: ValidationErrorKind::InvalidPort {
-                port: *port as u32,
-            },
+            kind: ValidationErrorKind::InvalidPort { port: *port as u32 },
             path: "endpoints[].port".to_string(),
         })
     }

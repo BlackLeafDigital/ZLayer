@@ -74,7 +74,12 @@ pub fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let mut reader = BufReader::new(file);
     let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| ProxyError::Tls(format!("Failed to parse certificates from '{}': {}", path, e)))?;
+        .map_err(|e| {
+            ProxyError::Tls(format!(
+                "Failed to parse certificates from '{}': {}",
+                path, e
+            ))
+        })?;
 
     if certs.is_empty() {
         return Err(ProxyError::Tls(format!(
@@ -175,10 +180,7 @@ fn create_server_config(
 }
 
 /// Create a TLS acceptor directly from file paths
-pub fn create_acceptor_from_files(
-    cert_path: &str,
-    key_path: &str,
-) -> Result<TlsAcceptor> {
+pub fn create_acceptor_from_files(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
     let config = TlsServerConfig::new(cert_path, key_path);
     create_tls_acceptor(&config)
 }
@@ -192,7 +194,10 @@ mod tests {
         let config = TlsServerConfig::new("/path/to/cert.pem", "/path/to/key.pem");
         assert_eq!(config.cert_path, "/path/to/cert.pem");
         assert_eq!(config.key_path, "/path/to/key.pem");
-        assert_eq!(config.alpn_protocols, vec![b"h2".to_vec(), b"http/1.1".to_vec()]);
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
         assert_eq!(config.min_version, TlsVersion::Tls12);
     }
 

@@ -13,7 +13,7 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use agent::{ContainerdConfig, RuntimeConfig};
@@ -200,30 +200,31 @@ fn main() -> Result<()> {
 async fn run(cli: Cli) -> Result<()> {
     match &cli.command {
         #[cfg(feature = "deploy")]
-        Commands::Deploy { spec_path, dry_run } => {
-            deploy(&cli, spec_path, *dry_run).await
-        }
+        Commands::Deploy { spec_path, dry_run } => deploy(&cli, spec_path, *dry_run).await,
         #[cfg(feature = "join")]
         Commands::Join {
             token,
             spec_dir,
             service,
             replicas,
-        } => join(&cli, token, spec_dir.as_deref(), service.as_deref(), *replicas).await,
+        } => {
+            join(
+                &cli,
+                token,
+                spec_dir.as_deref(),
+                service.as_deref(),
+                *replicas,
+            )
+            .await
+        }
         #[cfg(feature = "serve")]
         Commands::Serve {
             bind,
             jwt_secret,
             no_swagger,
-        } => {
-            serve(bind, jwt_secret.clone(), *no_swagger).await
-        }
-        Commands::Status => {
-            status(&cli).await
-        }
-        Commands::Validate { spec_path } => {
-            validate(spec_path).await
-        }
+        } => serve(bind, jwt_secret.clone(), *no_swagger).await,
+        Commands::Status => status(&cli).await,
+        Commands::Validate { spec_path } => validate(spec_path).await,
         #[cfg(feature = "deploy")]
         Commands::Logs {
             deployment,
@@ -231,18 +232,14 @@ async fn run(cli: Cli) -> Result<()> {
             lines,
             follow,
             instance,
-        } => {
-            logs(deployment, service, *lines, *follow, instance.clone()).await
-        }
+        } => logs(deployment, service, *lines, *follow, instance.clone()).await,
         #[cfg(feature = "deploy")]
         Commands::Stop {
             deployment,
             service,
             force,
             timeout,
-        } => {
-            stop(deployment, service.clone(), *force, *timeout).await
-        }
+        } => stop(deployment, service.clone(), *force, *timeout).await,
     }
 }
 
@@ -261,7 +258,7 @@ fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
 }
 
 /// Parse and validate a deployment spec file
-fn parse_spec(spec_path: &PathBuf) -> Result<DeploymentSpec> {
+fn parse_spec(spec_path: &Path) -> Result<DeploymentSpec> {
     info!(path = %spec_path.display(), "Parsing deployment spec");
 
     let spec = spec::from_yaml_file(spec_path)
@@ -279,7 +276,7 @@ fn parse_spec(spec_path: &PathBuf) -> Result<DeploymentSpec> {
 
 /// Deploy services from a spec file
 #[cfg(feature = "deploy")]
-async fn deploy(cli: &Cli, spec_path: &PathBuf, dry_run: bool) -> Result<()> {
+async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
     let spec = parse_spec(spec_path)?;
 
     if dry_run {
@@ -410,8 +407,8 @@ fn parse_join_token(token: &str) -> Result<JoinInfo> {
         .context("Invalid join token: not valid base64")?;
 
     // Parse as JSON
-    let info: JoinInfo = serde_json::from_slice(&decoded)
-        .context("Invalid join token: not valid JSON")?;
+    let info: JoinInfo =
+        serde_json::from_slice(&decoded).context("Invalid join token: not valid JSON")?;
 
     Ok(info)
 }
@@ -463,8 +460,7 @@ async fn join(
     }
 
     // Load and validate spec
-    let spec_content =
-        std::fs::read_to_string(&spec_path).context("Failed to read spec file")?;
+    let spec_content = std::fs::read_to_string(&spec_path).context("Failed to read spec file")?;
     let spec: DeploymentSpec =
         serde_yaml::from_str(&spec_content).context("Failed to parse spec")?;
 
@@ -474,9 +470,10 @@ async fn join(
     let service_name = target_service
         .ok_or_else(|| anyhow::anyhow!("No service specified and token doesn't include one"))?;
 
-    let service_spec = spec.services.get(service_name).ok_or_else(|| {
-        anyhow::anyhow!("Service '{}' not found in deployment", service_name)
-    })?;
+    let service_spec = spec
+        .services
+        .get(service_name)
+        .ok_or_else(|| anyhow::anyhow!("Service '{}' not found in deployment", service_name))?;
 
     println!("\nService configuration:");
     println!("  Image: {}", service_spec.image.name);
@@ -487,10 +484,7 @@ async fn join(
     // 2. Scale service to requested replicas
     // 3. Register with scheduler for load balancing
     println!("\n[Service startup not yet implemented]");
-    println!(
-        "Would start {} replica(s) of '{}'",
-        replicas, service_name
-    );
+    println!("Would start {} replica(s) of '{}'", replicas, service_name);
 
     Ok(())
 }
@@ -539,7 +533,7 @@ async fn status(cli: &Cli) -> Result<()> {
 }
 
 /// Validate a spec file without deploying
-async fn validate(spec_path: &PathBuf) -> Result<()> {
+async fn validate(spec_path: &Path) -> Result<()> {
     info!(path = %spec_path.display(), "Validating spec file");
 
     match parse_spec(spec_path) {
@@ -654,12 +648,7 @@ async fn logs(
 
 /// Stop a deployment or service
 #[cfg(feature = "deploy")]
-async fn stop(
-    deployment: &str,
-    service: Option<String>,
-    force: bool,
-    timeout: u64,
-) -> Result<()> {
+async fn stop(deployment: &str, service: Option<String>, force: bool, timeout: u64) -> Result<()> {
     let target = match &service {
         Some(s) => format!("{}/{}", deployment, s),
         None => deployment.to_string(),
@@ -703,10 +692,13 @@ mod tests {
     fn test_cli_containerd_runtime() {
         let cli = Cli::try_parse_from([
             "zlayer",
-            "--runtime", "containerd",
-            "--socket", "/custom/socket.sock",
-            "status"
-        ]).unwrap();
+            "--runtime",
+            "containerd",
+            "--socket",
+            "/custom/socket.sock",
+            "status",
+        ])
+        .unwrap();
 
         assert!(matches!(cli.runtime, RuntimeType::Containerd));
         assert_eq!(cli.socket, PathBuf::from("/custom/socket.sock"));
@@ -715,11 +707,7 @@ mod tests {
     #[test]
     #[cfg(feature = "deploy")]
     fn test_cli_deploy_command() {
-        let cli = Cli::try_parse_from([
-            "zlayer",
-            "deploy",
-            "test-spec.yaml"
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "deploy", "test-spec.yaml"]).unwrap();
 
         match cli.command {
             Commands::Deploy { spec_path, dry_run } => {
@@ -733,12 +721,7 @@ mod tests {
     #[test]
     #[cfg(feature = "deploy")]
     fn test_cli_deploy_dry_run() {
-        let cli = Cli::try_parse_from([
-            "zlayer",
-            "deploy",
-            "--dry-run",
-            "test-spec.yaml"
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "deploy", "--dry-run", "test-spec.yaml"]).unwrap();
 
         match cli.command {
             Commands::Deploy { dry_run, .. } => {
@@ -804,10 +787,8 @@ mod tests {
     #[test]
     #[cfg(feature = "join")]
     fn test_cli_join_command_short_flags() {
-        let cli = Cli::try_parse_from([
-            "zlayer", "join", "-s", "api", "-r", "5", "token123",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer", "join", "-s", "api", "-r", "5", "token123"]).unwrap();
 
         match cli.command {
             Commands::Join {
@@ -854,8 +835,8 @@ mod tests {
             "api_endpoint": "http://api.example.com"
         });
 
-        let token = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_string(&info).unwrap());
+        let token =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&info).unwrap());
 
         let parsed = super::parse_join_token(&token).unwrap();
         assert_eq!(parsed.deployment, "my-deploy");
@@ -886,11 +867,7 @@ mod tests {
 
     #[test]
     fn test_cli_validate_command() {
-        let cli = Cli::try_parse_from([
-            "zlayer",
-            "validate",
-            "test-spec.yaml"
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "validate", "test-spec.yaml"]).unwrap();
 
         match cli.command {
             Commands::Validate { spec_path } => {
@@ -925,12 +902,17 @@ mod tests {
     fn test_build_runtime_config_containerd() {
         let cli = Cli::try_parse_from([
             "zlayer",
-            "--runtime", "containerd",
-            "--socket", "/custom/socket.sock",
-            "--namespace", "custom-ns",
-            "--state-dir", "/custom/state",
-            "status"
-        ]).unwrap();
+            "--runtime",
+            "containerd",
+            "--socket",
+            "/custom/socket.sock",
+            "--namespace",
+            "custom-ns",
+            "--state-dir",
+            "/custom/state",
+            "status",
+        ])
+        .unwrap();
 
         let config = build_runtime_config(&cli);
         match config {
@@ -965,11 +947,7 @@ mod tests {
     #[test]
     #[cfg(feature = "serve")]
     fn test_cli_serve_command_custom_bind() {
-        let cli = Cli::try_parse_from([
-            "zlayer",
-            "serve",
-            "--bind", "127.0.0.1:9090"
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "serve", "--bind", "127.0.0.1:9090"]).unwrap();
 
         match cli.command {
             Commands::Serve { bind, .. } => {
@@ -982,11 +960,8 @@ mod tests {
     #[test]
     #[cfg(feature = "serve")]
     fn test_cli_serve_command_jwt_secret() {
-        let cli = Cli::try_parse_from([
-            "zlayer",
-            "serve",
-            "--jwt-secret", "my-super-secret-key"
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "serve", "--jwt-secret", "my-super-secret-key"])
+            .unwrap();
 
         match cli.command {
             Commands::Serve { jwt_secret, .. } => {
@@ -999,11 +974,7 @@ mod tests {
     #[test]
     #[cfg(feature = "serve")]
     fn test_cli_serve_command_no_swagger() {
-        let cli = Cli::try_parse_from([
-            "zlayer",
-            "serve",
-            "--no-swagger"
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "serve", "--no-swagger"]).unwrap();
 
         match cli.command {
             Commands::Serve { no_swagger, .. } => {
@@ -1019,10 +990,13 @@ mod tests {
         let cli = Cli::try_parse_from([
             "zlayer",
             "serve",
-            "--bind", "0.0.0.0:3000",
-            "--jwt-secret", "test-secret",
-            "--no-swagger"
-        ]).unwrap();
+            "--bind",
+            "0.0.0.0:3000",
+            "--jwt-secret",
+            "test-secret",
+            "--no-swagger",
+        ])
+        .unwrap();
 
         match cli.command {
             Commands::Serve {
@@ -1044,9 +1018,11 @@ mod tests {
         let cli = Cli::try_parse_from([
             "zlayer",
             "logs",
-            "--deployment", "my-deployment",
-            "my-service"
-        ]).unwrap();
+            "--deployment",
+            "my-deployment",
+            "my-service",
+        ])
+        .unwrap();
 
         match cli.command {
             Commands::Logs {
@@ -1072,12 +1048,16 @@ mod tests {
         let cli = Cli::try_parse_from([
             "zlayer",
             "logs",
-            "--deployment", "prod",
-            "--lines", "50",
+            "--deployment",
+            "prod",
+            "--lines",
+            "50",
             "--follow",
-            "--instance", "abc123",
-            "web-server"
-        ]).unwrap();
+            "--instance",
+            "abc123",
+            "web-server",
+        ])
+        .unwrap();
 
         match cli.command {
             Commands::Logs {
@@ -1101,14 +1081,9 @@ mod tests {
     #[cfg(feature = "deploy")]
     fn test_cli_logs_command_short_flags() {
         let cli = Cli::try_parse_from([
-            "zlayer",
-            "logs",
-            "-d", "staging",
-            "-n", "25",
-            "-f",
-            "-i", "inst-456",
-            "api"
-        ]).unwrap();
+            "zlayer", "logs", "-d", "staging", "-n", "25", "-f", "-i", "inst-456", "api",
+        ])
+        .unwrap();
 
         match cli.command {
             Commands::Logs {
@@ -1131,11 +1106,7 @@ mod tests {
     #[test]
     #[cfg(feature = "deploy")]
     fn test_cli_stop_command_minimal() {
-        let cli = Cli::try_parse_from([
-            "zlayer",
-            "stop",
-            "my-deployment"
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "stop", "my-deployment"]).unwrap();
 
         match cli.command {
             Commands::Stop {
@@ -1156,12 +1127,8 @@ mod tests {
     #[test]
     #[cfg(feature = "deploy")]
     fn test_cli_stop_command_with_service() {
-        let cli = Cli::try_parse_from([
-            "zlayer",
-            "stop",
-            "--service", "web",
-            "my-deployment"
-        ]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer", "stop", "--service", "web", "my-deployment"]).unwrap();
 
         match cli.command {
             Commands::Stop {
@@ -1179,12 +1146,7 @@ mod tests {
     #[test]
     #[cfg(feature = "deploy")]
     fn test_cli_stop_command_force() {
-        let cli = Cli::try_parse_from([
-            "zlayer",
-            "stop",
-            "--force",
-            "my-deployment"
-        ]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "stop", "--force", "my-deployment"]).unwrap();
 
         match cli.command {
             Commands::Stop { force, .. } => {
@@ -1197,12 +1159,8 @@ mod tests {
     #[test]
     #[cfg(feature = "deploy")]
     fn test_cli_stop_command_timeout() {
-        let cli = Cli::try_parse_from([
-            "zlayer",
-            "stop",
-            "--timeout", "60",
-            "my-deployment"
-        ]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer", "stop", "--timeout", "60", "my-deployment"]).unwrap();
 
         match cli.command {
             Commands::Stop { timeout, .. } => {
@@ -1218,11 +1176,14 @@ mod tests {
         let cli = Cli::try_parse_from([
             "zlayer",
             "stop",
-            "-s", "database",
+            "-s",
+            "database",
             "-f",
-            "-t", "15",
-            "production"
-        ]).unwrap();
+            "-t",
+            "15",
+            "production",
+        ])
+        .unwrap();
 
         match cli.command {
             Commands::Stop {

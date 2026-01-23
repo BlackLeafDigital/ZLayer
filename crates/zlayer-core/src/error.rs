@@ -170,7 +170,9 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = ContainerError::NotFound { id: "test-id".to_string() };
+        let err = ContainerError::NotFound {
+            id: "test-id".to_string(),
+        };
         assert!(err.to_string().contains("test-id"));
     }
 }

@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 use openraft::storage::{LogState, RaftStorage, Snapshot};
 use openraft::{
-    Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder,
-    SnapshotMeta, StorageError, StoredMembership, Vote,
+    Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder, SnapshotMeta,
+    StorageError, StoredMembership, Vote,
 };
 use tokio::sync::RwLock;
 
@@ -115,7 +115,7 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStore {
             StorageError::from_io_error(
                 openraft::ErrorSubject::StateMachine,
                 openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::Other, e),
+                std::io::Error::other(e),
             )
         })?;
 
@@ -151,13 +151,13 @@ impl RaftStorage<TypeConfig> for MemStore {
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut log = self.log.write().await;
-        log.vote = Some(vote.clone());
+        log.vote = Some(*vote);
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
         let log = self.log.read().await;
-        Ok(log.vote.clone())
+        Ok(log.vote)
     }
 
     // === Log operations ===
@@ -193,11 +193,7 @@ impl RaftStorage<TypeConfig> for MemStore {
         log_id: LogId<NodeId>,
     ) -> Result<(), StorageError<NodeId>> {
         let mut log = self.log.write().await;
-        let keys: Vec<u64> = log
-            .log
-            .range(log_id.index..)
-            .map(|(k, _)| *k)
-            .collect();
+        let keys: Vec<u64> = log.log.range(log_id.index..).map(|(k, _)| *k).collect();
         for key in keys {
             log.log.remove(&key);
         }
@@ -207,11 +203,7 @@ impl RaftStorage<TypeConfig> for MemStore {
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut log = self.log.write().await;
 
-        let keys: Vec<u64> = log
-            .log
-            .range(..=log_id.index)
-            .map(|(k, _)| *k)
-            .collect();
+        let keys: Vec<u64> = log.log.range(..=log_id.index).map(|(k, _)| *k).collect();
         for key in keys {
             log.log.remove(&key);
         }

@@ -7,9 +7,9 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-use spec::{ScaleSpec, ScaleTargets};
 use crate::error::{Result, SchedulerError};
 use crate::metrics::AggregatedMetrics;
+use spec::{ScaleSpec, ScaleTargets};
 
 /// Default cooldown between scale events
 pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
@@ -21,17 +21,9 @@ pub const DEFAULT_EMA_ALPHA: f64 = 0.3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScalingDecision {
     /// Scale up to target replicas
-    ScaleUp {
-        from: u32,
-        to: u32,
-        reason: String,
-    },
+    ScaleUp { from: u32, to: u32, reason: String },
     /// Scale down to target replicas
-    ScaleDown {
-        from: u32,
-        to: u32,
-        reason: String,
-    },
+    ScaleDown { from: u32, to: u32, reason: String },
     /// No scaling needed
     NoChange { reason: String },
     /// Cannot scale (in cooldown or manual mode)
@@ -41,7 +33,10 @@ pub enum ScalingDecision {
 impl ScalingDecision {
     /// Check if this decision involves a change
     pub fn is_change(&self) -> bool {
-        matches!(self, ScalingDecision::ScaleUp { .. } | ScalingDecision::ScaleDown { .. })
+        matches!(
+            self,
+            ScalingDecision::ScaleUp { .. } | ScalingDecision::ScaleDown { .. }
+        )
     }
 
     /// Get the target replica count, if any
@@ -184,14 +179,15 @@ impl Autoscaler {
     ) {
         let name = name.into();
         let cooldown = match &spec {
-            ScaleSpec::Adaptive { cooldown, .. } => {
-                cooldown.unwrap_or(DEFAULT_COOLDOWN)
-            }
+            ScaleSpec::Adaptive { cooldown, .. } => cooldown.unwrap_or(DEFAULT_COOLDOWN),
             _ => DEFAULT_COOLDOWN,
         };
 
         info!(service = %name, ?spec, initial_replicas, "Registered service for autoscaling");
-        self.services.insert(name, ServiceScaleState::new(spec, initial_replicas, cooldown));
+        self.services.insert(
+            name,
+            ServiceScaleState::new(spec, initial_replicas, cooldown),
+        );
     }
 
     /// Unregister a service
@@ -200,8 +196,14 @@ impl Autoscaler {
     }
 
     /// Update metrics and compute scaling decision
-    pub fn evaluate(&mut self, service_name: &str, metrics: &AggregatedMetrics) -> Result<ScalingDecision> {
-        let state = self.services.get_mut(service_name)
+    pub fn evaluate(
+        &mut self,
+        service_name: &str,
+        metrics: &AggregatedMetrics,
+    ) -> Result<ScalingDecision> {
+        let state = self
+            .services
+            .get_mut(service_name)
             .ok_or_else(|| SchedulerError::ServiceNotFound(service_name.to_string()))?;
 
         // Update EMAs
@@ -213,11 +215,9 @@ impl Autoscaler {
 
         // Check scaling mode
         match &state.spec {
-            ScaleSpec::Manual => {
-                Ok(ScalingDecision::Blocked {
-                    reason: "Manual scaling mode".to_string()
-                })
-            }
+            ScaleSpec::Manual => Ok(ScalingDecision::Blocked {
+                reason: "Manual scaling mode".to_string(),
+            }),
             ScaleSpec::Fixed { replicas } => {
                 if state.current_replicas != *replicas {
                     let from = state.current_replicas;
@@ -237,14 +237,17 @@ impl Autoscaler {
                     }
                 } else {
                     Ok(ScalingDecision::NoChange {
-                        reason: "Fixed mode: at target".to_string()
+                        reason: "Fixed mode: at target".to_string(),
                     })
                 }
             }
-            ScaleSpec::Adaptive { min, max, targets, .. } => {
+            ScaleSpec::Adaptive {
+                min, max, targets, ..
+            } => {
                 // Check cooldown
                 if state.is_in_cooldown() {
-                    let remaining = state.cooldown
+                    let remaining = state
+                        .cooldown
                         .checked_sub(state.last_scale_time.unwrap().elapsed())
                         .unwrap_or_default();
                     return Ok(ScalingDecision::Blocked {
@@ -259,7 +262,11 @@ impl Autoscaler {
                     targets,
                     state.cpu_ema.value(),
                     state.memory_ema.value(),
-                    if metrics.total_rps.is_some() { Some(state.rps_ema.value()) } else { None },
+                    if metrics.total_rps.is_some() {
+                        Some(state.rps_ema.value())
+                    } else {
+                        None
+                    },
                 );
 
                 Ok(decision)
@@ -311,10 +318,13 @@ impl Autoscaler {
             let target = rps_target as f64;
             // RPS is total across instances, so per-instance = rps / current
             let per_instance = rps / current as f64;
-            let per_instance_target = target as f64;
+            let per_instance_target = target;
 
             if per_instance >= per_instance_target {
-                scale_up_reasons.push(format!("RPS/instance {:.1} >= {}", per_instance, rps_target));
+                scale_up_reasons.push(format!(
+                    "RPS/instance {:.1} >= {}",
+                    per_instance, rps_target
+                ));
             }
             if per_instance > per_instance_target * 0.5 {
                 scale_down_ok = false;
@@ -350,7 +360,9 @@ impl Autoscaler {
 
     /// Record that a scaling action was taken
     pub fn record_scale_action(&mut self, service_name: &str, new_replicas: u32) -> Result<()> {
-        let state = self.services.get_mut(service_name)
+        let state = self
+            .services
+            .get_mut(service_name)
             .ok_or_else(|| SchedulerError::ServiceNotFound(service_name.to_string()))?;
 
         state.current_replicas = new_replicas;
@@ -406,11 +418,7 @@ mod tests {
     fn test_autoscaler_fixed_mode() {
         let mut autoscaler = Autoscaler::new();
 
-        autoscaler.register_service(
-            "api",
-            ScaleSpec::Fixed { replicas: 3 },
-            1,
-        );
+        autoscaler.register_service("api", ScaleSpec::Fixed { replicas: 3 }, 1);
 
         let metrics = AggregatedMetrics {
             avg_cpu_percent: 50.0,
@@ -475,7 +483,11 @@ mod tests {
         let decision = autoscaler.evaluate("api", &metrics).unwrap();
 
         match decision {
-            ScalingDecision::ScaleUp { from: 2, to: 3, reason } => {
+            ScalingDecision::ScaleUp {
+                from: 2,
+                to: 3,
+                reason,
+            } => {
                 assert!(reason.contains("CPU"));
             }
             other => panic!("Expected ScaleUp, got {:?}", other),
@@ -661,7 +673,11 @@ mod tests {
         let decision = autoscaler.evaluate("api", &metrics).unwrap();
 
         match decision {
-            ScalingDecision::ScaleUp { from: 2, to: 3, reason } => {
+            ScalingDecision::ScaleUp {
+                from: 2,
+                to: 3,
+                reason,
+            } => {
                 assert!(reason.contains("RPS"));
             }
             other => panic!("Expected ScaleUp due to RPS, got {:?}", other),

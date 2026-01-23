@@ -3,8 +3,8 @@
 use crate::error::{InitError, Result};
 use std::collections::HashMap;
 use std::time::Duration;
-use tokio::time::{sleep, timeout};
 use tokio::process::Command;
+use tokio::time::{sleep, timeout};
 
 /// Wait for a TCP port to be open
 pub struct WaitTcp {
@@ -19,7 +19,10 @@ impl WaitTcp {
         let start = std::time::Instant::now();
 
         loop {
-            if tokio::net::TcpStream::connect(&format!("{}:{}", self.host, self.port)).await.is_ok() {
+            if tokio::net::TcpStream::connect(&format!("{}:{}", self.host, self.port))
+                .await
+                .is_ok()
+            {
                 return Ok(());
             }
 
@@ -90,7 +93,12 @@ pub struct RunCommand {
 
 impl RunCommand {
     pub async fn execute(&self) -> Result<()> {
-        match timeout(self.timeout, Command::new("sh").arg("-c").arg(&self.command).output()).await {
+        match timeout(
+            self.timeout,
+            Command::new("sh").arg("-c").arg(&self.command).output(),
+        )
+        .await
+        {
             Ok(Ok(output)) => {
                 if output.status.success() {
                     Ok(())
@@ -109,7 +117,9 @@ impl RunCommand {
                 stdout: String::new(),
                 stderr: "timeout".to_string(),
             }),
-            Err(_) => Err(InitError::Timeout { timeout: self.timeout }),
+            Err(_) => Err(InitError::Timeout {
+                timeout: self.timeout,
+            }),
         }
     }
 }
@@ -118,7 +128,7 @@ impl RunCommand {
 pub fn from_spec(
     action: &str,
     params: &HashMap<String, serde_json::Value>,
-    default_timeout: Duration,
+    _default_timeout: Duration,
 ) -> Result<InitAction> {
     match action {
         "init.wait_tcp" => {
@@ -131,18 +141,14 @@ pub fn from_spec(
                 })?
                 .to_string();
 
-            let port = params
-                .get("port")
-                .and_then(|v| v.as_u64())
-                .ok_or_else(|| InitError::InvalidParams {
+            let port = params.get("port").and_then(|v| v.as_u64()).ok_or_else(|| {
+                InitError::InvalidParams {
                     action: action.to_string(),
                     reason: "missing or invalid 'port' parameter".to_string(),
-                })? as u16;
+                }
+            })? as u16;
 
-            let timeout_secs = params
-                .get("timeout")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(30) as u64;
+            let timeout_secs = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
 
             Ok(InitAction::WaitTcp(WaitTcp {
                 host,
@@ -162,12 +168,12 @@ pub fn from_spec(
                 })?
                 .to_string();
 
-            let expect_status = params.get("expect_status").and_then(|v| v.as_u64()).map(|v| v as u16);
-
-            let timeout_secs = params
-                .get("timeout")
+            let expect_status = params
+                .get("expect_status")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(30) as u64;
+                .map(|v| v as u16);
+
+            let timeout_secs = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
 
             Ok(InitAction::WaitHttp(WaitHttp {
                 url,
@@ -190,7 +196,7 @@ pub fn from_spec(
             let timeout_secs = params
                 .get("timeout")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(300) as u64;
+                .unwrap_or(300);
 
             Ok(InitAction::Run(RunCommand {
                 command,

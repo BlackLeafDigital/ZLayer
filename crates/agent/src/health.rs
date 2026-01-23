@@ -37,11 +37,19 @@ impl HealthChecker {
                 id: id.to_string(),
                 reason: format!("TCP connection failed: {}", e),
             }),
-            Err(_) => Err(AgentError::Timeout { timeout: timeout_dur }),
+            Err(_) => Err(AgentError::Timeout {
+                timeout: timeout_dur,
+            }),
         }
     }
 
-    async fn check_http(&self, id: &ContainerId, url: &str, expect_status: u16, timeout_dur: Duration) -> Result<()> {
+    async fn check_http(
+        &self,
+        id: &ContainerId,
+        url: &str,
+        expect_status: u16,
+        timeout_dur: Duration,
+    ) -> Result<()> {
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -58,7 +66,10 @@ impl HealthChecker {
                 } else {
                     Err(AgentError::HealthCheckFailed {
                         id: id.to_string(),
-                        reason: format!("unexpected status: {} (expected {})", status, expect_status),
+                        reason: format!(
+                            "unexpected status: {} (expected {})",
+                            status, expect_status
+                        ),
                     })
                 }
             }
@@ -66,12 +77,27 @@ impl HealthChecker {
                 id: id.to_string(),
                 reason: format!("HTTP request failed: {}", e),
             }),
-            Err(_) => Err(AgentError::Timeout { timeout: timeout_dur }),
+            Err(_) => Err(AgentError::Timeout {
+                timeout: timeout_dur,
+            }),
         }
     }
 
-    async fn check_command(&self, id: &ContainerId, command: &str, timeout_dur: Duration) -> Result<()> {
-        match timeout(timeout_dur, tokio::process::Command::new("sh").arg("-c").arg(command).output()).await {
+    async fn check_command(
+        &self,
+        id: &ContainerId,
+        command: &str,
+        timeout_dur: Duration,
+    ) -> Result<()> {
+        match timeout(
+            timeout_dur,
+            tokio::process::Command::new("sh")
+                .arg("-c")
+                .arg(command)
+                .output(),
+        )
+        .await
+        {
             Ok(Ok(output)) => {
                 if output.status.success() {
                     Ok(())
@@ -90,7 +116,9 @@ impl HealthChecker {
                 id: id.to_string(),
                 reason: format!("command execution failed: {}", e),
             }),
-            Err(_) => Err(AgentError::Timeout { timeout: timeout_dur }),
+            Err(_) => Err(AgentError::Timeout {
+                timeout: timeout_dur,
+            }),
         }
     }
 }
@@ -127,7 +155,6 @@ impl HealthMonitor {
     pub fn start(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut failures = 0u32;
-            let mut last_reason = String::new();
 
             loop {
                 // Update state to checking
@@ -140,11 +167,10 @@ impl HealthMonitor {
                     }
                     Err(e) => {
                         failures += 1;
-                        last_reason = e.to_string();
 
                         *self.state.write().await = HealthState::Unhealthy {
                             failures,
-                            reason: last_reason.clone(),
+                            reason: e.to_string(),
                         };
 
                         if failures >= self.retries {
@@ -175,9 +201,12 @@ mod tests {
             failures: 3,
             reason: "connection refused".to_string(),
         };
-        assert_eq!(state, HealthState::Unhealthy {
-            failures: 3,
-            reason: "connection refused".to_string()
-        });
+        assert_eq!(
+            state,
+            HealthState::Unhealthy {
+                failures: 3,
+                reason: "connection refused".to_string()
+            }
+        );
     }
 }

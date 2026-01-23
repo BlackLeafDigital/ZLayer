@@ -45,8 +45,8 @@ pub struct DnsServer {
 impl DnsServer {
     /// Create a new DNS server for the given zone
     pub fn new(listen_addr: SocketAddr, zone: &str) -> Result<Self, DnsError> {
-        let zone_origin = Name::from_str(zone)
-            .map_err(|e| DnsError::InvalidName(format!("{}: {}", zone, e)))?;
+        let zone_origin =
+            Name::from_str(zone).map_err(|e| DnsError::InvalidName(format!("{}: {}", zone, e)))?;
 
         // Create an empty in-memory authority for the zone
         let authority = InMemoryAuthority::empty(zone_origin.clone(), ZoneType::Primary, false);

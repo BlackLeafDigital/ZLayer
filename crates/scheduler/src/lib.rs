@@ -21,30 +21,31 @@
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 
-pub mod error;
 pub mod autoscaler;
+pub mod error;
 pub mod metrics;
 pub mod raft;
 pub mod raft_storage;
 
-pub use error::{SchedulerError, Result};
-pub use autoscaler::{Autoscaler, ScalingDecision, EmaCalculator, DEFAULT_COOLDOWN, DEFAULT_EMA_ALPHA};
+pub use autoscaler::{
+    Autoscaler, EmaCalculator, ScalingDecision, DEFAULT_COOLDOWN, DEFAULT_EMA_ALPHA,
+};
+pub use error::{Result, SchedulerError};
 pub use metrics::{
-    ServiceMetrics, AggregatedMetrics, MetricsSource, MetricsCollector,
-    MockMetricsSource, ContainerdMetricsSource,
+    AggregatedMetrics, ContainerdMetricsSource, MetricsCollector, MetricsSource, MockMetricsSource,
+    ServiceMetrics,
 };
 pub use raft::{
-    TypeConfig, NodeId, Request, Response, ServiceState, HealthStatus,
-    ScaleEvent, ClusterState, NodeInfo, ZLayerRaft,
-    RaftConfig, RaftCoordinator,
+    ClusterState, HealthStatus, NodeId, NodeInfo, RaftConfig, RaftCoordinator, Request, Response,
+    ScaleEvent, ServiceState, TypeConfig, ZLayerRaft,
 };
-pub use raft_storage::{MemStore, LogStore, StateMachine};
+pub use raft_storage::{LogStore, MemStore, StateMachine};
 
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::time::interval;
-use tracing::{info, warn, error, debug};
+use tracing::{debug, error, info, warn};
 
 use spec::ScaleSpec;
 
@@ -144,15 +145,19 @@ impl Scheduler {
                 ScaleSpec::Manual => (0, u32::MAX),
             };
 
-            raft.update_service(name.clone(), ServiceState {
-                current_replicas: initial_replicas,
-                desired_replicas: initial_replicas,
-                min_replicas: min,
-                max_replicas: max,
-                health_status: HealthStatus::Unknown,
-                last_scale_time: None,
-                assigned_nodes: vec![self.config.raft.node_id],
-            }).await?;
+            raft.update_service(
+                name.clone(),
+                ServiceState {
+                    current_replicas: initial_replicas,
+                    desired_replicas: initial_replicas,
+                    min_replicas: min,
+                    max_replicas: max,
+                    health_status: HealthStatus::Unknown,
+                    last_scale_time: None,
+                    assigned_nodes: vec![self.config.raft.node_id],
+                },
+            )
+            .await?;
         }
 
         info!(service = %name, initial_replicas, "Registered service");
@@ -195,7 +200,11 @@ impl Scheduler {
     ///
     /// This records the decision and updates state. The actual scaling
     /// (starting/stopping containers) is done by the caller.
-    pub async fn apply_scaling(&self, service_name: &str, decision: &ScalingDecision) -> Result<()> {
+    pub async fn apply_scaling(
+        &self,
+        service_name: &str,
+        decision: &ScalingDecision,
+    ) -> Result<()> {
         if let Some(target) = decision.target_replicas() {
             // Update autoscaler state
             {
@@ -211,12 +220,8 @@ impl Scheduler {
                     _ => return Ok(()),
                 };
 
-                raft.record_scale_event(
-                    service_name.to_string(),
-                    from,
-                    target,
-                    reason,
-                ).await?;
+                raft.record_scale_event(service_name.to_string(), from, target, reason)
+                    .await?;
             }
 
             info!(
@@ -339,11 +344,10 @@ mod tests {
         let config = SchedulerConfig::default();
         let scheduler = Scheduler::new_standalone(config);
 
-        scheduler.register_service(
-            "api",
-            ScaleSpec::Fixed { replicas: 3 },
-            1,
-        ).await.unwrap();
+        scheduler
+            .register_service("api", ScaleSpec::Fixed { replicas: 3 }, 1)
+            .await
+            .unwrap();
 
         assert_eq!(scheduler.current_replicas("api").await, Some(1));
     }
@@ -355,33 +359,38 @@ mod tests {
 
         // Add mock metrics source
         let mock = Arc::new(MockMetricsSource::new());
-        mock.set_metrics("api", vec![
-            ServiceMetrics {
+        mock.set_metrics(
+            "api",
+            vec![ServiceMetrics {
                 cpu_percent: 80.0,
                 memory_bytes: 512 * 1024 * 1024,
                 memory_limit: 1024 * 1024 * 1024,
                 rps: Some(100.0),
                 timestamp: Some(std::time::Instant::now()),
-            },
-        ]).await;
+            }],
+        )
+        .await;
 
         scheduler.add_metrics_source(mock).await;
 
         // Register service with adaptive scaling
-        scheduler.register_service(
-            "api",
-            ScaleSpec::Adaptive {
-                min: 1,
-                max: 10,
-                cooldown: Some(Duration::from_secs(0)),
-                targets: ScaleTargets {
-                    cpu: Some(70),
-                    memory: None,
-                    rps: None,
+        scheduler
+            .register_service(
+                "api",
+                ScaleSpec::Adaptive {
+                    min: 1,
+                    max: 10,
+                    cooldown: Some(Duration::from_secs(0)),
+                    targets: ScaleTargets {
+                        cpu: Some(70),
+                        memory: None,
+                        rps: None,
+                    },
                 },
-            },
-            2,
-        ).await.unwrap();
+                2,
+            )
+            .await
+            .unwrap();
 
         // Evaluate - should want to scale up due to high CPU
         let decision = scheduler.evaluate_service("api").await.unwrap();

@@ -153,9 +153,9 @@ where
             .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
 
         // Parse Bearer token
-        let token = auth_header
-            .strip_prefix("Bearer ")
-            .ok_or_else(|| ApiError::Unauthorized("Invalid Authorization header format".to_string()))?;
+        let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
+            ApiError::Unauthorized("Invalid Authorization header format".to_string())
+        })?;
 
         // Verify token
         let claims = verify_token(&auth_state.jwt_secret, token)?;
@@ -254,13 +254,8 @@ mod tests {
 
     #[test]
     fn test_wrong_secret_fails() {
-        let token = create_token(
-            TEST_SECRET,
-            "user123",
-            Duration::from_secs(3600),
-            vec![],
-        )
-        .unwrap();
+        let token =
+            create_token(TEST_SECRET, "user123", Duration::from_secs(3600), vec![]).unwrap();
 
         let result = verify_token("wrong-secret", &token);
         assert!(result.is_err());

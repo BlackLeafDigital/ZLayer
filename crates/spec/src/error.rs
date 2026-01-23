@@ -103,9 +103,13 @@ impl fmt::Display for ValidationErrorKind {
             Self::EmptyDeploymentName => write!(f, "deployment name is empty"),
             Self::EmptyServiceName => write!(f, "service name is empty"),
             Self::EmptyImageName => write!(f, "image name is empty"),
-            Self::InvalidPort { port } => write!(f, "port {} is out of valid range (1-65535)", port),
+            Self::InvalidPort { port } => {
+                write!(f, "port {} is out of valid range (1-65535)", port)
+            }
             Self::InvalidCpu { cpu } => write!(f, "CPU limit {} is invalid (must be > 0)", cpu),
-            Self::InvalidMemoryFormat { value } => write!(f, "memory format '{}' is invalid", value),
+            Self::InvalidMemoryFormat { value } => {
+                write!(f, "memory format '{}' is invalid", value)
+            }
             Self::InvalidDuration { value } => write!(f, "duration format '{}' is invalid", value),
             Self::DuplicateEndpoint { name } => write!(f, "duplicate endpoint '{}'", name),
             Self::UnknownInitAction { action } => write!(f, "unknown init action '{}'", action),
@@ -124,11 +128,21 @@ impl fmt::Display for ValidationErrorKind {
                 write!(f, "invalid scale range: min {} > max {}", min, max)
             }
             Self::EmptyScaleTargets => write!(f, "scale targets are empty in adaptive mode"),
-            Self::InvalidEnvVar { name } => write!(f, "invalid environment variable name '{}'", name),
+            Self::InvalidEnvVar { name } => {
+                write!(f, "invalid environment variable name '{}'", name)
+            }
             Self::Generic { message } => write!(f, "{}", message),
         }
     }
 }
+
+impl fmt::Display for ValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} at {}", self.kind, self.path)
+    }
+}
+
+impl std::error::Error for ValidationError {}
 
 #[cfg(test)]
 mod tests {
@@ -145,11 +159,3 @@ mod tests {
         assert!(err.to_string().contains("invalid version"));
     }
 }
-
-impl fmt::Display for ValidationError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at {}", self.kind, self.path)
-    }
-}
-
-impl std::error::Error for ValidationError {}

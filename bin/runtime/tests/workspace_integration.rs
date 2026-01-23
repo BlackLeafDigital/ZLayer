@@ -65,9 +65,18 @@ fn test_runtime_full_features_help() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("serve"), "Should have serve command with full features");
-    assert!(stdout.contains("deploy"), "Should have deploy command with full features");
-    assert!(stdout.contains("join"), "Should have join command with full features");
+    assert!(
+        stdout.contains("serve"),
+        "Should have serve command with full features"
+    );
+    assert!(
+        stdout.contains("deploy"),
+        "Should have deploy command with full features"
+    );
+    assert!(
+        stdout.contains("join"),
+        "Should have join command with full features"
+    );
 }
 
 /// Test that runtime status command works
@@ -150,9 +159,18 @@ fn test_devctl_generate_join_token() {
         .output()
         .expect("Failed to run devctl generate join-token");
 
-    assert!(output.status.success(), "Join token generation should succeed");
+    assert!(
+        output.status.success(),
+        "Join token generation should succeed"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("Join Token Generated"), "Should show generation success");
-    assert!(stdout.contains("test-deployment"), "Should include deployment name");
+    assert!(
+        stdout.contains("Join Token Generated"),
+        "Should show generation success"
+    );
+    assert!(
+        stdout.contains("test-deployment"),
+        "Should include deployment name"
+    );
 }

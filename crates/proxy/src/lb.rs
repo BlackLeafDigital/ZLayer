@@ -276,11 +276,8 @@ mod tests {
 
         lb.add_backend(Backend::new("127.0.0.1:8081".parse().unwrap()))
             .await;
-        lb.update_health(
-            "127.0.0.1:8081".parse().unwrap(),
-            HealthStatus::Unhealthy,
-        )
-        .await;
+        lb.update_health("127.0.0.1:8081".parse().unwrap(), HealthStatus::Unhealthy)
+            .await;
 
         let result = lb.select().await;
         assert!(matches!(result, Err(ProxyError::NoHealthyBackends { .. })));
@@ -305,7 +302,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_least_connections() {
-        let lb = LoadBalancer::with_algorithm("test-service", LoadBalancerAlgorithm::LeastConnections);
+        let lb =
+            LoadBalancer::with_algorithm("test-service", LoadBalancerAlgorithm::LeastConnections);
 
         let b1 = Backend::new("127.0.0.1:8081".parse().unwrap());
         let b2 = Backend::new("127.0.0.1:8082".parse().unwrap());

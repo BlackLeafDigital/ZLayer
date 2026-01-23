@@ -84,10 +84,7 @@ impl ReverseProxyService {
     }
 
     /// Handle an incoming HTTP request
-    pub async fn proxy_request(
-        &self,
-        req: Request<Incoming>,
-    ) -> Result<Response<BoxBody>> {
+    pub async fn proxy_request(&self, req: Request<Incoming>) -> Result<Response<BoxBody>> {
         let method = req.method().clone();
         let uri = req.uri().clone();
 
@@ -126,17 +123,15 @@ impl ReverseProxyService {
         );
 
         // Build the forwarded request
-        let forwarded_req = self.build_forwarded_request(req, &backend.addr, route).await?;
+        let forwarded_req = self
+            .build_forwarded_request(req, &backend.addr, route)
+            .await?;
 
         // Forward to backend
-        let response = self
-            .client
-            .request(forwarded_req)
-            .await
-            .map_err(|e| {
-                error!(error = %e, backend = %backend.addr, "Backend request failed");
-                ProxyError::BackendRequestFailed(e.to_string())
-            })?;
+        let response = self.client.request(forwarded_req).await.map_err(|e| {
+            error!(error = %e, backend = %backend.addr, "Backend request failed");
+            ProxyError::BackendRequestFailed(e.to_string())
+        })?;
 
         // Convert response body
         let (parts, body) = response.into_parts();
@@ -272,12 +267,7 @@ impl ReverseProxyService {
             .headers
             .get(header::CONNECTION)
             .and_then(|h| h.to_str().ok())
-            .map(|value| {
-                value
-                    .split(',')
-                    .map(|s| s.trim().to_lowercase())
-                    .collect()
-            })
+            .map(|value| value.split(',').map(|s| s.trim().to_lowercase()).collect())
             .unwrap_or_default();
 
         // Standard hop-by-hop headers that should not be forwarded
@@ -319,7 +309,10 @@ impl Service<Request<Incoming>> for ReverseProxyService {
     type Response = Response<BoxBody>;
     type Error = ProxyError;
     type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>,
+        Box<
+            dyn std::future::Future<Output = std::result::Result<Self::Response, Self::Error>>
+                + Send,
+        >,
     >;
 
     fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {

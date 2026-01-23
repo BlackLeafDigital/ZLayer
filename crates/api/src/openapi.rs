@@ -5,9 +5,7 @@ use utoipa::{Modify, OpenApi};
 
 // Import types for schema definitions
 use crate::handlers::auth::{TokenRequest, TokenResponse};
-use crate::handlers::deployments::{
-    CreateDeploymentRequest, DeploymentDetails, DeploymentSummary,
-};
+use crate::handlers::deployments::{CreateDeploymentRequest, DeploymentDetails, DeploymentSummary};
 use crate::handlers::health::HealthResponse;
 use crate::handlers::services::{
     ScaleRequest, ServiceDetails, ServiceEndpoint, ServiceMetrics, ServiceSummary,

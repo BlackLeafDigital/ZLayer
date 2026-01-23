@@ -25,19 +25,33 @@ impl WireGuardManager {
     /// Create WireGuard interface
     pub async fn create_interface(&self) -> Result<(), Box<dyn std::error::Error>> {
         let output = Command::new("ip")
-            .args(["link", "add", "dev", &self.interface_name, "type", "wireguard"])
+            .args([
+                "link",
+                "add",
+                "dev",
+                &self.interface_name,
+                "type",
+                "wireguard",
+            ])
             .output()
             .await?;
 
         if !output.status.success() {
-            return Err(format!("Failed to create WireGuard interface: {}", String::from_utf8_lossy(&output.stderr)).into());
+            return Err(format!(
+                "Failed to create WireGuard interface: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
         }
 
         Ok(())
     }
 
     /// Configure WireGuard interface
-    pub async fn configure_interface(&self, peers: &[PeerInfo]) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn configure_interface(
+        &self,
+        peers: &[PeerInfo],
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let mut config = format!(
             "[Interface]\n\
                         PrivateKey = {}\n\
@@ -63,7 +77,11 @@ impl WireGuardManager {
             .await?;
 
         if !output.status.success() {
-            return Err(format!("Failed to bring up WireGuard interface: {}", String::from_utf8_lossy(&output.stderr)).into());
+            return Err(format!(
+                "Failed to bring up WireGuard interface: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
         }
 
         Ok(())
@@ -86,10 +104,7 @@ impl WireGuardManager {
     /// The private key is then piped to `wg pubkey` to derive the public key.
     pub async fn generate_keys() -> Result<(String, String), Box<dyn std::error::Error>> {
         // Generate private key: `wg genkey` outputs to stdout
-        let genkey_output = Command::new("wg")
-            .arg("genkey")
-            .output()
-            .await?;
+        let genkey_output = Command::new("wg").arg("genkey").output().await?;
 
         if !genkey_output.status.success() {
             return Err(format!(
@@ -161,7 +176,11 @@ impl WireGuardManager {
             .await?;
 
         if !output.status.success() {
-            return Err(format!("Failed to add WireGuard peer: {}", String::from_utf8_lossy(&output.stderr)).into());
+            return Err(format!(
+                "Failed to add WireGuard peer: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
         }
 
         Ok(())
@@ -175,7 +194,11 @@ impl WireGuardManager {
             .await?;
 
         if !output.status.success() {
-            return Err(format!("Failed to remove WireGuard peer: {}", String::from_utf8_lossy(&output.stderr)).into());
+            return Err(format!(
+                "Failed to remove WireGuard peer: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
         }
 
         Ok(())

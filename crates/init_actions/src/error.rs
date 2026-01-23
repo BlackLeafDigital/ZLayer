@@ -8,7 +8,11 @@ use thiserror::Error;
 pub enum InitError {
     /// TCP connection failed
     #[error("TCP connection to {host}:{port} failed: {reason}")]
-    TcpFailed { host: String, port: u16, reason: String },
+    TcpFailed {
+        host: String,
+        port: u16,
+        reason: String,
+    },
 
     /// HTTP request failed
     #[error("HTTP request to {url} failed: {reason}")]

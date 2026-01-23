@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Main proxy configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ProxyConfig {
     /// Server configuration
     #[serde(default)]
@@ -29,18 +29,6 @@ pub struct ProxyConfig {
     /// Header configuration
     #[serde(default)]
     pub headers: HeaderConfig,
-}
-
-impl Default for ProxyConfig {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            tls: None,
-            pool: PoolConfig::default(),
-            timeouts: TimeoutConfig::default(),
-            headers: HeaderConfig::default(),
-        }
-    }
 }
 
 /// Server bind configuration

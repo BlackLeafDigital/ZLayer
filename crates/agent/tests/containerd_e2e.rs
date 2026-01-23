@@ -14,8 +14,8 @@
 //! ```
 
 use agent::{
-    AgentError, ContainerdConfig, ContainerdRuntime, ContainerId, ContainerState,
-    HealthChecker, ProxyManager, ProxyManagerConfig, Runtime, ServiceInstance, ServiceManager,
+    AgentError, ContainerId, ContainerState, ContainerdConfig, ContainerdRuntime, HealthChecker,
+    ProxyManager, ProxyManagerConfig, Runtime, ServiceInstance, ServiceManager,
 };
 use spec::{DeploymentSpec, HealthCheck, ServiceSpec};
 use std::net::SocketAddr;
@@ -45,7 +45,10 @@ async fn containerd_available() -> bool {
 macro_rules! skip_without_containerd {
     () => {
         if !containerd_available().await {
-            eprintln!("Skipping test: containerd not available at {}", CONTAINERD_SOCKET);
+            eprintln!(
+                "Skipping test: containerd not available at {}",
+                CONTAINERD_SOCKET
+            );
             return;
         }
     };
@@ -88,12 +91,16 @@ async fn wait_for_state(
                     return Ok(());
                 }
                 // For Exited state, just check the variant, not the exit code
-                if matches!((&state, &expected), (ContainerState::Exited { .. }, ContainerState::Exited { .. }))
-                {
+                if matches!(
+                    (&state, &expected),
+                    (ContainerState::Exited { .. }, ContainerState::Exited { .. })
+                ) {
                     return Ok(());
                 }
             }
-            Err(AgentError::NotFound { .. }) if matches!(expected, ContainerState::Exited { .. }) => {
+            Err(AgentError::NotFound { .. })
+                if matches!(expected, ContainerState::Exited { .. }) =>
+            {
                 // Container was removed - treat as exited
                 return Ok(());
             }
@@ -291,7 +298,11 @@ async fn test_container_lifecycle() {
     // 1. Pull image
     println!("Pulling image: {}", ALPINE_IMAGE);
     let pull_result = runtime.pull_image(ALPINE_IMAGE).await;
-    assert!(pull_result.is_ok(), "Failed to pull image: {:?}", pull_result);
+    assert!(
+        pull_result.is_ok(),
+        "Failed to pull image: {:?}",
+        pull_result
+    );
 
     // 2. Create container
     println!("Creating container: {}", id);
@@ -350,10 +361,7 @@ async fn test_container_lifecycle() {
 
     // Verify container is gone
     let state = runtime.container_state(&id).await;
-    assert!(
-        state.is_err(),
-        "Container should not exist after removal"
-    );
+    assert!(state.is_err(), "Container should not exist after removal");
 }
 
 // =============================================================================
@@ -448,11 +456,18 @@ async fn test_health_checks_tcp() {
     // Pull nginx image
     println!("Pulling nginx image");
     let pull_result = runtime.pull_image(NGINX_IMAGE).await;
-    assert!(pull_result.is_ok(), "Failed to pull nginx: {:?}", pull_result);
+    assert!(
+        pull_result.is_ok(),
+        "Failed to pull nginx: {:?}",
+        pull_result
+    );
 
     // Create and start container
     println!("Creating and starting nginx container");
-    runtime.create_container(&id, &spec).await.expect("Failed to create");
+    runtime
+        .create_container(&id, &spec)
+        .await
+        .expect("Failed to create");
     runtime.start_container(&id).await.expect("Failed to start");
 
     // Wait for container to be running
@@ -526,7 +541,11 @@ async fn test_proxy_routing() {
     // Verify backends were added via the router
     let lb = manager.router().get_lb(&service_name).await;
     assert!(lb.is_some(), "Load balancer should exist");
-    assert_eq!(lb.unwrap().backend_count().await, 2, "Should have 2 backends");
+    assert_eq!(
+        lb.unwrap().backend_count().await,
+        2,
+        "Should have 2 backends"
+    );
 
     // Update health status
     manager
@@ -534,11 +553,19 @@ async fn test_proxy_routing() {
         .await;
 
     let lb = manager.router().get_lb(&service_name).await.unwrap();
-    assert_eq!(lb.healthy_count().await, 1, "One backend should be unhealthy");
+    assert_eq!(
+        lb.healthy_count().await,
+        1,
+        "One backend should be unhealthy"
+    );
 
     // Remove backend
     manager.remove_backend(&service_name, backend_addr1).await;
-    assert_eq!(lb.backend_count().await, 1, "Should have 1 backend after removal");
+    assert_eq!(
+        lb.backend_count().await,
+        1,
+        "Should have 1 backend after removal"
+    );
 
     // Remove service
     manager.remove_service(&service_name).await;
@@ -576,8 +603,14 @@ async fn test_container_logs() {
     let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
     // Pull and create container
-    runtime.pull_image(ALPINE_IMAGE).await.expect("Failed to pull");
-    runtime.create_container(&id, &spec).await.expect("Failed to create");
+    runtime
+        .pull_image(ALPINE_IMAGE)
+        .await
+        .expect("Failed to pull");
+    runtime
+        .create_container(&id, &spec)
+        .await
+        .expect("Failed to create");
     runtime.start_container(&id).await.expect("Failed to start");
 
     // Wait for container to start
@@ -631,7 +664,10 @@ async fn test_error_missing_image() {
     };
 
     // Try to pull a non-existent image
-    let fake_image = format!("docker.io/library/{}:definitely-not-real", unique_name("fake"));
+    let fake_image = format!(
+        "docker.io/library/{}:definitely-not-real",
+        unique_name("fake")
+    );
     println!("Attempting to pull non-existent image: {}", fake_image);
 
     let result = runtime.pull_image(&fake_image).await;
@@ -740,7 +776,10 @@ async fn test_concurrent_containers() {
     };
 
     // First, pull the image once
-    runtime.pull_image(ALPINE_IMAGE).await.expect("Failed to pull image");
+    runtime
+        .pull_image(ALPINE_IMAGE)
+        .await
+        .expect("Failed to pull image");
 
     let container_count = 3;
     let base_name = unique_name("concurrent");
@@ -859,10 +898,16 @@ async fn test_cleanup_state_directory() {
     let spec = create_alpine_spec();
 
     // Pull image
-    runtime.pull_image(ALPINE_IMAGE).await.expect("Failed to pull");
+    runtime
+        .pull_image(ALPINE_IMAGE)
+        .await
+        .expect("Failed to pull");
 
     // Create container
-    runtime.create_container(&id, &spec).await.expect("Failed to create");
+    runtime
+        .create_container(&id, &spec)
+        .await
+        .expect("Failed to create");
 
     // Start container
     runtime.start_container(&id).await.expect("Failed to start");
@@ -880,7 +925,10 @@ async fn test_cleanup_state_directory() {
 
     // Stop and remove
     let _ = runtime.stop_container(&id, Duration::from_secs(5)).await;
-    runtime.remove_container(&id).await.expect("Failed to remove");
+    runtime
+        .remove_container(&id)
+        .await
+        .expect("Failed to remove");
 
     // State directory should be cleaned up
     let exists_after = tokio::fs::metadata(&state_dir).await.is_ok();

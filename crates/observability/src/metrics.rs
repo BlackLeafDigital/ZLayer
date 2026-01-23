@@ -57,8 +57,11 @@ impl ZLayerMetrics {
         let registry = Registry::new();
 
         // Service metrics
-        let services_total = Gauge::new("zlayer_services_total", "Total number of registered services")
-            .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
+        let services_total = Gauge::new(
+            "zlayer_services_total",
+            "Total number of registered services",
+        )
+        .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
 
         let service_replicas = GaugeVec::new(
             Opts::new(
@@ -85,13 +88,11 @@ impl ZLayerMetrics {
         )
         .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
 
-        let scale_up_total =
-            Counter::new("zlayer_scale_up_total", "Total scale up events")
-                .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
+        let scale_up_total = Counter::new("zlayer_scale_up_total", "Total scale up events")
+            .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
 
-        let scale_down_total =
-            Counter::new("zlayer_scale_down_total", "Total scale down events")
-                .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
+        let scale_down_total = Counter::new("zlayer_scale_down_total", "Total scale down events")
+            .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
 
         // Request metrics
         let requests_total = CounterVec::new(
@@ -122,9 +123,8 @@ impl ZLayerMetrics {
         let raft_term = Gauge::new("zlayer_raft_term", "Current Raft term")
             .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
 
-        let raft_commit_index =
-            Gauge::new("zlayer_raft_commit_index", "Current Raft commit index")
-                .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
+        let raft_commit_index = Gauge::new("zlayer_raft_commit_index", "Current Raft commit index")
+            .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
 
         // System metrics
         let uptime_seconds = Gauge::new(
@@ -134,40 +134,20 @@ impl ZLayerMetrics {
         .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
 
         // Register all metrics
-        registry
-            .register(Box::new(services_total.clone()))
-            .ok();
-        registry
-            .register(Box::new(service_replicas.clone()))
-            .ok();
-        registry
-            .register(Box::new(service_health.clone()))
-            .ok();
-        registry
-            .register(Box::new(scale_events_total.clone()))
-            .ok();
-        registry
-            .register(Box::new(scale_up_total.clone()))
-            .ok();
-        registry
-            .register(Box::new(scale_down_total.clone()))
-            .ok();
-        registry
-            .register(Box::new(requests_total.clone()))
-            .ok();
+        registry.register(Box::new(services_total.clone())).ok();
+        registry.register(Box::new(service_replicas.clone())).ok();
+        registry.register(Box::new(service_health.clone())).ok();
+        registry.register(Box::new(scale_events_total.clone())).ok();
+        registry.register(Box::new(scale_up_total.clone())).ok();
+        registry.register(Box::new(scale_down_total.clone())).ok();
+        registry.register(Box::new(requests_total.clone())).ok();
         registry
             .register(Box::new(request_duration_seconds.clone()))
             .ok();
-        registry
-            .register(Box::new(raft_is_leader.clone()))
-            .ok();
+        registry.register(Box::new(raft_is_leader.clone())).ok();
         registry.register(Box::new(raft_term.clone())).ok();
-        registry
-            .register(Box::new(raft_commit_index.clone()))
-            .ok();
-        registry
-            .register(Box::new(uptime_seconds.clone()))
-            .ok();
+        registry.register(Box::new(raft_commit_index.clone())).ok();
+        registry.register(Box::new(uptime_seconds.clone())).ok();
 
         Ok(Self {
             registry,
@@ -308,10 +288,7 @@ pub async fn metrics_handler() -> impl axum::response::IntoResponse {
     match metrics() {
         Some(m) => match m.encode() {
             Ok(body) => (StatusCode::OK, body),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Error: {}", e),
-            ),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)),
         },
         None => (
             StatusCode::SERVICE_UNAVAILABLE,

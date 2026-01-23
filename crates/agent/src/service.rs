@@ -19,7 +19,11 @@ pub struct ServiceInstance {
 
 impl ServiceInstance {
     /// Create a new service instance
-    pub fn new(service_name: String, spec: ServiceSpec, runtime: Arc<dyn Runtime + Send + Sync>) -> Self {
+    pub fn new(
+        service_name: String,
+        spec: ServiceSpec,
+        runtime: Arc<dyn Runtime + Send + Sync>,
+    ) -> Self {
         Self {
             service_name,
             spec,
@@ -51,22 +55,26 @@ impl ServiceInstance {
                     })?;
 
                 // Create container
-                self.runtime.create_container(&id, &self.spec).await.map_err(|e| {
-                    AgentError::CreateFailed {
+                self.runtime
+                    .create_container(&id, &self.spec)
+                    .await
+                    .map_err(|e| AgentError::CreateFailed {
                         id: id.to_string(),
                         reason: e.to_string(),
-                    }
-                })?;
+                    })?;
 
                 // Run init actions
                 let init_orchestrator = InitOrchestrator::new(id.clone(), self.spec.init.clone());
                 init_orchestrator.run().await?;
 
                 // Start container
-                self.runtime.start_container(&id).await.map_err(|e| AgentError::StartFailed {
-                    id: id.to_string(),
-                    reason: e.to_string(),
-                })?;
+                self.runtime
+                    .start_container(&id)
+                    .await
+                    .map_err(|e| AgentError::StartFailed {
+                        id: id.to_string(),
+                        reason: e.to_string(),
+                    })?;
 
                 // Start health monitoring
                 {
@@ -80,12 +88,15 @@ impl ServiceInstance {
                     let _monitor = monitor;
                 }
 
-                containers.insert(id.clone(), Container {
-                    id: id.clone(),
-                    state: ContainerState::Running,
-                    pid: None,
-                    task: None,
-                });
+                containers.insert(
+                    id.clone(),
+                    Container {
+                        id: id.clone(),
+                        state: ContainerState::Running,
+                        pid: None,
+                        task: None,
+                    },
+                );
             }
         }
 
@@ -97,7 +108,7 @@ impl ServiceInstance {
                     replica: i + 1,
                 };
 
-                if let Some(container) = containers.remove(&id) {
+                if let Some(_container) = containers.remove(&id) {
                     // Stop container
                     self.runtime
                         .stop_container(&id, Duration::from_secs(30))
@@ -161,12 +172,10 @@ impl ServiceManager {
         let _permit = self.scale_semaphore.acquire().await;
 
         let services = self.services.read().await;
-        let instance = services
-            .get(name)
-            .ok_or_else(|| AgentError::NotFound {
-                container: name.to_string(),
-                reason: "service not found".to_string(),
-            })?;
+        let instance = services.get(name).ok_or_else(|| AgentError::NotFound {
+            container: name.to_string(),
+            reason: "service not found".to_string(),
+        })?;
 
         instance.scale_to(replicas).await
     }
@@ -174,12 +183,10 @@ impl ServiceManager {
     /// Get service replica count
     pub async fn service_replica_count(&self, name: &str) -> Result<usize> {
         let services = self.services.read().await;
-        let instance = services
-            .get(name)
-            .ok_or_else(|| AgentError::NotFound {
-                container: name.to_string(),
-                reason: "service not found".to_string(),
-            })?;
+        let instance = services.get(name).ok_or_else(|| AgentError::NotFound {
+            container: name.to_string(),
+            reason: "service not found".to_string(),
+        })?;
 
         Ok(instance.replica_count().await)
     }
@@ -212,7 +219,10 @@ mod tests {
 
         // Add service
         let spec = mock_spec();
-        manager.upsert_service("test".to_string(), spec).await.unwrap();
+        manager
+            .upsert_service("test".to_string(), spec)
+            .await
+            .unwrap();
 
         // Scale up
         manager.scale_service("test", 3).await.unwrap();
@@ -227,7 +237,6 @@ mod tests {
     }
 
     fn mock_spec() -> ServiceSpec {
-        use spec::*;
         serde_yaml::from_str::<spec::DeploymentSpec>(
             r#"
 version: v1

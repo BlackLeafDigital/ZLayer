@@ -7,14 +7,20 @@ use std::future::Future;
 use std::io::Cursor;
 use std::sync::Arc;
 
-use openraft::error::{Fatal, InstallSnapshotError, RPCError, RaftError, ReplicationClosed, StreamingError, Unreachable};
+use openraft::error::{
+    Fatal, InstallSnapshotError, RPCError, RaftError, ReplicationClosed, StreamingError,
+    Unreachable,
+};
 use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
 use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     SnapshotResponse, VoteRequest, VoteResponse,
 };
 use openraft::storage::Adaptor;
-use openraft::{BasicNode, Config, Entry, LogId, OptionalSend, Raft, RaftTypeConfig, Snapshot, StoredMembership, Vote};
+use openraft::{
+    BasicNode, Config, Entry, LogId, OptionalSend, Raft, RaftTypeConfig, Snapshot,
+    StoredMembership, Vote,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
@@ -57,14 +63,9 @@ pub enum Request {
         timestamp: u64,
     },
     /// Register a new node
-    RegisterNode {
-        node_id: NodeId,
-        address: String,
-    },
+    RegisterNode { node_id: NodeId, address: String },
     /// Deregister a node
-    DeregisterNode {
-        node_id: NodeId,
-    },
+    DeregisterNode { node_id: NodeId },
     /// Update service assignment to nodes
     UpdateServiceAssignment {
         service_name: String,
@@ -153,7 +154,10 @@ impl ClusterState {
     /// Apply a request to the state machine
     pub fn apply(&mut self, request: &Request) -> Response {
         match request {
-            Request::UpdateServiceState { service_name, state } => {
+            Request::UpdateServiceState {
+                service_name,
+                state,
+            } => {
                 self.services.insert(service_name.clone(), state.clone());
                 Response::Success { data: None }
             }
@@ -192,12 +196,15 @@ impl ClusterState {
                     .unwrap()
                     .as_millis() as u64;
 
-                self.nodes.insert(*node_id, NodeInfo {
-                    node_id: *node_id,
-                    address: address.clone(),
-                    registered_at: now,
-                    last_heartbeat: now,
-                });
+                self.nodes.insert(
+                    *node_id,
+                    NodeInfo {
+                        node_id: *node_id,
+                        address: address.clone(),
+                        registered_at: now,
+                        last_heartbeat: now,
+                    },
+                );
 
                 Response::Success { data: None }
             }
@@ -211,7 +218,10 @@ impl ClusterState {
 
                 Response::Success { data: None }
             }
-            Request::UpdateServiceAssignment { service_name, node_ids } => {
+            Request::UpdateServiceAssignment {
+                service_name,
+                node_ids,
+            } => {
                 if let Some(svc) = self.services.get_mut(service_name) {
                     svc.assigned_nodes = node_ids.clone();
                     Response::Success { data: None }
@@ -454,9 +464,10 @@ impl RaftCoordinator {
             ..Default::default()
         };
 
-        let raft_config = Arc::new(raft_config.validate().map_err(|e| {
-            SchedulerError::InvalidConfig(format!("Invalid Raft config: {}", e))
-        })?);
+        let raft_config =
+            Arc::new(raft_config.validate().map_err(|e| {
+                SchedulerError::InvalidConfig(format!("Invalid Raft config: {}", e))
+            })?);
 
         let storage = MemStore::new();
         let network = ZLayerNetwork::new();
@@ -495,11 +506,15 @@ impl RaftCoordinator {
             },
         );
 
-        self.raft.initialize(members).await.map_err(|e| {
-            SchedulerError::Raft(format!("Bootstrap failed: {}", e))
-        })?;
+        self.raft
+            .initialize(members)
+            .await
+            .map_err(|e| SchedulerError::Raft(format!("Bootstrap failed: {}", e)))?;
 
-        info!(node_id = self.config.node_id, "Bootstrapped single-node cluster");
+        info!(
+            node_id = self.config.node_id,
+            "Bootstrapped single-node cluster"
+        );
         Ok(())
     }
 
@@ -516,9 +531,11 @@ impl RaftCoordinator {
 
     /// Propose a state change (must be leader)
     pub async fn propose(&self, request: Request) -> Result<Response> {
-        let result = self.raft.client_write(request).await.map_err(|e| {
-            SchedulerError::Raft(format!("Failed to propose: {}", e))
-        })?;
+        let result = self
+            .raft
+            .client_write(request)
+            .await
+            .map_err(|e| SchedulerError::Raft(format!("Failed to propose: {}", e)))?;
 
         Ok(result.data)
     }
@@ -579,9 +596,10 @@ impl RaftCoordinator {
 
     /// Shutdown the Raft node
     pub async fn shutdown(&self) -> Result<()> {
-        self.raft.shutdown().await.map_err(|e| {
-            SchedulerError::Raft(format!("Shutdown failed: {}", e))
-        })?;
+        self.raft
+            .shutdown()
+            .await
+            .map_err(|e| SchedulerError::Raft(format!("Shutdown failed: {}", e)))?;
         info!("Raft coordinator shut down");
         Ok(())
     }

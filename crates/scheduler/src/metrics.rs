@@ -92,10 +92,7 @@ impl MetricsCollector {
         let registry = Registry::new();
 
         let cpu_gauge = GaugeVec::new(
-            Opts::new(
-                "zlayer_service_cpu_percent",
-                "Average CPU usage percentage",
-            ),
+            Opts::new("zlayer_service_cpu_percent", "Average CPU usage percentage"),
             &["service"],
         )
         .expect("metric creation failed");
@@ -303,7 +300,10 @@ impl MetricsSource for MockMetricsSource {
     async fn collect(&self, service_name: &str) -> Result<Vec<ServiceMetrics>> {
         let map = self.metrics.read().await;
         map.get(service_name).cloned().ok_or_else(|| {
-            SchedulerError::MetricsCollection(format!("No mock metrics for service: {}", service_name))
+            SchedulerError::MetricsCollection(format!(
+                "No mock metrics for service: {}",
+                service_name
+            ))
         })
     }
 
@@ -387,7 +387,7 @@ mod tests {
     fn test_service_metrics_memory_percent() {
         let metrics = ServiceMetrics {
             cpu_percent: 50.0,
-            memory_bytes: 512 * 1024 * 1024, // 512MB
+            memory_bytes: 512 * 1024 * 1024,  // 512MB
             memory_limit: 1024 * 1024 * 1024, // 1GB
             rps: None,
             timestamp: Some(Instant::now()),

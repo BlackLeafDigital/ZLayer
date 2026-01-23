@@ -81,9 +81,8 @@ pub fn build_router(config: &ApiConfig) -> Router {
 
     // Add Swagger UI if enabled
     if config.swagger_enabled {
-        router = router.merge(
-            SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()),
-        );
+        router = router
+            .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()));
     }
 
     router

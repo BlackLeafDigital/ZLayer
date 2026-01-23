@@ -187,9 +187,8 @@ impl ContainerdRuntime {
             .map_err(|e| AgentError::InvalidSpec(format!("failed to build user: {}", e)))?;
 
         // Build environment variables
-        let mut env: Vec<String> = vec![
-            "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
-        ];
+        let mut env: Vec<String> =
+            vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()];
         for (key, value) in &spec.env {
             env.push(format!("{}={}", key, value));
         }
@@ -300,12 +299,13 @@ impl ContainerdRuntime {
 
         let request = with_namespace!(request, self.config.namespace.as_str());
 
-        let response = client.mounts(request).await.map_err(|e| {
-            AgentError::NotFound {
+        let response = client
+            .mounts(request)
+            .await
+            .map_err(|e| AgentError::NotFound {
                 container: snapshot_key.to_string(),
                 reason: format!("failed to get snapshot mounts: {}", e),
-            }
-        })?;
+            })?;
 
         Ok(response.into_inner().mounts)
     }
@@ -315,10 +315,10 @@ impl ContainerdRuntime {
         // containerd task status values
         // 0 = Unknown, 1 = Created, 2 = Running, 3 = Stopped, 4 = Paused, 5 = Pausing
         match status {
-            1 => ContainerState::Pending, // Created
-            2 => ContainerState::Running, // Running
+            1 => ContainerState::Pending,            // Created
+            2 => ContainerState::Running,            // Running
             3 => ContainerState::Exited { code: 0 }, // Stopped (exit code not available here)
-            4 | 5 => ContainerState::Stopping, // Paused/Pausing
+            4 | 5 => ContainerState::Stopping,       // Paused/Pausing
             _ => ContainerState::Failed {
                 reason: format!("unknown status: {}", status),
             },
@@ -333,22 +333,22 @@ fn parse_memory_string(s: &str) -> std::result::Result<u64, String> {
         return Err("empty memory string".to_string());
     }
 
-    let (num_str, suffix) = if s.ends_with("Ki") {
-        (&s[..s.len() - 2], 1024u64)
-    } else if s.ends_with("Mi") {
-        (&s[..s.len() - 2], 1024u64 * 1024)
-    } else if s.ends_with("Gi") {
-        (&s[..s.len() - 2], 1024u64 * 1024 * 1024)
-    } else if s.ends_with("Ti") {
-        (&s[..s.len() - 2], 1024u64 * 1024 * 1024 * 1024)
-    } else if s.ends_with('K') || s.ends_with('k') {
-        (&s[..s.len() - 1], 1000u64)
-    } else if s.ends_with('M') || s.ends_with('m') {
-        (&s[..s.len() - 1], 1000u64 * 1000)
-    } else if s.ends_with('G') || s.ends_with('g') {
-        (&s[..s.len() - 1], 1000u64 * 1000 * 1000)
-    } else if s.ends_with('T') || s.ends_with('t') {
-        (&s[..s.len() - 1], 1000u64 * 1000 * 1000 * 1000)
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix("Ki") {
+        (n, 1024u64)
+    } else if let Some(n) = s.strip_suffix("Mi") {
+        (n, 1024u64 * 1024)
+    } else if let Some(n) = s.strip_suffix("Gi") {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("Ti") {
+        (n, 1024u64 * 1024 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix('K').or_else(|| s.strip_suffix('k')) {
+        (n, 1000u64)
+    } else if let Some(n) = s.strip_suffix('M').or_else(|| s.strip_suffix('m')) {
+        (n, 1000u64 * 1000)
+    } else if let Some(n) = s.strip_suffix('G').or_else(|| s.strip_suffix('g')) {
+        (n, 1000u64 * 1000 * 1000)
+    } else if let Some(n) = s.strip_suffix('T').or_else(|| s.strip_suffix('t')) {
+        (n, 1000u64 * 1000 * 1000 * 1000)
     } else {
         (s, 1u64)
     };
@@ -357,7 +357,7 @@ fn parse_memory_string(s: &str) -> std::result::Result<u64, String> {
         .parse()
         .map_err(|e| format!("invalid number: {}", e))?;
 
-    Ok(num * suffix)
+    Ok(num * multiplier)
 }
 
 #[async_trait::async_trait]
@@ -508,12 +508,12 @@ impl Runtime for ContainerdRuntime {
         // Get container info
         let (stdout_path, stderr_path, snapshot_key) = {
             let containers = self.containers.read().await;
-            let info = containers.get(&container_id).ok_or_else(|| {
-                AgentError::NotFound {
+            let info = containers
+                .get(&container_id)
+                .ok_or_else(|| AgentError::NotFound {
                     container: container_id.clone(),
                     reason: "container not found in local state".to_string(),
-                }
-            })?;
+                })?;
             (
                 info.stdout_path.clone(),
                 info.stderr_path.clone(),
@@ -771,12 +771,12 @@ impl Runtime for ContainerdRuntime {
         // Get paths from local state
         let (stdout_path, stderr_path) = {
             let containers = self.containers.read().await;
-            let info = containers.get(&container_id).ok_or_else(|| {
-                AgentError::NotFound {
+            let info = containers
+                .get(&container_id)
+                .ok_or_else(|| AgentError::NotFound {
                     container: container_id.clone(),
                     reason: "container not found in local state".to_string(),
-                }
-            })?;
+                })?;
             (info.stdout_path.clone(), info.stderr_path.clone())
         };
 
@@ -887,12 +887,13 @@ impl Runtime for ContainerdRuntime {
 
         let exec_request = with_namespace!(exec_request, self.config.namespace.as_str());
 
-        tasks_client.exec(exec_request).await.map_err(|e| {
-            AgentError::CreateFailed {
+        tasks_client
+            .exec(exec_request)
+            .await
+            .map_err(|e| AgentError::CreateFailed {
                 id: exec_id.clone(),
                 reason: format!("failed to create exec: {}", e),
-            }
-        })?;
+            })?;
 
         // Start exec process
         let start_request = StartRequest {
@@ -902,12 +903,13 @@ impl Runtime for ContainerdRuntime {
 
         let start_request = with_namespace!(start_request, self.config.namespace.as_str());
 
-        tasks_client.start(start_request).await.map_err(|e| {
-            AgentError::StartFailed {
+        tasks_client
+            .start(start_request)
+            .await
+            .map_err(|e| AgentError::StartFailed {
                 id: exec_id.clone(),
                 reason: format!("failed to start exec: {}", e),
-            }
-        })?;
+            })?;
 
         // Wait for exec to complete
         let wait_request = WaitRequest {
@@ -917,12 +919,14 @@ impl Runtime for ContainerdRuntime {
 
         let wait_request = with_namespace!(wait_request, self.config.namespace.as_str());
 
-        let wait_response = tasks_client.wait(wait_request).await.map_err(|e| {
-            AgentError::StartFailed {
-                id: exec_id.clone(),
-                reason: format!("failed to wait for exec: {}", e),
-            }
-        })?;
+        let wait_response =
+            tasks_client
+                .wait(wait_request)
+                .await
+                .map_err(|e| AgentError::StartFailed {
+                    id: exec_id.clone(),
+                    reason: format!("failed to wait for exec: {}", e),
+                })?;
 
         let exit_status = wait_response.into_inner().exit_status as i32;
 
@@ -990,10 +994,16 @@ mod tests {
     fn test_containerd_config_default() {
         let config = ContainerdConfig::default();
 
-        assert_eq!(config.socket_path, PathBuf::from("/run/containerd/containerd.sock"));
+        assert_eq!(
+            config.socket_path,
+            PathBuf::from("/run/containerd/containerd.sock")
+        );
         assert_eq!(config.namespace, "zlayer");
         assert_eq!(config.snapshotter, "overlayfs");
-        assert_eq!(config.state_dir, PathBuf::from("/var/lib/zlayer/containers"));
+        assert_eq!(
+            config.state_dir,
+            PathBuf::from("/var/lib/zlayer/containers")
+        );
         assert_eq!(config.runtime, "io.containerd.runc.v2");
     }
 
@@ -1035,7 +1045,10 @@ mod tests {
         let container_id = format!("{}-{}", id.service, id.replica);
         let state_dir = config.state_dir.join(&container_id);
 
-        assert_eq!(state_dir, PathBuf::from("/var/lib/zlayer/containers/myapp-3"));
+        assert_eq!(
+            state_dir,
+            PathBuf::from("/var/lib/zlayer/containers/myapp-3")
+        );
     }
 
     /// Test that ContainerdRuntime::new() returns an error when containerd is unavailable
@@ -1051,7 +1064,10 @@ mod tests {
         let result = ContainerdRuntime::new(config).await;
 
         // Should fail because containerd is not available at that socket
-        assert!(result.is_err(), "Expected error when containerd unavailable");
+        assert!(
+            result.is_err(),
+            "Expected error when containerd unavailable"
+        );
 
         match result {
             Err(AgentError::CreateFailed { id, reason }) => {
@@ -1102,7 +1118,10 @@ mod tests {
         assert_eq!(parse_memory_string("1Ki").unwrap(), 1024);
         assert_eq!(parse_memory_string("1Mi").unwrap(), 1024 * 1024);
         assert_eq!(parse_memory_string("1Gi").unwrap(), 1024 * 1024 * 1024);
-        assert_eq!(parse_memory_string("1Ti").unwrap(), 1024u64 * 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_memory_string("1Ti").unwrap(),
+            1024u64 * 1024 * 1024 * 1024
+        );
 
         // Decimal units (SI)
         assert_eq!(parse_memory_string("1K").unwrap(), 1000);
@@ -1111,8 +1130,14 @@ mod tests {
         assert_eq!(parse_memory_string("1m").unwrap(), 1000 * 1000);
         assert_eq!(parse_memory_string("1G").unwrap(), 1000 * 1000 * 1000);
         assert_eq!(parse_memory_string("1g").unwrap(), 1000 * 1000 * 1000);
-        assert_eq!(parse_memory_string("1T").unwrap(), 1000u64 * 1000 * 1000 * 1000);
-        assert_eq!(parse_memory_string("1t").unwrap(), 1000u64 * 1000 * 1000 * 1000);
+        assert_eq!(
+            parse_memory_string("1T").unwrap(),
+            1000u64 * 1000 * 1000 * 1000
+        );
+        assert_eq!(
+            parse_memory_string("1t").unwrap(),
+            1000u64 * 1000 * 1000 * 1000
+        );
 
         // No suffix (bytes)
         assert_eq!(parse_memory_string("1234567890").unwrap(), 1234567890);

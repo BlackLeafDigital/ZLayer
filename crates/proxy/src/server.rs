@@ -101,12 +101,12 @@ impl ProxyServer {
     /// Run the HTTP server
     pub async fn run(&self) -> Result<()> {
         let addr = self.config.server.http_addr;
-        let listener = TcpListener::bind(addr).await.map_err(|e| {
-            ProxyError::BindFailed {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| ProxyError::BindFailed {
                 addr,
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         info!(addr = %addr, "HTTP proxy server listening");
 
@@ -115,12 +115,12 @@ impl ProxyServer {
 
     /// Run the server on a specific address
     pub async fn run_on(&self, addr: SocketAddr) -> Result<()> {
-        let listener = TcpListener::bind(addr).await.map_err(|e| {
-            ProxyError::BindFailed {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| ProxyError::BindFailed {
                 addr,
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         info!(addr = %addr, "HTTP proxy server listening");
 
@@ -211,17 +211,18 @@ impl ProxyServer {
     ///
     /// This requires TLS to be configured when creating the ProxyServer.
     pub async fn run_https(&self) -> Result<()> {
-        let acceptor = self.tls_acceptor.as_ref().ok_or_else(|| {
-            ProxyError::Config("TLS not configured".to_string())
-        })?;
+        let acceptor = self
+            .tls_acceptor
+            .as_ref()
+            .ok_or_else(|| ProxyError::Config("TLS not configured".to_string()))?;
 
         let addr = self.config.server.https_addr;
-        let listener = TcpListener::bind(addr).await.map_err(|e| {
-            ProxyError::BindFailed {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| ProxyError::BindFailed {
                 addr,
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         info!(addr = %addr, "HTTPS proxy server listening");
 
@@ -230,16 +231,17 @@ impl ProxyServer {
 
     /// Run the HTTPS server on a specific address
     pub async fn run_https_on(&self, addr: SocketAddr) -> Result<()> {
-        let acceptor = self.tls_acceptor.as_ref().ok_or_else(|| {
-            ProxyError::Config("TLS not configured".to_string())
-        })?;
+        let acceptor = self
+            .tls_acceptor
+            .as_ref()
+            .ok_or_else(|| ProxyError::Config("TLS not configured".to_string()))?;
 
-        let listener = TcpListener::bind(addr).await.map_err(|e| {
-            ProxyError::BindFailed {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| ProxyError::BindFailed {
                 addr,
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         info!(addr = %addr, "HTTPS proxy server listening");
 
@@ -253,23 +255,26 @@ impl ProxyServer {
         let http_addr = self.config.server.http_addr;
         let https_addr = self.config.server.https_addr;
 
-        let acceptor = self.tls_acceptor.as_ref().ok_or_else(|| {
-            ProxyError::Config("TLS not configured".to_string())
-        })?;
+        let acceptor = self
+            .tls_acceptor
+            .as_ref()
+            .ok_or_else(|| ProxyError::Config("TLS not configured".to_string()))?;
 
-        let http_listener = TcpListener::bind(http_addr).await.map_err(|e| {
-            ProxyError::BindFailed {
-                addr: http_addr,
-                reason: e.to_string(),
-            }
-        })?;
+        let http_listener =
+            TcpListener::bind(http_addr)
+                .await
+                .map_err(|e| ProxyError::BindFailed {
+                    addr: http_addr,
+                    reason: e.to_string(),
+                })?;
 
-        let https_listener = TcpListener::bind(https_addr).await.map_err(|e| {
-            ProxyError::BindFailed {
-                addr: https_addr,
-                reason: e.to_string(),
-            }
-        })?;
+        let https_listener =
+            TcpListener::bind(https_addr)
+                .await
+                .map_err(|e| ProxyError::BindFailed {
+                    addr: https_addr,
+                    reason: e.to_string(),
+                })?;
 
         info!(http = %http_addr, https = %https_addr, "Proxy server listening");
 
@@ -339,9 +344,10 @@ impl ProxyServer {
         acceptor: TlsAcceptor,
     ) -> Result<()> {
         // Perform TLS handshake
-        let tls_stream = acceptor.accept(stream).await.map_err(|e| {
-            ProxyError::Tls(format!("TLS handshake failed: {}", e))
-        })?;
+        let tls_stream = acceptor
+            .accept(stream)
+            .await
+            .map_err(|e| ProxyError::Tls(format!("TLS handshake failed: {}", e)))?;
 
         let io = TokioIo::new(tls_stream);
 
@@ -530,11 +536,8 @@ mod tests {
         let lb = router.get_or_create_lb("test-service").await;
         lb.add_backend(Backend::new("127.0.0.1:8081".parse().unwrap()))
             .await;
-        lb.update_health(
-            "127.0.0.1:8081".parse().unwrap(),
-            HealthStatus::Healthy,
-        )
-        .await;
+        lb.update_health("127.0.0.1:8081".parse().unwrap(), HealthStatus::Healthy)
+            .await;
 
         let server = ProxyServerBuilder::new().router(router).build();
 

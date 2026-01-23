@@ -87,10 +87,7 @@ where
 ///
 /// This is a higher-level function that takes OnUpgrade futures from hyper
 /// and handles the bidirectional copying between them.
-pub async fn proxy_upgrade(
-    client_upgrade: OnUpgrade,
-    server_upgrade: OnUpgrade,
-) -> Result<()> {
+pub async fn proxy_upgrade(client_upgrade: OnUpgrade, server_upgrade: OnUpgrade) -> Result<()> {
     // Wait for both upgrades to complete
     let (client_result, server_result) = tokio::join!(client_upgrade, server_upgrade);
 
@@ -144,10 +141,7 @@ pub fn is_websocket_header(name: &str) -> bool {
 }
 
 /// Copy upgrade-related headers from source to destination request parts
-pub fn copy_upgrade_headers(
-    src: &http::request::Parts,
-    dst: &mut http::request::Parts,
-) {
+pub fn copy_upgrade_headers(src: &http::request::Parts, dst: &mut http::request::Parts) {
     // Copy Connection and Upgrade headers
     if let Some(conn) = src.headers.get(header::CONNECTION) {
         dst.headers.insert(header::CONNECTION, conn.clone());
@@ -267,10 +261,7 @@ mod tests {
             .unwrap();
         assert!(is_upgrade_response(&res));
 
-        let res = Response::builder()
-            .status(StatusCode::OK)
-            .body(())
-            .unwrap();
+        let res = Response::builder().status(StatusCode::OK).body(()).unwrap();
         assert!(!is_upgrade_response(&res));
     }
 
@@ -280,10 +271,7 @@ mod tests {
             .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
             .body(())
             .unwrap();
-        assert_eq!(
-            get_websocket_key(&req),
-            Some("dGhlIHNhbXBsZSBub25jZQ==")
-        );
+        assert_eq!(get_websocket_key(&req), Some("dGhlIHNhbXBsZSBub25jZQ=="));
 
         let req = Request::builder().body(()).unwrap();
         assert_eq!(get_websocket_key(&req), None);
@@ -322,11 +310,7 @@ mod tests {
             .into_parts()
             .0;
 
-        let mut dst = Request::builder()
-            .body(())
-            .unwrap()
-            .into_parts()
-            .0;
+        let mut dst = Request::builder().body(()).unwrap().into_parts().0;
 
         copy_upgrade_headers(&src, &mut dst);
 

@@ -37,9 +37,10 @@ impl BlobCache {
     /// Get a blob by digest
     pub fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, CacheError> {
         validate_digest(digest)?;
-        let blobs = self.blobs.read().map_err(|e| {
-            CacheError::Database(format!("failed to acquire read lock: {}", e))
-        })?;
+        let blobs = self
+            .blobs
+            .read()
+            .map_err(|e| CacheError::Database(format!("failed to acquire read lock: {}", e)))?;
         Ok(blobs.get(digest).cloned())
     }
 
@@ -72,36 +73,40 @@ impl BlobCache {
     /// Check if a blob exists in the cache
     pub fn contains(&self, digest: &str) -> Result<bool, CacheError> {
         validate_digest(digest)?;
-        let blobs = self.blobs.read().map_err(|e| {
-            CacheError::Database(format!("failed to acquire read lock: {}", e))
-        })?;
+        let blobs = self
+            .blobs
+            .read()
+            .map_err(|e| CacheError::Database(format!("failed to acquire read lock: {}", e)))?;
         Ok(blobs.contains_key(digest))
     }
 
     /// Delete a blob from the cache
     pub fn delete(&self, digest: &str) -> Result<(), CacheError> {
         validate_digest(digest)?;
-        let mut blobs = self.blobs.write().map_err(|e| {
-            CacheError::Database(format!("failed to acquire write lock: {}", e))
-        })?;
+        let mut blobs = self
+            .blobs
+            .write()
+            .map_err(|e| CacheError::Database(format!("failed to acquire write lock: {}", e)))?;
         blobs.remove(digest);
         Ok(())
     }
 
     /// Get current cache size in bytes
     pub fn size(&self) -> Result<u64, CacheError> {
-        let blobs = self.blobs.read().map_err(|e| {
-            CacheError::Database(format!("failed to acquire read lock: {}", e))
-        })?;
+        let blobs = self
+            .blobs
+            .read()
+            .map_err(|e| CacheError::Database(format!("failed to acquire read lock: {}", e)))?;
         let size = blobs.values().map(|v| v.len() as u64).sum();
         Ok(size)
     }
 
     /// Clear all blobs from the cache
     pub fn clear(&self) -> Result<(), CacheError> {
-        let mut blobs = self.blobs.write().map_err(|e| {
-            CacheError::Database(format!("failed to acquire write lock: {}", e))
-        })?;
+        let mut blobs = self
+            .blobs
+            .write()
+            .map_err(|e| CacheError::Database(format!("failed to acquire write lock: {}", e)))?;
         blobs.clear();
         Ok(())
     }
@@ -174,7 +179,10 @@ mod tests {
 
     #[test]
     fn test_validate_digest() {
-        assert!(validate_digest("sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef").is_ok());
+        assert!(validate_digest(
+            "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+        )
+        .is_ok());
         assert!(validate_digest("md5:123456").is_err());
         assert!(validate_digest("sha256:123").is_err());
     }

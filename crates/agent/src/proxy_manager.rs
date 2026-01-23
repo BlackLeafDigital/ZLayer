@@ -240,12 +240,7 @@ impl ProxyManager {
     }
 
     /// Update the health status of a backend
-    pub async fn update_backend_health(
-        &self,
-        service: &str,
-        addr: SocketAddr,
-        healthy: bool,
-    ) {
+    pub async fn update_backend_health(&self, service: &str, addr: SocketAddr, healthy: bool) {
         if let Some(lb) = self.router.get_lb(service).await {
             let status = if healthy {
                 HealthStatus::Healthy

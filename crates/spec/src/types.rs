@@ -24,11 +24,9 @@ mod duration {
         use serde::de::Error;
         let s: Option<String> = Option::deserialize(deserializer)?;
         match s {
-            Some(s) => {
-                humantime::parse_duration(&s)
-                    .map(Some)
-                    .map_err(|e| D::Error::custom(format!("invalid duration: {}", e)))
-            }
+            Some(s) => humantime::parse_duration(&s)
+                .map(Some)
+                .map_err(|e| D::Error::custom(format!("invalid duration: {}", e))),
             None => Ok(None),
         }
     }
@@ -185,6 +183,7 @@ pub struct ResourcesSpec {
 /// Network configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct NetworkSpec {
     /// Overlay network configuration
     #[serde(default)]
@@ -193,15 +192,6 @@ pub struct NetworkSpec {
     /// Join policy (who can join this service)
     #[serde(default)]
     pub join: JoinPolicy,
-}
-
-impl Default for NetworkSpec {
-    fn default() -> Self {
-        Self {
-            overlays: Default::default(),
-            join: Default::default(),
-        }
-    }
 }
 
 /// Overlay network configuration
@@ -402,6 +392,7 @@ impl Default for ScaleSpec {
 /// Target metrics for adaptive scaling
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct ScaleTargets {
     /// CPU percentage threshold (0-100)
     #[serde(default)]
@@ -414,16 +405,6 @@ pub struct ScaleTargets {
     /// Requests per second threshold
     #[serde(default)]
     pub rps: Option<u32>,
-}
-
-impl Default for ScaleTargets {
-    fn default() -> Self {
-        Self {
-            cpu: None,
-            memory: None,
-            rps: None,
-        }
-    }
 }
 
 /// Dependency specification
@@ -540,16 +521,11 @@ fn default_expect_status() -> u16 {
 /// Init actions specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct InitSpec {
     /// Init steps to run before container starts
     #[serde(default)]
     pub steps: Vec<InitStep>,
-}
-
-impl Default for InitSpec {
-    fn default() -> Self {
-        Self { steps: Vec::new() }
-    }
 }
 
 /// Init action step
@@ -598,6 +574,7 @@ pub enum FailureAction {
 /// Error handling policies
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[derive(Default)]
 pub struct ErrorsSpec {
     /// Init failure policy
     #[serde(default)]
@@ -606,15 +583,6 @@ pub struct ErrorsSpec {
     /// Panic/restart policy
     #[serde(default)]
     pub on_panic: PanicPolicy,
-}
-
-impl Default for ErrorsSpec {
-    fn default() -> Self {
-        Self {
-            on_init_failure: Default::default(),
-            on_panic: Default::default(),
-        }
-    }
 }
 
 /// Init failure policy

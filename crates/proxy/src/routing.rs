@@ -95,10 +95,7 @@ impl Route {
         // Must match prefix exactly or with trailing slash
         normalized_path.starts_with(normalized_prefix)
             && (normalized_path.len() == normalized_prefix.len()
-                || normalized_path
-                    .chars()
-                    .nth(normalized_prefix.len())
-                    .map_or(false, |c| c == '/'))
+                || (normalized_path.chars().nth(normalized_prefix.len()) == Some('/')))
     }
 
     /// Transform the path based on route configuration
@@ -108,8 +105,7 @@ impl Route {
         }
 
         let normalized_prefix = self.path_prefix.trim_end_matches('/');
-        if path.starts_with(normalized_prefix) {
-            let remainder = &path[normalized_prefix.len()..];
+        if let Some(remainder) = path.strip_prefix(normalized_prefix) {
             if remainder.is_empty() {
                 "/".to_string()
             } else {

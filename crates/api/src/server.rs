@@ -87,8 +87,10 @@ mod tests {
 
     #[test]
     fn test_server_custom_bind() {
-        let mut config = ApiConfig::default();
-        config.bind = "127.0.0.1:9090".parse().unwrap();
+        let config = ApiConfig {
+            bind: "127.0.0.1:9090".parse().unwrap(),
+            ..Default::default()
+        };
         let server = ApiServer::new(config);
         assert_eq!(server.bind_addr(), "127.0.0.1:9090".parse().unwrap());
     }

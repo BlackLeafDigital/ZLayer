@@ -56,9 +56,9 @@ impl RateLimitState {
 
     pub fn disabled() -> Self {
         Self {
-            limiter: Arc::new(RateLimiter::direct(
-                Quota::per_second(NonZeroU32::new(u32::MAX).unwrap()),
-            )),
+            limiter: Arc::new(RateLimiter::direct(Quota::per_second(
+                NonZeroU32::new(u32::MAX).unwrap(),
+            ))),
             enabled: false,
         }
     }

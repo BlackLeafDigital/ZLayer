@@ -5,7 +5,6 @@
 
 use crate::error::{AgentError, Result};
 use spec::ServiceSpec;
-use std::path::PathBuf;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -56,11 +55,7 @@ pub trait Runtime: Send + Sync {
     async fn pull_image(&self, image: &str) -> Result<()>;
 
     /// Create a container
-    async fn create_container(
-        &self,
-        id: &ContainerId,
-        spec: &ServiceSpec,
-    ) -> Result<()>;
+    async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()>;
 
     /// Start a container
     async fn start_container(&self, id: &ContainerId) -> Result<()>;
