@@ -7,6 +7,8 @@ use crate::error::{AgentError, Result};
 use crate::runtime::{ContainerId, ContainerState, Runtime};
 use containerd_client::services::v1::container::Runtime as ContainerRuntime;
 use containerd_client::services::v1::containers_client::ContainersClient;
+use containerd_client::services::v1::content_client::ContentClient;
+use containerd_client::services::v1::images_client::ImagesClient;
 use containerd_client::services::v1::snapshots::snapshots_client::SnapshotsClient;
 use containerd_client::services::v1::snapshots::{
     MountsRequest, PrepareSnapshotRequest, RemoveSnapshotRequest,
@@ -15,8 +17,9 @@ use containerd_client::services::v1::tasks_client::TasksClient;
 use containerd_client::services::v1::transfer_client::TransferClient;
 use containerd_client::services::v1::{
     Container, CreateContainerRequest, CreateTaskRequest, DeleteContainerRequest,
-    DeleteTaskRequest, ExecProcessRequest, GetContainerRequest, GetRequest as GetTaskRequest,
-    KillRequest, StartRequest, TransferRequest, WaitRequest,
+    DeleteTaskRequest, ExecProcessRequest, GetContainerRequest, GetImageRequest,
+    GetRequest as GetTaskRequest, KillRequest, ReadContentRequest, StartRequest, TransferRequest,
+    WaitRequest,
 };
 use containerd_client::types::transfer::{ImageStore, OciRegistry, UnpackConfiguration};
 use containerd_client::types::{Mount, Platform};
@@ -26,6 +29,7 @@ use oci_spec::runtime::{
     SpecBuilder, UserBuilder,
 };
 use spec::ServiceSpec;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -324,6 +328,126 @@ impl ContainerdRuntime {
             },
         }
     }
+
+    /// Get the chain ID (rootfs snapshot parent) for an image
+    async fn get_image_chain_id(&self, image: &str) -> Result<String> {
+        // 1. Get image metadata
+        let mut images_client = ImagesClient::new(self.channel.clone());
+        let get_req = with_namespace!(
+            GetImageRequest {
+                name: image.to_string()
+            },
+            self.config.namespace.as_str()
+        );
+        let image_resp = images_client.get(get_req).await.map_err(|e| {
+            AgentError::CreateFailed {
+                id: image.to_string(),
+                reason: format!("failed to get image: {}", e),
+            }
+        })?;
+
+        let img = image_resp
+            .into_inner()
+            .image
+            .ok_or_else(|| AgentError::CreateFailed {
+                id: image.to_string(),
+                reason: "image not found".to_string(),
+            })?;
+
+        let manifest_digest = img
+            .target
+            .ok_or_else(|| AgentError::CreateFailed {
+                id: image.to_string(),
+                reason: "image has no target".to_string(),
+            })?
+            .digest;
+
+        // 2. Read manifest to get config digest
+        let mut content_client = ContentClient::new(self.channel.clone());
+        let manifest_req = with_namespace!(
+            ReadContentRequest {
+                digest: manifest_digest,
+                offset: 0,
+                size: 0,
+            },
+            self.config.namespace.as_str()
+        );
+
+        let manifest_stream = content_client.read(manifest_req).await.map_err(|e| {
+            AgentError::CreateFailed {
+                id: image.to_string(),
+                reason: format!("failed to read manifest: {}", e),
+            }
+        })?;
+
+        let mut manifest_bytes = Vec::new();
+        let mut stream = manifest_stream.into_inner();
+        while let Some(chunk) = stream.message().await.map_err(|e| AgentError::CreateFailed {
+            id: image.to_string(),
+            reason: format!("failed to read manifest chunk: {}", e),
+        })? {
+            manifest_bytes.extend_from_slice(&chunk.data);
+        }
+
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_bytes).map_err(|e| AgentError::CreateFailed {
+                id: image.to_string(),
+                reason: format!("failed to parse manifest: {}", e),
+            })?;
+
+        let config_digest = manifest["config"]["digest"]
+            .as_str()
+            .ok_or_else(|| AgentError::CreateFailed {
+                id: image.to_string(),
+                reason: "manifest has no config digest".to_string(),
+            })?
+            .to_string();
+
+        // 3. Read config to get diff_ids
+        let config_req = with_namespace!(
+            ReadContentRequest {
+                digest: config_digest,
+                offset: 0,
+                size: 0,
+            },
+            self.config.namespace.as_str()
+        );
+
+        let config_stream = content_client.read(config_req).await.map_err(|e| {
+            AgentError::CreateFailed {
+                id: image.to_string(),
+                reason: format!("failed to read config: {}", e),
+            }
+        })?;
+
+        let mut config_bytes = Vec::new();
+        let mut stream = config_stream.into_inner();
+        while let Some(chunk) = stream.message().await.map_err(|e| AgentError::CreateFailed {
+            id: image.to_string(),
+            reason: format!("failed to read config chunk: {}", e),
+        })? {
+            config_bytes.extend_from_slice(&chunk.data);
+        }
+
+        let config: serde_json::Value =
+            serde_json::from_slice(&config_bytes).map_err(|e| AgentError::CreateFailed {
+                id: image.to_string(),
+                reason: format!("failed to parse config: {}", e),
+            })?;
+
+        let diff_ids: Vec<String> = config["rootfs"]["diff_ids"]
+            .as_array()
+            .ok_or_else(|| AgentError::CreateFailed {
+                id: image.to_string(),
+                reason: "config has no diff_ids".to_string(),
+            })?
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+
+        // 4. Compute chain ID
+        Ok(compute_chain_id(&diff_ids))
+    }
 }
 
 /// Parse memory string like "512Mi", "1Gi" to bytes
@@ -358,6 +482,23 @@ fn parse_memory_string(s: &str) -> std::result::Result<u64, String> {
         .map_err(|e| format!("invalid number: {}", e))?;
 
     Ok(num * multiplier)
+}
+
+/// Compute the chain ID from diff IDs (OCI image spec algorithm)
+fn compute_chain_id(diff_ids: &[String]) -> String {
+    let mut chain_id = String::new();
+    for diff_id in diff_ids {
+        if chain_id.is_empty() {
+            chain_id = diff_id.clone();
+        } else {
+            let input = format!("{} {}", chain_id, diff_id);
+            let mut hasher = Sha256::new();
+            hasher.update(input.as_bytes());
+            let result = hasher.finalize();
+            chain_id = format!("sha256:{:x}", result);
+        }
+    }
+    chain_id
 }
 
 #[async_trait::async_trait]
@@ -431,12 +572,14 @@ impl Runtime for ContainerdRuntime {
         // First, prepare a snapshot from the image
         let mut snapshots_client = SnapshotsClient::new(self.channel.clone());
 
-        // Get the image's chain ID for the snapshot parent
-        // For simplicity, we use the image name as the parent (containerd resolves this)
+        // Get the image's chain ID for snapshot parent
+        let chain_id = self.get_image_chain_id(image).await?;
+
+        // Prepare snapshot with correct parent
         let prepare_request = PrepareSnapshotRequest {
             snapshotter: self.config.snapshotter.clone(),
             key: snapshot_key.clone(),
-            parent: image.clone(),
+            parent: chain_id,
             labels: HashMap::new(),
         };
 
