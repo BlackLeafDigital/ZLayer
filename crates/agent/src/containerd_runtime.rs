@@ -70,11 +70,19 @@ pub struct ContainerdConfig {
 impl Default for ContainerdConfig {
     fn default() -> Self {
         Self {
-            socket_path: PathBuf::from(DEFAULT_SOCKET_PATH),
-            namespace: DEFAULT_NAMESPACE.to_string(),
-            snapshotter: DEFAULT_SNAPSHOTTER.to_string(),
-            state_dir: PathBuf::from("/var/lib/zlayer/containers"),
-            runtime: DEFAULT_RUNTIME.to_string(),
+            // Priority: env var > default constant
+            socket_path: std::env::var("CONTAINERD_SOCKET")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET_PATH)),
+            namespace: std::env::var("ZLAYER_NAMESPACE")
+                .unwrap_or_else(|_| DEFAULT_NAMESPACE.to_string()),
+            snapshotter: std::env::var("ZLAYER_SNAPSHOTTER")
+                .unwrap_or_else(|_| DEFAULT_SNAPSHOTTER.to_string()),
+            state_dir: std::env::var("ZLAYER_STATE_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/var/lib/zlayer/containers")),
+            runtime: std::env::var("ZLAYER_RUNTIME")
+                .unwrap_or_else(|_| DEFAULT_RUNTIME.to_string()),
         }
     }
 }
@@ -403,13 +411,98 @@ impl ContainerdRuntime {
                 reason: format!("failed to parse manifest: {}", e),
             })?;
 
-        let config_digest = manifest["config"]["digest"]
-            .as_str()
-            .ok_or_else(|| AgentError::CreateFailed {
-                id: image.to_string(),
-                reason: "manifest has no config digest".to_string(),
-            })?
-            .to_string();
+        // Check if this is a manifest index (multi-platform image)
+        let config_digest =
+            if manifest.get("manifests").is_some() {
+                // This is a manifest index - find the manifest for our platform
+                let target_arch = match std::env::consts::ARCH {
+                    "x86_64" => "amd64",
+                    "aarch64" => "arm64",
+                    arch => arch,
+                };
+
+                let manifests =
+                    manifest["manifests"]
+                        .as_array()
+                        .ok_or_else(|| AgentError::CreateFailed {
+                            id: image.to_string(),
+                            reason: "manifest index has no manifests array".to_string(),
+                        })?;
+
+                // Find manifest matching our platform
+                let platform_manifest = manifests
+                    .iter()
+                    .find(|m| {
+                        m["platform"]["architecture"].as_str() == Some(target_arch)
+                            && m["platform"]["os"].as_str() == Some("linux")
+                    })
+                    .ok_or_else(|| AgentError::CreateFailed {
+                        id: image.to_string(),
+                        reason: format!("no manifest found for linux/{}", target_arch),
+                    })?;
+
+                let platform_digest = platform_manifest["digest"]
+                    .as_str()
+                    .ok_or_else(|| AgentError::CreateFailed {
+                        id: image.to_string(),
+                        reason: "platform manifest has no digest".to_string(),
+                    })?
+                    .to_string();
+
+                // Read the platform-specific manifest
+                let platform_req = with_namespace!(
+                    ReadContentRequest {
+                        digest: platform_digest,
+                        offset: 0,
+                        size: 0,
+                    },
+                    self.config.namespace.as_str()
+                );
+
+                let platform_stream = content_client.read(platform_req).await.map_err(|e| {
+                    AgentError::CreateFailed {
+                        id: image.to_string(),
+                        reason: format!("failed to read platform manifest: {}", e),
+                    }
+                })?;
+
+                let mut platform_bytes = Vec::new();
+                let mut stream = platform_stream.into_inner();
+                while let Some(chunk) =
+                    stream
+                        .message()
+                        .await
+                        .map_err(|e| AgentError::CreateFailed {
+                            id: image.to_string(),
+                            reason: format!("failed to read platform manifest chunk: {}", e),
+                        })?
+                {
+                    platform_bytes.extend_from_slice(&chunk.data);
+                }
+
+                let platform_manifest: serde_json::Value = serde_json::from_slice(&platform_bytes)
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: image.to_string(),
+                        reason: format!("failed to parse platform manifest: {}", e),
+                    })?;
+
+                platform_manifest["config"]["digest"]
+                    .as_str()
+                    .ok_or_else(|| AgentError::CreateFailed {
+                        id: image.to_string(),
+                        reason: "platform manifest has no config digest".to_string(),
+                    })?
+                    .to_string()
+            } else {
+                // Single-platform manifest - get config directly
+                manifest["config"]["digest"]
+                    .as_str()
+                    .ok_or_else(|| AgentError::CreateFailed {
+                        id: image.to_string(),
+                        reason: "manifest has no config digest".to_string(),
+                    })?
+                    .to_string()
+            };
 
         // 3. Read config to get diff_ids
         let config_req = with_namespace!(
@@ -696,6 +789,47 @@ impl Runtime for ContainerdRuntime {
 
         // Get snapshot mounts
         let mounts = self.get_snapshot_mounts(&snapshot_key).await?;
+
+        // Open FIFOs for reading BEFORE creating task
+        // This prevents the containerd shim from blocking on write-open
+        let stdout_path_clone = stdout_path.clone();
+        let stderr_path_clone = stderr_path.clone();
+
+        // Spawn readers that will consume the FIFO output
+        // Open in non-blocking mode first to avoid blocking ourselves
+        let _stdout_reader = tokio::spawn(async move {
+            if let Ok(file) = tokio::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&stdout_path_clone)
+                .await
+            {
+                // Just keep the file open to unblock the writer
+                // In production, you'd read and log this
+                let _ = file;
+                // Keep alive until container exits
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+        });
+
+        let _stderr_reader = tokio::spawn(async move {
+            if let Ok(file) = tokio::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&stderr_path_clone)
+                .await
+            {
+                let _ = file;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+        });
+
+        // Give readers a moment to open the FIFOs
+        tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Create task
         let mut tasks_client = TasksClient::new(self.channel.clone());

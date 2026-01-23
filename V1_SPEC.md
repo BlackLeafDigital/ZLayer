@@ -94,6 +94,51 @@ image:
 
 ---
 
+## 5.5. Command Override (Optional)
+
+By default, containers use the image's `ENTRYPOINT` and `CMD` as defined in the Dockerfile/OCI image. The `command` field allows optional overrides following Docker/OCI conventions.
+
+\```yaml
+command:
+  entrypoint: [string]?  # Override image ENTRYPOINT
+  args: [string]?        # Override image CMD
+  workdir: string?       # Override working directory
+\```
+
+### Behavior
+
+| Field | Effect |
+|---|---|
+| `entrypoint` | Replaces the image's `ENTRYPOINT` |
+| `args` | Replaces the image's `CMD` |
+| `workdir` | Replaces the image's `WORKDIR` |
+
+### Semantics
+
+- If **neither** `entrypoint` nor `args` is specified, the image's `ENTRYPOINT` and `CMD` are used unchanged.
+- If **only `args`** is specified, it replaces the image's `CMD` but the image's `ENTRYPOINT` is preserved. The args are passed to the entrypoint.
+- If **only `entrypoint`** is specified, it replaces the image's `ENTRYPOINT` and the image's `CMD` is used as arguments.
+- If **both** are specified, both the image's `ENTRYPOINT` and `CMD` are replaced.
+- `workdir` can be specified independently and does not affect entrypoint/args behavior.
+
+### Example
+
+\```yaml
+# Run a custom script instead of the default entrypoint
+command:
+  entrypoint: ["/bin/sh", "-c"]
+  args: ["python /app/worker.py --mode=background"]
+  workdir: /app
+\```
+
+\```yaml
+# Override just the arguments (entrypoint preserved)
+command:
+  args: ["--config", "/etc/myapp/production.yaml"]
+\```
+
+---
+
 ## 6. Resources (Limits)
 
 Upper bounds, not reservations.
@@ -351,6 +396,94 @@ services:
       targets:
         cpu: 70%
         rps: 800
+\```
+
+---
+
+## 15.5. Example: Service with Command Override
+
+This example shows how `command` overrides work alongside `init` steps. Remember:
+- **Init steps** handle pre-start workflows (database polling, migrations, environment validation) and exit when complete
+- **Command override** controls the main container process that runs after init completes
+
+\```yaml
+services:
+  worker:
+    rtype: service
+    image:
+      name: python:3.12-slim
+      pull_policy: if_not_present
+
+    # Override the default python REPL with a custom worker script
+    command:
+      entrypoint: ["python"]
+      args: ["/app/worker.py", "--queue=high-priority", "--concurrency=4"]
+      workdir: /app
+
+    env:
+      REDIS_URL: $E:REDIS_URL
+      DATABASE_URL: $E:DATABASE_URL
+
+    # Init steps run BEFORE the command, then exit
+    # The container stays healthy because the main process (command) is running
+    init:
+      steps:
+        - id: wait-redis
+          uses: init.wait_tcp
+          with:
+            host: redis.global
+            port: 6379
+          timeout: 60s
+          on_failure: fail
+
+        - id: wait-db
+          uses: init.wait_tcp
+          with:
+            host: db.global
+            port: 5432
+          timeout: 120s
+          on_failure: fail
+
+        - id: run-migrations
+          uses: init.run
+          with:
+            command: python /app/migrate.py --apply
+          timeout: 300s
+          on_failure: fail
+
+    network:
+      overlays:
+        service:
+          enabled: true
+          encrypted: true
+
+    scale:
+      mode: adaptive
+      min: 1
+      max: 20
+      targets:
+        cpu: 80%
+
+  # Example: only override args, keep image entrypoint
+  nginx-custom:
+    rtype: service
+    image:
+      name: nginx:alpine
+      pull_policy: if_not_present
+
+    # nginx image has ENTRYPOINT ["nginx"], just override CMD
+    command:
+      args: ["-g", "daemon off;", "-c", "/etc/nginx/custom.conf"]
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 80
+        expose: public
+
+    scale:
+      mode: fixed
+      replicas: 3
 \```
 
 ---

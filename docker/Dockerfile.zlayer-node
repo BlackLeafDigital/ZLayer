@@ -1,0 +1,58 @@
+# ZLayer Node - Container image with embedded containerd
+# Run ZLayer inside a Docker container (like KIND for Kubernetes)
+#
+# Usage:
+#   docker build -f docker/Dockerfile.zlayer-node -t zlayer-node .
+#   docker run --privileged -d zlayer-node serve
+
+FROM ubuntu:22.04
+
+LABEL org.opencontainers.image.title="ZLayer Node"
+LABEL org.opencontainers.image.description="ZLayer runtime with embedded containerd"
+LABEL org.opencontainers.image.source="https://github.com/ZachHandley/ZLayer"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL maintainer="Zach Handley <zachhandley@gmail.com>"
+
+# Prevent interactive prompts during installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install containerd and networking tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    containerd \
+    runc \
+    iptables \
+    iproute2 \
+    ca-certificates \
+    wireguard-tools \
+    curl \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create containerd config with native snapshotter
+RUN mkdir -p /etc/containerd && \
+    containerd config default > /etc/containerd/config.toml
+
+# Create required directories
+RUN mkdir -p \
+    /run/containerd \
+    /var/lib/containerd \
+    /var/lib/zlayer/containers \
+    /var/lib/zlayer/state
+
+# Copy ZLayer binary (build with: cargo build --release --package runtime)
+COPY target/release/zlayer /usr/local/bin/zlayer
+
+# Copy entrypoint script
+COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# Expose HTTP/HTTPS ports
+EXPOSE 80 443
+
+# Environment variables for configuration
+ENV CONTAINERD_SOCKET=/run/containerd/containerd.sock
+ENV ZLAYER_NAMESPACE=zlayer
+ENV ZLAYER_STATE_DIR=/var/lib/zlayer/containers
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["serve"]

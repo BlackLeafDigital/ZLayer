@@ -221,17 +221,14 @@ jobs:
     needs: test
     # Only run on main branch or explicit trigger (expensive)
     if: github.ref == 'refs/heads/main' || contains(github.event.head_commit.message, '[e2e]')
+    # Run in a privileged container with containerd pre-installed
+    # This isolates containerd from the host and prevents interference with runner's Docker
+    container:
+      image: ghcr.io/zachhandley/baseimages/rust-containerd-alpine:latest
+      options: --privileged
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      - name: Install protobuf compiler
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
@@ -245,38 +242,30 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
-      - name: Install containerd
+      - name: Start containerd
         run: |
-          sudo apt-get update
-          sudo apt-get install -y containerd runc
-
-      - name: Configure containerd
-        run: |
-          sudo mkdir -p /etc/containerd
-          sudo containerd config default | sudo tee /etc/containerd/config.toml
-          sudo systemctl restart containerd
-          sleep 2
-          sudo systemctl status containerd --no-pager
-
-      - name: Verify containerd is running
-        run: |
-          sudo ctr version
-          sudo ctr namespace ls
+          # Start containerd in background (no systemd in containers)
+          containerd &
+          # Wait for socket to be ready
+          timeout=30
+          while [ ! -S /run/containerd/containerd.sock ] && [ $timeout -gt 0 ]; do
+            sleep 1
+            timeout=$((timeout - 1))
+          done
+          # Verify containerd is running
+          ctr version
+          ctr namespace ls
 
       - name: Create test namespace
-        run: |
-          sudo ctr namespace create zlayer-e2e-test || true
+        run: ctr namespace create zlayer-e2e-test || true
 
       - name: Pull test images
         run: |
-          sudo ctr -n zlayer-e2e-test image pull docker.io/library/alpine:latest
-          sudo ctr -n zlayer-e2e-test image pull docker.io/library/nginx:alpine
+          ctr -n zlayer-e2e-test image pull docker.io/library/alpine:latest
+          ctr -n zlayer-e2e-test image pull docker.io/library/nginx:alpine
 
       - name: Run E2E tests
-        run: |
-          # Run with sudo since containerd socket requires root
-          sudo -E env "PATH=$PATH" "CARGO_HOME=$CARGO_HOME" "RUSTUP_HOME=$RUSTUP_HOME" \
-            $(which cargo) test --package agent --test containerd_e2e -- --test-threads=1
+        run: cargo test --package agent --test containerd_e2e -- --test-threads=1
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
@@ -284,9 +273,9 @@ jobs:
       - name: Cleanup test namespace
         if: always()
         run: |
-          sudo ctr -n zlayer-e2e-test containers rm $(sudo ctr -n zlayer-e2e-test containers ls -q) 2>/dev/null || true
-          sudo ctr -n zlayer-e2e-test tasks rm $(sudo ctr -n zlayer-e2e-test tasks ls -q) 2>/dev/null || true
-          sudo ctr namespace remove zlayer-e2e-test 2>/dev/null || true
+          ctr -n zlayer-e2e-test containers rm $(ctr -n zlayer-e2e-test containers ls -q) 2>/dev/null || true
+          ctr -n zlayer-e2e-test tasks rm $(ctr -n zlayer-e2e-test tasks ls -q) 2>/dev/null || true
+          ctr namespace remove zlayer-e2e-test 2>/dev/null || true
 
   # ===========================================
   # Cache Cleanup
