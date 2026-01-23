@@ -26,6 +26,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
         with:
@@ -76,6 +81,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
 
@@ -124,6 +134,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
 
@@ -171,6 +186,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
 
@@ -204,6 +224,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
