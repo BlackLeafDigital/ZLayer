@@ -261,8 +261,8 @@ jobs:
 
       - name: Pull test images
         run: |
-          ctr -n zlayer-e2e-test image pull docker.io/library/alpine:latest
-          ctr -n zlayer-e2e-test image pull docker.io/library/nginx:alpine
+          ctr -n zlayer-e2e-test image pull --snapshotter native docker.io/library/alpine:latest
+          ctr -n zlayer-e2e-test image pull --snapshotter native docker.io/library/nginx:alpine
 
       - name: Run E2E tests
         run: cargo test --package agent --test containerd_e2e -- --test-threads=1
