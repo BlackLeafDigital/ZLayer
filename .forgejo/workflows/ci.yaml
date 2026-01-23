@@ -249,7 +249,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y containerd runc
-          sudo systemctl start containerd
+
+      - name: Configure containerd
+        run: |
+          sudo mkdir -p /etc/containerd
+          sudo containerd config default | sudo tee /etc/containerd/config.toml
+          sudo systemctl restart containerd
+          sleep 2
           sudo systemctl status containerd --no-pager
 
       - name: Verify containerd is running
