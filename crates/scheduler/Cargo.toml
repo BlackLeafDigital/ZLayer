@@ -1,0 +1,42 @@
+[package]
+name = "scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Internal crates
+spec.path = "../spec"
+zlayer-core.path = "../zlayer-core"
+
+# Serialization
+serde.workspace = true
+
+# Async
+async-trait.workspace = true
+tokio.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging/tracing
+tracing.workspace = true
+
+# UUID
+uuid.workspace = true
+
+# Web framework (for raft network layer)
+axum.workspace = true
+
+# Consensus
+openraft.workspace = true
+
+# Metrics
+metrics.workspace = true
+prometheus.workspace = true
+
+# JSON serialization for snapshots
+serde_json.workspace = true

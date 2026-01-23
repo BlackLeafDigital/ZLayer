@@ -1,0 +1,53 @@
+[package]
+name = "api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Internal crates
+spec = { path = "../spec" }
+scheduler = { path = "../scheduler" }
+observability = { path = "../observability" }
+
+# Web framework
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+
+# Authentication
+jsonwebtoken.workspace = true
+
+# Rate limiting
+governor.workspace = true
+tower_governor.workspace = true
+
+# OpenAPI
+utoipa.workspace = true
+utoipa-swagger-ui.workspace = true
+
+# Async
+tokio.workspace = true
+async-trait.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Tracing
+tracing.workspace = true
+
+# Time
+time.workspace = true
+chrono.workspace = true
+
+# UUID
+uuid.workspace = true

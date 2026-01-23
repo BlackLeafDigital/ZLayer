@@ -1,0 +1,44 @@
+[package]
+name = "proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# HTTP server
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = "1.0"
+http-body-util = "0.1"
+bytes = "1"
+
+# TLS
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+tokio-rustls = { workspace = true }
+
+# Middleware
+tower = { workspace = true }
+tower-http = { workspace = true }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+
+# Internal crates
+spec = { path = "../spec" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+tempfile = "3"

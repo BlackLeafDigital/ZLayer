@@ -1,0 +1,196 @@
+[workspace]
+resolver = "2"
+default-members = ["bin/runtime", "tools/devctl"]
+members = [
+  "crates/spec",
+  "crates/zlayer-core",
+  "crates/agent",
+  "crates/proxy",
+  "crates/overlay",
+  "crates/scheduler",
+  "crates/init_actions",
+  "crates/registry",
+  "crates/observability",
+  "crates/api",
+  "bin/runtime",
+  "tools/devctl",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/zachhandley/ZLayer"
+rust-version = "1.78"  # Minimum supported version
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+serde_json = "1"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Async runtime
+tokio = { version = "1.35", features = ["full", "tracing"] }
+
+# Logging/tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
+tracing-appender = "0.2"
+tracing-opentelemetry = "0.28"
+
+# OpenTelemetry
+opentelemetry = "0.27"
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
+
+# Time handling
+chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["serde"] }
+
+# Duration parsing
+humantime = "2"
+
+# HTTP/client
+reqwest = { version = "0.11", features = ["json"] }
+hyper = { version = "1.0", features = ["full", "http2"] }
+hyper-util = { version = "0.1", features = ["full"] }
+
+# TLS
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio-rustls = "0.26"
+
+# Tower middleware
+tower = { version = "0.4", features = ["full"] }
+tower-http = { version = "0.5", features = ["full"] }
+tower-balance = "0.4"
+
+# Web framework (for API)
+axum = { version = "0.7", features = ["macros", "ws"] }
+
+# JWT Authentication
+jsonwebtoken = "9"
+
+# OpenAPI documentation
+utoipa = { version = "5", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "8", features = ["axum"] }
+
+# Rate limiting
+governor = "0.7"
+tower_governor = "0.4"
+
+# WebSockets
+tokio-tungstenite = "0.21"
+
+# Consensus
+openraft = { version = "0.9", features = ["serde"] }
+
+# Metrics
+prometheus = "0.13"
+metrics = "0.21"
+metrics-exporter-prometheus = "0.13"
+
+# OCI/Container
+oci-distribution = "0.10"
+oci-spec = "0.6"
+containerd-client = "0.8"
+
+# gRPC/Protobuf (for containerd)
+tonic = "0.12"
+prost = "0.13"
+prost-types = "0.13"
+
+# Async traits
+async-trait = "0.1"
+
+# Cryptography
+x25519-dalek = "2"
+blake2 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+
+# DNS
+trust-dns-server = "0.23"
+trust-dns-client = "0.23"
+
+# Storage
+redb = "0.14"
+
+# Process management
+command-group = "4"
+
+# Config
+config = "0.14"
+
+# UUID
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Unix/Linux system calls
+libc = "0.2"
+nix = { version = "0.29", features = ["fs", "signal", "process"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Base64 encoding/decoding
+base64 = "0.22"
+
+# Validation
+validator = { version = "0.16", features = ["derive"] }
+
+# Schema generation
+schemars = { version = "0.8", features = ["chrono"] }
+
+# =============================================================================
+# Build Profiles
+# =============================================================================
+
+[profile.release]
+# Enable Link-Time Optimization for smaller, faster binaries
+lto = "thin"
+# Single codegen unit for better optimization (slower compile)
+codegen-units = 1
+# Strip symbols for smaller binaries
+strip = true
+# Optimize for size with speed (good balance)
+opt-level = 3
+# Enable debug info for profiling (optional, remove for smallest size)
+# debug = 1
+# Abort on panic for smaller binary (no unwinding)
+panic = "abort"
+
+[profile.release-fast]
+# Faster release builds for development
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false
+
+[profile.dev]
+# Faster incremental builds
+opt-level = 0
+debug = true
+
+[profile.dev.package."*"]
+# Optimize dependencies even in dev mode
+opt-level = 2
+
+[profile.bench]
+# Benchmarking profile
+inherits = "release"
+debug = true
+lto = "thin"
+
+# =============================================================================
+# Release Metadata
+# =============================================================================
+
+[workspace.metadata.release]
+# Release configuration for cargo-release
+pre-release-commit-message = "chore: release v{{version}}"
+tag-message = "v{{version}}"
+tag-prefix = "v"

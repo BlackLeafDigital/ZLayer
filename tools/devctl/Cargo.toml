@@ -1,0 +1,47 @@
+[package]
+name = "devctl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZLayer developer control tool"
+
+[[bin]]
+name = "devctl"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates
+api = { path = "../../crates/api" }
+spec = { path = "../../crates/spec" }
+
+# CLI
+clap = { workspace = true }
+
+# Async
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Tracing
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# UUID for token IDs
+uuid = { workspace = true }
+
+# Base64 for token decoding
+base64 = { workspace = true }
+
+# Validation (for spec validation)
+validator = { workspace = true }

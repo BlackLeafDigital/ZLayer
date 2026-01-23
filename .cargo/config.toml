@@ -1,0 +1,29 @@
+[build]
+# Enable incremental compilation by default
+incremental = true
+
+# Use multiple cores for builds (set to number of cores or leave commented for default)
+# jobs = 8
+
+[target.x86_64-unknown-linux-gnu]
+# Use mold linker if available for faster builds (uncomment if mold is installed)
+# linker = "clang"
+# rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+[alias]
+# Common build aliases for development workflow
+dev = "build --package runtime"
+prod = "build --release --package runtime"
+devctl-dev = "build --package devctl"
+devctl-prod = "build --release --package devctl"
+check-all = "check --workspace --all-targets"
+test-all = "test --workspace"
+clippy-all = "clippy --workspace --all-targets -- -D warnings"
+
+# Feature-specific builds
+build-agent = "build --package runtime --no-default-features --features join"
+build-server = "build --package runtime --no-default-features --features serve"
+build-deploy = "build --package runtime --no-default-features --features deploy"
+
+[patch.crates-io]
+# You can add patches here if needed for development

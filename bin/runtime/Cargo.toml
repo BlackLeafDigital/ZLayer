@@ -1,0 +1,42 @@
+[package]
+name = "runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZLayer container orchestration runtime"
+
+[[bin]]
+name = "zlayer"
+path = "src/main.rs"
+
+[features]
+default = ["full"]
+# Full runtime with all CLI commands
+full = ["serve", "join", "deploy"]
+# Enable serve command (API server mode)
+serve = ["dep:api"]
+# Enable join command (agent/worker node mode)
+join = []
+# Enable deploy command (orchestration mode)
+deploy = []
+
+[dependencies]
+# Internal crates - always required
+agent = { path = "../../crates/agent" }
+spec = { path = "../../crates/spec" }
+observability = { path = "../../crates/observability" }
+
+# Optional: API server (only needed for serve command)
+api = { path = "../../crates/api", optional = true }
+
+# External dependencies
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+base64 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }

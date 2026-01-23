@@ -1,0 +1,159 @@
+//! API router construction
+
+use axum::{
+    middleware,
+    routing::{delete, get, post},
+    Extension, Router,
+};
+use std::sync::Arc;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
+
+use crate::auth::AuthState;
+use crate::config::ApiConfig;
+use crate::handlers;
+use crate::openapi::ApiDoc;
+use crate::ratelimit::{rate_limit_middleware, IpRateLimiter, RateLimitState};
+
+/// Build the API router
+pub fn build_router(config: &ApiConfig) -> Router {
+    // Auth state
+    let auth_state = AuthState {
+        jwt_secret: config.jwt_secret.clone(),
+    };
+
+    // Rate limiting
+    let rate_limit_state = RateLimitState::new(&config.rate_limit);
+    let ip_limiter = Arc::new(IpRateLimiter::new(config.rate_limit.clone()));
+
+    // CORS layer
+    let cors = build_cors_layer(config);
+
+    // Health routes (no auth required)
+    let health_routes = Router::new()
+        .route("/live", get(handlers::health::liveness))
+        .route("/ready", get(handlers::health::readiness));
+
+    // Auth routes (no auth required for token endpoint)
+    let auth_routes = Router::new()
+        .route("/token", post(handlers::auth::get_token))
+        .with_state(auth_state.clone());
+
+    // Deployment routes (auth required)
+    let deployment_routes = Router::new()
+        .route("/", get(handlers::deployments::list_deployments))
+        .route("/", post(handlers::deployments::create_deployment))
+        .route("/{name}", get(handlers::deployments::get_deployment))
+        .route("/{name}", delete(handlers::deployments::delete_deployment))
+        .route(
+            "/{deployment}/services",
+            get(handlers::services::list_services),
+        )
+        .route(
+            "/{deployment}/services/{service}",
+            get(handlers::services::get_service),
+        )
+        .route(
+            "/{deployment}/services/{service}/scale",
+            post(handlers::services::scale_service),
+        )
+        .route(
+            "/{deployment}/services/{service}/logs",
+            get(handlers::services::get_service_logs),
+        );
+
+    // API v1 routes
+    let api_v1 = Router::new().nest("/deployments", deployment_routes);
+
+    // Main router
+    let mut router = Router::new()
+        .nest("/health", health_routes)
+        .nest("/auth", auth_routes)
+        .nest("/api/v1", api_v1)
+        .layer(Extension(auth_state))
+        .layer(Extension(rate_limit_state))
+        .layer(Extension(ip_limiter))
+        .layer(middleware::from_fn(rate_limit_middleware))
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
+
+    // Add Swagger UI if enabled
+    if config.swagger_enabled {
+        router = router.merge(
+            SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()),
+        );
+    }
+
+    router
+}
+
+fn build_cors_layer(config: &ApiConfig) -> CorsLayer {
+    let cors = CorsLayer::new().max_age(std::time::Duration::from_secs(config.cors.max_age));
+
+    let cors = if config.cors.allowed_origins.is_empty() {
+        cors.allow_origin(Any)
+    } else {
+        // Parse origins
+        let origins: Vec<_> = config
+            .cors
+            .allowed_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        cors.allow_origin(origins)
+    };
+
+    let cors = if config.cors.allow_credentials {
+        cors.allow_credentials(true)
+    } else {
+        cors
+    };
+
+    cors.allow_methods(Any).allow_headers(Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_build_router() {
+        let config = ApiConfig::default();
+        let _router = build_router(&config);
+        // Router builds without error
+    }
+
+    #[test]
+    fn test_build_router_without_swagger() {
+        let config = ApiConfig {
+            swagger_enabled: false,
+            ..Default::default()
+        };
+        let _router = build_router(&config);
+    }
+
+    #[test]
+    fn test_build_cors_layer_default() {
+        let config = ApiConfig::default();
+        let _cors = build_cors_layer(&config);
+    }
+
+    #[test]
+    fn test_build_cors_layer_with_origins() {
+        let mut config = ApiConfig::default();
+        config.cors.allowed_origins = vec![
+            "http://localhost:3000".to_string(),
+            "https://example.com".to_string(),
+        ];
+        let _cors = build_cors_layer(&config);
+    }
+
+    #[test]
+    fn test_build_cors_layer_with_credentials() {
+        let mut config = ApiConfig::default();
+        config.cors.allow_credentials = true;
+        let _cors = build_cors_layer(&config);
+    }
+}

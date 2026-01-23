@@ -1,0 +1,143 @@
+version: v1
+deployment: production-stack
+
+services:
+  api:
+    rtype: service
+    image:
+      name: ghcr.io/myorg/api:latest
+      pull_policy: always
+
+    resources:
+      cpu: 2.0
+      memory: 512Mi
+
+    env:
+      NODE_ENV: production
+      DATABASE_URL: $E:DATABASE_URL
+      REDIS_URL: $E:REDIS_URL
+
+    network:
+      overlays:
+        service:
+          enabled: true
+          encrypted: true
+          isolated: true
+        global:
+          enabled: true
+          encrypted: true
+      join:
+        mode: token
+        scope: service
+
+    endpoints:
+      - name: http
+        protocol: https
+        port: 3000
+        path: /api
+        expose: public
+      - name: metrics
+        protocol: http
+        port: 9090
+        expose: internal
+
+    scale:
+      mode: adaptive
+      min: 2
+      max: 50
+      cooldown: 15s
+      targets:
+        cpu: 70
+        rps: 800
+
+    depends:
+      - service: database
+        condition: healthy
+        timeout: 300s
+        on_timeout: fail
+
+    health:
+      start_grace: 30s
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      check:
+        type: http
+        url: http://localhost:3000/health
+        expect_status: 200
+
+    init:
+      steps:
+        - id: wait-db
+          uses: init.wait_tcp
+          with:
+            host: database.service
+            port: 5432
+          timeout: 60s
+          on_failure: fail
+
+    errors:
+      on_init_failure:
+        action: backoff
+      on_panic:
+        action: restart
+
+  database:
+    rtype: service
+    image:
+      name: postgres:16-alpine
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 1.0
+      memory: 1Gi
+
+    env:
+      POSTGRES_DB: $E:POSTGRES_DB
+      POSTGRES_USER: $E:POSTGRES_USER
+      POSTGRES_PASSWORD: $E:POSTGRES_PASSWORD
+
+    endpoints:
+      - name: postgres
+        protocol: tcp
+        port: 5432
+        expose: internal
+
+    scale:
+      mode: fixed
+      replicas: 1
+
+    health:
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      check:
+        type: tcp
+        port: 5432
+
+  worker:
+    rtype: job
+    image:
+      name: ghcr.io/myorg/worker:latest
+
+    resources:
+      cpu: 0.5
+      memory: 256Mi
+
+    env:
+      QUEUE_URL: $E:QUEUE_URL
+
+    depends:
+      - service: api
+        condition: ready
+        timeout: 120s
+        on_timeout: warn
+
+  cleanup:
+    rtype: cron
+    image:
+      name: ghcr.io/myorg/cleanup:latest
+
+    resources:
+      cpu: 0.25
+      memory: 128Mi
