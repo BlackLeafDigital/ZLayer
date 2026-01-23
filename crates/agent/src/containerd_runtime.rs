@@ -19,7 +19,7 @@ use containerd_client::services::v1::{
     KillRequest, StartRequest, TransferRequest, WaitRequest,
 };
 use containerd_client::types::transfer::{ImageStore, OciRegistry, UnpackConfiguration};
-use containerd_client::types::Mount;
+use containerd_client::types::{Mount, Platform};
 use containerd_client::{connect, to_any, with_namespace};
 use oci_spec::runtime::{
     LinuxBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, ProcessBuilder, RootBuilder, Spec,
@@ -372,16 +372,32 @@ impl Runtime for ContainerdRuntime {
             resolver: None,
         };
 
+        // Map Rust architecture names to OCI platform architecture names
+        let arch = match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            arch => arch,
+        }
+        .to_string();
+
+        // Define target platform for unpacking
+        let platform = Platform {
+            os: "linux".to_string(),
+            architecture: arch,
+            variant: String::new(),
+            os_version: String::new(),
+        };
+
         // Create image store destination with unpack configuration
         let destination = ImageStore {
             name: image.to_string(),
             labels: HashMap::new(),
-            platforms: vec![],
+            platforms: vec![platform.clone()],
             all_metadata: false,
             manifest_limit: 0,
             extra_references: vec![],
             unpacks: vec![UnpackConfiguration {
-                platform: None,
+                platform: Some(platform),
                 snapshotter: self.config.snapshotter.clone(),
             }],
         };
