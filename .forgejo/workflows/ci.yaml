@@ -225,7 +225,7 @@ jobs:
     # This isolates containerd from the host and prevents interference with runner's Docker
     container:
       image: ghcr.io/zachhandley/baseimages/rust-containerd-alpine:latest
-      options: --privileged
+      options: --privileged --security-opt seccomp=unconfined --security-opt apparmor=unconfined
     steps:
       - name: Checkout
         uses: actions/checkout@v4

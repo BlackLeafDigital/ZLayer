@@ -52,6 +52,48 @@ const DEFAULT_SNAPSHOTTER: &str = "overlayfs";
 /// Default runtime name
 const DEFAULT_RUNTIME: &str = "io.containerd.runc.v2";
 
+/// Detect if we're running inside a container
+fn is_running_in_container() -> bool {
+    // Method 1: Docker creates /.dockerenv
+    if std::path::Path::new("/.dockerenv").exists() {
+        return true;
+    }
+
+    // Method 2: Check cgroup for container markers
+    if let Ok(cgroup) = std::fs::read_to_string("/proc/1/cgroup") {
+        if cgroup.contains("docker")
+            || cgroup.contains("containerd")
+            || cgroup.contains("lxc")
+            || cgroup.contains("kubepods")
+        {
+            return true;
+        }
+    }
+
+    // Method 3: Check for container env vars
+    if std::env::var("container").is_ok() || std::env::var("KUBERNETES_SERVICE_HOST").is_ok() {
+        return true;
+    }
+
+    false
+}
+
+/// Get the best snapshotter for the current environment
+/// Priority: env var > auto-detect
+fn detect_snapshotter() -> String {
+    // Env var takes priority
+    if let Ok(snapshotter) = std::env::var("ZLAYER_SNAPSHOTTER") {
+        return snapshotter;
+    }
+
+    // Auto-detect based on environment
+    if is_running_in_container() {
+        "native".to_string() // Works in nested containers
+    } else {
+        DEFAULT_SNAPSHOTTER.to_string() // Faster on bare metal
+    }
+}
+
 /// Configuration for ContainerdRuntime
 #[derive(Debug, Clone)]
 pub struct ContainerdConfig {
@@ -76,8 +118,7 @@ impl Default for ContainerdConfig {
                 .unwrap_or_else(|_| PathBuf::from(DEFAULT_SOCKET_PATH)),
             namespace: std::env::var("ZLAYER_NAMESPACE")
                 .unwrap_or_else(|_| DEFAULT_NAMESPACE.to_string()),
-            snapshotter: std::env::var("ZLAYER_SNAPSHOTTER")
-                .unwrap_or_else(|_| DEFAULT_SNAPSHOTTER.to_string()),
+            snapshotter: detect_snapshotter(),
             state_dir: std::env::var("ZLAYER_STATE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("/var/lib/zlayer/containers")),
