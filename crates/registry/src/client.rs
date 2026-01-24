@@ -23,6 +23,8 @@ impl ImagePuller {
     pub fn new(cache: Arc<BlobCache>) -> Self {
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
+            connect_timeout: Some(std::time::Duration::from_secs(30)),
+            read_timeout: Some(std::time::Duration::from_secs(300)), // 5 minutes for large layers
             ..Default::default()
         };
         let client = oci_client::Client::new(config);
