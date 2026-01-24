@@ -241,6 +241,10 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
+      - name: Install system dependencies
+        run: |
+          apk add --no-cache libseccomp-dev protobuf-dev openssl-dev
+
       - name: Setup E2E environment
         run: |
           # Create required directories for youki runtime
