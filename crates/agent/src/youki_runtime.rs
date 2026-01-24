@@ -253,12 +253,12 @@ impl Runtime for YoukiRuntime {
 
         // Initialize blob cache
         let cache_path = self.config.cache_dir.join("blobs.redb");
-        let cache = std::sync::Arc::new(
-            registry::BlobCache::open(&cache_path).map_err(|e| AgentError::PullFailed {
+        let cache = std::sync::Arc::new(registry::BlobCache::open(&cache_path).map_err(|e| {
+            AgentError::PullFailed {
                 image: image.to_string(),
                 reason: format!("failed to open blob cache: {}", e),
-            })?,
-        );
+            }
+        })?);
 
         // Create image puller
         let puller = registry::ImagePuller::new(cache);
