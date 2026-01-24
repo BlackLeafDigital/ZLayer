@@ -5,7 +5,9 @@
 pub mod cache;
 pub mod client;
 pub mod error;
+pub mod unpack;
 
 pub use cache::*;
 pub use client::*;
 pub use error::*;
+pub use unpack::*;

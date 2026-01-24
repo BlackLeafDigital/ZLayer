@@ -16,7 +16,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-use agent::{ContainerdConfig, RuntimeConfig};
+use agent::{RuntimeConfig, YoukiConfig};
 use observability::{init_observability, LogFormat, LogLevel, LoggingConfig, ObservabilityConfig};
 use spec::DeploymentSpec;
 
@@ -29,14 +29,6 @@ struct Cli {
     /// Container runtime to use
     #[arg(long, default_value = "mock", value_enum)]
     runtime: RuntimeType,
-
-    /// Path to containerd socket (only used with containerd runtime)
-    #[arg(long, default_value = "/run/containerd/containerd.sock")]
-    socket: PathBuf,
-
-    /// Containerd namespace
-    #[arg(long, default_value = "zlayer")]
-    namespace: String,
 
     /// State directory for runtime data
     #[arg(long, default_value = "/var/lib/zlayer/containers")]
@@ -55,8 +47,8 @@ struct Cli {
 enum RuntimeType {
     /// Mock runtime for testing and development
     Mock,
-    /// Containerd runtime for production deployments
-    Containerd,
+    /// Youki runtime for production deployments
+    Youki,
 }
 
 /// CLI subcommands
@@ -248,9 +240,7 @@ async fn run(cli: Cli) -> Result<()> {
 fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
     match cli.runtime {
         RuntimeType::Mock => RuntimeConfig::Mock,
-        RuntimeType::Containerd => RuntimeConfig::Containerd(ContainerdConfig {
-            socket_path: cli.socket.clone(),
-            namespace: cli.namespace.clone(),
+        RuntimeType::Youki => RuntimeConfig::Youki(YoukiConfig {
             state_dir: cli.state_dir.clone(),
             ..Default::default()
         }),
@@ -309,11 +299,10 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
         RuntimeType::Mock => {
             info!("Using mock runtime - containers will be simulated");
         }
-        RuntimeType::Containerd => {
+        RuntimeType::Youki => {
             info!(
-                socket = %cli.socket.display(),
-                namespace = %cli.namespace,
-                "Connected to containerd"
+                state_dir = %cli.state_dir.display(),
+                "Using Youki runtime"
             );
         }
     }
@@ -501,25 +490,21 @@ async fn status(cli: &Cli) -> Result<()> {
             println!("Status: Ready (mock mode)");
             println!("Note: Using mock runtime - no actual containers will be created");
         }
-        RuntimeType::Containerd => {
-            println!("Socket: {}", cli.socket.display());
-            println!("Namespace: {}", cli.namespace);
+        RuntimeType::Youki => {
             println!("State Dir: {}", cli.state_dir.display());
 
-            // Try to connect to containerd to verify it's available
-            let config = ContainerdConfig {
-                socket_path: cli.socket.clone(),
-                namespace: cli.namespace.clone(),
+            // Try to create the youki runtime to verify it's available
+            let config = YoukiConfig {
                 state_dir: cli.state_dir.clone(),
                 ..Default::default()
             };
 
-            match agent::create_runtime(RuntimeConfig::Containerd(config)).await {
+            match agent::create_runtime(RuntimeConfig::Youki(config)).await {
                 Ok(_) => {
-                    println!("Status: Connected to containerd");
+                    println!("Status: Youki runtime ready");
                 }
                 Err(e) => {
-                    println!("Status: Containerd unavailable");
+                    println!("Status: Youki runtime unavailable");
                     println!("Error: {}", e);
                     warn!("Consider using --runtime mock for testing");
                 }
@@ -689,19 +674,19 @@ mod tests {
     }
 
     #[test]
-    fn test_cli_containerd_runtime() {
+    fn test_cli_youki_runtime() {
         let cli = Cli::try_parse_from([
             "zlayer",
             "--runtime",
-            "containerd",
-            "--socket",
-            "/custom/socket.sock",
+            "youki",
+            "--state-dir",
+            "/custom/state",
             "status",
         ])
         .unwrap();
 
-        assert!(matches!(cli.runtime, RuntimeType::Containerd));
-        assert_eq!(cli.socket, PathBuf::from("/custom/socket.sock"));
+        assert!(matches!(cli.runtime, RuntimeType::Youki));
+        assert_eq!(cli.state_dir, PathBuf::from("/custom/state"));
     }
 
     #[test]
@@ -899,15 +884,11 @@ mod tests {
 
     #[test]
     #[cfg(feature = "deploy")]
-    fn test_build_runtime_config_containerd() {
+    fn test_build_runtime_config_youki() {
         let cli = Cli::try_parse_from([
             "zlayer",
             "--runtime",
-            "containerd",
-            "--socket",
-            "/custom/socket.sock",
-            "--namespace",
-            "custom-ns",
+            "youki",
             "--state-dir",
             "/custom/state",
             "status",
@@ -916,12 +897,10 @@ mod tests {
 
         let config = build_runtime_config(&cli);
         match config {
-            RuntimeConfig::Containerd(c) => {
-                assert_eq!(c.socket_path, PathBuf::from("/custom/socket.sock"));
-                assert_eq!(c.namespace, "custom-ns");
+            RuntimeConfig::Youki(c) => {
                 assert_eq!(c.state_dir, PathBuf::from("/custom/state"));
             }
-            _ => panic!("Expected Containerd config"),
+            _ => panic!("Expected Youki config"),
         }
     }
 

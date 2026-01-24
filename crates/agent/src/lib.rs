@@ -2,21 +2,23 @@
 //!
 //! Manages container lifecycle, health checking, init actions, and proxy integration.
 
-pub mod containerd_runtime;
+pub mod bundle;
 pub mod error;
 pub mod health;
 pub mod init;
 pub mod proxy_manager;
 pub mod runtime;
 pub mod service;
+pub mod youki_runtime;
 
-pub use containerd_runtime::{ContainerdConfig, ContainerdRuntime};
+pub use bundle::*;
 pub use error::*;
 pub use health::*;
 pub use init::*;
 pub use proxy_manager::{ProxyManager, ProxyManagerConfig};
 pub use runtime::*;
 pub use service::*;
+pub use youki_runtime::{YoukiConfig, YoukiRuntime};
 
 use std::sync::Arc;
 
@@ -25,8 +27,8 @@ use std::sync::Arc;
 pub enum RuntimeConfig {
     /// Use the mock runtime for testing and development
     Mock,
-    /// Use containerd as the container runtime
-    Containerd(ContainerdConfig),
+    /// Use youki/libcontainer as the container runtime
+    Youki(YoukiConfig),
 }
 
 impl Default for RuntimeConfig {
@@ -44,20 +46,20 @@ impl Default for RuntimeConfig {
 /// An `Arc<dyn Runtime + Send + Sync>` that can be used with `ServiceManager`
 ///
 /// # Errors
-/// Returns `AgentError` if the runtime cannot be initialized (e.g., containerd
-/// socket not available)
+/// Returns `AgentError` if the runtime cannot be initialized (e.g., failed to create
+/// required directories)
 ///
 /// # Example
 /// ```no_run
-/// use agent::{RuntimeConfig, ContainerdConfig, create_runtime};
+/// use agent::{RuntimeConfig, YoukiConfig, create_runtime};
 ///
 /// # async fn example() -> Result<(), agent::AgentError> {
 /// // Use mock runtime for testing
 /// let mock_runtime = create_runtime(RuntimeConfig::Mock).await?;
 ///
-/// // Use containerd runtime for production
-/// let containerd_runtime = create_runtime(
-///     RuntimeConfig::Containerd(ContainerdConfig::default())
+/// // Use youki runtime for production
+/// let youki_runtime = create_runtime(
+///     RuntimeConfig::Youki(YoukiConfig::default())
 /// ).await?;
 /// # Ok(())
 /// # }
@@ -65,8 +67,8 @@ impl Default for RuntimeConfig {
 pub async fn create_runtime(config: RuntimeConfig) -> Result<Arc<dyn Runtime + Send + Sync>> {
     match config {
         RuntimeConfig::Mock => Ok(Arc::new(MockRuntime::new())),
-        RuntimeConfig::Containerd(containerd_config) => {
-            let runtime = ContainerdRuntime::new(containerd_config).await?;
+        RuntimeConfig::Youki(youki_config) => {
+            let runtime = YoukiRuntime::new(youki_config).await?;
             Ok(Arc::new(runtime))
         }
     }

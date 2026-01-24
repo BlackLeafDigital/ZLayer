@@ -108,6 +108,18 @@ pub struct ServiceSpec {
     /// Error handling policies
     #[serde(default)]
     pub errors: ErrorsSpec,
+
+    /// Device passthrough (e.g., /dev/kvm for VMs)
+    #[serde(default)]
+    pub devices: Vec<DeviceSpec>,
+
+    /// Linux capabilities to add (e.g., SYS_ADMIN, NET_ADMIN)
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+
+    /// Run container in privileged mode (all capabilities + all devices)
+    #[serde(default)]
+    pub privileged: bool,
 }
 
 fn default_resource_type() -> ResourceType {
@@ -163,6 +175,31 @@ pub enum PullPolicy {
     IfNotPresent,
     /// Never pull, use local image only
     Never,
+}
+
+/// Device passthrough specification
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceSpec {
+    /// Host device path (e.g., /dev/kvm, /dev/net/tun)
+    #[validate(length(min = 1, message = "device path cannot be empty"))]
+    pub path: String,
+
+    /// Allow read access
+    #[serde(default = "default_true")]
+    pub read: bool,
+
+    /// Allow write access
+    #[serde(default = "default_true")]
+    pub write: bool,
+
+    /// Allow mknod (create device nodes)
+    #[serde(default)]
+    pub mknod: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Resource limits (upper bounds, not reservations)

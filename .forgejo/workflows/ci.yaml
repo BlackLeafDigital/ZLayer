@@ -26,10 +26,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install protobuf compiler
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
@@ -81,10 +81,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install protobuf compiler
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
@@ -134,10 +134,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install protobuf compiler
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
@@ -186,10 +186,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install protobuf compiler
+      - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
@@ -213,22 +213,25 @@ jobs:
         run: cargo test --package runtime ${{ matrix.features }}
 
   # ===========================================
-  # E2E Tests (Containerd)
+  # E2E Tests (Youki/libcontainer)
   # ===========================================
   e2e-tests:
-    name: E2E Tests (Containerd)
+    name: E2E Tests (Youki)
     runs-on: ubuntu-latest
     needs: test
     # Only run on main branch or explicit trigger (expensive)
     if: github.ref == 'refs/heads/main' || contains(github.event.head_commit.message, '[e2e]')
-    # Run in a privileged container with containerd pre-installed
-    # This isolates containerd from the host and prevents interference with runner's Docker
-    container:
-      image: ghcr.io/zachhandley/baseimages/rust-containerd-alpine:latest
-      options: --privileged --security-opt seccomp=unconfined --security-opt apparmor=unconfined
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
+
+      - name: Setup Rust
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
@@ -242,44 +245,23 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
-      - name: Start containerd
+      - name: Setup E2E environment
         run: |
-          # Start containerd in background (no systemd in containers)
-          containerd &
-          # Wait for socket to be ready
-          timeout=30
-          while [ ! -S /run/containerd/containerd.sock ] && [ $timeout -gt 0 ]; do
-            sleep 1
-            timeout=$((timeout - 1))
-          done
-          # Verify containerd is running
-          ctr version
-          ctr namespace ls
-
-          # Debug: show available snapshotters
-          echo "=== Available snapshotters ==="
-          ctr plugins ls | grep -i snapshot
-          echo "=== Containerd config ==="
-          cat /etc/containerd/config.toml | head -50
-
-      - name: Create test namespace
-        run: ctr namespace create zlayer-e2e-test || true
-
-      # Note: Images are pulled by ZLayer's ContainerdRuntime during tests
-      # It uses auto-detected snapshotter (native in containers)
+          # Create required directories for youki runtime
+          sudo mkdir -p /var/lib/zlayer/{containers,rootfs,bundles,cache}
+          sudo chmod 755 /var/lib/zlayer
+          # Youki/libcontainer is daemonless - no daemon setup needed
 
       - name: Run E2E tests
-        run: cargo test --package agent --test containerd_e2e -- --test-threads=1
+        run: sudo -E cargo test --package agent --test youki_e2e -- --test-threads=1
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
 
-      - name: Cleanup test namespace
+      - name: Cleanup
         if: always()
         run: |
-          ctr -n zlayer-e2e-test containers rm $(ctr -n zlayer-e2e-test containers ls -q) 2>/dev/null || true
-          ctr -n zlayer-e2e-test tasks rm $(ctr -n zlayer-e2e-test tasks ls -q) 2>/dev/null || true
-          ctr namespace remove zlayer-e2e-test 2>/dev/null || true
+          sudo rm -rf /var/lib/zlayer/* 2>/dev/null || true
 
   # ===========================================
   # Cache Cleanup

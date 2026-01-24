@@ -51,9 +51,6 @@ opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
 chrono = { version = "0.4", features = ["serde"] }
 time = { version = "0.3", features = ["serde"] }
 
-# Duration parsing
-humantime = "2"
-
 # HTTP/client
 reqwest = { version = "0.11", features = ["json"] }
 hyper = { version = "1.0", features = ["full", "http2"] }
@@ -67,7 +64,6 @@ tokio-rustls = "0.26"
 # Tower middleware
 tower = { version = "0.4", features = ["full"] }
 tower-http = { version = "0.5", features = ["full"] }
-tower-balance = "0.4"
 
 # Web framework (for API)
 axum = { version = "0.7", features = ["macros", "ws"] }
@@ -83,9 +79,6 @@ utoipa-swagger-ui = { version = "8", features = ["axum"] }
 governor = "0.7"
 tower_governor = "0.4"
 
-# WebSockets
-tokio-tungstenite = "0.21"
-
 # Consensus
 openraft = { version = "0.9", features = ["serde"] }
 
@@ -97,12 +90,6 @@ metrics-exporter-prometheus = "0.13"
 # OCI/Container
 oci-distribution = "0.10"
 oci-spec = "0.6"
-containerd-client = "0.8"
-
-# gRPC/Protobuf (for containerd)
-tonic = "0.12"
-prost = "0.13"
-prost-types = "0.13"
 
 # Async traits
 async-trait = "0.1"
@@ -119,9 +106,6 @@ trust-dns-client = "0.23"
 
 # Storage
 redb = "0.14"
-
-# Process management
-command-group = "4"
 
 # Config
 config = "0.14"
@@ -141,9 +125,6 @@ base64 = "0.22"
 
 # Validation
 validator = { version = "0.16", features = ["derive"] }
-
-# Schema generation
-schemars = { version = "0.8", features = ["chrono"] }
 
 # =============================================================================
 # Build Profiles
