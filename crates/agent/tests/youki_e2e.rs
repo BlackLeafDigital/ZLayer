@@ -57,7 +57,7 @@ macro_rules! skip_without_root {
 /// This ensures tests can run in parallel without name collisions.
 fn unique_name(prefix: &str) -> String {
     use rand::Rng;
-    let suffix: u32 = rand::thread_rng().gen_range(10000..99999);
+    let suffix: u32 = rand::rng().random_range(10000..99999);
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
