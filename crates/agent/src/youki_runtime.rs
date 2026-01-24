@@ -236,13 +236,32 @@ impl Runtime for YoukiRuntime {
     async fn pull_image(&self, image: &str) -> Result<()> {
         let rootfs_path = self.rootfs_path(image);
 
-        // Check if rootfs already exists
+        // Check if rootfs already exists AND has valid content
         if rootfs_path.exists() {
-            tracing::debug!(
-                rootfs = %rootfs_path.display(),
-                "rootfs already exists, skipping pull"
-            );
-            return Ok(());
+            if self.validate_rootfs_content(&rootfs_path).await {
+                tracing::debug!(
+                    rootfs = %rootfs_path.display(),
+                    "rootfs already exists with valid content, skipping pull"
+                );
+                return Ok(());
+            } else {
+                // Directory exists but is empty/corrupted - clean up and repull
+                tracing::warn!(
+                    rootfs = %rootfs_path.display(),
+                    "rootfs directory exists but appears empty or corrupted, removing and repulling"
+                );
+                if let Err(e) = tokio::fs::remove_dir_all(&rootfs_path).await {
+                    tracing::error!(
+                        rootfs = %rootfs_path.display(),
+                        error = %e,
+                        "failed to remove corrupted rootfs directory"
+                    );
+                    return Err(AgentError::PullFailed {
+                        image: image.to_string(),
+                        reason: format!("failed to remove corrupted rootfs: {}", e),
+                    });
+                }
+            }
         }
 
         tracing::info!(
@@ -830,6 +849,27 @@ impl Runtime for YoukiRuntime {
 }
 
 impl YoukiRuntime {
+    /// Validate that a rootfs directory has essential content
+    ///
+    /// Returns true if the rootfs appears to have valid content (essential Linux
+    /// directories or at least some entries). Returns false if the directory is
+    /// empty or missing expected structure, indicating a failed/partial pull.
+    async fn validate_rootfs_content(&self, rootfs_path: &std::path::Path) -> bool {
+        // Check for essential directories that should exist in any Linux rootfs
+        for path in ["bin", "lib", "etc", "usr"] {
+            if rootfs_path.join(path).exists() {
+                return true;
+            }
+        }
+        // Also check if directory has ANY entries (for minimal images)
+        if let Ok(mut entries) = tokio::fs::read_dir(rootfs_path).await {
+            if entries.next_entry().await.ok().flatten().is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Build OCI runtime spec from ServiceSpec
     ///
     /// This is a simplified version that generates basic OCI config.

@@ -4,12 +4,11 @@ use crate::cache::BlobCache;
 use crate::error::{RegistryError, Result};
 use oci_client::{
     client::{ClientConfig, ClientProtocol},
-    manifest::{OciDescriptor, OciImageManifest},
+    manifest::OciImageManifest,
     secrets::RegistryAuth,
     Reference,
 };
 use std::sync::Arc;
-use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::Semaphore;
 
 /// OCI image puller with caching
@@ -67,29 +66,23 @@ impl ImagePuller {
         tracing::debug!(digest = %digest, image = %image, "pulling blob from registry");
 
         // Pull from registry into memory
+        // Note: We pass &mut buffer directly, not wrapped in BufWriter.
+        // Vec<u8> implements AsyncWrite and oci_client's pull_blob writes directly to it.
+        // Using BufWriter was causing data to not be flushed properly.
         let mut buffer = Vec::new();
-        {
-            let mut writer = BufWriter::new(&mut buffer);
-            // Create an OciDescriptor with the digest (oci-distribution 0.11+ API)
-            let descriptor = OciDescriptor {
-                digest: digest.to_string(),
-                ..Default::default()
-            };
-            self.client
-                .pull_blob(&reference, &descriptor, &mut writer)
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, digest = %digest, "failed to pull blob");
-                    RegistryError::Cache(crate::error::CacheError::NotFound {
-                        digest: digest.to_string(),
-                    })
-                })?;
-            writer.flush().await.map_err(|e| {
-                RegistryError::Cache(crate::error::CacheError::Database(format!(
-                    "failed to flush: {}",
-                    e
-                )))
+        self.client
+            .pull_blob(&reference, digest, &mut buffer)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, digest = %digest, image = %image, "failed to pull blob from registry");
+                RegistryError::Oci(e)
             })?;
+
+        // Validate blob data is not empty
+        if buffer.is_empty() {
+            return Err(RegistryError::Cache(crate::error::CacheError::Corrupted(
+                format!("blob {} was empty after pulling from registry", digest),
+            )));
         }
 
         // Cache the blob
@@ -163,6 +156,14 @@ impl ImagePuller {
             );
 
             let data = self.pull_blob(image, &layer.digest, auth).await?;
+
+            // Validate layer data is not empty
+            if data.is_empty() {
+                return Err(RegistryError::Cache(crate::error::CacheError::Corrupted(
+                    format!("layer {} ({}) is empty after pull", i, layer.digest),
+                )));
+            }
+
             layers.push((data, layer.media_type.clone()));
         }
 

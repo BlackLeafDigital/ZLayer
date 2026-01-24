@@ -41,18 +41,23 @@ pub enum CompressionType {
 
 impl CompressionType {
     /// Detect compression type from media type string
-    pub fn from_media_type(media_type: &str) -> Self {
+    /// Returns None if media type is unrecognized (caller should use magic bytes)
+    pub fn from_media_type(media_type: &str) -> Option<Self> {
         match media_type {
-            media_types::TAR_GZIP | media_types::DOCKER_TAR_GZIP => Self::Gzip,
-            media_types::TAR_ZSTD => Self::Zstd,
-            media_types::TAR => Self::None,
-            _ => Self::from_magic_bytes(&[]), // Unknown, will fallback to magic bytes
+            media_types::TAR_GZIP | media_types::DOCKER_TAR_GZIP => Some(Self::Gzip),
+            media_types::TAR_ZSTD => Some(Self::Zstd),
+            media_types::TAR => Some(Self::None),
+            _ => None, // Unknown - caller should use detect() with actual data
         }
     }
 
     /// Detect compression type from magic bytes
     pub fn from_magic_bytes(data: &[u8]) -> Self {
         if data.len() < 4 {
+            tracing::warn!(
+                data_len = data.len(),
+                "insufficient data for magic byte detection, assuming uncompressed tar"
+            );
             return Self::None;
         }
 
@@ -76,10 +81,15 @@ impl CompressionType {
 
     /// Detect compression, preferring media type but falling back to magic bytes
     pub fn detect(media_type: &str, data: &[u8]) -> Self {
-        let from_media = Self::from_media_type(media_type);
-        if from_media != Self::None {
-            return from_media;
+        // First try media type
+        if let Some(compression) = Self::from_media_type(media_type) {
+            return compression;
         }
+        // Fall back to magic bytes for unknown media types
+        tracing::debug!(
+            media_type = %media_type,
+            "unrecognized media type, detecting compression from magic bytes"
+        );
         Self::from_magic_bytes(data)
     }
 }
@@ -135,14 +145,22 @@ impl LayerUnpacker {
     }
 
     /// Unpack multiple layers in order (base layer first)
-    ///
-    /// # Arguments
-    /// * `layers` - Slice of (layer_data, media_type) tuples in order
-    ///
-    /// # Errors
-    /// Returns an error if any layer extraction fails
     pub async fn unpack_layers(&mut self, layers: &[(Vec<u8>, String)]) -> Result<()> {
+        if layers.is_empty() {
+            return Err(RegistryError::Cache(CacheError::Corrupted(
+                "no layers to unpack".to_string(),
+            )));
+        }
+
         for (i, (data, media_type)) in layers.iter().enumerate() {
+            // Validate layer data is not empty
+            if data.is_empty() {
+                return Err(RegistryError::Cache(CacheError::Corrupted(format!(
+                    "layer {} is empty",
+                    i
+                ))));
+            }
+
             tracing::debug!(
                 layer = i,
                 media_type = %media_type,
@@ -151,7 +169,23 @@ impl LayerUnpacker {
             );
             self.unpack_layer(data, media_type).await?;
         }
+
+        // Validate rootfs has content after all layers
+        if !self.rootfs_has_content() {
+            return Err(RegistryError::Cache(CacheError::Corrupted(
+                "rootfs empty after unpacking all layers".to_string(),
+            )));
+        }
+
         Ok(())
+    }
+
+    /// Check if the rootfs directory has any content
+    fn rootfs_has_content(&self) -> bool {
+        if let Ok(mut entries) = std::fs::read_dir(&self.rootfs_dir) {
+            return entries.next().is_some();
+        }
+        false
     }
 
     /// Unpack a gzip-compressed tar archive
@@ -630,10 +664,13 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let rootfs = temp_dir.path().join("rootfs");
 
-        // First layer: create a file
-        let layer1 = create_tar_gz(&[("to_delete.txt", b"will be deleted")]);
+        // First layer: create files - one to delete and one to keep
+        let layer1 = create_tar_gz(&[
+            ("to_delete.txt", b"will be deleted"),
+            ("keep_me.txt", b"this file stays"),
+        ]);
 
-        // Second layer: whiteout file
+        // Second layer: whiteout file to delete the specific file
         let layer2 = create_tar_gz(&[(".wh.to_delete.txt", b"")]);
 
         let mut unpacker = LayerUnpacker::new(rootfs.clone());
@@ -645,8 +682,14 @@ mod tests {
             .await
             .unwrap();
 
-        // File should be deleted
+        // The whiteout target should be deleted
         assert!(!rootfs.join("to_delete.txt").exists());
+        // The other file should still exist
+        assert!(rootfs.join("keep_me.txt").exists());
+        assert_eq!(
+            fs::read_to_string(rootfs.join("keep_me.txt")).unwrap(),
+            "this file stays"
+        );
     }
 
     #[tokio::test]
@@ -697,19 +740,24 @@ mod tests {
     fn test_media_type_detection() {
         assert_eq!(
             CompressionType::from_media_type(media_types::TAR_GZIP),
-            CompressionType::Gzip
+            Some(CompressionType::Gzip)
         );
         assert_eq!(
             CompressionType::from_media_type(media_types::DOCKER_TAR_GZIP),
-            CompressionType::Gzip
+            Some(CompressionType::Gzip)
         );
         assert_eq!(
             CompressionType::from_media_type(media_types::TAR_ZSTD),
-            CompressionType::Zstd
+            Some(CompressionType::Zstd)
         );
         assert_eq!(
             CompressionType::from_media_type(media_types::TAR),
-            CompressionType::None
+            Some(CompressionType::None)
+        );
+        // Unknown media type returns None
+        assert_eq!(
+            CompressionType::from_media_type("application/unknown"),
+            None
         );
     }
 }
