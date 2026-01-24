@@ -192,20 +192,18 @@ impl YoukiRuntime {
         let (stdout_path, stderr_path) = self.log_paths(id);
 
         // Create stdout file
-        let stdout_file = std::fs::File::create(&stdout_path).map_err(|e| {
-            AgentError::CreateFailed {
+        let stdout_file =
+            std::fs::File::create(&stdout_path).map_err(|e| AgentError::CreateFailed {
                 id: id.to_string(),
                 reason: format!("failed to create stdout log: {}", e),
-            }
-        })?;
+            })?;
 
         // Create stderr file
-        let stderr_file = std::fs::File::create(&stderr_path).map_err(|e| {
-            AgentError::CreateFailed {
+        let stderr_file =
+            std::fs::File::create(&stderr_path).map_err(|e| AgentError::CreateFailed {
                 id: id.to_string(),
                 reason: format!("failed to create stderr log: {}", e),
-            }
-        })?;
+            })?;
 
         // Convert to OwnedFd
         use std::os::unix::io::IntoRawFd;
@@ -279,11 +277,7 @@ impl Runtime for YoukiRuntime {
         let bundle_path = self.bundle_path(id);
         let container_root = self.container_root(id);
 
-        tracing::info!(
-            "Creating container {} from image {}",
-            container_id,
-            image
-        );
+        tracing::info!("Creating container {} from image {}", container_id, image);
 
         // Create bundle directory structure
         fs::create_dir_all(&bundle_path)
@@ -309,12 +303,11 @@ impl Runtime for YoukiRuntime {
         // This is a simplified version - the full bundle.rs has more comprehensive support
         let oci_spec = self.build_oci_spec(id, spec)?;
         let config_path = bundle_path.join("config.json");
-        let config_json = serde_json::to_string_pretty(&oci_spec).map_err(|e| {
-            AgentError::CreateFailed {
+        let config_json =
+            serde_json::to_string_pretty(&oci_spec).map_err(|e| AgentError::CreateFailed {
                 id: container_id.clone(),
                 reason: format!("failed to serialize OCI spec: {}", e),
-            }
-        })?;
+            })?;
         fs::write(&config_path, config_json)
             .await
             .map_err(|e| AgentError::CreateFailed {
@@ -398,12 +391,11 @@ impl Runtime for YoukiRuntime {
 
         // Load and start the container using spawn_blocking
         let pid = tokio::task::spawn_blocking(move || {
-            let mut container = Container::load(container_root).map_err(|e| {
-                AgentError::StartFailed {
+            let mut container =
+                Container::load(container_root).map_err(|e| AgentError::StartFailed {
                     id: container_id.clone(),
                     reason: format!("failed to load container: {}", e),
-                }
-            })?;
+                })?;
 
             // Start the container
             container.start().map_err(|e| AgentError::StartFailed {
@@ -445,7 +437,11 @@ impl Runtime for YoukiRuntime {
         let container_id = self.container_id_str(id);
         let container_root = self.container_root(id);
 
-        tracing::info!("Stopping container {} with {:?} timeout", container_id, timeout);
+        tracing::info!(
+            "Stopping container {} with {:?} timeout",
+            container_id,
+            timeout
+        );
 
         // Send SIGTERM first
         let container_root_clone = container_root.clone();
@@ -489,7 +485,10 @@ impl Runtime for YoukiRuntime {
 
             // Check container state
             let state = self.container_state(id).await?;
-            if matches!(state, ContainerState::Exited { .. } | ContainerState::Failed { .. }) {
+            if matches!(
+                state,
+                ContainerState::Exited { .. } | ContainerState::Failed { .. }
+            ) {
                 tracing::info!("Container {} stopped gracefully", container_id);
                 return Ok(());
             }
@@ -498,7 +497,10 @@ impl Runtime for YoukiRuntime {
         }
 
         // Timeout exceeded - send SIGKILL
-        tracing::debug!("Container {} did not stop gracefully, sending SIGKILL", container_id);
+        tracing::debug!(
+            "Container {} did not stop gracefully, sending SIGKILL",
+            container_id
+        );
 
         let container_root_clone = container_root.clone();
         let container_id_clone = container_id.clone();
@@ -734,12 +736,13 @@ impl Runtime for YoukiRuntime {
                     .with_stdout(stdout_fd)
                     .with_stderr(stderr_fd);
 
-            let container_builder = container_builder
-                .with_root_path(&container_root)
-                .map_err(|e| AgentError::CreateFailed {
-                    id: container_id_clone.clone(),
-                    reason: format!("failed to set root path: {}", e),
-                })?;
+            let container_builder =
+                container_builder
+                    .with_root_path(&container_root)
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: container_id_clone.clone(),
+                        reason: format!("failed to set root path: {}", e),
+                    })?;
 
             // Configure as tenant (joins existing namespaces)
             let tenant_builder = container_builder
@@ -748,10 +751,12 @@ impl Runtime for YoukiRuntime {
                 .with_detach(false); // Wait for completion
 
             // Execute and wait
-            let pid = tenant_builder.build().map_err(|e| AgentError::CreateFailed {
-                id: container_id_clone.clone(),
-                reason: format!("failed to exec in container: {}", e),
-            })?;
+            let pid = tenant_builder
+                .build()
+                .map_err(|e| AgentError::CreateFailed {
+                    id: container_id_clone.clone(),
+                    reason: format!("failed to exec in container: {}", e),
+                })?;
 
             Ok::<nix::unistd::Pid, AgentError>(pid)
         })
@@ -775,12 +780,8 @@ impl Runtime for YoukiRuntime {
         .unwrap_or(-1);
 
         // Read output
-        let stdout_content = fs::read_to_string(&stdout_path)
-            .await
-            .unwrap_or_default();
-        let stderr_content = fs::read_to_string(&stderr_path)
-            .await
-            .unwrap_or_default();
+        let stdout_content = fs::read_to_string(&stdout_path).await.unwrap_or_default();
+        let stderr_content = fs::read_to_string(&stderr_path).await.unwrap_or_default();
 
         // Clean up exec directory
         let _ = fs::remove_dir_all(&exec_dir).await;
@@ -914,7 +915,10 @@ mod tests {
     fn test_rootfs_path_sanitization() {
         // Test that image names are sanitized for filesystem paths
         let images = vec![
-            ("docker.io/library/nginx:latest", "docker.io_library_nginx_latest"),
+            (
+                "docker.io/library/nginx:latest",
+                "docker.io_library_nginx_latest",
+            ),
             ("ghcr.io/owner/repo:v1.0", "ghcr.io_owner_repo_v1.0"),
             (
                 "registry.example.com/image@sha256:abc123",
@@ -1022,7 +1026,11 @@ mod tests {
         // This should succeed and create all directories
         let result = YoukiRuntime::new(config.clone()).await;
 
-        assert!(result.is_ok(), "Failed to create runtime: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Failed to create runtime: {:?}",
+            result.err()
+        );
 
         // Verify directories were created
         assert!(config.state_dir.exists());

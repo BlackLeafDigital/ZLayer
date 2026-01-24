@@ -844,10 +844,7 @@ async fn test_cleanup_state_directory() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // State directory should exist
-    let state_dir = format!(
-        "{}/state/{}-{}",
-        E2E_TEST_DIR, id.service, id.replica
-    );
+    let state_dir = format!("{}/state/{}-{}", E2E_TEST_DIR, id.service, id.replica);
     let exists_before = tokio::fs::metadata(&state_dir).await.is_ok();
     println!(
         "State directory {} exists before removal: {}",

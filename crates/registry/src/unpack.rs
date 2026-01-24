@@ -62,7 +62,11 @@ impl CompressionType {
         }
 
         // Zstd magic: 0x28 0xb5 0x2f 0xfd
-        if data.len() >= 4 && data[0] == 0x28 && data[1] == 0xb5 && data[2] == 0x2f && data[3] == 0xfd
+        if data.len() >= 4
+            && data[0] == 0x28
+            && data[1] == 0xb5
+            && data[2] == 0x2f
+            && data[3] == 0xfd
         {
             return Self::Zstd;
         }
@@ -446,11 +450,7 @@ impl LayerUnpacker {
     }
 
     /// Extract a regular file
-    fn extract_file<R: Read>(
-        &self,
-        entry: &mut tar::Entry<'_, R>,
-        full_path: &Path,
-    ) -> Result<()> {
+    fn extract_file<R: Read>(&self, entry: &mut tar::Entry<'_, R>, full_path: &Path) -> Result<()> {
         // Remove existing file if present (might be a different type)
         let _ = fs::remove_file(full_path);
 
@@ -474,11 +474,7 @@ impl LayerUnpacker {
     }
 
     /// Set file permissions from tar entry
-    fn set_permissions<R: Read>(
-        &self,
-        entry: &tar::Entry<'_, R>,
-        full_path: &Path,
-    ) -> Result<()> {
+    fn set_permissions<R: Read>(&self, entry: &tar::Entry<'_, R>, full_path: &Path) -> Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

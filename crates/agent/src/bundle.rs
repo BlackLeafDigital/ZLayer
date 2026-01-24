@@ -241,11 +241,7 @@ impl BundleBuilder {
     /// # Errors
     /// - `AgentError::CreateFailed` if directory creation fails
     /// - `AgentError::InvalidSpec` if the OCI spec generation fails
-    pub async fn build(
-        &self,
-        container_id: &ContainerId,
-        spec: &ServiceSpec,
-    ) -> Result<PathBuf> {
+    pub async fn build(&self, container_id: &ContainerId, spec: &ServiceSpec) -> Result<PathBuf> {
         // Create bundle directory
         fs::create_dir_all(&self.bundle_dir)
             .await
@@ -498,9 +494,15 @@ impl BundleBuilder {
                 .destination("/proc".to_string())
                 .typ("proc".to_string())
                 .source("proc".to_string())
-                .options(vec!["nosuid".to_string(), "noexec".to_string(), "nodev".to_string()])
+                .options(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                ])
                 .build()
-                .map_err(|e| AgentError::InvalidSpec(format!("failed to build /proc mount: {}", e)))?,
+                .map_err(|e| {
+                    AgentError::InvalidSpec(format!("failed to build /proc mount: {}", e))
+                })?,
         );
 
         // /dev
@@ -516,7 +518,9 @@ impl BundleBuilder {
                     "size=65536k".to_string(),
                 ])
                 .build()
-                .map_err(|e| AgentError::InvalidSpec(format!("failed to build /dev mount: {}", e)))?,
+                .map_err(|e| {
+                    AgentError::InvalidSpec(format!("failed to build /dev mount: {}", e))
+                })?,
         );
 
         // /dev/pts
@@ -564,7 +568,11 @@ impl BundleBuilder {
                 .destination("/dev/mqueue".to_string())
                 .typ("mqueue".to_string())
                 .source("mqueue".to_string())
-                .options(vec!["nosuid".to_string(), "noexec".to_string(), "nodev".to_string()])
+                .options(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                ])
                 .build()
                 .map_err(|e| {
                     AgentError::InvalidSpec(format!("failed to build /dev/mqueue mount: {}", e))
@@ -573,7 +581,11 @@ impl BundleBuilder {
 
         // /sys - read-only unless privileged
         let sys_options = if spec.privileged {
-            vec!["nosuid".to_string(), "noexec".to_string(), "nodev".to_string()]
+            vec![
+                "nosuid".to_string(),
+                "noexec".to_string(),
+                "nodev".to_string(),
+            ]
         } else {
             vec![
                 "nosuid".to_string(),
@@ -590,7 +602,9 @@ impl BundleBuilder {
                 .source("sysfs".to_string())
                 .options(sys_options)
                 .build()
-                .map_err(|e| AgentError::InvalidSpec(format!("failed to build /sys mount: {}", e)))?,
+                .map_err(|e| {
+                    AgentError::InvalidSpec(format!("failed to build /sys mount: {}", e))
+                })?,
         );
 
         // /sys/fs/cgroup - for cgroup access
@@ -659,9 +673,7 @@ impl BundleBuilder {
         // Set masked/readonly paths based on privileged mode
         if spec.privileged {
             // Privileged containers get no masked paths (full access)
-            linux_builder = linux_builder
-                .masked_paths(vec![])
-                .readonly_paths(vec![]);
+            linux_builder = linux_builder.masked_paths(vec![]).readonly_paths(vec![]);
         } else {
             // Set masked paths for security (hide sensitive host info)
             let masked_paths = vec![
@@ -713,7 +725,9 @@ impl BundleBuilder {
                 .quota(quota)
                 .period(100_000u64)
                 .build()
-                .map_err(|e| AgentError::InvalidSpec(format!("failed to build CPU limits: {}", e)))?;
+                .map_err(|e| {
+                    AgentError::InvalidSpec(format!("failed to build CPU limits: {}", e))
+                })?;
 
             resources_builder = resources_builder.cpu(cpu);
             has_resources = true;
@@ -783,14 +797,14 @@ impl BundleBuilder {
             // Allow standard container devices
             // /dev/null, /dev/zero, /dev/full, /dev/random, /dev/urandom, /dev/tty
             let standard_char_devices = [
-                (1, 3, "rwm"),  // /dev/null
-                (1, 5, "rwm"),  // /dev/zero
-                (1, 7, "rwm"),  // /dev/full
-                (1, 8, "rwm"),  // /dev/random
-                (1, 9, "rwm"),  // /dev/urandom
-                (5, 0, "rwm"),  // /dev/tty
-                (5, 1, "rwm"),  // /dev/console
-                (5, 2, "rwm"),  // /dev/ptmx
+                (1, 3, "rwm"),    // /dev/null
+                (1, 5, "rwm"),    // /dev/zero
+                (1, 7, "rwm"),    // /dev/full
+                (1, 8, "rwm"),    // /dev/random
+                (1, 9, "rwm"),    // /dev/urandom
+                (5, 0, "rwm"),    // /dev/tty
+                (5, 1, "rwm"),    // /dev/console
+                (5, 2, "rwm"),    // /dev/ptmx
                 (136, -1, "rwm"), // /dev/pts/* (wildcard minor)
             ];
 
@@ -1122,7 +1136,9 @@ services:
 
         // Check that masked paths are NOT set for privileged
         let linux = oci_spec.linux().as_ref().unwrap();
-        assert!(linux.masked_paths().is_none() || linux.masked_paths().as_ref().unwrap().is_empty());
+        assert!(
+            linux.masked_paths().is_none() || linux.masked_paths().as_ref().unwrap().is_empty()
+        );
     }
 
     #[test]
