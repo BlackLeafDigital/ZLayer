@@ -54,7 +54,7 @@ pub struct DeploymentSpec {
 
     /// Service definitions
     #[serde(default)]
-    #[validate]
+    #[validate(nested)]
     pub services: HashMap<String, ServiceSpec>,
 }
 
@@ -67,12 +67,12 @@ pub struct ServiceSpec {
     pub rtype: ResourceType,
 
     /// Container image specification
-    #[validate]
+    #[validate(nested)]
     pub image: ImageSpec,
 
     /// Resource limits
     #[serde(default)]
-    #[validate]
+    #[validate(nested)]
     pub resources: ResourcesSpec,
 
     /// Environment variables
@@ -85,7 +85,7 @@ pub struct ServiceSpec {
 
     /// Endpoint definitions (proxy bindings)
     #[serde(default)]
-    #[validate]
+    #[validate(nested)]
     pub endpoints: Vec<EndpointSpec>,
 
     /// Scaling configuration

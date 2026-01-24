@@ -239,29 +239,63 @@ impl Runtime for YoukiRuntime {
         // Check if rootfs already exists
         if rootfs_path.exists() {
             tracing::debug!(
-                "Rootfs already exists at {}, skipping pull",
-                rootfs_path.display()
+                rootfs = %rootfs_path.display(),
+                "rootfs already exists, skipping pull"
             );
             return Ok(());
         }
 
-        tracing::info!("Pulling image {} to {}", image, rootfs_path.display());
+        tracing::info!(
+            image = %image,
+            rootfs = %rootfs_path.display(),
+            "pulling image"
+        );
 
-        // Create the rootfs directory
-        fs::create_dir_all(&rootfs_path)
+        // Initialize blob cache
+        let cache_path = self.config.cache_dir.join("blobs.redb");
+        let cache = std::sync::Arc::new(
+            registry::BlobCache::open(&cache_path).map_err(|e| AgentError::PullFailed {
+                image: image.to_string(),
+                reason: format!("failed to open blob cache: {}", e),
+            })?,
+        );
+
+        // Create image puller
+        let puller = registry::ImagePuller::new(cache);
+
+        // Use anonymous auth by default
+        // TODO: Support authenticated pulls via config
+        let auth = registry::RegistryAuth::Anonymous;
+
+        // Pull image layers from registry
+        let layers = puller
+            .pull_image(image, &auth)
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
-                reason: format!("failed to create rootfs directory: {}", e),
+                reason: format!("failed to pull image: {}", e),
             })?;
 
-        // TODO: Implement full OCI image pull using registry crate
-        // For now, this serves as a placeholder that expects rootfs to be pre-populated
-        // The registry crate provides ImagePuller and LayerUnpacker for this purpose
+        tracing::debug!(
+            image = %image,
+            layer_count = layers.len(),
+            "image layers pulled, unpacking to rootfs"
+        );
 
-        tracing::warn!(
-            "Image pull not fully implemented - rootfs at {} should be pre-populated",
-            rootfs_path.display()
+        // Unpack layers to rootfs
+        let mut unpacker = registry::LayerUnpacker::new(rootfs_path.clone());
+        unpacker
+            .unpack_layers(&layers)
+            .await
+            .map_err(|e| AgentError::PullFailed {
+                image: image.to_string(),
+                reason: format!("failed to unpack layers: {}", e),
+            })?;
+
+        tracing::info!(
+            image = %image,
+            rootfs = %rootfs_path.display(),
+            "image pull complete"
         );
 
         Ok(())
@@ -758,7 +792,9 @@ impl Runtime for YoukiRuntime {
                     reason: format!("failed to exec in container: {}", e),
                 })?;
 
-            Ok::<nix::unistd::Pid, AgentError>(pid)
+            // Return raw pid as i32 to avoid nix version conflicts
+            // (libcontainer uses nix 0.29, we use nix 0.31)
+            Ok::<i32, AgentError>(pid.as_raw())
         })
         .await
         .map_err(|e| AgentError::CreateFailed {
@@ -769,7 +805,10 @@ impl Runtime for YoukiRuntime {
         // Wait for process to complete and get exit status
         let exit_code = tokio::task::spawn_blocking(move || {
             use nix::sys::wait::{waitpid, WaitStatus};
-            match waitpid(exec_pid, None) {
+            use nix::unistd::Pid;
+            // Convert raw pid back to our nix version's Pid type
+            let pid = Pid::from_raw(exec_pid);
+            match waitpid(pid, None) {
                 Ok(WaitStatus::Exited(_, code)) => code,
                 Ok(WaitStatus::Signaled(_, signal, _)) => 128 + signal as i32,
                 Ok(_) => -1,

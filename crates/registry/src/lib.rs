@@ -11,3 +11,6 @@ pub use cache::*;
 pub use client::*;
 pub use error::*;
 pub use unpack::*;
+
+// Re-export oci_client types that users need
+pub use oci_client::secrets::RegistryAuth;

@@ -2,8 +2,9 @@
 
 use crate::cache::BlobCache;
 use crate::error::{RegistryError, Result};
-use oci_distribution::{
+use oci_client::{
     client::{ClientConfig, ClientProtocol},
+    manifest::{OciDescriptor, OciImageManifest},
     secrets::RegistryAuth,
     Reference,
 };
@@ -13,7 +14,7 @@ use tokio::sync::Semaphore;
 
 /// OCI image puller with caching
 pub struct ImagePuller {
-    client: oci_distribution::Client,
+    client: oci_client::Client,
     cache: Arc<BlobCache>,
     concurrency_limit: Arc<Semaphore>,
 }
@@ -25,7 +26,7 @@ impl ImagePuller {
             protocol: ClientProtocol::Https,
             ..Default::default()
         };
-        let client = oci_distribution::Client::new(config);
+        let client = oci_client::Client::new(config);
 
         Self {
             client,
@@ -41,6 +42,9 @@ impl ImagePuller {
     }
 
     /// Pull a single blob and cache it
+    ///
+    /// Note: Authentication is handled internally by the oci_client.
+    /// The `auth` parameter is reserved for future use with explicit auth flows.
     pub async fn pull_blob(
         &self,
         image: &str,
@@ -49,6 +53,7 @@ impl ImagePuller {
     ) -> Result<Vec<u8>> {
         // Check cache first
         if let Some(data) = self.cache.get(digest)? {
+            tracing::debug!(digest = %digest, "blob found in cache");
             return Ok(data);
         }
 
@@ -59,14 +64,22 @@ impl ImagePuller {
 
         let _permit = self.concurrency_limit.acquire().await.unwrap();
 
+        tracing::debug!(digest = %digest, image = %image, "pulling blob from registry");
+
         // Pull from registry into memory
         let mut buffer = Vec::new();
         {
             let mut writer = BufWriter::new(&mut buffer);
+            // Create an OciDescriptor with the digest (oci-distribution 0.11+ API)
+            let descriptor = OciDescriptor {
+                digest: digest.to_string(),
+                ..Default::default()
+            };
             self.client
-                .pull_blob(&reference, digest, &mut writer)
+                .pull_blob(&reference, &descriptor, &mut writer)
                 .await
-                .map_err(|_e| {
+                .map_err(|e| {
+                    tracing::error!(error = %e, digest = %digest, "failed to pull blob");
                     RegistryError::Cache(crate::error::CacheError::NotFound {
                         digest: digest.to_string(),
                     })
@@ -82,7 +95,84 @@ impl ImagePuller {
         // Cache the blob
         self.cache.put(digest, &buffer)?;
 
+        tracing::debug!(digest = %digest, size = buffer.len(), "blob cached successfully");
+
         Ok(buffer)
+    }
+
+    /// Pull an image manifest from the registry
+    ///
+    /// Returns the manifest and its digest.
+    pub async fn pull_manifest(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+    ) -> Result<(OciImageManifest, String)> {
+        let reference: Reference = image.parse().map_err(|_| RegistryError::NotFound {
+            registry: "unknown".to_string(),
+            image: image.to_string(),
+        })?;
+
+        tracing::info!(image = %image, "pulling manifest from registry");
+
+        let (manifest, digest) = self
+            .client
+            .pull_image_manifest(&reference, auth)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, image = %image, "failed to pull manifest");
+                RegistryError::Oci(e)
+            })?;
+
+        tracing::debug!(
+            image = %image,
+            digest = %digest,
+            layers = manifest.layers.len(),
+            "manifest pulled successfully"
+        );
+
+        Ok((manifest, digest))
+    }
+
+    /// Pull a complete image (manifest + all layers)
+    ///
+    /// Returns a vector of (layer_data, media_type) tuples in order (base layer first).
+    pub async fn pull_image(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+    ) -> Result<Vec<(Vec<u8>, String)>> {
+        // Pull manifest first
+        let (manifest, _digest) = self.pull_manifest(image, auth).await?;
+
+        tracing::info!(
+            image = %image,
+            layer_count = manifest.layers.len(),
+            "pulling image layers"
+        );
+
+        // Pull each layer in order
+        let mut layers = Vec::with_capacity(manifest.layers.len());
+        for (i, layer) in manifest.layers.iter().enumerate() {
+            tracing::debug!(
+                layer = i,
+                digest = %layer.digest,
+                media_type = %layer.media_type,
+                size = layer.size,
+                "pulling layer"
+            );
+
+            let data = self.pull_blob(image, &layer.digest, auth).await?;
+            layers.push((data, layer.media_type.clone()));
+        }
+
+        tracing::info!(
+            image = %image,
+            layers_pulled = layers.len(),
+            "image pull complete"
+        );
+
+        Ok(layers)
     }
 }
 

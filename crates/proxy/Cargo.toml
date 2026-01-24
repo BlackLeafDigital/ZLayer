@@ -10,7 +10,7 @@ rust-version.workspace = true
 # HTTP server
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-http = "1.0"
+http = "1.4"
 http-body-util = "0.1"
 bytes = "1"
 

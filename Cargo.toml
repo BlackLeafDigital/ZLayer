@@ -34,26 +34,26 @@ anyhow = "1"
 thiserror = "2"
 
 # Async runtime
-tokio = { version = "1.35", features = ["full", "tracing"] }
+tokio = { version = "1.49", features = ["full", "tracing"] }
 
 # Logging/tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "fmt"] }
 tracing-appender = "0.2"
-tracing-opentelemetry = "0.28"
+tracing-opentelemetry = "0.32"
 
 # OpenTelemetry
-opentelemetry = "0.27"
-opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["tonic"] }
+opentelemetry = "0.31"
+opentelemetry_sdk = { version = "0.31", features = ["rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace"] }
 
 # Time handling
 chrono = { version = "0.4", features = ["serde"] }
 time = { version = "0.3", features = ["serde"] }
 
 # HTTP/client
-reqwest = { version = "0.11", features = ["json"] }
-hyper = { version = "1.0", features = ["full", "http2"] }
+reqwest = { version = "0.13", features = ["json"] }
+hyper = { version = "1.8", features = ["full", "http2"] }
 hyper-util = { version = "0.1", features = ["full"] }
 
 # TLS
@@ -62,34 +62,31 @@ rustls-pemfile = "2"
 tokio-rustls = "0.26"
 
 # Tower middleware
-tower = { version = "0.4", features = ["full"] }
-tower-http = { version = "0.5", features = ["full"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["full"] }
 
 # Web framework (for API)
-axum = { version = "0.7", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 
 # JWT Authentication
 jsonwebtoken = "9"
 
 # OpenAPI documentation
 utoipa = { version = "5", features = ["axum_extras"] }
-utoipa-swagger-ui = { version = "8", features = ["axum"] }
+utoipa-swagger-ui = { version = "9", features = ["axum"] }
 
 # Rate limiting
-governor = "0.7"
-tower_governor = "0.4"
+governor = "0.10"
+tower_governor = "0.8"
 
 # Consensus
 openraft = { version = "0.9", features = ["serde"] }
 
 # Metrics
 prometheus = "0.13"
-metrics = "0.21"
-metrics-exporter-prometheus = "0.13"
-
-# OCI/Container
-oci-distribution = "0.10"
-oci-spec = "0.6"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.18"
+oci-spec = "0.8"
 
 # Async traits
 async-trait = "0.1"
@@ -105,17 +102,17 @@ trust-dns-server = "0.23"
 trust-dns-client = "0.23"
 
 # Storage
-redb = "0.14"
+redb = "2.2"
 
 # Config
-config = "0.14"
+config = "0.15"
 
 # UUID
-uuid = { version = "1.6", features = ["v4", "serde"] }
+uuid = { version = "1.19", features = ["v4", "serde"] }
 
 # Unix/Linux system calls
 libc = "0.2"
-nix = { version = "0.29", features = ["fs", "signal", "process"] }
+nix = { version = "0.31", features = ["fs", "signal", "process"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }
@@ -124,7 +121,7 @@ clap = { version = "4", features = ["derive"] }
 base64 = "0.22"
 
 # Validation
-validator = { version = "0.16", features = ["derive"] }
+validator = { version = "0.19", features = ["derive"] }
 
 # =============================================================================
 # Build Profiles

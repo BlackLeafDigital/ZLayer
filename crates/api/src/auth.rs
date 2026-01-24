@@ -3,7 +3,6 @@
 //! Provides token creation, verification, and Axum request extractors.
 
 use axum::{
-    async_trait,
     extract::FromRequestParts,
     http::{header::AUTHORIZATION, request::Parts},
 };
@@ -130,7 +129,6 @@ pub struct AuthState {
 }
 
 /// Axum extractor for authenticated users
-#[async_trait]
 impl<S> FromRequestParts<S> for AuthUser
 where
     S: Send + Sync,
@@ -150,7 +148,9 @@ where
             .headers
             .get(AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .ok_or_else(|| ApiError::Unauthorized("Missing Authorization header".to_string()))?;
+            .ok_or_else(|| {
+                ApiError::Unauthorized("Missing Authorization header".to_string())
+            })?;
 
         // Parse Bearer token
         let token = auth_header.strip_prefix("Bearer ").ok_or_else(|| {
@@ -173,7 +173,6 @@ where
 #[derive(Debug, Clone)]
 pub struct OptionalAuthUser(pub Option<AuthUser>);
 
-#[async_trait]
 impl<S> FromRequestParts<S> for OptionalAuthUser
 where
     S: Send + Sync,

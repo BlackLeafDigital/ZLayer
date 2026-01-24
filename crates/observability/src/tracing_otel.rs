@@ -5,7 +5,7 @@
 use opentelemetry::{global, trace::TracerProvider as _, KeyValue};
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::{
-    trace::{RandomIdGenerator, Sampler, TracerProvider},
+    trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
     Resource,
 };
 use tracing_opentelemetry::OpenTelemetryLayer;
@@ -16,13 +16,16 @@ use crate::error::{ObservabilityError, Result};
 
 /// Guard that shuts down the tracer provider when dropped
 pub struct TracingGuard {
-    _provider: Option<TracerProvider>,
+    _provider: Option<SdkTracerProvider>,
 }
 
 impl Drop for TracingGuard {
     fn drop(&mut self) {
-        if self._provider.is_some() {
-            global::shutdown_tracer_provider();
+        if let Some(ref provider) = self._provider {
+            // Use the provider's shutdown method directly (0.31+ API)
+            if let Err(e) = provider.shutdown() {
+                tracing::warn!("Error shutting down tracer provider: {:?}", e);
+            }
         }
     }
 }
@@ -47,7 +50,7 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
         )
     })?;
 
-    // Build the OTLP exporter
+    // Build the OTLP exporter (0.31+ API: with_tonic() first, then configure)
     let exporter = opentelemetry_otlp::SpanExporter::builder()
         .with_tonic()
         .with_endpoint(endpoint)
@@ -63,15 +66,17 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
         Sampler::TraceIdRatioBased(config.sampling_ratio)
     };
 
-    // Build the tracer provider with batch exporter
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    // Build the tracer provider with batch exporter (0.31+ API)
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_sampler(sampler)
         .with_id_generator(RandomIdGenerator::default())
-        .with_resource(Resource::new(vec![
-            KeyValue::new("service.name", config.service_name.clone()),
-            KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
-        ]))
+        .with_resource(
+            Resource::builder_empty()
+                .with_service_name(config.service_name.clone())
+                .with_attribute(KeyValue::new("service.version", env!("CARGO_PKG_VERSION")))
+                .build(),
+        )
         .build();
 
     // Set the global tracer provider
@@ -122,14 +127,15 @@ pub fn create_otel_layer(
         Sampler::TraceIdRatioBased(config.sampling_ratio)
     };
 
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+    let provider = SdkTracerProvider::builder()
+        .with_batch_exporter(exporter)
         .with_sampler(sampler)
         .with_id_generator(RandomIdGenerator::default())
-        .with_resource(Resource::new(vec![KeyValue::new(
-            "service.name",
-            config.service_name.clone(),
-        )]))
+        .with_resource(
+            Resource::builder_empty()
+                .with_service_name(config.service_name.clone())
+                .build(),
+        )
         .build();
 
     let tracer = provider.tracer("zlayer");

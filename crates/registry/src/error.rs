@@ -1,6 +1,6 @@
 //! Registry error types
 
-use oci_distribution::errors::OciDistributionError;
+use oci_client::errors::OciDistributionError;
 use thiserror::Error;
 
 /// Registry-specific errors

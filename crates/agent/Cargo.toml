@@ -23,6 +23,7 @@ uuid.workspace = true
 zlayer-core = { version = "0.1.0", path = "../zlayer-core" }
 proxy = { version = "0.1.0", path = "../proxy" }
 libcontainer = "0.5"
+registry = { version = "0.1.0", path = "../registry" }
 
 [dev-dependencies]
-rand = "0.8"
+rand = "0.9"
