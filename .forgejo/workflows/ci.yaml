@@ -256,6 +256,12 @@ jobs:
           ctr version
           ctr namespace ls
 
+          # Debug: show available snapshotters
+          echo "=== Available snapshotters ==="
+          ctr plugins ls | grep -i snapshot
+          echo "=== Containerd config ==="
+          cat /etc/containerd/config.toml | head -50
+
       - name: Create test namespace
         run: ctr namespace create zlayer-e2e-test || true
 
