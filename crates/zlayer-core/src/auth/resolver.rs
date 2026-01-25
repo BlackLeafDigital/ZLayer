@@ -16,10 +16,7 @@ pub enum AuthSource {
     Anonymous,
 
     /// Basic authentication with username and password
-    Basic {
-        username: String,
-        password: String,
-    },
+    Basic { username: String, password: String },
 
     /// Load from Docker config.json
     DockerConfig,
@@ -212,10 +209,7 @@ mod tests {
     #[test]
     fn test_extract_registry() {
         assert_eq!(AuthResolver::extract_registry("ubuntu"), "docker.io");
-        assert_eq!(
-            AuthResolver::extract_registry("ubuntu:latest"),
-            "docker.io"
-        );
+        assert_eq!(AuthResolver::extract_registry("ubuntu:latest"), "docker.io");
         assert_eq!(
             AuthResolver::extract_registry("library/ubuntu"),
             "docker.io"
@@ -248,10 +242,7 @@ mod tests {
         let resolver = AuthResolver::new(config);
         let auth = resolver.resolve("ubuntu:latest");
 
-        assert!(matches!(
-            auth,
-            oci_client::secrets::RegistryAuth::Anonymous
-        ));
+        assert!(matches!(auth, oci_client::secrets::RegistryAuth::Anonymous));
     }
 
     #[test]
@@ -304,10 +295,7 @@ mod tests {
 
         // Should use default (anonymous) for docker.io
         let auth = resolver.resolve("ubuntu:latest");
-        assert!(matches!(
-            auth,
-            oci_client::secrets::RegistryAuth::Anonymous
-        ));
+        assert!(matches!(auth, oci_client::secrets::RegistryAuth::Anonymous));
     }
 
     #[test]
@@ -352,9 +340,6 @@ mod tests {
         let resolver = AuthResolver::new(config);
         let auth = resolver.resolve("ubuntu:latest");
 
-        assert!(matches!(
-            auth,
-            oci_client::secrets::RegistryAuth::Anonymous
-        ));
+        assert!(matches!(auth, oci_client::secrets::RegistryAuth::Anonymous));
     }
 }

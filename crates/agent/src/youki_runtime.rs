@@ -141,7 +141,10 @@ impl YoukiRuntime {
     }
 
     /// Create a new YoukiRuntime with custom auth configuration
-    pub async fn with_auth(config: YoukiConfig, auth_config: zlayer_core::AuthConfig) -> Result<Self> {
+    pub async fn with_auth(
+        config: YoukiConfig,
+        auth_config: zlayer_core::AuthConfig,
+    ) -> Result<Self> {
         // Ensure directories exist
         for dir in [
             &config.state_dir,

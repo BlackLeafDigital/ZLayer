@@ -15,7 +15,7 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     SnapshotResponse, VoteRequest, VoteResponse,
 };
-use openraft::{Vote, Snapshot};
+use openraft::{Snapshot, Vote};
 use serde::Deserialize;
 use tracing::{debug, error};
 

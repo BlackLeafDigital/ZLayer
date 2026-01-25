@@ -6,10 +6,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{
-    routing::post,
-    Router,
-};
+use axum::{routing::post, Router};
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
@@ -67,9 +64,9 @@ impl RaftService {
 
         info!(address = %addr, "Starting Raft RPC server");
 
-        let listener = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| crate::error::SchedulerError::Network(format!("Failed to bind to {}: {}", addr, e)))?;
+        let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+            crate::error::SchedulerError::Network(format!("Failed to bind to {}: {}", addr, e))
+        })?;
 
         axum::serve(listener, app)
             .await

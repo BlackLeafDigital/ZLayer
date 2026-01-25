@@ -387,9 +387,7 @@ impl RaftNetwork<TypeConfig> for ZLayerNetworkConnection {
             .append_entries(&self.target_addr, rpc)
             .await
             .map_err(|e| {
-                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
-                    e.to_string(),
-                )))
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
             })
     }
 
@@ -406,9 +404,7 @@ impl RaftNetwork<TypeConfig> for ZLayerNetworkConnection {
             .install_snapshot(&self.target_addr, rpc)
             .await
             .map_err(|e| {
-                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
-                    e.to_string(),
-                )))
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
             })
     }
 
@@ -419,14 +415,9 @@ impl RaftNetwork<TypeConfig> for ZLayerNetworkConnection {
     ) -> std::result::Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>
     {
         debug!(target = %self.target_addr, "Sending vote RPC");
-        self.client
-            .vote(&self.target_addr, rpc)
-            .await
-            .map_err(|e| {
-                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
-                    e.to_string(),
-                )))
-            })
+        self.client.vote(&self.target_addr, rpc).await.map_err(|e| {
+            RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
+        })
     }
 
     async fn full_snapshot(
@@ -442,21 +433,17 @@ impl RaftNetwork<TypeConfig> for ZLayerNetworkConnection {
         // Read snapshot data into a buffer
         let mut snapshot_data = Vec::new();
         let mut snapshot_reader = snapshot.snapshot;
-        std::io::Read::read_to_end(&mut snapshot_reader, &mut snapshot_data)
-            .map_err(|e| {
-                StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(
-                    format!("Failed to read snapshot: {}", e),
-                )))
-            })?;
+        std::io::Read::read_to_end(&mut snapshot_reader, &mut snapshot_data).map_err(|e| {
+            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
+                "Failed to read snapshot: {}",
+                e
+            ))))
+        })?;
 
         self.client
             .full_snapshot(&self.target_addr, vote, snapshot_data)
             .await
-            .map_err(|e| {
-                StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(
-                    e,
-                )))
-            })
+            .map_err(|e| StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(e))))
     }
 }
 

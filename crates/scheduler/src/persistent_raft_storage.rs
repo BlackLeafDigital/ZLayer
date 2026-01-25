@@ -296,13 +296,16 @@ impl PersistentLogStore {
         })?;
 
         // Get the last entry using reverse iteration
-        let last_entry = table.iter().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?.last();
+        let last_entry = table
+            .iter()
+            .map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Read,
+                    std::io::Error::other(e),
+                )
+            })?
+            .last();
 
         if let Some(entry) = last_entry {
             let (_, value) = entry.map_err(|e| {
@@ -806,13 +809,15 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
                     )
                 })?;
 
-                table.insert(entry.log_id.index, bytes.as_slice()).map_err(|e| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Write,
-                        std::io::Error::other(e),
-                    )
-                })?;
+                table
+                    .insert(entry.log_id.index, bytes.as_slice())
+                    .map_err(|e| {
+                        StorageError::from_io_error(
+                            openraft::ErrorSubject::Logs,
+                            openraft::ErrorVerb::Write,
+                            std::io::Error::other(e),
+                        )
+                    })?;
             }
         }
 
@@ -859,14 +864,13 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
                     )
                 })?
                 .map(|item| {
-                    item.map(|(k, _)| k.value())
-                        .map_err(|e| {
-                            StorageError::from_io_error(
-                                openraft::ErrorSubject::Logs,
-                                openraft::ErrorVerb::Read,
-                                std::io::Error::other(e),
-                            )
-                        })
+                    item.map(|(k, _)| k.value()).map_err(|e| {
+                        StorageError::from_io_error(
+                            openraft::ErrorSubject::Logs,
+                            openraft::ErrorVerb::Read,
+                            std::io::Error::other(e),
+                        )
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -922,14 +926,13 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
                     )
                 })?
                 .map(|item| {
-                    item.map(|(k, _)| k.value())
-                        .map_err(|e| {
-                            StorageError::from_io_error(
-                                openraft::ErrorSubject::Logs,
-                                openraft::ErrorVerb::Read,
-                                std::io::Error::other(e),
-                            )
-                        })
+                    item.map(|(k, _)| k.value()).map_err(|e| {
+                        StorageError::from_io_error(
+                            openraft::ErrorSubject::Logs,
+                            openraft::ErrorVerb::Read,
+                            std::io::Error::other(e),
+                        )
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
@@ -995,7 +998,8 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
                     responses.push(resp);
                 }
                 EntryPayload::Membership(mem) => {
-                    applied.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
+                    applied.last_membership =
+                        StoredMembership::new(Some(entry.log_id), mem.clone());
                     responses.push(Response::Success { data: None });
                 }
             }
@@ -1074,13 +1078,16 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         })?;
 
         // Get the latest snapshot (last entry)
-        let latest_meta = meta_table.iter().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Snapshot(None),
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?.last();
+        let latest_meta = meta_table
+            .iter()
+            .map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Snapshot(None),
+                    openraft::ErrorVerb::Read,
+                    std::io::Error::other(e),
+                )
+            })?
+            .last();
 
         if let Some(meta_entry) = latest_meta {
             let (snapshot_id, meta_bytes) = meta_entry.map_err(|e| {
@@ -1246,9 +1253,7 @@ mod tests {
         assert_eq!(snapshot.meta.snapshot_id, "0-0");
 
         // Verify snapshot was saved
-        let current = RaftStorage::get_current_snapshot(&mut store)
-            .await
-            .unwrap();
+        let current = RaftStorage::get_current_snapshot(&mut store).await.unwrap();
         assert!(current.is_some());
         let current = current.unwrap();
         assert_eq!(current.meta.snapshot_id, "0-0");

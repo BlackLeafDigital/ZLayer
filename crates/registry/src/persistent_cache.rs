@@ -126,9 +126,9 @@ impl PersistentBlobCache {
             CacheError::Database(format!("failed to begin read transaction: {}", e))
         })?;
 
-        let table = read_txn.open_table(BLOB_DATA).map_err(|e| {
-            CacheError::Database(format!("failed to open blob_data table: {}", e))
-        })?;
+        let table = read_txn
+            .open_table(BLOB_DATA)
+            .map_err(|e| CacheError::Database(format!("failed to open blob_data table: {}", e)))?;
 
         let result = table
             .get(digest)
@@ -206,9 +206,9 @@ impl PersistentBlobCache {
             })?;
 
             // Store blob data
-            data_table.insert(digest, data).map_err(|e| {
-                CacheError::Database(format!("failed to insert blob: {}", e))
-            })?;
+            data_table
+                .insert(digest, data)
+                .map_err(|e| CacheError::Database(format!("failed to insert blob: {}", e)))?;
 
             // Store metadata
             let metadata = BlobMetadata::new(data.len() as u64);
@@ -237,9 +237,9 @@ impl PersistentBlobCache {
             CacheError::Database(format!("failed to begin read transaction: {}", e))
         })?;
 
-        let table = read_txn.open_table(BLOB_DATA).map_err(|e| {
-            CacheError::Database(format!("failed to open blob_data table: {}", e))
-        })?;
+        let table = read_txn
+            .open_table(BLOB_DATA)
+            .map_err(|e| CacheError::Database(format!("failed to open blob_data table: {}", e)))?;
 
         let exists = table
             .get(digest)
@@ -266,13 +266,13 @@ impl PersistentBlobCache {
                 CacheError::Database(format!("failed to open blob_metadata table: {}", e))
             })?;
 
-            data_table.remove(digest).map_err(|e| {
-                CacheError::Database(format!("failed to remove blob: {}", e))
-            })?;
+            data_table
+                .remove(digest)
+                .map_err(|e| CacheError::Database(format!("failed to remove blob: {}", e)))?;
 
-            meta_table.remove(digest).map_err(|e| {
-                CacheError::Database(format!("failed to remove metadata: {}", e))
-            })?;
+            meta_table
+                .remove(digest)
+                .map_err(|e| CacheError::Database(format!("failed to remove metadata: {}", e)))?;
         }
 
         write_txn
@@ -295,12 +295,12 @@ impl PersistentBlobCache {
         })?;
 
         let mut total_size = 0u64;
-        for entry in table.iter().map_err(|e| {
-            CacheError::Database(format!("failed to iterate metadata: {}", e))
-        })? {
-            let (_, value) = entry.map_err(|e| {
-                CacheError::Database(format!("failed to read entry: {}", e))
-            })?;
+        for entry in table
+            .iter()
+            .map_err(|e| CacheError::Database(format!("failed to iterate metadata: {}", e)))?
+        {
+            let (_, value) =
+                entry.map_err(|e| CacheError::Database(format!("failed to read entry: {}", e)))?;
             if let Some(metadata) = BlobMetadata::deserialize(value.value()) {
                 total_size += metadata.size_bytes;
             }
@@ -315,13 +315,13 @@ impl PersistentBlobCache {
             CacheError::Database(format!("failed to begin read transaction: {}", e))
         })?;
 
-        let table = read_txn.open_table(BLOB_DATA).map_err(|e| {
-            CacheError::Database(format!("failed to open blob_data table: {}", e))
-        })?;
+        let table = read_txn
+            .open_table(BLOB_DATA)
+            .map_err(|e| CacheError::Database(format!("failed to open blob_data table: {}", e)))?;
 
-        let count = table.len().map_err(|e| {
-            CacheError::Database(format!("failed to get table length: {}", e))
-        })?;
+        let count = table
+            .len()
+            .map_err(|e| CacheError::Database(format!("failed to get table length: {}", e)))?;
 
         Ok(count)
     }
@@ -385,12 +385,12 @@ impl PersistentBlobCache {
                 CacheError::Database(format!("failed to open blob_metadata table: {}", e))
             })?;
 
-            for entry in table.iter().map_err(|e| {
-                CacheError::Database(format!("failed to iterate metadata: {}", e))
-            })? {
-                let (key, value) = entry.map_err(|e| {
-                    CacheError::Database(format!("failed to read entry: {}", e))
-                })?;
+            for entry in table
+                .iter()
+                .map_err(|e| CacheError::Database(format!("failed to iterate metadata: {}", e)))?
+            {
+                let (key, value) = entry
+                    .map_err(|e| CacheError::Database(format!("failed to read entry: {}", e)))?;
                 if let Some(metadata) = BlobMetadata::deserialize(value.value()) {
                     entries.push((key.value().to_string(), metadata));
                 }
@@ -563,7 +563,8 @@ mod tests {
         let (cache, _temp) = create_test_cache();
 
         let data = b"test data";
-        let wrong_digest = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let wrong_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
         let result = cache.put(wrong_digest, data);
         assert!(result.is_err());
@@ -610,7 +611,11 @@ mod tests {
         let final_size = cache.size().unwrap();
 
         // data3 (just added) should always remain
-        assert!(has_data3, "data3 should remain (just added). data1={}, data2={}, data3={}, size={}", has_data1, has_data2, has_data3, final_size);
+        assert!(
+            has_data3,
+            "data3 should remain (just added). data1={}, data2={}, data3={}, size={}",
+            has_data1, has_data2, has_data3, final_size
+        );
 
         // At least one should be evicted
         assert!(
