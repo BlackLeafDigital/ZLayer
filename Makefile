@@ -53,6 +53,22 @@ test-observability:
 test-agent:
 	cargo test --package agent
 
+# E2E tests requiring root (youki/libcontainer)
+test-e2e:
+	@echo "Cleaning up leftover state..."
+	sudo rm -rf /tmp/zlayer-youki-e2e-test/state/* 2>/dev/null || true
+	@echo "Running E2E tests with root privileges..."
+	sudo -E env "PATH=$(HOME)/.cargo/bin:$(PATH)" \
+		cargo test --package agent --test youki_e2e -- --nocapture --test-threads=1
+
+# Run specific E2E test (usage: make test-e2e-single TEST=test_cleanup_state_directory)
+test-e2e-single:
+	@echo "Cleaning up leftover state..."
+	sudo rm -rf /tmp/zlayer-youki-e2e-test/state/* 2>/dev/null || true
+	@echo "Running E2E test: $(TEST)"
+	sudo -E env "PATH=$(HOME)/.cargo/bin:$(PATH)" \
+		cargo test --package agent --test youki_e2e $(TEST) -- --nocapture
+
 test-spec:
 	cargo test --package spec
 
@@ -149,6 +165,8 @@ help:
 	@echo "Test targets:"
 	@echo "  make test         - Run all tests"
 	@echo "  make test-<crate> - Run tests for specific crate"
+	@echo "  make test-e2e     - Run E2E tests (requires sudo)"
+	@echo "  make test-e2e-single TEST=name - Run single E2E test"
 	@echo "  make test-features- Test feature flag combinations"
 	@echo ""
 	@echo "Documentation:"

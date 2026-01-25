@@ -421,12 +421,13 @@ impl Runtime for YoukiRuntime {
                     .with_stderr(stderr_fd);
 
             // Set container root path (base dir - libcontainer creates <root>/<container_id>)
-            let container_builder = container_builder
-                .with_root_path(&state_dir_clone)
-                .map_err(|e| AgentError::CreateFailed {
-                    id: container_id_clone.clone(),
-                    reason: format!("failed to set root path: {}", e),
-                })?;
+            let container_builder =
+                container_builder
+                    .with_root_path(&state_dir_clone)
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: container_id_clone.clone(),
+                        reason: format!("failed to set root path: {}", e),
+                    })?;
 
             // Configure as init container (creates new namespaces)
             let init_builder = container_builder
@@ -675,11 +676,7 @@ impl Runtime for YoukiRuntime {
         let state_dir = self.container_root(id);
         if state_dir.exists() {
             if let Err(e) = fs::remove_dir_all(&state_dir).await {
-                tracing::warn!(
-                    "Failed to remove state dir {}: {}",
-                    state_dir.display(),
-                    e
-                );
+                tracing::warn!("Failed to remove state dir {}: {}", state_dir.display(), e);
             }
         }
 
