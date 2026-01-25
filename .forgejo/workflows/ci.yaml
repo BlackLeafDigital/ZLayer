@@ -247,12 +247,18 @@ jobs:
 
       - name: Setup E2E environment
         run: |
-          # Create required directories for youki runtime
-          mkdir -p /var/lib/zlayer/{containers,rootfs,bundles,cache}
-          chmod 755 /var/lib/zlayer
+          # Create test directories (must match E2E_TEST_DIR in youki_e2e.rs)
+          mkdir -p /tmp/zlayer-youki-e2e-test/{state,rootfs,bundles,cache}
+          chmod -R 755 /tmp/zlayer-youki-e2e-test
+
+          # Ensure cgroup v2 is writable (required for container creation)
+          # If cgroup is read-only, try to remount it
+          if [ -d /sys/fs/cgroup ] && [ ! -w /sys/fs/cgroup/cgroup.subtree_control ]; then
+            mount -o remount,rw /sys/fs/cgroup 2>/dev/null || true
+          fi
 
       - name: Run E2E tests
-        run: cargo test --package agent --test youki_e2e -- --test-threads=1
+        run: cargo test --package agent --test youki_e2e -- --test-threads=1 --nocapture
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
