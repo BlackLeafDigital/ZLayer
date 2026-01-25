@@ -33,8 +33,7 @@ impl Default for BackoffConfig {
 impl BackoffConfig {
     /// Calculate the delay for a given retry attempt (0-indexed)
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
-        let delay_secs =
-            self.initial_delay.as_secs_f64() * self.multiplier.powi(attempt as i32);
+        let delay_secs = self.initial_delay.as_secs_f64() * self.multiplier.powi(attempt as i32);
         let capped_secs = delay_secs.min(self.max_delay.as_secs_f64());
         Duration::from_secs_f64(capped_secs)
     }

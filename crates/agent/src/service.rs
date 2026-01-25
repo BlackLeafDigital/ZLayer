@@ -574,9 +574,10 @@ impl ServiceManager {
                     scheduler.register(&name, &spec).await?;
                     tracing::info!(cron = %name, "Registered cron job with scheduler");
                 } else {
-                    return Err(AgentError::Configuration(
-                        format!("Cron scheduler not configured for cron job '{}'", name),
-                    ));
+                    return Err(AgentError::Configuration(format!(
+                        "Cron scheduler not configured for cron job '{}'",
+                        name
+                    )));
                 }
             }
         }
@@ -827,16 +828,18 @@ impl ServiceManager {
     /// - Returns error if job executor is not configured
     /// - Returns error if the job is not registered
     pub async fn trigger_job(&self, name: &str, trigger: JobTrigger) -> Result<JobExecutionId> {
-        let executor = self.job_executor.as_ref().ok_or_else(|| {
-            AgentError::Configuration("Job executor not configured".to_string())
-        })?;
+        let executor = self
+            .job_executor
+            .as_ref()
+            .ok_or_else(|| AgentError::Configuration("Job executor not configured".to_string()))?;
 
-        let spec = executor.get_job_spec(name).await.ok_or_else(|| {
-            AgentError::NotFound {
+        let spec = executor
+            .get_job_spec(name)
+            .await
+            .ok_or_else(|| AgentError::NotFound {
                 container: name.to_string(),
                 reason: "job not registered".to_string(),
-            }
-        })?;
+            })?;
 
         executor.trigger(name, &spec, trigger).await
     }
@@ -879,9 +882,10 @@ impl ServiceManager {
     /// # Errors
     /// Returns error if job executor is not configured or if cancellation fails
     pub async fn cancel_job(&self, id: &JobExecutionId) -> Result<()> {
-        let executor = self.job_executor.as_ref().ok_or_else(|| {
-            AgentError::Configuration("Job executor not configured".to_string())
-        })?;
+        let executor = self
+            .job_executor
+            .as_ref()
+            .ok_or_else(|| AgentError::Configuration("Job executor not configured".to_string()))?;
 
         executor.cancel(id).await
     }

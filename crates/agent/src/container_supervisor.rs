@@ -245,7 +245,10 @@ impl ContainerSupervisor {
     }
 
     /// Get information about a supervised container
-    pub async fn get_container_info(&self, container_id: &ContainerId) -> Option<SupervisedContainer> {
+    pub async fn get_container_info(
+        &self,
+        container_id: &ContainerId,
+    ) -> Option<SupervisedContainer> {
         let containers = self.containers.read().await;
         containers.get(container_id).cloned()
     }
@@ -820,10 +823,7 @@ services:
             .supervise(&mock_container_id("api", 2), &spec)
             .await;
 
-        assert_eq!(
-            supervisor.count_by_state(SupervisedState::Running).await,
-            2
-        );
+        assert_eq!(supervisor.count_by_state(SupervisedState::Running).await, 2);
         assert_eq!(
             supervisor
                 .count_by_state(SupervisedState::CrashLoopBackOff)
