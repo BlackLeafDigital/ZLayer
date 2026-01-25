@@ -189,10 +189,16 @@ impl YoukiRuntime {
         self.config.rootfs_dir.join(safe_name)
     }
 
+    /// Get log directory for a container (separate from state to avoid conflicts with libcontainer)
+    fn log_dir(&self, id: &ContainerId) -> PathBuf {
+        // Put logs in bundle directory to avoid conflicting with libcontainer's state directory
+        self.bundle_path(id).join("logs")
+    }
+
     /// Get log file paths for a container
     fn log_paths(&self, id: &ContainerId) -> (PathBuf, PathBuf) {
-        let state_dir = self.container_root(id);
-        (state_dir.join("stdout.log"), state_dir.join("stderr.log"))
+        let log_dir = self.log_dir(id);
+        (log_dir.join("stdout.log"), log_dir.join("stderr.log"))
     }
 
     /// Map libcontainer status to our ContainerState
@@ -211,12 +217,12 @@ impl YoukiRuntime {
         &self,
         id: &ContainerId,
     ) -> Result<(PathBuf, PathBuf, OwnedFd, OwnedFd)> {
-        let container_root = self.container_root(id);
-        fs::create_dir_all(&container_root)
+        let log_dir = self.log_dir(id);
+        fs::create_dir_all(&log_dir)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: id.to_string(),
-                reason: format!("failed to create container state dir: {}", e),
+                reason: format!("failed to create log dir: {}", e),
             })?;
 
         let (stdout_path, stderr_path) = self.log_paths(id);
@@ -357,7 +363,6 @@ impl Runtime for YoukiRuntime {
         let image = &spec.image.name;
         let rootfs_path = self.rootfs_path(image);
         let bundle_path = self.bundle_path(id);
-        let container_root = self.container_root(id);
 
         tracing::info!("Creating container {} from image {}", container_id, image);
 
@@ -404,7 +409,8 @@ impl Runtime for YoukiRuntime {
         let config = self.config.clone();
         let container_id_clone = container_id.clone();
         let bundle_path_clone = bundle_path.clone();
-        let container_root_clone = container_root.clone();
+        // Use state_dir as the root path - libcontainer appends container_id internally
+        let state_dir_clone = self.config.state_dir.clone();
 
         let _container = tokio::task::spawn_blocking(move || {
             // Create container using libcontainer
@@ -414,9 +420,9 @@ impl Runtime for YoukiRuntime {
                     .with_stdout(stdout_fd)
                     .with_stderr(stderr_fd);
 
-            // Set container root path
+            // Set container root path (base dir - libcontainer creates <root>/<container_id>)
             let container_builder = container_builder
-                .with_root_path(&container_root_clone)
+                .with_root_path(&state_dir_clone)
                 .map_err(|e| AgentError::CreateFailed {
                     id: container_id_clone.clone(),
                     reason: format!("failed to set root path: {}", e),
@@ -621,43 +627,60 @@ impl Runtime for YoukiRuntime {
     /// Remove a container
     ///
     /// Deletes the container and cleans up its bundle and state.
+    /// Cleanup always proceeds even if libcontainer operations fail.
     async fn remove_container(&self, id: &ContainerId) -> Result<()> {
         let container_id = self.container_id_str(id);
         let container_root = self.container_root(id);
 
         tracing::info!("Removing container {}", container_id);
 
-        // Delete the container using libcontainer
+        // Attempt libcontainer delete, but don't fail if container not found
         let container_id_clone = container_id.clone();
+        let container_root_clone = container_root.clone();
 
-        tokio::task::spawn_blocking(move || {
-            let mut container =
-                Container::load(container_root).map_err(|e| AgentError::NotFound {
-                    container: container_id_clone.clone(),
-                    reason: format!("failed to load container: {}", e),
-                })?;
-
-            // Delete with force=true to handle any state
-            container.delete(true).map_err(|e| AgentError::NotFound {
-                container: container_id_clone.clone(),
-                reason: format!("failed to delete container: {}", e),
-            })?;
-
-            Ok::<(), AgentError>(())
+        let libcontainer_result = tokio::task::spawn_blocking(move || {
+            match Container::load(container_root_clone) {
+                Ok(mut container) => {
+                    // Delete with force=true to handle any state
+                    if let Err(e) = container.delete(true) {
+                        tracing::warn!(
+                            "libcontainer delete failed for {}: {}",
+                            container_id_clone,
+                            e
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Container may already be gone or state is in unexpected location
+                    tracing::warn!(
+                        "Container::load failed for {} (may already be removed): {}",
+                        container_id_clone,
+                        e
+                    );
+                }
+            }
         })
-        .await
-        .map_err(|e| AgentError::NotFound {
-            container: container_id.clone(),
-            reason: format!("task join error: {}", e),
-        })??;
+        .await;
 
-        // Clean up bundle
-        self.cleanup_bundle(id).await?;
+        if let Err(e) = libcontainer_result {
+            tracing::warn!("spawn_blocking failed during remove: {}", e);
+        }
 
-        // Clean up state directory
+        // ALWAYS clean up bundle regardless of libcontainer result
+        if let Err(e) = self.cleanup_bundle(id).await {
+            tracing::warn!("Failed to cleanup bundle for {}: {}", container_id, e);
+        }
+
+        // ALWAYS clean up state directory regardless of libcontainer result
         let state_dir = self.container_root(id);
         if state_dir.exists() {
-            let _ = fs::remove_dir_all(&state_dir).await;
+            if let Err(e) = fs::remove_dir_all(&state_dir).await {
+                tracing::warn!(
+                    "Failed to remove state dir {}: {}",
+                    state_dir.display(),
+                    e
+                );
+            }
         }
 
         // Remove from local tracking
@@ -766,7 +789,6 @@ impl Runtime for YoukiRuntime {
     /// Uses libcontainer's tenant builder to exec into the container's namespaces.
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)> {
         let container_id = self.container_id_str(id);
-        let container_root = self.container_root(id);
 
         if cmd.is_empty() {
             return Err(AgentError::InvalidSpec(
@@ -808,6 +830,8 @@ impl Runtime for YoukiRuntime {
 
         let cmd_clone = cmd.to_vec();
         let container_id_clone = container_id.clone();
+        // Use state_dir as the root path - libcontainer expects base dir
+        let state_dir_clone = self.config.state_dir.clone();
 
         // Execute using tenant builder
         let exec_pid = tokio::task::spawn_blocking(move || {
@@ -820,7 +844,7 @@ impl Runtime for YoukiRuntime {
 
             let container_builder =
                 container_builder
-                    .with_root_path(&container_root)
+                    .with_root_path(&state_dir_clone)
                     .map_err(|e| AgentError::CreateFailed {
                         id: container_id_clone.clone(),
                         reason: format!("failed to set root path: {}", e),

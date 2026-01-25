@@ -641,9 +641,12 @@ async fn test_container_logs() {
 // Error Handling Tests
 // =============================================================================
 
-/// Test NotFound error when removing a non-existent container
+/// Test removing a non-existent container is idempotent (succeeds gracefully)
+///
+/// Note: remove_container is designed to be idempotent - removing a container
+/// that doesn't exist should succeed (not error) to support cleanup resilience.
 #[tokio::test]
-async fn test_error_remove_nonexistent() {
+async fn test_remove_nonexistent_is_idempotent() {
     with_timeout!(180, {
         skip_without_root!();
 
@@ -663,18 +666,14 @@ async fn test_error_remove_nonexistent() {
         println!("Attempting to remove non-existent container: {}", id);
         let result = runtime.remove_container(&id).await;
 
-        assert!(result.is_err(), "Should fail for non-existent container");
-        match result {
-            Err(AgentError::NotFound { container, reason }) => {
-                println!("Got expected NotFound error:");
-                println!("  container: {}", container);
-                println!("  reason: {}", reason);
-            }
-            Err(other) => {
-                println!("Got error (may be acceptable): {:?}", other);
-            }
-            Ok(_) => panic!("Should not succeed removing non-existent container"),
-        }
+        // remove_container should succeed even for non-existent containers
+        // This supports idempotent cleanup operations
+        assert!(
+            result.is_ok(),
+            "remove_container should be idempotent: {:?}",
+            result
+        );
+        println!("remove_container succeeded (idempotent behavior)");
     });
 }
 
@@ -870,6 +869,9 @@ async fn test_cleanup_state_directory() {
             .create_container(&id, &spec)
             .await
             .expect("Failed to create");
+
+        // Setup cleanup guard for panic safety
+        let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
         // Start container
         runtime.start_container(&id).await.expect("Failed to start");
