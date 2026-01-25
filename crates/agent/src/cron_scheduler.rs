@@ -382,7 +382,6 @@ services:
         let scheduler = CronScheduler::new(executor);
 
         // Create a spec manually with invalid schedule
-        use spec::*;
         let mut spec = mock_cron_spec("0 * * * * * *");
         spec.schedule = Some("not a valid cron".to_string());
 
