@@ -36,6 +36,25 @@ impl ImagePuller {
         }
     }
 
+    /// Store authentication for a registry
+    ///
+    /// This ensures the client has auth credentials before attempting pulls.
+    async fn store_auth(&self, image: &str, auth: &RegistryAuth) -> Result<()> {
+        let reference: Reference = image.parse().map_err(|_| RegistryError::NotFound {
+            registry: "unknown".to_string(),
+            image: image.to_string(),
+        })?;
+
+        // Store auth in the client's internal cache
+        // This is called by pull_image_manifest, but we call it explicitly here
+        // to ensure auth is available for blob pulls
+        self.client
+            .store_auth_if_needed(reference.resolve_registry(), auth)
+            .await;
+
+        Ok(())
+    }
+
     /// Set concurrency limit for blob downloads
     pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
         self.concurrency_limit = Arc::new(Semaphore::new(limit));
@@ -44,19 +63,21 @@ impl ImagePuller {
 
     /// Pull a single blob and cache it
     ///
-    /// Note: Authentication is handled internally by the oci_client.
-    /// The `auth` parameter is reserved for future use with explicit auth flows.
+    /// Uses the provided authentication credentials to pull blobs from the registry.
     pub async fn pull_blob(
         &self,
         image: &str,
         digest: &str,
-        _auth: &RegistryAuth,
+        auth: &RegistryAuth,
     ) -> Result<Vec<u8>> {
         // Check cache first
         if let Some(data) = self.cache.get(digest)? {
             tracing::debug!(digest = %digest, "blob found in cache");
             return Ok(data);
         }
+
+        // Store auth before pulling blob
+        self.store_auth(image, auth).await?;
 
         let reference: Reference = image.parse().map_err(|_| RegistryError::NotFound {
             registry: "unknown".to_string(),

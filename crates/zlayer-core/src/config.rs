@@ -32,6 +32,10 @@ pub struct AgentConfig {
     /// Logging configuration
     #[serde(default)]
     pub logging: LoggingConfig,
+
+    /// Registry authentication configuration
+    #[serde(default)]
+    pub auth: crate::auth::AuthConfig,
 }
 
 fn default_data_dir() -> PathBuf {

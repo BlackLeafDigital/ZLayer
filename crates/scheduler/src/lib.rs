@@ -23,9 +23,15 @@
 
 pub mod autoscaler;
 pub mod error;
+pub mod handlers;
 pub mod metrics;
 pub mod raft;
+pub mod raft_network;
+pub mod raft_service;
 pub mod raft_storage;
+
+#[cfg(feature = "persistent")]
+pub mod persistent_raft_storage;
 
 pub use autoscaler::{
     Autoscaler, EmaCalculator, ScalingDecision, DEFAULT_COOLDOWN, DEFAULT_EMA_ALPHA,
@@ -39,7 +45,14 @@ pub use raft::{
     ClusterState, HealthStatus, NodeId, NodeInfo, RaftConfig, RaftCoordinator, Request, Response,
     ScaleEvent, ServiceState, TypeConfig, ZLayerRaft,
 };
+pub use raft_network::RaftHttpClient;
+pub use raft_service::RaftService;
 pub use raft_storage::{LogStore, MemStore, StateMachine};
+
+#[cfg(feature = "persistent")]
+pub use persistent_raft_storage::{
+    PersistentLogStore, PersistentRaftStorage, PersistentStateMachine,
+};
 
 use std::sync::Arc;
 use std::time::Duration;

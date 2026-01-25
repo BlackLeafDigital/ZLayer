@@ -134,7 +134,7 @@ impl Default for BlobCache {
 }
 
 /// Validate that a digest string is properly formatted
-fn validate_digest(digest: &str) -> Result<(), CacheError> {
+pub(crate) fn validate_digest(digest: &str) -> Result<(), CacheError> {
     if !digest.starts_with("sha256:") {
         return Err(CacheError::InvalidDigest(
             "digest must start with sha256:".to_string(),

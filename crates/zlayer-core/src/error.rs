@@ -139,6 +139,17 @@ pub enum ConfigError {
     /// Failed to load configuration file
     #[error("failed to load config from {path}: {reason}")]
     LoadFailed { path: PathBuf, reason: String },
+
+    /// Generic configuration error
+    #[error("{0}")]
+    Other(String),
+}
+
+impl ConfigError {
+    /// Create a generic configuration error
+    pub fn other(msg: impl Into<String>) -> ZLayerError {
+        ZLayerError::Config(ConfigError::Other(msg.into()))
+    }
 }
 
 /// Registry/OCI errors
@@ -163,6 +174,16 @@ pub enum RegistryError {
 
 /// Result type alias for ZLayer operations
 pub type Result<T, E = ZLayerError> = std::result::Result<T, E>;
+
+/// Convenience alias for core Error type
+pub use ZLayerError as Error;
+
+impl Error {
+    /// Create a configuration error
+    pub fn config(msg: impl Into<String>) -> Self {
+        ZLayerError::Config(ConfigError::Other(msg.into()))
+    }
+}
 
 #[cfg(test)]
 mod tests {

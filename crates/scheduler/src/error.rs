@@ -46,5 +46,29 @@ pub enum SchedulerError {
     Io(#[from] std::io::Error),
 }
 
+/// Errors specific to Raft network operations
+#[derive(Debug, Error)]
+pub enum RaftNetworkError {
+    /// Request timeout
+    #[error("Network request timed out")]
+    Timeout,
+
+    /// Target node unreachable
+    #[error("Target node unreachable: {0}")]
+    Unreachable(String),
+
+    /// Serialization/deserialization failed
+    #[error("Serialization error: {0}")]
+    Serialization(String),
+
+    /// Invalid or unexpected response
+    #[error("Invalid response: {0}")]
+    InvalidResponse(String),
+
+    /// HTTP client error
+    #[error("HTTP error: {0}")]
+    Http(#[from] reqwest::Error),
+}
+
 /// Result type alias for scheduler operations
 pub type Result<T> = std::result::Result<T, SchedulerError>;

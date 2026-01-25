@@ -86,7 +86,10 @@ openraft = { version = "0.9", features = ["serde"] }
 prometheus = "0.13"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
+
+# OCI
 oci-spec = "0.8"
+oci-client = "0.15"
 
 # Async traits
 async-trait = "0.1"

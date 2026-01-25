@@ -7,6 +7,11 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64 = "0.22"
+dirs = "5.0"
+oci-client.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tracing = "0.1"
 spec = { path = "../spec" }

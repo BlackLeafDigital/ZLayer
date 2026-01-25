@@ -26,6 +26,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info};
 
 use crate::error::{Result, SchedulerError};
+use crate::raft_network::RaftHttpClient;
 use crate::raft_storage::MemStore;
 
 /// Node ID type (u64 for simplicity)
@@ -274,6 +275,10 @@ pub struct RaftConfig {
     pub heartbeat_interval_ms: u64,
     /// Election timeout range in milliseconds (min, max)
     pub election_timeout_ms: (u64, u64),
+    /// RPC timeout in milliseconds
+    pub rpc_timeout_ms: u64,
+    /// Raft API port (default 9090)
+    pub raft_port: u16,
 }
 
 impl Default for RaftConfig {
@@ -283,6 +288,8 @@ impl Default for RaftConfig {
             address: "127.0.0.1:9000".to_string(),
             heartbeat_interval_ms: 150,
             election_timeout_ms: (300, 600),
+            rpc_timeout_ms: 5000,
+            raft_port: 9090,
         }
     }
 }
@@ -293,18 +300,25 @@ impl Default for RaftConfig {
 
 /// Network implementation for Raft RPCs
 ///
-/// For now, this is a stub that will be connected to axum handlers.
-/// In production, this would use HTTP/gRPC to communicate between nodes.
+/// Uses HTTP-based RPC client to communicate between nodes.
 pub struct ZLayerNetwork {
     /// Known peer addresses
     peers: Arc<RwLock<HashMap<NodeId, String>>>,
+    /// Shared HTTP client for making RPC calls
+    client: Arc<RaftHttpClient>,
 }
 
 impl ZLayerNetwork {
-    /// Create a new network layer
+    /// Create a new network layer with default timeout (5 seconds)
     pub fn new() -> Self {
+        Self::with_timeout(5000)
+    }
+
+    /// Create a new network layer with specified timeout in milliseconds
+    pub fn with_timeout(timeout_ms: u64) -> Self {
         Self {
             peers: Arc::new(RwLock::new(HashMap::new())),
+            client: Arc::new(RaftHttpClient::new(timeout_ms)),
         }
     }
 
@@ -336,6 +350,7 @@ impl Clone for ZLayerNetwork {
     fn clone(&self) -> Self {
         Self {
             peers: Arc::clone(&self.peers),
+            client: Arc::clone(&self.client),
         }
     }
 }
@@ -347,6 +362,7 @@ impl RaftNetworkFactory<TypeConfig> for ZLayerNetwork {
     async fn new_client(&mut self, _target: NodeId, node: &BasicNode) -> Self::Network {
         ZLayerNetworkConnection {
             target_addr: node.addr.clone(),
+            client: Arc::clone(&self.client),
         }
     }
 }
@@ -354,76 +370,93 @@ impl RaftNetworkFactory<TypeConfig> for ZLayerNetwork {
 /// A connection to a single Raft peer
 pub struct ZLayerNetworkConnection {
     target_addr: String,
+    client: Arc<RaftHttpClient>,
 }
 
 impl RaftNetwork<TypeConfig> for ZLayerNetworkConnection {
     async fn append_entries(
         &mut self,
-        _rpc: AppendEntriesRequest<TypeConfig>,
+        rpc: AppendEntriesRequest<TypeConfig>,
         _option: RPCOption,
     ) -> std::result::Result<
         AppendEntriesResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId>>,
     > {
-        // TODO: Implement actual HTTP/gRPC call to target node
-        // For now, return unreachable error to indicate network not implemented
-        debug!(target = %self.target_addr, "append_entries RPC (stub)");
-        Err(RPCError::Unreachable(Unreachable::new(
-            &std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "Network layer not yet implemented",
-            ),
-        )))
+        debug!(target = %self.target_addr, "Sending append_entries RPC");
+        self.client
+            .append_entries(&self.target_addr, rpc)
+            .await
+            .map_err(|e| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
+                    e.to_string(),
+                )))
+            })
     }
 
     async fn install_snapshot(
         &mut self,
-        _rpc: InstallSnapshotRequest<TypeConfig>,
+        rpc: InstallSnapshotRequest<TypeConfig>,
         _option: RPCOption,
     ) -> std::result::Result<
         InstallSnapshotResponse<NodeId>,
         RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
     > {
-        debug!(target = %self.target_addr, "install_snapshot RPC (stub)");
-        Err(RPCError::Unreachable(Unreachable::new(
-            &std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "Network layer not yet implemented",
-            ),
-        )))
+        debug!(target = %self.target_addr, "Sending install_snapshot RPC");
+        self.client
+            .install_snapshot(&self.target_addr, rpc)
+            .await
+            .map_err(|e| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
+                    e.to_string(),
+                )))
+            })
     }
 
     async fn vote(
         &mut self,
-        _rpc: VoteRequest<NodeId>,
+        rpc: VoteRequest<NodeId>,
         _option: RPCOption,
     ) -> std::result::Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>
     {
-        debug!(target = %self.target_addr, "vote RPC (stub)");
-        Err(RPCError::Unreachable(Unreachable::new(
-            &std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "Network layer not yet implemented",
-            ),
-        )))
+        debug!(target = %self.target_addr, "Sending vote RPC");
+        self.client
+            .vote(&self.target_addr, rpc)
+            .await
+            .map_err(|e| {
+                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(
+                    e.to_string(),
+                )))
+            })
     }
 
     async fn full_snapshot(
         &mut self,
-        _vote: Vote<NodeId>,
-        _snapshot: Snapshot<TypeConfig>,
+        vote: Vote<NodeId>,
+        snapshot: Snapshot<TypeConfig>,
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> std::result::Result<SnapshotResponse<NodeId>, StreamingError<TypeConfig, Fatal<NodeId>>>
     {
-        debug!(target = %self.target_addr, "full_snapshot RPC (stub)");
-        // Return an error indicating the network is not yet implemented
-        Err(StreamingError::Unreachable(Unreachable::new(
-            &std::io::Error::new(
-                std::io::ErrorKind::NotConnected,
-                "Network layer not yet implemented",
-            ),
-        )))
+        debug!(target = %self.target_addr, "Sending full_snapshot RPC");
+
+        // Read snapshot data into a buffer
+        let mut snapshot_data = Vec::new();
+        let mut snapshot_reader = snapshot.snapshot;
+        std::io::Read::read_to_end(&mut snapshot_reader, &mut snapshot_data)
+            .map_err(|e| {
+                StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(
+                    format!("Failed to read snapshot: {}", e),
+                )))
+            })?;
+
+        self.client
+            .full_snapshot(&self.target_addr, vote, snapshot_data)
+            .await
+            .map_err(|e| {
+                StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(
+                    e,
+                )))
+            })
     }
 }
 
@@ -470,7 +503,7 @@ impl RaftCoordinator {
             })?);
 
         let storage = MemStore::new();
-        let network = ZLayerNetwork::new();
+        let network = ZLayerNetwork::with_timeout(config.rpc_timeout_ms);
 
         // Create adaptors for log storage and state machine from the combined storage
         let (log_store, state_machine) = Adaptor::new(storage);
@@ -602,6 +635,13 @@ impl RaftCoordinator {
             .map_err(|e| SchedulerError::Raft(format!("Shutdown failed: {}", e)))?;
         info!("Raft coordinator shut down");
         Ok(())
+    }
+
+    /// Get a reference to the underlying Raft instance
+    ///
+    /// This is used by network handlers to forward RPCs to the Raft node.
+    pub fn raft_handle(&self) -> &ZLayerRaft {
+        &self.raft
     }
 }
 

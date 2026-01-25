@@ -98,6 +98,8 @@ pub struct YoukiRuntime {
     config: YoukiConfig,
     /// Local container state tracking
     containers: RwLock<HashMap<String, ContainerInfo>>,
+    /// Authentication resolver for registry pulls
+    auth_resolver: zlayer_core::AuthResolver,
 }
 
 impl std::fmt::Debug for YoukiRuntime {
@@ -129,12 +131,37 @@ impl YoukiRuntime {
         Ok(Self {
             config,
             containers: RwLock::new(HashMap::new()),
+            auth_resolver: zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()),
         })
     }
 
     /// Create a new YoukiRuntime with default configuration
     pub async fn with_defaults() -> Result<Self> {
         Self::new(YoukiConfig::default()).await
+    }
+
+    /// Create a new YoukiRuntime with custom auth configuration
+    pub async fn with_auth(config: YoukiConfig, auth_config: zlayer_core::AuthConfig) -> Result<Self> {
+        // Ensure directories exist
+        for dir in [
+            &config.state_dir,
+            &config.rootfs_dir,
+            &config.bundle_dir,
+            &config.cache_dir,
+        ] {
+            fs::create_dir_all(dir)
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: "runtime".to_string(),
+                    reason: format!("failed to create directory {}: {}", dir.display(), e),
+                })?;
+        }
+
+        Ok(Self {
+            config,
+            containers: RwLock::new(HashMap::new()),
+            auth_resolver: zlayer_core::AuthResolver::new(auth_config),
+        })
     }
 
     /// Get the container ID string
@@ -282,9 +309,8 @@ impl Runtime for YoukiRuntime {
         // Create image puller
         let puller = registry::ImagePuller::new(cache);
 
-        // Use anonymous auth by default
-        // TODO: Support authenticated pulls via config
-        let auth = registry::RegistryAuth::Anonymous;
+        // Resolve authentication for this image
+        let auth = self.auth_resolver.resolve(image);
 
         // Pull image layers from registry
         let layers = puller
