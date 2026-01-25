@@ -27,6 +27,7 @@ deploy = []
 agent = { path = "../../crates/agent" }
 spec = { path = "../../crates/spec" }
 observability = { path = "../../crates/observability" }
+init_actions = { path = "../../crates/init_actions" }
 
 # Optional: API server (only needed for serve command)
 api = { path = "../../crates/api", optional = true }
@@ -40,3 +41,4 @@ base64 = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+reqwest = { workspace = true }

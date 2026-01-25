@@ -3,8 +3,10 @@
 //! This module provides validators for all spec fields with proper error reporting.
 
 use crate::error::{ValidationError, ValidationErrorKind};
-use crate::types::{DeploymentSpec, EndpointSpec, ScaleSpec};
+use crate::types::{DeploymentSpec, EndpointSpec, ResourceType, ScaleSpec, ServiceSpec};
+use cron::Schedule;
 use std::collections::HashSet;
+use std::str::FromStr;
 
 // =============================================================================
 // Validator crate wrapper functions
@@ -147,6 +149,17 @@ pub fn validate_scale_spec(scale: &ScaleSpec) -> Result<(), validator::Validatio
     Ok(())
 }
 
+/// Wrapper for validate_cron_schedule for use with validator crate
+/// Note: For Option<String> fields, validator crate unwraps and passes &String
+pub fn validate_schedule_wrapper(schedule: &String) -> Result<(), validator::ValidationError> {
+    Schedule::from_str(schedule).map(|_| ()).map_err(|e| {
+        make_validation_error(
+            "invalid_cron_schedule",
+            format!("invalid cron schedule '{}': {}", schedule, e),
+        )
+    })
+}
+
 // =============================================================================
 // Cross-field validation functions (called from lib.rs)
 // =============================================================================
@@ -185,6 +198,38 @@ pub fn validate_unique_service_endpoints(spec: &DeploymentSpec) -> Result<(), Va
                 });
             }
         }
+    }
+
+    Ok(())
+}
+
+/// Validate schedule/rtype consistency for all services
+pub fn validate_cron_schedules(spec: &DeploymentSpec) -> Result<(), ValidationError> {
+    for (service_name, service_spec) in &spec.services {
+        validate_service_schedule(service_name, service_spec)?;
+    }
+    Ok(())
+}
+
+/// Validate schedule/rtype consistency for a single service
+pub fn validate_service_schedule(
+    service_name: &str,
+    spec: &ServiceSpec,
+) -> Result<(), ValidationError> {
+    // If schedule is set, rtype must be Cron
+    if spec.schedule.is_some() && spec.rtype != ResourceType::Cron {
+        return Err(ValidationError {
+            kind: ValidationErrorKind::ScheduleOnlyForCron,
+            path: format!("services.{}.schedule", service_name),
+        });
+    }
+
+    // If rtype is Cron, schedule must be set
+    if spec.rtype == ResourceType::Cron && spec.schedule.is_none() {
+        return Err(ValidationError {
+            kind: ValidationErrorKind::CronRequiresSchedule,
+            path: format!("services.{}.schedule", service_name),
+        });
     }
 
     Ok(())
@@ -617,5 +662,28 @@ mod tests {
     fn test_validate_scale_range_large_gap() {
         // Large gap between min and max should still be valid
         assert!(validate_scale_range(1, 1000).is_ok());
+    }
+
+    // Cron schedule validation tests
+    // Note: The `cron` crate uses 7-field format: "sec min hour day-of-month month day-of-week year"
+    #[test]
+    fn test_validate_schedule_wrapper_valid() {
+        // Valid 7-field cron expressions (sec min hour dom month dow year)
+        assert!(validate_schedule_wrapper(&"0 0 0 * * * *".to_string()).is_ok()); // Daily at midnight
+        assert!(validate_schedule_wrapper(&"0 */5 * * * * *".to_string()).is_ok()); // Every 5 minutes
+        assert!(validate_schedule_wrapper(&"0 0 12 * * MON-FRI *".to_string()).is_ok()); // Weekdays at noon
+        assert!(validate_schedule_wrapper(&"0 30 2 1 * * *".to_string()).is_ok()); // Monthly at 2:30am on 1st
+        assert!(validate_schedule_wrapper(&"*/10 * * * * * *".to_string()).is_ok());
+        // Every 10 seconds
+    }
+
+    #[test]
+    fn test_validate_schedule_wrapper_invalid() {
+        // Invalid cron expressions
+        assert!(validate_schedule_wrapper(&"".to_string()).is_err()); // Empty
+        assert!(validate_schedule_wrapper(&"not a cron".to_string()).is_err()); // Plain text
+        assert!(validate_schedule_wrapper(&"0 0 * * *".to_string()).is_err()); // 5-field (standard unix cron) not supported
+        assert!(validate_schedule_wrapper(&"60 0 0 * * * *".to_string()).is_err());
+        // Invalid second (60)
     }
 }

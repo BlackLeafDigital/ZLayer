@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 # Internal crates
+agent = { path = "../agent" }
 spec = { path = "../spec" }
 scheduler = { path = "../scheduler" }
 observability = { path = "../observability" }

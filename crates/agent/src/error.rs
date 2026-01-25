@@ -38,9 +38,30 @@ pub enum AgentError {
     #[error("Timeout after {timeout:?}")]
     Timeout { timeout: Duration },
 
+    /// Dependency timeout - service waiting for dependency condition
+    #[error("Dependency timeout: '{service}' waiting for '{dependency}' ({condition}) after {timeout:?}")]
+    DependencyTimeout {
+        service: String,
+        dependency: String,
+        condition: String,
+        timeout: Duration,
+    },
+
     /// Invalid spec
     #[error("Invalid spec: {0}")]
     InvalidSpec(String),
+
+    /// Network setup or operation failed
+    #[error("Network error: {0}")]
+    Network(String),
+
+    /// Configuration error (missing or invalid configuration)
+    #[error("Configuration error: {0}")]
+    Configuration(String),
+
+    /// Internal runtime error
+    #[error("Internal error: {0}")]
+    Internal(String),
 }
 
 pub type Result<T, E = AgentError> = std::result::Result<T, E>;

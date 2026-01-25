@@ -44,6 +44,7 @@ openraft.workspace = true
 # Metrics
 metrics.workspace = true
 prometheus.workspace = true
+num_cpus = { workspace = true }
 
 # JSON serialization for snapshots
 serde_json.workspace = true

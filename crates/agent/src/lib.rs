@@ -2,19 +2,43 @@
 //!
 //! Manages container lifecycle, health checking, init actions, and proxy integration.
 
+pub mod autoscale_controller;
 pub mod bundle;
+pub mod cgroups_stats;
+pub mod container_supervisor;
+pub mod cron_scheduler;
+pub mod dependency;
+pub mod env;
 pub mod error;
 pub mod health;
 pub mod init;
+pub mod job;
+pub mod metrics_providers;
+pub mod overlay_manager;
 pub mod proxy_manager;
 pub mod runtime;
 pub mod service;
 pub mod youki_runtime;
 
+pub use autoscale_controller::{has_adaptive_scaling, AutoscaleController};
 pub use bundle::*;
+pub use container_supervisor::{
+    ContainerSupervisor, SupervisedContainer, SupervisedState, SupervisorConfig, SupervisorEvent,
+};
+pub use cron_scheduler::{CronJobInfo, CronScheduler};
+pub use dependency::{
+    DependencyConditionChecker, DependencyError, DependencyGraph, DependencyNode, DependencyWaiter,
+    WaitResult,
+};
+pub use env::{resolve_env_value, resolve_env_vars, EnvResolutionError, ResolvedEnv};
 pub use error::*;
 pub use health::*;
-pub use init::*;
+pub use init::{BackoffConfig, InitOrchestrator};
+pub use job::{
+    JobExecution, JobExecutionId, JobExecutor, JobExecutorConfig, JobStatus, JobTrigger,
+};
+pub use metrics_providers::{RuntimeStatsProvider, ServiceManagerContainerProvider};
+pub use overlay_manager::OverlayManager;
 pub use proxy_manager::{ProxyManager, ProxyManagerConfig};
 pub use runtime::*;
 pub use service::*;

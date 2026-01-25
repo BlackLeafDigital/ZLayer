@@ -66,6 +66,16 @@ pub struct ServiceSpec {
     #[serde(default = "default_resource_type")]
     pub rtype: ResourceType,
 
+    /// Cron schedule expression (only for rtype: cron)
+    /// Uses 7-field cron syntax: "sec min hour day-of-month month day-of-week year"
+    /// Examples:
+    ///   - "0 0 0 * * * *" (daily at midnight)
+    ///   - "0 */5 * * * * *" (every 5 minutes)
+    ///   - "0 0 12 * * MON-FRI *" (weekdays at noon)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "crate::validate::validate_schedule_wrapper"))]
+    pub schedule: Option<String>,
+
     /// Container image specification
     #[validate(nested)]
     pub image: ImageSpec,
@@ -78,6 +88,10 @@ pub struct ServiceSpec {
     /// Environment variables
     #[serde(default)]
     pub env: HashMap<String, String>,
+
+    /// Command override (entrypoint, args, workdir)
+    #[serde(default)]
+    pub command: CommandSpec,
 
     /// Network configuration
     #[serde(default)]
@@ -120,6 +134,23 @@ pub struct ServiceSpec {
     /// Run container in privileged mode (all capabilities + all devices)
     #[serde(default)]
     pub privileged: bool,
+}
+
+/// Command override specification (Section 5.5)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CommandSpec {
+    /// Override image ENTRYPOINT
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<Vec<String>>,
+
+    /// Override image CMD
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+
+    /// Override working directory
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
 }
 
 fn default_resource_type() -> ResourceType {

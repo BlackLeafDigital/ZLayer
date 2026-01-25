@@ -51,6 +51,9 @@ opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic", "trace"] }
 chrono = { version = "0.4", features = ["serde"] }
 time = { version = "0.3", features = ["serde"] }
 
+# Cron expression parsing
+cron = "0.15"
+
 # HTTP/client
 reqwest = { version = "0.13", features = ["json"] }
 hyper = { version = "1.8", features = ["full", "http2"] }
@@ -125,6 +128,24 @@ base64 = "0.22"
 
 # Validation
 validator = { version = "0.19", features = ["derive"] }
+
+# Pingora (Cloudflare's proxy framework)
+pingora = { version = "0.6", features = ["lb", "proxy", "cache"] }
+pingora-core = "0.6"
+pingora-proxy = "0.6"
+pingora-load-balancing = "0.6"
+pingora-cache = "0.6"
+pingora-timeout = "0.6"
+
+# ACME/TLS certificates
+instant-acme = "0.7"
+rcgen = "0.13"
+
+# Concurrent hashmaps
+dashmap = "6"
+
+# System info
+num_cpus = "1.16"
 
 # =============================================================================
 # Build Profiles

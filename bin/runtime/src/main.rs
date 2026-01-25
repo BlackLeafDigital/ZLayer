@@ -267,6 +267,9 @@ fn parse_spec(spec_path: &Path) -> Result<DeploymentSpec> {
 /// Deploy services from a spec file
 #[cfg(feature = "deploy")]
 async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
     let spec = parse_spec(spec_path)?;
 
     if dry_run {
@@ -280,7 +283,7 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
     info!(runtime = ?cli.runtime, "Creating container runtime");
 
     // Create the runtime
-    let _runtime = agent::create_runtime(runtime_config)
+    let runtime = agent::create_runtime(runtime_config)
         .await
         .context("Failed to create container runtime")?;
 
@@ -289,22 +292,203 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
     // Print deployment plan
     print_deployment_plan(&spec);
 
-    // For now, just print what would be deployed
-    // Future: Actually deploy the services using ServiceManager
-    info!("Deployment would proceed with the above services");
-    info!("(Full deployment implementation pending ServiceManager integration)");
+    // Create ServiceManager (wrap in Arc for autoscaler)
+    let manager = Arc::new(agent::ServiceManager::new(runtime.clone()));
 
-    // Demonstrate runtime is working by showing its type
-    match cli.runtime {
-        RuntimeType::Mock => {
-            info!("Using mock runtime - containers will be simulated");
+    println!("\n=== Deploying Services ===\n");
+
+    // Track deployment results
+    let mut deployed_services: Vec<(String, u32)> = Vec::new();
+    let mut failed_services: Vec<(String, String)> = Vec::new();
+
+    // Deploy each service
+    for (name, service_spec) in &spec.services {
+        info!(service = %name, "Deploying service");
+        println!("Deploying service: {}", name);
+
+        // Register the service with ServiceManager
+        match manager
+            .upsert_service(name.clone(), service_spec.clone())
+            .await
+        {
+            Ok(()) => {
+                info!(service = %name, "Service registered");
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to register service: {}", e);
+                warn!(service = %name, error = %e, "Failed to register service");
+                failed_services.push((name.clone(), error_msg));
+                continue;
+            }
         }
-        RuntimeType::Youki => {
-            info!(
-                state_dir = %cli.state_dir.display(),
-                "Using Youki runtime"
+
+        // Determine initial replica count from scale spec
+        let replicas = match &service_spec.scale {
+            spec::ScaleSpec::Fixed { replicas } => *replicas,
+            spec::ScaleSpec::Adaptive { min, .. } => *min,
+            spec::ScaleSpec::Manual => 0,
+        };
+
+        if replicas > 0 {
+            info!(service = %name, replicas = replicas, "Scaling service");
+            println!("  Scaling to {} replica(s)...", replicas);
+
+            match manager.scale_service(name, replicas).await {
+                Ok(()) => {
+                    info!(service = %name, replicas = replicas, "Service scaled successfully");
+                    deployed_services.push((name.clone(), replicas));
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to scale service: {}", e);
+                    warn!(service = %name, error = %e, "Failed to scale service");
+                    failed_services.push((name.clone(), error_msg));
+                }
+            }
+        } else {
+            info!(service = %name, "Service registered with manual scaling (0 replicas)");
+            println!("  Registered (manual scaling - 0 replicas)");
+            deployed_services.push((name.clone(), 0));
+        }
+    }
+
+    // Wait for services to stabilize with a timeout
+    if !deployed_services.is_empty() {
+        println!("\nWaiting for services to stabilize...");
+        let stabilize_timeout = Duration::from_secs(30);
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < stabilize_timeout {
+            let mut all_ready = true;
+
+            for (name, expected_replicas) in &deployed_services {
+                if *expected_replicas == 0 {
+                    continue;
+                }
+
+                match manager.service_replica_count(name).await {
+                    Ok(count) if count as u32 == *expected_replicas => {
+                        // Service has expected replicas
+                    }
+                    Ok(_count) => {
+                        all_ready = false;
+                    }
+                    Err(_) => {
+                        all_ready = false;
+                    }
+                }
+            }
+
+            if all_ready {
+                break;
+            }
+
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        if start.elapsed() >= stabilize_timeout {
+            warn!("Timeout waiting for all services to stabilize");
+            println!("Warning: Timeout waiting for all services to reach desired state");
+        }
+    }
+
+    // Print deployment summary
+    println!("\n=== Deployment Summary ===\n");
+    println!("Deployment: {}", spec.deployment);
+    println!("Version: {}", spec.version);
+    println!();
+
+    if !deployed_services.is_empty() {
+        println!("Successfully deployed services:");
+        for (name, replicas) in &deployed_services {
+            let actual_count = manager.service_replica_count(name).await.unwrap_or(0);
+            println!(
+                "  - {} ({}/{} replicas running)",
+                name, actual_count, replicas
             );
         }
+    }
+
+    if !failed_services.is_empty() {
+        println!("\nFailed services:");
+        for (name, error) in &failed_services {
+            println!("  - {}: {}", name, error);
+        }
+    }
+
+    // List all managed services
+    let all_services = manager.list_services().await;
+    info!(
+        services = ?all_services,
+        deployed = deployed_services.len(),
+        failed = failed_services.len(),
+        "Deployment complete"
+    );
+
+    if !failed_services.is_empty() {
+        anyhow::bail!(
+            "Deployment completed with {} failed service(s)",
+            failed_services.len()
+        )
+    }
+
+    // Check if any service uses adaptive scaling
+    let has_adaptive = agent::has_adaptive_scaling(&spec.services);
+
+    if has_adaptive {
+        // Create autoscale controller
+        let autoscale_interval = Duration::from_secs(10);
+        let controller = Arc::new(agent::AutoscaleController::new(
+            manager.clone(),
+            runtime.clone(),
+            autoscale_interval,
+        ));
+
+        // Register adaptive services with the controller
+        for (name, service_spec) in &spec.services {
+            if let spec::ScaleSpec::Adaptive { .. } = &service_spec.scale {
+                let replicas = manager.service_replica_count(name).await.unwrap_or(0) as u32;
+                controller
+                    .register_service(name, &service_spec.scale, replicas)
+                    .await;
+            }
+        }
+
+        let adaptive_count = controller.registered_service_count().await;
+        info!(
+            count = adaptive_count,
+            interval_secs = autoscale_interval.as_secs(),
+            "Autoscale controller configured"
+        );
+        println!("\nAutoscaling enabled for {} service(s)", adaptive_count);
+        println!("  Evaluation interval: {}s", autoscale_interval.as_secs());
+
+        // Spawn autoscale loop
+        let controller_clone = controller.clone();
+        let autoscale_handle = tokio::spawn(async move {
+            if let Err(e) = controller_clone.run_loop().await {
+                tracing::error!(error = %e, "Autoscale controller failed");
+            }
+        });
+
+        // Wait for Ctrl+C
+        println!("\nDeployment running with autoscaling. Press Ctrl+C to stop.");
+        tokio::signal::ctrl_c()
+            .await
+            .context("Failed to wait for Ctrl+C")?;
+
+        println!("\nShutting down...");
+        info!("Received shutdown signal");
+
+        // Shutdown autoscaler
+        controller.shutdown();
+        if let Err(e) = autoscale_handle.await {
+            warn!(error = %e, "Autoscale handle join error");
+        }
+
+        info!("Autoscale controller stopped");
+    } else {
+        println!("\nDeployment completed successfully!");
+        println!("No adaptive scaling configured - deployment is static.");
     }
 
     Ok(())
@@ -373,44 +557,50 @@ fn print_deployment_plan(spec: &DeploymentSpec) {
 
 /// Join token information
 #[cfg(feature = "join")]
-#[derive(Debug, serde::Deserialize)]
-struct JoinInfo {
-    /// Deployment identifier/key
-    #[serde(alias = "key")]
-    deployment: String,
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+struct JoinToken {
     /// API endpoint to contact
     api_endpoint: String,
-    /// Optional service name
+    /// Deployment name
+    deployment: String,
+    /// Authentication key for the API
+    key: String,
+    /// Optional service name (if token is service-specific)
+    #[serde(default)]
     service: Option<String>,
 }
 
 /// Parse a join token
 #[cfg(feature = "join")]
-fn parse_join_token(token: &str) -> Result<JoinInfo> {
+fn parse_join_token(token: &str) -> Result<JoinToken> {
     use base64::Engine;
 
-    // Try to decode as base64
+    // Try to decode as base64 (try URL-safe first, then standard)
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(token)
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(token))
         .context("Invalid join token: not valid base64")?;
 
     // Parse as JSON
-    let info: JoinInfo =
+    let join_token: JoinToken =
         serde_json::from_slice(&decoded).context("Invalid join token: not valid JSON")?;
 
-    Ok(info)
+    Ok(join_token)
 }
 
 /// Join an existing deployment
 #[cfg(feature = "join")]
 async fn join(
-    _cli: &Cli,
+    cli: &Cli,
     token: &str,
-    spec_dir: Option<&str>,
+    _spec_dir: Option<&str>,
     service: Option<&str>,
     replicas: u32,
 ) -> Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::RwLock;
+
     info!(
         token_len = token.len(),
         service = ?service,
@@ -418,63 +608,228 @@ async fn join(
         "Joining deployment"
     );
 
-    // Parse the join token
-    // Token format: base64(json({ "key": "deployment-key", "api": "http://...", "service": "svc" }))
-    let join_info = parse_join_token(token)?;
+    // Step 1: Parse join token
+    let join_token = parse_join_token(token)?;
 
-    println!("Joining deployment: {}", join_info.deployment);
-    println!("API endpoint: {}", join_info.api_endpoint);
+    info!(
+        api_endpoint = %join_token.api_endpoint,
+        deployment = %join_token.deployment,
+        "Joining deployment"
+    );
 
-    let target_service = service.or(join_info.service.as_deref());
-    if let Some(svc) = target_service {
-        println!("Service: {}", svc);
+    println!("Joining deployment: {}", join_token.deployment);
+    println!("API endpoint: {}", join_token.api_endpoint);
+
+    // Step 2: Authenticate with API
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    info!("Authenticating with API...");
+    let auth_response = client
+        .post(format!("{}/api/v1/auth/verify", join_token.api_endpoint))
+        .bearer_auth(&join_token.key)
+        .send()
+        .await
+        .context("Failed to authenticate with API")?;
+
+    if !auth_response.status().is_success() {
+        let status = auth_response.status();
+        let body = auth_response.text().await.unwrap_or_default();
+        anyhow::bail!("Authentication failed: {} - {}", status, body);
     }
-    println!("Replicas: {}", replicas);
+    info!("Authentication successful");
+    println!("Authentication successful");
 
-    // Spec directory
-    let spec_base = spec_dir.map(String::from).unwrap_or_else(|| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        format!("{}/.zlayer/deployments", home)
-    });
-    let spec_path = format!("{}/{}/spec.yaml", spec_base, join_info.deployment);
+    // Step 3: Fetch deployment spec from API
+    info!("Fetching deployment spec from API...");
+    let spec_response = client
+        .get(format!(
+            "{}/api/v1/deployments/{}/spec",
+            join_token.api_endpoint, join_token.deployment
+        ))
+        .bearer_auth(&join_token.key)
+        .send()
+        .await
+        .context("Failed to fetch deployment spec")?;
 
-    println!("\nLooking for spec at: {}", spec_path);
-
-    // Check if spec exists locally, if not fetch from API
-    if !std::path::Path::new(&spec_path).exists() {
-        println!("Spec not found locally, fetching from API...");
-        // TODO: Fetch spec from join_info.api_endpoint
-        println!("[Spec fetching not yet implemented]");
-        return Ok(());
+    if !spec_response.status().is_success() {
+        let status = spec_response.status();
+        let body = spec_response.text().await.unwrap_or_default();
+        anyhow::bail!("Failed to fetch deployment spec: {} - {}", status, body);
     }
 
-    // Load and validate spec
-    let spec_content = std::fs::read_to_string(&spec_path).context("Failed to read spec file")?;
-    let spec: DeploymentSpec =
-        serde_yaml::from_str(&spec_content).context("Failed to parse spec")?;
+    let spec: DeploymentSpec = spec_response
+        .json()
+        .await
+        .context("Failed to parse deployment spec")?;
 
-    println!("Loaded deployment: {}", spec.deployment);
+    info!(
+        deployment = %spec.deployment,
+        services = spec.services.len(),
+        "Fetched deployment spec"
+    );
+    println!("Fetched deployment spec: {} services", spec.services.len());
 
-    // Find the service in the spec
-    let service_name = target_service
-        .ok_or_else(|| anyhow::anyhow!("No service specified and token doesn't include one"))?;
+    // Step 4: Determine which service(s) to join
+    let target_service = service.or(join_token.service.as_deref());
+    let services_to_join: Vec<(String, spec::ServiceSpec)> = if let Some(svc) = target_service {
+        // Join specific service
+        if !spec.services.contains_key(svc) {
+            anyhow::bail!("Service '{}' not found in deployment", svc);
+        }
+        vec![(svc.to_string(), spec.services.get(svc).unwrap().clone())]
+    } else {
+        // Join all services (for global join)
+        spec.services
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
 
-    let service_spec = spec
-        .services
-        .get(service_name)
-        .ok_or_else(|| anyhow::anyhow!("Service '{}' not found in deployment", service_name))?;
+    println!("\nServices to join:");
+    for (name, svc_spec) in &services_to_join {
+        println!("  - {} (image: {})", name, svc_spec.image.name);
+    }
 
-    println!("\nService configuration:");
-    println!("  Image: {}", service_spec.image.name);
-    println!("  Type: {:?}", service_spec.rtype);
+    // Step 5: Build runtime
+    let runtime_config = build_runtime_config(cli);
+    info!(runtime = ?cli.runtime, "Creating container runtime");
 
-    // TODO: Actually start the service
-    // 1. Create ServiceManager from agent crate
-    // 2. Scale service to requested replicas
-    // 3. Register with scheduler for load balancing
-    println!("\n[Service startup not yet implemented]");
-    println!("Would start {} replica(s) of '{}'", replicas, service_name);
+    let runtime = agent::create_runtime(runtime_config)
+        .await
+        .context("Failed to create container runtime")?;
+    info!("Runtime created successfully");
 
+    // Step 6: Setup overlay networks
+    let overlay_manager = match agent::OverlayManager::new(spec.deployment.clone()).await {
+        Ok(mut om) => {
+            // Setup global overlay
+            if let Err(e) = om.setup_global_overlay().await {
+                warn!("Failed to setup global overlay (non-fatal): {}", e);
+                println!("Warning: Overlay network setup failed: {}", e);
+            } else {
+                info!("Global overlay network created");
+                println!("Global overlay network created");
+            }
+            Some(Arc::new(RwLock::new(om)))
+        }
+        Err(e) => {
+            warn!("Overlay networks disabled: {}", e);
+            println!("Warning: Overlay networks disabled: {}", e);
+            None
+        }
+    };
+
+    // Step 7: Create ServiceManager with overlay support
+    let manager = if let Some(om) = overlay_manager.clone() {
+        agent::ServiceManager::with_overlay(runtime.clone(), om)
+    } else {
+        agent::ServiceManager::new(runtime.clone())
+    };
+
+    println!("\n=== Starting Services ===\n");
+
+    // Step 8: For each service, pull image, run init, register and scale
+    for (service_name, service_spec) in services_to_join {
+        info!(service = %service_name, "Joining service");
+        println!("Joining service: {}", service_name);
+
+        // Pull image
+        println!("  Pulling image: {}...", service_spec.image.name);
+        runtime
+            .pull_image(&service_spec.image.name)
+            .await
+            .context(format!(
+                "Failed to pull image for service '{}'",
+                service_name
+            ))?;
+        info!(service = %service_name, image = %service_spec.image.name, "Image pulled");
+        println!("  Image pulled successfully");
+
+        // Run init steps (if any)
+        if !service_spec.init.steps.is_empty() {
+            println!(
+                "  Running {} init step(s)...",
+                service_spec.init.steps.len()
+            );
+            for step in &service_spec.init.steps {
+                info!(service = %service_name, step = %step.id, "Running init step");
+                println!("    Step: {}", step.id);
+
+                let action =
+                    init_actions::from_spec(&step.uses, &step.with, Duration::from_secs(300))
+                        .context(format!("Invalid init action: {}", step.uses))?;
+
+                action
+                    .execute()
+                    .await
+                    .context(format!("Init step '{}' failed", step.id))?;
+
+                info!(service = %service_name, step = %step.id, "Init step completed");
+            }
+        }
+
+        // Register service
+        manager
+            .upsert_service(service_name.clone(), service_spec.clone())
+            .await
+            .context(format!("Failed to register service '{}'", service_name))?;
+        info!(service = %service_name, "Service registered");
+
+        // Determine replica count
+        let target_replicas = if replicas > 0 {
+            replicas
+        } else {
+            match &service_spec.scale {
+                spec::ScaleSpec::Fixed { replicas } => *replicas,
+                spec::ScaleSpec::Adaptive { min, .. } => *min,
+                spec::ScaleSpec::Manual => 1, // Join implies at least 1 replica
+            }
+        };
+
+        // Scale service
+        println!("  Scaling to {} replica(s)...", target_replicas);
+        manager
+            .scale_service(&service_name, target_replicas)
+            .await
+            .context(format!("Failed to scale service '{}'", service_name))?;
+
+        info!(
+            service = %service_name,
+            replicas = target_replicas,
+            "Service joined"
+        );
+        println!(
+            "  Service '{}' joined with {} replica(s)",
+            service_name, target_replicas
+        );
+    }
+
+    // Step 9: Wait for Ctrl+C
+    println!("\n=== Join Complete ===");
+    println!("Services are running. Press Ctrl+C to leave the deployment.");
+
+    tokio::signal::ctrl_c()
+        .await
+        .context("Failed to wait for Ctrl+C")?;
+
+    println!("\nShutting down...");
+    info!("Received shutdown signal, cleaning up");
+
+    // Step 10: Cleanup overlay networks on exit
+    if let Some(om) = overlay_manager {
+        info!("Cleaning up overlay networks");
+        let mut om_guard = om.write().await;
+        if let Err(e) = om_guard.cleanup().await {
+            warn!("Failed to cleanup overlay networks: {}", e);
+        } else {
+            info!("Overlay networks cleaned up");
+        }
+    }
+
+    println!("Goodbye!");
     Ok(())
 }
 
@@ -796,8 +1151,9 @@ mod tests {
         use base64::Engine;
 
         let info = serde_json::json!({
-            "deployment": "my-app",
             "api_endpoint": "http://localhost:8080",
+            "deployment": "my-app",
+            "key": "secret-auth-key",
             "service": "api"
         });
 
@@ -805,8 +1161,9 @@ mod tests {
             .encode(serde_json::to_string(&info).unwrap());
 
         let parsed = super::parse_join_token(&token).unwrap();
-        assert_eq!(parsed.deployment, "my-app");
         assert_eq!(parsed.api_endpoint, "http://localhost:8080");
+        assert_eq!(parsed.deployment, "my-app");
+        assert_eq!(parsed.key, "secret-auth-key");
         assert_eq!(parsed.service, Some("api".to_string()));
     }
 
@@ -816,15 +1173,18 @@ mod tests {
         use base64::Engine;
 
         let info = serde_json::json!({
-            "key": "my-deploy",
-            "api_endpoint": "http://api.example.com"
+            "api_endpoint": "http://api.example.com",
+            "deployment": "my-deploy",
+            "key": "auth-key"
         });
 
         let token =
             base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&info).unwrap());
 
         let parsed = super::parse_join_token(&token).unwrap();
+        assert_eq!(parsed.api_endpoint, "http://api.example.com");
         assert_eq!(parsed.deployment, "my-deploy");
+        assert_eq!(parsed.key, "auth-key");
         assert!(parsed.service.is_none());
     }
 

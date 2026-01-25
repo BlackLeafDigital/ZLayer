@@ -29,6 +29,7 @@ pub fn from_yaml_str(yaml: &str) -> Result<DeploymentSpec, SpecError> {
     // Cross-field validation
     validate_dependencies(&spec)?;
     validate_unique_service_endpoints(&spec)?;
+    validate_cron_schedules(&spec)?;
 
     Ok(spec)
 }
@@ -341,5 +342,177 @@ services:
 "#;
         let result = from_yaml_str(yaml);
         assert!(result.is_ok(), "Valid dependency should pass: {:?}", result);
+    }
+
+    // =========================================================================
+    // Cron schedule validation tests (Feature 4, Phase 1)
+    // =========================================================================
+
+    #[test]
+    fn test_valid_cron_job_with_schedule() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services:
+  cleanup:
+    rtype: cron
+    image:
+      name: cleanup:latest
+    schedule: "0 0 0 * * * *"
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(result.is_ok(), "Valid cron job should pass: {:?}", result);
+        let spec = result.unwrap();
+        let cleanup = spec.services.get("cleanup").unwrap();
+        assert_eq!(cleanup.rtype, ResourceType::Cron);
+        assert_eq!(cleanup.schedule, Some("0 0 0 * * * *".to_string()));
+    }
+
+    #[test]
+    fn test_cron_without_schedule_rejected() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services:
+  cleanup:
+    rtype: cron
+    image:
+      name: cleanup:latest
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("schedule") || err_str.contains("cron"),
+            "Error should mention missing schedule: {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_service_with_schedule_rejected() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services:
+  api:
+    rtype: service
+    image:
+      name: api:latest
+    schedule: "0 0 0 * * * *"
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("schedule") || err_str.contains("cron"),
+            "Error should mention schedule/cron mismatch: {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_job_with_schedule_rejected() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services:
+  backup:
+    rtype: job
+    image:
+      name: backup:latest
+    schedule: "0 0 0 * * * *"
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("schedule") || err_str.contains("cron"),
+            "Error should mention schedule/cron mismatch: {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_invalid_cron_expression_rejected() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services:
+  cleanup:
+    rtype: cron
+    image:
+      name: cleanup:latest
+    schedule: "not a valid cron"
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("cron") || err_str.contains("schedule") || err_str.contains("invalid"),
+            "Error should mention invalid cron expression: {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_valid_extended_cron_expression() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services:
+  cleanup:
+    rtype: cron
+    image:
+      name: cleanup:latest
+    schedule: "0 30 2 * * * *"
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(
+            result.is_ok(),
+            "Extended cron expression should be valid: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_mixed_service_types_valid() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services:
+  api:
+    rtype: service
+    image:
+      name: api:latest
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+  backup:
+    rtype: job
+    image:
+      name: backup:latest
+  cleanup:
+    rtype: cron
+    image:
+      name: cleanup:latest
+    schedule: "0 0 0 * * * *"
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(
+            result.is_ok(),
+            "Mixed service types should be valid: {:?}",
+            result
+        );
+        let spec = result.unwrap();
+        assert_eq!(spec.services.len(), 3);
+        assert_eq!(spec.services["api"].rtype, ResourceType::Service);
+        assert_eq!(spec.services["backup"].rtype, ResourceType::Job);
+        assert_eq!(spec.services["cleanup"].rtype, ResourceType::Cron);
     }
 }

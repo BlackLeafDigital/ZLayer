@@ -3,8 +3,9 @@
 //! Defines the Runtime trait that can be implemented for different container runtimes
 //! (containerd, CRI-O, etc.)
 
+use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
-use spec::ServiceSpec;
+use spec::{PullPolicy, ServiceSpec};
 use std::time::Duration;
 use tokio::task::JoinHandle;
 
@@ -54,6 +55,9 @@ pub trait Runtime: Send + Sync {
     /// Pull an image to local storage
     async fn pull_image(&self, image: &str) -> Result<()>;
 
+    /// Pull an image to local storage with a specific policy
+    async fn pull_image_with_policy(&self, image: &str, policy: PullPolicy) -> Result<()>;
+
     /// Create a container
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()>;
 
@@ -74,6 +78,24 @@ pub trait Runtime: Send + Sync {
 
     /// Execute command in container
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)>;
+
+    /// Get container resource statistics from cgroups
+    ///
+    /// Returns CPU and memory statistics for the specified container.
+    /// Used for metrics collection and autoscaling decisions.
+    async fn get_container_stats(&self, id: &ContainerId) -> Result<ContainerStats>;
+
+    /// Wait for a container to exit and return its exit code
+    ///
+    /// This method blocks until the container exits or an error occurs.
+    /// Used primarily for job execution to implement run-to-completion semantics.
+    async fn wait_container(&self, id: &ContainerId) -> Result<i32>;
+
+    /// Get container logs (stdout/stderr combined)
+    ///
+    /// Returns logs as a vector of log lines.
+    /// Used to capture job output after completion.
+    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>>;
 }
 
 /// In-memory mock runtime for testing and development
@@ -98,6 +120,11 @@ impl Default for MockRuntime {
 #[async_trait::async_trait]
 impl Runtime for MockRuntime {
     async fn pull_image(&self, _image: &str) -> Result<()> {
+        self.pull_image_with_policy(_image, PullPolicy::IfNotPresent)
+            .await
+    }
+
+    async fn pull_image_with_policy(&self, _image: &str, _policy: PullPolicy) -> Result<()> {
         // Mock: always succeeds
         tokio::time::sleep(Duration::from_millis(100)).await;
         Ok(())
@@ -157,6 +184,63 @@ impl Runtime for MockRuntime {
 
     async fn exec(&self, _id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)> {
         Ok((0, cmd.join(" "), "".to_string()))
+    }
+
+    async fn get_container_stats(&self, id: &ContainerId) -> Result<ContainerStats> {
+        // Mock: return dummy stats
+        let containers = self.containers.read().await;
+        if containers.contains_key(id) {
+            Ok(ContainerStats {
+                cpu_usage_usec: 1_000_000,       // 1 second
+                memory_bytes: 50 * 1024 * 1024,  // 50 MB
+                memory_limit: 256 * 1024 * 1024, // 256 MB
+                timestamp: std::time::Instant::now(),
+            })
+        } else {
+            Err(AgentError::NotFound {
+                container: id.to_string(),
+                reason: "container not found".to_string(),
+            })
+        }
+    }
+
+    async fn wait_container(&self, id: &ContainerId) -> Result<i32> {
+        // Mock: simulate waiting for container to exit
+        let containers = self.containers.read().await;
+        if let Some(container) = containers.get(id) {
+            match &container.state {
+                ContainerState::Exited { code } => Ok(*code),
+                ContainerState::Failed { .. } => Ok(1),
+                _ => {
+                    // Simulate a brief wait and then return success
+                    drop(containers);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    Ok(0)
+                }
+            }
+        } else {
+            Err(AgentError::NotFound {
+                container: id.to_string(),
+                reason: "container not found".to_string(),
+            })
+        }
+    }
+
+    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>> {
+        // Mock: return dummy log lines
+        let containers = self.containers.read().await;
+        if containers.contains_key(id) {
+            Ok(vec![
+                format!("[{}] Container started", id),
+                format!("[{}] Executing command...", id),
+                format!("[{}] Command completed successfully", id),
+            ])
+        } else {
+            Err(AgentError::NotFound {
+                container: id.to_string(),
+                reason: "container not found".to_string(),
+            })
+        }
     }
 }
 

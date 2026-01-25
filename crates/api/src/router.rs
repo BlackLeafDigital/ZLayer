@@ -2,7 +2,7 @@
 
 use axum::{
     middleware,
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Extension, Router,
 };
 use std::sync::Arc;
@@ -14,8 +14,12 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::auth::AuthState;
 use crate::config::ApiConfig;
 use crate::handlers;
+use crate::handlers::cron::CronState;
+use crate::handlers::jobs::JobState;
 use crate::openapi::ApiDoc;
 use crate::ratelimit::{rate_limit_middleware, IpRateLimiter, RateLimitState};
+
+use agent::{CronScheduler, JobExecutor};
 
 /// Build the API router
 pub fn build_router(config: &ApiConfig) -> Router {
@@ -86,6 +90,64 @@ pub fn build_router(config: &ApiConfig) -> Router {
     }
 
     router
+}
+
+/// Build the API router with job and cron execution capabilities
+///
+/// This extends the basic router with endpoints for triggering jobs and managing cron schedules.
+///
+/// # Arguments
+/// * `config` - API configuration
+/// * `job_executor` - Job executor for running jobs
+/// * `cron_scheduler` - Cron scheduler for managing scheduled jobs
+pub fn build_router_with_jobs(
+    config: &ApiConfig,
+    job_executor: Arc<JobExecutor>,
+    cron_scheduler: Arc<CronScheduler>,
+) -> Router {
+    // Start with the basic router
+    let base_router = build_router(config);
+
+    // Job state
+    let job_state = JobState {
+        executor: job_executor,
+    };
+
+    // Cron state
+    let cron_state = CronState {
+        scheduler: cron_scheduler,
+    };
+
+    // Job routes
+    let job_routes = Router::new()
+        .route("/{name}/trigger", post(handlers::jobs::trigger_job))
+        .route(
+            "/{execution_id}/status",
+            get(handlers::jobs::get_execution_status),
+        )
+        .route(
+            "/{name}/executions",
+            get(handlers::jobs::list_job_executions),
+        )
+        .route(
+            "/{execution_id}/cancel",
+            post(handlers::jobs::cancel_execution),
+        )
+        .with_state(job_state);
+
+    // Cron routes
+    let cron_routes = Router::new()
+        .route("/", get(handlers::cron::list_cron_jobs))
+        .route("/{name}", get(handlers::cron::get_cron_job))
+        .route("/{name}/trigger", post(handlers::cron::trigger_cron_job))
+        .route("/{name}/enable", put(handlers::cron::enable_cron_job))
+        .route("/{name}/disable", put(handlers::cron::disable_cron_job))
+        .with_state(cron_state);
+
+    // Merge job and cron routes into API v1
+    base_router
+        .nest("/api/v1/jobs", job_routes)
+        .nest("/api/v1/cron", cron_routes)
 }
 
 fn build_cors_layer(config: &ApiConfig) -> CorsLayer {

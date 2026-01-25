@@ -5,6 +5,7 @@
 
 // Note: bundle module must be added to lib.rs in Phase 5
 // For now, we inline the necessary bundle functionality
+use crate::cgroups_stats::{self, ContainerStats};
 use crate::error::{AgentError, Result};
 use crate::runtime::{ContainerId, ContainerState, Runtime};
 use libcontainer::container::builder::ContainerBuilder;
@@ -270,32 +271,65 @@ impl Runtime for YoukiRuntime {
     ///
     /// Downloads image layers from a registry and unpacks them to a rootfs.
     async fn pull_image(&self, image: &str) -> Result<()> {
+        self.pull_image_with_policy(image, spec::PullPolicy::IfNotPresent)
+            .await
+    }
+
+    /// Pull an image to local storage with a specific pull policy
+    async fn pull_image_with_policy(&self, image: &str, policy: spec::PullPolicy) -> Result<()> {
         let rootfs_path = self.rootfs_path(image);
 
-        // Check if rootfs already exists AND has valid content
-        if rootfs_path.exists() {
-            if self.validate_rootfs_content(&rootfs_path).await {
-                tracing::debug!(
-                    rootfs = %rootfs_path.display(),
-                    "rootfs already exists with valid content, skipping pull"
-                );
-                return Ok(());
-            } else {
-                // Directory exists but is empty/corrupted - clean up and repull
-                tracing::warn!(
-                    rootfs = %rootfs_path.display(),
-                    "rootfs directory exists but appears empty or corrupted, removing and repulling"
-                );
-                if let Err(e) = tokio::fs::remove_dir_all(&rootfs_path).await {
-                    tracing::error!(
-                        rootfs = %rootfs_path.display(),
-                        error = %e,
-                        "failed to remove corrupted rootfs directory"
-                    );
-                    return Err(AgentError::PullFailed {
-                        image: image.to_string(),
-                        reason: format!("failed to remove corrupted rootfs: {}", e),
+        match policy {
+            spec::PullPolicy::Never => {
+                if !rootfs_path.exists() {
+                    return Err(AgentError::NotFound {
+                        container: image.to_string(),
+                        reason: "image not found locally and pull policy is Never".to_string(),
                     });
+                }
+                return Ok(());
+            }
+            spec::PullPolicy::IfNotPresent => {
+                // Check if rootfs already exists AND has valid content
+                if rootfs_path.exists() {
+                    if self.validate_rootfs_content(&rootfs_path).await {
+                        tracing::debug!(
+                            rootfs = %rootfs_path.display(),
+                            "rootfs already exists with valid content, skipping pull"
+                        );
+                        return Ok(());
+                    } else {
+                        // Directory exists but is empty/corrupted - clean up and repull
+                        tracing::warn!(
+                            rootfs = %rootfs_path.display(),
+                            "rootfs directory exists but appears empty or corrupted, removing and repulling"
+                        );
+                        if let Err(e) = tokio::fs::remove_dir_all(&rootfs_path).await {
+                            tracing::error!(
+                                rootfs = %rootfs_path.display(),
+                                error = %e,
+                                "failed to remove corrupted rootfs directory"
+                            );
+                            return Err(AgentError::PullFailed {
+                                image: image.to_string(),
+                                reason: format!("failed to remove corrupted rootfs: {}", e),
+                            });
+                        }
+                    }
+                }
+            }
+            spec::PullPolicy::Always => {
+                if rootfs_path.exists() {
+                    tracing::info!(
+                        rootfs = %rootfs_path.display(),
+                        "pull policy is Always, removing existing rootfs before repull"
+                    );
+                    if let Err(e) = tokio::fs::remove_dir_all(&rootfs_path).await {
+                        return Err(AgentError::PullFailed {
+                            image: image.to_string(),
+                            reason: format!("failed to remove existing rootfs: {}", e),
+                        });
+                    }
                 }
             }
         }
@@ -896,6 +930,138 @@ impl Runtime for YoukiRuntime {
 
         Ok((exit_code, stdout_content, stderr_content))
     }
+
+    /// Get container resource statistics from cgroups
+    ///
+    /// Reads CPU and memory statistics from the cgroups v2 filesystem.
+    /// Supports both systemd and cgroupfs cgroup drivers.
+    async fn get_container_stats(&self, id: &ContainerId) -> Result<ContainerStats> {
+        let container_id = self.container_id_str(id);
+
+        // Determine cgroup path based on cgroup driver
+        let cgroup_path = if self.config.use_systemd {
+            // systemd cgroup driver: /sys/fs/cgroup/system.slice/zlayer-{id}.scope
+            PathBuf::from(format!(
+                "/sys/fs/cgroup/system.slice/zlayer-{}.scope",
+                container_id
+            ))
+        } else {
+            // cgroupfs driver: /sys/fs/cgroup/zlayer/{id}
+            PathBuf::from(format!("/sys/fs/cgroup/zlayer/{}", container_id))
+        };
+
+        tracing::debug!(
+            container = %container_id,
+            cgroup_path = %cgroup_path.display(),
+            "reading container stats from cgroups"
+        );
+
+        cgroups_stats::read_container_stats(&cgroup_path)
+            .await
+            .map_err(|e| {
+                AgentError::Internal(format!(
+                    "failed to read cgroup stats for container {}: {}",
+                    container_id, e
+                ))
+            })
+    }
+
+    /// Wait for a container to exit and return its exit code
+    ///
+    /// This polls the container state until it reaches an exited state.
+    /// For libcontainer, we don't have a direct "wait" API, so we poll.
+    async fn wait_container(&self, id: &ContainerId) -> Result<i32> {
+        let container_id = self.container_id_str(id);
+        let poll_interval = Duration::from_millis(100);
+        let max_wait = Duration::from_secs(3600); // 1 hour max
+        let start = std::time::Instant::now();
+
+        tracing::debug!(
+            container = %container_id,
+            "waiting for container to exit"
+        );
+
+        loop {
+            if start.elapsed() > max_wait {
+                return Err(AgentError::Timeout { timeout: max_wait });
+            }
+
+            match self.container_state(id).await {
+                Ok(ContainerState::Exited { code }) => {
+                    tracing::debug!(
+                        container = %container_id,
+                        exit_code = code,
+                        "container exited"
+                    );
+                    return Ok(code);
+                }
+                Ok(ContainerState::Failed { reason }) => {
+                    tracing::warn!(
+                        container = %container_id,
+                        reason = %reason,
+                        "container failed"
+                    );
+                    return Err(AgentError::Internal(format!(
+                        "container failed: {}",
+                        reason
+                    )));
+                }
+                Ok(_) => {
+                    // Still running, wait and poll again
+                    tokio::time::sleep(poll_interval).await;
+                }
+                Err(AgentError::NotFound { .. }) => {
+                    // Container may have been removed - treat as exited with code 0
+                    tracing::debug!(
+                        container = %container_id,
+                        "container not found, treating as exited"
+                    );
+                    return Ok(0);
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    /// Get container logs (stdout/stderr combined)
+    ///
+    /// Reads from the container's log files and returns as a vector of lines.
+    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>> {
+        let container_id = self.container_id_str(id);
+
+        // Get log paths
+        let (stdout_path, stderr_path) = {
+            let containers = self.containers.read().await;
+            match containers.get(&container_id) {
+                Some(info) => (info.stdout_path.clone(), info.stderr_path.clone()),
+                None => self.log_paths(id),
+            }
+        };
+
+        let mut logs = Vec::new();
+
+        // Read stdout
+        if stdout_path.exists() {
+            if let Ok(content) = fs::read_to_string(&stdout_path).await {
+                for line in content.lines() {
+                    logs.push(format!("[stdout] {}", line));
+                }
+            }
+        }
+
+        // Read stderr
+        if stderr_path.exists() {
+            if let Ok(content) = fs::read_to_string(&stderr_path).await {
+                for line in content.lines() {
+                    logs.push(format!("[stderr] {}", line));
+                }
+            }
+        }
+
+        Ok(logs)
+    }
 }
 
 impl YoukiRuntime {
@@ -946,19 +1112,27 @@ impl YoukiRuntime {
             vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()];
         env.push("TERM=xterm".to_string());
 
-        // Add service-specific env vars
-        for (key, value) in &spec.env {
-            env.push(format!("{}={}", key, value));
+        // Resolve $E: prefixed env vars from host environment
+        let resolved = crate::env::resolve_env_vars_with_warnings(&spec.env).map_err(|e| {
+            AgentError::InvalidSpec(format!("environment variable resolution failed: {}", e))
+        })?;
+
+        // Log any warnings
+        for warning in &resolved.warnings {
+            tracing::warn!(service = %id.service, "{}", warning);
         }
 
-        // Build process - use /bin/sh as default if no command specified
-        // Note: ServiceSpec doesn't have command/args fields, so we use a default
+        // Add resolved environment variables
+        env.extend(resolved.vars);
+
+        // Build process from command overrides or defaults
+        let (process_args, working_dir) = self.resolve_command(spec);
         let process = ProcessBuilder::default()
             .terminal(false)
             .user(user)
             .env(env)
-            .args(vec!["/bin/sh".to_string()])
-            .cwd("/".to_string())
+            .args(process_args)
+            .cwd(working_dir)
             .no_new_privileges(!spec.privileged)
             .build()
             .map_err(|e| AgentError::InvalidSpec(format!("failed to build process: {}", e)))?;
@@ -1011,6 +1185,34 @@ impl YoukiRuntime {
             .map_err(|e| AgentError::InvalidSpec(format!("failed to build OCI spec: {}", e)))?;
 
         Ok(oci_spec)
+    }
+
+    /// Resolve command from ServiceSpec following Docker/OCI semantics
+    fn resolve_command(&self, spec: &ServiceSpec) -> (Vec<String>, String) {
+        let mut args = Vec::new();
+
+        match (&spec.command.entrypoint, &spec.command.args) {
+            (Some(entrypoint), Some(cmd_args)) => {
+                args.extend_from_slice(entrypoint);
+                args.extend_from_slice(cmd_args);
+            }
+            (Some(entrypoint), None) => {
+                args.extend_from_slice(entrypoint);
+            }
+            (None, Some(cmd_args)) if !cmd_args.is_empty() => {
+                args.extend_from_slice(cmd_args);
+            }
+            _ => {
+                args.push("/bin/sh".to_string());
+            }
+        }
+
+        let workdir = spec
+            .command
+            .workdir
+            .clone()
+            .unwrap_or_else(|| "/".to_string());
+        (args, workdir)
     }
 }
 

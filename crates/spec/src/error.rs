@@ -92,6 +92,15 @@ pub enum ValidationErrorKind {
     /// Invalid environment variable name
     InvalidEnvVar { name: String },
 
+    /// Invalid cron schedule expression
+    InvalidCronSchedule { schedule: String, reason: String },
+
+    /// Schedule field is only valid for rtype: cron
+    ScheduleOnlyForCron,
+
+    /// rtype: cron requires a schedule field
+    CronRequiresSchedule,
+
     /// Generic validation error (from validator crate)
     Generic { message: String },
 }
@@ -130,6 +139,15 @@ impl fmt::Display for ValidationErrorKind {
             Self::EmptyScaleTargets => write!(f, "scale targets are empty in adaptive mode"),
             Self::InvalidEnvVar { name } => {
                 write!(f, "invalid environment variable name '{}'", name)
+            }
+            Self::InvalidCronSchedule { schedule, reason } => {
+                write!(f, "invalid cron schedule '{}': {}", schedule, reason)
+            }
+            Self::ScheduleOnlyForCron => {
+                write!(f, "schedule field is only valid for rtype: cron")
+            }
+            Self::CronRequiresSchedule => {
+                write!(f, "rtype: cron requires a schedule field")
             }
             Self::Generic { message } => write!(f, "{}", message),
         }

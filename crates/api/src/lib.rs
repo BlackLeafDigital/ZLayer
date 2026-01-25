@@ -36,5 +36,9 @@ pub use ratelimit::{
     create_global_limiter, ip_rate_limit_middleware, rate_limit_middleware, GlobalLimiter,
     IpRateLimiter, RateLimitState,
 };
-pub use router::build_router;
+pub use router::{build_router, build_router_with_jobs};
 pub use server::ApiServer;
+
+// Re-export state types for job/cron endpoints
+pub use handlers::cron::CronState;
+pub use handlers::jobs::JobState;
