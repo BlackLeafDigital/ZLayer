@@ -224,7 +224,7 @@ jobs:
     # Run in a privileged container with libseccomp pre-installed
     container:
       image: ghcr.io/zachhandley/baseimages/rust-alpine:latest
-      options: --privileged --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+      options: --privileged --cgroupns=host --security-opt seccomp=unconfined --security-opt apparmor=unconfined
     steps:
       - name: Checkout
         uses: actions/checkout@v4
