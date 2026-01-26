@@ -71,11 +71,17 @@ jobs:
 
       - name: Build in Docker container
         run: |
+          echo "PWD: $(pwd)"
+          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
+          ls -la
           docker run --rm \
-            -v "$(pwd)":/workspace \
+            -v "$(pwd)":/workspace:rw \
             -w /workspace \
             --platform linux/arm64 \
             rust:latest bash -c "
+              echo 'Inside container:'
+              pwd
+              ls -la /workspace
               apt-get update && apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config
               cargo build --release --package runtime
               cargo build --release --package devctl
