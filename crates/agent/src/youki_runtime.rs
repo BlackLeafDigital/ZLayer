@@ -69,6 +69,14 @@ impl Default for YoukiConfig {
     }
 }
 
+/// Process-global mutex to serialize libcontainer operations.
+/// libcontainer uses chdir() internally for notify socket operations
+/// (to work around Unix socket 108-char path limit), which affects the
+/// entire process. Concurrent container operations race on the CWD.
+/// This must be process-global, not per-runtime, since chdir affects all threads.
+static LIBCONTAINER_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 /// Container tracking information
 #[derive(Debug)]
 struct ContainerInfo {
@@ -445,8 +453,15 @@ impl Runtime for YoukiRuntime {
         let bundle_path_clone = bundle_path.clone();
         // Use state_dir as the root path - libcontainer appends container_id internally
         let state_dir_clone = self.config.state_dir.clone();
-
         let _container = tokio::task::spawn_blocking(move || {
+            // Acquire process-global lock to serialize libcontainer operations.
+            // libcontainer uses chdir() internally which affects the entire process,
+            // so concurrent operations would race on the working directory.
+            let _guard = LIBCONTAINER_LOCK.lock().map_err(|e| AgentError::CreateFailed {
+                id: container_id_clone.clone(),
+                reason: format!("failed to acquire libcontainer lock: {}", e),
+            })?;
+
             // Create container using libcontainer
             // Set stdout/stderr on ContainerBuilder BEFORE calling as_init()
             let container_builder =
@@ -514,6 +529,14 @@ impl Runtime for YoukiRuntime {
 
         // Load and start the container using spawn_blocking
         let pid = tokio::task::spawn_blocking(move || {
+            // Acquire process-global lock to serialize libcontainer operations.
+            // libcontainer uses chdir() internally which affects the entire process,
+            // so concurrent operations would race on the working directory.
+            let _guard = LIBCONTAINER_LOCK.lock().map_err(|e| AgentError::StartFailed {
+                id: container_id.clone(),
+                reason: format!("failed to acquire libcontainer lock: {}", e),
+            })?;
+
             let mut container =
                 Container::load(container_root).map_err(|e| AgentError::StartFailed {
                     id: container_id.clone(),
