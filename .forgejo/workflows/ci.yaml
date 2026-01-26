@@ -221,10 +221,7 @@ jobs:
     needs: test
     # Only run on main branch or explicit trigger (expensive)
     if: github.ref == 'refs/heads/main' || contains(github.event.head_commit.message, '[e2e]')
-    # Run in a privileged container with libseccomp pre-installed (Ubuntu for glibc/cgroup compatibility)
-    container:
-      image: ghcr.io/zachhandley/baseimages/rust-containerd:latest
-      options: --privileged --cgroupns=host --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+    # Run directly on host (no container) to avoid nested container issues
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -252,14 +249,8 @@ jobs:
           mkdir -p /tmp/zlayer-youki-e2e-test/{state,rootfs,bundles,cache}
           chmod -R 755 /tmp/zlayer-youki-e2e-test
 
-          # Ensure cgroup v2 is writable (required for container creation)
-          # If cgroup is read-only, try to remount it
-          if [ -d /sys/fs/cgroup ] && [ ! -w /sys/fs/cgroup/cgroup.subtree_control ]; then
-            mount -o remount,rw /sys/fs/cgroup 2>/dev/null || true
-          fi
-
       - name: Run E2E tests
-        run: cargo test --package agent --test youki_e2e -- --test-threads=1 --nocapture
+        run: sudo -E cargo test --package agent --test youki_e2e -- --test-threads=1 --nocapture
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
@@ -267,7 +258,8 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          rm -rf /var/lib/zlayer/* 2>/dev/null || true
+          sudo rm -rf /var/lib/zlayer/* 2>/dev/null || true
+          rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
 
   # ===========================================
   # Cache Cleanup
