@@ -81,17 +81,45 @@ sudo dnf install libseccomp-devel
 sudo pacman -S libseccomp
 ```
 
-## Building
+## Installation
+
+### From Package Registry (Recommended)
+
+Download the latest release for your architecture:
 
 ```bash
-# Debug build
-cargo build
+# For amd64 (latest)
+curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/latest/zlayer-linux-amd64.tar.gz | tar xz
+sudo mv zlayer devctl /usr/local/bin/
 
-# Release build
-cargo build --release
+# For arm64 (latest)
+curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/latest/zlayer-linux-arm64.tar.gz | tar xz
+sudo mv zlayer devctl /usr/local/bin/
+```
 
-# Run tests
-cargo test --workspace
+Or pin to a specific version:
+
+```bash
+# Replace VERSION with desired version (e.g., v0.1.0)
+curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/VERSION/zlayer-linux-amd64.tar.gz | tar xz
+```
+
+### From Source
+
+```bash
+# Clone the repo
+git clone https://forge.blackleafdigital.com/BlackLeafDigital/ZLayer.git
+cd ZLayer
+
+# Install dependencies (Ubuntu/Debian)
+sudo apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config cmake
+
+# Build release binaries
+cargo build --release --package runtime
+cargo build --release --package devctl
+
+# Install
+sudo cp target/release/zlayer target/release/devctl /usr/local/bin/
 ```
 
 ## Quick Start
