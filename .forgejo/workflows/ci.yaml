@@ -248,9 +248,10 @@ jobs:
 
       - name: Setup E2E environment
         run: |
+          # Clean up any leftover state from previous runs
+          sudo rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
           # Create test directories (must match E2E_TEST_DIR in youki_e2e.rs)
           mkdir -p /tmp/zlayer-youki-e2e-test/{state,rootfs,bundles,cache}
-          chmod -R 755 /tmp/zlayer-youki-e2e-test
 
       - name: Run E2E tests
         run: sudo -E env "PATH=$PATH" cargo test --package agent --test youki_e2e -- --nocapture
