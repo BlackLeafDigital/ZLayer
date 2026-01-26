@@ -71,11 +71,20 @@ jobs:
 
       - name: Build in Docker container
         run: |
-          docker run --rm -v "$PWD":/workspace -w /workspace rust:latest bash -c "
-            apt-get update && apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config
-            cargo build --release --package runtime
-            cargo build --release --package devctl
-          "
+          echo "Building in: $GITHUB_WORKSPACE"
+          ls -la "$GITHUB_WORKSPACE"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE":/workspace \
+            -w /workspace \
+            --platform linux/arm64 \
+            rust:latest bash -c "
+              ls -la /workspace
+              apt-get update && apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config
+              cargo build --release --package runtime
+              cargo build --release --package devctl
+            "
+          # Fix permissions on target dir (Docker runs as root)
+          sudo chown -R $(id -u):$(id -g) target 2>/dev/null || true
 
       - name: Create release archive
         run: |
