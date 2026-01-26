@@ -71,23 +71,21 @@ jobs:
 
       - name: Build in Docker container
         run: |
-          echo "PWD: $(pwd)"
-          echo "GITHUB_WORKSPACE: $GITHUB_WORKSPACE"
-          ls -la
+          # Copy to /tmp which Docker Desktop can mount (unlike /opt/homebrew)
+          BUILD_DIR="/tmp/zlayer-build-$$"
+          cp -r . "$BUILD_DIR"
           docker run --rm \
-            -v "$(pwd)":/workspace:rw \
+            -v "${BUILD_DIR}":/workspace \
             -w /workspace \
             --platform linux/arm64 \
             rust:latest bash -c "
-              echo 'Inside container:'
-              pwd
-              ls -la /workspace
               apt-get update && apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config
               cargo build --release --package runtime
               cargo build --release --package devctl
             "
-          # Fix permissions on target dir (Docker runs as root)
-          sudo chown -R $(id -u):$(id -g) target 2>/dev/null || true
+          # Copy binaries back
+          cp -r "${BUILD_DIR}/target" ./target
+          rm -rf "$BUILD_DIR"
 
       - name: Create release archive
         run: |
