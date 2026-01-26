@@ -71,22 +71,13 @@ jobs:
 
       - name: Build in Docker container
         run: |
-          # Copy to /Volumes which Docker Desktop can mount
-          BUILD_DIR="/Volumes/Expanded/tmp/zlayer-build-$$"
-          mkdir -p "$BUILD_DIR"
-          cp -r . "$BUILD_DIR"
-          docker run --rm \
-            -v "${BUILD_DIR}":/workspace \
-            -w /workspace \
-            --platform linux/arm64 \
-            rust:latest bash -c "
-              apt-get update && apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config
-              cargo build --release --package runtime
-              cargo build --release --package devctl
-            "
-          # Copy binaries back
-          cp -r "${BUILD_DIR}/target" ./target
-          rm -rf "$BUILD_DIR"
+          docker build --platform linux/arm64 -f docker/Dockerfile.arm64-builder -t zlayer-arm64-build .
+          # Extract binaries from the image
+          CONTAINER=$(docker create zlayer-arm64-build)
+          mkdir -p target/release
+          docker cp "${CONTAINER}:/output/zlayer" target/release/
+          docker cp "${CONTAINER}:/output/devctl" target/release/
+          docker rm "${CONTAINER}"
 
       - name: Create release archive
         run: |

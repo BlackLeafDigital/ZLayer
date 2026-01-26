@@ -1,0 +1,19 @@
+FROM rust:latest
+
+RUN apt-get update && apt-get install -y \
+    protobuf-compiler \
+    libseccomp-dev \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY . .
+
+RUN cargo build --release --package runtime && \
+    cargo build --release --package devctl
+
+# Output binaries to a known location for extraction
+RUN mkdir -p /output && \
+    cp target/release/zlayer /output/ && \
+    cp target/release/devctl /output/
