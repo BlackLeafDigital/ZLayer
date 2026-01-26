@@ -21,7 +21,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/zachhandley/ZLayer"
-rust-version = "1.78"  # Minimum supported version
+rust-version = "1.85"  # Minimum supported version
 
 [workspace.dependencies]
 # Serialization

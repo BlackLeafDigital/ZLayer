@@ -457,10 +457,12 @@ impl Runtime for YoukiRuntime {
             // Acquire process-global lock to serialize libcontainer operations.
             // libcontainer uses chdir() internally which affects the entire process,
             // so concurrent operations would race on the working directory.
-            let _guard = LIBCONTAINER_LOCK.lock().map_err(|e| AgentError::CreateFailed {
-                id: container_id_clone.clone(),
-                reason: format!("failed to acquire libcontainer lock: {}", e),
-            })?;
+            let _guard = LIBCONTAINER_LOCK
+                .lock()
+                .map_err(|e| AgentError::CreateFailed {
+                    id: container_id_clone.clone(),
+                    reason: format!("failed to acquire libcontainer lock: {}", e),
+                })?;
 
             // Create container using libcontainer
             // Set stdout/stderr on ContainerBuilder BEFORE calling as_init()
@@ -532,10 +534,12 @@ impl Runtime for YoukiRuntime {
             // Acquire process-global lock to serialize libcontainer operations.
             // libcontainer uses chdir() internally which affects the entire process,
             // so concurrent operations would race on the working directory.
-            let _guard = LIBCONTAINER_LOCK.lock().map_err(|e| AgentError::StartFailed {
-                id: container_id.clone(),
-                reason: format!("failed to acquire libcontainer lock: {}", e),
-            })?;
+            let _guard = LIBCONTAINER_LOCK
+                .lock()
+                .map_err(|e| AgentError::StartFailed {
+                    id: container_id.clone(),
+                    reason: format!("failed to acquire libcontainer lock: {}", e),
+                })?;
 
             let mut container =
                 Container::load(container_root).map_err(|e| AgentError::StartFailed {
