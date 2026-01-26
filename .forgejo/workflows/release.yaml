@@ -71,8 +71,9 @@ jobs:
 
       - name: Build in Docker container
         run: |
-          # Copy to /tmp which Docker Desktop can mount (unlike /opt/homebrew)
-          BUILD_DIR="/tmp/zlayer-build-$$"
+          # Copy to /Volumes which Docker Desktop can mount
+          BUILD_DIR="/Volumes/Expanded/tmp/zlayer-build-$$"
+          mkdir -p "$BUILD_DIR"
           cp -r . "$BUILD_DIR"
           docker run --rm \
             -v "${BUILD_DIR}":/workspace \
