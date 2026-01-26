@@ -10,63 +10,93 @@ env:
 
 jobs:
   build-release:
-    name: Build Release (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
+    name: Build Release (${{ matrix.name }})
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
             name: linux-amd64
+            cross: false
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
             name: linux-arm64
+            cross: true
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
+
+      - name: Install cross-compilation tools
+        if: matrix.cross
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          # For libseccomp cross-compilation
+          sudo apt-get install -y libseccomp-dev:arm64 || true
+
+      - name: Setup Rust
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: Restore cache
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
-      - name: Build
+      - name: Configure cross-compilation
+        if: matrix.cross
+        run: |
+          mkdir -p .cargo
+          cat >> .cargo/config.toml << EOF
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build release binaries
         run: |
           cargo build --release --target ${{ matrix.target }} --package runtime
           cargo build --release --target ${{ matrix.target }} --package devctl
 
-      - name: Package
+      - name: Create release archive
         run: |
-          mkdir -p dist
-          cp target/${{ matrix.target }}/release/zlayer dist/zlayer-${{ matrix.name }}
-          cp target/${{ matrix.target }}/release/devctl dist/devctl-${{ matrix.name }}
-          cd dist && sha256sum * > checksums-${{ matrix.name }}.txt
+          mkdir -p release
+          cp target/${{ matrix.target }}/release/zlayer release/
+          cp target/${{ matrix.target }}/release/devctl release/
+          cp README.md release/ 2>/dev/null || true
+          cp LICENSE* release/ 2>/dev/null || true
+          cd release && tar -czvf ../zlayer-${{ github.ref_name }}-${{ matrix.name }}.tar.gz *
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - name: Upload artifact
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
-          name: release-${{ matrix.name }}
-          path: dist/*
+          name: zlayer-${{ matrix.name }}
+          path: zlayer-${{ github.ref_name }}-${{ matrix.name }}.tar.gz
 
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
     needs: build-release
     steps:
-      - uses: actions/checkout@v4
-
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: https://github.com/christopherhx/gitea-download-artifact@v4
         with:
           path: artifacts
 
-      - name: Create release
-        uses: softprops/action-gh-release@v1
+      - name: Create Release
+        uses: https://github.com/softprops/action-gh-release@v1
         with:
-          files: artifacts/**/*
+          files: artifacts/**/*.tar.gz
           generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
