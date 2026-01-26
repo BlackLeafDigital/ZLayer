@@ -28,7 +28,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          sudo apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config
 
       - name: Install cross-compilation tools
         if: matrix.cross
