@@ -236,7 +236,7 @@ async fn run(cli: Cli) -> Result<()> {
 }
 
 /// Build runtime configuration from CLI arguments
-#[cfg(feature = "deploy")]
+#[cfg(any(feature = "deploy", feature = "join"))]
 fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
     match cli.runtime {
         RuntimeType::Mock => RuntimeConfig::Mock,
