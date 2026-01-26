@@ -40,6 +40,31 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use validator::Validate;
 
+/// How service replicas are allocated to nodes
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeMode {
+    /// Containers placed on any node with capacity (default, bin-packing)
+    #[default]
+    Shared,
+    /// Each replica gets its own dedicated node (1:1 mapping)
+    Dedicated,
+    /// Service is the ONLY thing on its nodes (no other services)
+    Exclusive,
+}
+
+/// Node selection constraints for service placement
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NodeSelector {
+    /// Required labels that nodes must have (all must match)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
+    /// Preferred labels (soft constraint, nodes with these are preferred)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub prefer_labels: HashMap<String, String>,
+}
+
 /// Top-level deployment specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Validate)]
 #[serde(deny_unknown_fields)]
@@ -134,6 +159,14 @@ pub struct ServiceSpec {
     /// Run container in privileged mode (all capabilities + all devices)
     #[serde(default)]
     pub privileged: bool,
+
+    /// Node allocation mode (shared, dedicated, exclusive)
+    #[serde(default)]
+    pub node_mode: NodeMode,
+
+    /// Node selection constraints (required/preferred labels)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_selector: Option<NodeSelector>,
 }
 
 /// Command override specification (Section 5.5)
@@ -805,5 +838,160 @@ services:
             }
             _ => panic!("Expected Adaptive scale mode"),
         }
+    }
+
+    #[test]
+    fn test_node_mode_default() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  hello:
+    rtype: service
+    image:
+      name: hello-world:latest
+"#;
+
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.services["hello"].node_mode, NodeMode::Shared);
+        assert!(spec.services["hello"].node_selector.is_none());
+    }
+
+    #[test]
+    fn test_node_mode_dedicated() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  api:
+    rtype: service
+    image:
+      name: api:latest
+    node_mode: dedicated
+"#;
+
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.services["api"].node_mode, NodeMode::Dedicated);
+    }
+
+    #[test]
+    fn test_node_mode_exclusive() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  database:
+    rtype: service
+    image:
+      name: postgres:15
+    node_mode: exclusive
+"#;
+
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.services["database"].node_mode, NodeMode::Exclusive);
+    }
+
+    #[test]
+    fn test_node_selector_with_labels() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  ml-worker:
+    rtype: service
+    image:
+      name: ml-worker:latest
+    node_mode: dedicated
+    node_selector:
+      labels:
+        gpu: "true"
+        zone: us-east
+      prefer_labels:
+        storage: ssd
+"#;
+
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let service = &spec.services["ml-worker"];
+        assert_eq!(service.node_mode, NodeMode::Dedicated);
+
+        let selector = service.node_selector.as_ref().unwrap();
+        assert_eq!(selector.labels.get("gpu"), Some(&"true".to_string()));
+        assert_eq!(selector.labels.get("zone"), Some(&"us-east".to_string()));
+        assert_eq!(
+            selector.prefer_labels.get("storage"),
+            Some(&"ssd".to_string())
+        );
+    }
+
+    #[test]
+    fn test_node_mode_serialization_roundtrip() {
+        use serde_json;
+
+        // Test all variants serialize/deserialize correctly
+        let modes = [NodeMode::Shared, NodeMode::Dedicated, NodeMode::Exclusive];
+        let expected_json = ["\"shared\"", "\"dedicated\"", "\"exclusive\""];
+
+        for (mode, expected) in modes.iter().zip(expected_json.iter()) {
+            let json = serde_json::to_string(mode).unwrap();
+            assert_eq!(&json, *expected, "Serialization failed for {:?}", mode);
+
+            let deserialized: NodeMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(deserialized, *mode, "Roundtrip failed for {:?}", mode);
+        }
+    }
+
+    #[test]
+    fn test_node_selector_empty() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  api:
+    rtype: service
+    image:
+      name: api:latest
+    node_selector:
+      labels: {}
+"#;
+
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let selector = spec.services["api"].node_selector.as_ref().unwrap();
+        assert!(selector.labels.is_empty());
+        assert!(selector.prefer_labels.is_empty());
+    }
+
+    #[test]
+    fn test_mixed_node_modes_in_deployment() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  redis:
+    rtype: service
+    image:
+      name: redis:alpine
+    # Default shared mode
+  api:
+    rtype: service
+    image:
+      name: api:latest
+    node_mode: dedicated
+  database:
+    rtype: service
+    image:
+      name: postgres:15
+    node_mode: exclusive
+    node_selector:
+      labels:
+        storage: ssd
+"#;
+
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.services["redis"].node_mode, NodeMode::Shared);
+        assert_eq!(spec.services["api"].node_mode, NodeMode::Dedicated);
+        assert_eq!(spec.services["database"].node_mode, NodeMode::Exclusive);
+
+        let db_selector = spec.services["database"].node_selector.as_ref().unwrap();
+        assert_eq!(db_selector.labels.get("storage"), Some(&"ssd".to_string()));
     }
 }

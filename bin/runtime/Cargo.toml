@@ -14,13 +14,15 @@ path = "src/main.rs"
 [features]
 default = ["full"]
 # Full runtime with all CLI commands
-full = ["serve", "join", "deploy"]
+full = ["serve", "join", "deploy", "node"]
 # Enable serve command (API server mode)
 serve = ["dep:api"]
 # Enable join command (agent/worker node mode)
 join = []
 # Enable deploy command (orchestration mode)
 deploy = []
+# Enable node command (cluster management)
+node = []
 
 [dependencies]
 # Internal crates - always required
@@ -28,6 +30,10 @@ agent = { path = "../../crates/agent" }
 spec = { path = "../../crates/spec" }
 observability = { path = "../../crates/observability" }
 init_actions = { path = "../../crates/init_actions" }
+builder = { path = "../../crates/builder" }
+scheduler = { path = "../../crates/scheduler" }
+overlay = { path = "../../crates/overlay" }
+zlayer-core = { path = "../../crates/zlayer-core" }
 
 # Optional: API server (only needed for serve command)
 api = { path = "../../crates/api", optional = true }
@@ -42,3 +48,6 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 reqwest = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

@@ -103,6 +103,13 @@ pub enum ValidationErrorKind {
 
     /// Generic validation error (from validator crate)
     Generic { message: String },
+
+    /// Not enough nodes available for dedicated/exclusive placement
+    InsufficientNodes {
+        required: usize,
+        available: usize,
+        message: String,
+    },
 }
 
 impl fmt::Display for ValidationErrorKind {
@@ -150,6 +157,15 @@ impl fmt::Display for ValidationErrorKind {
                 write!(f, "rtype: cron requires a schedule field")
             }
             Self::Generic { message } => write!(f, "{}", message),
+            Self::InsufficientNodes {
+                required,
+                available,
+                message,
+            } => write!(
+                f,
+                "insufficient nodes: need {} but only {} available - {}",
+                required, available, message
+            ),
         }
     }
 }

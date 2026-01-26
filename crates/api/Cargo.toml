@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 # Internal crates
 agent = { path = "../agent" }
+builder = { path = "../builder" }
 spec = { path = "../spec" }
 scheduler = { path = "../scheduler" }
 observability = { path = "../observability" }
@@ -52,3 +53,15 @@ chrono.workspace = true
 
 # UUID
 uuid.workspace = true
+
+# Streaming
+tokio-stream.workspace = true
+futures-util.workspace = true
+
+# Archive handling
+tar.workspace = true
+flate2.workspace = true
+
+# Temp directories for tests
+[dev-dependencies]
+tempfile = "3"

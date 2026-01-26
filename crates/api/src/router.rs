@@ -19,6 +19,7 @@ use crate::handlers::jobs::JobState;
 use crate::openapi::ApiDoc;
 use crate::ratelimit::{rate_limit_middleware, IpRateLimiter, RateLimitState};
 
+use crate::handlers::build::{build_routes, BuildState};
 use agent::{CronScheduler, JobExecutor};
 
 /// Build the API router
@@ -148,6 +149,50 @@ pub fn build_router_with_jobs(
     base_router
         .nest("/api/v1/jobs", job_routes)
         .nest("/api/v1/cron", cron_routes)
+}
+
+/// Build the API router with build capabilities
+///
+/// This extends the basic router with endpoints for building container images.
+///
+/// # Arguments
+/// * `config` - API configuration
+/// * `build_dir` - Directory for storing build contexts and logs
+pub fn build_router_with_builds(config: &ApiConfig, build_dir: std::path::PathBuf) -> Router {
+    let base_router = build_router(config);
+
+    let build_state = BuildState::new(build_dir);
+
+    // Build routes
+    let build_api_routes = build_routes().with_state(build_state);
+
+    base_router.nest("/api/v1", build_api_routes)
+}
+
+/// Build the API router with all features (jobs, cron, and builds)
+///
+/// This creates a full-featured API router with all available capabilities.
+///
+/// # Arguments
+/// * `config` - API configuration
+/// * `job_executor` - Job executor for running jobs
+/// * `cron_scheduler` - Cron scheduler for managing scheduled jobs
+/// * `build_dir` - Directory for storing build contexts and logs
+pub fn build_router_full(
+    config: &ApiConfig,
+    job_executor: Arc<JobExecutor>,
+    cron_scheduler: Arc<CronScheduler>,
+    build_dir: std::path::PathBuf,
+) -> Router {
+    // Start with jobs and cron router
+    let base_router = build_router_with_jobs(config, job_executor, cron_scheduler);
+
+    let build_state = BuildState::new(build_dir);
+
+    // Build routes
+    let build_api_routes = build_routes().with_state(build_state);
+
+    base_router.nest("/api/v1", build_api_routes)
 }
 
 fn build_cors_layer(config: &ApiConfig) -> CorsLayer {

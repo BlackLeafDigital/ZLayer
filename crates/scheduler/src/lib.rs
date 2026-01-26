@@ -25,6 +25,7 @@ pub mod autoscaler;
 pub mod error;
 pub mod handlers;
 pub mod metrics;
+pub mod placement;
 pub mod raft;
 pub mod raft_network;
 pub mod raft_service;
@@ -40,6 +41,10 @@ pub use error::{Result, SchedulerError};
 pub use metrics::{
     AggregatedMetrics, ContainerdMetricsSource, MetricsCollector, MetricsSource, MockMetricsSource,
     ServiceMetrics,
+};
+pub use placement::{
+    can_place_on_node, place_service_replicas, validate_placement_feasibility, ContainerId,
+    NodeResources, NodeState, PlacementDecision, PlacementReason, PlacementState,
 };
 pub use raft::{
     ClusterState, HealthStatus, NodeId, NodeInfo, RaftConfig, RaftCoordinator, Request, Response,

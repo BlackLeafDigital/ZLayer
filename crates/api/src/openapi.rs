@@ -5,6 +5,10 @@ use utoipa::{Modify, OpenApi};
 
 // Import types for schema definitions
 use crate::handlers::auth::{TokenRequest, TokenResponse};
+use crate::handlers::build::{
+    BuildRequest, BuildRequestWithContext, BuildStateEnum, BuildStatus, TemplateInfo,
+    TriggerBuildResponse,
+};
 use crate::handlers::deployments::{CreateDeploymentRequest, DeploymentDetails, DeploymentSummary};
 use crate::handlers::health::HealthResponse;
 use crate::handlers::services::{
@@ -13,6 +17,11 @@ use crate::handlers::services::{
 
 // Import the auto-generated path types from utoipa macros
 use crate::handlers::auth::__path_get_token;
+use crate::handlers::build::{
+    __path_get_build_logs, __path_get_build_status, __path_list_builds,
+    __path_list_runtime_templates, __path_start_build, __path_start_build_json,
+    __path_stream_build,
+};
 use crate::handlers::deployments::{
     __path_create_deployment, __path_delete_deployment, __path_get_deployment,
     __path_list_deployments,
@@ -70,6 +79,14 @@ impl Modify for SecurityAddon {
         get_service,
         scale_service,
         get_service_logs,
+        // Build
+        start_build,
+        start_build_json,
+        get_build_status,
+        stream_build,
+        get_build_logs,
+        list_builds,
+        list_runtime_templates,
     ),
     components(
         schemas(
@@ -84,6 +101,13 @@ impl Modify for SecurityAddon {
             ServiceEndpoint,
             ServiceMetrics,
             ScaleRequest,
+            // Build schemas
+            BuildRequest,
+            BuildRequestWithContext,
+            BuildStatus,
+            BuildStateEnum,
+            TemplateInfo,
+            TriggerBuildResponse,
         )
     ),
     modifiers(&SecurityAddon),
@@ -92,6 +116,7 @@ impl Modify for SecurityAddon {
         (name = "Authentication", description = "Authentication endpoints"),
         (name = "Deployments", description = "Deployment management"),
         (name = "Services", description = "Service management"),
+        (name = "Build", description = "Container image building"),
     )
 )]
 pub struct ApiDoc;
