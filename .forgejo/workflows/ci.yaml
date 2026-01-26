@@ -221,9 +221,9 @@ jobs:
     needs: test
     # Only run on main branch or explicit trigger (expensive)
     if: github.ref == 'refs/heads/main' || contains(github.event.head_commit.message, '[e2e]')
-    # Run in a privileged container with libseccomp pre-installed
+    # Run in a privileged container with libseccomp pre-installed (Ubuntu for glibc/cgroup compatibility)
     container:
-      image: ghcr.io/zachhandley/baseimages/rust-alpine:latest
+      image: ghcr.io/zachhandley/baseimages/rust-containerd:latest
       options: --privileged --cgroupns=host --security-opt seccomp=unconfined --security-opt apparmor=unconfined
     steps:
       - name: Checkout
@@ -243,7 +243,8 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          apk add --no-cache libseccomp-dev protobuf-dev openssl-dev
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup E2E environment
         run: |
