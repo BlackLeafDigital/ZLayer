@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.1.0)'
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -48,13 +54,13 @@ jobs:
           cp target/release/devctl release/
           cp README.md release/ 2>/dev/null || true
           cp LICENSE* release/ 2>/dev/null || true
-          cd release && tar -czvf ../zlayer-${{ github.ref_name }}-linux-amd64.tar.gz *
+          cd release && tar -czvf ../zlayer-${{ inputs.version || github.ref_name }}-linux-amd64.tar.gz *
 
       - name: Upload artifact
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: zlayer-linux-amd64
-          path: zlayer-${{ github.ref_name }}-linux-amd64.tar.gz
+          path: zlayer-${{ inputs.version || github.ref_name }}-linux-amd64.tar.gz
 
   build-arm64:
     name: Build Release (linux-arm64)
@@ -78,13 +84,13 @@ jobs:
           cp target/release/devctl release/
           cp README.md release/ 2>/dev/null || true
           cp LICENSE* release/ 2>/dev/null || true
-          cd release && tar -czvf ../zlayer-${{ github.ref_name }}-linux-arm64.tar.gz *
+          cd release && tar -czvf ../zlayer-${{ inputs.version || github.ref_name }}-linux-arm64.tar.gz *
 
       - name: Upload artifact
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: zlayer-linux-arm64
-          path: zlayer-${{ github.ref_name }}-linux-arm64.tar.gz
+          path: zlayer-${{ inputs.version || github.ref_name }}-linux-arm64.tar.gz
 
   create-release:
     name: Create Release

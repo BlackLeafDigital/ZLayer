@@ -5,6 +5,13 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_e2e:
+        description: 'Run E2E tests'
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -219,8 +226,8 @@ jobs:
     name: E2E Tests (Youki)
     runs-on: ubuntu-latest
     needs: test
-    # Only run on main branch or explicit trigger (expensive)
-    if: github.ref == 'refs/heads/main' || contains(github.event.head_commit.message, '[e2e]')
+    # Only run on main branch, explicit trigger, or workflow_dispatch with run_e2e
+    if: github.ref == 'refs/heads/main' || contains(github.event.head_commit.message, '[e2e]') || inputs.run_e2e
     # Run directly on host (no container) to avoid nested container issues
     steps:
       - name: Checkout
