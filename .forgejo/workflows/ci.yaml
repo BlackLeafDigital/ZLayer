@@ -250,7 +250,7 @@ jobs:
           chmod -R 755 /tmp/zlayer-youki-e2e-test
 
       - name: Run E2E tests
-        run: sudo -E cargo test --package agent --test youki_e2e -- --test-threads=1 --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test --package agent --test youki_e2e -- --nocapture
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
