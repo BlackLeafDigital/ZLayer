@@ -49,6 +49,11 @@ jobs:
 
       - name: Create release archive
         run: |
+          echo "PWD: $(pwd)"
+          echo "Looking for binaries..."
+          find . -name "zlayer" -type f 2>/dev/null || echo "zlayer not found"
+          find . -name "devctl" -type f 2>/dev/null || echo "devctl not found"
+          ls -la target/release/ || echo "target/release not found"
           mkdir -p release
           cp target/release/zlayer release/
           cp target/release/devctl release/
