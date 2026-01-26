@@ -42,7 +42,7 @@ macro_rules! with_timeout {
 const E2E_TEST_DIR: &str = "/tmp/zlayer-youki-e2e-test";
 
 /// Test images
-const ALPINE_IMAGE: &str = "docker.io/library/alpine:latest";
+const ALPINE_IMAGE: &str = "ghcr.io/zachhandley/baseimages/alpine:latest";
 
 // =============================================================================
 // Skip Mechanism
@@ -204,7 +204,7 @@ services:
   alpine:
     rtype: service
     image:
-      name: docker.io/library/alpine:latest
+      name: ghcr.io/zachhandley/baseimages/alpine:latest
     endpoints:
       - name: dummy
         protocol: tcp

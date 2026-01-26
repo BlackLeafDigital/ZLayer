@@ -243,6 +243,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev
 
+      - name: Login to GitHub Container Registry
+        run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | docker login ghcr.io -u zachhandley --password-stdin
+
       - name: Setup E2E environment
         run: |
           # Create test directories (must match E2E_TEST_DIR in youki_e2e.rs)
