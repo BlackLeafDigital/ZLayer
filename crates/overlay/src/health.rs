@@ -380,7 +380,7 @@ mod tests {
         let deserialized: PeerStatus = serde_json::from_str(&json).unwrap();
 
         assert_eq!(deserialized.public_key, "test_key");
-        assert_eq!(deserialized.healthy, true);
+        assert!(deserialized.healthy);
     }
 
     #[test]

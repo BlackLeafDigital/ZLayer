@@ -281,8 +281,10 @@ mod tests {
 
     #[test]
     fn test_header_border_style_error() {
-        let mut state = BuildState::default();
-        state.error = Some("test error".to_string());
+        let state = BuildState {
+            error: Some("test error".to_string()),
+            ..Default::default()
+        };
         let view = BuildView::new(&state);
         let style = view.header_border_style();
         assert_eq!(style.fg, Some(Color::Red));
@@ -290,9 +292,11 @@ mod tests {
 
     #[test]
     fn test_header_border_style_complete() {
-        let mut state = BuildState::default();
-        state.completed = true;
-        state.image_id = Some("sha256:abc".to_string());
+        let state = BuildState {
+            completed: true,
+            image_id: Some("sha256:abc".to_string()),
+            ..Default::default()
+        };
         let view = BuildView::new(&state);
         let style = view.header_border_style();
         assert_eq!(style.fg, Some(Color::Green));
