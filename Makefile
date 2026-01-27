@@ -18,7 +18,6 @@ build:
 # Build release
 release:
 	cargo build --release --package runtime
-	cargo build --release --package devctl
 
 # Clean build artifacts
 clean:
@@ -84,9 +83,6 @@ test-registry:
 test-runtime:
 	cargo test --package runtime
 
-test-devctl:
-	cargo test --package devctl
-
 # Test with specific features
 test-features:
 	cargo test --package runtime --no-default-features --features join
@@ -105,12 +101,10 @@ docs-build:
 # Install locally
 install:
 	cargo install --path bin/runtime
-	cargo install --path tools/devctl
 
 # Install in development mode (faster builds)
 install-dev:
 	cargo install --path bin/runtime --debug
-	cargo install --path tools/devctl --debug
 
 # Run the API server (for development)
 run-server:
@@ -142,7 +136,7 @@ outdated:
 
 # Generate schema for spec (if schemars is used)
 schema:
-	cargo run --package devctl -- dump-spec examples/basic-deployment.yaml --format json
+	cargo run --package runtime --features full -- spec dump examples/basic-deployment.yaml --format json
 
 # Help target
 help:

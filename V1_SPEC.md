@@ -700,12 +700,6 @@ repo/
       src/
         main.rs
 
-  tools/
-    devctl/
-      Cargo.toml
-      src/
-        main.rs
-
   docs/
     spec.md
     architecture.md
@@ -739,7 +733,6 @@ members = [
   "crates/observability",
   "crates/api",
   "bin/runtime",
-  "tools/devctl",
 ]
 
 [workspace.package]
@@ -773,8 +766,7 @@ clap = { version = "4", features = ["derive"] }
 - `crates/registry`: OCI pulls/build cache, image resolution
 - `crates/observability`: tracing/metrics/log plumbing shared everywhere
 - `crates/api`: control-plane API (optional if fully decentralized)
-- `bin/runtime`: “single binary” distribution option that composes agent+proxy
-- `tools/devctl`: developer CLI tooling (format, generate tokens, local run)
+- `bin/runtime`: "single binary" distribution option that composes agent+proxy (includes all CLI tooling: format, tokens, local run)
 
 ---
 

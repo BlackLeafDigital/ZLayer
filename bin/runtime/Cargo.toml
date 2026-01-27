@@ -16,7 +16,7 @@ default = ["full"]
 # Full runtime with all CLI commands
 full = ["serve", "join", "deploy", "node"]
 # Enable serve command (API server mode)
-serve = ["dep:api"]
+serve = []
 # Enable join command (agent/worker node mode)
 join = []
 # Enable deploy command (orchestration mode)
@@ -35,8 +35,8 @@ scheduler = { path = "../../crates/scheduler" }
 overlay = { path = "../../crates/overlay" }
 zlayer-core = { path = "../../crates/zlayer-core" }
 
-# Optional: API server (only needed for serve command)
-api = { path = "../../crates/api", optional = true }
+# API server
+api = { path = "../../crates/api" }
 
 # External dependencies
 clap = { workspace = true }

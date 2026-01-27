@@ -33,20 +33,6 @@ fn test_runtime_help() {
     assert!(stdout.contains("validate"), "Should have validate command");
 }
 
-/// Test that devctl binary has expected commands
-#[test]
-fn test_devctl_help() {
-    let output = Command::new("cargo")
-        .args(["run", "--package", "devctl", "--", "--help"])
-        .output()
-        .expect("Failed to run devctl");
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    assert!(stdout.contains("token"), "Should have token command");
-    assert!(stdout.contains("validate"), "Should have validate command");
-}
-
 /// Test that runtime has feature-gated commands when built with full features
 #[test]
 fn test_runtime_full_features_help() {
@@ -96,13 +82,13 @@ fn test_runtime_status() {
     );
 }
 
-/// Test that devctl token info command works
+/// Test that zlayer token info command works
 #[test]
-fn test_devctl_token_info() {
+fn test_zlayer_token_info() {
     let output = Command::new("cargo")
-        .args(["run", "--package", "devctl", "--", "token", "info"])
+        .args(["run", "--package", "runtime", "--features", "full", "--", "token", "info"])
         .output()
-        .expect("Failed to run devctl token info");
+        .expect("Failed to run zlayer token info");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -110,14 +96,16 @@ fn test_devctl_token_info() {
     assert!(stdout.contains("Roles"), "Should show available roles");
 }
 
-/// Test that devctl can create tokens
+/// Test that zlayer can create tokens
 #[test]
-fn test_devctl_token_create() {
+fn test_zlayer_token_create() {
     let output = Command::new("cargo")
         .args([
             "run",
             "--package",
-            "devctl",
+            "runtime",
+            "--features",
+            "full",
             "--",
             "token",
             "create",
@@ -130,7 +118,7 @@ fn test_devctl_token_create() {
             "reader",
         ])
         .output()
-        .expect("Failed to run devctl token create");
+        .expect("Failed to run zlayer token create");
 
     assert!(output.status.success(), "Token creation should succeed");
 
@@ -140,24 +128,26 @@ fn test_devctl_token_create() {
     assert_eq!(parts.len(), 3, "Token should be a valid JWT with 3 parts");
 }
 
-/// Test that devctl can generate join tokens
+/// Test that zlayer can generate join tokens
 #[test]
-fn test_devctl_generate_join_token() {
+fn test_zlayer_generate_join_token() {
     let output = Command::new("cargo")
         .args([
             "run",
             "--package",
-            "devctl",
+            "runtime",
+            "--features",
+            "full",
             "--",
-            "generate",
-            "join-token",
+            "node",
+            "generate-join-token",
             "-d",
             "test-deployment",
             "-a",
             "http://localhost:8080",
         ])
         .output()
-        .expect("Failed to run devctl generate join-token");
+        .expect("Failed to run zlayer node generate-join-token");
 
     assert!(
         output.status.success(),

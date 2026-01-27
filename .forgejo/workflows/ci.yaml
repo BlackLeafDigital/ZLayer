@@ -164,7 +164,6 @@ jobs:
       - name: Build release binaries
         run: |
           cargo build --release --package runtime
-          cargo build --release --package devctl
 
       - name: Upload artifacts
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
@@ -172,7 +171,6 @@ jobs:
           name: binaries
           path: |
             target/release/zlayer
-            target/release/devctl
           retention-days: 7
 
   # ===========================================

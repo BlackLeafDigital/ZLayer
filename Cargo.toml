@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-default-members = ["bin/runtime", "tools/devctl"]
+default-members = ["bin/runtime"]
 members = [
   "crates/spec",
   "crates/zlayer-core",
@@ -14,7 +14,6 @@ members = [
   "crates/api",
   "crates/builder",
   "bin/runtime",
-  "tools/devctl",
 ]
 
 [workspace.package]

@@ -11,10 +11,8 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /workspace
 COPY . .
 
-RUN cargo build --release --package runtime && \
-    cargo build --release --package devctl
+RUN cargo build --release --package runtime
 
 # Output binaries to a known location for extraction
 RUN mkdir -p /output && \
-    cp target/release/zlayer /output/ && \
-    cp target/release/devctl /output/
+    cp target/release/zlayer /output/

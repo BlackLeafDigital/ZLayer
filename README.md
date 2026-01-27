@@ -9,12 +9,15 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 ### Key Features
 
 - **Daemonless Runtime** - Uses libcontainer directly, no containerd/Docker daemon needed
-- **Encrypted Overlay Networks** - WireGuard-based mesh networking between nodes
+- **Built-in Image Builder** - Dockerfile parser with buildah integration and runtime templates
+- **Encrypted Overlay Networks** - WireGuard-based mesh networking with IP allocation and health checking
+- **Smart Scheduler** - Node placement with Shared/Dedicated/Exclusive allocation modes
 - **Built-in Proxy** - TLS termination, HTTP/2, load balancing on every node
 - **Adaptive Autoscaling** - Scale based on CPU, memory, or requests per second
 - **Init Actions** - Pre-start lifecycle hooks (wait for TCP, HTTP, run commands)
 - **Health Checks** - TCP, HTTP, and command-based health monitoring
 - **OCI Compatible** - Pull images from any OCI-compliant registry
+- **REST API** - Deploy, manage, and build images via HTTP API with streaming progress
 
 ## Architecture
 
@@ -40,6 +43,23 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 │  │Container│        │Container│        │Container│         │
 │  └─────────┘        └─────────┘        └─────────┘         │
 └─────────────────────────────────────────────────────────────┘
+│                                                               │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │                    Builder Subsystem                   │ │
+│  │  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  │ │
+│  │  │  Dockerfile │  │   Buildah    │  │   Runtime    │  │ │
+│  │  │   Parser    │──│   Executor   │  │  Templates   │  │ │
+│  │  └─────────────┘  └──────────────┘  └──────────────┘  │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                               │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │                  Overlay Networking                    │ │
+│  │  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  │ │
+│  │  │   IP Alloc  │  │   Bootstrap  │  │ WireGuard    │  │ │
+│  │  │             │──│   Join/Init  │──│   Mesh       │  │ │
+│  │  └─────────────┘  └──────────────┘  └──────────────┘  │ │
+│  └────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────┘
 ```
 
 ## Project Structure
@@ -47,21 +67,19 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 ```
 crates/
 ├── agent/          # Container runtime (libcontainer integration)
-├── api/            # REST API server
+├── api/            # REST API server with build endpoints and streaming
+├── builder/        # Dockerfile parser, buildah integration, runtime templates
 ├── init_actions/   # Pre-start lifecycle actions
 ├── observability/  # Metrics, logging, tracing
-├── overlay/        # WireGuard overlay networking
+├── overlay/        # WireGuard overlay networking, IP allocation, health checks
 ├── proxy/          # L4/L7 proxy with TLS
 ├── registry/       # OCI image pulling and caching
-├── scheduler/      # Raft-based distributed scheduler
+├── scheduler/      # Raft-based distributed scheduler with placement logic
 ├── spec/           # Deployment specification types
 └── zlayer-core/    # Shared types and configuration
 
 bin/
 └── runtime/        # Main zlayer binary
-
-tools/
-└── devctl/         # Development CLI tool
 ```
 
 ## Requirements
@@ -90,11 +108,11 @@ Download the latest release for your architecture:
 ```bash
 # For amd64 (latest)
 curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/latest/zlayer-linux-amd64.tar.gz | tar xz
-sudo mv zlayer devctl /usr/local/bin/
+sudo mv zlayer /usr/local/bin/
 
 # For arm64 (latest)
 curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/latest/zlayer-linux-arm64.tar.gz | tar xz
-sudo mv zlayer devctl /usr/local/bin/
+sudo mv zlayer /usr/local/bin/
 ```
 
 Or pin to a specific version:
@@ -114,12 +132,11 @@ cd ZLayer
 # Install dependencies (Ubuntu/Debian)
 sudo apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config cmake
 
-# Build release binaries
+# Build release binary
 cargo build --release --package runtime
-cargo build --release --package devctl
 
 # Install
-sudo cp target/release/zlayer target/release/devctl /usr/local/bin/
+sudo cp target/release/zlayer /usr/local/bin/
 ```
 
 ## Quick Start
@@ -184,6 +201,212 @@ See [V1_SPEC.md](./V1_SPEC.md) for the complete specification.
 | `fixed` | Fixed number of replicas |
 | `manual` | No automatic scaling |
 
+### Node Allocation Modes
+
+| Mode | Description |
+|------|-------------|
+| `shared` | Containers bin-packed onto nodes with available capacity |
+| `dedicated` | Each replica gets its own node (1:1 mapping) |
+| `exclusive` | Service has nodes exclusively to itself (no other services) |
+
+## Image Building
+
+ZLayer includes a built-in image builder that supports Dockerfiles and runtime templates.
+
+### Runtime Templates
+
+Build images without writing a Dockerfile using pre-configured templates:
+
+| Runtime | Description |
+|---------|-------------|
+| `node20`, `node22` | Node.js apps on Alpine |
+| `python312`, `python313` | Python apps on Debian slim |
+| `rust` | Static musl binaries |
+| `go` | Static Go binaries |
+| `deno` | Deno JavaScript/TypeScript runtime |
+| `bun` | Bun JavaScript runtime |
+
+### Building via API
+
+```bash
+# Build from a Dockerfile
+curl -X POST http://localhost:3000/api/v1/build/json \
+  -H "Content-Type: application/json" \
+  -d '{
+    "context_path": "/path/to/app",
+    "tags": ["myapp:latest"]
+  }'
+
+# Build using a runtime template
+curl -X POST http://localhost:3000/api/v1/build/json \
+  -H "Content-Type: application/json" \
+  -d '{
+    "context_path": "/path/to/node/app",
+    "runtime": "node22",
+    "tags": ["myapp:latest"]
+  }'
+
+# Stream build progress via SSE
+curl http://localhost:3000/api/v1/build/{id}/stream
+```
+
+### Building via CLI
+
+```bash
+# Build from Dockerfile
+zlayer build /path/to/app -t myapp:latest
+
+# Build with runtime template (auto-detected)
+zlayer build /path/to/app -t myapp:latest --runtime node22
+
+# List available templates
+zlayer runtimes
+```
+
+
+
+### Resource Types
+
+| Type | Description |
+|------|-------------|
+| `service` | Long-running, load-balanced container |
+| `job` | Run-to-completion, triggered by endpoint/CLI |
+| `cron` | Scheduled run-to-completion |
+
+### Scaling Modes
+
+| Mode | Description |
+|------|-------------|
+| `adaptive` | Auto-scale based on CPU/memory/RPS targets |
+| `fixed` | Fixed number of replicas |
+| `manual` | No automatic scaling |
+
+## CLI Reference
+
+The `zlayer` binary provides comprehensive command-line management:
+
+### Node Management
+
+```bash
+# Initialize a new cluster (this node becomes leader)
+zlayer node init --advertise-addr 10.0.0.1
+
+# Join an existing cluster
+zlayer node join 10.0.0.1:8080 --token <TOKEN> --advertise-addr 10.0.0.2
+
+# List nodes in cluster
+zlayer node list
+
+# Show node status
+zlayer node status
+
+# Add labels to nodes (for node selectors)
+zlayer node label <node-id> gpu=true
+
+# Generate a join token for workers
+zlayer node generate-join-token -d my-deploy -a http://10.0.0.1:8080
+```
+
+### Deployment Management
+
+```bash
+# Deploy from spec file
+zlayer deploy deployment.yaml
+
+# Validate a deployment spec
+zlayer validate deployment.yaml
+
+# View deployment status
+zlayer status
+
+# Stream logs from a service
+zlayer logs -d my-app -s web --follow
+
+# Stop a deployment
+zlayer stop my-app --service web
+```
+
+### Build Commands
+
+```bash
+# Build from Dockerfile
+zlayer build . -t myapp:latest
+
+# Build with runtime template
+zlayer build . --runtime node22 -t myapp:latest
+
+# Auto-detect runtime from project files
+zlayer build . --runtime-auto -t myapp:latest
+
+# Build with arguments
+zlayer build . --build-arg VERSION=1.0 -t myapp:1.0.0
+
+# Multi-stage builds with target
+zlayer build . --target production -t myapp:prod
+
+# List available runtime templates
+zlayer runtimes
+```
+
+### API Server
+
+```bash
+# Start the REST API server
+zlayer serve --bind 0.0.0.0:8080
+
+# With JWT secret
+zlayer serve --bind 0.0.0.0:8080 --jwt-secret <secret>
+```
+
+### Token Management
+
+```bash
+# Create a JWT token for API access
+zlayer token create --subject dev --hours 24 --roles admin
+
+# Create token (quiet mode for scripting)
+zlayer token create --quiet
+
+# Decode and inspect a token
+zlayer token decode <token>
+
+# Show token system info
+zlayer token info
+```
+
+### Spec Inspection
+
+```bash
+# Dump parsed spec as JSON
+zlayer spec dump deployment.yaml --format json
+
+# Dump parsed spec as YAML (default)
+zlayer spec dump deployment.yaml
+
+# Validate a spec file
+zlayer spec validate deployment.yaml
+
+# Inspect a running deployment
+zlayer spec inspect my-deployment --format table
+zlayer spec inspect my-deployment --api http://localhost:8080 --format json
+```
+
+### Local Development
+
+```bash
+# Run a deployment locally (development mode)
+zlayer run deployment.yaml
+
+# Dry run - validate and show plan
+zlayer run deployment.yaml --dry-run
+
+# With port offset for multiple instances
+zlayer run deployment.yaml --port-offset 1000
+
+# Production environment
+zlayer run deployment.yaml --env prod
+```
+
 ## Development
 
 ```bash
@@ -196,10 +419,61 @@ cargo clippy --workspace -- -D warnings
 # Run specific crate tests
 cargo test -p agent
 cargo test -p registry
+cargo test -p builder
+cargo test -p scheduler
 
 # Build with specific features
 cargo build --package runtime --features full
 ```
+
+### Builder Development
+
+The builder crate provides comprehensive Dockerfile parsing and buildah integration:
+
+```rust
+use builder::{ImageBuilder, Runtime};
+
+// Build from a Dockerfile
+let image = ImageBuilder::new("./my-app").await?
+    .tag("myapp:latest")
+    .build()
+    .await?;
+
+// Build using runtime templates
+let image = ImageBuilder::new("./my-node-app").await?
+    .runtime(Runtime::Node22)
+    .tag("myapp:latest")
+    .build()
+    .await?;
+```
+
+### Overlay Networking
+
+Initialize and manage encrypted overlay networks:
+
+```rust
+use overlay::OverlayBootstrap;
+
+// Initialize as cluster leader
+let bootstrap = OverlayBootstrap::init_leader(
+    "10.200.0.0/16",
+    51820,
+    Path::new("/var/lib/zlayer"),
+).await?;
+
+// Join existing overlay
+let bootstrap = OverlayBootstrap::join(
+    "10.200.0.0/16",
+    "192.168.1.100:51820",
+    leader_public_key,
+    "10.200.0.1".parse()?,
+    "10.200.0.5".parse()?,
+    51820,
+    Path::new("/var/lib/zlayer"),
+).await?;
+```
+
+
 
 ## License
 

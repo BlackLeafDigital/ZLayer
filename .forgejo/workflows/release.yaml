@@ -45,13 +45,11 @@ jobs:
       - name: Build release binaries
         run: |
           cargo build --release --package runtime
-          cargo build --release --package devctl
 
       - name: Create release archive
         run: |
           mkdir -p release
           cp "${CARGO_TARGET_DIR}/release/zlayer" release/
-          cp "${CARGO_TARGET_DIR}/release/devctl" release/
           cp README.md release/ 2>/dev/null || true
           cp LICENSE* release/ 2>/dev/null || true
           cd release && tar -czvf ../zlayer-${{ inputs.version || github.ref_name }}-linux-amd64.tar.gz *
@@ -76,14 +74,12 @@ jobs:
           CONTAINER=$(docker create zlayer-arm64-build)
           mkdir -p target/release
           docker cp "${CONTAINER}:/output/zlayer" target/release/
-          docker cp "${CONTAINER}:/output/devctl" target/release/
           docker rm "${CONTAINER}"
 
       - name: Create release archive
         run: |
           mkdir -p release
           cp target/release/zlayer release/
-          cp target/release/devctl release/
           cp README.md release/ 2>/dev/null || true
           cp LICENSE* release/ 2>/dev/null || true
           cd release && tar -czvf ../zlayer-${{ inputs.version || github.ref_name }}-linux-arm64.tar.gz *

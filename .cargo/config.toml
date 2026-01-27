@@ -14,8 +14,6 @@ incremental = true
 # Common build aliases for development workflow
 dev = "build --package runtime"
 prod = "build --release --package runtime"
-devctl-dev = "build --package devctl"
-devctl-prod = "build --release --package devctl"
 check-all = "check --workspace --all-targets"
 test-all = "test --workspace"
 clippy-all = "clippy --workspace --all-targets -- -D warnings"
