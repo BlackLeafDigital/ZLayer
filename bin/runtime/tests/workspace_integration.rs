@@ -132,8 +132,14 @@ fn test_zlayer_token_create() {
     assert!(output.status.success(), "Token creation should succeed");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // Get the last non-empty line (the JWT token) - observability logs may precede it
+    let token = stdout
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('{'))
+        .next_back()
+        .expect("Should have token output");
     // JWT format: header.payload.signature
-    let parts: Vec<&str> = stdout.trim().split('.').collect();
+    let parts: Vec<&str> = token.split('.').collect();
     assert_eq!(parts.len(), 3, "Token should be a valid JWT with 3 parts");
 }
 
