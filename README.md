@@ -21,45 +21,47 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         ZLayer Node                          │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────────┐ │
-│  │  Proxy  │  │ Agent   │  │Scheduler│  │   Observability │ │
-│  │  (TLS)  │  │(Runtime)│  │ (Raft)  │  │ (Metrics/Logs)  │ │
-│  └────┬────┘  └────┬────┘  └────┬────┘  └────────┬────────┘ │
-│       │            │            │                 │          │
-│       └────────────┴────────────┴─────────────────┘          │
-│                           │                                   │
-│              ┌────────────┴────────────┐                     │
-│              │     libcontainer        │                     │
-│              │   (OCI Runtime Layer)   │                     │
-│              └────────────┬────────────┘                     │
-│                           │                                   │
-│       ┌───────────────────┼───────────────────┐              │
-│       │                   │                   │              │
-│  ┌────┴────┐        ┌────┴────┐        ┌────┴────┐         │
-│  │Container│        │Container│        │Container│         │
-│  └─────────┘        └─────────┘        └─────────┘         │
-└─────────────────────────────────────────────────────────────┘
-│                                                               │
-│  ┌────────────────────────────────────────────────────────┐ │
-│  │                    Builder Subsystem                   │ │
-│  │  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  │ │
-│  │  │  Dockerfile │  │   Buildah    │  │   Runtime    │  │ │
-│  │  │   Parser    │──│   Executor   │  │  Templates   │  │ │
-│  │  └─────────────┘  └──────────────┘  └──────────────┘  │ │
-│  └────────────────────────────────────────────────────────┘ │
-│                                                               │
-│  ┌────────────────────────────────────────────────────────┐ │
-│  │                  Overlay Networking                    │ │
-│  │  ┌─────────────┐  ┌──────────────┐  ┌──────────────┐  │ │
-│  │  │   IP Alloc  │  │   Bootstrap  │  │ WireGuard    │  │ │
-│  │  │             │──│   Join/Init  │──│   Mesh       │  │ │
-│  │  └─────────────┘  └──────────────┘  └──────────────┘  │ │
-│  └────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph ZLayer Node
+        API[REST API]
+        Proxy[Proxy<br/>TLS/HTTP2/LB]
+        Agent[Agent<br/>Runtime]
+        Scheduler[Scheduler<br/>Raft]
+        Obs[Observability<br/>Metrics/Logs]
+
+        API --> Agent
+        Proxy --> Agent
+        Scheduler --> Agent
+        Obs --> Agent
+
+        subgraph Runtime Layer
+            LC[libcontainer<br/>OCI Runtime]
+            LC --> C1[Container]
+            LC --> C2[Container]
+            LC --> C3[Container]
+        end
+
+        Agent --> LC
+    end
+
+    subgraph Builder Subsystem
+        DF[Dockerfile Parser]
+        BA[Buildah Executor]
+        RT[Runtime Templates]
+        DF --> BA
+        RT --> BA
+    end
+
+    subgraph Overlay Networking
+        IP[IP Allocator]
+        Boot[Bootstrap<br/>Join/Init]
+        WG[WireGuard Mesh]
+        IP --> Boot --> WG
+    end
+
+    Agent --> Builder Subsystem
+    Agent --> Overlay Networking
 ```
 
 ## Project Structure
@@ -85,7 +87,7 @@ bin/
 ## Requirements
 
 - Linux (kernel 5.4+)
-- Rust 1.78+
+- Rust 1.85+
 - libseccomp-dev
 
 ```bash
@@ -101,7 +103,13 @@ sudo pacman -S libseccomp
 
 ## Installation
 
-### From Package Registry (Recommended)
+### Quick Install (Recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | bash
+```
+
+### From Package Registry
 
 Download the latest release for your architecture:
 
@@ -126,7 +134,7 @@ curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/gene
 
 ```bash
 # Clone the repo
-git clone https://forge.blackleafdigital.com/BlackLeafDigital/ZLayer.git
+git clone https://github.com/BlackLeafDigital/ZLayer.git
 cd ZLayer
 
 # Install dependencies (Ubuntu/Debian)
@@ -263,24 +271,6 @@ zlayer build /path/to/app -t myapp:latest --runtime node22
 zlayer runtimes
 ```
 
-
-
-### Resource Types
-
-| Type | Description |
-|------|-------------|
-| `service` | Long-running, load-balanced container |
-| `job` | Run-to-completion, triggered by endpoint/CLI |
-| `cron` | Scheduled run-to-completion |
-
-### Scaling Modes
-
-| Mode | Description |
-|------|-------------|
-| `adaptive` | Auto-scale based on CPU/memory/RPS targets |
-| `fixed` | Fixed number of replicas |
-| `manual` | No automatic scaling |
-
 ## CLI Reference
 
 The `zlayer` binary provides comprehensive command-line management:
@@ -416,6 +406,9 @@ cargo fmt
 # Run clippy
 cargo clippy --workspace -- -D warnings
 
+# Run all tests
+cargo test --workspace
+
 # Run specific crate tests
 cargo test -p agent
 cargo test -p registry
@@ -426,55 +419,6 @@ cargo test -p scheduler
 cargo build --package runtime --features full
 ```
 
-### Builder Development
-
-The builder crate provides comprehensive Dockerfile parsing and buildah integration:
-
-```rust
-use builder::{ImageBuilder, Runtime};
-
-// Build from a Dockerfile
-let image = ImageBuilder::new("./my-app").await?
-    .tag("myapp:latest")
-    .build()
-    .await?;
-
-// Build using runtime templates
-let image = ImageBuilder::new("./my-node-app").await?
-    .runtime(Runtime::Node22)
-    .tag("myapp:latest")
-    .build()
-    .await?;
-```
-
-### Overlay Networking
-
-Initialize and manage encrypted overlay networks:
-
-```rust
-use overlay::OverlayBootstrap;
-
-// Initialize as cluster leader
-let bootstrap = OverlayBootstrap::init_leader(
-    "10.200.0.0/16",
-    51820,
-    Path::new("/var/lib/zlayer"),
-).await?;
-
-// Join existing overlay
-let bootstrap = OverlayBootstrap::join(
-    "10.200.0.0/16",
-    "192.168.1.100:51820",
-    leader_public_key,
-    "10.200.0.1".parse()?,
-    "10.200.0.5".parse()?,
-    51820,
-    Path::new("/var/lib/zlayer"),
-).await?;
-```
-
-
-
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
