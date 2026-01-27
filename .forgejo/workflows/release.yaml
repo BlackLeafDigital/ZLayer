@@ -105,8 +105,13 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
-          git tag -a "${{ inputs.version }}" -m "Release ${{ inputs.version }}"
-          git push origin "${{ inputs.version }}"
+          # Only create tag if it doesn't already exist
+          if ! git rev-parse "${{ inputs.version }}" >/dev/null 2>&1; then
+            git tag -a "${{ inputs.version }}" -m "Release ${{ inputs.version }}"
+            git push origin "${{ inputs.version }}"
+          else
+            echo "Tag ${{ inputs.version }} already exists, skipping tag creation"
+          fi
 
       - name: Download all artifacts
         uses: https://github.com/christopherhx/gitea-download-artifact@v4
@@ -130,7 +135,24 @@ jobs:
             curl --fail -X PUT -H "$AUTH_HEADER" --upload-file "$FILE" "${BASE_URL}/latest/zlayer-linux-${arch}.tar.gz"
           done
 
-      - name: Create Release
+      - name: Delete existing Forgejo release if exists
+        env:
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          # Get release ID by tag
+          RELEASE_ID=$(curl -s -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            "https://forge.blackleafdigital.com/api/v1/repos/BlackLeafDigital/ZLayer/releases/tags/${VERSION}" \
+            | jq -r '.id // empty')
+
+          if [ -n "$RELEASE_ID" ]; then
+            echo "Deleting existing release ${VERSION} (ID: ${RELEASE_ID})"
+            curl -X DELETE -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              "https://forge.blackleafdigital.com/api/v1/repos/BlackLeafDigital/ZLayer/releases/${RELEASE_ID}"
+          else
+            echo "No existing release found for ${VERSION}"
+          fi
+
+      - name: Create Forgejo Release
         uses: https://github.com/softprops/action-gh-release@v1
         with:
           tag_name: ${{ inputs.version || github.ref_name }}
@@ -138,3 +160,14 @@ jobs:
           generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trigger GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+          VERSION: ${{ inputs.version || github.ref_name }}
+        run: |
+          curl -X POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/repos/BlackLeafDigital/ZLayer/actions/workflows/release.yml/dispatches" \
+            -d "{\"ref\":\"main\",\"inputs\":{\"version\":\"${VERSION}\"}}"
