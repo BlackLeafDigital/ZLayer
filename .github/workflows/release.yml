@@ -34,7 +34,7 @@ jobs:
 
       - name: Delete existing GitHub release if exists
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
           VERSION: ${{ inputs.version }}
         run: |
           # Delete existing release if it exists (ignore errors if not found)
@@ -48,4 +48,4 @@ jobs:
           files: artifacts/*.tar.gz
           generate_release_notes: true
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
