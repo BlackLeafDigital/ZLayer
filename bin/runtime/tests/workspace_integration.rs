@@ -86,7 +86,16 @@ fn test_runtime_status() {
 #[test]
 fn test_zlayer_token_info() {
     let output = Command::new("cargo")
-        .args(["run", "--package", "runtime", "--features", "full", "--", "token", "info"])
+        .args([
+            "run",
+            "--package",
+            "runtime",
+            "--features",
+            "full",
+            "--",
+            "token",
+            "info",
+        ])
         .output()
         .expect("Failed to run zlayer token info");
 

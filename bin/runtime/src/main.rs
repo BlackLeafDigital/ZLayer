@@ -2611,11 +2611,11 @@ async fn handle_spec(action: &SpecCommands) -> Result<()> {
         SpecCommands::Dump { spec, format } => {
             let spec = spec.clone();
             let format = format.clone();
-            let content = std::fs::read_to_string(&spec)
-                .context("Failed to read specification file")?;
+            let content =
+                std::fs::read_to_string(&spec).context("Failed to read specification file")?;
 
-            let parsed_spec = spec::from_yaml_str(&content)
-                .context("Failed to parse specification")?;
+            let parsed_spec =
+                spec::from_yaml_str(&content).context("Failed to parse specification")?;
 
             match format.to_lowercase().as_str() {
                 "json" => {
