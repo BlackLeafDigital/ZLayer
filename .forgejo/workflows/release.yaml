@@ -115,28 +115,20 @@ jobs:
 
       - name: Publish to Package Registry
         run: |
-          # Upload versioned amd64
-          curl --fail -X PUT \
-            -H "Authorization: token ${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-            --upload-file "artifacts/zlayer-linux-amd64/zlayer-${VERSION}-linux-amd64.tar.gz" \
-            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-linux-amd64.tar.gz"
+          BASE_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer"
+          AUTH_HEADER="Authorization: token ${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
 
-          # Upload versioned arm64
-          curl --fail -X PUT \
-            -H "Authorization: token ${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-            --upload-file "artifacts/zlayer-linux-arm64/zlayer-${VERSION}-linux-arm64.tar.gz" \
-            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-linux-arm64.tar.gz"
+          for arch in amd64 arm64; do
+            FILE="artifacts/zlayer-linux-${arch}/zlayer-${VERSION}-linux-${arch}.tar.gz"
 
-          # Upload as latest (overwrite)
-          curl --fail -X PUT \
-            -H "Authorization: token ${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-            --upload-file "artifacts/zlayer-linux-amd64/zlayer-${VERSION}-linux-amd64.tar.gz" \
-            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/latest/zlayer-linux-amd64.tar.gz"
+            # Versioned release - delete if exists, then upload
+            curl -X DELETE -H "$AUTH_HEADER" "${BASE_URL}/${VERSION}/zlayer-linux-${arch}.tar.gz" || true
+            curl --fail -X PUT -H "$AUTH_HEADER" --upload-file "$FILE" "${BASE_URL}/${VERSION}/zlayer-linux-${arch}.tar.gz"
 
-          curl --fail -X PUT \
-            -H "Authorization: token ${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-            --upload-file "artifacts/zlayer-linux-arm64/zlayer-${VERSION}-linux-arm64.tar.gz" \
-            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/latest/zlayer-linux-arm64.tar.gz"
+            # Latest - delete if exists, then upload
+            curl -X DELETE -H "$AUTH_HEADER" "${BASE_URL}/latest/zlayer-linux-${arch}.tar.gz" || true
+            curl --fail -X PUT -H "$AUTH_HEADER" --upload-file "$FILE" "${BASE_URL}/latest/zlayer-linux-${arch}.tar.gz"
+          done
 
       - name: Create Release
         uses: https://github.com/softprops/action-gh-release@v1
