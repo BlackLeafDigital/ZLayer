@@ -23,20 +23,20 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 
 ```mermaid
 graph TB
-    subgraph ZLayer Node
+    subgraph Node[ZLayer Node]
         API[REST API]
-        Proxy[Proxy<br/>TLS/HTTP2/LB]
-        Agent[Agent<br/>Runtime]
-        Scheduler[Scheduler<br/>Raft]
-        Obs[Observability<br/>Metrics/Logs]
+        Proxy[Proxy TLS/HTTP2/LB]
+        Agent[Agent Runtime]
+        Scheduler[Scheduler Raft]
+        Obs[Observability]
 
         API --> Agent
         Proxy --> Agent
         Scheduler --> Agent
         Obs --> Agent
 
-        subgraph Runtime Layer
-            LC[libcontainer<br/>OCI Runtime]
+        subgraph Runtime[Runtime Layer]
+            LC[libcontainer]
             LC --> C1[Container]
             LC --> C2[Container]
             LC --> C3[Container]
@@ -45,7 +45,7 @@ graph TB
         Agent --> LC
     end
 
-    subgraph Builder Subsystem
+    subgraph Builder[Builder Subsystem]
         DF[Dockerfile Parser]
         BA[Buildah Executor]
         RT[Runtime Templates]
@@ -53,15 +53,15 @@ graph TB
         RT --> BA
     end
 
-    subgraph Overlay Networking
+    subgraph Overlay[Overlay Networking]
         IP[IP Allocator]
-        Boot[Bootstrap<br/>Join/Init]
+        Boot[Bootstrap]
         WG[WireGuard Mesh]
         IP --> Boot --> WG
     end
 
-    Agent --> Builder Subsystem
-    Agent --> Overlay Networking
+    Agent --> Builder
+    Agent --> Overlay
 ```
 
 ## Project Structure
