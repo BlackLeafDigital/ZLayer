@@ -38,6 +38,15 @@ pub enum InitError {
     /// Invalid parameters
     #[error("Invalid parameters for action '{action}': {reason}")]
     InvalidParams { action: String, reason: String },
+
+    /// S3 operation failed
+    #[cfg(feature = "s3")]
+    #[error("S3 operation failed for {bucket}/{key}: {reason}")]
+    S3Failed {
+        bucket: String,
+        key: String,
+        reason: String,
+    },
 }
 
 pub type Result<T, E = InitError> = std::result::Result<T, E>;

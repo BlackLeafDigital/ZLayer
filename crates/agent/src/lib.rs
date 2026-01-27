@@ -18,6 +18,7 @@ pub mod overlay_manager;
 pub mod proxy_manager;
 pub mod runtime;
 pub mod service;
+pub mod storage_manager;
 pub mod youki_runtime;
 
 pub use autoscale_controller::{has_adaptive_scaling, AutoscaleController};
@@ -42,6 +43,7 @@ pub use overlay_manager::OverlayManager;
 pub use proxy_manager::{ProxyManager, ProxyManagerConfig};
 pub use runtime::*;
 pub use service::*;
+pub use storage_manager::{StorageError, StorageManager, VolumeInfo};
 pub use youki_runtime::{YoukiConfig, YoukiRuntime};
 
 use std::sync::Arc;

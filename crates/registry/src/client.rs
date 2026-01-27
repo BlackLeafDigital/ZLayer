@@ -1,6 +1,6 @@
 //! OCI distribution client for pulling images
 
-use crate::cache::BlobCache;
+use crate::cache::BlobCacheBackend;
 use crate::error::{RegistryError, Result};
 use oci_client::{
     client::{ClientConfig, ClientProtocol},
@@ -14,13 +14,30 @@ use tokio::sync::Semaphore;
 /// OCI image puller with caching
 pub struct ImagePuller {
     client: oci_client::Client,
-    cache: Arc<BlobCache>,
+    cache: Arc<Box<dyn BlobCacheBackend>>,
     concurrency_limit: Arc<Semaphore>,
 }
 
 impl ImagePuller {
-    /// Create a new image puller
-    pub fn new(cache: Arc<BlobCache>) -> Self {
+    /// Create a new image puller with any cache backend
+    pub fn new<C: BlobCacheBackend + 'static>(cache: C) -> Self {
+        let config = ClientConfig {
+            protocol: ClientProtocol::Https,
+            connect_timeout: Some(std::time::Duration::from_secs(30)),
+            read_timeout: Some(std::time::Duration::from_secs(300)), // 5 minutes for large layers
+            ..Default::default()
+        };
+        let client = oci_client::Client::new(config);
+
+        Self {
+            client,
+            cache: Arc::new(Box::new(cache) as Box<dyn BlobCacheBackend>),
+            concurrency_limit: Arc::new(Semaphore::new(3)),
+        }
+    }
+
+    /// Create a new image puller with boxed cache backend
+    pub fn with_cache(cache: Arc<Box<dyn BlobCacheBackend>>) -> Self {
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
             connect_timeout: Some(std::time::Duration::from_secs(30)),
@@ -70,8 +87,8 @@ impl ImagePuller {
         digest: &str,
         auth: &RegistryAuth,
     ) -> Result<Vec<u8>> {
-        // Check cache first
-        if let Some(data) = self.cache.get(digest)? {
+        // Check cache first (now async)
+        if let Some(data) = self.cache.get(digest).await? {
             tracing::debug!(digest = %digest, "blob found in cache");
             return Ok(data);
         }
@@ -108,8 +125,8 @@ impl ImagePuller {
             )));
         }
 
-        // Cache the blob
-        self.cache.put(digest, &buffer)?;
+        // Cache the blob (now async)
+        self.cache.put(digest, &buffer).await?;
 
         tracing::debug!(digest = %digest, size = buffer.len(), "blob cached successfully");
 

@@ -8,6 +8,7 @@
 use crate::cgroups_stats::{self, ContainerStats};
 use crate::error::{AgentError, Result};
 use crate::runtime::{ContainerId, ContainerState, Runtime};
+use crate::storage_manager::StorageManager;
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::signal::Signal;
@@ -19,6 +20,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::fs;
 use tokio::sync::RwLock;
+use tracing::instrument;
 
 /// Default state directory for libcontainer containers
 pub const DEFAULT_STATE_DIR: &str = "/var/lib/zlayer/containers";
@@ -43,6 +45,8 @@ pub struct YoukiConfig {
     pub bundle_dir: PathBuf,
     /// Cache directory for image blobs
     pub cache_dir: PathBuf,
+    /// Directory for persistent volumes
+    pub volume_dir: PathBuf,
     /// Use systemd cgroups
     pub use_systemd: bool,
 }
@@ -62,6 +66,9 @@ impl Default for YoukiConfig {
             cache_dir: std::env::var("ZLAYER_CACHE_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from(DEFAULT_CACHE_DIR)),
+            volume_dir: std::env::var("ZLAYER_VOLUME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("/var/lib/zlayer/volumes")),
             use_systemd: std::env::var("ZLAYER_USE_SYSTEMD")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(false),
@@ -109,6 +116,8 @@ pub struct YoukiRuntime {
     containers: RwLock<HashMap<String, ContainerInfo>>,
     /// Authentication resolver for registry pulls
     auth_resolver: zlayer_core::AuthResolver,
+    /// Storage volume manager
+    storage_manager: std::sync::Arc<tokio::sync::RwLock<StorageManager>>,
 }
 
 impl std::fmt::Debug for YoukiRuntime {
@@ -137,10 +146,18 @@ impl YoukiRuntime {
                 })?;
         }
 
+        // Initialize storage manager
+        let storage_manager =
+            StorageManager::new(&config.volume_dir).map_err(|e| AgentError::CreateFailed {
+                id: "runtime".to_string(),
+                reason: format!("failed to create storage manager: {}", e),
+            })?;
+
         Ok(Self {
             config,
             containers: RwLock::new(HashMap::new()),
             auth_resolver: zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()),
+            storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
         })
     }
 
@@ -169,10 +186,18 @@ impl YoukiRuntime {
                 })?;
         }
 
+        // Initialize storage manager
+        let storage_manager =
+            StorageManager::new(&config.volume_dir).map_err(|e| AgentError::CreateFailed {
+                id: "runtime".to_string(),
+                reason: format!("failed to create storage manager: {}", e),
+            })?;
+
         Ok(Self {
             config,
             containers: RwLock::new(HashMap::new()),
             auth_resolver: zlayer_core::AuthResolver::new(auth_config),
+            storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
         })
     }
 
@@ -189,13 +214,6 @@ impl YoukiRuntime {
     /// Get the bundle path for a container
     fn bundle_path(&self, id: &ContainerId) -> PathBuf {
         self.config.bundle_dir.join(self.container_id_str(id))
-    }
-
-    /// Get the rootfs path for an image
-    fn rootfs_path(&self, image: &str) -> PathBuf {
-        // Create a safe directory name from the image reference
-        let safe_name = image.replace(['/', ':', '@'], "_");
-        self.config.rootfs_dir.join(safe_name)
     }
 
     /// Get log directory for a container (separate from state to avoid conflicts with libcontainer)
@@ -271,6 +289,156 @@ impl YoukiRuntime {
         }
         Ok(())
     }
+
+    /// Pull image layers and return them for extraction
+    async fn pull_image_layers(&self, image: &str) -> Result<Vec<(Vec<u8>, String)>> {
+        let cache_path = self.config.cache_dir.join("blobs.redb");
+        let cache = registry::BlobCache::open(&cache_path).map_err(|e| AgentError::PullFailed {
+            image: image.to_string(),
+            reason: format!("failed to open blob cache: {}", e),
+        })?;
+
+        let puller = registry::ImagePuller::new(cache);
+        let auth = self.auth_resolver.resolve(image);
+
+        puller
+            .pull_image(image, &auth)
+            .await
+            .map_err(|e| AgentError::PullFailed {
+                image: image.to_string(),
+                reason: format!("failed to pull image: {}", e),
+            })
+    }
+
+    /// Prepare storage volumes for a container, returning paths for mounts
+    async fn prepare_storage_volumes(
+        &self,
+        id: &ContainerId,
+        spec: &ServiceSpec,
+    ) -> Result<std::collections::HashMap<String, PathBuf>> {
+        use spec::StorageSpec;
+
+        let mut volume_paths = std::collections::HashMap::new();
+        let container_id = self.container_id_str(id);
+
+        let mut storage_manager = self.storage_manager.write().await;
+
+        for storage in &spec.storage {
+            match storage {
+                StorageSpec::Named { name, .. } => {
+                    let path = storage_manager.ensure_volume(name).map_err(|e| {
+                        AgentError::CreateFailed {
+                            id: container_id.clone(),
+                            reason: format!("failed to ensure volume '{}': {}", name, e),
+                        }
+                    })?;
+                    storage_manager
+                        .attach_volume(name, &container_id)
+                        .map_err(|e| AgentError::CreateFailed {
+                            id: container_id.clone(),
+                            reason: format!("failed to attach volume '{}': {}", name, e),
+                        })?;
+                    volume_paths.insert(name.clone(), path);
+                }
+
+                StorageSpec::Anonymous { target, .. } => {
+                    let path = storage_manager
+                        .create_anonymous(&container_id, target)
+                        .map_err(|e| AgentError::CreateFailed {
+                            id: container_id.clone(),
+                            reason: format!(
+                                "failed to create anonymous volume for '{}': {}",
+                                target, e
+                            ),
+                        })?;
+                    let key = format!("_anon_{}", target.trim_start_matches('/').replace('/', "_"));
+                    volume_paths.insert(key, path);
+                }
+
+                // Bind mounts don't need preparation - source path is used directly
+                StorageSpec::Bind { .. } => {}
+
+                // Tmpfs mounts don't need preparation
+                StorageSpec::Tmpfs { .. } => {}
+
+                StorageSpec::S3 {
+                    bucket,
+                    prefix,
+                    endpoint,
+                    ..
+                } => {
+                    let path = storage_manager
+                        .mount_s3(
+                            bucket,
+                            prefix.as_deref(),
+                            endpoint.as_deref(),
+                            &container_id,
+                        )
+                        .map_err(|e| AgentError::CreateFailed {
+                            id: container_id.clone(),
+                            reason: format!("failed to mount S3 bucket '{}': {}", bucket, e),
+                        })?;
+                    let key = format!("_s3_{}_{}", bucket, prefix.as_deref().unwrap_or(""));
+                    volume_paths.insert(key, path);
+                }
+            }
+        }
+
+        Ok(volume_paths)
+    }
+
+    /// Clean up storage volumes for a container
+    ///
+    /// Note: This method requires the ServiceSpec to know which volumes to clean up.
+    /// For now, remove_container uses a simpler approach that only cleans up anonymous volumes.
+    /// This method is available for future use when the spec is stored/available at removal time.
+    #[allow(dead_code)]
+    async fn cleanup_storage_volumes(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
+        use spec::StorageSpec;
+
+        let container_id = self.container_id_str(id);
+        let mut storage_manager = self.storage_manager.write().await;
+
+        // Detach named volumes
+        for storage in &spec.storage {
+            match storage {
+                StorageSpec::Named { name, .. } => {
+                    if let Err(e) = storage_manager.detach_volume(name, &container_id) {
+                        tracing::warn!(
+                            volume = %name,
+                            container = %container_id,
+                            error = %e,
+                            "failed to detach volume"
+                        );
+                    }
+                }
+                StorageSpec::S3 { bucket, prefix, .. } => {
+                    if let Err(e) =
+                        storage_manager.unmount_s3(bucket, prefix.as_deref(), &container_id)
+                    {
+                        tracing::warn!(
+                            bucket = %bucket,
+                            container = %container_id,
+                            error = %e,
+                            "failed to unmount S3 bucket"
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Clean up anonymous volumes
+        if let Err(e) = storage_manager.cleanup_anonymous(&container_id) {
+            tracing::warn!(
+                container = %container_id,
+                error = %e,
+                "failed to cleanup anonymous volumes"
+            );
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait::async_trait]
@@ -278,92 +446,55 @@ impl Runtime for YoukiRuntime {
     /// Pull an image to local storage
     ///
     /// Downloads image layers from a registry and unpacks them to a rootfs.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "image.pull",
+            container.image.name = %image,
+        )
+    )]
     async fn pull_image(&self, image: &str) -> Result<()> {
         self.pull_image_with_policy(image, spec::PullPolicy::IfNotPresent)
             .await
     }
 
     /// Pull an image to local storage with a specific pull policy
+    ///
+    /// This downloads image layers to the blob cache. Layers are extracted
+    /// per-container in create_container to avoid race conditions.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "image.pull",
+            container.image.name = %image,
+            pull_policy = ?policy,
+        )
+    )]
     async fn pull_image_with_policy(&self, image: &str, policy: spec::PullPolicy) -> Result<()> {
-        let rootfs_path = self.rootfs_path(image);
+        // Check blob cache to see if image layers are already cached
+        let cache_path = self.config.cache_dir.join("blobs.redb");
+        let cache = registry::BlobCache::open(&cache_path).map_err(|e| AgentError::PullFailed {
+            image: image.to_string(),
+            reason: format!("failed to open blob cache: {}", e),
+        })?;
 
-        match policy {
-            spec::PullPolicy::Never => {
-                if !rootfs_path.exists() {
-                    return Err(AgentError::NotFound {
-                        container: image.to_string(),
-                        reason: "image not found locally and pull policy is Never".to_string(),
-                    });
-                }
-                return Ok(());
-            }
-            spec::PullPolicy::IfNotPresent => {
-                // Check if rootfs already exists AND has valid content
-                if rootfs_path.exists() {
-                    if self.validate_rootfs_content(&rootfs_path).await {
-                        tracing::debug!(
-                            rootfs = %rootfs_path.display(),
-                            "rootfs already exists with valid content, skipping pull"
-                        );
-                        return Ok(());
-                    } else {
-                        // Directory exists but is empty/corrupted - clean up and repull
-                        tracing::warn!(
-                            rootfs = %rootfs_path.display(),
-                            "rootfs directory exists but appears empty or corrupted, removing and repulling"
-                        );
-                        if let Err(e) = tokio::fs::remove_dir_all(&rootfs_path).await {
-                            tracing::error!(
-                                rootfs = %rootfs_path.display(),
-                                error = %e,
-                                "failed to remove corrupted rootfs directory"
-                            );
-                            return Err(AgentError::PullFailed {
-                                image: image.to_string(),
-                                reason: format!("failed to remove corrupted rootfs: {}", e),
-                            });
-                        }
-                    }
-                }
-            }
-            spec::PullPolicy::Always => {
-                if rootfs_path.exists() {
-                    tracing::info!(
-                        rootfs = %rootfs_path.display(),
-                        "pull policy is Always, removing existing rootfs before repull"
-                    );
-                    if let Err(e) = tokio::fs::remove_dir_all(&rootfs_path).await {
-                        return Err(AgentError::PullFailed {
-                            image: image.to_string(),
-                            reason: format!("failed to remove existing rootfs: {}", e),
-                        });
-                    }
-                }
-            }
+        // For Never policy, we just check if we can pull from cache
+        // The actual extraction happens in create_container
+        if matches!(policy, spec::PullPolicy::Never) {
+            // Try to get manifest to verify image is cached
+            // For now, assume if policy is Never, caller knows image exists
+            tracing::debug!(image = %image, "pull policy is Never, skipping pull");
+            return Ok(());
         }
 
-        tracing::info!(
-            image = %image,
-            rootfs = %rootfs_path.display(),
-            "pulling image"
-        );
-
-        // Initialize blob cache
-        let cache_path = self.config.cache_dir.join("blobs.redb");
-        let cache = std::sync::Arc::new(registry::BlobCache::open(&cache_path).map_err(|e| {
-            AgentError::PullFailed {
-                image: image.to_string(),
-                reason: format!("failed to open blob cache: {}", e),
-            }
-        })?);
-
-        // Create image puller
+        // For IfNotPresent, check if image layers are in cache by trying to pull
+        // The ImagePuller uses the blob cache internally
         let puller = registry::ImagePuller::new(cache);
-
-        // Resolve authentication for this image
         let auth = self.auth_resolver.resolve(image);
 
-        // Pull image layers from registry
+        tracing::info!(image = %image, "pulling image layers to cache");
+
+        // Pull image layers from registry (cached layers are retrieved from cache)
         let layers = puller
             .pull_image(image, &auth)
             .await
@@ -372,26 +503,10 @@ impl Runtime for YoukiRuntime {
                 reason: format!("failed to pull image: {}", e),
             })?;
 
-        tracing::debug!(
-            image = %image,
-            layer_count = layers.len(),
-            "image layers pulled, unpacking to rootfs"
-        );
-
-        // Unpack layers to rootfs
-        let mut unpacker = registry::LayerUnpacker::new(rootfs_path.clone());
-        unpacker
-            .unpack_layers(&layers)
-            .await
-            .map_err(|e| AgentError::PullFailed {
-                image: image.to_string(),
-                reason: format!("failed to unpack layers: {}", e),
-            })?;
-
         tracing::info!(
             image = %image,
-            rootfs = %rootfs_path.display(),
-            "image pull complete"
+            layer_count = layers.len(),
+            "image layers cached"
         );
 
         Ok(())
@@ -400,11 +515,22 @@ impl Runtime for YoukiRuntime {
     /// Create a container
     ///
     /// Creates an OCI bundle and uses libcontainer to create the container.
+    /// Each container gets its own rootfs extracted from cached layers.
+    #[instrument(
+        skip(self, spec),
+        fields(
+            otel.name = "container.create",
+            container.id = %self.container_id_str(id),
+            service.name = %id.service,
+            service.replica = %id.replica,
+            container.image.name = %spec.image.name,
+        )
+    )]
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
         let container_id = self.container_id_str(id);
         let image = &spec.image.name;
-        let rootfs_path = self.rootfs_path(image);
         let bundle_path = self.bundle_path(id);
+        let rootfs_path = bundle_path.join("rootfs");
 
         tracing::info!("Creating container {} from image {}", container_id, image);
 
@@ -416,21 +542,30 @@ impl Runtime for YoukiRuntime {
                 reason: format!("failed to create bundle directory: {}", e),
             })?;
 
-        // Create rootfs symlink in bundle
-        let bundle_rootfs = bundle_path.join("rootfs");
-        if bundle_rootfs.exists() {
-            let _ = fs::remove_file(&bundle_rootfs).await;
-        }
-        tokio::fs::symlink(&rootfs_path, &bundle_rootfs)
+        // Pull image layers (from cache if available)
+        let layers = self.pull_image_layers(image).await?;
+
+        tracing::debug!(
+            container = %container_id,
+            layer_count = layers.len(),
+            "extracting layers to container rootfs"
+        );
+
+        // Extract layers to this container's own rootfs
+        let mut unpacker = registry::LayerUnpacker::new(rootfs_path.clone());
+        unpacker
+            .unpack_layers(&layers)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: container_id.clone(),
-                reason: format!("failed to symlink rootfs: {}", e),
+                reason: format!("failed to extract rootfs: {}", e),
             })?;
 
-        // Generate OCI config.json using oci-spec crate
-        // This is a simplified version - the full bundle.rs has more comprehensive support
-        let oci_spec = self.build_oci_spec(id, spec)?;
+        // Prepare storage volumes
+        let volume_paths = self.prepare_storage_volumes(id, spec).await?;
+
+        // Generate OCI config.json using oci-spec crate with storage mounts
+        let oci_spec = self.build_oci_spec(id, spec, &volume_paths)?;
         let config_path = bundle_path.join("config.json");
         let config_json =
             serde_json::to_string_pretty(&oci_spec).map_err(|e| AgentError::CreateFailed {
@@ -523,6 +658,14 @@ impl Runtime for YoukiRuntime {
     /// Start a container
     ///
     /// Starts the container's init process.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.start",
+            container.id = %self.container_id_str(id),
+            service.name = %id.service,
+        )
+    )]
     async fn start_container(&self, id: &ContainerId) -> Result<()> {
         let container_id = self.container_id_str(id);
         let container_root = self.container_root(id);
@@ -583,6 +726,15 @@ impl Runtime for YoukiRuntime {
     /// Stop a container
     ///
     /// Sends SIGTERM, waits for timeout, then sends SIGKILL if needed.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.stop",
+            container.id = %self.container_id_str(id),
+            service.name = %id.service,
+            timeout_ms = %timeout.as_millis(),
+        )
+    )]
     async fn stop_container(&self, id: &ContainerId, timeout: Duration) -> Result<()> {
         let container_id = self.container_id_str(id);
         let container_root = self.container_root(id);
@@ -690,6 +842,14 @@ impl Runtime for YoukiRuntime {
     ///
     /// Deletes the container and cleans up its bundle and state.
     /// Cleanup always proceeds even if libcontainer operations fail.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.remove",
+            container.id = %self.container_id_str(id),
+            service.name = %id.service,
+        )
+    )]
     async fn remove_container(&self, id: &ContainerId) -> Result<()> {
         let container_id = self.container_id_str(id);
         let container_root = self.container_root(id);
@@ -741,6 +901,20 @@ impl Runtime for YoukiRuntime {
             }
         }
 
+        // Clean up storage volumes
+        // Note: We need the spec to know what to clean up, but we don't have it here
+        // For now, we'll just clean up anonymous volumes by container ID
+        {
+            let mut storage_manager = self.storage_manager.write().await;
+            if let Err(e) = storage_manager.cleanup_anonymous(&container_id) {
+                tracing::warn!(
+                    container = %container_id,
+                    error = %e,
+                    "failed to cleanup anonymous volumes"
+                );
+            }
+        }
+
         // Remove from local tracking
         {
             let mut containers = self.containers.write().await;
@@ -752,6 +926,13 @@ impl Runtime for YoukiRuntime {
     }
 
     /// Get container state
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.state",
+            container.id = %self.container_id_str(id),
+        )
+    )]
     async fn container_state(&self, id: &ContainerId) -> Result<ContainerState> {
         let container_id = self.container_id_str(id);
         let container_root = self.container_root(id);
@@ -845,6 +1026,14 @@ impl Runtime for YoukiRuntime {
     /// Execute a command in a running container
     ///
     /// Uses libcontainer's tenant builder to exec into the container's namespaces.
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.exec",
+            container.id = %self.container_id_str(id),
+            command = ?cmd,
+        )
+    )]
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)> {
         let container_id = self.container_id_str(id);
 
@@ -1091,28 +1280,8 @@ impl Runtime for YoukiRuntime {
     }
 }
 
+// Helper methods for YoukiRuntime that are not part of the Runtime trait
 impl YoukiRuntime {
-    /// Validate that a rootfs directory has essential content
-    ///
-    /// Returns true if the rootfs appears to have valid content (essential Linux
-    /// directories or at least some entries). Returns false if the directory is
-    /// empty or missing expected structure, indicating a failed/partial pull.
-    async fn validate_rootfs_content(&self, rootfs_path: &std::path::Path) -> bool {
-        // Check for essential directories that should exist in any Linux rootfs
-        for path in ["bin", "lib", "etc", "usr"] {
-            if rootfs_path.join(path).exists() {
-                return true;
-            }
-        }
-        // Also check if directory has ANY entries (for minimal images)
-        if let Ok(mut entries) = tokio::fs::read_dir(rootfs_path).await {
-            if entries.next_entry().await.ok().flatten().is_some() {
-                return true;
-            }
-        }
-        false
-    }
-
     /// Build OCI runtime spec from ServiceSpec
     ///
     /// This is a simplified version that generates basic OCI config.
@@ -1121,10 +1290,11 @@ impl YoukiRuntime {
         &self,
         id: &ContainerId,
         spec: &ServiceSpec,
+        volume_paths: &std::collections::HashMap<String, PathBuf>,
     ) -> Result<oci_spec::runtime::Spec> {
         use oci_spec::runtime::{
-            LinuxBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, ProcessBuilder, RootBuilder,
-            SpecBuilder, UserBuilder,
+            LinuxBuilder, LinuxNamespaceBuilder, LinuxNamespaceType, MountBuilder, ProcessBuilder,
+            RootBuilder, SpecBuilder, UserBuilder,
         };
 
         // Build user (default to root)
@@ -1200,6 +1370,82 @@ impl YoukiRuntime {
             .build()
             .map_err(|e| AgentError::InvalidSpec(format!("failed to build linux config: {}", e)))?;
 
+        // Build storage mounts
+        let storage_mounts = self.build_storage_mounts(spec, volume_paths)?;
+
+        // Build default mounts (proc, dev, sys, etc.) plus storage mounts
+        let mut mounts = vec![
+            MountBuilder::default()
+                .destination("/proc".to_string())
+                .typ("proc".to_string())
+                .source("proc".to_string())
+                .build()
+                .map_err(|e| {
+                    AgentError::InvalidSpec(format!("failed to build proc mount: {}", e))
+                })?,
+            MountBuilder::default()
+                .destination("/dev".to_string())
+                .typ("tmpfs".to_string())
+                .source("tmpfs".to_string())
+                .options(vec![
+                    "nosuid".to_string(),
+                    "strictatime".to_string(),
+                    "mode=755".to_string(),
+                    "size=65536k".to_string(),
+                ])
+                .build()
+                .map_err(|e| {
+                    AgentError::InvalidSpec(format!("failed to build dev mount: {}", e))
+                })?,
+            MountBuilder::default()
+                .destination("/dev/pts".to_string())
+                .typ("devpts".to_string())
+                .source("devpts".to_string())
+                .options(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "newinstance".to_string(),
+                    "ptmxmode=0666".to_string(),
+                    "mode=0620".to_string(),
+                ])
+                .build()
+                .map_err(|e| {
+                    AgentError::InvalidSpec(format!("failed to build devpts mount: {}", e))
+                })?,
+            MountBuilder::default()
+                .destination("/dev/shm".to_string())
+                .typ("tmpfs".to_string())
+                .source("shm".to_string())
+                .options(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "mode=1777".to_string(),
+                    "size=65536k".to_string(),
+                ])
+                .build()
+                .map_err(|e| {
+                    AgentError::InvalidSpec(format!("failed to build shm mount: {}", e))
+                })?,
+            MountBuilder::default()
+                .destination("/sys".to_string())
+                .typ("sysfs".to_string())
+                .source("sysfs".to_string())
+                .options(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "ro".to_string(),
+                ])
+                .build()
+                .map_err(|e| {
+                    AgentError::InvalidSpec(format!("failed to build sysfs mount: {}", e))
+                })?,
+        ];
+
+        // Add storage mounts
+        mounts.extend(storage_mounts);
+
         // Build the complete spec
         let hostname = id.to_string();
         let oci_spec = SpecBuilder::default()
@@ -1208,10 +1454,141 @@ impl YoukiRuntime {
             .process(process)
             .hostname(hostname)
             .linux(linux)
+            .mounts(mounts)
             .build()
             .map_err(|e| AgentError::InvalidSpec(format!("failed to build OCI spec: {}", e)))?;
 
         Ok(oci_spec)
+    }
+
+    /// Build storage mounts from ServiceSpec
+    fn build_storage_mounts(
+        &self,
+        spec: &ServiceSpec,
+        volume_paths: &std::collections::HashMap<String, PathBuf>,
+    ) -> Result<Vec<oci_spec::runtime::Mount>> {
+        use oci_spec::runtime::MountBuilder;
+        use spec::StorageSpec;
+
+        let mut mounts = Vec::new();
+
+        for storage in &spec.storage {
+            let mount = match storage {
+                StorageSpec::Bind {
+                    source,
+                    target,
+                    readonly,
+                } => {
+                    let mut options = vec!["rbind".to_string()];
+                    if *readonly {
+                        options.push("ro".to_string());
+                    } else {
+                        options.push("rw".to_string());
+                    }
+
+                    MountBuilder::default()
+                        .destination(target.clone())
+                        .typ("none".to_string())
+                        .source(source.clone())
+                        .options(options)
+                        .build()
+                        .map_err(|e| AgentError::InvalidSpec(format!("bind mount failed: {}", e)))?
+                }
+                StorageSpec::Named {
+                    name,
+                    target,
+                    readonly,
+                    ..
+                } => {
+                    let source = volume_paths.get(name).ok_or_else(|| {
+                        AgentError::InvalidSpec(format!("volume '{}' not prepared", name))
+                    })?;
+                    let mut options = vec!["rbind".to_string()];
+                    if *readonly {
+                        options.push("ro".to_string());
+                    } else {
+                        options.push("rw".to_string());
+                    }
+
+                    MountBuilder::default()
+                        .destination(target.clone())
+                        .typ("none".to_string())
+                        .source(source.to_string_lossy().to_string())
+                        .options(options)
+                        .build()
+                        .map_err(|e| {
+                            AgentError::InvalidSpec(format!("named volume mount failed: {}", e))
+                        })?
+                }
+                StorageSpec::Anonymous { target, .. } => {
+                    let key = format!("_anon_{}", target.trim_start_matches('/').replace('/', "_"));
+                    let source = volume_paths.get(&key).ok_or_else(|| {
+                        AgentError::InvalidSpec(format!(
+                            "anonymous volume for '{}' not prepared",
+                            target
+                        ))
+                    })?;
+
+                    MountBuilder::default()
+                        .destination(target.clone())
+                        .typ("none".to_string())
+                        .source(source.to_string_lossy().to_string())
+                        .options(vec!["rbind".to_string(), "rw".to_string()])
+                        .build()
+                        .map_err(|e| {
+                            AgentError::InvalidSpec(format!("anonymous volume mount failed: {}", e))
+                        })?
+                }
+                StorageSpec::Tmpfs { target, size, mode } => {
+                    let mut options = vec!["nosuid".to_string(), "nodev".to_string()];
+                    if let Some(s) = size {
+                        options.push(format!("size={}", s));
+                    }
+                    if let Some(m) = mode {
+                        options.push(format!("mode={:o}", m));
+                    }
+
+                    MountBuilder::default()
+                        .destination(target.clone())
+                        .typ("tmpfs".to_string())
+                        .source("tmpfs".to_string())
+                        .options(options)
+                        .build()
+                        .map_err(|e| {
+                            AgentError::InvalidSpec(format!("tmpfs mount failed: {}", e))
+                        })?
+                }
+                StorageSpec::S3 {
+                    bucket,
+                    prefix,
+                    target,
+                    readonly,
+                    ..
+                } => {
+                    let key = format!("_s3_{}_{}", bucket, prefix.as_deref().unwrap_or(""));
+                    let source = volume_paths.get(&key).ok_or_else(|| {
+                        AgentError::InvalidSpec(format!("S3 mount for '{}' not prepared", bucket))
+                    })?;
+                    let mut options = vec!["rbind".to_string()];
+                    if *readonly {
+                        options.push("ro".to_string());
+                    } else {
+                        options.push("rw".to_string());
+                    }
+
+                    MountBuilder::default()
+                        .destination(target.clone())
+                        .typ("none".to_string())
+                        .source(source.to_string_lossy().to_string())
+                        .options(options)
+                        .build()
+                        .map_err(|e| AgentError::InvalidSpec(format!("S3 mount failed: {}", e)))?
+                }
+            };
+            mounts.push(mount);
+        }
+
+        Ok(mounts)
     }
 
     /// Resolve command from ServiceSpec following Docker/OCI semantics
@@ -1255,6 +1632,7 @@ mod tests {
         assert_eq!(config.rootfs_dir, PathBuf::from(DEFAULT_ROOTFS_DIR));
         assert_eq!(config.bundle_dir, PathBuf::from(DEFAULT_BUNDLE_DIR));
         assert_eq!(config.cache_dir, PathBuf::from(DEFAULT_CACHE_DIR));
+        assert_eq!(config.volume_dir, PathBuf::from("/var/lib/zlayer/volumes"));
         assert!(!config.use_systemd);
     }
 
@@ -1352,6 +1730,7 @@ mod tests {
             rootfs_dir: PathBuf::from("/custom/rootfs"),
             bundle_dir: PathBuf::from("/custom/bundles"),
             cache_dir: PathBuf::from("/custom/cache"),
+            volume_dir: PathBuf::from("/custom/volumes"),
             use_systemd: true,
         };
 
@@ -1361,6 +1740,7 @@ mod tests {
         assert_eq!(cloned.rootfs_dir, config.rootfs_dir);
         assert_eq!(cloned.bundle_dir, config.bundle_dir);
         assert_eq!(cloned.cache_dir, config.cache_dir);
+        assert_eq!(cloned.volume_dir, config.volume_dir);
         assert_eq!(cloned.use_systemd, config.use_systemd);
     }
 
@@ -1375,6 +1755,7 @@ mod tests {
             rootfs_dir: temp_base.join("rootfs"),
             bundle_dir: temp_base.join("bundles"),
             cache_dir: temp_base.join("cache"),
+            volume_dir: temp_base.join("volumes"),
             use_systemd: false,
         };
 
@@ -1395,6 +1776,7 @@ mod tests {
         assert!(config.rootfs_dir.exists());
         assert!(config.bundle_dir.exists());
         assert!(config.cache_dir.exists());
+        assert!(config.volume_dir.exists());
 
         // Clean up
         let _ = std::fs::remove_dir_all(&temp_base);

@@ -556,6 +556,7 @@ mod tests {
             init: Default::default(),
             errors: Default::default(),
             devices: vec![],
+            storage: vec![],
             capabilities: vec![],
             privileged: false,
             node_mode,

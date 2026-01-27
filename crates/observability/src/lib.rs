@@ -20,12 +20,15 @@
 //! ```
 
 pub mod config;
+pub mod container_spans;
 pub mod error;
 pub mod logging;
 pub mod metrics;
+pub mod propagation;
 pub mod tracing_otel;
 
 pub use config::*;
+pub use container_spans::*;
 pub use error::{ObservabilityError, Result};
 pub use logging::{init_logging, LogGuard};
 pub use metrics::{init_metrics, metrics, HealthStatus, ZLayerMetrics};

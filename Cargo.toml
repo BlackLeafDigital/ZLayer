@@ -13,6 +13,7 @@ members = [
   "crates/observability",
   "crates/api",
   "crates/builder",
+  "crates/layer-storage",
   "bin/runtime",
 ]
 

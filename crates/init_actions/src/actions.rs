@@ -124,6 +124,268 @@ impl RunCommand {
     }
 }
 
+/// Push files to S3 from a local path
+#[cfg(feature = "s3")]
+pub struct S3Push {
+    /// Local source path (file or directory)
+    pub source: String,
+    /// S3 bucket name
+    pub bucket: String,
+    /// S3 key prefix
+    pub key: String,
+    /// Custom S3 endpoint (for S3-compatible services)
+    pub endpoint: Option<String>,
+    /// Region
+    pub region: Option<String>,
+    /// Upload timeout
+    pub timeout: Duration,
+}
+
+#[cfg(feature = "s3")]
+impl S3Push {
+    pub async fn execute(&self) -> Result<()> {
+        use aws_sdk_s3::Client;
+
+        // Build AWS config
+        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(ref region) = self.region {
+            config_loader = config_loader.region(aws_config::Region::new(region.clone()));
+        }
+        let sdk_config = config_loader.load().await;
+
+        // Build S3 client
+        let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config);
+        if let Some(ref endpoint) = self.endpoint {
+            s3_config = s3_config.endpoint_url(endpoint).force_path_style(true);
+        }
+        let client = Client::from_conf(s3_config.build());
+
+        let source_path = std::path::Path::new(&self.source);
+
+        if source_path.is_file() {
+            // Upload single file
+            self.upload_file(&client, source_path, &self.key).await?;
+        } else if source_path.is_dir() {
+            // Upload directory recursively
+            self.upload_directory(&client, source_path, &self.key)
+                .await?;
+        } else {
+            return Err(InitError::S3Failed {
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+                reason: format!("source path '{}' does not exist", self.source),
+            });
+        }
+
+        Ok(())
+    }
+
+    #[cfg(feature = "s3")]
+    async fn upload_file(
+        &self,
+        client: &aws_sdk_s3::Client,
+        path: &std::path::Path,
+        key: &str,
+    ) -> Result<()> {
+        use aws_sdk_s3::primitives::ByteStream;
+
+        tracing::info!(
+            bucket = %self.bucket,
+            key = %key,
+            source = %path.display(),
+            "pushing file to S3"
+        );
+
+        let data = tokio::fs::read(path)
+            .await
+            .map_err(|e| InitError::S3Failed {
+                bucket: self.bucket.clone(),
+                key: key.to_string(),
+                reason: format!("failed to read file: {}", e),
+            })?;
+
+        tokio::time::timeout(
+            self.timeout,
+            client
+                .put_object()
+                .bucket(&self.bucket)
+                .key(key)
+                .body(ByteStream::from(data))
+                .content_type("application/octet-stream")
+                .send(),
+        )
+        .await
+        .map_err(|_| InitError::Timeout {
+            timeout: self.timeout,
+        })?
+        .map_err(|e| InitError::S3Failed {
+            bucket: self.bucket.clone(),
+            key: key.to_string(),
+            reason: format!("put_object failed: {}", e),
+        })?;
+
+        tracing::info!(bucket = %self.bucket, key = %key, "S3 push complete");
+        Ok(())
+    }
+
+    #[cfg(feature = "s3")]
+    async fn upload_directory(
+        &self,
+        client: &aws_sdk_s3::Client,
+        dir: &std::path::Path,
+        prefix: &str,
+    ) -> Result<()> {
+        let mut entries = tokio::fs::read_dir(dir)
+            .await
+            .map_err(|e| InitError::S3Failed {
+                bucket: self.bucket.clone(),
+                key: prefix.to_string(),
+                reason: format!("failed to read directory: {}", e),
+            })?;
+
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| InitError::S3Failed {
+                bucket: self.bucket.clone(),
+                key: prefix.to_string(),
+                reason: format!("failed to read directory entry: {}", e),
+            })?
+        {
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let key = format!(
+                "{}/{}",
+                prefix.trim_end_matches('/'),
+                file_name.to_string_lossy()
+            );
+
+            if path.is_file() {
+                self.upload_file(client, &path, &key).await?;
+            } else if path.is_dir() {
+                // Use Box::pin for recursive async
+                Box::pin(self.upload_directory(client, &path, &key)).await?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Pull files from S3 to a local path
+#[cfg(feature = "s3")]
+pub struct S3Pull {
+    /// S3 bucket name
+    pub bucket: String,
+    /// S3 key or prefix to download
+    pub key: String,
+    /// Local destination path
+    pub destination: String,
+    /// Custom S3 endpoint (for S3-compatible services)
+    pub endpoint: Option<String>,
+    /// Region
+    pub region: Option<String>,
+    /// Download timeout
+    pub timeout: Duration,
+}
+
+#[cfg(feature = "s3")]
+impl S3Pull {
+    pub async fn execute(&self) -> Result<()> {
+        use aws_sdk_s3::Client;
+        use tokio::io::AsyncWriteExt;
+
+        // Build AWS config
+        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(ref region) = self.region {
+            config_loader = config_loader.region(aws_config::Region::new(region.clone()));
+        }
+        let sdk_config = config_loader.load().await;
+
+        // Build S3 client
+        let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config);
+        if let Some(ref endpoint) = self.endpoint {
+            s3_config = s3_config.endpoint_url(endpoint).force_path_style(true);
+        }
+        let client = Client::from_conf(s3_config.build());
+
+        tracing::info!(
+            bucket = %self.bucket,
+            key = %self.key,
+            destination = %self.destination,
+            "pulling from S3"
+        );
+
+        // Get object from S3
+        let result = tokio::time::timeout(
+            self.timeout,
+            client
+                .get_object()
+                .bucket(&self.bucket)
+                .key(&self.key)
+                .send(),
+        )
+        .await
+        .map_err(|_| InitError::Timeout {
+            timeout: self.timeout,
+        })?
+        .map_err(|e| InitError::S3Failed {
+            bucket: self.bucket.clone(),
+            key: self.key.clone(),
+            reason: format!("get_object failed: {}", e),
+        })?;
+
+        // Read body
+        let data = result
+            .body
+            .collect()
+            .await
+            .map_err(|e| InitError::S3Failed {
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+                reason: format!("failed to read body: {}", e),
+            })?
+            .into_bytes();
+
+        // Write to destination
+        let dest_path = std::path::Path::new(&self.destination);
+        if let Some(parent) = dest_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|e| InitError::S3Failed {
+                    bucket: self.bucket.clone(),
+                    key: self.key.clone(),
+                    reason: format!("failed to create destination directory: {}", e),
+                })?;
+        }
+
+        let mut file = tokio::fs::File::create(&self.destination)
+            .await
+            .map_err(|e| InitError::S3Failed {
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+                reason: format!("failed to create file: {}", e),
+            })?;
+
+        file.write_all(&data)
+            .await
+            .map_err(|e| InitError::S3Failed {
+                bucket: self.bucket.clone(),
+                key: self.key.clone(),
+                reason: format!("failed to write file: {}", e),
+            })?;
+
+        tracing::info!(
+            bucket = %self.bucket,
+            key = %self.key,
+            bytes = data.len(),
+            "S3 pull complete"
+        );
+
+        Ok(())
+    }
+}
+
 /// Create an init action from the spec
 pub fn from_spec(
     action: &str,
@@ -204,6 +466,110 @@ pub fn from_spec(
             }))
         }
 
+        #[cfg(feature = "s3")]
+        "init.s3_push" => {
+            let source = params
+                .get("source")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| InitError::InvalidParams {
+                    action: action.to_string(),
+                    reason: "missing 'source' parameter".to_string(),
+                })?
+                .to_string();
+
+            let bucket = params
+                .get("bucket")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| InitError::InvalidParams {
+                    action: action.to_string(),
+                    reason: "missing 'bucket' parameter".to_string(),
+                })?
+                .to_string();
+
+            let key = params
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| InitError::InvalidParams {
+                    action: action.to_string(),
+                    reason: "missing 'key' parameter".to_string(),
+                })?
+                .to_string();
+
+            let endpoint = params
+                .get("endpoint")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let region = params
+                .get("region")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let timeout_secs = params
+                .get("timeout")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(300);
+
+            Ok(InitAction::S3Push(S3Push {
+                source,
+                bucket,
+                key,
+                endpoint,
+                region,
+                timeout: Duration::from_secs(timeout_secs),
+            }))
+        }
+
+        #[cfg(feature = "s3")]
+        "init.s3_pull" => {
+            let bucket = params
+                .get("bucket")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| InitError::InvalidParams {
+                    action: action.to_string(),
+                    reason: "missing 'bucket' parameter".to_string(),
+                })?
+                .to_string();
+
+            let key = params
+                .get("key")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| InitError::InvalidParams {
+                    action: action.to_string(),
+                    reason: "missing 'key' parameter".to_string(),
+                })?
+                .to_string();
+
+            let destination = params
+                .get("destination")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| InitError::InvalidParams {
+                    action: action.to_string(),
+                    reason: "missing 'destination' parameter".to_string(),
+                })?
+                .to_string();
+
+            let endpoint = params
+                .get("endpoint")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let region = params
+                .get("region")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let timeout_secs = params
+                .get("timeout")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(300);
+
+            Ok(InitAction::S3Pull(S3Pull {
+                bucket,
+                key,
+                destination,
+                endpoint,
+                region,
+                timeout: Duration::from_secs(timeout_secs),
+            }))
+        }
+
         _ => Err(InitError::UnknownAction(action.to_string())),
     }
 }
@@ -213,6 +579,10 @@ pub enum InitAction {
     WaitTcp(WaitTcp),
     WaitHttp(WaitHttp),
     Run(RunCommand),
+    #[cfg(feature = "s3")]
+    S3Push(S3Push),
+    #[cfg(feature = "s3")]
+    S3Pull(S3Pull),
 }
 
 impl InitAction {
@@ -221,6 +591,10 @@ impl InitAction {
             InitAction::WaitTcp(a) => a.execute().await,
             InitAction::WaitHttp(a) => a.execute().await,
             InitAction::Run(a) => a.execute().await,
+            #[cfg(feature = "s3")]
+            InitAction::S3Push(a) => a.execute().await,
+            #[cfg(feature = "s3")]
+            InitAction::S3Pull(a) => a.execute().await,
         }
     }
 }

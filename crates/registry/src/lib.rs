@@ -10,6 +10,9 @@ pub mod unpack;
 #[cfg(feature = "persistent")]
 pub mod persistent_cache;
 
+#[cfg(feature = "s3")]
+pub mod s3_cache;
+
 pub use cache::*;
 pub use client::*;
 pub use error::*;
@@ -17,6 +20,9 @@ pub use unpack::*;
 
 #[cfg(feature = "persistent")]
 pub use persistent_cache::PersistentBlobCache;
+
+#[cfg(feature = "s3")]
+pub use s3_cache::{S3BlobCache, S3CacheConfig};
 
 // Re-export oci_client types that users need
 pub use oci_client::secrets::RegistryAuth;

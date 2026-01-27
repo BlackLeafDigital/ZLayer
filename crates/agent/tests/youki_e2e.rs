@@ -155,6 +155,7 @@ async fn create_e2e_runtime() -> Result<YoukiRuntime, AgentError> {
         rootfs_dir: test_dir.join("rootfs"),
         bundle_dir: test_dir.join("bundles"),
         cache_dir: test_dir.join("cache"),
+        volume_dir: test_dir.join("volumes"),
         use_systemd: false,
     };
     YoukiRuntime::new(config).await

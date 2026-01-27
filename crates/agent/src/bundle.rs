@@ -13,7 +13,7 @@ use oci_spec::runtime::{
     LinuxNamespaceType, LinuxResourcesBuilder, Mount, MountBuilder, ProcessBuilder, RootBuilder,
     Spec, SpecBuilder, UserBuilder,
 };
-use spec::ServiceSpec;
+use spec::{ServiceSpec, StorageSpec, StorageTier};
 use std::collections::HashSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -280,7 +280,8 @@ impl BundleBuilder {
         }
 
         // Generate OCI runtime spec
-        let oci_spec = self.build_oci_spec(container_id, spec)?;
+        let oci_spec =
+            self.build_oci_spec(container_id, spec, &std::collections::HashMap::new())?;
 
         // Write config.json
         let config_path = self.bundle_dir.join("config.json");
@@ -307,7 +308,12 @@ impl BundleBuilder {
     }
 
     /// Build the OCI runtime spec from ServiceSpec
-    fn build_oci_spec(&self, container_id: &ContainerId, spec: &ServiceSpec) -> Result<Spec> {
+    fn build_oci_spec(
+        &self,
+        container_id: &ContainerId,
+        spec: &ServiceSpec,
+        volume_paths: &std::collections::HashMap<String, PathBuf>,
+    ) -> Result<Spec> {
         // Build user (default to root)
         let user = UserBuilder::default()
             .uid(0u32)
@@ -369,7 +375,11 @@ impl BundleBuilder {
             .map_err(|e| AgentError::InvalidSpec(format!("failed to build root: {}", e)))?;
 
         // Build default mounts
-        let mounts = self.build_default_mounts(spec)?;
+        let mut mounts = self.build_default_mounts(spec)?;
+
+        // Add storage mounts from spec
+        let storage_mounts = self.build_storage_mounts(spec, volume_paths)?;
+        mounts.extend(storage_mounts);
 
         // Build Linux-specific config
         let linux = self.build_linux_config(spec)?;
@@ -624,6 +634,202 @@ impl BundleBuilder {
                     AgentError::InvalidSpec(format!("failed to build cgroup mount: {}", e))
                 })?,
         );
+
+        Ok(mounts)
+    }
+
+    /// Build storage mounts from ServiceSpec storage entries
+    ///
+    /// Converts StorageSpec entries to OCI Mount entries.
+    /// Note: Named and Anonymous volumes require StorageManager to prepare paths.
+    /// S3 volumes require s3fs FUSE mount (handled separately).
+    fn build_storage_mounts(
+        &self,
+        spec: &ServiceSpec,
+        volume_paths: &std::collections::HashMap<String, PathBuf>,
+    ) -> Result<Vec<Mount>> {
+        let mut mounts = Vec::new();
+
+        for storage in &spec.storage {
+            let mount = match storage {
+                StorageSpec::Bind {
+                    source,
+                    target,
+                    readonly,
+                } => {
+                    let mut options = vec!["rbind".to_string()];
+                    if *readonly {
+                        options.push("ro".to_string());
+                    } else {
+                        options.push("rw".to_string());
+                    }
+
+                    MountBuilder::default()
+                        .destination(target.clone())
+                        .typ("none".to_string())
+                        .source(source.clone())
+                        .options(options)
+                        .build()
+                        .map_err(|e| {
+                            AgentError::InvalidSpec(format!(
+                                "failed to build bind mount for {}: {}",
+                                target, e
+                            ))
+                        })?
+                }
+
+                StorageSpec::Named {
+                    name,
+                    target,
+                    readonly,
+                    tier,
+                } => {
+                    // Get the prepared volume path from StorageManager
+                    let source = volume_paths.get(name).ok_or_else(|| {
+                        AgentError::InvalidSpec(format!(
+                            "volume '{}' not prepared - ensure StorageManager.ensure_volume() was called",
+                            name
+                        ))
+                    })?;
+
+                    // Warn about SQLite safety for non-local tiers
+                    if matches!(tier, StorageTier::Network) {
+                        tracing::warn!(
+                            volume = %name,
+                            tier = ?tier,
+                            "Network storage tier is NOT SQLite-safe. Avoid using SQLite databases on this volume."
+                        );
+                    }
+
+                    let mut options = vec!["rbind".to_string()];
+                    if *readonly {
+                        options.push("ro".to_string());
+                    } else {
+                        options.push("rw".to_string());
+                    }
+
+                    MountBuilder::default()
+                        .destination(target.clone())
+                        .typ("none".to_string())
+                        .source(source.to_string_lossy().to_string())
+                        .options(options)
+                        .build()
+                        .map_err(|e| {
+                            AgentError::InvalidSpec(format!(
+                                "failed to build named volume mount for {}: {}",
+                                target, e
+                            ))
+                        })?
+                }
+
+                StorageSpec::Anonymous { target, tier } => {
+                    // Anonymous volumes should have been created by StorageManager
+                    // and the path passed in volume_paths with key "_anon_{target}"
+                    let key = format!("_anon_{}", target.trim_start_matches('/').replace('/', "_"));
+                    let source = volume_paths.get(&key).ok_or_else(|| {
+                        AgentError::InvalidSpec(format!(
+                            "anonymous volume for '{}' not prepared",
+                            target
+                        ))
+                    })?;
+
+                    if matches!(tier, StorageTier::Network) {
+                        tracing::warn!(
+                            target = %target,
+                            tier = ?tier,
+                            "Network storage tier is NOT SQLite-safe."
+                        );
+                    }
+
+                    let options = vec!["rbind".to_string(), "rw".to_string()];
+
+                    MountBuilder::default()
+                        .destination(target.clone())
+                        .typ("none".to_string())
+                        .source(source.to_string_lossy().to_string())
+                        .options(options)
+                        .build()
+                        .map_err(|e| {
+                            AgentError::InvalidSpec(format!(
+                                "failed to build anonymous volume mount for {}: {}",
+                                target, e
+                            ))
+                        })?
+                }
+
+                StorageSpec::Tmpfs { target, size, mode } => {
+                    let mut options = vec!["nosuid".to_string(), "nodev".to_string()];
+
+                    if let Some(size_str) = size {
+                        options.push(format!("size={}", size_str));
+                    }
+
+                    if let Some(mode_val) = mode {
+                        options.push(format!("mode={:o}", mode_val));
+                    }
+
+                    MountBuilder::default()
+                        .destination(target.clone())
+                        .typ("tmpfs".to_string())
+                        .source("tmpfs".to_string())
+                        .options(options)
+                        .build()
+                        .map_err(|e| {
+                            AgentError::InvalidSpec(format!(
+                                "failed to build tmpfs mount for {}: {}",
+                                target, e
+                            ))
+                        })?
+                }
+
+                StorageSpec::S3 {
+                    bucket,
+                    prefix,
+                    target,
+                    readonly,
+                    endpoint: _,
+                    credentials: _,
+                } => {
+                    // S3 mounts are handled via s3fs FUSE
+                    // The StorageManager should have mounted the bucket and passed the path
+                    let key = format!("_s3_{}_{}", bucket, prefix.as_deref().unwrap_or(""));
+                    let source = volume_paths.get(&key).ok_or_else(|| {
+                        AgentError::InvalidSpec(format!(
+                            "S3 volume for bucket '{}' not mounted - ensure StorageManager.mount_s3() was called",
+                            bucket
+                        ))
+                    })?;
+
+                    tracing::warn!(
+                        bucket = %bucket,
+                        target = %target,
+                        "S3 storage is NOT SQLite-safe. Use for read-heavy workloads only."
+                    );
+
+                    let mut options = vec!["rbind".to_string()];
+                    if *readonly {
+                        options.push("ro".to_string());
+                    } else {
+                        options.push("rw".to_string());
+                    }
+
+                    MountBuilder::default()
+                        .destination(target.clone())
+                        .typ("none".to_string())
+                        .source(source.to_string_lossy().to_string())
+                        .options(options)
+                        .build()
+                        .map_err(|e| {
+                            AgentError::InvalidSpec(format!(
+                                "failed to build S3 mount for {}: {}",
+                                target, e
+                            ))
+                        })?
+                }
+            };
+
+            mounts.push(mount);
+        }
 
         Ok(mounts)
     }
@@ -1077,7 +1283,9 @@ services:
         let spec = mock_spec();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
-        let oci_spec = builder.build_oci_spec(&id, &spec).unwrap();
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .unwrap();
 
         assert_eq!(oci_spec.version(), "1.0.2");
         assert!(oci_spec.root().is_some());
@@ -1098,7 +1306,9 @@ services:
         let spec = mock_spec_with_resources();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
-        let oci_spec = builder.build_oci_spec(&id, &spec).unwrap();
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .unwrap();
 
         // Check that resources are set
         let linux = oci_spec.linux().as_ref().unwrap();
@@ -1123,7 +1333,9 @@ services:
         let spec = mock_privileged_spec();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
-        let oci_spec = builder.build_oci_spec(&id, &spec).unwrap();
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .unwrap();
 
         // Check that all capabilities are set
         let process = oci_spec.process().as_ref().unwrap();
@@ -1151,7 +1363,9 @@ services:
         let builder = BundleBuilder::new("/tmp/test-bundle".into())
             .with_env("EXTRA_VAR".to_string(), "extra_value".to_string());
 
-        let oci_spec = builder.build_oci_spec(&id, &spec).unwrap();
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .unwrap();
 
         let process = oci_spec.process().as_ref().unwrap();
         let env = process.env().as_ref().unwrap();
@@ -1174,7 +1388,9 @@ services:
         let spec = mock_spec();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
 
-        let oci_spec = builder.build_oci_spec(&id, &spec).unwrap();
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .unwrap();
         let linux = oci_spec.linux().as_ref().unwrap();
         let namespaces = linux.namespaces().as_ref().unwrap();
 
@@ -1204,5 +1420,245 @@ services:
         assert!(mount_destinations.contains(&"/dev/pts".to_string()));
         assert!(mount_destinations.contains(&"/dev/shm".to_string()));
         assert!(mount_destinations.contains(&"/sys".to_string()));
+    }
+
+    #[test]
+    fn test_build_storage_mounts_bind() {
+        let spec = serde_yaml::from_str::<spec::DeploymentSpec>(
+            r#"
+version: v1
+deployment: test
+services:
+  test:
+    image:
+      name: test:latest
+    storage:
+      - type: bind
+        source: /host/data
+        target: /app/data
+        readonly: true
+"#,
+        )
+        .unwrap()
+        .services
+        .remove("test")
+        .unwrap();
+
+        let builder = BundleBuilder::new("/tmp/test-bundle".into());
+        let volume_paths = std::collections::HashMap::new();
+
+        let mounts = builder.build_storage_mounts(&spec, &volume_paths).unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].destination().to_string_lossy(), "/app/data");
+        assert_eq!(
+            mounts[0]
+                .source()
+                .as_ref()
+                .map(|s| s.to_string_lossy().to_string()),
+            Some("/host/data".to_string())
+        );
+        let options = mounts[0].options().as_ref().unwrap();
+        assert!(options.contains(&"rbind".to_string()));
+        assert!(options.contains(&"ro".to_string()));
+    }
+
+    #[test]
+    fn test_build_storage_mounts_named() {
+        let spec = serde_yaml::from_str::<spec::DeploymentSpec>(
+            r#"
+version: v1
+deployment: test
+services:
+  test:
+    image:
+      name: test:latest
+    storage:
+      - type: named
+        name: my-volume
+        target: /app/data
+"#,
+        )
+        .unwrap()
+        .services
+        .remove("test")
+        .unwrap();
+
+        let builder = BundleBuilder::new("/tmp/test-bundle".into());
+        let mut volume_paths = std::collections::HashMap::new();
+        volume_paths.insert(
+            "my-volume".to_string(),
+            PathBuf::from("/var/lib/zlayer/volumes/my-volume"),
+        );
+
+        let mounts = builder.build_storage_mounts(&spec, &volume_paths).unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].destination().to_string_lossy(), "/app/data");
+        assert_eq!(
+            mounts[0]
+                .source()
+                .as_ref()
+                .map(|s| s.to_string_lossy().to_string()),
+            Some("/var/lib/zlayer/volumes/my-volume".to_string())
+        );
+    }
+
+    #[test]
+    fn test_build_storage_mounts_tmpfs() {
+        let spec = serde_yaml::from_str::<spec::DeploymentSpec>(
+            r#"
+version: v1
+deployment: test
+services:
+  test:
+    image:
+      name: test:latest
+    storage:
+      - type: tmpfs
+        target: /app/tmp
+        size: 256Mi
+        mode: 1777
+"#,
+        )
+        .unwrap()
+        .services
+        .remove("test")
+        .unwrap();
+
+        let builder = BundleBuilder::new("/tmp/test-bundle".into());
+        let volume_paths = std::collections::HashMap::new();
+
+        let mounts = builder.build_storage_mounts(&spec, &volume_paths).unwrap();
+
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0].destination().to_string_lossy(), "/app/tmp");
+        assert_eq!(mounts[0].typ().as_ref().map(|s| s.as_str()), Some("tmpfs"));
+        let options = mounts[0].options().as_ref().unwrap();
+        assert!(options.iter().any(|o| o.starts_with("size=")));
+        assert!(options.iter().any(|o| o.starts_with("mode=")));
+    }
+
+    #[test]
+    fn test_build_storage_mounts_multiple() {
+        let spec = serde_yaml::from_str::<spec::DeploymentSpec>(
+            r#"
+version: v1
+deployment: test
+services:
+  test:
+    image:
+      name: test:latest
+    storage:
+      - type: bind
+        source: /etc/config
+        target: /app/config
+        readonly: true
+      - type: named
+        name: app-data
+        target: /app/data
+      - type: tmpfs
+        target: /app/tmp
+"#,
+        )
+        .unwrap()
+        .services
+        .remove("test")
+        .unwrap();
+
+        let builder = BundleBuilder::new("/tmp/test-bundle".into());
+        let mut volume_paths = std::collections::HashMap::new();
+        volume_paths.insert(
+            "app-data".to_string(),
+            PathBuf::from("/var/lib/zlayer/volumes/app-data"),
+        );
+
+        let mounts = builder.build_storage_mounts(&spec, &volume_paths).unwrap();
+
+        assert_eq!(mounts.len(), 3);
+
+        // Verify each mount is correct type
+        let destinations: Vec<String> = mounts
+            .iter()
+            .map(|m| m.destination().to_string_lossy().to_string())
+            .collect();
+        assert!(destinations.contains(&"/app/config".to_string()));
+        assert!(destinations.contains(&"/app/data".to_string()));
+        assert!(destinations.contains(&"/app/tmp".to_string()));
+    }
+
+    #[test]
+    fn test_build_storage_mounts_anonymous_missing_path() {
+        let spec = serde_yaml::from_str::<spec::DeploymentSpec>(
+            r#"
+version: v1
+deployment: test
+services:
+  test:
+    image:
+      name: test:latest
+    storage:
+      - type: anonymous
+        target: /app/cache
+"#,
+        )
+        .unwrap()
+        .services
+        .remove("test")
+        .unwrap();
+
+        let builder = BundleBuilder::new("/tmp/test-bundle".into());
+        let volume_paths = std::collections::HashMap::new(); // No path provided
+
+        let result = builder.build_storage_mounts(&spec, &volume_paths);
+
+        // Should fail because anonymous volume path not prepared
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_oci_spec_includes_storage_mounts() {
+        let id = ContainerId {
+            service: "test".to_string(),
+            replica: 1,
+        };
+        let spec = serde_yaml::from_str::<spec::DeploymentSpec>(
+            r#"
+version: v1
+deployment: test
+services:
+  test:
+    image:
+      name: test:latest
+    storage:
+      - type: bind
+        source: /host/data
+        target: /app/data
+      - type: tmpfs
+        target: /app/tmp
+"#,
+        )
+        .unwrap()
+        .services
+        .remove("test")
+        .unwrap();
+
+        let builder = BundleBuilder::new("/tmp/test-bundle".into());
+        let volume_paths = std::collections::HashMap::new();
+
+        let oci_spec = builder.build_oci_spec(&id, &spec, &volume_paths).unwrap();
+
+        // Verify the OCI spec includes storage mounts
+        let mounts = oci_spec.mounts().as_ref().unwrap();
+        let destinations: Vec<String> = mounts
+            .iter()
+            .map(|m| m.destination().to_string_lossy().to_string())
+            .collect();
+
+        // Should include both default mounts and storage mounts
+        assert!(destinations.contains(&"/proc".to_string())); // default
+        assert!(destinations.contains(&"/dev".to_string())); // default
+        assert!(destinations.contains(&"/app/data".to_string())); // storage bind
+        assert!(destinations.contains(&"/app/tmp".to_string())); // storage tmpfs
     }
 }

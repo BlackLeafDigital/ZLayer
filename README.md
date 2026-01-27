@@ -14,10 +14,12 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 - **Smart Scheduler** - Node placement with Shared/Dedicated/Exclusive allocation modes
 - **Built-in Proxy** - TLS termination, HTTP/2, load balancing on every node
 - **Adaptive Autoscaling** - Scale based on CPU, memory, or requests per second
-- **Init Actions** - Pre-start lifecycle hooks (wait for TCP, HTTP, run commands)
+- **Init Actions** - Pre-start lifecycle hooks (wait for TCP, HTTP, S3 pull/push, run commands)
 - **Health Checks** - TCP, HTTP, and command-based health monitoring
 - **OCI Compatible** - Pull images from any OCI-compliant registry
 - **REST API** - Deploy, manage, and build images via HTTP API with streaming progress
+- **S3 Layer Persistence** - Persist container state to S3 with crash-tolerant uploads
+- **OpenTelemetry Tracing** - Distributed tracing with OTLP export and context propagation
 
 ## Architecture
 
@@ -37,12 +39,14 @@ graph TB
 
         subgraph Runtime[Runtime Layer]
             LC[libcontainer]
+            SM[Storage Manager]
             LC --> C1[Container]
             LC --> C2[Container]
             LC --> C3[Container]
         end
 
         Agent --> LC
+        Agent --> SM
     end
 
     subgraph Builder[Builder Subsystem]
@@ -60,6 +64,15 @@ graph TB
         IP --> Boot --> WG
     end
 
+    subgraph Storage[Storage Backends]
+        LV[Local Volumes]
+        S3C[S3 Cache]
+        LS[Layer Storage]
+        LV --> SM
+        S3C --> SM
+        LS --> SM
+    end
+
     Agent --> Builder
     Agent --> Overlay
 ```
@@ -68,14 +81,15 @@ graph TB
 
 ```
 crates/
-├── agent/          # Container runtime (libcontainer integration)
+├── agent/          # Container runtime (libcontainer integration, storage manager)
 ├── api/            # REST API server with build endpoints and streaming
 ├── builder/        # Dockerfile parser, buildah integration, runtime templates
-├── init_actions/   # Pre-start lifecycle actions
-├── observability/  # Metrics, logging, tracing
+├── init_actions/   # Pre-start lifecycle actions (TCP, HTTP, S3, commands)
+├── layer-storage/  # S3-backed layer persistence with crash-tolerant uploads
+├── observability/  # Metrics, logging, OpenTelemetry tracing
 ├── overlay/        # WireGuard overlay networking, IP allocation, health checks
 ├── proxy/          # L4/L7 proxy with TLS
-├── registry/       # OCI image pulling and caching
+├── registry/       # OCI image pulling and caching (with optional S3 backend)
 ├── scheduler/      # Raft-based distributed scheduler with placement logic
 ├── spec/           # Deployment specification types
 └── zlayer-core/    # Shared types and configuration
@@ -216,6 +230,96 @@ See [V1_SPEC.md](./V1_SPEC.md) for the complete specification.
 | `shared` | Containers bin-packed onto nodes with available capacity |
 | `dedicated` | Each replica gets its own node (1:1 mapping) |
 | `exclusive` | Service has nodes exclusively to itself (no other services) |
+
+### Storage & Persistence
+
+ZLayer provides comprehensive storage options for containers.
+
+#### Volume Mounts
+
+Mount external storage into containers:
+
+| Type | Description | Lifecycle |
+|------|-------------|-----------|
+| `bind` | Host path mounted into container | Host-managed |
+| `named` | Persistent named volume | Survives container restarts |
+| `anonymous` | Auto-named volume | Cleaned on container removal |
+| `tmpfs` | Memory-backed filesystem | Lost on container stop |
+| `s3` | S3-backed FUSE mount (requires s3fs) | Remote-managed |
+
+#### Storage Tiers
+
+Named and anonymous volumes support configurable performance tiers:
+
+| Tier | Description | SQLite Safe |
+|------|-------------|-------------|
+| `local` | Direct local filesystem (SSD/NVMe) | Yes |
+| `cached` | bcache-backed tiered storage | Yes |
+| `network` | NFS/network storage | No |
+
+#### Layer Persistence
+
+Persist container filesystem changes (OverlayFS upper layer) to S3:
+
+- **Automatic snapshots** - Tar + zstd compress the upper layer on container stop
+- **Crash-tolerant uploads** - Multipart S3 uploads with resume capability
+- **Content-addressable** - Layers keyed by SHA256 digest (automatic deduplication)
+- **Cross-node restore** - Containers can resume state on different nodes
+
+#### S3 Init Actions
+
+Transfer files to/from S3 as part of container lifecycle:
+
+| Action | Description |
+|--------|-------------|
+| `init.s3_pull` | Download files from S3 before container starts |
+| `init.s3_push` | Upload files to S3 after container stops |
+
+#### Example Storage Configuration
+
+```yaml
+services:
+  api:
+    image:
+      name: myapi:latest
+    storage:
+      # Bind mount (read-only config)
+      - type: bind
+        source: /etc/myapp/config
+        target: /app/config
+        readonly: true
+
+      # Named persistent volume
+      - type: named
+        name: api-data
+        target: /app/data
+        tier: local  # SQLite-safe
+
+      # Anonymous cache (auto-cleaned)
+      - type: anonymous
+        target: /app/cache
+
+      # Memory-backed temp
+      - type: tmpfs
+        target: /app/tmp
+        size: 256Mi
+        mode: 1777
+
+      # S3 model storage (requires s3fs)
+      - type: s3
+        bucket: my-models
+        prefix: v1/
+        target: /app/models
+        readonly: true
+        endpoint: https://s3.us-west-2.amazonaws.com
+
+    # S3 init actions for artifact transfer
+    init:
+      - action: init.s3_pull
+        bucket: my-artifacts
+        key: models/latest.bin
+        destination: /app/models/model.bin
+```
 
 ## Image Building
 
@@ -396,6 +500,44 @@ zlayer run deployment.yaml --port-offset 1000
 # Production environment
 zlayer run deployment.yaml --env prod
 ```
+
+## Observability
+
+ZLayer includes built-in observability with Prometheus metrics and OpenTelemetry tracing.
+
+### OpenTelemetry Tracing
+
+Distributed tracing with automatic instrumentation of container operations:
+
+- **OTLP Export** - Send traces to any OpenTelemetry-compatible backend (Jaeger, Tempo, etc.)
+- **Context Propagation** - W3C Trace Context for distributed trace correlation
+- **Container Spans** - Automatic spans for create, start, stop, remove, exec operations
+- **Semantic Attributes** - Standard attributes (`container.id`, `service.name`, etc.)
+
+#### Configuration via Environment Variables
+
+```bash
+# Enable tracing
+export OTEL_TRACES_ENABLED=true
+export OTEL_SERVICE_NAME=zlayer-agent
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+
+# Sampling (0.0 to 1.0)
+export OTEL_TRACES_SAMPLER_ARG=0.1  # Sample 10% of traces
+
+# Environment tag
+export DEPLOYMENT_ENVIRONMENT=production
+```
+
+### Prometheus Metrics
+
+Expose metrics for scraping:
+
+```bash
+zlayer serve --metrics-bind 0.0.0.0:9090
+```
+
+Available metrics include container counts, request latencies, and resource utilization.
 
 ## Development
 

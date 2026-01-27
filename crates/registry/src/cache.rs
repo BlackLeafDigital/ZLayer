@@ -3,10 +3,27 @@
 //! Simplified cache implementation using std::collections::HashMap.
 
 use crate::error::{CacheError, Result};
+use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::RwLock;
+
+/// Trait for blob cache backends
+///
+/// This trait abstracts the storage backend for blob caching,
+/// allowing different implementations (in-memory, disk, S3, etc.)
+#[async_trait]
+pub trait BlobCacheBackend: Send + Sync {
+    /// Get a blob by digest
+    async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, CacheError>;
+
+    /// Put a blob into the cache
+    async fn put(&self, digest: &str, data: &[u8]) -> Result<(), CacheError>;
+
+    /// Check if a blob exists in the cache
+    async fn contains(&self, digest: &str) -> Result<bool, CacheError>;
+}
 
 /// Local blob cache for OCI images (in-memory)
 pub struct BlobCache {
@@ -130,6 +147,24 @@ impl BlobCache {
 impl Default for BlobCache {
     fn default() -> Self {
         Self::new().unwrap()
+    }
+}
+
+#[async_trait]
+impl BlobCacheBackend for BlobCache {
+    async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, CacheError> {
+        // Delegate to the synchronous method
+        BlobCache::get(self, digest)
+    }
+
+    async fn put(&self, digest: &str, data: &[u8]) -> Result<(), CacheError> {
+        // Delegate to the synchronous method
+        BlobCache::put(self, digest, data)
+    }
+
+    async fn contains(&self, digest: &str) -> Result<bool, CacheError> {
+        // Delegate to the synchronous method
+        BlobCache::contains(self, digest)
     }
 }
 

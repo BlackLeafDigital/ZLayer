@@ -172,6 +172,18 @@ pub struct TracingConfig {
     /// Sampling ratio (0.0 to 1.0)
     #[serde(default = "default_sampling_ratio")]
     pub sampling_ratio: f64,
+
+    /// Deployment environment (production, staging, development)
+    #[serde(default)]
+    pub environment: Option<String>,
+
+    /// Batch export configuration
+    #[serde(default)]
+    pub batch: BatchConfig,
+
+    /// Use gRPC (true) or HTTP (false) for OTLP
+    #[serde(default = "default_true")]
+    pub use_grpc: bool,
 }
 
 fn default_service_name() -> String {
@@ -182,6 +194,44 @@ fn default_sampling_ratio() -> f64 {
     1.0
 }
 
+fn default_max_queue_size() -> usize {
+    2048
+}
+
+fn default_scheduled_delay() -> u64 {
+    5000
+}
+
+fn default_max_export_batch_size() -> usize {
+    512
+}
+
+/// Batch export configuration for OpenTelemetry
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchConfig {
+    /// Maximum queue size before dropping spans (default: 2048)
+    #[serde(default = "default_max_queue_size")]
+    pub max_queue_size: usize,
+
+    /// Scheduled delay for batch export in milliseconds (default: 5000)
+    #[serde(default = "default_scheduled_delay")]
+    pub scheduled_delay_ms: u64,
+
+    /// Maximum export batch size (default: 512)
+    #[serde(default = "default_max_export_batch_size")]
+    pub max_export_batch_size: usize,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        Self {
+            max_queue_size: default_max_queue_size(),
+            scheduled_delay_ms: default_scheduled_delay(),
+            max_export_batch_size: default_max_export_batch_size(),
+        }
+    }
+}
+
 impl Default for TracingConfig {
     fn default() -> Self {
         Self {
@@ -189,6 +239,32 @@ impl Default for TracingConfig {
             otlp_endpoint: None,
             service_name: default_service_name(),
             sampling_ratio: default_sampling_ratio(),
+            environment: None,
+            batch: BatchConfig::default(),
+            use_grpc: true,
+        }
+    }
+}
+
+impl TracingConfig {
+    /// Load from environment variables with fallback to defaults
+    pub fn from_env() -> Self {
+        Self {
+            enabled: std::env::var("OTEL_TRACES_ENABLED")
+                .map(|v| v == "true" || v == "1")
+                .unwrap_or(false),
+            otlp_endpoint: std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
+            service_name: std::env::var("OTEL_SERVICE_NAME")
+                .unwrap_or_else(|_| "zlayer".to_string()),
+            sampling_ratio: std::env::var("OTEL_TRACES_SAMPLER_ARG")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1.0),
+            environment: std::env::var("DEPLOYMENT_ENVIRONMENT").ok(),
+            batch: BatchConfig::default(),
+            use_grpc: std::env::var("OTEL_EXPORTER_OTLP_PROTOCOL")
+                .map(|v| v != "http/protobuf")
+                .unwrap_or(true),
         }
     }
 }

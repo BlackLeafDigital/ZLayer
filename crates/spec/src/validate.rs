@@ -160,6 +160,24 @@ pub fn validate_schedule_wrapper(schedule: &String) -> Result<(), validator::Val
     })
 }
 
+/// Validate storage name format (lowercase alphanumeric with hyphens)
+pub fn validate_storage_name(name: &str) -> Result<(), validator::ValidationError> {
+    // Must be lowercase alphanumeric with hyphens, not starting/ending with hyphen
+    let re = regex::Regex::new(r"^[a-z0-9]([a-z0-9-]*[a-z0-9])?$").unwrap();
+    if !re.is_match(name) || name.len() > 63 {
+        return Err(make_validation_error(
+            "invalid_storage_name",
+            format!("storage name '{}' must be lowercase alphanumeric with hyphens, 1-63 chars, not starting/ending with hyphen", name),
+        ));
+    }
+    Ok(())
+}
+
+/// Wrapper for validate_storage_name for use with validator crate
+pub fn validate_storage_name_wrapper(name: &str) -> Result<(), validator::ValidationError> {
+    validate_storage_name(name)
+}
+
 // =============================================================================
 // Cross-field validation functions (called from lib.rs)
 // =============================================================================

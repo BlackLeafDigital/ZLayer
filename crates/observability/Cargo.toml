@@ -9,6 +9,7 @@ rust-version.workspace = true
 [features]
 default = []
 axum = ["dep:axum"]
+propagation = []
 
 [dependencies]
 # Web framework (optional for metrics handler)
@@ -42,3 +43,6 @@ chrono.workspace = true
 
 # Config
 config.workspace = true
+
+# HTTP types for propagation
+http = "1"

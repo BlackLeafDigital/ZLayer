@@ -53,6 +53,19 @@ pub enum NodeMode {
     Exclusive,
 }
 
+/// Storage performance tier
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageTier {
+    /// Direct local filesystem (SSD/NVMe) - SQLite-safe, fast fsync
+    #[default]
+    Local,
+    /// bcache-backed tiered storage (SSD cache + slower backend)
+    Cached,
+    /// NFS/network storage - NOT SQLite-safe (will warn)
+    Network,
+}
+
 /// Node selection constraints for service placement
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -151,6 +164,10 @@ pub struct ServiceSpec {
     /// Device passthrough (e.g., /dev/kvm for VMs)
     #[serde(default)]
     pub devices: Vec<DeviceSpec>,
+
+    /// Storage mounts for the container
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub storage: Vec<StorageSpec>,
 
     /// Linux capabilities to add (e.g., SYS_ADMIN, NET_ADMIN)
     #[serde(default)]
@@ -264,6 +281,57 @@ pub struct DeviceSpec {
 
 fn default_true() -> bool {
     true
+}
+
+/// Storage mount specification
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, tag = "type", rename_all = "snake_case")]
+pub enum StorageSpec {
+    /// Bind mount from host path to container
+    Bind {
+        source: String,
+        target: String,
+        #[serde(default)]
+        readonly: bool,
+    },
+    /// Named persistent storage volume
+    Named {
+        name: String,
+        target: String,
+        #[serde(default)]
+        readonly: bool,
+        /// Performance tier (default: local, SQLite-safe)
+        #[serde(default)]
+        tier: StorageTier,
+    },
+    /// Anonymous storage (auto-named, container lifecycle)
+    Anonymous {
+        target: String,
+        /// Performance tier (default: local)
+        #[serde(default)]
+        tier: StorageTier,
+    },
+    /// Memory-backed tmpfs mount
+    Tmpfs {
+        target: String,
+        #[serde(default)]
+        size: Option<String>,
+        #[serde(default)]
+        mode: Option<u32>,
+    },
+    /// S3-backed FUSE mount
+    S3 {
+        bucket: String,
+        #[serde(default)]
+        prefix: Option<String>,
+        target: String,
+        #[serde(default)]
+        readonly: bool,
+        #[serde(default)]
+        endpoint: Option<String>,
+        #[serde(default)]
+        credentials: Option<String>,
+    },
 }
 
 /// Resource limits (upper bounds, not reservations)
@@ -993,5 +1061,211 @@ services:
 
         let db_selector = spec.services["database"].node_selector.as_ref().unwrap();
         assert_eq!(db_selector.labels.get("storage"), Some(&"ssd".to_string()));
+    }
+
+    #[test]
+    fn test_storage_bind_mount() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  app:
+    image:
+      name: app:latest
+    storage:
+      - type: bind
+        source: /host/data
+        target: /app/data
+        readonly: true
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let storage = &spec.services["app"].storage;
+        assert_eq!(storage.len(), 1);
+        match &storage[0] {
+            StorageSpec::Bind {
+                source,
+                target,
+                readonly,
+            } => {
+                assert_eq!(source, "/host/data");
+                assert_eq!(target, "/app/data");
+                assert!(*readonly);
+            }
+            _ => panic!("Expected Bind storage"),
+        }
+    }
+
+    #[test]
+    fn test_storage_named_with_tier() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  app:
+    image:
+      name: app:latest
+    storage:
+      - type: named
+        name: my-data
+        target: /app/data
+        tier: cached
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let storage = &spec.services["app"].storage;
+        match &storage[0] {
+            StorageSpec::Named {
+                name, target, tier, ..
+            } => {
+                assert_eq!(name, "my-data");
+                assert_eq!(target, "/app/data");
+                assert_eq!(*tier, StorageTier::Cached);
+            }
+            _ => panic!("Expected Named storage"),
+        }
+    }
+
+    #[test]
+    fn test_storage_anonymous() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  app:
+    image:
+      name: app:latest
+    storage:
+      - type: anonymous
+        target: /app/cache
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let storage = &spec.services["app"].storage;
+        match &storage[0] {
+            StorageSpec::Anonymous { target, tier } => {
+                assert_eq!(target, "/app/cache");
+                assert_eq!(*tier, StorageTier::Local); // default
+            }
+            _ => panic!("Expected Anonymous storage"),
+        }
+    }
+
+    #[test]
+    fn test_storage_tmpfs() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  app:
+    image:
+      name: app:latest
+    storage:
+      - type: tmpfs
+        target: /app/tmp
+        size: 256Mi
+        mode: 1777
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let storage = &spec.services["app"].storage;
+        match &storage[0] {
+            StorageSpec::Tmpfs { target, size, mode } => {
+                assert_eq!(target, "/app/tmp");
+                assert_eq!(size.as_deref(), Some("256Mi"));
+                assert_eq!(*mode, Some(1777));
+            }
+            _ => panic!("Expected Tmpfs storage"),
+        }
+    }
+
+    #[test]
+    fn test_storage_s3() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  app:
+    image:
+      name: app:latest
+    storage:
+      - type: s3
+        bucket: my-bucket
+        prefix: models/
+        target: /app/models
+        readonly: true
+        endpoint: https://s3.us-west-2.amazonaws.com
+        credentials: aws-creds
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let storage = &spec.services["app"].storage;
+        match &storage[0] {
+            StorageSpec::S3 {
+                bucket,
+                prefix,
+                target,
+                readonly,
+                endpoint,
+                credentials,
+            } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(prefix.as_deref(), Some("models/"));
+                assert_eq!(target, "/app/models");
+                assert!(*readonly);
+                assert_eq!(
+                    endpoint.as_deref(),
+                    Some("https://s3.us-west-2.amazonaws.com")
+                );
+                assert_eq!(credentials.as_deref(), Some("aws-creds"));
+            }
+            _ => panic!("Expected S3 storage"),
+        }
+    }
+
+    #[test]
+    fn test_storage_multiple_types() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  app:
+    image:
+      name: app:latest
+    storage:
+      - type: bind
+        source: /etc/config
+        target: /app/config
+        readonly: true
+      - type: named
+        name: app-data
+        target: /app/data
+      - type: tmpfs
+        target: /app/tmp
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let storage = &spec.services["app"].storage;
+        assert_eq!(storage.len(), 3);
+        assert!(matches!(&storage[0], StorageSpec::Bind { .. }));
+        assert!(matches!(&storage[1], StorageSpec::Named { .. }));
+        assert!(matches!(&storage[2], StorageSpec::Tmpfs { .. }));
+    }
+
+    #[test]
+    fn test_storage_tier_default() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  app:
+    image:
+      name: app:latest
+    storage:
+      - type: named
+        name: data
+        target: /data
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        match &spec.services["app"].storage[0] {
+            StorageSpec::Named { tier, .. } => {
+                assert_eq!(*tier, StorageTier::Local); // default should be Local
+            }
+            _ => panic!("Expected Named storage"),
+        }
     }
 }
