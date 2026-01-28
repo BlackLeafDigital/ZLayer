@@ -19,12 +19,12 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-use agent::{RuntimeConfig, YoukiConfig};
-use observability::{init_observability, LogFormat, LogLevel, LoggingConfig, ObservabilityConfig};
-use spec::DeploymentSpec;
+use zlayer_agent::{RuntimeConfig, YoukiConfig};
+use zlayer_observability::{init_observability, LogFormat, LogLevel, LoggingConfig, ObservabilityConfig};
+use zlayer_spec::DeploymentSpec;
 
 // Import API crate functions for token management
-use api::create_token;
+use zlayer_api::create_token;
 
 #[cfg(feature = "node")]
 use serde::{Deserialize, Serialize};
@@ -237,6 +237,48 @@ enum Commands {
     #[cfg(feature = "node")]
     #[command(subcommand)]
     Node(NodeCommands),
+
+    /// Export an image to a tar file (OCI Image Layout)
+    ///
+    /// Exports a locally stored image to an OCI Image Layout tar archive
+    /// that can be imported on another system or loaded into Docker.
+    ///
+    /// Examples:
+    ///   zlayer export myapp:latest -o myapp.tar
+    ///   zlayer export myapp:v1.0 -o myapp.tar.gz --gzip
+    ///   zlayer export myapp@sha256:abc123... -o myapp.tar
+    #[command(verbatim_doc_comment)]
+    Export {
+        /// Image reference (name:tag or name@digest)
+        image: String,
+
+        /// Output file path (.tar or .tar.gz)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Compress output with gzip
+        #[arg(long)]
+        gzip: bool,
+    },
+
+    /// Import an image from a tar file
+    ///
+    /// Imports an OCI Image Layout tar archive into the local registry.
+    /// The archive can be created by `zlayer export` or `docker save`.
+    ///
+    /// Examples:
+    ///   zlayer import myapp.tar
+    ///   zlayer import myapp.tar.gz -t myapp:imported
+    ///   zlayer import /path/to/image.tar --tag myapp:v1.0
+    #[command(verbatim_doc_comment)]
+    Import {
+        /// Input tar file path
+        input: PathBuf,
+
+        /// Tag to apply to imported image
+        #[arg(short, long)]
+        tag: Option<String>,
+    },
 }
 
 /// Node management subcommands
@@ -537,6 +579,10 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Runtimes => handle_runtimes().await,
         Commands::Token(token_cmd) => handle_token(token_cmd),
         Commands::Spec(spec_cmd) => handle_spec(spec_cmd).await,
+        Commands::Export { image, output, gzip } => {
+            handle_export(&cli, image, output, *gzip).await
+        }
+        Commands::Import { input, tag } => handle_import(&cli, input, tag.clone()).await,
         #[cfg(feature = "node")]
         Commands::Node(node_cmd) => match node_cmd {
             NodeCommands::Init {
@@ -611,7 +657,7 @@ fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
 fn parse_spec(spec_path: &Path) -> Result<DeploymentSpec> {
     info!(path = %spec_path.display(), "Parsing deployment spec");
 
-    let spec = spec::from_yaml_file(spec_path)
+    let spec = zlayer_spec::from_yaml_file(spec_path)
         .with_context(|| format!("Failed to parse spec file: {}", spec_path.display()))?;
 
     info!(
@@ -643,7 +689,7 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
     info!(runtime = ?cli.runtime, "Creating container runtime");
 
     // Create the runtime
-    let runtime = agent::create_runtime(runtime_config)
+    let runtime = zlayer_agent::create_runtime(runtime_config)
         .await
         .context("Failed to create container runtime")?;
 
@@ -653,7 +699,7 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
     print_deployment_plan(&spec);
 
     // Create ServiceManager (wrap in Arc for autoscaler)
-    let manager = Arc::new(agent::ServiceManager::new(runtime.clone()));
+    let manager = Arc::new(zlayer_agent::ServiceManager::new(runtime.clone()));
 
     println!("\n=== Deploying Services ===\n");
 
@@ -684,9 +730,9 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
 
         // Determine initial replica count from scale spec
         let replicas = match &service_spec.scale {
-            spec::ScaleSpec::Fixed { replicas } => *replicas,
-            spec::ScaleSpec::Adaptive { min, .. } => *min,
-            spec::ScaleSpec::Manual => 0,
+            zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+            zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
+            zlayer_spec::ScaleSpec::Manual => 0,
         };
 
         if replicas > 0 {
@@ -792,12 +838,12 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
     }
 
     // Check if any service uses adaptive scaling
-    let has_adaptive = agent::has_adaptive_scaling(&spec.services);
+    let has_adaptive = zlayer_agent::has_adaptive_scaling(&spec.services);
 
     if has_adaptive {
         // Create autoscale controller
         let autoscale_interval = Duration::from_secs(10);
-        let controller = Arc::new(agent::AutoscaleController::new(
+        let controller = Arc::new(zlayer_agent::AutoscaleController::new(
             manager.clone(),
             runtime.clone(),
             autoscale_interval,
@@ -805,7 +851,7 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
 
         // Register adaptive services with the controller
         for (name, service_spec) in &spec.services {
-            if let spec::ScaleSpec::Adaptive { .. } = &service_spec.scale {
+            if let zlayer_spec::ScaleSpec::Adaptive { .. } = &service_spec.scale {
                 let replicas = manager.service_replica_count(name).await.unwrap_or(0) as u32;
                 controller
                     .register_service(name, &service_spec.scale, replicas)
@@ -869,13 +915,13 @@ fn print_deployment_plan(spec: &DeploymentSpec) {
 
         // Print scaling info
         match &service.scale {
-            spec::ScaleSpec::Fixed { replicas } => {
+            zlayer_spec::ScaleSpec::Fixed { replicas } => {
                 println!("    Scale: fixed ({} replicas)", replicas);
             }
-            spec::ScaleSpec::Adaptive { min, max, .. } => {
+            zlayer_spec::ScaleSpec::Adaptive { min, max, .. } => {
                 println!("    Scale: adaptive ({}-{} replicas)", min, max);
             }
-            spec::ScaleSpec::Manual => {
+            zlayer_spec::ScaleSpec::Manual => {
                 println!("    Scale: manual");
             }
         }
@@ -1034,7 +1080,7 @@ async fn join(
 
     // Step 4: Determine which service(s) to join
     let target_service = service.or(join_token.service.as_deref());
-    let services_to_join: Vec<(String, spec::ServiceSpec)> = if let Some(svc) = target_service {
+    let services_to_join: Vec<(String, zlayer_spec::ServiceSpec)> = if let Some(svc) = target_service {
         // Join specific service
         if !spec.services.contains_key(svc) {
             anyhow::bail!("Service '{}' not found in deployment", svc);
@@ -1057,13 +1103,13 @@ async fn join(
     let runtime_config = build_runtime_config(cli);
     info!(runtime = ?cli.runtime, "Creating container runtime");
 
-    let runtime = agent::create_runtime(runtime_config)
+    let runtime = zlayer_agent::create_runtime(runtime_config)
         .await
         .context("Failed to create container runtime")?;
     info!("Runtime created successfully");
 
     // Step 6: Setup overlay networks
-    let overlay_manager = match agent::OverlayManager::new(spec.deployment.clone()).await {
+    let overlay_manager = match zlayer_agent::OverlayManager::new(spec.deployment.clone()).await {
         Ok(mut om) => {
             // Setup global overlay
             if let Err(e) = om.setup_global_overlay().await {
@@ -1084,9 +1130,9 @@ async fn join(
 
     // Step 7: Create ServiceManager with overlay support
     let manager = if let Some(om) = overlay_manager.clone() {
-        agent::ServiceManager::with_overlay(runtime.clone(), om)
+        zlayer_agent::ServiceManager::with_overlay(runtime.clone(), om)
     } else {
-        agent::ServiceManager::new(runtime.clone())
+        zlayer_agent::ServiceManager::new(runtime.clone())
     };
 
     println!("\n=== Starting Services ===\n");
@@ -1119,7 +1165,7 @@ async fn join(
                 println!("    Step: {}", step.id);
 
                 let action =
-                    init_actions::from_spec(&step.uses, &step.with, Duration::from_secs(300))
+                    zlayer_init_actions::from_spec(&step.uses, &step.with, Duration::from_secs(300))
                         .context(format!("Invalid init action: {}", step.uses))?;
 
                 action
@@ -1143,9 +1189,9 @@ async fn join(
             replicas
         } else {
             match &service_spec.scale {
-                spec::ScaleSpec::Fixed { replicas } => *replicas,
-                spec::ScaleSpec::Adaptive { min, .. } => *min,
-                spec::ScaleSpec::Manual => 1, // Join implies at least 1 replica
+                zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+                zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
+                zlayer_spec::ScaleSpec::Manual => 1, // Join implies at least 1 replica
             }
         };
 
@@ -1214,7 +1260,7 @@ async fn status(cli: &Cli) -> Result<()> {
                 ..Default::default()
             };
 
-            match agent::create_runtime(RuntimeConfig::Youki(config)).await {
+            match zlayer_agent::create_runtime(RuntimeConfig::Youki(config)).await {
                 Ok(_) => {
                     println!("Status: Youki runtime ready");
                 }
@@ -1262,7 +1308,7 @@ async fn serve(bind: &str, jwt_secret: Option<String>, no_swagger: bool) -> Resu
         .parse()
         .context(format!("Invalid bind address: {}", bind))?;
 
-    let config = api::ApiConfig {
+    let config = zlayer_api::ApiConfig {
         bind: bind_addr,
         jwt_secret,
         swagger_enabled: !no_swagger,
@@ -1275,7 +1321,7 @@ async fn serve(bind: &str, jwt_secret: Option<String>, no_swagger: bool) -> Resu
         "Starting ZLayer API server"
     );
 
-    let server = api::ApiServer::new(config);
+    let server = zlayer_api::ApiServer::new(config);
 
     // Setup graceful shutdown on SIGTERM/SIGINT
     let shutdown = async {
@@ -1391,7 +1437,7 @@ async fn handle_build(
     no_tui: bool,
     verbose_build: bool,
 ) -> Result<()> {
-    use builder::{detect_runtime, BuildEvent, ImageBuilder, PlainLogger, Runtime};
+    use zlayer_builder::{detect_runtime, BuildEvent, ImageBuilder, PlainLogger, Runtime};
 
     info!(
         context = %context.display(),
@@ -1487,7 +1533,7 @@ async fn handle_build(
 
     if use_tui {
         // TUI mode - run build with interactive progress display
-        use builder::BuildTui;
+        use zlayer_builder::BuildTui;
 
         // Spawn build in background
         let build_handle = tokio::spawn(async move { builder.build().await });
@@ -1553,7 +1599,7 @@ async fn handle_build(
 
 /// List available runtime templates
 async fn handle_runtimes() -> Result<()> {
-    use builder::{list_templates, Runtime};
+    use zlayer_builder::{list_templates, Runtime};
 
     println!("Available runtime templates:\n");
 
@@ -1575,6 +1621,68 @@ async fn handle_runtimes() -> Result<()> {
             .collect::<Vec<_>>()
             .join(", ")
     );
+
+    Ok(())
+}
+
+// =============================================================================
+// Image Export/Import Commands
+// =============================================================================
+
+/// Handle export command - export image to OCI tar archive
+async fn handle_export(cli: &Cli, image: &str, output: &Path, gzip: bool) -> Result<()> {
+    use zlayer_registry::{export_image, LocalRegistry};
+
+    let registry_path = cli.state_dir.join("registry");
+    let registry = LocalRegistry::new(registry_path)
+        .await
+        .context("Failed to open local registry")?;
+
+    // If gzip flag is set and output doesn't end in .gz, append it
+    let output = if gzip && output.extension().is_none_or(|e| e != "gz") {
+        output.with_extension("tar.gz")
+    } else {
+        output.to_path_buf()
+    };
+
+    info!("Exporting {} to {}", image, output.display());
+    println!("Exporting {} to {}...", image, output.display());
+
+    let export_info = export_image(&registry, image, &output)
+        .await
+        .context("Failed to export image")?;
+
+    println!("Exported successfully!");
+    println!("  Digest: {}", export_info.digest);
+    println!("  Layers: {}", export_info.layers);
+    println!("  Size: {} bytes", export_info.size);
+    println!("  Output: {}", export_info.output_path.display());
+
+    Ok(())
+}
+
+/// Handle import command - import image from OCI tar archive
+async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) -> Result<()> {
+    use zlayer_registry::{import_image, LocalRegistry};
+
+    let registry_path = cli.state_dir.join("registry");
+    let registry = LocalRegistry::new(registry_path)
+        .await
+        .context("Failed to open local registry")?;
+
+    info!("Importing from {}", input.display());
+    println!("Importing from {}...", input.display());
+
+    let import_info = import_image(&registry, input, tag.as_deref())
+        .await
+        .context("Failed to import image")?;
+
+    println!("Imported successfully!");
+    println!("  Digest: {}", import_info.digest);
+    println!("  Layers: {}", import_info.layers);
+    if let Some(tag) = import_info.tag {
+        println!("  Tagged as: {}", tag);
+    }
 
     Ok(())
 }
@@ -1783,7 +1891,7 @@ async fn handle_node_init(
     data_dir: PathBuf,
     overlay_cidr: String,
 ) -> Result<()> {
-    use overlay::WireGuardManager;
+    use zlayer_overlay::WireGuardManager;
 
     println!("Initializing ZLayer node as cluster leader...");
 
@@ -1836,14 +1944,14 @@ async fn handle_node_init(
 
     // 6. Initialize Raft as leader (bootstrap single-node cluster)
     println!("  Starting Raft consensus...");
-    let raft_config = scheduler::RaftConfig {
+    let raft_config = zlayer_scheduler::RaftConfig {
         node_id: raft_node_id,
         address: format!("{}:{}", advertise_addr, raft_port),
         raft_port,
         ..Default::default()
     };
 
-    let raft = scheduler::RaftCoordinator::new(raft_config)
+    let raft = zlayer_scheduler::RaftCoordinator::new(raft_config)
         .await
         .context("Failed to create Raft coordinator")?;
 
@@ -1894,7 +2002,7 @@ async fn handle_node_join(
     mode: String,
     services: Option<Vec<String>>,
 ) -> Result<()> {
-    use overlay::WireGuardManager;
+    use zlayer_overlay::WireGuardManager;
     use std::time::Duration;
 
     println!("Joining ZLayer cluster at {}...", leader_addr);
@@ -2615,7 +2723,7 @@ async fn handle_spec(action: &SpecCommands) -> Result<()> {
                 std::fs::read_to_string(&spec).context("Failed to read specification file")?;
 
             let parsed_spec =
-                spec::from_yaml_str(&content).context("Failed to parse specification")?;
+                zlayer_spec::from_yaml_str(&content).context("Failed to parse specification")?;
 
             match format.to_lowercase().as_str() {
                 "json" => {

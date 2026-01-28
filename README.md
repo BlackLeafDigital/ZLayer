@@ -1,6 +1,18 @@
-# ZLayer
+<p align="center">
+  <img src="assets/zlayer_logo.png" alt="ZLayer Logo" width="150">
+</p>
 
-A lightweight, Rust-based container orchestration platform with built-in networking, scaling, and observability.
+<h1 align="center">ZLayer</h1>
+
+<p align="center">
+  A lightweight, Rust-based container orchestration platform with built-in networking, scaling, and observability.
+</p>
+
+<p align="center">
+  <a href="https://zlayer.dev">Website</a> •
+  <a href="https://zlayer.dev/docs">Documentation</a> •
+  <a href="https://crates.io/crates/zlayer-spec">Crates.io</a>
+</p>
 
 ## Overview
 
@@ -120,7 +132,7 @@ sudo pacman -S libseccomp
 ### Quick Install (Recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | bash
+curl -fsSL https://zlayer.dev/install.sh | bash
 ```
 
 ### From Package Registry

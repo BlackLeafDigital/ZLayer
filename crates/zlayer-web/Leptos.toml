@@ -1,0 +1,49 @@
+# Leptos configuration for cargo-leptos
+# This file configures the cargo-leptos build tool for SSR + Hydration
+
+[package]
+# Name used for the WASM output artifacts
+output-name = "zlayer-web"
+
+# The package in the workspace that contains the Leptos app
+lib-package = "zlayer-web"
+bin-package = "zlayer-web"
+
+# Site configuration
+# Where the build artifacts go (relative to workspace root)
+site-root = "target/site"
+# The directory for WASM/JS artifacts inside site-root
+site-pkg-dir = "pkg"
+# Address for the server (used in dev mode)
+site-addr = "127.0.0.1:3000"
+
+# No style file (we use inline CSS)
+style-file = ""
+
+# Features for compilation
+# Server binary gets ssr feature
+bin-features = ["ssr"]
+# WASM library gets hydrate feature
+lib-features = ["hydrate"]
+
+# Binary and library targets
+bin-target = "zlayer-web"
+
+# WASM optimization settings
+[package.lib-profile-release]
+opt-level = 'z'
+lto = true
+
+# Development settings
+[package.watch]
+# Additional files to watch for changes
+additional-files = ["crates/zlayer-web/src"]
+
+# Environment settings
+[env]
+# Use hash-based filenames for cache busting
+LEPTOS_HASH_FILES = "true"
+# Site root path
+LEPTOS_SITE_ROOT = "target/site"
+LEPTOS_SITE_PKG_DIR = "pkg"
+LEPTOS_OUTPUT_NAME = "zlayer-web"

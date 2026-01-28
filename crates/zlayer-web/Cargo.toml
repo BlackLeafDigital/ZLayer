@@ -1,0 +1,121 @@
+[package]
+name = "zlayer-web"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ZLayer web UI with Leptos SSR + Hydration"
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "zlayer-web"
+path = "src/main.rs"
+required-features = ["ssr"]
+
+[dependencies]
+# =============================================================================
+# Shared dependencies (used by both SSR and hydrate builds)
+# =============================================================================
+
+# Serialization (needed for server fn types)
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+# Web UI - core Leptos components (using 0.8.x for stability)
+leptos = { version = "0.8", default-features = false, features = ["nonce"] }
+leptos_router = { version = "0.8", default-features = false }
+leptos_meta = { version = "0.8", default-features = false }
+
+# WASM bindings (needed for client-side)
+web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Storage", "MediaQueryList"] }
+wasm-bindgen = { version = "0.2" }
+
+# =============================================================================
+# SSR-only dependencies (server binary only)
+# =============================================================================
+
+# Async runtime (server-only)
+tokio = { workspace = true, optional = true }
+
+# Web framework (server-only)
+axum = { workspace = true, optional = true }
+tower = { workspace = true, optional = true }
+tower-http = { version = "0.6", features = ["fs", "trace", "compression-br"], optional = true }
+
+# Leptos SSR integration (server-only)
+leptos_axum = { version = "0.8", optional = true }
+
+# Local crates (server-only)
+zlayer-agent = { path = "../zlayer-agent", optional = true }
+zlayer-spec = { path = "../zlayer-spec", optional = true }
+
+# Utilities (server-only)
+tracing = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+# =============================================================================
+# Hydrate-only dependencies (WASM client only)
+# =============================================================================
+console_error_panic_hook = { version = "0.1", optional = true }
+gloo-timers = { version = "0.3", optional = true }
+
+[features]
+default = []
+
+# SSR feature for server-side rendering (server binary)
+ssr = [
+    "leptos/ssr",
+    "leptos_router/ssr",
+    "leptos_meta/ssr",
+    "dep:leptos_axum",
+    "dep:tokio",
+    "dep:axum",
+    "dep:tower",
+    "dep:tower-http",
+    "dep:zlayer-agent",
+    "dep:zlayer-spec",
+    "dep:tracing",
+    "dep:tracing-subscriber",
+]
+
+# Hydrate feature for client-side hydration (WASM binary)
+# Note: leptos_router and leptos_meta don't have hydrate feature in 0.8.x
+hydrate = [
+    "leptos/hydrate",
+    "dep:console_error_panic_hook",
+    "dep:gloo-timers",
+]
+
+[lints]
+workspace = true
+
+# Metadata for cargo-leptos
+[package.metadata.leptos]
+# The name of the output artifacts from the WASM build
+output-name = "zlayer-web"
+# Site root relative to workspace root
+site-root = "target/site"
+# Package directory for WASM artifacts
+site-pkg-dir = "pkg"
+# Tailwind/assets directory (we use inline CSS)
+style-file = ""
+# Enable hash-based filenames
+hash-files = true
+# Browser reload on change
+reload-port = 3001
+# Environment
+env = "DEV"
+# Bin target
+bin-target = "zlayer-web"
+# Lib target for WASM
+lib-target = "zlayer-web"
+# Bin features
+bin-features = ["ssr"]
+# Lib features for WASM
+lib-features = ["hydrate"]
+# WASM optimization level
+lib-profile-release = "release"

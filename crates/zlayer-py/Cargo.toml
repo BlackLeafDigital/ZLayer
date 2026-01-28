@@ -1,0 +1,48 @@
+[package]
+name = "zlayer-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Python bindings for ZLayer container runtime"
+keywords = ["container", "python", "pyo3", "bindings", "orchestration"]
+categories = ["api-bindings", "development-tools::ffi"]
+readme = "README.md"
+
+[lib]
+name = "zlayer"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# PyO3 for Python bindings
+pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
+pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+
+# ZLayer crates
+zlayer-agent = { version = "0.1.0", path = "../zlayer-agent" }
+zlayer-spec = { version = "0.1.0", path = "../zlayer-spec" }
+zlayer-builder = { version = "0.1.0", path = "../zlayer-builder" }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+
+# Error handling
+thiserror.workspace = true
+
+# Serialization for conversion
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+# Tracing for logging
+tracing.workspace = true
+
+# Collections
+indexmap = "2"
+
+# Random number generation (for container name generation)
+rand.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

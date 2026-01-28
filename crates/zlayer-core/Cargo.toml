@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+description = "Shared types and configuration for ZLayer container orchestration"
+keywords = ["container", "orchestration", "types", "config"]
+categories = ["config"]
+readme = "README.md"
 
 [dependencies]
 base64 = "0.22"
@@ -14,4 +18,4 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
-spec = { path = "../spec" }
+zlayer-spec = { path = "../zlayer-spec" }

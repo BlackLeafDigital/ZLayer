@@ -2,18 +2,20 @@
 resolver = "2"
 default-members = ["bin/runtime"]
 members = [
-  "crates/spec",
+  "crates/zlayer-spec",
   "crates/zlayer-core",
-  "crates/agent",
-  "crates/proxy",
-  "crates/overlay",
-  "crates/scheduler",
-  "crates/init_actions",
-  "crates/registry",
-  "crates/observability",
-  "crates/api",
-  "crates/builder",
-  "crates/layer-storage",
+  "crates/zlayer-agent",
+  "crates/zlayer-proxy",
+  "crates/zlayer-overlay",
+  "crates/zlayer-scheduler",
+  "crates/zlayer-init-actions",
+  "crates/zlayer-registry",
+  "crates/zlayer-observability",
+  "crates/zlayer-api",
+  "crates/zlayer-builder",
+  "crates/zlayer-storage",
+  "crates/zlayer-py",
+  "crates/zlayer-web",
   "bin/runtime",
 ]
 
@@ -22,6 +24,7 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/zachhandley/ZLayer"
+homepage = "https://zlayer.dev"
 rust-version = "1.85"  # Minimum supported version
 
 [workspace.dependencies]
@@ -198,6 +201,18 @@ opt-level = 2
 inherits = "release"
 debug = true
 lto = "thin"
+
+# =============================================================================
+# Workspace Lints
+# =============================================================================
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+dead_code = "warn"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
 
 # =============================================================================
 # Release Metadata
