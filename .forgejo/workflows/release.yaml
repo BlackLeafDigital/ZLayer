@@ -90,10 +90,147 @@ jobs:
           name: zlayer-linux-arm64
           path: zlayer-${{ inputs.version || github.ref_name }}-linux-arm64.tar.gz
 
+  # ===========================================
+  # Publish Crates to crates.io
+  # ===========================================
+  publish-crates:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    needs: [build-amd64, build-arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config
+
+      - name: Setup Rust
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+
+      - name: Restore cache
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      # Tier 1: No internal dependencies
+      # First crate has no continue-on-error - if this fails, the whole job fails
+      # (likely a token issue or network problem that would affect all publishes)
+      - name: Publish zlayer-spec
+        run: cargo publish -p zlayer-spec --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish zlayer-builder
+        continue-on-error: true
+        run: cargo publish -p zlayer-builder --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish zlayer-storage
+        continue-on-error: true
+        run: cargo publish -p zlayer-storage --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index update (tier 1)
+        run: sleep 30
+
+      # Tier 2: Depends on tier 1
+      - name: Publish zlayer-core
+        continue-on-error: true
+        run: cargo publish -p zlayer-core --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish zlayer-registry
+        continue-on-error: true
+        run: cargo publish -p zlayer-registry --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish zlayer-observability
+        continue-on-error: true
+        run: cargo publish -p zlayer-observability --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish zlayer-init-actions
+        continue-on-error: true
+        run: cargo publish -p zlayer-init-actions --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index update (tier 2)
+        run: sleep 30
+
+      # Tier 3: Depends on tier 1 and 2
+      - name: Publish zlayer-overlay
+        continue-on-error: true
+        run: cargo publish -p zlayer-overlay --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish zlayer-scheduler
+        continue-on-error: true
+        run: cargo publish -p zlayer-scheduler --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish zlayer-proxy
+        continue-on-error: true
+        run: cargo publish -p zlayer-proxy --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index update (tier 3)
+        run: sleep 30
+
+      # Tier 4: Depends on many crates
+      - name: Publish zlayer-agent
+        continue-on-error: true
+        run: cargo publish -p zlayer-agent --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index update (tier 4)
+        run: sleep 30
+
+      # Tier 5: Depends on agent
+      - name: Publish zlayer-api
+        continue-on-error: true
+        run: cargo publish -p zlayer-api --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Publish zlayer-web
+        continue-on-error: true
+        run: cargo publish -p zlayer-web --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for crates.io index update (tier 5)
+        run: sleep 30
+
+      # Tier 6: Python bindings (depends on agent, spec, builder)
+      - name: Publish zlayer-py
+        continue-on-error: true
+        run: cargo publish -p zlayer-py --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   create-release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [build-amd64, build-arm64]
+    needs: [build-amd64, build-arm64, publish-crates]
     env:
       VERSION: ${{ inputs.version || github.ref_name }}
     steps:
