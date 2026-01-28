@@ -52,6 +52,8 @@ leptos_axum = { version = "0.8", optional = true }
 # Local crates (server-only)
 zlayer-agent = { path = "../zlayer-agent", optional = true }
 zlayer-spec = { path = "../zlayer-spec", optional = true }
+zlayer-scheduler = { path = "../zlayer-scheduler", optional = true }
+zlayer-observability = { path = "../zlayer-observability", optional = true }
 
 # WASM execution (server-only)
 wasmtime = { version = "41", default-features = false, features = ["cranelift"], optional = true }
@@ -83,6 +85,8 @@ ssr = [
     "dep:tower-http",
     "dep:zlayer-agent",
     "dep:zlayer-spec",
+    "dep:zlayer-scheduler",
+    "dep:zlayer-observability",
     "dep:tracing",
     "dep:tracing-subscriber",
     "dep:wasmtime",

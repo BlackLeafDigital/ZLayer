@@ -5,10 +5,12 @@ use leptos::config::{Env, LeptosOptions};
 use leptos::prelude::*;
 use leptos_axum::{generate_route_list, handle_server_fns_with_context, LeptosRoutes};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tower_http::services::ServeDir;
 use tracing::info;
 
 use crate::app::{app_css, App};
+use crate::server::state::WebState;
 
 /// HTML shell wrapper that includes CSS and hydration scripts.
 ///
@@ -43,13 +45,22 @@ fn shell(options: &LeptosOptions) -> impl IntoView {
 
 /// Start UI server with Leptos SSR + Hydration.
 ///
+/// # Arguments
+///
+/// * `web_state` - Optional shared state for server functions. If `None`, a default
+///   `WebState` with no service manager or metrics collector will be created.
+///
 /// # Errors
 ///
 /// Returns an error if:
 /// - The bind address is invalid or cannot be parsed
 /// - The TCP listener fails to bind to the address
 /// - The server encounters a runtime error
-pub async fn start_ui_server() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn start_ui_server(
+    web_state: Option<WebState>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Create or use provided WebState, wrapped in Arc for sharing across handlers
+    let state = Arc::new(web_state.unwrap_or_default());
     // Parse bind address from environment or use default
     let bind_address =
         std::env::var("ZLAYER_WEB_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
@@ -90,22 +101,34 @@ pub async fn start_ui_server() -> Result<(), Box<dyn std::error::Error>> {
     let routes = generate_route_list(move || shell(&opts_for_route_gen));
 
     // Context provider closure for server functions
-    let provide_context = || {
-        // Future: provide ZLayer services as context here
-        // provide_context(zlayer_agent.clone());
+    // Clone state for use in closures - need separate clones for routes and server fn handler
+    let state_for_routes = state.clone();
+    let state_for_server_fns = state.clone();
+
+    let provide_context_for_routes = move || {
+        // Provide WebState as Leptos context for server functions
+        leptos::prelude::provide_context(state_for_routes.clone());
+    };
+
+    let provide_context_for_server_fns = move || {
+        // Provide WebState as Leptos context for server functions
+        leptos::prelude::provide_context(state_for_server_fns.clone());
     };
 
     // Main app router with Leptos SSR + Hydration
     let leptos_router = Router::new().leptos_routes_with_context(
         &leptos_options,
         routes,
-        provide_context,
+        provide_context_for_routes,
         move || shell(&opts_for_ssr),
     );
 
     // Server function handler with the same context
-    let server_fn_handler =
-        { move |req: Request<Body>| handle_server_fns_with_context(provide_context, req) };
+    let server_fn_handler = {
+        move |req: Request<Body>| {
+            handle_server_fns_with_context(provide_context_for_server_fns, req)
+        }
+    };
 
     // Serve static files (WASM pkg directory) for client-side hydration
     let pkg_dir = format!("{site_root}/pkg");

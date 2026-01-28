@@ -21,7 +21,7 @@ async fn main() {
 
     tracing::info!("Starting ZLayer Web Server");
 
-    if let Err(e) = zlayer_web::server::ui::start_ui_server().await {
+    if let Err(e) = zlayer_web::server::ui::start_ui_server(None).await {
         tracing::error!("Server error: {}", e);
         std::process::exit(1);
     }

@@ -6,13 +6,12 @@
 use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
 use crate::runtime::{ContainerId, ContainerState, Runtime};
-use bollard::container::{
-    Config, CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
-    StatsOptions, StopContainerOptions, WaitContainerOptions,
-};
 use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::image::CreateImageOptions;
-use bollard::models::{HostConfig, PortBinding};
+use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptions, LogsOptions, RemoveContainerOptions,
+    StartContainerOptions, StatsOptions, StopContainerOptions, WaitContainerOptions,
+};
 use bollard::Docker;
 use futures_util::StreamExt;
 use std::collections::HashMap;
@@ -97,14 +96,12 @@ fn parse_image_ref(image: &str) -> (&str, &str) {
     (image, "latest")
 }
 
-/// Build exposed ports map for Docker container config
-fn build_exposed_ports(spec: &ServiceSpec) -> HashMap<String, HashMap<(), ()>> {
-    let mut ports = HashMap::new();
-    for endpoint in &spec.endpoints {
-        let key = format!("{}/tcp", endpoint.port);
-        ports.insert(key, HashMap::new());
-    }
-    ports
+/// Build exposed ports list for Docker container config
+fn build_exposed_ports(spec: &ServiceSpec) -> Vec<String> {
+    spec.endpoints
+        .iter()
+        .map(|endpoint| format!("{}/tcp", endpoint.port))
+        .collect()
 }
 
 /// Build host configuration for Docker container
@@ -212,8 +209,12 @@ impl Runtime for DockerRuntime {
         tracing::info!(image = %image, name = %name, tag = %tag, "pulling image");
 
         let options = CreateImageOptions {
-            from_image: name,
-            tag,
+            from_image: Some(name.to_string()),
+            tag: if tag.is_empty() {
+                None
+            } else {
+                Some(tag.to_string())
+            },
             ..Default::default()
         };
 
@@ -271,7 +272,7 @@ impl Runtime for DockerRuntime {
         let entrypoint = spec.command.entrypoint.clone();
         let working_dir = spec.command.workdir.clone();
 
-        let config = Config {
+        let config = ContainerCreateBody {
             image: Some(spec.image.name.clone()),
             env: if env.is_empty() { None } else { Some(env) },
             cmd,
@@ -287,8 +288,8 @@ impl Runtime for DockerRuntime {
         };
 
         let options = CreateContainerOptions {
-            name: name.clone(),
-            platform: None,
+            name: Some(name.clone()),
+            platform: String::new(),
         };
 
         tracing::info!(container = %name, image = %spec.image.name, "creating container");
@@ -320,7 +321,7 @@ impl Runtime for DockerRuntime {
         tracing::info!(container = %name, "starting container");
 
         self.docker
-            .start_container(&name, None::<StartContainerOptions<String>>)
+            .start_container(&name, None::<StartContainerOptions>)
             .await
             .map_err(|e| AgentError::StartFailed {
                 id: name.clone(),
@@ -347,7 +348,8 @@ impl Runtime for DockerRuntime {
         tracing::info!(container = %name, timeout = ?timeout, "stopping container");
 
         let options = StopContainerOptions {
-            t: timeout.as_secs() as i64,
+            t: Some(timeout.as_secs() as i32),
+            signal: None,
         };
 
         self.docker
@@ -460,7 +462,7 @@ impl Runtime for DockerRuntime {
     async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<String> {
         let name = container_name(id);
 
-        let options = LogsOptions::<String> {
+        let options = LogsOptions {
             stdout: true,
             stderr: true,
             tail: tail.to_string(),
@@ -608,13 +610,26 @@ impl Runtime for DockerRuntime {
 
         // Extract CPU usage from Docker stats
         // Docker provides cumulative CPU usage in nanoseconds
-        let cpu_usage_usec = stats.cpu_stats.cpu_usage.total_usage / 1000; // Convert nanoseconds to microseconds
+        // In bollard 0.20+, cpu_stats and memory_stats are Option<T>
+        let cpu_usage_usec = stats
+            .cpu_stats
+            .and_then(|s| s.cpu_usage)
+            .and_then(|u| u.total_usage)
+            .unwrap_or(0)
+            / 1000; // Convert nanoseconds to microseconds
 
         // Extract memory usage
-        let memory_bytes = stats.memory_stats.usage.unwrap_or(0);
+        let memory_bytes = stats
+            .memory_stats
+            .as_ref()
+            .and_then(|s| s.usage)
+            .unwrap_or(0);
 
         // Extract memory limit
-        let memory_limit = stats.memory_stats.limit.unwrap_or(u64::MAX);
+        let memory_limit = stats
+            .memory_stats
+            .and_then(|s| s.limit)
+            .unwrap_or(u64::MAX);
 
         let container_stats = ContainerStats {
             cpu_usage_usec,
@@ -649,7 +664,7 @@ impl Runtime for DockerRuntime {
         tracing::debug!(container = %name, "waiting for container to exit");
 
         let options = WaitContainerOptions {
-            condition: "not-running",
+            condition: "not-running".to_string(),
         };
 
         let mut stream = self.docker.wait_container(&name, Some(options));
@@ -686,7 +701,7 @@ impl Runtime for DockerRuntime {
     async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>> {
         let name = container_name(id);
 
-        let options = LogsOptions::<String> {
+        let options = LogsOptions {
             stdout: true,
             stderr: true,
             tail: "all".to_string(),
@@ -833,7 +848,7 @@ mod tests {
     fn test_build_exposed_ports_single() {
         let spec = create_test_spec(vec![8080]);
         let ports = build_exposed_ports(&spec);
-        assert!(ports.contains_key("8080/tcp"));
+        assert!(ports.contains(&"8080/tcp".to_string()));
         assert_eq!(ports.len(), 1);
     }
 
@@ -841,9 +856,9 @@ mod tests {
     fn test_build_exposed_ports_multiple() {
         let spec = create_test_spec(vec![8080, 9090, 3000]);
         let ports = build_exposed_ports(&spec);
-        assert!(ports.contains_key("8080/tcp"));
-        assert!(ports.contains_key("9090/tcp"));
-        assert!(ports.contains_key("3000/tcp"));
+        assert!(ports.contains(&"8080/tcp".to_string()));
+        assert!(ports.contains(&"9090/tcp".to_string()));
+        assert!(ports.contains(&"3000/tcp".to_string()));
         assert_eq!(ports.len(), 3);
     }
 

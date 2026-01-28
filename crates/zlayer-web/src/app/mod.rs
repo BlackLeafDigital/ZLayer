@@ -16,7 +16,7 @@ use leptos_router::{StaticSegment, WildcardSegment};
 use wasm_bindgen::JsCast;
 
 use components::{Footer, Navbar};
-use pages::{DocsPage, HomePage, PlaygroundPage};
+use pages::{DashboardPage, DocsPage, HomePage, PlaygroundPage};
 
 // =============================================================================
 // SVG Icons Module - Inline SVGs for SSR compatibility
@@ -472,6 +472,7 @@ pub fn App() -> impl IntoView {
                 <Route path=StaticSegment("docs") view=DocsPage/>
                 <Route path=(StaticSegment("docs"), WildcardSegment("any")) view=DocsPage/>
                 <Route path=StaticSegment("playground") view=PlaygroundPage/>
+                <Route path=StaticSegment("dashboard") view=DashboardPage/>
             </Routes>
         </Router>
     }

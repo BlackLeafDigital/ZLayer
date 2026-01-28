@@ -85,6 +85,10 @@ pub fn Navbar() -> impl IntoView {
                 </A>
 
                 <div class="navbar-nav">
+                    <A href="/dashboard" attr:class="nav-link">
+                        {icons::layers_icon("16")}
+                        <span>"Dashboard"</span>
+                    </A>
                     <A href="/docs" attr:class="nav-link">
                         {icons::book_icon("16")}
                         <span>"Docs"</span>

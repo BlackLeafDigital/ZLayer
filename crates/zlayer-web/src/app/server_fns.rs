@@ -26,6 +26,33 @@ pub struct SystemStats {
     pub available_images: u64,
     /// Number of configured overlay networks
     pub overlay_networks: u64,
+    /// Total number of registered services
+    pub total_services: u64,
+    /// Number of healthy services
+    pub healthy_services: u64,
+    /// Total CPU usage percentage across all services
+    pub total_cpu_percent: f64,
+    /// Total memory usage in bytes
+    pub total_memory_bytes: u64,
+    /// Total memory limit in bytes
+    pub total_memory_limit: u64,
+    /// Server uptime in seconds
+    pub uptime_seconds: u64,
+}
+
+/// Statistics for a single service
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceStats {
+    /// Service name
+    pub name: String,
+    /// Number of running replicas
+    pub replicas: u32,
+    /// CPU usage percentage
+    pub cpu_percent: f64,
+    /// Memory usage percentage
+    pub memory_percent: f64,
+    /// Health status (e.g., "healthy", "unhealthy", "unknown")
+    pub health_status: String,
 }
 
 /// Container specification summary
@@ -59,17 +86,186 @@ pub struct WasmExecutionResult {
 
 /// Get system statistics
 #[server(prefix = "/api/leptos")]
+#[allow(clippy::similar_names)]
 pub async fn get_system_stats() -> Result<SystemStats, ServerFnError> {
-    // TODO: Connect to actual ZLayer services when available
-    // Server functions must be async for Leptos macro; use ready().await
-    // to satisfy clippy when there's no actual async work yet
-    std::future::ready(Ok(SystemStats {
-        version: env!("CARGO_PKG_VERSION").to_string(),
-        running_containers: 0,
-        available_images: 0,
-        overlay_networks: 0,
-    }))
-    .await
+    #[cfg(feature = "ssr")]
+    {
+        use std::sync::Arc;
+
+        use crate::server::state::WebState;
+
+        // Try to get WebState from Leptos context
+        let state: Option<Arc<WebState>> = leptos::prelude::use_context();
+
+        let mut stats = SystemStats {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            running_containers: 0,
+            available_images: 0,
+            overlay_networks: 0,
+            total_services: 0,
+            healthy_services: 0,
+            total_cpu_percent: 0.0,
+            total_memory_bytes: 0,
+            total_memory_limit: 0,
+            uptime_seconds: 0,
+        };
+
+        if let Some(web_state) = state {
+            // Always set uptime
+            stats.uptime_seconds = web_state.uptime().as_secs();
+
+            // Get service stats if service_manager is available
+            if let Some(service_manager) = web_state.service_manager() {
+                let manager = service_manager.read().await;
+                let services = manager.list_services().await;
+                stats.total_services = services.len() as u64;
+
+                // Count running containers (sum of all replica counts)
+                let mut total_containers: u64 = 0;
+                for service_name in &services {
+                    if let Ok(count) = manager.service_replica_count(service_name).await {
+                        total_containers += count as u64;
+                    }
+                }
+                stats.running_containers = total_containers;
+
+                // Count healthy services from health states
+                let health_states = manager.health_states();
+                let states = health_states.read().await;
+                stats.healthy_services = states
+                    .values()
+                    .filter(|s| matches!(s, zlayer_agent::health::HealthState::Healthy))
+                    .count() as u64;
+            }
+
+            // Get aggregated metrics if metrics_collector is available
+            if let Some(metrics_collector) = web_state.metrics_collector() {
+                // If we have service manager, collect metrics for all services
+                if let Some(service_manager) = web_state.service_manager() {
+                    let manager = service_manager.read().await;
+                    let services = manager.list_services().await;
+
+                    let mut total_cpu = 0.0;
+                    let mut service_count_with_metrics = 0;
+
+                    for service_name in &services {
+                        if let Ok(aggregated) = metrics_collector.collect(service_name).await {
+                            total_cpu += aggregated.avg_cpu_percent;
+                            service_count_with_metrics += 1;
+                        }
+                    }
+
+                    if service_count_with_metrics > 0 {
+                        stats.total_cpu_percent = total_cpu / f64::from(service_count_with_metrics);
+                    }
+                }
+            }
+        }
+
+        Ok(stats)
+    }
+
+    #[cfg(not(feature = "ssr"))]
+    {
+        std::future::ready(Ok(SystemStats {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            running_containers: 0,
+            available_images: 0,
+            overlay_networks: 0,
+            total_services: 0,
+            healthy_services: 0,
+            total_cpu_percent: 0.0,
+            total_memory_bytes: 0,
+            total_memory_limit: 0,
+            uptime_seconds: 0,
+        }))
+        .await
+    }
+}
+
+/// Get statistics for all services
+///
+/// Returns a vector of `ServiceStats` containing metrics for each registered service.
+/// If no services are registered or WebState is not available, returns an empty vector.
+#[server(prefix = "/api/leptos")]
+#[allow(clippy::similar_names, clippy::cast_possible_truncation)]
+pub async fn get_all_service_stats() -> Result<Vec<ServiceStats>, ServerFnError> {
+    #[cfg(feature = "ssr")]
+    {
+        use std::sync::Arc;
+
+        use crate::server::state::WebState;
+
+        // Try to get WebState from Leptos context
+        let state: Option<Arc<WebState>> = leptos::prelude::use_context();
+
+        let Some(web_state) = state else {
+            return Ok(Vec::new());
+        };
+
+        let Some(service_manager) = web_state.service_manager() else {
+            return Ok(Vec::new());
+        };
+
+        let manager = service_manager.read().await;
+        let services = manager.list_services().await;
+
+        if services.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Get health states
+        let health_states = manager.health_states();
+        let health_map = health_states.read().await;
+
+        let mut result = Vec::with_capacity(services.len());
+
+        for service_name in services {
+            // Get replica count
+            let replicas = manager
+                .service_replica_count(&service_name)
+                .await
+                .unwrap_or(0) as u32;
+
+            // Get health status
+            let health_status = health_map
+                .get(&service_name)
+                .map_or("unknown", |s| match s {
+                    zlayer_agent::health::HealthState::Healthy => "healthy",
+                    zlayer_agent::health::HealthState::Unhealthy { .. } => "unhealthy",
+                    zlayer_agent::health::HealthState::Unknown => "unknown",
+                    zlayer_agent::health::HealthState::Checking => "checking",
+                })
+                .to_string();
+
+            // Get metrics if available
+            let (cpu_percent, memory_percent) =
+                if let Some(metrics_collector) = web_state.metrics_collector() {
+                    metrics_collector
+                        .collect(&service_name)
+                        .await
+                        .map(|m| (m.avg_cpu_percent, m.avg_memory_percent))
+                        .unwrap_or((0.0, 0.0))
+                } else {
+                    (0.0, 0.0)
+                };
+
+            result.push(ServiceStats {
+                name: service_name,
+                replicas,
+                cpu_percent,
+                memory_percent,
+                health_status,
+            });
+        }
+
+        Ok(result)
+    }
+
+    #[cfg(not(feature = "ssr"))]
+    {
+        std::future::ready(Ok(Vec::new())).await
+    }
 }
 
 /// Validate a container specification YAML

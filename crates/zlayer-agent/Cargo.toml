@@ -48,7 +48,7 @@ ulid = "1.2.1"
 # - time: Timestamp support
 # - pipe: Unix socket/Windows named pipe support (required for connect_with_local_defaults)
 # - http: HTTP transport support
-bollard = { version = "0.18", default-features = false, features = ["ssl", "time", "pipe", "http"], optional = true }
+bollard = { version = "0.20", default-features = false, features = ["ssl", "time", "pipe", "http"], optional = true }
 
 # Streaming utilities (needed for Docker streaming)
 futures-util.workspace = true
