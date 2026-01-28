@@ -1,0 +1,23 @@
+[package]
+name = "{{name}}"
+version = "{{version}}"
+edition = "2024"
+rust-version = "1.85"
+description = "{{description}}"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zlayer-sdk = "0.1"
+
+[package.metadata.component]
+package = "zlayer:plugin"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

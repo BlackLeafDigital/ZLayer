@@ -1,0 +1,14 @@
+/// ZLayer Plugin System
+///
+/// This package defines the complete WIT interface for ZLayer plugins.
+/// Plugins are WebAssembly components that can extend ZLayer's functionality
+/// with custom request handling, authentication, rate limiting, and more.
+///
+/// The package includes:
+/// - Common types (types.wit): Shared types used across interfaces
+/// - Host interfaces (host.wit): Capabilities provided by ZLayer to plugins
+/// - Plugin interfaces (plugin.wit): Interfaces that plugins must export
+/// - HTTP interfaces (http.wit): Extended HTTP-specific types and handlers
+/// - World definitions (world.wit): Complete plugin worlds
+
+package zlayer:plugin@0.1.0;

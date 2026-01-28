@@ -1,0 +1,32 @@
+[package]
+name = "rust-hello-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "A minimal Rust WASM example for ZLayer"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Build for WASI Preview 2 (WASIp2)
+# This creates a WebAssembly component that ZLayer can execute
+[package.metadata.component]
+package = "example:rust-hello"
+
+[dependencies]
+# No dependencies needed for this minimal example
+# For real applications, you might add:
+# zlayer-sdk = { version = "0.1" }  # For ZLayer-specific features
+
+[profile.release]
+opt-level = "s"      # Optimize for size
+lto = true           # Link-time optimization
+strip = true         # Strip debug symbols
+codegen-units = 1    # Better optimization
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

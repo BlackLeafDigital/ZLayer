@@ -13,7 +13,7 @@ readme = "README.md"
 [features]
 default = []
 docker = ["bollard"]
-wasm = ["wasmtime", "wasmtime-wasi"]
+wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
 
 [dependencies]
 async-trait.workspace = true
@@ -59,6 +59,7 @@ futures-util.workspace = true
 # - component-model: WASIp2 component model support
 wasmtime = { version = "29", default-features = false, features = ["async", "cranelift", "component-model"], optional = true }
 wasmtime-wasi = { version = "29", default-features = false, features = ["preview1"], optional = true }
+wasmtime-wasi-http = { version = "29", default-features = false, optional = true }
 
 [dev-dependencies]
 rand = "0.9"

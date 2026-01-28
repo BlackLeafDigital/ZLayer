@@ -1,0 +1,52 @@
+[package]
+name = "zlayer-sdk"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "ZLayer Plugin Development Kit for Rust"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/BlackLeafDigital/zlayer"
+keywords = ["wasm", "wasi", "plugin", "zlayer", "wasip2"]
+categories = ["wasm", "development-tools"]
+readme = "README.md"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+wit-bindgen = "0.36"
+
+[dev-dependencies]
+# For testing plugins locally
+wasmtime = "28"
+
+[build-dependencies]
+# wit-bindgen generates bindings at compile time
+
+[features]
+default = []
+# Enable additional debugging features
+debug = []
+# Enable testing utilities (MockHost, zlayer_test! macro)
+# Note: testing feature enables std for allocator/panic handler in tests
+testing = ["std"]
+# Enable std library (for testing and non-WASM targets)
+std = []
+
+[package.metadata.component]
+package = "zlayer:plugin"
+
+[package.metadata.component.dependencies]
+# WASI dependencies are resolved via wit/deps.toml
+
+[lints.rust]
+unsafe_code = "warn"
+dead_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+# This crate is independent of the ZLayer workspace
+# (it's meant to be published and used by plugin authors)
+[workspace]

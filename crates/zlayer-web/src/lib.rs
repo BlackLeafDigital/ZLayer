@@ -6,6 +6,8 @@
 //! - `ssr` feature: Server-side rendering mode (for the server binary)
 //! - `hydrate` feature: Client-side hydration mode (for WASM)
 
+#![recursion_limit = "512"]
+
 // App module is always needed (shared between server and client)
 pub mod app;
 

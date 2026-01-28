@@ -34,6 +34,30 @@ mod duration {
     pub mod option {
         pub use super::*;
     }
+
+    /// Serde module for required (non-Option) Duration fields
+    pub mod required {
+        use humantime::format_duration;
+        use serde::{Deserialize, Deserializer, Serializer};
+        use std::time::Duration;
+
+        pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.serialize_str(&format_duration(*duration).to_string())
+        }
+
+        pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
+        where
+            D: Deserializer<'de>,
+        {
+            use serde::de::Error;
+            let s: String = String::deserialize(deserializer)?;
+            humantime::parse_duration(&s)
+                .map_err(|e| D::Error::custom(format!("invalid duration: {}", e)))
+        }
+    }
 }
 
 use serde::{Deserialize, Serialize};
@@ -51,6 +75,19 @@ pub enum NodeMode {
     Dedicated,
     /// Service is the ONLY thing on its nodes (no other services)
     Exclusive,
+}
+
+/// Service type - determines runtime behavior and scaling model
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ServiceType {
+    /// Standard long-running container service
+    #[default]
+    Standard,
+    /// WASM-based HTTP service with instance pooling
+    WasmHttp,
+    /// Run-to-completion job
+    Job,
 }
 
 /// Storage performance tier
@@ -76,6 +113,51 @@ pub struct NodeSelector {
     /// Preferred labels (soft constraint, nodes with these are preferred)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub prefer_labels: HashMap<String, String>,
+}
+
+/// Configuration for WASM HTTP services with instance pooling
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WasmHttpConfig {
+    /// Minimum number of warm instances to keep ready
+    #[serde(default = "default_min_instances")]
+    pub min_instances: u32,
+    /// Maximum number of instances to scale to
+    #[serde(default = "default_max_instances")]
+    pub max_instances: u32,
+    /// Time before idle instances are terminated
+    #[serde(default = "default_idle_timeout", with = "duration::required")]
+    pub idle_timeout: std::time::Duration,
+    /// Maximum time for a single request
+    #[serde(default = "default_request_timeout", with = "duration::required")]
+    pub request_timeout: std::time::Duration,
+}
+
+fn default_min_instances() -> u32 {
+    0
+}
+
+fn default_max_instances() -> u32 {
+    10
+}
+
+fn default_idle_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(300)
+}
+
+fn default_request_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(30)
+}
+
+impl Default for WasmHttpConfig {
+    fn default() -> Self {
+        Self {
+            min_instances: default_min_instances(),
+            max_instances: default_max_instances(),
+            idle_timeout: default_idle_timeout(),
+            request_timeout: default_request_timeout(),
+        }
+    }
 }
 
 /// Top-level deployment specification
@@ -184,6 +266,14 @@ pub struct ServiceSpec {
     /// Node selection constraints (required/preferred labels)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<NodeSelector>,
+
+    /// Service type (standard, wasm_http, job)
+    #[serde(default)]
+    pub service_type: ServiceType,
+
+    /// WASM HTTP configuration (only used when service_type is WasmHttp)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wasm_http: Option<WasmHttpConfig>,
 }
 
 /// Command override specification (Section 5.5)

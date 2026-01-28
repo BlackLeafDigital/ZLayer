@@ -43,7 +43,8 @@ fn shell(options: LeptosOptions) -> impl IntoView {
 /// Start UI server with Leptos SSR + Hydration
 pub async fn start_ui_server() -> Result<(), Box<dyn std::error::Error>> {
     // Parse bind address from environment or use default
-    let bind_address = std::env::var("ZLAYER_WEB_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
+    let bind_address =
+        std::env::var("ZLAYER_WEB_ADDR").unwrap_or_else(|_| "0.0.0.0:3000".to_string());
 
     let addr = bind_address
         .parse::<SocketAddr>()

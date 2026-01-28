@@ -2,10 +2,11 @@
 
 use leptos::prelude::*;
 
-use crate::app::components::{CodeBlock, Footer, Navbar};
+use crate::app::components::{CodeBlock, CodeEditor, Footer, Navbar};
 use crate::app::icons::{
     ArrowRightIcon, HammerIcon, LayersIcon, NetworkIcon, RocketIcon, ShieldIcon, ZapIcon,
 };
+use crate::app::server_fns::execute_wasm;
 
 /// Feature card component
 #[component]
@@ -157,6 +158,9 @@ spec:
                     </div>
                 </section>
 
+                // Try It Now Section
+                <TryItNowSection/>
+
                 // CTA Section
                 <section class="cta">
                     <div class="container cta-content">
@@ -179,5 +183,129 @@ spec:
 
             <Footer/>
         </div>
+    }
+}
+
+/// Mini Hello World WAT for the try-it-now section
+const MINI_HELLO_WAT: &str = r#"(module
+  (import "wasi_snapshot_preview1" "fd_write"
+    (func $fd_write (param i32 i32 i32 i32) (result i32)))
+  (memory (export "memory") 1)
+  (data (i32.const 8) "Hello from ZLayer WASM!\n")
+  (func (export "_start")
+    (i32.store (i32.const 0) (i32.const 8))
+    (i32.store (i32.const 4) (i32.const 24))
+    (drop (call $fd_write (i32.const 1) (i32.const 0) (i32.const 1) (i32.const 100)))
+  )
+)"#;
+
+/// Try It Now section with mini WASM playground
+#[component]
+fn TryItNowSection() -> impl IntoView {
+    let editor_content = RwSignal::new(MINI_HELLO_WAT.to_string());
+    let output = RwSignal::new(String::new());
+    let is_running = RwSignal::new(false);
+    let has_run = RwSignal::new(false);
+
+    // Execution action
+    let execute_action = Action::new(move |code: &String| {
+        let code = code.clone();
+        async move { execute_wasm(code, "wat".to_string(), String::new()).await }
+    });
+
+    // Handle run button click
+    let on_run = move |_| {
+        is_running.set(true);
+        has_run.set(true);
+        execute_action.dispatch(editor_content.get());
+    };
+
+    // Update output when execution completes
+    Effect::new(move |_| {
+        if let Some(result) = execute_action.value().get() {
+            is_running.set(false);
+            match result {
+                Ok(res) => {
+                    if !res.stdout.is_empty() {
+                        output.set(res.stdout);
+                    } else if let Some(info) = res.info {
+                        output.set(format!("Executed successfully in {}ms\n{}", res.execution_time_ms, info));
+                    } else {
+                        output.set(format!("Executed successfully (exit code: {})", res.exit_code));
+                    }
+                }
+                Err(e) => output.set(format!("Error: {}", e)),
+            }
+        }
+    });
+
+    view! {
+        <section class="try-it-now">
+            <div class="container">
+                <div class="section-header">
+                    <h2 class="section-title">"Try It Now"</h2>
+                    <p class="section-description">
+                        "Execute WebAssembly code directly in your browser. "
+                        "Click Run to see it in action."
+                    </p>
+                </div>
+
+                <div class="try-it-container">
+                    <div class="try-it-editor">
+                        <div class="try-it-header">
+                            <span class="try-it-label">"WebAssembly (WAT)"</span>
+                            <button
+                                class="btn btn-gradient try-it-run-btn"
+                                on:click=on_run
+                                disabled=move || is_running.get()
+                            >
+                                {move || if is_running.get() { "Running..." } else { "Run" }}
+                            </button>
+                        </div>
+                        <div class="try-it-code">
+                            <CodeEditor
+                                initial_content=MINI_HELLO_WAT.to_string()
+                                placeholder="WAT code...".to_string()
+                                read_only=false
+                                content=editor_content
+                            />
+                        </div>
+                    </div>
+
+                    <div class="try-it-output">
+                        <div class="try-it-header">
+                            <span class="try-it-label">"Output"</span>
+                        </div>
+                        <div class="try-it-result">
+                            {move || {
+                                let out = output.get();
+                                let ran = has_run.get();
+
+                                if out.is_empty() && !ran {
+                                    view! {
+                                        <span class="try-it-placeholder">"Click Run to execute"</span>
+                                    }.into_any()
+                                } else if out.is_empty() && ran {
+                                    view! {
+                                        <span class="try-it-placeholder">"Running..."</span>
+                                    }.into_any()
+                                } else {
+                                    view! {
+                                        <pre class="try-it-output-text">{out}</pre>
+                                    }.into_any()
+                                }
+                            }}
+                        </div>
+                    </div>
+                </div>
+
+                <div class="try-it-cta">
+                    <a href="/playground" class="btn btn-outline">
+                        "Open Full Playground"
+                        <ArrowRightIcon size="18"/>
+                    </a>
+                </div>
+            </div>
+        </section>
     }
 }

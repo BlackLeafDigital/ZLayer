@@ -1,0 +1,311 @@
+# Multi-Service Application Stack
+#
+# A complete application stack demonstrating:
+# - Web frontend (nginx)
+# - API backend (custom app)
+# - PostgreSQL database
+# - Redis cache
+# - Service dependencies and health checks
+# - Internal and external networking
+#
+# Usage:
+#   # Set required secrets
+#   export POSTGRES_PASSWORD="secure-db-password"
+#   export API_SECRET_KEY="your-api-secret-key"
+#
+#   zlayer deploy -f deployment.yaml
+#
+# Architecture:
+#   [Internet] -> [web:443] -> [api:8080] -> [database:5432]
+#                                        -> [cache:6379]
+
+version: v1
+deployment: multi-service-app
+
+services:
+  # Frontend: Nginx serving static files and proxying to API
+  web:
+    rtype: service
+    image:
+      name: nginx:1.25-alpine
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 0.25
+      memory: 64Mi
+
+    # Mount custom nginx config that proxies /api to backend
+    volumes:
+      - name: nginx-config
+        path: /etc/nginx/conf.d/default.conf
+        source: ./nginx.conf
+        read_only: true
+      - name: static-content
+        path: /usr/share/nginx/html
+        source: ./static
+        read_only: true
+
+    endpoints:
+      - name: https
+        protocol: https
+        port: 443
+        expose: public
+      - name: http
+        protocol: http
+        port: 80
+        expose: public
+
+    depends:
+      - service: api
+        condition: healthy
+        timeout: 120s
+        on_timeout: fail
+
+    scale:
+      mode: adaptive
+      min: 2
+      max: 10
+      targets:
+        cpu: 70
+        rps: 1000
+
+    health:
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      check:
+        type: http
+        url: http://localhost:80/health
+        expect_status: 200
+
+  # Backend API: Application server
+  api:
+    rtype: service
+    image:
+      name: ghcr.io/myorg/api:latest
+      pull_policy: always
+
+    resources:
+      cpu: 1.0
+      memory: 512Mi
+
+    env:
+      # Application configuration
+      APP_ENV: production
+      APP_PORT: "8080"
+      LOG_LEVEL: info
+
+      # Database connection
+      DATABASE_URL: postgresql://appuser:$E:POSTGRES_PASSWORD@database.service:5432/appdb
+
+      # Redis connection
+      REDIS_URL: redis://cache.service:6379
+
+      # Security
+      SECRET_KEY: $E:API_SECRET_KEY
+
+      # Feature flags
+      ENABLE_METRICS: "true"
+      ENABLE_TRACING: "true"
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+        expose: internal
+      - name: metrics
+        protocol: http
+        port: 9090
+        expose: internal
+
+    depends:
+      - service: database
+        condition: healthy
+        timeout: 300s
+        on_timeout: fail
+      - service: cache
+        condition: healthy
+        timeout: 60s
+        on_timeout: warn
+
+    init:
+      steps:
+        - id: wait-db
+          uses: init.wait_tcp
+          with:
+            host: database.service
+            port: 5432
+          timeout: 60s
+        - id: run-migrations
+          uses: init.exec
+          with:
+            command: ["./migrate", "up"]
+          timeout: 120s
+          on_failure: fail
+
+    scale:
+      mode: adaptive
+      min: 2
+      max: 20
+      cooldown: 30s
+      targets:
+        cpu: 70
+        rps: 500
+
+    health:
+      start_grace: 30s
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      check:
+        type: http
+        url: http://localhost:8080/health
+        expect_status: 200
+
+  # Database: PostgreSQL
+  database:
+    rtype: service
+    image:
+      name: postgres:16-alpine
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 1.0
+      memory: 1Gi
+
+    env:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: $E:POSTGRES_PASSWORD
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    volumes:
+      - name: pgdata
+        path: /var/lib/postgresql/data
+        size: 20Gi
+        persist: true
+      - name: init-scripts
+        path: /docker-entrypoint-initdb.d
+        source: ./init
+        read_only: true
+
+    endpoints:
+      - name: postgres
+        protocol: tcp
+        port: 5432
+        expose: internal
+
+    scale:
+      mode: fixed
+      replicas: 1
+
+    health:
+      start_grace: 30s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      check:
+        type: exec
+        command:
+          - pg_isready
+          - -U
+          - appuser
+          - -d
+          - appdb
+
+  # Cache: Redis
+  cache:
+    rtype: service
+    image:
+      name: redis:7-alpine
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 0.5
+      memory: 256Mi
+
+    command:
+      - redis-server
+      - --maxmemory
+      - 200mb
+      - --maxmemory-policy
+      - allkeys-lru
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+
+    endpoints:
+      - name: redis
+        protocol: tcp
+        port: 6379
+        expose: internal
+
+    scale:
+      mode: fixed
+      replicas: 1
+
+    health:
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      check:
+        type: exec
+        command:
+          - redis-cli
+          - ping
+
+  # Background worker: Process async jobs
+  worker:
+    rtype: job
+    image:
+      name: ghcr.io/myorg/api:latest
+      pull_policy: always
+
+    resources:
+      cpu: 0.5
+      memory: 256Mi
+
+    env:
+      APP_ENV: production
+      WORKER_MODE: "true"
+      DATABASE_URL: postgresql://appuser:$E:POSTGRES_PASSWORD@database.service:5432/appdb
+      REDIS_URL: redis://cache.service:6379
+      LOG_LEVEL: info
+
+    command:
+      - ./worker
+      - --queues
+      - default,emails,notifications
+
+    depends:
+      - service: database
+        condition: healthy
+      - service: cache
+        condition: healthy
+
+    scale:
+      mode: fixed
+      replicas: 2
+
+  # Scheduled task: Daily cleanup
+  cleanup:
+    rtype: cron
+    image:
+      name: ghcr.io/myorg/api:latest
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 0.25
+      memory: 128Mi
+
+    schedule: "0 3 * * *"  # Daily at 3 AM
+
+    env:
+      APP_ENV: production
+      DATABASE_URL: postgresql://appuser:$E:POSTGRES_PASSWORD@database.service:5432/appdb
+
+    command:
+      - ./cleanup
+      - --older-than
+      - 30d

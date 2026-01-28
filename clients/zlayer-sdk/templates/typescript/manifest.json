@@ -1,0 +1,59 @@
+{
+  "name": "typescript",
+  "displayName": "TypeScript Plugin",
+  "description": "A ZLayer plugin template using TypeScript and jco for WASM compilation",
+  "version": "1.0.0",
+  "language": "typescript",
+  "buildTool": "jco",
+  "files": [
+    {
+      "source": "package.json.template",
+      "destination": "package.json"
+    },
+    {
+      "source": "tsconfig.json.template",
+      "destination": "tsconfig.json"
+    },
+    {
+      "source": "src/plugin.ts.template",
+      "destination": "src/plugin.ts"
+    },
+    {
+      "source": "README.md.template",
+      "destination": "README.md"
+    }
+  ],
+  "variables": {
+    "name": {
+      "description": "Plugin name (e.g., my-plugin)",
+      "required": true,
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "version": {
+      "description": "Initial version",
+      "required": false,
+      "default": "0.1.0"
+    },
+    "description": {
+      "description": "Short plugin description",
+      "required": true
+    },
+    "author": {
+      "description": "Plugin author or organization",
+      "required": true
+    },
+    "license": {
+      "description": "License identifier (e.g., MIT, Apache-2.0)",
+      "required": false,
+      "default": "MIT"
+    }
+  },
+  "postCreate": [
+    "pnpm install",
+    "echo 'Plugin created! Run \"pnpm run build\" to compile.'"
+  ],
+  "directories": [
+    "src",
+    "wit"
+  ]
+}

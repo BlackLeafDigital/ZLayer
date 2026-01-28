@@ -5,7 +5,9 @@ use leptos_router::components::A;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
-use crate::app::icons::{BookIcon, ContainerIcon, GithubIcon, MoonIcon, MonitorIcon, SunIcon, TerminalIcon};
+use crate::app::icons::{
+    BookIcon, ContainerIcon, GithubIcon, MonitorIcon, MoonIcon, SunIcon, TerminalIcon,
+};
 use crate::app::Theme;
 
 /// Theme toggle button component

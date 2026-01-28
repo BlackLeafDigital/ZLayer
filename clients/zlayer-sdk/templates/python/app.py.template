@@ -1,0 +1,33 @@
+"""{{description}}"""
+
+from zlayer import (
+    ZLayerPlugin,
+    PluginInfo,
+    log_info,
+)
+
+
+class Plugin(ZLayerPlugin):
+    """{{name}} plugin implementation."""
+
+    def init(self) -> None:
+        log_info("{{name}} plugin initializing...")
+
+    def info(self) -> PluginInfo:
+        return PluginInfo(
+            name="{{name}}",
+            version="{{version}}",
+            description="{{description}}",
+        )
+
+    def handle(self, event_type: str, payload: bytes) -> bytes:
+        log_info(f"Handling event: {event_type}")
+        # Your implementation here
+        return b""
+
+    def shutdown(self) -> None:
+        log_info("{{name}} plugin shutting down...")
+
+
+# Plugin instance for componentize-py
+plugin = Plugin()

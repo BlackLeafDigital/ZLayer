@@ -1,0 +1,31 @@
+# ZLayer WIT Dependencies
+#
+# This file configures wkg (WASM Package Tools) to fetch
+# WASI interface definitions as dependencies.
+#
+# To fetch dependencies:
+#   wkg wit fetch
+#
+# This will download the WIT definitions to wit/deps/
+
+[dependencies]
+# WASI CLI interfaces (args, env, stdio, filesystem, terminal)
+"wasi:cli" = "0.2.0"
+
+# WASI HTTP interfaces (incoming/outgoing handlers, types)
+"wasi:http" = "0.2.0"
+
+# WASI I/O interfaces (streams, poll)
+"wasi:io" = "0.2.0"
+
+# WASI Filesystem interfaces
+"wasi:filesystem" = "0.2.0"
+
+# WASI Clocks interfaces (wall clock, monotonic clock)
+"wasi:clocks" = "0.2.0"
+
+# WASI Random interfaces
+"wasi:random" = "0.2.0"
+
+# WASI Sockets interfaces (for outgoing connections)
+"wasi:sockets" = "0.2.0"

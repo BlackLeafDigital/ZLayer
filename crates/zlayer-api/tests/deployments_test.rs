@@ -300,14 +300,8 @@ async fn test_list_deployments_with_data() {
     // Pre-populate storage with deployments
     let spec1 = zlayer_spec::from_yaml_str(&valid_deployment_spec("app-alpha")).unwrap();
     let spec2 = zlayer_spec::from_yaml_str(&valid_deployment_spec("app-beta")).unwrap();
-    storage
-        .store(&StoredDeployment::new(spec1))
-        .await
-        .unwrap();
-    storage
-        .store(&StoredDeployment::new(spec2))
-        .await
-        .unwrap();
+    storage.store(&StoredDeployment::new(spec1)).await.unwrap();
+    storage.store(&StoredDeployment::new(spec2)).await.unwrap();
 
     let app = build_router_with_storage(&config, storage);
 
@@ -373,10 +367,7 @@ async fn test_get_deployment_success() {
 
     // Pre-populate storage
     let spec = zlayer_spec::from_yaml_str(&valid_deployment_spec("my-app")).unwrap();
-    storage
-        .store(&StoredDeployment::new(spec))
-        .await
-        .unwrap();
+    storage.store(&StoredDeployment::new(spec)).await.unwrap();
 
     let app = build_router_with_storage(&config, storage);
 
@@ -433,10 +424,7 @@ async fn test_get_deployment_requires_auth() {
 
     // Pre-populate storage
     let spec = zlayer_spec::from_yaml_str(&valid_deployment_spec("my-app")).unwrap();
-    storage
-        .store(&StoredDeployment::new(spec))
-        .await
-        .unwrap();
+    storage.store(&StoredDeployment::new(spec)).await.unwrap();
 
     let app = build_router_with_storage(&config, storage);
 
@@ -469,10 +457,7 @@ async fn test_delete_deployment_success() {
 
     // Pre-populate storage
     let spec = zlayer_spec::from_yaml_str(&valid_deployment_spec("to-delete")).unwrap();
-    storage
-        .store(&StoredDeployment::new(spec))
-        .await
-        .unwrap();
+    storage.store(&StoredDeployment::new(spec)).await.unwrap();
 
     let app = build_router_with_storage(&config, storage.clone());
 
@@ -532,10 +517,7 @@ async fn test_delete_deployment_requires_auth() {
 
     // Pre-populate storage
     let spec = zlayer_spec::from_yaml_str(&valid_deployment_spec("my-app")).unwrap();
-    storage
-        .store(&StoredDeployment::new(spec))
-        .await
-        .unwrap();
+    storage.store(&StoredDeployment::new(spec)).await.unwrap();
 
     let app = build_router_with_storage(&config, storage);
 

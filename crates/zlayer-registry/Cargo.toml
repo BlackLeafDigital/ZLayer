@@ -20,7 +20,7 @@ hex.workspace = true
 oci-client.workspace = true
 redb.workspace = true
 serde = { workspace = true, optional = true }
-serde_json = { workspace = true, optional = true }
+serde_json.workspace = true
 sha2.workspace = true
 tar = "0.4.44"
 thiserror.workspace = true
@@ -34,4 +34,4 @@ tempfile = "3.24.0"
 [features]
 persistent = []
 s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
-local = ["dep:serde", "dep:serde_json"]
+local = ["dep:serde"]

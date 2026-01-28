@@ -1,0 +1,24 @@
+/// ZLayer Plugin System - World Definitions
+///
+/// This file defines the minimal world for ZLayer plugins that don't need
+/// WASI dependencies. For the full plugin worlds with WASI support, see the
+/// main wit directory in the ZLayer repository.
+///
+/// Available world:
+/// - zlayer-plugin-minimal - Simple plugins with host function access only
+
+/// Minimal plugin world for SDK development and testing.
+/// This world does not include WASI dependencies, making it suitable
+/// for generating bindings without needing external WIT packages.
+/// Use this for simple plugins that don't need filesystem or HTTP access.
+world zlayer-plugin-minimal {
+    // ZLayer host-provided capabilities only
+    import config;
+    import keyvalue;
+    import logging;
+    import secrets;
+    import metrics;
+
+    // Plugin must export its handler interface
+    export handler;
+}

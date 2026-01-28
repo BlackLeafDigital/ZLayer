@@ -21,6 +21,8 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 ### Key Features
 
 - **Daemonless Runtime** - Uses libcontainer directly, no containerd/Docker daemon needed
+- **WebAssembly Support** - First-class WASM runtime with WASIp1 & WASIp2 support via wasmtime
+- **Multi-Language WASM SDKs** - Build WASM workloads from Rust, Go, Python, TypeScript, C, Zig, and more
 - **Built-in Image Builder** - Dockerfile parser with buildah integration and runtime templates
 - **Encrypted Overlay Networks** - WireGuard-based mesh networking with IP allocation and health checking
 - **Smart Scheduler** - Node placement with Shared/Dedicated/Exclusive allocation modes
@@ -51,13 +53,16 @@ graph TB
 
         subgraph Runtime[Runtime Layer]
             LC[libcontainer]
+            WT[wasmtime]
             SM[Storage Manager]
             LC --> C1[Container]
             LC --> C2[Container]
-            LC --> C3[Container]
+            WT --> W1[WASM Module]
+            WT --> W2[WASM Module]
         end
 
         Agent --> LC
+        Agent --> WT
         Agent --> SM
     end
 
@@ -203,13 +208,33 @@ services:
         expect_status: 200
 ```
 
-### 2. Deploy
+### 2. Deploy a WASM workload
+
+ZLayer auto-detects WASM artifacts from OCI registries:
+
+```yaml
+# wasm-deployment.yaml
+version: v1
+deployment: my-wasm-app
+
+services:
+  handler:
+    rtype: service
+    image:
+      # ZLayer auto-detects WASM artifacts by media type
+      name: ghcr.io/myorg/my-wasm-handler:v1
+    env:
+      - name: LOG_LEVEL
+        value: info
+```
+
+### 3. Deploy
 
 ```bash
 zlayer deploy deployment.yaml
 ```
 
-### 3. Check status
+### 4. Check status
 
 ```bash
 zlayer status my-app
@@ -512,6 +537,117 @@ zlayer run deployment.yaml --port-offset 1000
 # Production environment
 zlayer run deployment.yaml --env prod
 ```
+
+### WASM Commands
+
+```bash
+# Build WASM from source (auto-detects language)
+zlayer wasm build .
+zlayer wasm build --language rust --target wasip2 --optimize ./my-rust-app
+
+# Export WASM as OCI artifact
+zlayer wasm export ./app.wasm --name myapp:v1
+zlayer wasm export ./app.wasm --name ghcr.io/myorg/myapp:latest --output ./oci-dir
+
+# Push WASM to registry
+zlayer wasm push ./app.wasm ghcr.io/myorg/myapp:v1
+zlayer wasm push ./app.wasm --username $USER --password $TOKEN registry.example.com/app:v1
+
+# Validate a WASM binary
+zlayer wasm validate ./handler.wasm
+
+# Inspect WASM binary info
+zlayer wasm info ./handler.wasm
+
+# Run a WASM image (auto-detected from registry)
+zlayer run ghcr.io/myorg/my-wasm-handler:v1
+```
+
+## WebAssembly Support
+
+ZLayer supports WebAssembly (WASM) as a first-class runtime alongside traditional OCI containers. WASM workloads benefit from near-instant cold starts, smaller image sizes, and universal portability.
+
+### Supported Languages
+
+| Tier | Languages | Notes |
+|------|-----------|-------|
+| **Tier 1** | Rust, Go, C/C++, Zig, AssemblyScript | Direct compilation to WASM |
+| **Tier 2** | C#/.NET, Kotlin, Swift | Experimental/growing support |
+| **Tier 3** | Python, JavaScript, Ruby, PHP, Lua | Interpreter-based (via WASM-compiled runtimes) |
+
+### WASM vs Container Comparison
+
+| Aspect | Container | WASM |
+|--------|-----------|------|
+| **Cold Start** | ~300ms | ~1-5ms |
+| **Image Size** | 10MB - 1GB+ | 100KB - 10MB |
+| **Isolation** | Linux namespaces/cgroups | WASM sandbox |
+| **Portability** | Arch-specific (x86/ARM) | Universal bytecode |
+| **exec() support** | Yes | No (single process model) |
+
+### Building WASM Plugins
+
+**Using ZLayer CLI (Recommended):**
+
+```bash
+# Build and push in one workflow (auto-detects language)
+zlayer wasm build .
+zlayer wasm push ./target/wasm32-wasip2/release/handler.wasm ghcr.io/myorg/handler:v1
+
+# Or specify language and target explicitly
+zlayer wasm build --language rust --target wasip2 --optimize .
+zlayer wasm push ./handler.wasm ghcr.io/myorg/handler:v1
+```
+
+**Manual Build Commands:**
+
+```bash
+# Rust
+cargo build --target wasm32-wasip2 --release
+zlayer wasm push target/wasm32-wasip2/release/handler.wasm ghcr.io/myorg/handler:v1
+
+# Go (TinyGo)
+tinygo build -target=wasip2 -o handler.wasm .
+zlayer wasm push handler.wasm ghcr.io/myorg/handler:v1
+
+# C/C++ (WASI SDK)
+clang --target=wasm32-wasip2 -o handler.wasm handler.c
+zlayer wasm push handler.wasm ghcr.io/myorg/handler:v1
+
+# Zig
+zig build -Dtarget=wasm32-wasi
+zlayer wasm push zig-out/bin/handler.wasm ghcr.io/myorg/handler:v1
+
+# AssemblyScript
+asc handler.ts -o handler.wasm
+zlayer wasm push handler.wasm ghcr.io/myorg/handler:v1
+
+# TypeScript (via jco)
+jco componentize handler.js -o handler.wasm
+zlayer wasm push handler.wasm ghcr.io/myorg/handler:v1
+```
+
+### WASM Detection
+
+ZLayer auto-detects WASM artifacts using multiple signals:
+
+1. **OCI 1.1+ `artifactType`** - Most authoritative
+2. **Config `mediaType`** - `application/vnd.wasm.config.v0+json`
+3. **Layer `mediaType`** - `application/wasm` fallback
+
+No configuration required - just reference the image and ZLayer handles the rest.
+
+### Building with WASM Support
+
+```bash
+# Build ZLayer with WASM runtime enabled
+cargo build --release --features wasm
+
+# Build with both Docker and WASM support
+cargo build --release --features "docker,wasm"
+```
+
+For detailed WASM implementation documentation, see [WASM_DONE.md](./WASM_DONE.md).
 
 ## Observability
 

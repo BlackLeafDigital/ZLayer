@@ -280,6 +280,8 @@ mod tests {
                 privileged: false,
                 node_mode: Default::default(),
                 node_selector: None,
+                service_type: Default::default(),
+                wasm_http: None,
             },
         );
 

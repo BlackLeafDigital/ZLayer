@@ -1,0 +1,80 @@
+/**
+ * {{description}}
+ */
+
+import {
+  ZLayerPlugin,
+  PluginInfo,
+  PluginRequest,
+  HandleResult,
+  Capabilities,
+  InitError,
+  log,
+  jsonResponse,
+  passThrough,
+  parseVersion,
+} from '@zlayer/sdk';
+
+class Plugin implements ZLayerPlugin {
+  /**
+   * Initialize the plugin.
+   * Called once when the plugin is loaded.
+   */
+  init(): Capabilities | InitError {
+    log.info('{{name}} plugin initializing...');
+
+    // Request capabilities your plugin needs
+    return {
+      logging: true,
+      // Uncomment capabilities as needed:
+      // config: true,
+      // keyvalue: true,
+      // secrets: true,
+      // metrics: true,
+      // httpClient: true,
+    };
+  }
+
+  /**
+   * Return plugin metadata.
+   * Called after successful initialization.
+   */
+  info(): PluginInfo {
+    return {
+      id: '{{author}}:{{name}}',
+      name: '{{name}}',
+      version: parseVersion('{{version}}'),
+      description: '{{description}}',
+      author: '{{author}}',
+      license: '{{license}}',
+    };
+  }
+
+  /**
+   * Handle an incoming request.
+   * @param request The incoming request to process
+   */
+  handle(request: PluginRequest): HandleResult {
+    log.info(`Handling request: ${request.method} ${request.path}`);
+
+    // Your implementation here
+    // Example: Return a JSON response
+    // return {
+    //   type: 'response',
+    //   response: jsonResponse({ message: 'Hello from {{name}}!' }),
+    // };
+
+    // Pass through to next handler if not handling this request
+    return passThrough();
+  }
+
+  /**
+   * Graceful shutdown hook.
+   * Called when the plugin is being unloaded.
+   */
+  shutdown(): void {
+    log.info('{{name}} plugin shutting down...');
+  }
+}
+
+export const plugin = new Plugin();

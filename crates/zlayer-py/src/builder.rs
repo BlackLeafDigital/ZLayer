@@ -505,22 +505,24 @@ pub fn buildah_install_instructions() -> String {
 ///     ValueError: If invalid arguments are provided
 ///
 /// Example:
-///     >>> # Simple build
-///     >>> image = await zlayer.build("./app", tag="myapp:latest")
-///     >>> print(image)  # "myapp:latest"
+/// ```python
+/// # Simple build
+/// image = await zlayer.build("./app", tag="myapp:latest")
+/// print(image)  # "myapp:latest"
 ///
-///     >>> # Build with custom Dockerfile
-///     >>> image = await zlayer.build(".", tag="api:v1", dockerfile="Dockerfile.prod")
+/// # Build with custom Dockerfile
+/// image = await zlayer.build(".", tag="api:v1", dockerfile="Dockerfile.prod")
 ///
-///     >>> # Build with arguments
-///     >>> image = await zlayer.build(
-///     ...     "./app",
-///     ...     tag="myapp:latest",
-///     ...     build_args={"VERSION": "1.0.0", "DEBUG": "false"}
-///     ... )
+/// # Build with arguments
+/// image = await zlayer.build(
+///     "./app",
+///     tag="myapp:latest",
+///     build_args={"VERSION": "1.0.0", "DEBUG": "false"}
+/// )
 ///
-///     >>> # Build without cache
-///     >>> image = await zlayer.build("./app", tag="myapp:latest", no_cache=True)
+/// # Build without cache
+/// image = await zlayer.build("./app", tag="myapp:latest", no_cache=True)
+/// ```
 #[pyfunction]
 #[pyo3(signature = (path, tag, dockerfile=None, build_args=None, no_cache=false, progress=true))]
 pub fn build<'py>(

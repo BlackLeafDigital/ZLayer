@@ -1,0 +1,5 @@
+module {{module}}
+
+go 1.23
+
+require github.com/zlayer/zlayer-sdk-go v0.1.0

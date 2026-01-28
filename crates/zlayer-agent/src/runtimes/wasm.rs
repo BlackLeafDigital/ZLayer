@@ -6,6 +6,7 @@
 //! ## Features
 //!
 //! - **WASI Preview 1 (wasip1)**: Core module support with basic WASI syscalls
+//! - **WASI Preview 2 (wasip2)**: Component model support with full WASI interfaces
 //! - **Async execution**: Tokio integration for cooperative scheduling
 //! - **Epoch-based interruption**: Timeout support via epoch deadlines
 //! - **Log capture**: stdout/stderr captured for container logs
@@ -25,10 +26,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::instrument;
+use wasmtime::component::{Component, Linker as ComponentLinker, ResourceTable};
 use wasmtime::{Config, Engine, Linker, Module, Store};
 use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-use wasmtime_wasi::WasiCtxBuilder;
-use zlayer_registry::WasiVersion;
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use zlayer_registry::{detect_wasm_version_from_binary, WasiVersion};
 use zlayer_spec::{PullPolicy, ServiceSpec};
 
 /// Default directory for WASM module cache
@@ -330,6 +332,150 @@ impl WasmRuntime {
         .await
         .map_err(|e| format!("task join error: {}", e))?
     }
+
+    /// Execute a WASIp2 component
+    ///
+    /// WASIp2 components use the WebAssembly Component Model and provide richer
+    /// WASI interfaces compared to Preview 1 modules. This method handles:
+    /// - Component compilation and instantiation
+    /// - WASI Preview 2 interface linking (wasi:cli, wasi:io, etc.)
+    /// - Calling the wasi:cli/run export
+    #[instrument(
+        skip(engine, component_bytes, env_vars, args),
+        fields(
+            component_size = component_bytes.len(),
+            args_count = args.len(),
+        )
+    )]
+    async fn execute_component(
+        engine: Engine,
+        component_bytes: Vec<u8>,
+        env_vars: Vec<(String, String)>,
+        args: Vec<String>,
+        epoch_deadline: u64,
+        enable_epochs: bool,
+    ) -> std::result::Result<i32, String> {
+        // Component model operations are CPU-bound, run in blocking context
+        tokio::task::spawn_blocking(move || {
+            // Compile the component
+            let component = Component::from_binary(&engine, &component_bytes)
+                .map_err(|e| format!("failed to compile component: {}", e))?;
+
+            // Build WASIp2 context with environment and args
+            let mut wasi_builder = WasiCtxBuilder::new();
+
+            // Set environment variables
+            for (key, value) in &env_vars {
+                wasi_builder.env(key, value);
+            }
+
+            // Set command line arguments
+            wasi_builder.args(&args);
+
+            // Inherit stdio for now (in production we'd capture to pipes)
+            wasi_builder.inherit_stdio();
+
+            // Build the WASIp2 context
+            let wasi_ctx = wasi_builder.build();
+
+            // Create resource table for component model resources
+            let table = ResourceTable::new();
+
+            // Create our WasiState that implements WasiView
+            let state = WasiState {
+                ctx: wasi_ctx,
+                table,
+            };
+
+            // Create store with our WASI state
+            let mut store = Store::new(&engine, state);
+
+            // Set epoch deadline for interruption if enabled
+            if enable_epochs {
+                store.set_epoch_deadline(epoch_deadline);
+            }
+
+            // Create component linker and add WASIp2 interfaces
+            let mut linker: ComponentLinker<WasiState> = ComponentLinker::new(&engine);
+            wasmtime_wasi::add_to_linker_sync(&mut linker)
+                .map_err(|e| format!("failed to add WASIp2 to linker: {}", e))?;
+
+            // Try to instantiate as a wasi:cli/command component
+            // This is the standard entry point for CLI-style WASM components
+            let instance = linker
+                .instantiate(&mut store, &component)
+                .map_err(|e| format!("failed to instantiate component: {}", e))?;
+
+            // Try to get the wasi:cli/run export first (preferred for wasip2)
+            // The run function has signature: func run() -> result<_, error>
+            if let Some(run_func) = instance.get_func(&mut store, "wasi:cli/run@0.2.0#run") {
+                // Call the run function
+                match run_func.call(&mut store, &[], &mut []) {
+                    Ok(()) => return Ok(0),
+                    Err(e) => {
+                        // Check for WASI exit
+                        if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                            return Ok(exit.0);
+                        }
+                        return Err(format!("wasi:cli/run execution error: {}", e));
+                    }
+                }
+            }
+
+            // Fall back to _start if run is not found (for wasip1-style components)
+            if let Some(start_func) = instance.get_func(&mut store, "_start") {
+                match start_func.call(&mut store, &[], &mut []) {
+                    Ok(()) => return Ok(0),
+                    Err(e) => {
+                        // Check for WASI exit
+                        if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                            return Ok(exit.0);
+                        }
+                        return Err(format!("_start execution error: {}", e));
+                    }
+                }
+            }
+
+            // Try main as last resort
+            if let Some(main_func) = instance.get_func(&mut store, "main") {
+                match main_func.call(&mut store, &[], &mut []) {
+                    Ok(()) => return Ok(0),
+                    Err(e) => {
+                        if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
+                            return Ok(exit.0);
+                        }
+                        return Err(format!("main execution error: {}", e));
+                    }
+                }
+            }
+
+            Err("no wasi:cli/run, _start, or main function found in component".to_string())
+        })
+        .await
+        .map_err(|e| format!("task join error: {}", e))?
+    }
+}
+
+/// WASIp2 state for the component model
+///
+/// This struct holds the WASI context and resource table required
+/// for executing WASIp2 components. It implements [`WasiView`] to
+/// provide access to these resources during component execution.
+struct WasiState {
+    /// WASI Preview 2 context with environment, args, and capabilities
+    ctx: WasiCtx,
+    /// Resource table for component model resources (files, sockets, etc.)
+    table: ResourceTable,
+}
+
+impl WasiView for WasiState {
+    fn ctx(&mut self) -> &mut WasiCtx {
+        &mut self.ctx
+    }
+
+    fn table(&mut self) -> &mut ResourceTable {
+        &mut self.table
+    }
 }
 
 #[async_trait::async_trait]
@@ -434,7 +580,7 @@ impl Runtime for WasmRuntime {
         let loaded_from_cache = cache_path.exists();
 
         let (module_bytes, wasi_version) = if loaded_from_cache {
-            // Read from local cache - default to Preview1 since we don't have manifest info
+            // Read from local cache
             let bytes =
                 tokio::fs::read(&cache_path)
                     .await
@@ -442,7 +588,14 @@ impl Runtime for WasmRuntime {
                         id: instance_id.clone(),
                         reason: format!("failed to read cached WASM: {}", e),
                     })?;
-            (bytes, WasiVersion::Preview1)
+            // Detect WASI version from the binary itself
+            let detected_version = detect_wasm_version_from_binary(&bytes);
+            tracing::debug!(
+                instance = %instance_id,
+                wasi_version = %detected_version,
+                "detected WASI version from cached binary"
+            );
+            (bytes, detected_version)
         } else {
             // Pull from registry - get WASI version from manifest
             let auth = self.auth_resolver.resolve(image);
@@ -510,7 +663,7 @@ impl Runtime for WasmRuntime {
         tracing::info!(instance = %instance_id, "starting WASM instance");
 
         // Get instance and extract data for execution
-        let (module_bytes, env_vars, args) = {
+        let (wasm_bytes, wasi_version, env_vars, args) = {
             let mut instances = self.instances.write().await;
             let instance = instances
                 .get_mut(&instance_id)
@@ -526,28 +679,62 @@ impl Runtime for WasmRuntime {
 
             (
                 instance.module_bytes.clone(),
+                instance.wasi_version.clone(),
                 instance.env_vars.clone(),
                 instance.args.clone(),
             )
         };
 
-        // Spawn execution task
+        // Detect if this is a component (WASIp2) or module (WASIp1) from the binary
+        // The stored wasi_version from manifest takes precedence, but we also check binary
+        let is_component = match &wasi_version {
+            WasiVersion::Preview2 => true,
+            WasiVersion::Preview1 => false,
+            WasiVersion::Unknown => {
+                // Fall back to binary detection
+                let detected = detect_wasm_version_from_binary(&wasm_bytes);
+                detected.is_preview2()
+            }
+        };
+
+        tracing::info!(
+            instance = %instance_id,
+            wasi_version = %wasi_version,
+            is_component = is_component,
+            "starting WASM execution"
+        );
+
+        // Spawn execution task based on component vs module
         let engine = self.engine.clone();
         let epoch_deadline = self.config.epoch_deadline;
         let enable_epochs = self.config.enable_epochs;
         let instance_id_clone = instance_id.clone();
 
-        let handle = tokio::spawn(async move {
-            Self::execute_module(
-                engine,
-                module_bytes,
-                env_vars,
-                args,
-                epoch_deadline,
-                enable_epochs,
-            )
-            .await
-        });
+        let handle = if is_component {
+            tokio::spawn(async move {
+                Self::execute_component(
+                    engine,
+                    wasm_bytes,
+                    env_vars,
+                    args,
+                    epoch_deadline,
+                    enable_epochs,
+                )
+                .await
+            })
+        } else {
+            tokio::spawn(async move {
+                Self::execute_module(
+                    engine,
+                    wasm_bytes,
+                    env_vars,
+                    args,
+                    epoch_deadline,
+                    enable_epochs,
+                )
+                .await
+            })
+        };
 
         // Store handle and update state
         {
@@ -756,7 +943,25 @@ impl Runtime for WasmRuntime {
 
     /// Get container resource statistics
     ///
-    /// WASM runs in-process without cgroups, so we return stub values.
+    /// # Design Decision: Empty Statistics
+    ///
+    /// WASM modules run in-process within the wasmtime runtime and do not have
+    /// kernel-level isolation like containers. As a result:
+    ///
+    /// - **No cgroup stats**: WASM has no cgroup, so CPU/memory accounting at the
+    ///   kernel level is not available.
+    /// - **Shared process memory**: WASM linear memory is part of the host process
+    ///   heap, making per-instance memory measurement impractical.
+    /// - **CPU time**: While wasmtime tracks fuel/epochs for interruption, it does
+    ///   not expose CPU time metrics in a format compatible with cgroup stats.
+    ///
+    /// For WASM resource monitoring, consider:
+    /// - Using wasmtime's fuel metering for instruction-level accounting
+    /// - Monitoring the host process's overall resource usage
+    /// - Implementing application-level metrics within the WASM module
+    ///
+    /// Returns zero values for all metrics with `u64::MAX` as the memory limit
+    /// (indicating no limit), which is semantically correct for WASM modules.
     async fn get_container_stats(&self, id: &ContainerId) -> Result<ContainerStats> {
         let instance_id = self.instance_id(id);
 
@@ -769,7 +974,7 @@ impl Runtime for WasmRuntime {
             });
         }
 
-        // Return stub stats - WASM doesn't have cgroups
+        // Return empty stats - WASM has no cgroup isolation for kernel-level resource tracking
         Ok(ContainerStats {
             cpu_usage_usec: 0,
             memory_bytes: 0,

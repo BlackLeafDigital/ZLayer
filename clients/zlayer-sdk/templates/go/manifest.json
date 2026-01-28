@@ -1,0 +1,11 @@
+{
+  "name": "go",
+  "display_name": "Go Plugin",
+  "description": "A Go plugin template for ZLayer using TinyGo",
+  "placeholders": {
+    "name": "Plugin name (kebab-case)",
+    "module": "Go module path",
+    "version": "Plugin version",
+    "description": "Plugin description"
+  }
+}

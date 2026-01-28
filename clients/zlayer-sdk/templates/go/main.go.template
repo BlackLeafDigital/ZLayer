@@ -1,0 +1,41 @@
+// Package main implements the {{name}} ZLayer plugin.
+package main
+
+import (
+	"github.com/zlayer/zlayer-sdk-go"
+)
+
+// Plugin implements the ZLayer plugin interface.
+type Plugin struct{}
+
+// Init is called when the plugin is loaded.
+func (p *Plugin) Init() error {
+	zlayer.LogInfo("{{name}} plugin initializing...")
+	return nil
+}
+
+// Info returns plugin metadata.
+func (p *Plugin) Info() zlayer.PluginInfo {
+	return zlayer.PluginInfo{
+		Name:        "{{name}}",
+		Version:     "{{version}}",
+		Description: "{{description}}",
+	}
+}
+
+// Handle processes incoming events.
+func (p *Plugin) Handle(eventType string, payload []byte) ([]byte, error) {
+	zlayer.LogInfof("Handling event: %s", eventType)
+	// Your implementation here
+	return nil, nil
+}
+
+// Shutdown is called when the plugin is unloaded.
+func (p *Plugin) Shutdown() error {
+	zlayer.LogInfo("{{name}} plugin shutting down...")
+	return nil
+}
+
+func main() {
+	// Required for TinyGo WASM
+}

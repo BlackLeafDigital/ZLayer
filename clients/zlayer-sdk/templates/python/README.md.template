@@ -1,0 +1,165 @@
+# {{name}}
+
+{{description}}
+
+## Prerequisites
+
+- Python 3.11 or later
+- [componentize-py](https://github.com/bytecodealliance/componentize-py) for WASM component compilation
+
+### Installing componentize-py
+
+```bash
+# Using pip
+pip install componentize-py
+
+# Or using uv
+uv add --dev componentize-py
+```
+
+## Project Setup
+
+```bash
+# Create and activate virtual environment
+python -m venv .venv
+source .venv/bin/activate  # Linux/macOS
+# .venv\Scripts\activate   # Windows
+
+# Install dependencies
+pip install -e ".[dev]"
+```
+
+## Building
+
+```bash
+# Build the WASM module
+make build
+
+# Or manually:
+componentize-py -d wit -w zlayer-plugin componentize app -o {{name}}.wasm
+```
+
+## Build Output
+
+After building, you will have a `{{name}}.wasm` file that can be loaded by ZLayer.
+
+## Project Structure
+
+```
+{{name}}/
+├── app.py               # Plugin implementation
+├── pyproject.toml       # Project configuration
+├── Makefile             # Build automation
+├── wit/                 # WIT interface definitions (copy from ZLayer)
+│   └── zlayer/
+│       ├── world.wit
+│       ├── host.wit
+│       ├── plugin.wit
+│       └── types.wit
+└── {{name}}.wasm        # Compiled WASM module (created by make build)
+```
+
+## Development
+
+### Plugin Interface
+
+Your plugin must implement these methods:
+
+- `init()` - Called when the plugin is loaded
+- `info()` - Returns plugin metadata as `PluginInfo`
+- `handle(event_type: str, payload: bytes)` - Processes incoming events
+- `shutdown()` - Called when the plugin is unloaded
+
+### Using Host Capabilities
+
+The ZLayer SDK provides access to host capabilities:
+
+```python
+from zlayer import (
+    # Configuration
+    get_config,
+    get_config_required,
+
+    # Key-Value Storage
+    kv_get,
+    kv_set,
+    kv_delete,
+
+    # Logging
+    log_info,
+    log_debug,
+    log_error,
+    log_warn,
+
+    # Secrets
+    get_secret,
+    get_secret_required,
+
+    # Metrics
+    counter_inc,
+    gauge_set,
+    histogram_observe,
+)
+```
+
+### Example: Using Configuration
+
+```python
+def init(self) -> None:
+    api_key = get_config("api_key")
+    if api_key:
+        log_info(f"Configured with API key: {api_key[:4]}...")
+    else:
+        log_warn("No API key configured")
+```
+
+### Example: Using Key-Value Storage
+
+```python
+def handle(self, event_type: str, payload: bytes) -> bytes:
+    # Store data
+    kv_set("last_event", event_type.encode())
+
+    # Retrieve data
+    count = kv_get("event_count")
+    new_count = int(count.decode()) + 1 if count else 1
+    kv_set("event_count", str(new_count).encode())
+
+    return b""
+```
+
+### Example: Recording Metrics
+
+```python
+from zlayer import counter_inc, histogram_observe
+import time
+
+def handle(self, event_type: str, payload: bytes) -> bytes:
+    start = time.time_ns()
+
+    # Process event...
+    counter_inc("events_processed")
+
+    # Record duration
+    duration_ms = (time.time_ns() - start) / 1_000_000
+    histogram_observe("event_duration_ms", duration_ms)
+
+    return b""
+```
+
+## WIT Interface
+
+The plugin communicates with ZLayer through the WIT (WebAssembly Interface Type) definitions.
+Copy the `wit/zlayer/` directory from the ZLayer repository to your project.
+
+## Cleaning
+
+```bash
+make clean
+```
+
+This removes the compiled WASM file.
+
+## Version
+
+{{version}}

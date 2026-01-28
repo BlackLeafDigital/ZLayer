@@ -4,10 +4,10 @@
 
 use crate::error::{ProxyError, Result};
 use crate::lb::LoadBalancer;
-use zlayer_spec::{EndpointSpec, ExposeType, Protocol};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use zlayer_spec::{EndpointSpec, ExposeType, Protocol};
 
 /// A route definition
 #[derive(Debug, Clone)]

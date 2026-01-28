@@ -3,6 +3,8 @@
 //! This is the main entry point for the ZLayer web server.
 //! It starts the Leptos SSR server with Axum.
 
+#![recursion_limit = "512"]
+
 #[cfg(feature = "ssr")]
 #[tokio::main]
 async fn main() {

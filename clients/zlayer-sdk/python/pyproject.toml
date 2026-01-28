@@ -1,0 +1,39 @@
+[project]
+name = "zlayer-sdk"
+version = "0.1.0"
+description = "ZLayer Plugin Development Kit for Python"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+keywords = ["wasm", "wasi", "plugin", "zlayer"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries",
+]
+
+[project.optional-dependencies]
+dev = [
+    "componentize-py>=0.13",
+    "mypy>=1.8",
+    "pytest>=8.0",
+    "ruff>=0.3",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["zlayer"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true

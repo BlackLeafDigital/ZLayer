@@ -97,6 +97,15 @@ mod docker;
 #[cfg(feature = "wasm")]
 mod wasm;
 
+#[cfg(feature = "wasm")]
+mod wasm_host;
+
+#[cfg(feature = "wasm")]
+mod wasm_http;
+
+#[cfg(feature = "wasm")]
+pub mod wasm_test;
+
 pub use youki::{YoukiConfig, YoukiRuntime};
 
 #[cfg(feature = "docker")]
@@ -104,6 +113,12 @@ pub use docker::DockerRuntime;
 
 #[cfg(feature = "wasm")]
 pub use wasm::{WasmConfig, WasmRuntime};
+
+#[cfg(feature = "wasm")]
+pub use wasm_host::{add_to_linker, DefaultHost, KvError, LogLevel, MetricsStore, ZLayerHost};
+
+#[cfg(feature = "wasm")]
+pub use wasm_http::{HttpRequest, HttpResponse, PoolStats, WasmHttpError, WasmHttpRuntime};
 
 use crate::error::{AgentError, Result};
 use crate::runtime::Runtime;

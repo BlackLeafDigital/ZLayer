@@ -1,0 +1,42 @@
+//! {{description}}
+
+#![no_std]
+extern crate alloc;
+
+use alloc::string::String;
+use alloc::vec::Vec;
+use zlayer_sdk::prelude::*;
+use zlayer_sdk::{log, ZLayerPlugin, zlayer_plugin};
+
+/// {{name}} plugin implementation.
+#[derive(Default)]
+pub struct {{PluginStruct}};
+
+impl ZLayerPlugin for {{PluginStruct}} {
+    fn info(&self) -> PluginInfo {
+        PluginInfo {
+            id: String::from("{{id}}"),
+            name: String::from("{{name}}"),
+            version: Version {
+                major: {{version_major}},
+                minor: {{version_minor}},
+                patch: {{version_patch}},
+                pre_release: None,
+            },
+            description: String::from("{{description}}"),
+            author: String::from("{{author}}"),
+            license: Some(String::from("MIT")),
+            homepage: None,
+            metadata: Vec::new(),
+        }
+    }
+
+    fn handle(&self, event_type: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
+        log::info(&alloc::format!("Handling event: {}", event_type));
+
+        // Your implementation here
+        Ok(payload.to_vec())
+    }
+}
+
+zlayer_plugin!({{PluginStruct}});

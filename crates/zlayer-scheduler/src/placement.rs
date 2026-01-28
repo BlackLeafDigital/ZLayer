@@ -561,6 +561,8 @@ mod tests {
             privileged: false,
             node_mode,
             node_selector,
+            service_type: Default::default(),
+            wasm_http: None,
         }
     }
 

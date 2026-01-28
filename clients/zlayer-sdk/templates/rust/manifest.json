@@ -1,0 +1,80 @@
+{
+  "name": "rust",
+  "display_name": "Rust Plugin",
+  "description": "A Rust plugin template for ZLayer",
+  "placeholders": {
+    "name": {
+      "description": "Plugin name (kebab-case)",
+      "example": "my-plugin",
+      "required": true
+    },
+    "name_underscore": {
+      "description": "Plugin name with underscores (for file paths)",
+      "example": "my_plugin",
+      "derived_from": "name",
+      "transform": "kebab-to-snake"
+    },
+    "version": {
+      "description": "Plugin version (semver)",
+      "example": "0.1.0",
+      "default": "0.1.0"
+    },
+    "version_major": {
+      "description": "Major version number",
+      "example": "0",
+      "derived_from": "version",
+      "transform": "semver-major"
+    },
+    "version_minor": {
+      "description": "Minor version number",
+      "example": "1",
+      "derived_from": "version",
+      "transform": "semver-minor"
+    },
+    "version_patch": {
+      "description": "Patch version number",
+      "example": "0",
+      "derived_from": "version",
+      "transform": "semver-patch"
+    },
+    "description": {
+      "description": "Plugin description",
+      "example": "A custom ZLayer plugin",
+      "required": true
+    },
+    "PluginStruct": {
+      "description": "Struct name (PascalCase)",
+      "example": "MyPlugin",
+      "derived_from": "name",
+      "transform": "kebab-to-pascal"
+    },
+    "id": {
+      "description": "Plugin ID (org:name format)",
+      "example": "myorg:my-plugin",
+      "required": true
+    },
+    "author": {
+      "description": "Plugin author name",
+      "example": "Your Name",
+      "required": true
+    }
+  },
+  "files": [
+    {
+      "template": "Cargo.toml.template",
+      "output": "Cargo.toml"
+    },
+    {
+      "template": "src/lib.rs.template",
+      "output": "src/lib.rs"
+    },
+    {
+      "template": "README.md.template",
+      "output": "README.md"
+    },
+    {
+      "template": ".gitignore.template",
+      "output": ".gitignore"
+    }
+  ]
+}

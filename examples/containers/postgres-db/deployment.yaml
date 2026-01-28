@@ -1,0 +1,84 @@
+# PostgreSQL Database
+#
+# A PostgreSQL deployment with persistent storage and health checks.
+# Demonstrates database configuration, volume persistence, and
+# internal-only endpoint exposure.
+#
+# Usage:
+#   # Set required environment variables
+#   export POSTGRES_PASSWORD="your-secure-password"
+#
+#   zlayer deploy -f deployment.yaml
+#
+# Security Note:
+#   In production, use ZLayer secrets management instead of
+#   environment variables for credentials.
+
+version: v1
+deployment: postgres-db
+
+services:
+  database:
+    rtype: service
+    image:
+      name: postgres:16-alpine
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 1.0
+      memory: 512Mi
+
+    # Database credentials
+    # Use $E: prefix to reference environment variables
+    # In production, use $S: prefix for secrets
+    env:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: $E:POSTGRES_PASSWORD
+      # Performance tuning
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+      # Connection settings
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    # Persistent storage for database files
+    volumes:
+      - name: pgdata
+        path: /var/lib/postgresql/data
+        size: 10Gi
+        persist: true
+
+    # Internal endpoint (not exposed publicly)
+    endpoints:
+      - name: postgres
+        protocol: tcp
+        port: 5432
+        expose: internal
+
+    # Single replica for data consistency
+    # Use PostgreSQL replication for HA setups
+    scale:
+      mode: fixed
+      replicas: 1
+
+    # Health check using pg_isready
+    health:
+      start_grace: 30s
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      check:
+        type: exec
+        command:
+          - pg_isready
+          - -U
+          - appuser
+          - -d
+          - appdb
+
+    # Initialization scripts (optional)
+    # Place SQL files in ./init/ directory
+    # volumes:
+    #   - name: init-scripts
+    #     path: /docker-entrypoint-initdb.d
+    #     source: ./init
+    #     read_only: true
