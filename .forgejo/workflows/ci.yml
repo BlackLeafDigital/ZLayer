@@ -16,8 +16,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo

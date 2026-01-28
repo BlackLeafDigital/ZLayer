@@ -114,7 +114,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        with:
+          toolchain: stable
       - name: Install cross
         run: cargo install cross
       - name: Install system deps
@@ -147,8 +149,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
         with:
+          toolchain: stable
           targets: ${{ matrix.target }}
       - name: Install protobuf
         run: brew install protobuf
@@ -168,7 +171,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        with:
+          toolchain: stable
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev protobuf-compiler
       - name: Publish
@@ -182,7 +187,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        with:
+          toolchain: stable
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev protobuf-compiler
       - name: Publish all in dependency order
@@ -202,7 +209,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        with:
+          toolchain: stable
       - name: Publish
         working-directory: clients/zlayer-sdk/rust
         env:
