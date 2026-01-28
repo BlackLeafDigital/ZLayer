@@ -3,10 +3,12 @@
 use leptos::prelude::*;
 
 use crate::app::components::{CodeEditor, Footer, Navbar};
-use crate::app::server_fns::{execute_wasm, execute_wasm_function, validate_spec, WasmExecutionResult};
+use crate::app::server_fns::{
+    execute_wasm, execute_wasm_function, validate_spec, WasmExecutionResult,
+};
 
 /// Default example specification
-const DEFAULT_SPEC: &str = r#"apiVersion: zlayer.dev/v1
+const DEFAULT_SPEC: &str = r"apiVersion: zlayer.dev/v1
 kind: Container
 metadata:
   name: example
@@ -20,7 +22,7 @@ spec:
     ports:
       - containerPort: 80
         hostPort: 8080
-"#;
+";
 
 /// Default Hello World WAT example
 const HELLO_WORLD_WAT: &str = r#"(module
@@ -150,44 +152,41 @@ pub enum WasmExample {
 }
 
 impl WasmExample {
-    fn code(&self) -> &'static str {
+    fn code(self) -> &'static str {
         match self {
-            WasmExample::HelloWorld => HELLO_WORLD_WAT,
-            WasmExample::Fibonacci => FIBONACCI_WAT,
-            WasmExample::Counter => COUNTER_WAT,
-            WasmExample::Factorial => FACTORIAL_WAT,
+            Self::HelloWorld => HELLO_WORLD_WAT,
+            Self::Fibonacci => FIBONACCI_WAT,
+            Self::Counter => COUNTER_WAT,
+            Self::Factorial => FACTORIAL_WAT,
         }
     }
 
-    fn name(&self) -> &'static str {
+    fn name(self) -> &'static str {
         match self {
-            WasmExample::HelloWorld => "Hello World",
-            WasmExample::Fibonacci => "Fibonacci",
-            WasmExample::Counter => "Counter",
-            WasmExample::Factorial => "Factorial",
+            Self::HelloWorld => "Hello World",
+            Self::Fibonacci => "Fibonacci",
+            Self::Counter => "Counter",
+            Self::Factorial => "Factorial",
         }
     }
 
-    fn description(&self) -> &'static str {
+    fn description(self) -> &'static str {
         match self {
-            WasmExample::HelloWorld => "Prints a greeting using WASI",
-            WasmExample::Fibonacci => "Recursive Fibonacci (exports fib function)",
-            WasmExample::Counter => "Simple counter output using WASI",
-            WasmExample::Factorial => "Iterative factorial (exports factorial function)",
+            Self::HelloWorld => "Prints a greeting using WASI",
+            Self::Fibonacci => "Recursive Fibonacci (exports fib function)",
+            Self::Counter => "Simple counter output using WASI",
+            Self::Factorial => "Iterative factorial (exports factorial function)",
         }
     }
 
-    fn has_main(&self) -> bool {
-        match self {
-            WasmExample::HelloWorld | WasmExample::Counter => true,
-            WasmExample::Fibonacci | WasmExample::Factorial => false,
-        }
+    fn has_main(self) -> bool {
+        matches!(self, Self::HelloWorld | Self::Counter)
     }
 
-    fn exported_function(&self) -> Option<(&'static str, i64)> {
+    fn exported_function(self) -> Option<(&'static str, i64)> {
         match self {
-            WasmExample::Fibonacci => Some(("fib", 10)),
-            WasmExample::Factorial => Some(("factorial", 10)),
+            Self::Fibonacci => Some(("fib", 10)),
+            Self::Factorial => Some(("factorial", 10)),
             _ => None,
         }
     }
@@ -280,8 +279,8 @@ fn ContainerSpecTab() -> impl IntoView {
         if let Some(result) = validate_action.value().get() {
             is_validating.set(false);
             match result {
-                Ok(msg) => output.set(format!("Success: {}", msg)),
-                Err(e) => output.set(format!("Error: {}", e)),
+                Ok(msg) => output.set(format!("Success: {msg}")),
+                Err(e) => output.set(format!("Error: {e}")),
             }
         }
     });
@@ -338,16 +337,18 @@ fn WasmPlaygroundTab() -> impl IntoView {
     // Execution action for modules with _start
     let execute_action = Action::new(move |code: &String| {
         let code = code.clone();
-        async move { execute_wasm(code, "wat".to_string(), String::new()).await }
+        async move { execute_wasm(code, "wat".to_string()).await }
     });
 
     // Execution action for function calls
-    let execute_func_action = Action::new(move |(code, func_name, args): &(String, String, Vec<i64>)| {
-        let code = code.clone();
-        let func_name = func_name.clone();
-        let args = args.clone();
-        async move { execute_wasm_function(code, func_name, args).await }
-    });
+    let execute_func_action = Action::new(
+        move |(code, func_name, args): &(String, String, Vec<i64>)| {
+            let code = code.clone();
+            let func_name = func_name.clone();
+            let args = args.clone();
+            async move { execute_wasm_function(code, func_name, args).await }
+        },
+    );
 
     // Handle example selection
     let on_example_select = move |example: WasmExample| {
@@ -434,7 +435,7 @@ fn WasmPlaygroundTab() -> impl IntoView {
                                     if let Some((func_name, _)) = example.exported_function() {
                                         return view! {
                                             <div class="wasm-func-input">
-                                                <label>{format!("{}(", func_name)}</label>
+                                                <label>{format!("{func_name}(")}</label>
                                                 <input
                                                     type="number"
                                                     class="wasm-arg-input"
@@ -586,28 +587,20 @@ fn WasmOutputDisplay(output: RwSignal<WasmOutput>) -> impl IntoView {
                         })}
 
                         // Stdout section
-                        {if !out.stdout.is_empty() {
-                            Some(view! {
-                                <div class="wasm-output-section">
-                                    <span class="wasm-output-label stdout">"stdout"</span>
-                                    <pre>{out.stdout.clone()}</pre>
-                                </div>
-                            })
-                        } else {
-                            None
-                        }}
+                        {(!out.stdout.is_empty()).then(|| view! {
+                            <div class="wasm-output-section">
+                                <span class="wasm-output-label stdout">"stdout"</span>
+                                <pre>{out.stdout.clone()}</pre>
+                            </div>
+                        })}
 
                         // Stderr section
-                        {if !out.stderr.is_empty() {
-                            Some(view! {
-                                <div class="wasm-output-section">
-                                    <span class="wasm-output-label stderr">"stderr"</span>
-                                    <pre>{out.stderr.clone()}</pre>
-                                </div>
-                            })
-                        } else {
-                            None
-                        }}
+                        {(!out.stderr.is_empty()).then(|| view! {
+                            <div class="wasm-output-section">
+                                <span class="wasm-output-label stderr">"stderr"</span>
+                                <pre>{out.stderr.clone()}</pre>
+                            </div>
+                        })}
 
                         // Exit code
                         <div class="wasm-output-footer">

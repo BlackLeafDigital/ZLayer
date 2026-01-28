@@ -28,8 +28,8 @@ use tokio::sync::RwLock;
 use tracing::instrument;
 use wasmtime::component::{Component, Linker as ComponentLinker, ResourceTable};
 use wasmtime::{Config, Engine, Linker, Module, Store};
-use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::p1::{self, WasiP1Ctx};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use zlayer_registry::{detect_wasm_version_from_binary, WasiVersion};
 use zlayer_spec::{PullPolicy, ServiceSpec};
 
@@ -298,7 +298,7 @@ impl WasmRuntime {
 
             // Create linker and add WASI
             let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
-            preview1::add_to_linker_sync(&mut linker, |ctx| ctx)
+            p1::add_to_linker_sync(&mut linker, |ctx| ctx)
                 .map_err(|e| format!("failed to add WASI to linker: {}", e))?;
 
             // Instantiate the module
@@ -397,7 +397,7 @@ impl WasmRuntime {
 
             // Create component linker and add WASIp2 interfaces
             let mut linker: ComponentLinker<WasiState> = ComponentLinker::new(&engine);
-            wasmtime_wasi::add_to_linker_sync(&mut linker)
+            wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
                 .map_err(|e| format!("failed to add WASIp2 to linker: {}", e))?;
 
             // Try to instantiate as a wasi:cli/command component
@@ -469,12 +469,11 @@ struct WasiState {
 }
 
 impl WasiView for WasiState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.ctx
-    }
-
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
     }
 }
 

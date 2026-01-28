@@ -1,6 +1,6 @@
-//! ZLayer Web UI with Leptos SSR + Hydration
+//! `ZLayer` Web UI with Leptos SSR + Hydration
 //!
-//! This crate provides the web interface for ZLayer, a lightweight container orchestration system.
+//! This crate provides the web interface for `ZLayer`, a lightweight container orchestration system.
 //!
 //! It supports two compilation modes:
 //! - `ssr` feature: Server-side rendering mode (for the server binary)

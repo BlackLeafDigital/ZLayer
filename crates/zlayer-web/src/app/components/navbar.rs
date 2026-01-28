@@ -5,9 +5,7 @@ use leptos_router::components::A;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
-use crate::app::icons::{
-    BookIcon, ContainerIcon, GithubIcon, MonitorIcon, MoonIcon, SunIcon, TerminalIcon,
-};
+use crate::app::icons;
 use crate::app::Theme;
 
 /// Theme toggle button component
@@ -67,9 +65,9 @@ fn ThemeToggle() -> impl IntoView {
             title=move || format!("Theme: {}", theme.get().display_name())
         >
             {move || match theme.get() {
-                Theme::Light => view! { <SunIcon/> }.into_any(),
-                Theme::Dark => view! { <MoonIcon/> }.into_any(),
-                Theme::System => view! { <MonitorIcon/> }.into_any(),
+                Theme::Light => icons::sun_icon().into_any(),
+                Theme::Dark => icons::moon_icon().into_any(),
+                Theme::System => icons::monitor_icon().into_any(),
             }}
         </button>
     }
@@ -82,17 +80,17 @@ pub fn Navbar() -> impl IntoView {
         <nav class="navbar">
             <div class="container navbar-content">
                 <A href="/" attr:class="navbar-logo">
-                    <ContainerIcon size="28"/>
+                    {icons::container_icon("28")}
                     <span>"ZLayer"</span>
                 </A>
 
                 <div class="navbar-nav">
                     <A href="/docs" attr:class="nav-link">
-                        <BookIcon size="16"/>
+                        {icons::book_icon("16")}
                         <span>"Docs"</span>
                     </A>
                     <A href="/playground" attr:class="nav-link">
-                        <TerminalIcon size="16"/>
+                        {icons::terminal_icon("16")}
                         <span>"Playground"</span>
                     </A>
                 </div>
@@ -105,7 +103,7 @@ pub fn Navbar() -> impl IntoView {
                         rel="noopener noreferrer"
                         class="github-link"
                     >
-                        <GithubIcon size="18"/>
+                        {icons::github_icon("18")}
                         <span>"GitHub"</span>
                     </a>
                 </div>

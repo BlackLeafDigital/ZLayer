@@ -10,9 +10,10 @@ use tracing::info;
 
 use crate::app::{app_css, App};
 
-/// HTML shell wrapper that includes CSS and hydration scripts
-/// The HydrationScripts component loads the WASM bundle for client-side interactivity
-fn shell(options: LeptosOptions) -> impl IntoView {
+/// HTML shell wrapper that includes CSS and hydration scripts.
+///
+/// The `HydrationScripts` component loads the WASM bundle for client-side interactivity.
+fn shell(options: &LeptosOptions) -> impl IntoView {
     use leptos::hydration::HydrationScripts;
 
     view! {
@@ -40,7 +41,14 @@ fn shell(options: LeptosOptions) -> impl IntoView {
     }
 }
 
-/// Start UI server with Leptos SSR + Hydration
+/// Start UI server with Leptos SSR + Hydration.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - The bind address is invalid or cannot be parsed
+/// - The TCP listener fails to bind to the address
+/// - The server encounters a runtime error
 pub async fn start_ui_server() -> Result<(), Box<dyn std::error::Error>> {
     // Parse bind address from environment or use default
     let bind_address =
@@ -48,7 +56,7 @@ pub async fn start_ui_server() -> Result<(), Box<dyn std::error::Error>> {
 
     let addr = bind_address
         .parse::<SocketAddr>()
-        .map_err(|e| format!("Invalid bind address '{}': {}", bind_address, e))?;
+        .map_err(|e| format!("Invalid bind address '{bind_address}': {e}"))?;
 
     info!("Starting ZLayer Web Server on {}", addr);
 
@@ -74,15 +82,15 @@ pub async fn start_ui_server() -> Result<(), Box<dyn std::error::Error>> {
         })
         .build();
 
-    // Clone options for use in shell closure
-    let options_for_shell = leptos_options.clone();
-    let shell_fn = move || shell(options_for_shell.clone());
+    // Clone options for use in shell closures
+    let opts_for_route_gen = leptos_options.clone();
+    let opts_for_ssr = leptos_options.clone();
 
     // Generate route list for SSR
-    let routes = generate_route_list(shell_fn.clone());
+    let routes = generate_route_list(move || shell(&opts_for_route_gen));
 
     // Context provider closure for server functions
-    let provide_context = move || {
+    let provide_context = || {
         // Future: provide ZLayer services as context here
         // provide_context(zlayer_agent.clone());
     };
@@ -91,18 +99,16 @@ pub async fn start_ui_server() -> Result<(), Box<dyn std::error::Error>> {
     let leptos_router = Router::new().leptos_routes_with_context(
         &leptos_options,
         routes,
-        provide_context.clone(),
-        shell_fn,
+        provide_context,
+        move || shell(&opts_for_ssr),
     );
 
     // Server function handler with the same context
-    let server_fn_handler = {
-        let context_fn = provide_context.clone();
-        move |req: Request<Body>| handle_server_fns_with_context(context_fn.clone(), req)
-    };
+    let server_fn_handler =
+        { move |req: Request<Body>| handle_server_fns_with_context(provide_context, req) };
 
     // Serve static files (WASM pkg directory) for client-side hydration
-    let pkg_dir = format!("{}/pkg", site_root);
+    let pkg_dir = format!("{site_root}/pkg");
     info!("Serving WASM package from {}", pkg_dir);
 
     // Determine assets directory - relative to crate in dev, or use site root in prod
@@ -111,7 +117,7 @@ pub async fn start_ui_server() -> Result<(), Box<dyn std::error::Error>> {
         "crates/zlayer-web/assets".to_string()
     } else {
         // In prod, assets should be copied to site root
-        format!("{}/assets", site_root)
+        format!("{site_root}/assets")
     };
     info!("Serving static assets from {}", assets_dir);
 

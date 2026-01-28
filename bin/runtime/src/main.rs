@@ -1870,7 +1870,7 @@ async fn handle_wasm_build(
     optimize: bool,
     wit: Option<PathBuf>,
 ) -> Result<()> {
-    use zlayer_builder::wasm_builder::{build_wasm, WasmBuildConfig, WasiTarget, WasmLanguage};
+    use zlayer_builder::wasm_builder::{build_wasm, WasiTarget, WasmBuildConfig, WasmLanguage};
 
     info!(
         context = %context.display(),
@@ -1960,13 +1960,9 @@ async fn handle_wasm_build(
 }
 
 /// Export WASM binary as OCI artifact
-async fn handle_wasm_export(
-    wasm_file: &Path,
-    name: &str,
-    output: Option<PathBuf>,
-) -> Result<()> {
-    use zlayer_registry::{export_wasm_as_oci, WasmExportConfig};
+async fn handle_wasm_export(wasm_file: &Path, name: &str, output: Option<PathBuf>) -> Result<()> {
     use std::collections::HashMap;
+    use zlayer_registry::{export_wasm_as_oci, WasmExportConfig};
 
     info!(
         wasm_file = %wasm_file.display(),
@@ -2028,19 +2024,28 @@ async fn handle_wasm_export(
         .context("Failed to create blobs directory")?;
 
     // Write config blob
-    let config_hash = result.config_digest.strip_prefix("sha256:").unwrap_or(&result.config_digest);
+    let config_hash = result
+        .config_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&result.config_digest);
     tokio::fs::write(blobs_dir.join(config_hash), &result.config_blob)
         .await
         .context("Failed to write config blob")?;
 
     // Write WASM layer blob
-    let wasm_hash = result.wasm_layer_digest.strip_prefix("sha256:").unwrap_or(&result.wasm_layer_digest);
+    let wasm_hash = result
+        .wasm_layer_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&result.wasm_layer_digest);
     tokio::fs::write(blobs_dir.join(wasm_hash), &result.wasm_binary)
         .await
         .context("Failed to write WASM blob")?;
 
     // Write manifest blob
-    let manifest_hash = result.manifest_digest.strip_prefix("sha256:").unwrap_or(&result.manifest_digest);
+    let manifest_hash = result
+        .manifest_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&result.manifest_digest);
     tokio::fs::write(blobs_dir.join(manifest_hash), &result.manifest_json)
         .await
         .context("Failed to write manifest blob")?;
@@ -2084,10 +2089,10 @@ async fn handle_wasm_push(
     username: Option<String>,
     password: Option<String>,
 ) -> Result<()> {
+    use std::collections::HashMap;
     use zlayer_registry::{
         export_wasm_as_oci, BlobCache, ImagePuller, RegistryAuth, WasmExportConfig,
     };
-    use std::collections::HashMap;
 
     info!(
         wasm_file = %wasm_file.display(),
@@ -2224,7 +2229,14 @@ async fn handle_wasm_validate(wasm_file: &Path) -> Result<()> {
         Ok(info) => {
             println!("\nValidation PASSED!");
             println!("  WASI version: {}", info.wasi_version);
-            println!("  Type: {}", if info.is_component { "Component (WASIp2)" } else { "Core Module (WASIp1)" });
+            println!(
+                "  Type: {}",
+                if info.is_component {
+                    "Component (WASIp2)"
+                } else {
+                    "Core Module (WASIp1)"
+                }
+            );
             println!("  Binary version: {}", info.binary_version);
             println!("  Size: {} bytes", info.size);
             Ok(())
@@ -2255,7 +2267,11 @@ async fn handle_wasm_info(wasm_file: &Path) -> Result<()> {
     println!("=======================");
     println!();
     println!("File: {}", wasm_file.display());
-    println!("Size: {} bytes ({:.2} KB)", info.size, info.size as f64 / 1024.0);
+    println!(
+        "Size: {} bytes ({:.2} KB)",
+        info.size,
+        info.size as f64 / 1024.0
+    );
     println!();
     println!("Format:");
     println!(

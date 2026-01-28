@@ -21,7 +21,7 @@ use zlayer_agent::runtimes::DockerRuntime;
 use zlayer_agent::{ContainerId, ContainerState, Runtime};
 use zlayer_spec::{
     CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NetworkSpec, NodeMode,
-    PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceSpec,
+    PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceSpec, ServiceType,
 };
 
 // =============================================================================
@@ -97,6 +97,8 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         privileged: false,
         node_mode: NodeMode::default(),
         node_selector: None,
+        service_type: ServiceType::default(),
+        wasm_http: None,
     }
 }
 

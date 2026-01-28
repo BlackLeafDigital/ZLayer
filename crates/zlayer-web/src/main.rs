@@ -1,6 +1,6 @@
-//! ZLayer Web Server Entry Point
+//! `ZLayer` Web Server Entry Point
 //!
-//! This is the main entry point for the ZLayer web server.
+//! This is the main entry point for the `ZLayer` web server.
 //! It starts the Leptos SSR server with Axum.
 
 #![recursion_limit = "512"]

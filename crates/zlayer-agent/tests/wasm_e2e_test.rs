@@ -140,7 +140,7 @@ fn create_minimal_wasm_module_bytes() -> Vec<u8> {
     vec![
         0x00, 0x61, 0x73, 0x6d, // Magic: \0asm
         0x01, 0x00, 0x00, 0x00, // Version: 1
-        // Empty module - no sections
+              // Empty module - no sections
     ]
 }
 
@@ -321,7 +321,10 @@ mod wasm_binary_analysis_e2e {
         let info = extract_wasm_binary_info(&wasm_bytes).expect("Should extract info");
         assert_eq!(info.wasi_version, WasiVersion::Preview1);
         assert!(!info.is_component);
-        assert!(info.size > 8, "WAT module should be larger than just header");
+        assert!(
+            info.size > 8,
+            "WAT module should be larger than just header"
+        );
     }
 
     /// Test analysis fails for invalid binary
@@ -372,7 +375,10 @@ mod wasm_binary_analysis_e2e {
         assert_eq!(info.wasi_version, WasiVersion::Preview1);
         assert!(!info.is_component);
         // Complex module should be larger
-        assert!(info.size > 100, "Complex module should have significant size");
+        assert!(
+            info.size > 100,
+            "Complex module should have significant size"
+        );
     }
 
     /// Test analysis for module with start function
@@ -402,8 +408,14 @@ mod wasm_binary_analysis_e2e {
     /// Test WASI version target triple suffixes
     #[test]
     fn test_wasi_version_target_triples() {
-        assert_eq!(WasiVersion::Preview1.target_triple_suffix(), "wasm32-wasip1");
-        assert_eq!(WasiVersion::Preview2.target_triple_suffix(), "wasm32-wasip2");
+        assert_eq!(
+            WasiVersion::Preview1.target_triple_suffix(),
+            "wasm32-wasip1"
+        );
+        assert_eq!(
+            WasiVersion::Preview2.target_triple_suffix(),
+            "wasm32-wasip2"
+        );
     }
 
     /// Test WASM artifact type constants
@@ -587,7 +599,10 @@ func main() {
             .expect("Failed to read WASM file");
 
         assert_eq!(read_bytes, wasm_bytes, "WASM bytes should match");
-        assert!(validate_wasm_magic(&read_bytes), "Read WASM should be valid");
+        assert!(
+            validate_wasm_magic(&read_bytes),
+            "Read WASM should be valid"
+        );
     }
 }
 
@@ -1412,11 +1427,7 @@ mod wasm_plugin_lifecycle_e2e {
         // Simulate HTTP event handling
         if host.config_get_bool("events.http").unwrap_or(false) {
             host.log(LogLevel::Info, "Handling HTTP event");
-            host.counter_inc_labeled(
-                "events",
-                1,
-                &[("type".to_string(), "http".to_string())],
-            );
+            host.counter_inc_labeled("events", 1, &[("type".to_string(), "http".to_string())]);
             host.histogram_observe_labeled(
                 "event_duration",
                 0.05,
@@ -1427,21 +1438,13 @@ mod wasm_plugin_lifecycle_e2e {
         // Simulate timer event handling
         if host.config_get_bool("events.timer").unwrap_or(false) {
             host.log(LogLevel::Info, "Handling timer event");
-            host.counter_inc_labeled(
-                "events",
-                1,
-                &[("type".to_string(), "timer".to_string())],
-            );
+            host.counter_inc_labeled("events", 1, &[("type".to_string(), "timer".to_string())]);
         }
 
         // Simulate custom event handling
         if host.config_get_bool("events.custom").unwrap_or(false) {
             host.log(LogLevel::Info, "Handling custom event");
-            host.counter_inc_labeled(
-                "events",
-                1,
-                &[("type".to_string(), "custom".to_string())],
-            );
+            host.counter_inc_labeled("events", 1, &[("type".to_string(), "custom".to_string())]);
         }
     }
 

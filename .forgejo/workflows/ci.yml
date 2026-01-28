@@ -39,11 +39,5 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-features -- -D warnings
 
-      - name: Test (default features)
-        run: cargo test --workspace
-
-      - name: Test (with docker feature)
-        run: cargo test --workspace --features docker
-
-      - name: Test (with wasm feature)
-        run: cargo test --workspace --features wasm
+      - name: Test
+        run: cargo test --workspace --all-features

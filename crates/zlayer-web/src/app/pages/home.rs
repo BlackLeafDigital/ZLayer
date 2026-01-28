@@ -3,9 +3,7 @@
 use leptos::prelude::*;
 
 use crate::app::components::{CodeBlock, CodeEditor, Footer, Navbar};
-use crate::app::icons::{
-    ArrowRightIcon, HammerIcon, LayersIcon, NetworkIcon, RocketIcon, ShieldIcon, ZapIcon,
-};
+use crate::app::icons;
 use crate::app::server_fns::execute_wasm;
 
 /// Feature card component
@@ -31,9 +29,10 @@ fn FeatureCard(
 
 /// Homepage component
 #[component]
+#[allow(clippy::too_many_lines)]
 pub fn HomePage() -> impl IntoView {
     // Example YAML specification
-    const EXAMPLE_SPEC: &str = r#"apiVersion: zlayer.dev/v1
+    const EXAMPLE_SPEC: &str = r"apiVersion: zlayer.dev/v1
 kind: Container
 metadata:
   name: my-app
@@ -51,7 +50,7 @@ spec:
   env:
     - name: DATABASE_URL
       valueFrom:
-        secretRef: db-credentials"#;
+        secretRef: db-credentials";
 
     view! {
         <div class="page-layout">
@@ -69,7 +68,7 @@ spec:
                             />
                         </div>
                         <div class="hero-badge">
-                            <LayersIcon size="16"/>
+                            {icons::layers_icon("16")}
                             <span>"Open Source Container Orchestration"</span>
                         </div>
                         <h1 class="hero-title">
@@ -82,12 +81,12 @@ spec:
                         </p>
                         <div class="hero-buttons">
                             <a href="/docs" class="btn btn-primary">
-                                <RocketIcon size="18"/>
+                                {icons::rocket_icon("18")}
                                 <span>"Get Started"</span>
                             </a>
                             <a href="/playground" class="btn btn-secondary">
                                 <span>"Try It Now"</span>
-                                <ArrowRightIcon size="18"/>
+                                {icons::arrow_right_icon("18")}
                             </a>
                         </div>
                     </div>
@@ -105,32 +104,32 @@ spec:
                         </div>
                         <div class="features-grid">
                             <FeatureCard
-                                icon=|| view! { <ZapIcon size="24"/> }.into_any()
+                                icon=|| icons::zap_icon("24").into_any()
                                 title="Daemonless Architecture"
                                 description="No background daemons required. Each container runs as a direct child process, giving you complete control and visibility."
                             />
                             <FeatureCard
-                                icon=|| view! { <HammerIcon size="24"/> }.into_any()
+                                icon=|| icons::hammer_icon("24").into_any()
                                 title="Built-in Builder"
                                 description="Build OCI-compliant container images directly. No need for external tools like Docker or Buildah."
                             />
                             <FeatureCard
-                                icon=|| view! { <NetworkIcon size="24"/> }.into_any()
+                                icon=|| icons::network_icon("24").into_any()
                                 title="Overlay Networks"
                                 description="WireGuard-based overlay networking with automatic peer discovery. Secure communication across hosts out of the box."
                             />
                             <FeatureCard
-                                icon=|| view! { <ShieldIcon size="24"/> }.into_any()
+                                icon=|| icons::shield_icon("24").into_any()
                                 title="Security First"
                                 description="Rootless containers, seccomp profiles, and namespace isolation. Defense in depth for production workloads."
                             />
                             <FeatureCard
-                                icon=|| view! { <LayersIcon size="24"/> }.into_any()
+                                icon=|| icons::layers_icon("24").into_any()
                                 title="Kubernetes-like API"
                                 description="Familiar YAML specifications for containers, pods, and services. Easy migration path from existing deployments."
                             />
                             <FeatureCard
-                                icon=|| view! { <RocketIcon size="24"/> }.into_any()
+                                icon=|| icons::rocket_icon("24").into_any()
                                 title="Minimal Footprint"
                                 description="Single binary under 20MB. Fast startup times and low resource consumption for edge and IoT deployments."
                             />
@@ -152,7 +151,7 @@ spec:
                             <CodeBlock
                                 code=EXAMPLE_SPEC
                                 title=Some("container.yaml")
-                                _language="yaml"
+                                language="yaml"
                             />
                         </div>
                     </div>
@@ -210,7 +209,7 @@ fn TryItNowSection() -> impl IntoView {
     // Execution action
     let execute_action = Action::new(move |code: &String| {
         let code = code.clone();
-        async move { execute_wasm(code, "wat".to_string(), String::new()).await }
+        async move { execute_wasm(code, "wat".to_string()).await }
     });
 
     // Handle run button click
@@ -229,12 +228,18 @@ fn TryItNowSection() -> impl IntoView {
                     if !res.stdout.is_empty() {
                         output.set(res.stdout);
                     } else if let Some(info) = res.info {
-                        output.set(format!("Executed successfully in {}ms\n{}", res.execution_time_ms, info));
+                        output.set(format!(
+                            "Executed successfully in {}ms\n{}",
+                            res.execution_time_ms, info
+                        ));
                     } else {
-                        output.set(format!("Executed successfully (exit code: {})", res.exit_code));
+                        output.set(format!(
+                            "Executed successfully (exit code: {})",
+                            res.exit_code
+                        ));
                     }
                 }
-                Err(e) => output.set(format!("Error: {}", e)),
+                Err(e) => output.set(format!("Error: {e}")),
             }
         }
     });
@@ -302,7 +307,7 @@ fn TryItNowSection() -> impl IntoView {
                 <div class="try-it-cta">
                     <a href="/playground" class="btn btn-outline">
                         "Open Full Playground"
-                        <ArrowRightIcon size="18"/>
+                        {icons::arrow_right_icon("18")}
                     </a>
                 </div>
             </div>

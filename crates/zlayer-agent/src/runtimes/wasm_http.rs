@@ -55,7 +55,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, info, instrument};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 use zlayer_spec::WasmHttpConfig;
 
@@ -299,12 +299,11 @@ impl WasmHttpState {
 }
 
 impl WasiView for WasmHttpState {
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
-    }
-
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi_ctx
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.table,
+        }
     }
 }
 
@@ -541,7 +540,7 @@ impl WasmHttpRuntime {
         let mut linker = Linker::new(&engine);
 
         // Add WASI bindings
-        wasmtime_wasi::add_to_linker_async(&mut linker)
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|e| WasmHttpError::EngineCreation(format!("failed to add WASI: {}", e)))?;
 
         // Add WASI HTTP bindings

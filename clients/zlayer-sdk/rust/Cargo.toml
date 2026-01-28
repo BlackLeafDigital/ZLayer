@@ -18,7 +18,7 @@ wit-bindgen = "0.36"
 
 [dev-dependencies]
 # For testing plugins locally
-wasmtime = "28"
+wasmtime = "41"
 
 [build-dependencies]
 # wit-bindgen generates bindings at compile time

@@ -13,16 +13,21 @@ path = "src/main.rs"
 
 [features]
 default = ["full"]
-# Full runtime with all CLI commands
-full = ["serve", "join", "deploy", "node"]
-# Enable serve command (API server mode)
+# Full runtime with all CLI commands and capabilities
+full = ["serve", "join", "deploy", "node", "docker", "wasm", "s3", "persistent", "observability"]
+
+# CLI commands
 serve = []
-# Enable join command (agent/worker node mode)
 join = []
-# Enable deploy command (orchestration mode)
 deploy = []
-# Enable node command (cluster management)
 node = []
+
+# Runtime capabilities (forwarded to deps)
+docker = ["zlayer-agent/docker"]
+wasm = ["zlayer-agent/wasm"]
+s3 = ["zlayer-agent/s3", "zlayer-registry/s3"]
+persistent = ["zlayer-scheduler/persistent", "zlayer-registry/persistent"]
+observability = ["zlayer-observability/axum", "zlayer-observability/propagation"]
 
 [dependencies]
 # Internal crates - always required

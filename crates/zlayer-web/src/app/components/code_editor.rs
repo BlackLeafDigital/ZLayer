@@ -48,7 +48,8 @@ pub fn CodeBlock(
     title: Option<&'static str>,
     /// Language for syntax highlighting (future use)
     #[prop(default = "yaml")]
-    _language: &'static str,
+    #[allow(unused)]
+    language: &'static str,
 ) -> impl IntoView {
     view! {
         <div class="code-block">

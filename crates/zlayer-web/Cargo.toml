@@ -54,8 +54,8 @@ zlayer-agent = { path = "../zlayer-agent", optional = true }
 zlayer-spec = { path = "../zlayer-spec", optional = true }
 
 # WASM execution (server-only)
-wasmtime = { version = "29", default-features = false, features = ["cranelift"], optional = true }
-wasmtime-wasi = { version = "29", default-features = false, features = ["preview1"], optional = true }
+wasmtime = { version = "41", default-features = false, features = ["cranelift"], optional = true }
+wasmtime-wasi = { version = "41", optional = true }
 wat = { version = "1", optional = true }
 
 # Utilities (server-only)

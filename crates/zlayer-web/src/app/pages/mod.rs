@@ -1,4 +1,4 @@
-//! Page components for ZLayer web interface
+//! Page components for `ZLayer` web interface
 
 mod docs;
 mod home;

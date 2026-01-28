@@ -2,7 +2,7 @@
 
 use leptos::prelude::*;
 
-use crate::app::icons::{ContainerIcon, GithubIcon};
+use crate::app::icons;
 
 /// Footer component
 #[component]
@@ -13,7 +13,7 @@ pub fn Footer() -> impl IntoView {
                 <div class="footer-content">
                     <div class="footer-brand">
                         <a href="/" class="footer-logo">
-                            <ContainerIcon size="24"/>
+                            {icons::container_icon("24")}
                             <span>"ZLayer"</span>
                         </a>
                         <p class="footer-tagline">
@@ -67,7 +67,7 @@ pub fn Footer() -> impl IntoView {
                     </p>
                     <div class="footer-social">
                         <a href="https://github.com/zachhandley/ZLayer" target="_blank" rel="noopener noreferrer" title="GitHub">
-                            <GithubIcon size="20"/>
+                            {icons::github_icon("20")}
                         </a>
                     </div>
                 </div>

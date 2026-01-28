@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 /// System statistics for the dashboard
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SystemStats {
-    /// Version of ZLayer
+    /// Version of `ZLayer`
     pub version: String,
     /// Number of running containers
     pub running_containers: u64,
@@ -61,26 +61,49 @@ pub struct WasmExecutionResult {
 #[server(prefix = "/api/leptos")]
 pub async fn get_system_stats() -> Result<SystemStats, ServerFnError> {
     // TODO: Connect to actual ZLayer services when available
-    Ok(SystemStats {
+    // Server functions must be async for Leptos macro; use ready().await
+    // to satisfy clippy when there's no actual async work yet
+    std::future::ready(Ok(SystemStats {
         version: env!("CARGO_PKG_VERSION").to_string(),
         running_containers: 0,
         available_images: 0,
         overlay_networks: 0,
-    })
+    }))
+    .await
 }
 
 /// Validate a container specification YAML
 #[server(prefix = "/api/leptos")]
 pub async fn validate_spec(yaml_content: String) -> Result<String, ServerFnError> {
-    // TODO: Use zlayer-spec to validate when available
-    if yaml_content.trim().is_empty() {
-        return Err(ServerFnError::new("Specification cannot be empty"));
+    #[cfg(feature = "ssr")]
+    {
+        if yaml_content.trim().is_empty() {
+            return std::future::ready(Err(ServerFnError::new("Specification cannot be empty")))
+                .await;
+        }
+
+        // Use zlayer-spec for full validation
+        std::future::ready(match zlayer_spec::from_yaml_str(&yaml_content) {
+            Ok(spec) => {
+                let service_count = spec.services.len();
+                let service_names: Vec<_> = spec.services.keys().collect();
+                Ok(format!(
+                    "Valid ZLayer spec: deployment '{}' with {} service(s): {:?}",
+                    spec.deployment, service_count, service_names
+                ))
+            }
+            Err(e) => Err(ServerFnError::new(format!("Validation error: {e}"))),
+        })
+        .await
     }
 
-    // Basic YAML parsing check
-    match serde_yaml::from_str::<serde_json::Value>(&yaml_content) {
-        Ok(_) => Ok("Specification is valid YAML".to_string()),
-        Err(e) => Err(ServerFnError::new(format!("Invalid YAML: {}", e))),
+    #[cfg(not(feature = "ssr"))]
+    {
+        let _ = yaml_content;
+        std::future::ready(Err(ServerFnError::new(
+            "Validation requires server-side rendering",
+        )))
+        .await
     }
 }
 
@@ -92,7 +115,6 @@ pub async fn validate_spec(yaml_content: String) -> Result<String, ServerFnError
 pub async fn execute_wasm(
     code: String,
     language: String,
-    _input: String,
 ) -> Result<WasmExecutionResult, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
@@ -108,22 +130,21 @@ pub async fn execute_wasm(
         // For now, we only support WAT format
         if language != "wat" {
             return Err(ServerFnError::new(format!(
-                "Language '{}' is not yet supported. Currently only 'wat' (WebAssembly Text) is supported.",
-                language
+                "Language '{language}' is not yet supported. Currently only 'wat' (WebAssembly Text) is supported."
             )));
         }
 
         // Convert WAT to WASM bytes
-        let wasm_bytes = wat::parse_str(&code).map_err(|e| {
-            ServerFnError::new(format!("WAT parse error: {}", e))
-        })?;
+        let wasm_bytes = wat::parse_str(&code)
+            .map_err(|e| ServerFnError::new(format!("WAT parse error: {e}")))?;
 
         // Execute the WASM module
-        let result = execute_wasm_bytes(&wasm_bytes).await.map_err(|e| {
-            ServerFnError::new(format!("Execution error: {}", e))
-        })?;
+        let result = execute_wasm_bytes(&wasm_bytes)
+            .await
+            .map_err(|e| ServerFnError::new(format!("Execution error: {e}")))?;
 
-        let execution_time_ms = start.elapsed().as_millis() as u64;
+        let elapsed_millis = start.elapsed().as_millis();
+        let execution_time_ms = u64::try_from(elapsed_millis).unwrap_or(u64::MAX);
 
         Ok(WasmExecutionResult {
             stdout: result.0,
@@ -136,8 +157,10 @@ pub async fn execute_wasm(
 
     #[cfg(not(feature = "ssr"))]
     {
-        let _ = (code, language, _input);
-        Err(ServerFnError::new("WASM execution requires server-side rendering"))
+        let _ = (code, language);
+        Err(ServerFnError::new(
+            "WASM execution requires server-side rendering",
+        ))
     }
 }
 
@@ -156,11 +179,12 @@ pub async fn execute_wasm_bytes_api(
             return Err(ServerFnError::new("WASM bytes cannot be empty"));
         }
 
-        let result = execute_wasm_bytes(&wasm_bytes).await.map_err(|e| {
-            ServerFnError::new(format!("Execution error: {}", e))
-        })?;
+        let result = execute_wasm_bytes(&wasm_bytes)
+            .await
+            .map_err(|e| ServerFnError::new(format!("Execution error: {e}")))?;
 
-        let execution_time_ms = start.elapsed().as_millis() as u64;
+        let elapsed_millis = start.elapsed().as_millis();
+        let execution_time_ms = u64::try_from(elapsed_millis).unwrap_or(u64::MAX);
 
         Ok(WasmExecutionResult {
             stdout: result.0,
@@ -174,16 +198,18 @@ pub async fn execute_wasm_bytes_api(
     #[cfg(not(feature = "ssr"))]
     {
         let _ = wasm_bytes;
-        Err(ServerFnError::new("WASM execution requires server-side rendering"))
+        Err(ServerFnError::new(
+            "WASM execution requires server-side rendering",
+        ))
     }
 }
 
 /// Internal function to execute WASM bytes
 #[cfg(feature = "ssr")]
 async fn execute_wasm_bytes(wasm_bytes: &[u8]) -> Result<(String, String, i32), String> {
-    use wasmtime::*;
-    use wasmtime_wasi::preview1::{self, WasiP1Ctx};
-    use wasmtime_wasi::pipe::MemoryOutputPipe;
+    use wasmtime::{Engine, Linker, Module, Store};
+    use wasmtime_wasi::p1::{self, WasiP1Ctx};
+    use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
     use wasmtime_wasi::WasiCtxBuilder;
 
     let wasm_bytes = wasm_bytes.to_vec();
@@ -195,7 +221,7 @@ async fn execute_wasm_bytes(wasm_bytes: &[u8]) -> Result<(String, String, i32), 
 
         // Compile module
         let module = Module::new(&engine, &wasm_bytes)
-            .map_err(|e| format!("Failed to compile module: {}", e))?;
+            .map_err(|e| format!("Failed to compile module: {e}"))?;
 
         // Create pipes to capture stdout/stderr
         let stdout_pipe = MemoryOutputPipe::new(4096);
@@ -217,13 +243,13 @@ async fn execute_wasm_bytes(wasm_bytes: &[u8]) -> Result<(String, String, i32), 
 
         // Create linker and add WASI
         let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
-        preview1::add_to_linker_sync(&mut linker, |ctx| ctx)
-            .map_err(|e| format!("Failed to add WASI to linker: {}", e))?;
+        p1::add_to_linker_sync(&mut linker, |ctx| ctx)
+            .map_err(|e| format!("Failed to add WASI to linker: {e}"))?;
 
         // Instantiate the module
         let instance = linker
             .instantiate(&mut store, &module)
-            .map_err(|e| format!("Failed to instantiate module: {}", e))?;
+            .map_err(|e| format!("Failed to instantiate module: {e}"))?;
 
         // Look for entry point
         let start_func = instance
@@ -243,7 +269,7 @@ async fn execute_wasm_bytes(wasm_bytes: &[u8]) -> Result<(String, String, i32), 
                             if e.to_string().contains("fuel") {
                                 return Err("Execution timed out (resource limit exceeded)".to_string());
                             }
-                            return Err(format!("Execution error: {}", e));
+                            return Err(format!("Execution error: {e}"));
                         }
                     }
                 }
@@ -270,7 +296,65 @@ async fn execute_wasm_bytes(wasm_bytes: &[u8]) -> Result<(String, String, i32), 
         Ok((stdout, stderr, exit_code))
     })
     .await
-    .map_err(|e| format!("Task join error: {}", e))?
+    .map_err(|e| format!("Task join error: {e}"))?
+}
+
+/// Convert an i64 argument to a WASM Val type with proper validation.
+///
+/// For I32: Returns error if value doesn't fit in i32 range.
+/// For F32/F64: Converts the integer to float. Note that large integers may lose
+/// precision when converted to floating point (f32 has 23-bit mantissa, f64 has 52-bit).
+/// This is the expected behavior when passing integer arguments to float parameters.
+#[cfg(feature = "ssr")]
+fn convert_i64_to_wasm_val(
+    arg: i64,
+    param_type: &wasmtime::ValType,
+    arg_index: usize,
+) -> Result<wasmtime::Val, String> {
+    use wasmtime::{Val, ValType};
+
+    match *param_type {
+        ValType::I32 => {
+            let val = i32::try_from(arg).map_err(|_| {
+                format!(
+                    "Argument {} value {} is out of range for i32 (valid range: {} to {})",
+                    arg_index,
+                    arg,
+                    i32::MIN,
+                    i32::MAX
+                )
+            })?;
+            Ok(Val::I32(val))
+        }
+        ValType::I64 => Ok(Val::I64(arg)),
+        ValType::F32 => {
+            // Convert i64 to f32. Precision loss is expected for large values.
+            // We use an explicit conversion to acknowledge the precision change.
+            #[allow(clippy::cast_precision_loss)]
+            let float_val = arg as f32;
+            Ok(Val::F32(float_val.to_bits()))
+        }
+        ValType::F64 => {
+            // Convert i64 to f64. Precision loss is expected for values outside
+            // the exact representable range (integers > 2^53).
+            #[allow(clippy::cast_precision_loss)]
+            let float_val = arg as f64;
+            Ok(Val::F64(float_val.to_bits()))
+        }
+        _ => {
+            // For other types (V128, FuncRef, ExternRef), default to I32 with validation
+            let val = i32::try_from(arg).map_err(|_| {
+                format!(
+                    "Argument {} value {} is out of range for i32 (valid range: {} to {})",
+                    arg_index,
+                    arg,
+                    i32::MIN,
+                    i32::MAX
+                )
+            })?;
+            Ok(Val::I32(val))
+        }
+    }
 }
 
 /// Execute a specific exported function from a WASM module
@@ -283,7 +367,7 @@ pub async fn execute_wasm_function(
     #[cfg(feature = "ssr")]
     {
         use std::time::Instant;
-        use wasmtime::*;
+        use wasmtime::{Engine, Instance, Module, Store, Val, ValType};
 
         let start = Instant::now();
 
@@ -292,9 +376,8 @@ pub async fn execute_wasm_function(
         }
 
         // Convert WAT to WASM bytes
-        let wasm_bytes = wat::parse_str(&code).map_err(|e| {
-            ServerFnError::new(format!("WAT parse error: {}", e))
-        })?;
+        let wasm_bytes = wat::parse_str(&code)
+            .map_err(|e| ServerFnError::new(format!("WAT parse error: {e}")))?;
 
         // Clone values for use after the blocking task
         let func_name_for_info = function_name.clone();
@@ -304,53 +387,47 @@ pub async fn execute_wasm_function(
         let result = tokio::task::spawn_blocking(move || {
             let engine = Engine::default();
             let module = Module::new(&engine, &wasm_bytes)
-                .map_err(|e| format!("Failed to compile module: {}", e))?;
+                .map_err(|e| format!("Failed to compile module: {e}"))?;
 
             let mut store = Store::new(&engine, ());
             store.set_fuel(10_000_000).ok();
 
             let instance = Instance::new(&mut store, &module, &[])
-                .map_err(|e| format!("Failed to instantiate module: {}", e))?;
+                .map_err(|e| format!("Failed to instantiate module: {e}"))?;
 
             let func = instance
                 .get_func(&mut store, &function_name)
-                .ok_or_else(|| format!("Function '{}' not found", function_name))?;
+                .ok_or_else(|| format!("Function '{function_name}' not found"))?;
 
-            // Prepare arguments
+            // Prepare arguments with proper type conversion and validation
             let func_type = func.ty(&store);
             let params: Vec<Val> = args
                 .iter()
                 .zip(func_type.params())
-                .map(|(arg, param_type)| match param_type {
-                    ValType::I32 => Val::I32(*arg as i32),
-                    ValType::I64 => Val::I64(*arg),
-                    ValType::F32 => Val::F32((*arg as f32).to_bits()),
-                    ValType::F64 => Val::F64((*arg as f64).to_bits()),
-                    _ => Val::I32(*arg as i32),
-                })
-                .collect();
+                .enumerate()
+                .map(|(idx, (arg, param_type))| convert_i64_to_wasm_val(*arg, &param_type, idx))
+                .collect::<Result<Vec<_>, _>>()?;
 
-            // Prepare results buffer
+            // Prepare results buffer - initialize with zero values
             let mut results: Vec<Val> = func_type
                 .results()
                 .map(|t| match t {
-                    ValType::I32 => Val::I32(0),
                     ValType::I64 => Val::I64(0),
                     ValType::F32 => Val::F32(0),
                     ValType::F64 => Val::F64(0),
+                    // I32, V128, FuncRef, ExternRef all use I32 as default
                     _ => Val::I32(0),
                 })
                 .collect();
 
             // Call the function
-            func.call(&mut store, &params, &mut results)
-                .map_err(|e| {
-                    if e.to_string().contains("fuel") {
-                        "Execution timed out (resource limit exceeded)".to_string()
-                    } else {
-                        format!("Execution error: {}", e)
-                    }
-                })?;
+            func.call(&mut store, &params, &mut results).map_err(|e| {
+                if e.to_string().contains("fuel") {
+                    "Execution timed out (resource limit exceeded)".to_string()
+                } else {
+                    format!("Execution error: {e}")
+                }
+            })?;
 
             // Format results
             let result_str = results
@@ -368,23 +445,26 @@ pub async fn execute_wasm_function(
             Ok::<_, String>(result_str)
         })
         .await
-        .map_err(|e| ServerFnError::new(format!("Task error: {}", e)))?
+        .map_err(|e| ServerFnError::new(format!("Task error: {e}")))?
         .map_err(ServerFnError::new)?;
 
-        let execution_time_ms = start.elapsed().as_millis() as u64;
+        let elapsed_millis = start.elapsed().as_millis();
+        let execution_time_ms = u64::try_from(elapsed_millis).unwrap_or(u64::MAX);
 
         Ok(WasmExecutionResult {
-            stdout: format!("Result: {}", result),
+            stdout: format!("Result: {result}"),
             stderr: String::new(),
             exit_code: 0,
             execution_time_ms,
-            info: Some(format!("Called {}({:?})", func_name_for_info, args_for_info)),
+            info: Some(format!("Called {func_name_for_info}({args_for_info:?})")),
         })
     }
 
     #[cfg(not(feature = "ssr"))]
     {
         let _ = (code, function_name, args);
-        Err(ServerFnError::new("WASM execution requires server-side rendering"))
+        Err(ServerFnError::new(
+            "WASM execution requires server-side rendering",
+        ))
     }
 }

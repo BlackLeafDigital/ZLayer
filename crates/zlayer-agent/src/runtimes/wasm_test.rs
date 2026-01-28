@@ -58,7 +58,7 @@ use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use wasmtime::component::{Component, Linker as ComponentLinker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiView};
+use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 
 use super::wasm_host::{KvError, LogLevel, ZLayerHost};
 
@@ -196,12 +196,11 @@ impl std::fmt::Debug for TestHostState {
 }
 
 impl WasiView for TestHostState {
-    fn ctx(&mut self) -> &mut WasiCtx {
-        &mut self.wasi_ctx
-    }
-
-    fn table(&mut self) -> &mut ResourceTable {
-        &mut self.table
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.wasi_ctx,
+            table: &mut self.table,
+        }
     }
 }
 
@@ -719,7 +718,7 @@ impl TestHost {
         let mut linker: ComponentLinker<TestHostState> = ComponentLinker::new(&self.engine);
 
         // Add WASI interfaces
-        wasmtime_wasi::add_to_linker_async(&mut linker)
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
             .map_err(|e| TestError::Instantiation(format!("failed to add WASI: {}", e)))?;
 
         // Add ZLayer host interfaces

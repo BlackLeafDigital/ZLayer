@@ -723,6 +723,7 @@ impl Runtime for DockerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_spec::ServiceType;
 
     #[test]
     fn test_container_name() {
@@ -911,6 +912,8 @@ mod tests {
             privileged: false,
             node_mode: NodeMode::default(),
             node_selector: None,
+            service_type: ServiceType::default(),
+            wasm_http: None,
         }
     }
 }

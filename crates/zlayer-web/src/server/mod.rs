@@ -1,3 +1,3 @@
-//! Server-side modules for ZLayer web
+//! Server-side modules for `ZLayer` web
 
 pub mod ui;

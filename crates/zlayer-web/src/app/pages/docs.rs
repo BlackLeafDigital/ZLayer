@@ -6,6 +6,7 @@ use crate::app::components::{Footer, Navbar};
 
 /// Documentation page component
 #[component]
+#[allow(clippy::too_many_lines)]
 pub fn DocsPage() -> impl IntoView {
     view! {
         <div class="page-layout">

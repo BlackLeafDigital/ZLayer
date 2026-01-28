@@ -259,6 +259,16 @@ impl InitOrchestrator {
                 id: self.id.to_string(),
                 reason: e.to_string(),
             }),
+            #[cfg(feature = "s3")]
+            InitAction::S3Push(a) => a.execute().await.map_err(|e| AgentError::InitActionFailed {
+                id: self.id.to_string(),
+                reason: e.to_string(),
+            }),
+            #[cfg(feature = "s3")]
+            InitAction::S3Pull(a) => a.execute().await.map_err(|e| AgentError::InitActionFailed {
+                id: self.id.to_string(),
+                reason: e.to_string(),
+            }),
         }
     }
 }

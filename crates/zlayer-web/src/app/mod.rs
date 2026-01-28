@@ -1,4 +1,4 @@
-//! ZLayer Leptos UI Application
+//! `ZLayer` Leptos UI Application
 //!
 //! This application supports SSR (Server-Side Rendering) with client-side hydration.
 //! - Initial HTML is rendered on the server for fast first paint and SEO
@@ -11,7 +11,7 @@ pub mod server_fns;
 
 use leptos::prelude::*;
 use leptos_router::components::{Route, Router, Routes};
-use leptos_router::*;
+use leptos_router::{StaticSegment, WildcardSegment};
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
@@ -23,12 +23,19 @@ use pages::{DocsPage, HomePage, PlaygroundPage};
 // =============================================================================
 
 /// Inline SVG icons using Iconify-style paths for SSR compatibility
+/// Inline SVG icon functions for SSR compatibility.
+///
+/// These are regular functions (not Leptos components) to avoid the Leptos
+/// component macro's limitation where `#[must_use]` is not forwarded to
+/// generated wrapper functions. See: <https://github.com/leptos-rs/leptos/issues/3172>
+///
+/// Usage: `{icons::container_icon("24")}` instead of `<ContainerIcon size="24"/>`
 pub mod icons {
     use leptos::prelude::*;
 
-    /// Container/Box icon for ZLayer logo
-    #[component]
-    pub fn ContainerIcon(#[prop(default = "32")] size: &'static str) -> impl IntoView {
+    /// Container/Box icon for `ZLayer` logo
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn container_icon(size: &'static str) -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -51,8 +58,8 @@ pub mod icons {
     }
 
     /// Layers icon
-    #[component]
-    pub fn LayersIcon(#[prop(default = "24")] size: &'static str) -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn layers_icon(size: &'static str) -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -74,8 +81,8 @@ pub mod icons {
     }
 
     /// Book/Documentation icon
-    #[component]
-    pub fn BookIcon(#[prop(default = "18")] size: &'static str) -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn book_icon(size: &'static str) -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -96,8 +103,8 @@ pub mod icons {
     }
 
     /// Play/Terminal icon
-    #[component]
-    pub fn TerminalIcon(#[prop(default = "18")] size: &'static str) -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn terminal_icon(size: &'static str) -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -118,8 +125,8 @@ pub mod icons {
     }
 
     /// GitHub icon
-    #[component]
-    pub fn GithubIcon(#[prop(default = "18")] size: &'static str) -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn github_icon(size: &'static str) -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -135,8 +142,8 @@ pub mod icons {
     }
 
     /// Sun icon for light theme
-    #[component]
-    pub fn SunIcon() -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn sun_icon() -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -164,8 +171,8 @@ pub mod icons {
     }
 
     /// Moon icon for dark theme
-    #[component]
-    pub fn MoonIcon() -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn moon_icon() -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -185,8 +192,8 @@ pub mod icons {
     }
 
     /// Monitor icon for system theme
-    #[component]
-    pub fn MonitorIcon() -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn monitor_icon() -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -208,8 +215,8 @@ pub mod icons {
     }
 
     /// Rocket icon for getting started
-    #[component]
-    pub fn RocketIcon(#[prop(default = "24")] size: &'static str) -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn rocket_icon(size: &'static str) -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -232,8 +239,8 @@ pub mod icons {
     }
 
     /// Zap/Lightning icon for features
-    #[component]
-    pub fn ZapIcon(#[prop(default = "24")] size: &'static str) -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn zap_icon(size: &'static str) -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -253,8 +260,8 @@ pub mod icons {
     }
 
     /// Shield icon for security
-    #[component]
-    pub fn ShieldIcon(#[prop(default = "24")] size: &'static str) -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn shield_icon(size: &'static str) -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -274,8 +281,8 @@ pub mod icons {
     }
 
     /// Network icon for overlay networks
-    #[component]
-    pub fn NetworkIcon(#[prop(default = "24")] size: &'static str) -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn network_icon(size: &'static str) -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -303,8 +310,8 @@ pub mod icons {
     }
 
     /// Hammer icon for builder
-    #[component]
-    pub fn HammerIcon(#[prop(default = "24")] size: &'static str) -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn hammer_icon(size: &'static str) -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -326,8 +333,8 @@ pub mod icons {
     }
 
     /// Arrow right icon
-    #[component]
-    pub fn ArrowRightIcon(#[prop(default = "18")] size: &'static str) -> impl IntoView {
+    #[must_use = "returns an SVG view that should be rendered"]
+    pub fn arrow_right_icon(size: &'static str) -> impl IntoView {
         view! {
             <svg
                 xmlns="http://www.w3.org/2000/svg"
@@ -363,6 +370,7 @@ pub enum Theme {
 
 impl Theme {
     /// Get the next theme in the cycle
+    #[must_use = "returns the next theme in the cycle without modifying self"]
     pub fn next(self) -> Self {
         match self {
             Theme::Light => Theme::Dark,
@@ -372,6 +380,7 @@ impl Theme {
     }
 
     /// Get display name for the theme
+    #[must_use = "returns the display name string"]
     pub fn display_name(self) -> &'static str {
         match self {
             Theme::Light => "Light",
@@ -381,6 +390,7 @@ impl Theme {
     }
 
     /// Convert to string for storage
+    #[must_use = "returns the storage string representation"]
     pub fn to_storage_string(self) -> &'static str {
         match self {
             Theme::Light => "light",
@@ -390,6 +400,7 @@ impl Theme {
     }
 
     /// Parse from storage string
+    #[must_use = "returns the parsed Theme value"]
     pub fn from_storage_string(s: &str) -> Self {
         match s {
             "light" => Theme::Light,
@@ -404,6 +415,8 @@ impl Theme {
 // =============================================================================
 
 /// Main application component
+// Component functions are called by the Leptos framework, must_use doesn't apply
+#[allow(clippy::must_use_candidate)]
 #[component]
 pub fn App() -> impl IntoView {
     // Create theme signal and provide it as context
@@ -487,6 +500,7 @@ fn NotFound() -> impl IntoView {
 // =============================================================================
 
 /// Generate CSS for the application
+#[must_use = "returns the CSS stylesheet content"]
 pub fn app_css() -> &'static str {
     include_str!("styles.css")
 }

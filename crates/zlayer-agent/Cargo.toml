@@ -14,6 +14,7 @@ readme = "README.md"
 default = []
 docker = ["bollard"]
 wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
+s3 = ["zlayer-init-actions/s3", "zlayer-registry/s3"]
 
 [dependencies]
 async-trait.workspace = true
@@ -57,9 +58,9 @@ futures-util.workspace = true
 # - async: Tokio integration for async execution
 # - cranelift: JIT compilation backend
 # - component-model: WASIp2 component model support
-wasmtime = { version = "29", default-features = false, features = ["async", "cranelift", "component-model"], optional = true }
-wasmtime-wasi = { version = "29", default-features = false, features = ["preview1"], optional = true }
-wasmtime-wasi-http = { version = "29", default-features = false, optional = true }
+wasmtime = { version = "41", default-features = false, features = ["async", "cranelift", "component-model"], optional = true }
+wasmtime-wasi = { version = "41", optional = true }
+wasmtime-wasi-http = { version = "41", optional = true }
 
 [dev-dependencies]
 rand = "0.9"

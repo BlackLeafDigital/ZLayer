@@ -1,4 +1,4 @@
-//! Reusable UI components for ZLayer web interface
+//! Reusable UI components for `ZLayer` web interface
 
 mod code_editor;
 mod footer;
