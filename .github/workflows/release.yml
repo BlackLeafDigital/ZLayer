@@ -1,34 +1,31 @@
 name: Release
 
 on:
+  push:
+    tags:
+      - 'v*'
+      - 'major-v*'
   workflow_dispatch:
     inputs:
       version:
         description: 'Version tag (e.g., v0.1.0)'
         required: true
-        type: string
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  # ===========================================
-  # E2E Tests (runs on push to main)
-  # ===========================================
   e2e-tests:
     name: E2E Tests (Youki)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-action@stable
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo registry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
@@ -36,13 +33,9 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Login to Docker Hub
         uses: docker/login-action@v3
@@ -52,15 +45,12 @@ jobs:
 
       - name: Setup E2E environment
         run: |
-          # Clean up any leftover state from previous runs
           sudo rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
-          # Create test directories (must match E2E_TEST_DIR in youki_e2e.rs)
           mkdir -p /tmp/zlayer-youki-e2e-test/{state,rootfs,bundles,cache}
 
       - name: Run E2E tests
         run: sudo -E env "PATH=$PATH" cargo test --package zlayer-agent --test youki_e2e -- --nocapture
         env:
-          RUST_BACKTRACE: 1
           RUST_LOG: debug
 
       - name: Cleanup
@@ -69,46 +59,77 @@ jobs:
           sudo rm -rf /var/lib/zlayer/* 2>/dev/null || true
           rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
 
-  # ===========================================
-  # Release (manual trigger only)
-  # ===========================================
+  wasm-e2e-tests:
+    name: E2E Tests (WASM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-action@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - name: Run WASM E2E tests
+        run: cargo test --package zlayer-agent --features wasm wasm_e2e -- --nocapture
+        env:
+          RUST_LOG: debug
+
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: e2e-tests
+    needs: [e2e-tests, wasm-e2e-tests]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.version }}
+          ref: ${{ github.ref_name }}
 
-      - name: Download artifacts from Forgejo
-        env:
-          VERSION: ${{ inputs.version }}
+      - name: Extract version
+        id: version
+        run: |
+          TAG="${{ github.ref_name }}"
+          VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download all artifacts from Forgejo
         run: |
           mkdir -p artifacts
+          VERSION="${{ steps.version.outputs.version }}"
           BASE_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
 
           for arch in amd64 arm64; do
             echo "Downloading zlayer-linux-${arch}.tar.gz..."
-            curl -fsSL "${BASE_URL}/zlayer-linux-${arch}.tar.gz" -o "artifacts/zlayer-${VERSION}-linux-${arch}.tar.gz"
+            curl -fsSL "${BASE_URL}/zlayer-linux-${arch}.tar.gz" \
+              -o "artifacts/zlayer-${VERSION}-linux-${arch}.tar.gz"
+          done
+
+          for artifact in darwin-amd64 darwin-arm64; do
+            echo "Downloading zlayer-${artifact}.tar.gz..."
+            curl -fsSL "${BASE_URL}/zlayer-${artifact}.tar.gz" \
+              -o "artifacts/zlayer-${VERSION}-${artifact}.tar.gz" || echo "macOS ${artifact} not available yet"
           done
 
           ls -la artifacts/
 
-      - name: Delete existing GitHub release if exists
+      - name: Delete existing release if exists
         env:
           GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
-          VERSION: ${{ inputs.version }}
         run: |
-          # Delete existing release if it exists (ignore errors if not found)
-          gh release delete "${VERSION}" --yes --cleanup-tag=false 2>/dev/null || echo "No existing release to delete"
+          gh release delete "${{ github.ref_name }}" --yes --cleanup-tag=false 2>/dev/null || echo "No existing release"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ inputs.version }}
-          name: ZLayer ${{ inputs.version }}
+          tag_name: ${{ github.ref_name }}
+          name: ZLayer ${{ steps.version.outputs.version }}
           files: artifacts/*.tar.gz
           generate_release_notes: true
         env:

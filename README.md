@@ -649,6 +649,68 @@ cargo build --release --features "docker,wasm"
 
 For detailed WASM implementation documentation, see [WASM_DONE.md](./WASM_DONE.md).
 
+## Runtime Modes
+
+ZLayer supports multiple container runtime backends:
+
+### Youki Runtime (Default on Linux)
+Direct container management via libcontainer - no daemon required. Optimal performance with minimal overhead.
+
+### Docker Runtime (Cross-Platform)
+Uses the Docker daemon via bollard for cross-platform support (macOS, Windows, Linux). Enable with the `docker` feature:
+
+```bash
+# Build with Docker runtime support
+cargo build --release --features docker
+
+# Or build with all runtimes
+cargo build --release --features "docker,wasm"
+```
+
+**Runtime Selection**:
+- Linux: Prefers youki, falls back to Docker if unavailable
+- macOS/Windows: Uses Docker automatically
+
+### WASM Runtime
+WebAssembly workloads via wasmtime. See [WebAssembly Support](#webassembly-support).
+
+| Runtime | Platform | Daemon Required | Use Case |
+|---------|----------|-----------------|----------|
+| Youki | Linux only | No | Production (optimal) |
+| Docker | All | Yes | Development, cross-platform |
+| WASM | All | No | Lightweight, portable workloads |
+
+## GitHub Action
+
+ZLayer is available as a GitHub Action for CI/CD workflows:
+
+```yaml
+- uses: BlackLeafDigital/ZLayer@v1
+  with:
+    command: wasm build .
+```
+
+### Quick Examples
+
+```yaml
+# Build WASM plugin
+- uses: BlackLeafDigital/ZLayer@v1
+  with:
+    command: wasm build --language rust --target wasip2
+
+# Push to registry
+- uses: BlackLeafDigital/ZLayer@v1
+  with:
+    command: wasm push ./handler.wasm ghcr.io/myorg/handler:latest
+
+# Validate deployment spec
+- uses: BlackLeafDigital/ZLayer@v1
+  with:
+    command: validate deployment.yaml
+```
+
+See [ACTION.md](./ACTION.md) for full documentation and examples.
+
 ## Observability
 
 ZLayer includes built-in observability with Prometheus metrics and OpenTelemetry tracing.
