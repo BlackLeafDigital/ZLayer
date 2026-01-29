@@ -49,6 +49,8 @@ pub struct YoukiConfig {
     pub volume_dir: PathBuf,
     /// Use systemd cgroups
     pub use_systemd: bool,
+    /// Cache type configuration (if None, determined from environment)
+    pub cache_type: Option<zlayer_registry::CacheType>,
 }
 
 impl Default for YoukiConfig {
@@ -72,6 +74,7 @@ impl Default for YoukiConfig {
             use_systemd: std::env::var("ZLAYER_USE_SYSTEMD")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(false),
+            cache_type: None,
         }
     }
 }
@@ -155,24 +158,49 @@ impl YoukiRuntime {
                 reason: format!("failed to create storage manager: {}", e),
             })?;
 
-        // Initialize shared blob cache with persistent disk storage (like Docker's /var/lib/docker/)
-        // This ensures layers are cached across process restarts and test runs
-        let cache_path = config.cache_dir.join("blobs.redb");
-        let blob_cache = zlayer_registry::PersistentBlobCache::open(&cache_path).map_err(|e| {
-            AgentError::CreateFailed {
-                id: "runtime".to_string(),
-                reason: format!("failed to open persistent blob cache: {}", e),
+        // Initialize shared blob cache using CacheType configuration
+        // If cache_type is provided, use it directly; otherwise use environment-based config
+        // but override the path for Persistent variant to use config.cache_dir
+        let blob_cache = match &config.cache_type {
+            Some(cache_type) => cache_type
+                .build()
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: "runtime".to_string(),
+                    reason: format!("failed to build blob cache: {}", e),
+                })?,
+            None => {
+                let cache_type = zlayer_registry::CacheType::from_env().map_err(|e| {
+                    AgentError::CreateFailed {
+                        id: "runtime".to_string(),
+                        reason: format!("failed to read cache config from env: {}", e),
+                    }
+                })?;
+                // Override persistent path to use config.cache_dir
+                let cache_type = match cache_type {
+                    zlayer_registry::CacheType::Persistent { .. } => {
+                        zlayer_registry::CacheType::persistent_at(
+                            config.cache_dir.join("blobs.redb"),
+                        )
+                    }
+                    other => other,
+                };
+                cache_type
+                    .build()
+                    .await
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: "runtime".to_string(),
+                        reason: format!("failed to build blob cache: {}", e),
+                    })?
             }
-        })?;
+        };
 
         Ok(Self {
             config,
             containers: RwLock::new(HashMap::new()),
             auth_resolver: zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()),
             storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
-            blob_cache: std::sync::Arc::new(
-                Box::new(blob_cache) as Box<dyn zlayer_registry::BlobCacheBackend>
-            ),
+            blob_cache,
         })
     }
 
@@ -208,24 +236,49 @@ impl YoukiRuntime {
                 reason: format!("failed to create storage manager: {}", e),
             })?;
 
-        // Initialize shared blob cache with persistent disk storage (like Docker's /var/lib/docker/)
-        // This ensures layers are cached across process restarts and test runs
-        let cache_path = config.cache_dir.join("blobs.redb");
-        let blob_cache = zlayer_registry::PersistentBlobCache::open(&cache_path).map_err(|e| {
-            AgentError::CreateFailed {
-                id: "runtime".to_string(),
-                reason: format!("failed to open persistent blob cache: {}", e),
+        // Initialize shared blob cache using CacheType configuration
+        // If cache_type is provided, use it directly; otherwise use environment-based config
+        // but override the path for Persistent variant to use config.cache_dir
+        let blob_cache = match &config.cache_type {
+            Some(cache_type) => cache_type
+                .build()
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: "runtime".to_string(),
+                    reason: format!("failed to build blob cache: {}", e),
+                })?,
+            None => {
+                let cache_type = zlayer_registry::CacheType::from_env().map_err(|e| {
+                    AgentError::CreateFailed {
+                        id: "runtime".to_string(),
+                        reason: format!("failed to read cache config from env: {}", e),
+                    }
+                })?;
+                // Override persistent path to use config.cache_dir
+                let cache_type = match cache_type {
+                    zlayer_registry::CacheType::Persistent { .. } => {
+                        zlayer_registry::CacheType::persistent_at(
+                            config.cache_dir.join("blobs.redb"),
+                        )
+                    }
+                    other => other,
+                };
+                cache_type
+                    .build()
+                    .await
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: "runtime".to_string(),
+                        reason: format!("failed to build blob cache: {}", e),
+                    })?
             }
-        })?;
+        };
 
         Ok(Self {
             config,
             containers: RwLock::new(HashMap::new()),
             auth_resolver: zlayer_core::AuthResolver::new(auth_config),
             storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
-            blob_cache: std::sync::Arc::new(
-                Box::new(blob_cache) as Box<dyn zlayer_registry::BlobCacheBackend>
-            ),
+            blob_cache,
         })
     }
 
@@ -1656,6 +1709,7 @@ mod tests {
         assert_eq!(config.cache_dir, PathBuf::from(DEFAULT_CACHE_DIR));
         assert_eq!(config.volume_dir, PathBuf::from("/var/lib/zlayer/volumes"));
         assert!(!config.use_systemd);
+        assert!(config.cache_type.is_none());
     }
 
     #[test]
@@ -1754,6 +1808,7 @@ mod tests {
             cache_dir: PathBuf::from("/custom/cache"),
             volume_dir: PathBuf::from("/custom/volumes"),
             use_systemd: true,
+            cache_type: Some(zlayer_registry::CacheType::memory()),
         };
 
         let cloned = config.clone();
@@ -1764,6 +1819,7 @@ mod tests {
         assert_eq!(cloned.cache_dir, config.cache_dir);
         assert_eq!(cloned.volume_dir, config.volume_dir);
         assert_eq!(cloned.use_systemd, config.use_systemd);
+        assert!(cloned.cache_type.is_some());
     }
 
     /// Test that YoukiRuntime::new() creates directories

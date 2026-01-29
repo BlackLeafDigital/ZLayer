@@ -47,6 +47,9 @@ pub struct WasmConfig {
     pub epoch_deadline: u64,
     /// Maximum execution time for WASM modules
     pub max_execution_time: Duration,
+    /// Optional cache type configuration for blob storage
+    /// If None, uses CacheType::from_env() with path override from cache_dir
+    pub cache_type: Option<zlayer_registry::CacheType>,
 }
 
 impl Default for WasmConfig {
@@ -58,6 +61,7 @@ impl Default for WasmConfig {
             enable_epochs: true,
             epoch_deadline: 1_000_000, // 1M instructions before yield check
             max_execution_time: Duration::from_secs(3600), // 1 hour default
+            cache_type: None,
         }
     }
 }
@@ -163,16 +167,40 @@ impl WasmRuntime {
             reason: format!("failed to create wasmtime engine: {}", e),
         })?;
 
-        // Create blob cache for registry
-        let cache_path = config.cache_dir.join("blobs.redb");
-        let cache = zlayer_registry::BlobCache::open(&cache_path).map_err(|e| {
-            AgentError::CreateFailed {
-                id: "wasm-runtime".to_string(),
-                reason: format!("failed to open blob cache: {}", e),
+        // Create blob cache for registry using new CacheType configuration
+        let blob_cache = match &config.cache_type {
+            Some(cache_type) => cache_type
+                .build()
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: "wasm-runtime".to_string(),
+                    reason: format!("failed to open blob cache: {}", e),
+                })?,
+            None => {
+                // Use environment-based configuration, but override path if Persistent
+                let cache_type = zlayer_registry::CacheType::from_env().map_err(|e| {
+                    AgentError::CreateFailed {
+                        id: "wasm-runtime".to_string(),
+                        reason: format!("failed to configure blob cache from env: {}", e),
+                    }
+                })?;
+                let cache_type = match cache_type {
+                    zlayer_registry::CacheType::Persistent { .. } => {
+                        zlayer_registry::CacheType::persistent_at(config.cache_dir.clone())
+                    }
+                    other => other,
+                };
+                cache_type
+                    .build()
+                    .await
+                    .map_err(|e| AgentError::CreateFailed {
+                        id: "wasm-runtime".to_string(),
+                        reason: format!("failed to open blob cache: {}", e),
+                    })?
             }
-        })?;
+        };
 
-        let registry = Arc::new(zlayer_registry::ImagePuller::new(cache));
+        let registry = Arc::new(zlayer_registry::ImagePuller::with_cache(blob_cache));
 
         tracing::info!("WASM runtime initialized with wasmtime");
 
@@ -1089,6 +1117,7 @@ mod tests {
         assert!(config.enable_epochs);
         assert_eq!(config.epoch_deadline, 1_000_000);
         assert_eq!(config.max_execution_time, Duration::from_secs(3600));
+        assert!(config.cache_type.is_none());
     }
 
     #[test]
@@ -1144,6 +1173,7 @@ mod tests {
             enable_epochs: false,
             epoch_deadline: 500_000,
             max_execution_time: Duration::from_secs(60),
+            cache_type: Some(zlayer_registry::CacheType::Memory),
         };
 
         let cloned = config.clone();
@@ -1152,5 +1182,6 @@ mod tests {
         assert_eq!(cloned.enable_epochs, config.enable_epochs);
         assert_eq!(cloned.epoch_deadline, config.epoch_deadline);
         assert_eq!(cloned.max_execution_time, config.max_execution_time);
+        assert!(cloned.cache_type.is_some());
     }
 }

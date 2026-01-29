@@ -9,6 +9,7 @@
 //! - `local` - Enable local OCI registry for storing built images
 
 pub mod cache;
+pub mod cache_config;
 pub mod client;
 pub mod error;
 pub mod unpack;
@@ -30,6 +31,7 @@ pub mod oci_export;
 pub mod wasm_export;
 
 pub use cache::*;
+pub use cache_config::CacheType;
 pub use client::*;
 pub use error::*;
 pub use unpack::*;
