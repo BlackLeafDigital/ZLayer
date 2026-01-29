@@ -98,6 +98,7 @@ fn create_test_config(cache_dir: &TempDir) -> WasmConfig {
         enable_epochs: true,
         epoch_deadline: 100_000,
         max_execution_time: Duration::from_secs(10), // Short timeout for tests
+        cache_type: None,
     }
 }
 
@@ -1036,6 +1037,7 @@ mod runtime_config_tests {
             enable_epochs: true,
             epoch_deadline: 100_000,
             max_execution_time: Duration::from_secs(10),
+            cache_type: None,
         };
 
         let runtime = WasmRuntime::new(config).await;
@@ -1051,6 +1053,7 @@ mod runtime_config_tests {
             enable_epochs: false, // Disabled
             epoch_deadline: 100_000,
             max_execution_time: Duration::from_secs(10),
+            cache_type: None,
         };
 
         let runtime = Arc::new(
@@ -1091,6 +1094,7 @@ mod runtime_config_tests {
             enable_epochs: false,
             epoch_deadline: 500_000,
             max_execution_time: Duration::from_secs(120),
+            cache_type: None,
         };
 
         let cloned = config.clone();

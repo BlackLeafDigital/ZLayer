@@ -1835,6 +1835,7 @@ mod tests {
             cache_dir: temp_base.join("cache"),
             volume_dir: temp_base.join("volumes"),
             use_systemd: false,
+            cache_type: None,
         };
 
         // Clean up any previous test run

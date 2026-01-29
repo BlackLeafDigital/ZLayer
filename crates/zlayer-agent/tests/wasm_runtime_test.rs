@@ -180,6 +180,7 @@ fn create_test_config(cache_dir: &TempDir) -> WasmConfig {
         enable_epochs: true,
         epoch_deadline: 100_000,
         max_execution_time: Duration::from_secs(30),
+        cache_type: None,
     }
 }
 
@@ -295,6 +296,7 @@ mod config_tests {
             enable_epochs: false,
             epoch_deadline: 500_000,
             max_execution_time: Duration::from_secs(60),
+            cache_type: None,
         };
 
         assert_eq!(config.cache_dir, PathBuf::from("/custom/path"));
@@ -310,6 +312,7 @@ mod config_tests {
             enable_epochs: true,
             epoch_deadline: 100_000,
             max_execution_time: Duration::from_secs(120),
+            cache_type: None,
         };
 
         let cloned = config.clone();
@@ -418,6 +421,7 @@ mod runtime_creation_tests {
             enable_epochs: true,
             epoch_deadline: 100_000,
             max_execution_time: Duration::from_secs(30),
+            cache_type: None,
         };
 
         let runtime = WasmRuntime::new(config).await;

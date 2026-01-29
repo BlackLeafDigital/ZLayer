@@ -157,6 +157,7 @@ async fn create_e2e_runtime() -> Result<YoukiRuntime, AgentError> {
         cache_dir: test_dir.join("cache"),
         volume_dir: test_dir.join("volumes"),
         use_systemd: false,
+        cache_type: None,
     };
     YoukiRuntime::new(config).await
 }
