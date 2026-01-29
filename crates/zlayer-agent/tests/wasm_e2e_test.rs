@@ -2140,10 +2140,7 @@ mod wasm_http_interfaces_e2e {
                 assert_eq!(e.vary.len(), 1);
                 assert!(e.vary.contains(&"Accept".to_string()));
                 assert_eq!(e.ttl(), Duration::from_secs(600));
-                assert_eq!(
-                    e.stale_while_revalidate(),
-                    Some(Duration::from_secs(60))
-                );
+                assert_eq!(e.stale_while_revalidate(), Some(Duration::from_secs(60)));
             }
             _ => panic!("Expected CacheWithTags"),
         }
@@ -2472,7 +2469,10 @@ mod wasm_complete_flow_e2e {
         let new_acquired = host
             .kv_compare_and_swap("lock:resource", Some(b""), b"owner2")
             .unwrap();
-        assert!(new_acquired, "New lock acquisition should succeed after release");
+        assert!(
+            new_acquired,
+            "New lock acquisition should succeed after release"
+        );
     }
 
     /// Test plugin flow with TTL-based expiration
