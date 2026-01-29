@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      # Crate-specific releases (direct tag push is fine)
       - 'spec-v*'
       - 'core-v*'
       - 'registry-v*'
@@ -19,7 +19,16 @@ on:
       - 'go-sdk-v*'
       - 'c-sdk-v*'
       - 'docker-v*'
-      - 'major-v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v1.0.0)'
+        required: true
+        type: string
+      sha:
+        description: 'Commit SHA for the release'
+        required: true
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
