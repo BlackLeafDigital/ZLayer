@@ -62,3 +62,4 @@ tempfile = "3"
 
 [features]
 persistent = ["redb"]
+test-skip-http = []

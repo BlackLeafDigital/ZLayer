@@ -249,46 +249,60 @@ impl Scheduler {
     ///
     /// This sends a scaling request to the agent to actually start/stop containers.
     async fn execute_scaling_on_agent(&self, service: &str, replicas: u32) -> Result<()> {
-        let url = format!("{}/api/v1/internal/scale", self.agent_base_url);
-
-        debug!(
-            service = service,
-            replicas = replicas,
-            url = %url,
-            "Sending scaling request to agent"
-        );
-
-        let response = self
-            .http_client
-            .post(&url)
-            .header("X-ZLayer-Internal-Token", &self.internal_token)
-            .json(&serde_json::json!({
-                "service": service,
-                "replicas": replicas
-            }))
-            .send()
-            .await
-            .map_err(|e| SchedulerError::AgentCommunication(e.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "unknown".to_string());
-            return Err(SchedulerError::AgentCommunication(format!(
-                "agent returned status {}: {}",
-                status, body
-            )));
+        // Skip HTTP calls during tests
+        #[cfg(feature = "test-skip-http")]
+        {
+            debug!(
+                service = service,
+                replicas = replicas,
+                "Test mode: skipping agent scaling call"
+            );
+            return Ok(());
         }
 
-        info!(
-            service = service,
-            replicas = replicas,
-            "Successfully sent scaling request to agent"
-        );
+        #[cfg(not(feature = "test-skip-http"))]
+        {
+            let url = format!("{}/api/v1/internal/scale", self.agent_base_url);
 
-        Ok(())
+            debug!(
+                service = service,
+                replicas = replicas,
+                url = %url,
+                "Sending scaling request to agent"
+            );
+
+            let response = self
+                .http_client
+                .post(&url)
+                .header("X-ZLayer-Internal-Token", &self.internal_token)
+                .json(&serde_json::json!({
+                    "service": service,
+                    "replicas": replicas
+                }))
+                .send()
+                .await
+                .map_err(|e| SchedulerError::AgentCommunication(e.to_string()))?;
+
+            if !response.status().is_success() {
+                let status = response.status();
+                let body = response
+                    .text()
+                    .await
+                    .unwrap_or_else(|_| "unknown".to_string());
+                return Err(SchedulerError::AgentCommunication(format!(
+                    "agent returned status {}: {}",
+                    status, body
+                )));
+            }
+
+            info!(
+                service = service,
+                replicas = replicas,
+                "Successfully sent scaling request to agent"
+            );
+
+            Ok(())
+        }
     }
 
     /// Apply a scaling decision
