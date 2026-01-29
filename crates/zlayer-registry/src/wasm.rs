@@ -1223,7 +1223,7 @@ mod tests {
     fn test_extract_wasm_binary_info_truncated_at_various_lengths() {
         // Test truncation at each byte position up to 7
         for len in 0..WASM_MIN_SIZE {
-            let bytes = vec![0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+            let bytes = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
             let truncated = &bytes[..len];
             let result = extract_wasm_binary_info(truncated);
             assert!(

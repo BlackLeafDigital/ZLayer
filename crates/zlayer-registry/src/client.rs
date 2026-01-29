@@ -1882,7 +1882,6 @@ mod tests {
         // 4. Push manifest
         //
         // This is enforced by the push_wasm method which pushes blobs first.
-        assert!(true);
     }
 
     #[test]
@@ -1899,7 +1898,6 @@ mod tests {
         // 1. Parse reference
         // 2. Authenticate for push operation
         // 3. Push manifest
-        assert!(true);
     }
 
     #[test]

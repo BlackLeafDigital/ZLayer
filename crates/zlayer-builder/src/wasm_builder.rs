@@ -976,11 +976,11 @@ mod tests {
         #[test]
         fn test_clone() {
             let lang = WasmLanguage::Rust;
-            let cloned = lang.clone();
+            let cloned = lang;
             assert_eq!(lang, cloned);
 
             let lang = WasmLanguage::Python;
-            let cloned = lang.clone();
+            let cloned = lang;
             assert_eq!(lang, cloned);
         }
 
@@ -1093,11 +1093,11 @@ mod tests {
         #[test]
         fn test_clone() {
             let target = WasiTarget::Preview1;
-            let cloned = target.clone();
+            let cloned = target;
             assert_eq!(target, cloned);
 
             let target = WasiTarget::Preview2;
-            let cloned = target.clone();
+            let cloned = target;
             assert_eq!(target, cloned);
         }
 
