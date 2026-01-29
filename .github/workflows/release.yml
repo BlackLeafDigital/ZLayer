@@ -1,7 +1,5 @@
 name: Release
 
-# Only triggered by Forgejo CI (repository_dispatch) or manual dispatch
-# Tag pushes are handled by Forgejo - GitHub auto-syncs from main so we avoid double runs
 on:
   repository_dispatch:
     types: [create-release]
@@ -10,6 +8,9 @@ on:
       version:
         description: 'Version tag (e.g., v0.1.0)'
         required: true
+      sha:
+        description: 'Commit SHA'
+        required: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -17,7 +18,7 @@ env:
 
 jobs:
   # ===========================================
-  # Determine version from various triggers
+  # Setup and check if release exists
   # ===========================================
   setup:
     name: Setup Release
@@ -31,20 +32,13 @@ jobs:
         id: get-version
         run: |
           if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
-            # Triggered by Forgejo CI
             VERSION="${{ github.event.client_payload.version }}"
             SHA="${{ github.event.client_payload.sha }}"
-            echo "Triggered by Forgejo CI for version ${VERSION}"
-          elif [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            # Manual trigger
-            VERSION="${{ github.event.inputs.version }}"
-            SHA="${{ github.sha }}"
-            echo "Manual trigger for version ${VERSION}"
+            echo "Triggered by E2E workflow for version ${VERSION}"
           else
-            # Tag push
-            VERSION="${{ github.ref_name }}"
-            SHA="${{ github.sha }}"
-            echo "Tag push trigger for version ${VERSION}"
+            VERSION="${{ inputs.version }}"
+            SHA="${{ inputs.sha || github.sha }}"
+            echo "Manual trigger for version ${VERSION}"
           fi
 
           echo "version=${VERSION}" >> $GITHUB_OUTPUT
@@ -70,81 +64,13 @@ jobs:
             echo "skip=false" >> $GITHUB_OUTPUT
           fi
 
-  e2e-tests:
-    name: E2E Tests (Youki)
-    runs-on: ubuntu-latest
-    needs: setup
-    if: needs.setup.outputs.skip_release != 'true'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
-        with:
-          components: rustfmt, clippy
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
-
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: zachhandley
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
-      - name: Setup E2E environment
-        run: |
-          sudo rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
-          mkdir -p /tmp/zlayer-youki-e2e-test/{state,rootfs,bundles,cache}
-
-      - name: Run E2E tests
-        run: sudo -E env "PATH=$PATH" cargo test --package zlayer-agent --test youki_e2e -- --nocapture
-        env:
-          RUST_LOG: debug
-
-      - name: Cleanup
-        if: always()
-        run: |
-          sudo rm -rf /var/lib/zlayer/* 2>/dev/null || true
-          rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
-
-  wasm-e2e-tests:
-    name: E2E Tests (WASM)
-    runs-on: ubuntu-latest
-    needs: setup
-    if: needs.setup.outputs.skip_release != 'true'
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Run WASM E2E tests
-        run: cargo test --package zlayer-agent --features wasm wasm_e2e -- --nocapture
-        env:
-          RUST_LOG: debug
-
+  # ===========================================
+  # Create GitHub Release
+  # ===========================================
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [setup, e2e-tests, wasm-e2e-tests]
+    needs: setup
     if: needs.setup.outputs.skip_release != 'true'
     steps:
       - uses: actions/checkout@v4
@@ -168,7 +94,7 @@ jobs:
           for arch in amd64 arm64; do
             echo "Downloading zlayer-linux-${arch}.tar.gz..."
             curl -fsSL "${BASE_URL}/zlayer-linux-${arch}.tar.gz" \
-              -o "artifacts/zlayer-${VERSION}-linux-${arch}.tar.gz"
+              -o "artifacts/zlayer-${VERSION}-linux-${arch}.tar.gz" || echo "Linux ${arch} not available yet"
           done
 
           for artifact in darwin-amd64 darwin-arm64; do
@@ -195,7 +121,7 @@ jobs:
           body: |
             ## Release ${{ steps.version.outputs.version }}
 
-            This release was automatically created after CI tests passed on [Forgejo](https://forge.blackleafdigital.com/BlackLeafDigital/ZLayer).
+            This release was automatically created after E2E tests passed.
 
             See the [CHANGELOG](https://github.com/zachhandley/ZLayer/blob/main/CHANGELOG.md) for details.
         env:

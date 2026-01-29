@@ -4,21 +4,10 @@ on:
   push:
     branches: [main, dev]
     tags:
-      - 'v*'  # Run full test suite on version tags
+      - 'v*'
   pull_request:
     branches: [main, dev]
   workflow_dispatch:
-    inputs:
-      run_e2e:
-        description: 'Run E2E tests'
-        required: false
-        type: boolean
-        default: false
-      trigger_release:
-        description: 'Trigger GitHub release after tests pass'
-        required: false
-        type: boolean
-        default: false
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -225,341 +214,29 @@ jobs:
         run: cargo test --package runtime ${{ matrix.features }}
 
   # ===========================================
-  # E2E Tests (Youki/libcontainer)
+  # Trigger E2E Tests
   # ===========================================
-  e2e-tests:
-    name: E2E Tests (Youki)
+  trigger-e2e:
+    name: Trigger E2E
     runs-on: ubuntu-latest
-    needs: test
-    # Run on: main branch, version tags, explicit [e2e] in commit, or manual trigger
-    if: |
-      github.ref == 'refs/heads/main' ||
-      startsWith(github.ref, 'refs/tags/v') ||
-      contains(github.event.head_commit.message, '[e2e]') ||
-      inputs.run_e2e
-    # Run directly on host (no container) to avoid nested container issues
+    needs: [build, feature-tests]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
-        with:
-          mode: restore
-          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
-          bucket: ${{ secrets.S3_BUCKET }}
-          endpoint: https://${{ secrets.S3_ENDPOINT }}
-          region: ${{ secrets.S3_REGION }}
-          access-key: ${{ secrets.S3_ACCESS_KEY }}
-          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
-
-      - name: Login to Docker Hub
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u zachhandley --password-stdin
-
-      - name: Setup E2E environment
-        run: |
-          # Clean up any leftover state from previous runs
-          sudo rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
-          # Create test directories (must match E2E_TEST_DIR in youki_e2e.rs)
-          mkdir -p /tmp/zlayer-youki-e2e-test/{state,rootfs,bundles,cache}
-
-      - name: Run E2E tests
-        run: sudo -E env "PATH=$PATH" cargo test --package agent --test youki_e2e -- --nocapture
-        env:
-          RUST_BACKTRACE: 1
-          RUST_LOG: debug
-
-      - name: Cleanup
-        if: always()
-        run: |
-          sudo rm -rf /var/lib/zlayer/* 2>/dev/null || true
-          rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
-
-  # ===========================================
-  # E2E Tests (WASM)
-  # ===========================================
-  wasm-e2e-tests:
-    name: E2E Tests (WASM)
-    runs-on: ubuntu-latest
-    needs: test
-    # Run on: main branch, version tags, explicit [e2e] in commit, or manual trigger
-    if: |
-      github.ref == 'refs/heads/main' ||
-      startsWith(github.ref, 'refs/tags/v') ||
-      contains(github.event.head_commit.message, '[e2e]') ||
-      inputs.run_e2e
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
-
-      - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
-
-      - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
-        with:
-          mode: restore
-          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
-          bucket: ${{ secrets.S3_BUCKET }}
-          endpoint: https://${{ secrets.S3_ENDPOINT }}
-          region: ${{ secrets.S3_REGION }}
-          access-key: ${{ secrets.S3_ACCESS_KEY }}
-          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
-
-      - name: Run WASM E2E tests
-        run: cargo test --package zlayer-agent --features wasm wasm_e2e -- --nocapture
-        env:
-          RUST_BACKTRACE: 1
-          RUST_LOG: debug
-
-  # ===========================================
-  # Build & Release zlayer-web (Forgejo only)
-  # ===========================================
-  release-web:
-    name: Release zlayer-web
-    runs-on: ubuntu-latest
-    needs: [build, e2e-tests, wasm-e2e-tests]
-    # Only run on version tags
-    if: startsWith(github.ref, 'refs/tags/v')
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Extract version
+      - name: Determine version
         id: version
         run: |
-          VERSION="${{ github.ref_name }}"
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "version_number=${VERSION#v}" >> $GITHUB_OUTPUT
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
-
-      - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
-        with:
-          targets: wasm32-unknown-unknown
-
-      - name: Install cargo-leptos
-        run: cargo install cargo-leptos
-
-      - name: Build zlayer-web release
-        run: |
-          cd crates/zlayer-web
-          cargo leptos build --release
-
-      - name: Package zlayer-web artifact
-        run: |
-          VERSION="${{ steps.version.outputs.version }}"
-          mkdir -p dist
-
-          # Package the web assets and binary
-          tar -czvf "dist/zlayer-web-${VERSION}.tar.gz" \
-            -C target/release zlayer-web \
-            -C ../../target/site .
-
-          # Create a zlayer spec template for deploying the web UI
-          cat > "dist/zlayer-web-${VERSION}.yaml" << EOF
-          deployment: zlayer-web
-          version: "${VERSION}"
-          services:
-            web:
-              image: zlayer-web:${VERSION}
-              replicas: 1
-              ports:
-                - "3000:3000"
-              environment:
-                ZLAYER_WEB_ADDR: "0.0.0.0:3000"
-              health_check:
-                endpoint: /
-                interval: 30s
-                timeout: 5s
-          EOF
-
-      - name: Upload to Forgejo Packages
-        env:
-          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version_number }}
-        run: |
-          # Upload web artifact
-          curl -X PUT \
-            -H "Authorization: token ${FORGEJO_TOKEN}" \
-            -T "dist/zlayer-web-${{ steps.version.outputs.version }}.tar.gz" \
-            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-web/${VERSION}/zlayer-web-${VERSION}.tar.gz"
-
-          # Upload zlayer spec template
-          curl -X PUT \
-            -H "Authorization: token ${FORGEJO_TOKEN}" \
-            -T "dist/zlayer-web-${{ steps.version.outputs.version }}.yaml" \
-            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-web/${VERSION}/zlayer-web-${VERSION}.yaml"
-
-      - name: Build and push container image
-        env:
-          FORGEJO_TOKEN: ${{ secrets.FORGEJO_TOKEN }}
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          # Build container image
-          docker build -t forge.blackleafdigital.com/blackleafdigital/zlayer-web:${VERSION} \
-            -t forge.blackleafdigital.com/blackleafdigital/zlayer-web:latest \
-            -f crates/zlayer-web/Dockerfile .
-
-          # Login to Forgejo container registry
-          echo "${FORGEJO_TOKEN}" | docker login forge.blackleafdigital.com -u zachhandley --password-stdin
-
-          # Push images
-          docker push forge.blackleafdigital.com/blackleafdigital/zlayer-web:${VERSION}
-          docker push forge.blackleafdigital.com/blackleafdigital/zlayer-web:latest
-
-      - name: Summary
-        run: |
-          echo "## zlayer-web Release" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: ${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Artifact**: zlayer-web-${{ steps.version.outputs.version }}.tar.gz" >> $GITHUB_STEP_SUMMARY
-          echo "- **Template**: zlayer-web-${{ steps.version.outputs.version }}.yaml" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image**: forge.blackleafdigital.com/blackleafdigital/zlayer-web:${{ steps.version.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-
-  # ===========================================
-  # Trigger GitHub Release
-  # ===========================================
-  trigger-release:
-    name: Trigger GitHub Release
-    runs-on: ubuntu-latest
-    needs: [build, feature-tests, e2e-tests, wasm-e2e-tests]
-    # Only run on version tags (from any branch) or manual trigger with trigger_release
-    # The tag push to GitHub will trigger the release workflow there
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.trigger_release
-    outputs:
-      release_needed: ${{ steps.check-release.outputs.release_needed }}
-      tag_needed: ${{ steps.check-release.outputs.tag_needed }}
-      version: ${{ steps.check-release.outputs.version }}
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Extract version from tag
-        id: get-version
-        run: |
           if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            VERSION="${{ github.ref_name }}"
+            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           else
-            # Get latest tag if not triggered by tag
-            VERSION=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          fi
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "Detected version: ${VERSION}"
-
-      - name: Check GitHub release status
-        id: check-release
-        env:
-          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
-          VERSION: ${{ steps.get-version.outputs.version }}
-        run: |
-          REPO="zachhandley/ZLayer"
-
-          echo "Checking release status for ${VERSION} on GitHub..."
-
-          # Check if tag exists on GitHub
-          TAG_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${REPO}/git/refs/tags/${VERSION}")
-
-          # Check if release exists on GitHub
-          RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${REPO}/releases/tags/${VERSION}")
-
-          echo "Tag exists response: ${TAG_EXISTS}"
-          echo "Release exists response: ${RELEASE_EXISTS}"
-
-          # Determine what actions are needed
-          if [[ "${RELEASE_EXISTS}" == "200" ]]; then
-            echo "Release ${VERSION} already exists on GitHub. Skipping."
-            echo "release_needed=false" >> $GITHUB_OUTPUT
-            echo "tag_needed=false" >> $GITHUB_OUTPUT
-          elif [[ "${TAG_EXISTS}" != "200" ]]; then
-            echo "Tag ${VERSION} does not exist on GitHub. Will create tag and release."
-            echo "release_needed=true" >> $GITHUB_OUTPUT
-            echo "tag_needed=true" >> $GITHUB_OUTPUT
-          else
-            echo "Tag exists but release does not. Will create release."
-            echo "release_needed=true" >> $GITHUB_OUTPUT
-            echo "tag_needed=false" >> $GITHUB_OUTPUT
+            echo "version=" >> $GITHUB_OUTPUT
           fi
 
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-
-      - name: Push tag to GitHub (if needed)
-        if: steps.check-release.outputs.tag_needed == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
-          VERSION: ${{ steps.check-release.outputs.version }}
+      - name: Trigger E2E workflow
         run: |
-          REPO="zachhandley/ZLayer"
-          COMMIT_SHA="${{ github.sha }}"
-
-          echo "Creating tag ${VERSION} on GitHub pointing to ${COMMIT_SHA}..."
-
-          # Create the tag reference on GitHub
           curl -X POST \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${REPO}/git/refs" \
-            -d "{\"ref\": \"refs/tags/${VERSION}\", \"sha\": \"${COMMIT_SHA}\"}"
-
-          echo "Tag ${VERSION} created on GitHub."
-
-      - name: Trigger GitHub release workflow
-        if: steps.check-release.outputs.release_needed == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
-          VERSION: ${{ steps.check-release.outputs.version }}
-        run: |
-          REPO="zachhandley/ZLayer"
-
-          echo "Triggering release workflow on GitHub for ${VERSION}..."
-
-          # Trigger the release workflow via repository_dispatch
-          curl -X POST \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${REPO}/dispatches" \
-            -d "{\"event_type\": \"create-release\", \"client_payload\": {\"version\": \"${VERSION}\", \"sha\": \"${{ github.sha }}\", \"forgejo_run_id\": \"${{ github.run_id }}\"}}"
-
-          echo "Release workflow triggered on GitHub for ${VERSION}."
-
-      - name: Summary
-        run: |
-          echo "## Release Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: ${{ steps.check-release.outputs.version }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Tag needed**: ${{ steps.check-release.outputs.tag_needed }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Release needed**: ${{ steps.check-release.outputs.release_needed }}" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ steps.check-release.outputs.release_needed }}" == "true" ]]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "✅ Release workflow triggered on GitHub" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "ℹ️ No release action needed" >> $GITHUB_STEP_SUMMARY
-          fi
+            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/e2e.yml/dispatches" \
+            -d '{"ref": "${{ github.ref }}", "inputs": {"version": "${{ steps.version.outputs.version }}", "sha": "${{ github.sha }}"}}'
 
   # ===========================================
   # Cache Cleanup
