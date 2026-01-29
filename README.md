@@ -140,17 +140,17 @@ sudo pacman -S libseccomp
 curl -fsSL https://zlayer.dev/install.sh | bash
 ```
 
-### From Package Registry
+### From GitHub Releases
 
 Download the latest release for your architecture:
 
 ```bash
 # For amd64 (latest)
-curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/latest/zlayer-linux-amd64.tar.gz | tar xz
+curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-linux-amd64.tar.gz | tar xz
 sudo mv zlayer /usr/local/bin/
 
 # For arm64 (latest)
-curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/latest/zlayer-linux-arm64.tar.gz | tar xz
+curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-linux-arm64.tar.gz | tar xz
 sudo mv zlayer /usr/local/bin/
 ```
 
@@ -158,7 +158,7 @@ Or pin to a specific version:
 
 ```bash
 # Replace VERSION with desired version (e.g., v0.1.0)
-curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/VERSION/zlayer-linux-amd64.tar.gz | tar xz
+curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/download/VERSION/zlayer-linux-amd64.tar.gz | tar xz
 ```
 
 ### From Source
