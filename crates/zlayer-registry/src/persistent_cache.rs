@@ -66,6 +66,9 @@ fn current_timestamp() -> u64 {
         .unwrap_or(0)
 }
 
+/// Default database filename used when a directory is provided
+const DEFAULT_DB_FILENAME: &str = "blob_cache.redb";
+
 /// Persistent blob cache for OCI images backed by redb
 pub struct PersistentBlobCache {
     db: Arc<Database>,
@@ -74,16 +77,27 @@ pub struct PersistentBlobCache {
 
 impl PersistentBlobCache {
     /// Create a new persistent cache at the given path
+    ///
+    /// If `path` is a directory, the cache database will be created as
+    /// `blob_cache.redb` inside that directory. If `path` is a file path,
+    /// it will be used directly as the database file.
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, CacheError> {
         let path = path.as_ref();
 
+        // If the path is an existing directory, append the default database filename
+        let db_path = if path.is_dir() {
+            path.join(DEFAULT_DB_FILENAME)
+        } else {
+            path.to_path_buf()
+        };
+
         // Ensure parent directory exists
-        if let Some(parent) = path.parent() {
+        if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let db = Database::create(path).map_err(|e| {
-            CacheError::Database(format!("failed to open database at {:?}: {}", path, e))
+        let db = Database::create(&db_path).map_err(|e| {
+            CacheError::Database(format!("failed to open database at {:?}: {}", db_path, e))
         })?;
 
         // Initialize tables
@@ -105,7 +119,7 @@ impl PersistentBlobCache {
             .commit()
             .map_err(|e| CacheError::Database(format!("failed to commit: {}", e)))?;
 
-        info!("Opened persistent blob cache at {:?}", path);
+        info!("Opened persistent blob cache at {:?}", db_path);
 
         Ok(Self {
             db: Arc::new(db),
@@ -589,6 +603,31 @@ mod tests {
 
         let result = cache.put(wrong_digest, data);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_open_with_directory_path() {
+        // Test that opening with a directory path works (appends default filename)
+        let temp_dir = TempDir::new().unwrap();
+
+        // Pass the directory path instead of a file path
+        let cache = PersistentBlobCache::open(temp_dir.path()).unwrap();
+
+        // Verify cache works
+        let data = b"test data for directory path";
+        let digest = compute_digest(data);
+
+        cache.put(&digest, data).unwrap();
+        let retrieved = cache.get(&digest).unwrap();
+        assert_eq!(retrieved, Some(data.to_vec()));
+
+        // Verify the database file was created with the default name
+        let expected_db_path = temp_dir.path().join(DEFAULT_DB_FILENAME);
+        assert!(
+            expected_db_path.exists(),
+            "Database file should be created at {:?}",
+            expected_db_path
+        );
     }
 
     #[test]

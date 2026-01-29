@@ -1353,6 +1353,64 @@ impl Runtime for YoukiRuntime {
 
         Ok(logs)
     }
+
+    /// Get the PID of a container's main process
+    ///
+    /// Returns:
+    /// - `Ok(Some(pid))` for running containers
+    /// - `Ok(None)` if the container exists but has no PID (not running or stopped)
+    /// - `Err` if the container doesn't exist or there's an error loading it
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.get_pid",
+            container.id = %self.container_id_str(id),
+        )
+    )]
+    async fn get_container_pid(&self, id: &ContainerId) -> Result<Option<u32>> {
+        let container_id = self.container_id_str(id);
+        let container_root = self.container_root(id);
+
+        // Check if container root exists
+        if !container_root.exists() {
+            return Err(AgentError::NotFound {
+                container: container_id.clone(),
+                reason: "container state directory not found".to_string(),
+            });
+        }
+
+        // Load container and get PID
+        let container_id_clone = container_id.clone();
+
+        let pid = tokio::task::spawn_blocking(move || {
+            let mut container =
+                Container::load(container_root).map_err(|e| AgentError::NotFound {
+                    container: container_id_clone.clone(),
+                    reason: format!("failed to load container: {}", e),
+                })?;
+
+            // Refresh status to get current state
+            let _ = container.refresh_status();
+
+            // Get PID - returns None if container is not running
+            let pid = container.pid().map(|p| p.as_raw() as u32);
+
+            Ok::<Option<u32>, AgentError>(pid)
+        })
+        .await
+        .map_err(|e| AgentError::NotFound {
+            container: container_id.clone(),
+            reason: format!("task join error: {}", e),
+        })??;
+
+        tracing::debug!(
+            container = %container_id,
+            pid = ?pid,
+            "retrieved container PID"
+        );
+
+        Ok(pid)
+    }
 }
 
 // Helper methods for YoukiRuntime that are not part of the Runtime trait

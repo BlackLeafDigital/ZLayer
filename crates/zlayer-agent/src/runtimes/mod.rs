@@ -104,6 +104,9 @@ mod wasm_host;
 mod wasm_http;
 
 #[cfg(feature = "wasm")]
+mod wasm_http_interfaces;
+
+#[cfg(feature = "wasm")]
 pub mod wasm_test;
 
 pub use youki::{YoukiConfig, YoukiRuntime};
@@ -119,6 +122,42 @@ pub use wasm_host::{add_to_linker, DefaultHost, KvError, LogLevel, MetricsStore,
 
 #[cfg(feature = "wasm")]
 pub use wasm_http::{HttpRequest, HttpResponse, PoolStats, WasmHttpError, WasmHttpRuntime};
+
+#[cfg(feature = "wasm")]
+pub use wasm_http_interfaces::{
+    // Utility functions
+    duration_to_ns,
+    ns_to_duration,
+    // Caching types
+    CacheDecision,
+    CacheEntry,
+    // Plugin traits
+    CachingPlugin,
+    // Common types
+    DurationNs,
+    // HTTP types
+    HttpMethod,
+    HttpVersion,
+    ImmediateResponse,
+    KeyValue,
+    // WebSocket types
+    MessageType,
+    // Middleware types
+    MiddlewareAction,
+    MiddlewarePlugin,
+    PluginRequest,
+    RedirectInfo,
+    RequestMetadata,
+    RouterPlugin,
+    RoutingDecision,
+    Timestamp,
+    UpgradeDecision,
+    Upstream,
+    // Errors
+    WasmInterfaceError,
+    WebSocketMessage,
+    WebSocketPlugin,
+};
 
 use crate::error::{AgentError, Result};
 use crate::runtime::Runtime;

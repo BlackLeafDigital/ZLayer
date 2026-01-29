@@ -59,6 +59,7 @@ pub use persistent_raft_storage::{
     PersistentLogStore, PersistentRaftStorage, PersistentStateMachine,
 };
 
+use reqwest::Client;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -103,22 +104,49 @@ pub struct Scheduler {
     config: SchedulerConfig,
     /// Shutdown signal
     shutdown: Arc<tokio::sync::Notify>,
+    /// HTTP client for agent communication
+    http_client: Client,
+    /// Internal token for authenticating with agents
+    internal_token: String,
+    /// Base URL of the agent's HTTP API
+    agent_base_url: String,
 }
 
 impl Scheduler {
     /// Create a new scheduler (standalone mode, no Raft)
-    pub fn new_standalone(config: SchedulerConfig) -> Self {
+    ///
+    /// # Arguments
+    /// * `config` - Scheduler configuration
+    /// * `internal_token` - Token for authenticating with agent internal endpoints
+    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:8080")
+    pub fn new_standalone(
+        config: SchedulerConfig,
+        internal_token: String,
+        agent_base_url: String,
+    ) -> Self {
         Self {
             metrics: Arc::new(RwLock::new(MetricsCollector::new())),
             autoscaler: Arc::new(RwLock::new(Autoscaler::new())),
             raft: None,
             config,
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            http_client: Client::new(),
+            internal_token,
+            agent_base_url,
         }
     }
 
     /// Create a new scheduler with Raft coordination
-    pub async fn new_distributed(config: SchedulerConfig) -> Result<Self> {
+    ///
+    /// # Arguments
+    /// * `config` - Scheduler configuration
+    /// * `internal_token` - Token for authenticating with agent internal endpoints
+    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:8080")
+    pub async fn new_distributed(
+        config: SchedulerConfig,
+        internal_token: String,
+        agent_base_url: String,
+    ) -> Result<Self> {
         let raft = RaftCoordinator::new(config.raft.clone()).await?;
 
         if config.bootstrap {
@@ -131,6 +159,9 @@ impl Scheduler {
             raft: Some(Arc::new(raft)),
             config,
             shutdown: Arc::new(tokio::sync::Notify::new()),
+            http_client: Client::new(),
+            internal_token,
+            agent_base_url,
         })
     }
 
@@ -214,21 +245,86 @@ impl Scheduler {
         Ok(decision)
     }
 
+    /// Execute a scaling decision by calling the agent's internal endpoint
+    ///
+    /// This sends a scaling request to the agent to actually start/stop containers.
+    async fn execute_scaling_on_agent(&self, service: &str, replicas: u32) -> Result<()> {
+        let url = format!("{}/api/v1/internal/scale", self.agent_base_url);
+
+        debug!(
+            service = service,
+            replicas = replicas,
+            url = %url,
+            "Sending scaling request to agent"
+        );
+
+        let response = self
+            .http_client
+            .post(&url)
+            .header("X-ZLayer-Internal-Token", &self.internal_token)
+            .json(&serde_json::json!({
+                "service": service,
+                "replicas": replicas
+            }))
+            .send()
+            .await
+            .map_err(|e| SchedulerError::AgentCommunication(e.to_string()))?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "unknown".to_string());
+            return Err(SchedulerError::AgentCommunication(format!(
+                "agent returned status {}: {}",
+                status, body
+            )));
+        }
+
+        info!(
+            service = service,
+            replicas = replicas,
+            "Successfully sent scaling request to agent"
+        );
+
+        Ok(())
+    }
+
     /// Apply a scaling decision
     ///
-    /// This records the decision and updates state. The actual scaling
-    /// (starting/stopping containers) is done by the caller.
+    /// This records the decision, updates state, and executes the scaling
+    /// by calling the agent's internal endpoint.
+    ///
+    /// In distributed mode, this verifies we're still the Raft leader before
+    /// executing to prevent split-brain scenarios where leadership changed
+    /// between evaluation and execution.
     pub async fn apply_scaling(
         &self,
         service_name: &str,
         decision: &ScalingDecision,
     ) -> Result<()> {
+        // Double-check leader status before executing scaling
+        // This prevents race conditions where leadership changed after evaluation
+        if let Some(raft) = &self.raft {
+            if !raft.is_leader() {
+                warn!(
+                    service = %service_name,
+                    "Skipping scaling execution - no longer leader"
+                );
+                return Ok(());
+            }
+        }
+
         if let Some(target) = decision.target_replicas() {
             // Update autoscaler state
             {
                 let mut autoscaler = self.autoscaler.write().await;
                 autoscaler.record_scale_action(service_name, target)?;
             }
+
+            // Execute the scaling by calling the agent
+            self.execute_scaling_on_agent(service_name, target).await?;
 
             // If using Raft, record the event
             if let Some(raft) = &self.raft {
@@ -348,7 +444,11 @@ mod tests {
     #[tokio::test]
     async fn test_scheduler_standalone() {
         let config = SchedulerConfig::default();
-        let scheduler = Scheduler::new_standalone(config);
+        let scheduler = Scheduler::new_standalone(
+            config,
+            "test-token".to_string(),
+            "http://localhost:8080".to_string(),
+        );
 
         // Should always be leader in standalone
         assert!(scheduler.is_leader().await);
@@ -360,7 +460,11 @@ mod tests {
     #[tokio::test]
     async fn test_scheduler_register_service() {
         let config = SchedulerConfig::default();
-        let scheduler = Scheduler::new_standalone(config);
+        let scheduler = Scheduler::new_standalone(
+            config,
+            "test-token".to_string(),
+            "http://localhost:8080".to_string(),
+        );
 
         scheduler
             .register_service("api", ScaleSpec::Fixed { replicas: 3 }, 1)
@@ -373,7 +477,11 @@ mod tests {
     #[tokio::test]
     async fn test_scheduler_with_mock_metrics() {
         let config = SchedulerConfig::default();
-        let scheduler = Scheduler::new_standalone(config);
+        let scheduler = Scheduler::new_standalone(
+            config,
+            "test-token".to_string(),
+            "http://localhost:8080".to_string(),
+        );
 
         // Add mock metrics source
         let mock = Arc::new(MockMetricsSource::new());

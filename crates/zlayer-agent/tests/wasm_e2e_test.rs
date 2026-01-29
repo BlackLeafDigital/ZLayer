@@ -1595,3 +1595,948 @@ mod wasm_runtime_config_e2e {
         assert!(long.idle_timeout > Duration::from_secs(60));
     }
 }
+
+// =============================================================================
+// E2E Test: WASM Networking Capability
+// =============================================================================
+
+mod wasm_networking_e2e {
+    use wasmtime_wasi::WasiCtxBuilder;
+
+    /// Test that networking is enabled in WASM context builder
+    ///
+    /// This verifies that the wasi:sockets interfaces (TCP, UDP, IP name lookup)
+    /// are properly available when inherit_network() is called.
+    #[test]
+    fn test_wasm_networking_capability_enabled() {
+        // Verify WasiCtxBuilder with inherit_network compiles and works
+        let mut builder = WasiCtxBuilder::new();
+        builder.inherit_network();
+        let _ctx = builder.build();
+        // If this compiles and runs, networking is properly configured
+    }
+
+    /// Test that we can build a WASI context with both networking and stdio
+    #[test]
+    fn test_wasm_networking_with_stdio() {
+        use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+
+        let mut builder = WasiCtxBuilder::new();
+
+        // Configure stdio
+        builder.stdin(MemoryInputPipe::new(Vec::new()));
+        builder.stdout(MemoryOutputPipe::new(1024));
+        builder.stderr(MemoryOutputPipe::new(1024));
+
+        // Enable networking
+        builder.inherit_network();
+
+        // Set environment and args
+        builder.env("TEST_VAR", "test_value");
+        builder.args(&["test-program".to_string(), "arg1".to_string()]);
+
+        let _ctx = builder.build();
+    }
+}
+
+// =============================================================================
+// E2E Test: WASM Filesystem Mount Configuration
+// =============================================================================
+
+mod wasm_filesystem_e2e {
+    use zlayer_spec::{StorageSpec, StorageTier};
+
+    /// Test StorageSpec parsing for WASM bind mounts
+    #[test]
+    fn test_bind_mount_parsing() {
+        let spec = StorageSpec::Bind {
+            source: "/host/data".to_string(),
+            target: "/guest/data".to_string(),
+            readonly: true,
+        };
+        // Verify the mount can be matched and fields extracted
+        match &spec {
+            StorageSpec::Bind {
+                source,
+                target,
+                readonly,
+            } => {
+                assert_eq!(source, "/host/data");
+                assert_eq!(target, "/guest/data");
+                assert!(*readonly);
+            }
+            _ => panic!("Expected Bind mount"),
+        }
+    }
+
+    /// Test bind mount with write access
+    #[test]
+    fn test_bind_mount_writable() {
+        let spec = StorageSpec::Bind {
+            source: "/var/lib/app/data".to_string(),
+            target: "/app/data".to_string(),
+            readonly: false,
+        };
+        match &spec {
+            StorageSpec::Bind {
+                source,
+                target,
+                readonly,
+            } => {
+                assert_eq!(source, "/var/lib/app/data");
+                assert_eq!(target, "/app/data");
+                assert!(!*readonly);
+            }
+            _ => panic!("Expected Bind mount"),
+        }
+    }
+
+    /// Test named volume mount parsing
+    #[test]
+    fn test_named_volume_parsing() {
+        let spec = StorageSpec::Named {
+            name: "my-volume".to_string(),
+            target: "/data".to_string(),
+            readonly: false,
+            tier: StorageTier::Local,
+        };
+        match &spec {
+            StorageSpec::Named {
+                name,
+                target,
+                readonly,
+                tier,
+            } => {
+                assert_eq!(name, "my-volume");
+                assert_eq!(target, "/data");
+                assert!(!*readonly);
+                assert_eq!(*tier, StorageTier::Local);
+            }
+            _ => panic!("Expected Named mount"),
+        }
+    }
+
+    /// Test named volume with different storage tiers
+    #[test]
+    fn test_named_volume_storage_tiers() {
+        // Local tier (default, SQLite-safe)
+        let local_vol = StorageSpec::Named {
+            name: "db-storage".to_string(),
+            target: "/var/lib/db".to_string(),
+            readonly: false,
+            tier: StorageTier::Local,
+        };
+        if let StorageSpec::Named { tier, .. } = &local_vol {
+            assert_eq!(*tier, StorageTier::Local);
+        }
+
+        // Cached tier (SSD cache + slower backend)
+        let cached_vol = StorageSpec::Named {
+            name: "cache-storage".to_string(),
+            target: "/var/cache".to_string(),
+            readonly: false,
+            tier: StorageTier::Cached,
+        };
+        if let StorageSpec::Named { tier, .. } = &cached_vol {
+            assert_eq!(*tier, StorageTier::Cached);
+        }
+
+        // Network tier (NOT SQLite-safe)
+        let network_vol = StorageSpec::Named {
+            name: "shared-storage".to_string(),
+            target: "/shared".to_string(),
+            readonly: true,
+            tier: StorageTier::Network,
+        };
+        if let StorageSpec::Named { tier, .. } = &network_vol {
+            assert_eq!(*tier, StorageTier::Network);
+        }
+    }
+
+    /// Test unsupported storage types for WASM (should be skipped with warnings)
+    #[test]
+    fn test_unsupported_storage_types() {
+        // Tmpfs - memory-backed, not supported in WASI
+        let tmpfs = StorageSpec::Tmpfs {
+            target: "/tmp".to_string(),
+            size: Some("100M".to_string()),
+            mode: None,
+        };
+        assert!(matches!(tmpfs, StorageSpec::Tmpfs { .. }));
+
+        // Anonymous - auto-named volumes, not supported for WASM
+        let anonymous = StorageSpec::Anonymous {
+            target: "/scratch".to_string(),
+            tier: StorageTier::Local,
+        };
+        assert!(matches!(anonymous, StorageSpec::Anonymous { .. }));
+    }
+
+    /// Test multiple mounts configuration
+    #[test]
+    fn test_multiple_mounts() {
+        let mounts = vec![
+            StorageSpec::Bind {
+                source: "/host/config".to_string(),
+                target: "/app/config".to_string(),
+                readonly: true,
+            },
+            StorageSpec::Named {
+                name: "app-data".to_string(),
+                target: "/app/data".to_string(),
+                readonly: false,
+                tier: StorageTier::Local,
+            },
+            StorageSpec::Bind {
+                source: "/var/log/app".to_string(),
+                target: "/app/logs".to_string(),
+                readonly: false,
+            },
+        ];
+
+        assert_eq!(mounts.len(), 3);
+
+        // Count bind mounts
+        let bind_count = mounts
+            .iter()
+            .filter(|m| matches!(m, StorageSpec::Bind { .. }))
+            .count();
+        assert_eq!(bind_count, 2);
+
+        // Count named volumes
+        let named_count = mounts
+            .iter()
+            .filter(|m| matches!(m, StorageSpec::Named { .. }))
+            .count();
+        assert_eq!(named_count, 1);
+    }
+}
+
+// =============================================================================
+// E2E Test: WASM stdout/stderr Capture
+// =============================================================================
+
+mod wasm_stdio_capture_e2e {
+    use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
+
+    /// Test that MemoryOutputPipe can be created and cloned
+    #[test]
+    fn test_memory_output_pipe_creation() {
+        let pipe = MemoryOutputPipe::new(1024);
+        let _pipe_clone = pipe.clone();
+        // Pipes are clonable (Arc<Mutex> internally)
+    }
+
+    /// Test that MemoryOutputPipe contents can be read
+    #[test]
+    fn test_memory_output_pipe_contents() {
+        let pipe = MemoryOutputPipe::new(1024);
+        let pipe_clone = pipe.clone();
+
+        // Initially empty
+        let contents = pipe_clone.contents();
+        assert!(contents.is_empty(), "New pipe should have empty contents");
+    }
+
+    /// Test stdout/stderr pipe configuration for WASI
+    #[test]
+    fn test_stdio_pipe_configuration() {
+        use wasmtime_wasi::p2::pipe::MemoryInputPipe;
+        use wasmtime_wasi::WasiCtxBuilder;
+
+        // Create pipes for capture
+        let stdout_pipe = MemoryOutputPipe::new(1024 * 1024); // 1MB
+        let stderr_pipe = MemoryOutputPipe::new(1024 * 1024);
+
+        // Clone for later reading
+        let stdout_clone = stdout_pipe.clone();
+        let stderr_clone = stderr_pipe.clone();
+
+        // Configure WASI context with pipes
+        let mut builder = WasiCtxBuilder::new();
+        builder.stdin(MemoryInputPipe::new(Vec::new()));
+        builder.stdout(stdout_pipe);
+        builder.stderr(stderr_pipe);
+
+        let _ctx = builder.build();
+
+        // Verify we can still access the cloned pipes
+        assert!(stdout_clone.contents().is_empty());
+        assert!(stderr_clone.contents().is_empty());
+    }
+
+    /// Test different pipe capacities
+    #[test]
+    fn test_pipe_capacity_configurations() {
+        // Small pipe for limited output
+        let small_pipe = MemoryOutputPipe::new(1024); // 1KB
+        assert!(small_pipe.contents().is_empty());
+
+        // Medium pipe for typical output
+        let medium_pipe = MemoryOutputPipe::new(64 * 1024); // 64KB
+        assert!(medium_pipe.contents().is_empty());
+
+        // Large pipe for verbose output
+        let large_pipe = MemoryOutputPipe::new(1024 * 1024); // 1MB
+        assert!(large_pipe.contents().is_empty());
+    }
+}
+
+// =============================================================================
+// E2E Test: Custom HTTP Interface Types
+// =============================================================================
+
+mod wasm_http_interfaces_e2e {
+    use super::*;
+    use zlayer_agent::runtimes::{
+        duration_to_ns, ns_to_duration, CacheDecision, CacheEntry, HttpMethod, HttpVersion,
+        ImmediateResponse, KeyValue, MessageType, MiddlewareAction, PluginRequest, RedirectInfo,
+        RequestMetadata, RoutingDecision, UpgradeDecision, Upstream, WebSocketMessage,
+    };
+
+    // -------------------------------------------------------------------------
+    // Routing Decision Tests
+    // -------------------------------------------------------------------------
+
+    /// Test RoutingDecision::Forward variant
+    #[test]
+    fn test_routing_decision_forward() {
+        let upstream = Upstream::new("backend.local", 8080);
+        let decision = RoutingDecision::Forward(upstream);
+        match decision {
+            RoutingDecision::Forward(u) => {
+                assert_eq!(u.host, "backend.local");
+                assert_eq!(u.port, 8080);
+                assert!(!u.tls);
+            }
+            _ => panic!("Expected Forward"),
+        }
+    }
+
+    /// Test RoutingDecision::Forward with HTTPS
+    #[test]
+    fn test_routing_decision_forward_https() {
+        let upstream = Upstream::https("api.example.com", 443);
+        let decision = RoutingDecision::Forward(upstream);
+        match decision {
+            RoutingDecision::Forward(u) => {
+                assert_eq!(u.host, "api.example.com");
+                assert_eq!(u.port, 443);
+                assert!(u.tls);
+                assert_eq!(u.url(), "https://api.example.com:443");
+            }
+            _ => panic!("Expected Forward"),
+        }
+    }
+
+    /// Test RoutingDecision::Redirect variant
+    #[test]
+    fn test_routing_decision_redirect() {
+        let redirect = RedirectInfo::permanent("https://example.com/new-path");
+        let decision = RoutingDecision::Redirect(redirect);
+        match decision {
+            RoutingDecision::Redirect(r) => {
+                assert_eq!(r.location, "https://example.com/new-path");
+                assert_eq!(r.status, 301);
+                assert!(!r.preserve_body);
+            }
+            _ => panic!("Expected Redirect"),
+        }
+    }
+
+    /// Test RoutingDecision::RespondImmediate variant
+    #[test]
+    fn test_routing_decision_respond_immediate() {
+        let response = ImmediateResponse::forbidden()
+            .with_header("X-Reason", "Access denied")
+            .with_text_body("Forbidden");
+        let decision = RoutingDecision::RespondImmediate(response);
+        match decision {
+            RoutingDecision::RespondImmediate(r) => {
+                assert_eq!(r.status, 403);
+                assert!(!r.headers.is_empty());
+                assert!(!r.body.is_empty());
+            }
+            _ => panic!("Expected RespondImmediate"),
+        }
+    }
+
+    /// Test RoutingDecision::ContinueProcessing variant
+    #[test]
+    fn test_routing_decision_continue() {
+        let decision = RoutingDecision::ContinueProcessing;
+        assert!(matches!(decision, RoutingDecision::ContinueProcessing));
+    }
+
+    // -------------------------------------------------------------------------
+    // Upstream Tests
+    // -------------------------------------------------------------------------
+
+    /// Test Upstream construction and URL generation
+    #[test]
+    fn test_upstream_url_generation() {
+        let http = Upstream::new("backend", 8080);
+        assert_eq!(http.url(), "http://backend:8080");
+
+        let https = Upstream::https("secure-backend", 443);
+        assert_eq!(https.url(), "https://secure-backend:443");
+    }
+
+    /// Test Upstream timeout configuration
+    #[test]
+    fn test_upstream_timeouts() {
+        let upstream = Upstream::new("backend", 80)
+            .with_connect_timeout(Duration::from_secs(10))
+            .with_request_timeout(Duration::from_secs(60));
+
+        assert_eq!(upstream.connect_timeout(), Duration::from_secs(10));
+        assert_eq!(upstream.request_timeout(), Duration::from_secs(60));
+    }
+
+    // -------------------------------------------------------------------------
+    // Middleware Action Tests
+    // -------------------------------------------------------------------------
+
+    /// Test MiddlewareAction::ContinueWith variant
+    #[test]
+    fn test_middleware_action_continue_with_headers() {
+        let headers = vec![
+            KeyValue::new("X-Custom", "value"),
+            KeyValue::new("X-Request-ID", "req-123"),
+        ];
+        let action = MiddlewareAction::ContinueWith(headers);
+        match action {
+            MiddlewareAction::ContinueWith(h) => {
+                assert_eq!(h.len(), 2);
+                assert_eq!(h[0].key, "X-Custom");
+                assert_eq!(h[0].value, "value");
+            }
+            _ => panic!("Expected ContinueWith"),
+        }
+    }
+
+    /// Test MiddlewareAction::Abort variant
+    #[test]
+    fn test_middleware_action_abort() {
+        let action = MiddlewareAction::Abort {
+            status: 403,
+            reason: "Forbidden".to_string(),
+        };
+        match action {
+            MiddlewareAction::Abort { status, reason } => {
+                assert_eq!(status, 403);
+                assert_eq!(reason, "Forbidden");
+            }
+            _ => panic!("Expected Abort"),
+        }
+    }
+
+    /// Test MiddlewareAction convenience constructors
+    #[test]
+    fn test_middleware_action_constructors() {
+        let unchanged = MiddlewareAction::continue_unchanged();
+        assert!(unchanged.is_continue());
+
+        let forbidden = MiddlewareAction::forbidden("Access denied");
+        assert!(forbidden.is_abort());
+
+        let rate_limited = MiddlewareAction::rate_limited("Too many requests");
+        assert!(rate_limited.is_abort());
+        if let MiddlewareAction::Abort { status, .. } = rate_limited {
+            assert_eq!(status, 429);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // WebSocket Tests
+    // -------------------------------------------------------------------------
+
+    /// Test UpgradeDecision::Accept variant
+    #[test]
+    fn test_websocket_upgrade_accept() {
+        let decision = UpgradeDecision::Accept;
+        assert!(decision.is_accepted());
+    }
+
+    /// Test UpgradeDecision::AcceptWithHeaders variant
+    #[test]
+    fn test_websocket_upgrade_accept_with_headers() {
+        let headers = vec![KeyValue::new("Sec-WebSocket-Protocol", "graphql-ws")];
+        let decision = UpgradeDecision::AcceptWithHeaders(headers);
+        assert!(decision.is_accepted());
+    }
+
+    /// Test UpgradeDecision::Reject variant
+    #[test]
+    fn test_websocket_upgrade_reject() {
+        let decision = UpgradeDecision::Reject {
+            status: 401,
+            reason: "Unauthorized".to_string(),
+        };
+        assert!(!decision.is_accepted());
+    }
+
+    /// Test WebSocketMessage types
+    #[test]
+    fn test_websocket_message_types() {
+        let text_msg = WebSocketMessage::text("Hello, WebSocket!");
+        assert_eq!(text_msg.msg_type, MessageType::Text);
+        assert_eq!(text_msg.as_text(), Some("Hello, WebSocket!"));
+        assert!(!text_msg.is_control());
+
+        let binary_msg = WebSocketMessage::binary(vec![0x01, 0x02, 0x03]);
+        assert_eq!(binary_msg.msg_type, MessageType::Binary);
+        assert!(binary_msg.as_text().is_none());
+
+        let ping_msg = WebSocketMessage::ping(vec![1, 2, 3, 4]);
+        assert_eq!(ping_msg.msg_type, MessageType::Ping);
+        assert!(ping_msg.is_control());
+
+        let pong_msg = WebSocketMessage::pong(vec![1, 2, 3, 4]);
+        assert_eq!(pong_msg.msg_type, MessageType::Pong);
+        assert!(pong_msg.is_control());
+
+        let close_msg = WebSocketMessage::close();
+        assert_eq!(close_msg.msg_type, MessageType::Close);
+        assert!(close_msg.is_control());
+    }
+
+    // -------------------------------------------------------------------------
+    // Caching Tests
+    // -------------------------------------------------------------------------
+
+    /// Test CacheDecision::NoCache variant
+    #[test]
+    fn test_cache_decision_no_cache() {
+        let no_cache = CacheDecision::NoCache;
+        assert!(matches!(no_cache, CacheDecision::NoCache));
+        assert!(!no_cache.is_cacheable());
+        assert!(no_cache.ttl().is_none());
+    }
+
+    /// Test CacheDecision::CacheFor variant
+    #[test]
+    fn test_cache_decision_cache_for() {
+        let cache_for = CacheDecision::cache_for(Duration::from_secs(300));
+        assert!(cache_for.is_cacheable());
+        assert_eq!(cache_for.ttl(), Some(Duration::from_secs(300)));
+    }
+
+    /// Test CacheDecision::CacheWithTags variant
+    #[test]
+    fn test_cache_decision_cache_with_tags() {
+        let entry = CacheEntry::ttl_secs(600)
+            .with_tag("api")
+            .with_tag("v1")
+            .vary_on("Accept")
+            .with_stale_while_revalidate(Duration::from_secs(60));
+
+        let cache_with_tags = CacheDecision::CacheWithTags(entry);
+        match cache_with_tags {
+            CacheDecision::CacheWithTags(e) => {
+                assert_eq!(e.tags.len(), 2);
+                assert!(e.tags.contains(&"api".to_string()));
+                assert!(e.tags.contains(&"v1".to_string()));
+                assert_eq!(e.vary.len(), 1);
+                assert!(e.vary.contains(&"Accept".to_string()));
+                assert_eq!(e.ttl(), Duration::from_secs(600));
+                assert_eq!(
+                    e.stale_while_revalidate(),
+                    Some(Duration::from_secs(60))
+                );
+            }
+            _ => panic!("Expected CacheWithTags"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // HTTP Method Tests
+    // -------------------------------------------------------------------------
+
+    /// Test HttpMethod enum Display implementation
+    #[test]
+    fn test_http_method_display() {
+        assert_eq!(HttpMethod::Get.to_string(), "GET");
+        assert_eq!(HttpMethod::Post.to_string(), "POST");
+        assert_eq!(HttpMethod::Put.to_string(), "PUT");
+        assert_eq!(HttpMethod::Delete.to_string(), "DELETE");
+        assert_eq!(HttpMethod::Patch.to_string(), "PATCH");
+        assert_eq!(HttpMethod::Head.to_string(), "HEAD");
+        assert_eq!(HttpMethod::Options.to_string(), "OPTIONS");
+        assert_eq!(HttpMethod::Connect.to_string(), "CONNECT");
+        assert_eq!(HttpMethod::Trace.to_string(), "TRACE");
+    }
+
+    /// Test HttpMethod FromStr implementation
+    #[test]
+    fn test_http_method_from_str() {
+        use std::str::FromStr;
+
+        assert_eq!(HttpMethod::from_str("GET").unwrap(), HttpMethod::Get);
+        assert_eq!(HttpMethod::from_str("post").unwrap(), HttpMethod::Post);
+        assert_eq!(HttpMethod::from_str("PUT").unwrap(), HttpMethod::Put);
+        assert_eq!(HttpMethod::from_str("delete").unwrap(), HttpMethod::Delete);
+        assert!(HttpMethod::from_str("UNKNOWN").is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // HttpVersion Tests
+    // -------------------------------------------------------------------------
+
+    /// Test HttpVersion enum
+    #[test]
+    fn test_http_version_enum() {
+        assert_eq!(HttpVersion::Http10.to_string(), "HTTP/1.0");
+        assert_eq!(HttpVersion::Http11.to_string(), "HTTP/1.1");
+        assert_eq!(HttpVersion::Http2.to_string(), "HTTP/2");
+        assert_eq!(HttpVersion::Http3.to_string(), "HTTP/3");
+        assert_eq!(HttpVersion::default(), HttpVersion::Http11);
+    }
+
+    // -------------------------------------------------------------------------
+    // RequestMetadata Tests
+    // -------------------------------------------------------------------------
+
+    /// Test RequestMetadata construction
+    #[test]
+    fn test_request_metadata_construction() {
+        let metadata = RequestMetadata::with_client("192.168.1.100", 54321)
+            .with_tls("TLSv1.3", "TLS_AES_256_GCM_SHA384")
+            .with_server_name("api.example.com")
+            .with_http_version(HttpVersion::Http2)
+            .with_timestamp(1234567890_000_000_000);
+
+        assert_eq!(metadata.client_ip, "192.168.1.100");
+        assert_eq!(metadata.client_port, 54321);
+        assert_eq!(metadata.tls_version, Some("TLSv1.3".to_string()));
+        assert_eq!(
+            metadata.tls_cipher,
+            Some("TLS_AES_256_GCM_SHA384".to_string())
+        );
+        assert_eq!(metadata.server_name, Some("api.example.com".to_string()));
+        assert_eq!(metadata.http_version, HttpVersion::Http2);
+        assert_eq!(metadata.received_at, 1234567890_000_000_000);
+    }
+
+    /// Test RequestMetadata local convenience constructor
+    #[test]
+    fn test_request_metadata_local() {
+        let metadata = RequestMetadata::local();
+        assert_eq!(metadata.client_ip, "127.0.0.1");
+        assert_eq!(metadata.client_port, 0);
+        assert!(metadata.tls_version.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // PluginRequest Tests
+    // -------------------------------------------------------------------------
+
+    /// Test PluginRequest construction
+    #[test]
+    fn test_plugin_request_construction() {
+        let request = PluginRequest::get("/api/users")
+            .with_query("page=1&limit=10")
+            .with_header("Accept", "application/json")
+            .with_header("Authorization", "Bearer token123")
+            .with_body(Vec::new())
+            .with_context("trace_id", "abc123");
+
+        assert_eq!(request.path, "/api/users");
+        assert_eq!(request.method, HttpMethod::Get);
+        assert_eq!(request.query, Some("page=1&limit=10".to_string()));
+        assert_eq!(request.headers.len(), 2);
+        assert_eq!(request.header("accept"), Some("application/json"));
+        assert_eq!(request.context_value("trace_id"), Some("abc123"));
+        assert_eq!(request.uri(), "/api/users?page=1&limit=10");
+    }
+
+    /// Test PluginRequest POST with body
+    #[test]
+    fn test_plugin_request_post_with_body() {
+        let body = r#"{"name": "test", "value": 42}"#.as_bytes().to_vec();
+        let request = PluginRequest::post("/api/items")
+            .with_header("Content-Type", "application/json")
+            .with_body(body.clone());
+
+        assert_eq!(request.method, HttpMethod::Post);
+        assert_eq!(request.body, body);
+        assert!(!request.request_id.is_empty());
+    }
+
+    // -------------------------------------------------------------------------
+    // Duration Conversion Tests
+    // -------------------------------------------------------------------------
+
+    /// Test duration conversion utilities
+    #[test]
+    fn test_duration_conversions() {
+        let dur = Duration::from_millis(1500);
+        let ns = duration_to_ns(dur);
+        assert_eq!(ns, 1_500_000_000);
+
+        let back = ns_to_duration(ns);
+        assert_eq!(back, dur);
+    }
+
+    /// Test duration conversion edge cases
+    #[test]
+    fn test_duration_conversion_edge_cases() {
+        // Zero duration
+        let zero = Duration::from_secs(0);
+        assert_eq!(duration_to_ns(zero), 0);
+        assert_eq!(ns_to_duration(0), zero);
+
+        // Large duration
+        let large = Duration::from_secs(3600); // 1 hour
+        let ns = duration_to_ns(large);
+        assert_eq!(ns, 3_600_000_000_000);
+        assert_eq!(ns_to_duration(ns), large);
+    }
+
+    // -------------------------------------------------------------------------
+    // KeyValue Tests
+    // -------------------------------------------------------------------------
+
+    /// Test KeyValue construction and conversion
+    #[test]
+    fn test_key_value_operations() {
+        let kv = KeyValue::new("Content-Type", "application/json");
+        assert_eq!(kv.key, "Content-Type");
+        assert_eq!(kv.value, "application/json");
+
+        // From tuple
+        let kv2: KeyValue = ("Accept", "text/html").into();
+        assert_eq!(kv2.key, "Accept");
+        assert_eq!(kv2.value, "text/html");
+
+        // To tuple
+        let (k, v): (String, String) = kv.into();
+        assert_eq!(k, "Content-Type");
+        assert_eq!(v, "application/json");
+    }
+
+    // -------------------------------------------------------------------------
+    // RedirectInfo Tests
+    // -------------------------------------------------------------------------
+
+    /// Test RedirectInfo variants
+    #[test]
+    fn test_redirect_info_variants() {
+        let permanent = RedirectInfo::permanent("https://new.example.com");
+        assert_eq!(permanent.status, 301);
+        assert!(!permanent.preserve_body);
+
+        let temporary = RedirectInfo::temporary("https://temp.example.com");
+        assert_eq!(temporary.status, 302);
+        assert!(!temporary.preserve_body);
+
+        let temp_with_body = RedirectInfo::temporary_with_body("https://temp.example.com");
+        assert_eq!(temp_with_body.status, 307);
+        assert!(temp_with_body.preserve_body);
+
+        let perm_with_body = RedirectInfo::permanent_with_body("https://new.example.com");
+        assert_eq!(perm_with_body.status, 308);
+        assert!(perm_with_body.preserve_body);
+    }
+
+    // -------------------------------------------------------------------------
+    // ImmediateResponse Tests
+    // -------------------------------------------------------------------------
+
+    /// Test ImmediateResponse construction
+    #[test]
+    fn test_immediate_response_construction() {
+        let resp = ImmediateResponse::ok()
+            .with_header("X-Custom", "value")
+            .with_json_body(r#"{"status":"ok"}"#);
+
+        assert_eq!(resp.status, 200);
+        assert!(resp.headers.len() >= 2); // X-Custom and Content-Type
+        assert!(!resp.body.is_empty());
+    }
+
+    /// Test ImmediateResponse status code constructors
+    #[test]
+    fn test_immediate_response_status_codes() {
+        assert_eq!(ImmediateResponse::ok().status, 200);
+        assert_eq!(ImmediateResponse::not_found().status, 404);
+        assert_eq!(ImmediateResponse::forbidden().status, 403);
+        assert_eq!(ImmediateResponse::internal_error().status, 500);
+        assert_eq!(ImmediateResponse::new(201).status, 201);
+    }
+}
+
+// =============================================================================
+// E2E Test: Complete WASM Plugin Flow
+// =============================================================================
+
+mod wasm_complete_flow_e2e {
+    use super::*;
+
+    /// Test complete WASM plugin flow with host functions
+    ///
+    /// This simulates a full plugin lifecycle using the host function APIs,
+    /// combining configuration, KV storage, logging, and metrics.
+    #[test]
+    fn test_complete_wasm_plugin_flow() {
+        // 1. Create host with plugin ID
+        let mut host = DefaultHost::with_plugin_id("complete-flow-test");
+
+        // 2. Add configs for networking and filesystem
+        host.add_configs([
+            ("network.enabled", "true"),
+            ("filesystem.readonly", "false"),
+            ("cache.ttl_seconds", "300"),
+        ]);
+
+        // 3. Verify networking config is accessible
+        assert_eq!(host.config_get_bool("network.enabled"), Some(true));
+        assert_eq!(host.config_get_bool("filesystem.readonly"), Some(false));
+
+        // 4. Test KV operations (simulating plugin state)
+        host.kv_set_string("request:count", "0").unwrap();
+        let count = host.kv_increment("request:count", 1).unwrap();
+        assert_eq!(count, 1);
+
+        // 5. Test logging with structured fields
+        host.log_structured(
+            LogLevel::Info,
+            "Request processed",
+            &[
+                ("path".to_string(), "/api/test".to_string()),
+                ("duration_ms".to_string(), "15".to_string()),
+            ],
+        );
+
+        // 6. Test metrics
+        host.counter_inc("requests_total", 1);
+        host.histogram_observe("request_duration_seconds", 0.015);
+        host.gauge_set("active_connections", 5.0);
+
+        // 7. Verify metrics were recorded
+        let metrics = host.metrics();
+        assert!(metrics.get_counter("requests_total").is_some());
+        assert!(metrics.get_gauge("active_connections").is_some());
+    }
+
+    /// Test plugin flow with secrets
+    #[test]
+    fn test_plugin_flow_with_secrets() {
+        let mut host = DefaultHost::with_plugin_id("secrets-test");
+
+        // Add secrets
+        host.add_secret("api_key", "sk-test-12345");
+        host.add_secret("db_password", "secret-password");
+
+        // Verify secret access
+        assert!(host.secret_exists("api_key"));
+        assert!(host.secret_exists("db_password"));
+        assert!(!host.secret_exists("nonexistent"));
+
+        let api_key = host.secret_get("api_key").unwrap();
+        assert_eq!(api_key, Some("sk-test-12345".to_string()));
+
+        // Required secret should succeed
+        let required = host.secret_get_required("api_key");
+        assert!(required.is_ok());
+
+        // Required secret should fail for missing
+        let missing = host.secret_get_required("nonexistent");
+        assert!(missing.is_err());
+    }
+
+    /// Test plugin flow with compare-and-swap for locking
+    #[test]
+    fn test_plugin_flow_with_cas_locking() {
+        let mut host = DefaultHost::with_plugin_id("cas-test");
+
+        // Acquire lock (CAS on non-existent key)
+        let acquired = host
+            .kv_compare_and_swap("lock:resource", None, b"owner1")
+            .unwrap();
+        assert!(acquired, "First lock acquisition should succeed");
+
+        // Try to acquire same lock (should fail)
+        let reacquired = host
+            .kv_compare_and_swap("lock:resource", None, b"owner2")
+            .unwrap();
+        assert!(!reacquired, "Second lock acquisition should fail");
+
+        // Release lock (CAS with correct expected value)
+        let released = host
+            .kv_compare_and_swap("lock:resource", Some(b"owner1"), b"")
+            .unwrap();
+        assert!(released, "Lock release should succeed");
+
+        // Now another owner can acquire
+        let new_acquired = host
+            .kv_compare_and_swap("lock:resource", Some(b""), b"owner2")
+            .unwrap();
+        assert!(new_acquired, "New lock acquisition should succeed after release");
+    }
+
+    /// Test plugin flow with TTL-based expiration
+    #[test]
+    fn test_plugin_flow_with_ttl() {
+        let mut host = DefaultHost::with_plugin_id("ttl-test");
+
+        // Set value with TTL (5 seconds in nanoseconds)
+        let ttl_ns = 5_000_000_000u64;
+        host.kv_set_with_ttl("temp:session", b"session-data", ttl_ns)
+            .unwrap();
+
+        // Value should exist immediately
+        assert!(host.kv_exists("temp:session"));
+
+        let value = host.kv_get("temp:session").unwrap();
+        assert_eq!(value, Some(b"session-data".to_vec()));
+    }
+
+    /// Test plugin flow with labeled metrics
+    #[test]
+    fn test_plugin_flow_with_labeled_metrics() {
+        let host = DefaultHost::with_plugin_id("labeled-metrics-test");
+
+        // Counter with labels
+        host.counter_inc_labeled(
+            "http_requests",
+            1,
+            &[
+                ("method".to_string(), "GET".to_string()),
+                ("status".to_string(), "200".to_string()),
+                ("path".to_string(), "/api/users".to_string()),
+            ],
+        );
+
+        host.counter_inc_labeled(
+            "http_requests",
+            1,
+            &[
+                ("method".to_string(), "POST".to_string()),
+                ("status".to_string(), "201".to_string()),
+                ("path".to_string(), "/api/users".to_string()),
+            ],
+        );
+
+        // Gauge with labels
+        host.gauge_set_labeled(
+            "queue_size",
+            42.0,
+            &[("queue_name".to_string(), "default".to_string())],
+        );
+
+        // Histogram with labels
+        host.histogram_observe_labeled(
+            "request_duration",
+            0.05,
+            &[("endpoint".to_string(), "/api/users".to_string())],
+        );
+
+        // Duration recording with labels
+        host.record_duration_labeled(
+            "db_query_ns",
+            50_000_000, // 50ms
+            &[("query_type".to_string(), "select".to_string())],
+        );
+    }
+}

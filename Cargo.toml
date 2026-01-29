@@ -142,9 +142,9 @@ base64 = "0.22"
 validator = { version = "0.19", features = ["derive"] }
 
 # Pingora (Cloudflare's proxy framework)
-pingora = { version = "0.6", features = ["lb", "proxy", "cache"] }
-pingora-core = "0.6"
-pingora-proxy = "0.6"
+pingora = { version = "0.6", features = ["lb", "proxy", "cache", "rustls"] }
+pingora-core = { version = "0.6", features = ["rustls"] }
+pingora-proxy = { version = "0.6", features = ["rustls"] }
 pingora-load-balancing = "0.6"
 pingora-cache = "0.6"
 pingora-timeout = "0.6"
@@ -152,6 +152,7 @@ pingora-timeout = "0.6"
 # ACME/TLS certificates
 instant-acme = "0.7"
 rcgen = "0.13"
+x509-parser = "0.18"
 
 # Concurrent hashmaps
 dashmap = "6"

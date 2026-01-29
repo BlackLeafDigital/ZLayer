@@ -44,6 +44,10 @@ pub enum SchedulerError {
     /// IO error
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// Agent communication failed
+    #[error("Agent communication error: {0}")]
+    AgentCommunication(String),
 }
 
 /// Errors specific to Raft network operations

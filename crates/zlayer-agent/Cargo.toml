@@ -13,7 +13,16 @@ readme = "README.md"
 [features]
 default = []
 docker = ["bollard"]
-wasm = ["dep:wasmtime", "dep:wasmtime-wasi", "dep:wasmtime-wasi-http"]
+wasm = [
+    "dep:wasmtime",
+    "dep:wasmtime-wasi",
+    "dep:wasmtime-wasi-http",
+    "dep:bytes",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:anyhow",
+]
 s3 = ["zlayer-init-actions/s3", "zlayer-registry/s3"]
 
 [dependencies]
@@ -61,6 +70,13 @@ futures-util.workspace = true
 wasmtime = { version = "41", default-features = false, features = ["async", "cranelift", "component-model"], optional = true }
 wasmtime-wasi = { version = "41", optional = true }
 wasmtime-wasi-http = { version = "41", optional = true }
+
+# HTTP types for WASM HTTP handler support (enabled with wasm feature)
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", optional = true }
+anyhow = { version = "1", optional = true }
 
 [dev-dependencies]
 rand = "0.9"

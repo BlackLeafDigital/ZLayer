@@ -25,7 +25,11 @@ async fn test_standalone_scheduling_workflow() {
         metrics_interval: Duration::from_millis(100),
         ..Default::default()
     };
-    let scheduler = Scheduler::new_standalone(config);
+    let scheduler = Scheduler::new_standalone(
+        config,
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    );
 
     // Add mock metrics source
     let mock = Arc::new(MockMetricsSource::new());
@@ -112,7 +116,11 @@ async fn test_standalone_scheduling_workflow() {
 /// Test multiple services
 #[tokio::test]
 async fn test_multiple_services() {
-    let scheduler = Scheduler::new_standalone(SchedulerConfig::default());
+    let scheduler = Scheduler::new_standalone(
+        SchedulerConfig::default(),
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
 
@@ -168,7 +176,11 @@ async fn test_multiple_services() {
 /// Test fixed scaling mode
 #[tokio::test]
 async fn test_fixed_scaling() {
-    let scheduler = Scheduler::new_standalone(SchedulerConfig::default());
+    let scheduler = Scheduler::new_standalone(
+        SchedulerConfig::default(),
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
 
@@ -196,7 +208,11 @@ async fn test_fixed_scaling() {
 /// Test manual scaling mode
 #[tokio::test]
 async fn test_manual_scaling() {
-    let scheduler = Scheduler::new_standalone(SchedulerConfig::default());
+    let scheduler = Scheduler::new_standalone(
+        SchedulerConfig::default(),
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
 
@@ -225,7 +241,11 @@ async fn test_manual_scaling() {
 /// Test apply_scaling records state correctly
 #[tokio::test]
 async fn test_apply_scaling() {
-    let scheduler = Scheduler::new_standalone(SchedulerConfig::default());
+    let scheduler = Scheduler::new_standalone(
+        SchedulerConfig::default(),
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
 
@@ -279,7 +299,11 @@ async fn test_apply_scaling() {
 /// Test Prometheus metrics registry
 #[tokio::test]
 async fn test_prometheus_metrics() {
-    let scheduler = Scheduler::new_standalone(SchedulerConfig::default());
+    let scheduler = Scheduler::new_standalone(
+        SchedulerConfig::default(),
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
 
@@ -340,7 +364,13 @@ async fn test_single_node_raft() {
         ..Default::default()
     };
 
-    let scheduler = match Scheduler::new_distributed(config).await {
+    let scheduler = match Scheduler::new_distributed(
+        config,
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    )
+    .await
+    {
         Ok(s) => s,
         Err(e) => {
             // If Raft fails to initialize, that's okay for this test
@@ -370,7 +400,11 @@ async fn test_single_node_raft() {
 /// Test service unregistration
 #[tokio::test]
 async fn test_service_unregistration() {
-    let scheduler = Scheduler::new_standalone(SchedulerConfig::default());
+    let scheduler = Scheduler::new_standalone(
+        SchedulerConfig::default(),
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
 
@@ -393,7 +427,11 @@ async fn test_service_unregistration() {
 /// Test standalone mode is always leader
 #[tokio::test]
 async fn test_standalone_is_leader() {
-    let scheduler = Scheduler::new_standalone(SchedulerConfig::default());
+    let scheduler = Scheduler::new_standalone(
+        SchedulerConfig::default(),
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    );
 
     // Standalone mode should always be leader
     assert!(scheduler.is_leader().await);
@@ -405,7 +443,11 @@ async fn test_standalone_is_leader() {
 /// Test scale down with low metrics
 #[tokio::test]
 async fn test_scale_down_low_metrics() {
-    let scheduler = Scheduler::new_standalone(SchedulerConfig::default());
+    let scheduler = Scheduler::new_standalone(
+        SchedulerConfig::default(),
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
 
@@ -453,7 +495,11 @@ async fn test_scale_down_low_metrics() {
 /// Test respects min/max bounds
 #[tokio::test]
 async fn test_respects_bounds() {
-    let scheduler = Scheduler::new_standalone(SchedulerConfig::default());
+    let scheduler = Scheduler::new_standalone(
+        SchedulerConfig::default(),
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
 
@@ -500,7 +546,11 @@ async fn test_respects_bounds() {
 /// Test memory-based scaling
 #[tokio::test]
 async fn test_memory_scaling() {
-    let scheduler = Scheduler::new_standalone(SchedulerConfig::default());
+    let scheduler = Scheduler::new_standalone(
+        SchedulerConfig::default(),
+        "test-token".to_string(),
+        "http://localhost:8080".to_string(),
+    );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
 

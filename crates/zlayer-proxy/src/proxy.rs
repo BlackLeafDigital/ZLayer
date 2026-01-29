@@ -8,6 +8,7 @@
 //! - TLS termination via CertManager
 
 use async_trait::async_trait;
+use bytes::Bytes;
 use dashmap::DashMap;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
@@ -18,6 +19,9 @@ use pingora_proxy::{ProxyHttp, Session};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// ACME HTTP-01 challenge path prefix
+const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
 
 use crate::acme::CertManager;
 use crate::routes::ServiceRegistry;
@@ -163,6 +167,63 @@ impl ProxyHttp for ZLayerProxy {
     /// Create a new per-request context
     fn new_ctx(&self) -> Self::CTX {
         ZLayerCtx::new()
+    }
+
+    /// Handle the incoming request before proxying
+    ///
+    /// This filter intercepts ACME HTTP-01 challenge requests at
+    /// `/.well-known/acme-challenge/{token}` and serves the key authorization
+    /// response directly, bypassing the normal proxy flow.
+    ///
+    /// Returns:
+    /// - `Ok(true)` if the response was sent (ACME challenge handled)
+    /// - `Ok(false)` to continue with normal proxying
+    async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        let path = session.req_header().uri.path();
+
+        // Check if this is an ACME HTTP-01 challenge request
+        if let Some(token) = path.strip_prefix(ACME_CHALLENGE_PREFIX) {
+            // Don't process if the token is empty
+            if token.is_empty() {
+                tracing::debug!("ACME challenge request with empty token");
+                let _ = session.respond_error(404).await;
+                return Ok(true);
+            }
+
+            tracing::debug!(token = %token, "Received ACME HTTP-01 challenge request");
+
+            // Look up the challenge response from CertManager
+            if let Some(key_auth) = self.cert_manager.get_challenge_response(token).await {
+                tracing::info!(
+                    token = %token,
+                    "Serving ACME HTTP-01 challenge response"
+                );
+
+                // Build and send a 200 OK response with the key authorization
+                let mut header = ResponseHeader::build(200, Some(2))?;
+                header.insert_header("Content-Type", "text/plain")?;
+                header.insert_header("Content-Length", key_auth.len().to_string())?;
+
+                // Write response header (not end of stream yet)
+                session
+                    .write_response_header(Box::new(header), false)
+                    .await?;
+
+                // Write response body (end of stream)
+                session
+                    .write_response_body(Some(Bytes::from(key_auth)), true)
+                    .await?;
+
+                return Ok(true); // Response sent, skip proxying
+            }
+
+            // Token not found - return 404
+            tracing::debug!(token = %token, "ACME challenge token not found");
+            let _ = session.respond_error(404).await;
+            return Ok(true);
+        }
+
+        Ok(false) // Continue normal proxying
     }
 
     /// Select upstream peer for the request
@@ -353,5 +414,39 @@ mod tests {
         let ctx = ZLayerCtx::new();
         std::thread::sleep(Duration::from_millis(10));
         assert!(ctx.elapsed() >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn test_acme_challenge_path_parsing() {
+        // Test the ACME challenge path prefix constant
+        assert_eq!(ACME_CHALLENGE_PREFIX, "/.well-known/acme-challenge/");
+
+        // Test path stripping logic used in request_filter
+        let valid_path = "/.well-known/acme-challenge/abc123";
+        let token = valid_path.strip_prefix(ACME_CHALLENGE_PREFIX);
+        assert_eq!(token, Some("abc123"));
+
+        // Test with complex token (typical ACME token format)
+        let complex_path =
+            "/.well-known/acme-challenge/abc123def456-ghi789_jkl012.mno345pqr678stu901vwx";
+        let complex_token = complex_path.strip_prefix(ACME_CHALLENGE_PREFIX);
+        assert_eq!(
+            complex_token,
+            Some("abc123def456-ghi789_jkl012.mno345pqr678stu901vwx")
+        );
+
+        // Test non-matching paths
+        let non_acme_path = "/api/users";
+        let non_match = non_acme_path.strip_prefix(ACME_CHALLENGE_PREFIX);
+        assert!(non_match.is_none());
+
+        let partial_path = "/.well-known/acme";
+        let partial_match = partial_path.strip_prefix(ACME_CHALLENGE_PREFIX);
+        assert!(partial_match.is_none());
+
+        // Test empty token case (just the prefix)
+        let empty_token_path = "/.well-known/acme-challenge/";
+        let empty_token = empty_token_path.strip_prefix(ACME_CHALLENGE_PREFIX);
+        assert_eq!(empty_token, Some("")); // Will be handled as empty in request_filter
     }
 }

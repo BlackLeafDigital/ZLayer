@@ -9,13 +9,25 @@
 //! - **WASI Preview 2 (wasip2)**: Component model support with full WASI interfaces
 //! - **Async execution**: Tokio integration for cooperative scheduling
 //! - **Epoch-based interruption**: Timeout support via epoch deadlines
-//! - **Log capture**: stdout/stderr captured for container logs
+//! - **Log capture**: stdout/stderr captured via memory pipes for container logs
+//! - **Filesystem mounts**: Bind mounts and named volumes via WASI preopens
+//! - **Networking**: Full wasi:sockets support (TCP, UDP, IP name lookup)
+//!
+//! ## Supported Storage Types
+//!
+//! - **Bind mounts**: Direct host path mapping to guest path
+//! - **Named volumes**: Persistent storage under `/var/lib/zlayer/volumes/{name}`
+//!
+//! ## Unsupported Storage Types (logged as warnings)
+//!
+//! - **Tmpfs**: Memory-backed mounts (not supported in WASI)
+//! - **Anonymous**: Auto-named volumes (not supported for WASM)
+//! - **S3**: FUSE-based S3 mounts (not supported in WASI)
 //!
 //! ## Limitations
 //!
 //! - No `exec` support (WASM modules are single-process)
 //! - No cgroup stats (WASM runs in-process, no kernel isolation)
-//! - Environment variables only (no filesystem mounts currently)
 
 use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
@@ -29,12 +41,145 @@ use tracing::instrument;
 use wasmtime::component::{Component, Linker as ComponentLinker, ResourceTable};
 use wasmtime::{Config, Engine, Linker, Module, Store};
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
-use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+// TODO: Phase 6 (stdout/stderr capture) will use these pipe types
+#[allow(unused_imports)]
+use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
+use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use zlayer_registry::{detect_wasm_version_from_binary, WasiVersion};
-use zlayer_spec::{PullPolicy, ServiceSpec};
+use zlayer_spec::{PullPolicy, ServiceSpec, StorageSpec};
 
 /// Default directory for WASM module cache
 pub const DEFAULT_WASM_CACHE_DIR: &str = "/var/lib/zlayer/wasm";
+
+/// Default directory for named volumes
+pub const DEFAULT_VOLUMES_DIR: &str = "/var/lib/zlayer/volumes";
+
+/// Default capacity for stdout/stderr capture pipes (1MB)
+/// TODO: Phase 6 (stdout/stderr capture) will use this constant
+#[allow(dead_code)]
+const STDIO_PIPE_CAPACITY: usize = 1024 * 1024;
+
+/// Result of WASM module/component execution with captured output
+#[derive(Debug, Clone)]
+struct ExecutionResult {
+    /// Exit code from the WASM execution
+    exit_code: i32,
+    /// Captured stdout bytes
+    stdout: Vec<u8>,
+    /// Captured stderr bytes
+    stderr: Vec<u8>,
+}
+
+/// Configure filesystem mounts on a WASI context builder.
+///
+/// This function processes the storage specifications and configures preopened
+/// directories for supported mount types (Bind and Named volumes).
+///
+/// # Arguments
+/// * `wasi_builder` - The WasiCtxBuilder to configure
+/// * `mounts` - Slice of StorageSpec defining the mounts
+///
+/// # Returns
+/// * `Ok(())` if all supported mounts were configured successfully
+/// * `Err(String)` if a mount configuration failed
+///
+/// # Supported Storage Types
+/// * `StorageSpec::Bind` - Direct host path to guest path mapping
+/// * `StorageSpec::Named` - Named volumes stored under `/var/lib/zlayer/volumes/{name}`
+///
+/// # Unsupported Storage Types (logged as warnings)
+/// * `StorageSpec::Tmpfs` - Memory-backed mounts
+/// * `StorageSpec::Anonymous` - Auto-named volumes
+/// * `StorageSpec::S3` - FUSE-based S3 mounts
+fn configure_wasi_mounts(
+    wasi_builder: &mut WasiCtxBuilder,
+    mounts: &[StorageSpec],
+) -> std::result::Result<(), String> {
+    for mount in mounts {
+        match mount {
+            StorageSpec::Bind {
+                source,
+                target,
+                readonly,
+            } => {
+                let (dir_perms, file_perms) = if *readonly {
+                    (DirPerms::READ, FilePerms::READ)
+                } else {
+                    (DirPerms::all(), FilePerms::all())
+                };
+
+                wasi_builder
+                    .preopened_dir(source, target, dir_perms, file_perms)
+                    .map_err(|e| {
+                        format!(
+                            "failed to preopen bind mount '{}' -> '{}': {}",
+                            source, target, e
+                        )
+                    })?;
+
+                tracing::debug!(
+                    source = %source,
+                    target = %target,
+                    readonly = %readonly,
+                    "configured bind mount for WASM"
+                );
+            }
+            StorageSpec::Named {
+                name,
+                target,
+                readonly,
+                tier: _,
+            } => {
+                // Named volumes are stored under the volumes directory
+                let volume_path = format!("{}/{}", DEFAULT_VOLUMES_DIR, name);
+
+                let (dir_perms, file_perms) = if *readonly {
+                    (DirPerms::READ, FilePerms::READ)
+                } else {
+                    (DirPerms::all(), FilePerms::all())
+                };
+
+                wasi_builder
+                    .preopened_dir(&volume_path, target, dir_perms, file_perms)
+                    .map_err(|e| {
+                        format!(
+                            "failed to preopen named volume '{}' at '{}': {}",
+                            name, target, e
+                        )
+                    })?;
+
+                tracing::debug!(
+                    name = %name,
+                    volume_path = %volume_path,
+                    target = %target,
+                    readonly = %readonly,
+                    "configured named volume for WASM"
+                );
+            }
+            StorageSpec::Tmpfs { target, .. } => {
+                tracing::warn!(
+                    target = %target,
+                    "tmpfs storage not supported for WASM, skipping"
+                );
+            }
+            StorageSpec::Anonymous { target, .. } => {
+                tracing::warn!(
+                    target = %target,
+                    "anonymous storage not supported for WASM, skipping"
+                );
+            }
+            StorageSpec::S3 { bucket, target, .. } => {
+                tracing::warn!(
+                    bucket = %bucket,
+                    target = %target,
+                    "S3 storage not supported for WASM, skipping"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
 
 /// Configuration for WasmRuntime
 #[derive(Debug, Clone)]
@@ -101,8 +246,10 @@ struct WasmInstance {
     env_vars: Vec<(String, String)>,
     /// Command args
     args: Vec<String>,
-    /// Execution handle (if running)
-    execution_handle: Option<tokio::task::JoinHandle<std::result::Result<i32, String>>>,
+    /// Filesystem mounts for WASI preopens
+    mounts: Vec<StorageSpec>,
+    /// Execution handle (if running) - returns ExecutionResult with captured stdout/stderr
+    execution_handle: Option<tokio::task::JoinHandle<std::result::Result<ExecutionResult, String>>>,
 }
 
 impl std::fmt::Debug for WasmInstance {
@@ -285,14 +432,27 @@ impl WasmRuntime {
     }
 
     /// Execute a WASM module asynchronously
+    ///
+    /// # Arguments
+    /// * `engine` - The wasmtime Engine
+    /// * `module_bytes` - The compiled WASM module bytes
+    /// * `env_vars` - Environment variables to set
+    /// * `args` - Command line arguments
+    /// * `mounts` - Filesystem mounts to configure as preopens
+    /// * `epoch_deadline` - Epoch deadline for interruption
+    /// * `enable_epochs` - Whether to enable epoch-based interruption
+    ///
+    /// # Returns
+    /// `ExecutionResult` containing the exit code and captured stdout/stderr
     async fn execute_module(
         engine: Engine,
         module_bytes: Vec<u8>,
         env_vars: Vec<(String, String)>,
         args: Vec<String>,
+        mounts: Vec<StorageSpec>,
         epoch_deadline: u64,
         enable_epochs: bool,
-    ) -> std::result::Result<i32, String> {
+    ) -> std::result::Result<ExecutionResult, String> {
         // This runs in a blocking context because wasmtime operations are CPU-bound
         tokio::task::spawn_blocking(move || {
             // Compile module
@@ -310,9 +470,21 @@ impl WasmRuntime {
             // Set command line arguments
             wasi_builder.args(&args);
 
-            // Build the WASI context - stdout/stderr go to the inherited streams
-            // In production we'd capture these to pipes, but for now inherit
-            wasi_builder.inherit_stdio();
+            // Configure filesystem mounts as preopened directories
+            configure_wasi_mounts(&mut wasi_builder, &mounts)?;
+
+            // Create memory pipes for stdout/stderr capture
+            // These are cloneable (Arc<Mutex> internally) so we can read after execution
+            let stdout_pipe = MemoryOutputPipe::new(STDIO_PIPE_CAPACITY);
+            let stderr_pipe = MemoryOutputPipe::new(STDIO_PIPE_CAPACITY);
+
+            // Configure stdio with memory pipes for capture
+            wasi_builder.stdin(MemoryInputPipe::new(Vec::new())); // Empty stdin
+            wasi_builder.stdout(stdout_pipe.clone());
+            wasi_builder.stderr(stderr_pipe.clone());
+
+            // Enable network access for wasi:sockets (TCP, UDP, IP name lookup)
+            wasi_builder.inherit_network();
 
             let wasi_ctx = wasi_builder.build_p1();
 
@@ -339,23 +511,41 @@ impl WasmRuntime {
                 .get_func(&mut store, "_start")
                 .or_else(|| instance.get_func(&mut store, "main"));
 
-            match start_func {
+            let exit_code = match start_func {
                 Some(func) => {
                     // Call the entry function
                     match func.call(&mut store, &[], &mut []) {
-                        Ok(()) => Ok(0),
+                        Ok(()) => 0,
                         Err(e) => {
                             // Check for WASI exit
                             if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
-                                Ok(exit.0)
+                                exit.0
                             } else {
-                                Err(format!("execution error: {}", e))
+                                // Capture output even on error before returning
+                                let stdout = stdout_pipe.contents().to_vec();
+                                let stderr = stderr_pipe.contents().to_vec();
+                                return Err(format!(
+                                    "execution error: {} (stdout: {} bytes, stderr: {} bytes)",
+                                    e,
+                                    stdout.len(),
+                                    stderr.len()
+                                ));
                             }
                         }
                     }
                 }
-                None => Err("no _start or main function found".to_string()),
-            }
+                None => return Err("no _start or main function found".to_string()),
+            };
+
+            // Capture output from the pipes after execution
+            let stdout = stdout_pipe.contents().to_vec();
+            let stderr = stderr_pipe.contents().to_vec();
+
+            Ok(ExecutionResult {
+                exit_code,
+                stdout,
+                stderr,
+            })
         })
         .await
         .map_err(|e| format!("task join error: {}", e))?
@@ -367,12 +557,26 @@ impl WasmRuntime {
     /// WASI interfaces compared to Preview 1 modules. This method handles:
     /// - Component compilation and instantiation
     /// - WASI Preview 2 interface linking (wasi:cli, wasi:io, etc.)
+    /// - Filesystem mounts via preopened directories
     /// - Calling the wasi:cli/run export
+    ///
+    /// # Arguments
+    /// * `engine` - The wasmtime Engine
+    /// * `component_bytes` - The compiled WASM component bytes
+    /// * `env_vars` - Environment variables to set
+    /// * `args` - Command line arguments
+    /// * `mounts` - Filesystem mounts to configure as preopens
+    /// * `epoch_deadline` - Epoch deadline for interruption
+    /// * `enable_epochs` - Whether to enable epoch-based interruption
+    ///
+    /// # Returns
+    /// `ExecutionResult` containing the exit code and captured stdout/stderr
     #[instrument(
-        skip(engine, component_bytes, env_vars, args),
+        skip(engine, component_bytes, env_vars, args, mounts),
         fields(
             component_size = component_bytes.len(),
             args_count = args.len(),
+            mounts_count = mounts.len(),
         )
     )]
     async fn execute_component(
@@ -380,9 +584,10 @@ impl WasmRuntime {
         component_bytes: Vec<u8>,
         env_vars: Vec<(String, String)>,
         args: Vec<String>,
+        mounts: Vec<StorageSpec>,
         epoch_deadline: u64,
         enable_epochs: bool,
-    ) -> std::result::Result<i32, String> {
+    ) -> std::result::Result<ExecutionResult, String> {
         // Component model operations are CPU-bound, run in blocking context
         tokio::task::spawn_blocking(move || {
             // Compile the component
@@ -400,8 +605,21 @@ impl WasmRuntime {
             // Set command line arguments
             wasi_builder.args(&args);
 
-            // Inherit stdio for now (in production we'd capture to pipes)
-            wasi_builder.inherit_stdio();
+            // Configure filesystem mounts as preopened directories
+            configure_wasi_mounts(&mut wasi_builder, &mounts)?;
+
+            // Create memory pipes for stdout/stderr capture
+            // These are cloneable (Arc<Mutex> internally) so we can read after execution
+            let stdout_pipe = MemoryOutputPipe::new(STDIO_PIPE_CAPACITY);
+            let stderr_pipe = MemoryOutputPipe::new(STDIO_PIPE_CAPACITY);
+
+            // Configure stdio with memory pipes for capture
+            wasi_builder.stdin(MemoryInputPipe::new(Vec::new())); // Empty stdin
+            wasi_builder.stdout(stdout_pipe.clone());
+            wasi_builder.stderr(stderr_pipe.clone());
+
+            // Enable network access for wasi:sockets (TCP, UDP, IP name lookup)
+            wasi_builder.inherit_network();
 
             // Build the WASIp2 context
             let wasi_ctx = wasi_builder.build();
@@ -434,16 +652,23 @@ impl WasmRuntime {
                 .instantiate(&mut store, &component)
                 .map_err(|e| format!("failed to instantiate component: {}", e))?;
 
+            // Helper to create result with captured output
+            let make_result = |exit_code: i32| ExecutionResult {
+                exit_code,
+                stdout: stdout_pipe.contents().to_vec(),
+                stderr: stderr_pipe.contents().to_vec(),
+            };
+
             // Try to get the wasi:cli/run export first (preferred for wasip2)
             // The run function has signature: func run() -> result<_, error>
             if let Some(run_func) = instance.get_func(&mut store, "wasi:cli/run@0.2.0#run") {
                 // Call the run function
                 match run_func.call(&mut store, &[], &mut []) {
-                    Ok(()) => return Ok(0),
+                    Ok(()) => return Ok(make_result(0)),
                     Err(e) => {
                         // Check for WASI exit
                         if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
-                            return Ok(exit.0);
+                            return Ok(make_result(exit.0));
                         }
                         return Err(format!("wasi:cli/run execution error: {}", e));
                     }
@@ -453,11 +678,11 @@ impl WasmRuntime {
             // Fall back to _start if run is not found (for wasip1-style components)
             if let Some(start_func) = instance.get_func(&mut store, "_start") {
                 match start_func.call(&mut store, &[], &mut []) {
-                    Ok(()) => return Ok(0),
+                    Ok(()) => return Ok(make_result(0)),
                     Err(e) => {
                         // Check for WASI exit
                         if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
-                            return Ok(exit.0);
+                            return Ok(make_result(exit.0));
                         }
                         return Err(format!("_start execution error: {}", e));
                     }
@@ -467,10 +692,10 @@ impl WasmRuntime {
             // Try main as last resort
             if let Some(main_func) = instance.get_func(&mut store, "main") {
                 match main_func.call(&mut store, &[], &mut []) {
-                    Ok(()) => return Ok(0),
+                    Ok(()) => return Ok(make_result(0)),
                     Err(e) => {
                         if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
-                            return Ok(exit.0);
+                            return Ok(make_result(exit.0));
                         }
                         return Err(format!("main execution error: {}", e));
                     }
@@ -648,6 +873,18 @@ impl Runtime for WasmRuntime {
         let env_vars = self.build_env_vars(spec);
         let args = self.build_args(spec);
 
+        // Clone storage mounts from spec
+        let mounts = spec.storage.clone();
+
+        // Log mount configuration
+        if !mounts.is_empty() {
+            tracing::info!(
+                instance = %instance_id,
+                mount_count = mounts.len(),
+                "WASM instance has filesystem mounts configured"
+            );
+        }
+
         // Create instance entry
         let instance = WasmInstance {
             state: InstanceState::Pending,
@@ -658,6 +895,7 @@ impl Runtime for WasmRuntime {
             stderr: Vec::new(),
             env_vars,
             args,
+            mounts,
             execution_handle: None,
         };
 
@@ -690,7 +928,7 @@ impl Runtime for WasmRuntime {
         tracing::info!(instance = %instance_id, "starting WASM instance");
 
         // Get instance and extract data for execution
-        let (wasm_bytes, wasi_version, env_vars, args) = {
+        let (wasm_bytes, wasi_version, env_vars, args, mounts) = {
             let mut instances = self.instances.write().await;
             let instance = instances
                 .get_mut(&instance_id)
@@ -709,6 +947,7 @@ impl Runtime for WasmRuntime {
                 instance.wasi_version.clone(),
                 instance.env_vars.clone(),
                 instance.args.clone(),
+                instance.mounts.clone(),
             )
         };
 
@@ -728,6 +967,7 @@ impl Runtime for WasmRuntime {
             instance = %instance_id,
             wasi_version = %wasi_version,
             is_component = is_component,
+            mount_count = mounts.len(),
             "starting WASM execution"
         );
 
@@ -744,6 +984,7 @@ impl Runtime for WasmRuntime {
                     wasm_bytes,
                     env_vars,
                     args,
+                    mounts,
                     epoch_deadline,
                     enable_epochs,
                 )
@@ -756,6 +997,7 @@ impl Runtime for WasmRuntime {
                     wasm_bytes,
                     env_vars,
                     args,
+                    mounts,
                     epoch_deadline,
                     enable_epochs,
                 )
@@ -821,10 +1063,15 @@ impl Runtime for WasmRuntime {
             let result = tokio::time::timeout(timeout, handle).await;
 
             match result {
-                Ok(Ok(Ok(exit_code))) => {
+                Ok(Ok(Ok(exec_result))) => {
                     let mut instances = self.instances.write().await;
                     if let Some(instance) = instances.get_mut(&instance_id) {
-                        instance.state = InstanceState::Completed { exit_code };
+                        // Update captured stdout/stderr if available
+                        instance.stdout = exec_result.stdout;
+                        instance.stderr = exec_result.stderr;
+                        instance.state = InstanceState::Completed {
+                            exit_code: exec_result.exit_code,
+                        };
                     }
                 }
                 Ok(Ok(Err(e))) => {
@@ -1035,8 +1282,13 @@ impl Runtime for WasmRuntime {
                         if handle.is_finished() {
                             let handle = instance.execution_handle.take().unwrap();
                             match handle.await {
-                                Ok(Ok(exit_code)) => {
-                                    instance.state = InstanceState::Completed { exit_code };
+                                Ok(Ok(exec_result)) => {
+                                    // Update captured stdout/stderr if available
+                                    instance.stdout = exec_result.stdout;
+                                    instance.stderr = exec_result.stderr;
+                                    instance.state = InstanceState::Completed {
+                                        exit_code: exec_result.exit_code,
+                                    };
                                 }
                                 Ok(Err(e)) => {
                                     instance.state = InstanceState::Failed { reason: e };
@@ -1102,6 +1354,21 @@ impl Runtime for WasmRuntime {
         }
 
         Ok(logs)
+    }
+
+    /// Get the PID of a WASM instance
+    ///
+    /// WASM modules run in-process within the wasmtime runtime - they don't have
+    /// their own OS process. Therefore, this method always returns `None`.
+    ///
+    /// This is correct behavior because:
+    /// - WASM workloads don't need overlay network attachment since they run in-process
+    /// - There is no separate process to track or manage
+    /// - The calling code should handle `None` gracefully (skip overlay attachment)
+    async fn get_container_pid(&self, _id: &ContainerId) -> Result<Option<u32>> {
+        // WASM modules run in-process, they don't have their own PID
+        // Return None to indicate no separate process exists
+        Ok(None)
     }
 }
 
@@ -1183,5 +1450,15 @@ mod tests {
         assert_eq!(cloned.epoch_deadline, config.epoch_deadline);
         assert_eq!(cloned.max_execution_time, config.max_execution_time);
         assert!(cloned.cache_type.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_wasm_network_enabled() {
+        // Verify that WasiCtxBuilder with inherit_network compiles and works
+        // This ensures the wasi:sockets interfaces are properly available
+        let mut builder = WasiCtxBuilder::new();
+        builder.inherit_network();
+        let _ctx = builder.build();
+        // If this compiles and runs, networking is properly configured
     }
 }

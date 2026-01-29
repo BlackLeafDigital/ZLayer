@@ -15,6 +15,9 @@ use crate::handlers::services::{
     ScaleRequest, ServiceDetails, ServiceEndpoint, ServiceMetrics, ServiceSummary,
 };
 
+// Internal API types
+use crate::handlers::internal::{InternalScaleRequest, InternalScaleResponse};
+
 // Import the auto-generated path types from utoipa macros
 use crate::handlers::auth::__path_get_token;
 use crate::handlers::build::{
@@ -27,6 +30,7 @@ use crate::handlers::deployments::{
     __path_list_deployments,
 };
 use crate::handlers::health::{__path_liveness, __path_readiness};
+use crate::handlers::internal::{__path_get_replicas_internal, __path_scale_service_internal};
 use crate::handlers::services::{
     __path_get_service, __path_get_service_logs, __path_list_services, __path_scale_service,
 };
@@ -87,6 +91,9 @@ impl Modify for SecurityAddon {
         get_build_logs,
         list_builds,
         list_runtime_templates,
+        // Internal (scheduler-to-agent)
+        scale_service_internal,
+        get_replicas_internal,
     ),
     components(
         schemas(
@@ -108,6 +115,9 @@ impl Modify for SecurityAddon {
             BuildStateEnum,
             TemplateInfo,
             TriggerBuildResponse,
+            // Internal schemas
+            InternalScaleRequest,
+            InternalScaleResponse,
         )
     ),
     modifiers(&SecurityAddon),
@@ -117,6 +127,7 @@ impl Modify for SecurityAddon {
         (name = "Deployments", description = "Deployment management"),
         (name = "Services", description = "Service management"),
         (name = "Build", description = "Container image building"),
+        (name = "Internal", description = "Internal scheduler-to-agent communication"),
     )
 )]
 pub struct ApiDoc;

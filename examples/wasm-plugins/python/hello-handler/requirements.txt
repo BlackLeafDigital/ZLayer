@@ -1,0 +1,15 @@
+# ZLayer Python WASM Plugin Requirements
+#
+# componentize-py is used to compile Python code to WebAssembly components
+# that implement the WASI HTTP interfaces.
+#
+# Installation:
+#   pip install -r requirements.txt
+#
+# Building:
+#   componentize-py -d ../../../../wit -w wasi:http/proxy@0.2.0 componentize app -o hello-handler.wasm
+#
+# For the latest version and documentation, see:
+#   https://github.com/bytecodealliance/componentize-py
+
+componentize-py>=0.14.0

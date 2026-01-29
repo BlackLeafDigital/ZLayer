@@ -5,6 +5,7 @@
 
 use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
+use std::net::IpAddr;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use zlayer_spec::{PullPolicy, ServiceSpec};
@@ -45,6 +46,10 @@ pub struct Container {
     pub state: ContainerState,
     pub pid: Option<u32>,
     pub task: Option<JoinHandle<std::io::Result<()>>>,
+    /// Overlay network IP address assigned to this container
+    pub overlay_ip: Option<IpAddr>,
+    /// Health monitor task handle for this container
+    pub health_monitor: Option<JoinHandle<()>>,
 }
 
 /// Abstract container runtime trait
@@ -96,6 +101,16 @@ pub trait Runtime: Send + Sync {
     /// Returns logs as a vector of log lines.
     /// Used to capture job output after completion.
     async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>>;
+
+    /// Get the PID of a container's main process
+    ///
+    /// Returns:
+    /// - `Ok(Some(pid))` for runtimes with real processes (Youki, Docker)
+    /// - `Ok(None)` for runtimes without separate PIDs (WASM in-process)
+    /// - `Err` if the container doesn't exist or there's an error
+    ///
+    /// Used for overlay network attachment and process management.
+    async fn get_container_pid(&self, id: &ContainerId) -> Result<Option<u32>>;
 }
 
 /// In-memory mock runtime for testing and development
@@ -139,6 +154,8 @@ impl Runtime for MockRuntime {
                 state: ContainerState::Pending,
                 pid: None,
                 task: None,
+                overlay_ip: None,
+                health_monitor: None,
             },
         );
         Ok(())
@@ -235,6 +252,18 @@ impl Runtime for MockRuntime {
                 format!("[{}] Executing command...", id),
                 format!("[{}] Command completed successfully", id),
             ])
+        } else {
+            Err(AgentError::NotFound {
+                container: id.to_string(),
+                reason: "container not found".to_string(),
+            })
+        }
+    }
+
+    async fn get_container_pid(&self, id: &ContainerId) -> Result<Option<u32>> {
+        let containers = self.containers.read().await;
+        if let Some(container) = containers.get(id) {
+            Ok(container.pid)
         } else {
             Err(AgentError::NotFound {
                 container: id.to_string(),

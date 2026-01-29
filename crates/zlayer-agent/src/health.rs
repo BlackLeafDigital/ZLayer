@@ -2,9 +2,14 @@
 
 use crate::error::{AgentError, Result};
 use crate::runtime::ContainerId;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 use zlayer_spec::HealthCheck;
+
+/// Callback type for health state changes.
+/// Called with (container_id, is_healthy) when health state transitions.
+pub type HealthCallback = Arc<dyn Fn(ContainerId, bool) + Send + Sync>;
 
 /// Health checker for containers
 pub struct HealthChecker {
@@ -130,6 +135,7 @@ pub struct HealthMonitor {
     interval: Duration,
     retries: u32,
     state: tokio::sync::RwLock<HealthState>,
+    on_health_change: Option<HealthCallback>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,13 +154,21 @@ impl HealthMonitor {
             interval,
             retries,
             state: tokio::sync::RwLock::new(HealthState::Unknown),
+            on_health_change: None,
         }
+    }
+
+    /// Set a callback to be invoked when health state changes (healthy <-> unhealthy).
+    pub fn with_callback(mut self, callback: HealthCallback) -> Self {
+        self.on_health_change = Some(callback);
+        self
     }
 
     /// Start monitoring (spawns background task)
     pub fn start(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut failures = 0u32;
+            let mut was_healthy: Option<bool> = None;
 
             loop {
                 // Update state to checking
@@ -164,6 +178,14 @@ impl HealthMonitor {
                     Ok(()) => {
                         failures = 0;
                         *self.state.write().await = HealthState::Healthy;
+
+                        // Check for state transition to healthy
+                        if was_healthy != Some(true) {
+                            if let Some(ref callback) = self.on_health_change {
+                                callback(self.id.clone(), true);
+                            }
+                            was_healthy = Some(true);
+                        }
                     }
                     Err(e) => {
                         failures += 1;
@@ -173,8 +195,15 @@ impl HealthMonitor {
                             reason: e.to_string(),
                         };
 
+                        // Check for state transition to unhealthy
+                        if was_healthy != Some(false) {
+                            if let Some(ref callback) = self.on_health_change {
+                                callback(self.id.clone(), false);
+                            }
+                            was_healthy = Some(false);
+                        }
+
                         if failures >= self.retries {
-                            // TODO: notify of unhealthy state
                             break;
                         }
                     }

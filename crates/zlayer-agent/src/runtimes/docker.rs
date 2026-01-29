@@ -730,6 +730,39 @@ impl Runtime for DockerRuntime {
         tracing::debug!(container = %name, line_count = lines.len(), "got container logs");
         Ok(lines)
     }
+
+    /// Get the PID of a container's main process
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.get_pid",
+            container.id = %container_name(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn get_container_pid(&self, id: &ContainerId) -> Result<Option<u32>> {
+        let name = container_name(id);
+
+        let inspect = self
+            .docker
+            .inspect_container(&name, None)
+            .await
+            .map_err(|e| AgentError::NotFound {
+                container: name.clone(),
+                reason: format!("failed to inspect container: {}", e),
+            })?;
+
+        // Extract the PID from the state - only return it if the container is running
+        // A PID of 0 means the container is not running
+        let pid =
+            inspect
+                .state
+                .and_then(|s| s.pid)
+                .and_then(|p| if p > 0 { Some(p as u32) } else { None });
+
+        tracing::debug!(container = %name, pid = ?pid, "got container PID");
+        Ok(pid)
+    }
 }
 
 #[cfg(test)]

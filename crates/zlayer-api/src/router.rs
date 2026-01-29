@@ -17,6 +17,7 @@ use crate::config::ApiConfig;
 use crate::handlers;
 use crate::handlers::cron::CronState;
 use crate::handlers::deployments::DeploymentState;
+use crate::handlers::internal::InternalState;
 use crate::handlers::jobs::JobState;
 use crate::handlers::services::ServiceState;
 use crate::openapi::ApiDoc;
@@ -338,6 +339,83 @@ pub fn build_router_with_services(
     router
 }
 
+/// Build the internal routes for scheduler-to-agent communication
+///
+/// These routes use a shared secret for authentication (via X-ZLayer-Internal-Token header)
+/// rather than JWT tokens, making them suitable for internal service-to-service calls.
+///
+/// # Arguments
+/// * `internal_state` - State containing the service manager and internal token
+///
+/// # Returns
+/// A Router with the internal endpoints mounted at /api/v1/internal
+pub fn build_internal_routes(internal_state: InternalState) -> Router {
+    Router::new()
+        .route("/scale", post(handlers::internal::scale_service_internal))
+        .route(
+            "/replicas/{service}",
+            get(handlers::internal::get_replicas_internal),
+        )
+        .layer(Extension(internal_state.clone()))
+        .with_state(internal_state)
+}
+
+/// Build the API router with internal scheduler endpoints
+///
+/// This extends the service-enabled router with internal endpoints for
+/// scheduler-to-agent communication. These endpoints use a shared secret
+/// for authentication rather than JWT tokens.
+///
+/// # Arguments
+/// * `config` - API configuration
+/// * `storage` - Deployment storage backend
+/// * `service_manager` - ServiceManager for container lifecycle operations
+/// * `internal_token` - Shared secret for authenticating internal API calls
+///
+/// # Example
+///
+/// ```no_run
+/// use zlayer_api::{ApiConfig, build_router_with_internal};
+/// use zlayer_api::storage::InMemoryStorage;
+/// use zlayer_agent::{ServiceManager, MockRuntime};
+/// use std::sync::Arc;
+/// use tokio::sync::RwLock;
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// let config = ApiConfig::default();
+/// let storage = Arc::new(InMemoryStorage::new());
+/// let runtime = Arc::new(MockRuntime::new());
+/// let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));
+/// let internal_token = "my-secret-token".to_string();
+///
+/// let router = build_router_with_internal(
+///     &config,
+///     storage,
+///     service_manager,
+///     internal_token,
+/// );
+/// # Ok(())
+/// # }
+/// ```
+pub fn build_router_with_internal(
+    config: &ApiConfig,
+    storage: Arc<dyn DeploymentStorage + Send + Sync>,
+    service_manager: Arc<RwLock<ServiceManager>>,
+    internal_token: String,
+) -> Router {
+    // Start with the services router
+    let base_router = build_router_with_services(config, storage, service_manager.clone());
+
+    // Create internal state
+    let internal_state = InternalState::new(service_manager, internal_token);
+
+    // Build internal routes
+    let internal_routes = build_internal_routes(internal_state);
+
+    // Merge internal routes
+    base_router.nest("/api/v1/internal", internal_routes)
+}
+
 fn build_cors_layer(config: &ApiConfig) -> CorsLayer {
     let cors = CorsLayer::new().max_age(std::time::Duration::from_secs(config.cors.max_age));
 
@@ -366,6 +444,7 @@ fn build_cors_layer(config: &ApiConfig) -> CorsLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_agent::MockRuntime;
 
     #[test]
     fn test_build_router() {
@@ -404,5 +483,27 @@ mod tests {
         let mut config = ApiConfig::default();
         config.cors.allow_credentials = true;
         let _cors = build_cors_layer(&config);
+    }
+
+    #[test]
+    fn test_build_router_with_internal() {
+        let config = ApiConfig::default();
+        let storage: Arc<dyn DeploymentStorage + Send + Sync> = Arc::new(InMemoryStorage::new());
+        let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));
+        let internal_token = "test-secret-token".to_string();
+
+        let _router = build_router_with_internal(&config, storage, service_manager, internal_token);
+        // Router builds without error
+    }
+
+    #[test]
+    fn test_build_internal_routes() {
+        let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));
+        let internal_state = InternalState::new(service_manager, "test-secret-token".to_string());
+
+        let _routes = build_internal_routes(internal_state);
+        // Routes build without error
     }
 }

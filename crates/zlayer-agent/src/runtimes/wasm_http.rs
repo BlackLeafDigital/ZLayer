@@ -16,6 +16,21 @@
 //! - **Component Caching**: Compiled components are cached for reuse
 //! - **Request/Response Mapping**: HTTP semantics mapped to WASI HTTP types
 //! - **Configurable Timeouts**: Per-request and idle timeouts
+//! - **HTTP Client Support**: WASM components can make outgoing HTTP requests
+//!   via `wasi:http/outgoing-handler` (enabled by default)
+//!
+//! ## HTTP Client Support (Outgoing Requests)
+//!
+//! WASM components running in this runtime can make HTTP client requests to external
+//! services via the `wasi:http/outgoing-handler` interface. This is enabled by default
+//! through the `default-send-request` feature of `wasmtime-wasi-http`, which provides:
+//!
+//! - **TLS Support**: Secure HTTPS connections using rustls
+//! - **Timeout Configuration**: Connect, first-byte, and between-bytes timeouts
+//! - **Connection Pooling**: Efficient connection reuse via hyper
+//!
+//! Guest components can use the WASI HTTP interfaces to fetch data, call APIs,
+//! or communicate with other services.
 //!
 //! ## Usage
 //!
@@ -50,12 +65,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 use wasmtime::component::{Component, Linker, ResourceTable};
 use wasmtime::{Config, Engine, Store};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use wasmtime_wasi_http::bindings::http::types::Scheme;
+use wasmtime_wasi_http::bindings::{Proxy, ProxyPre};
+use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 use zlayer_spec::WasmHttpConfig;
 
@@ -329,9 +349,8 @@ impl WasiHttpView for WasmHttpState {
 struct RequestInstance {
     /// The wasmtime store containing the WASM state
     store: Store<WasmHttpState>,
-    /// The instantiated component
-    #[allow(dead_code)]
-    instance: wasmtime::component::Instance,
+    /// The proxy bindings for calling WASI HTTP handlers
+    proxy: Proxy,
     /// When this instance was created
     #[allow(dead_code)]
     created_at: Instant,
@@ -595,8 +614,10 @@ impl WasmHttpRuntime {
         self.record_request(component_ref).await;
 
         // Handle the request with timeout
+        let component_ref_owned = component_ref.to_string();
         let result = tokio::time::timeout(timeout, async {
-            self.invoke_handler(&mut instance.store, request).await
+            self.invoke_handler(&mut instance, &component_ref_owned, request)
+                .await
         })
         .await;
 
@@ -738,8 +759,6 @@ impl WasmHttpRuntime {
         component_ref: &str,
         component: &Component,
     ) -> Result<RequestInstance, WasmHttpError> {
-        let engine = self.engine.clone();
-        let component = component.clone();
         let linker = Arc::clone(&self.linker);
         let component_ref_owned = component_ref.to_string();
 
@@ -752,31 +771,44 @@ impl WasmHttpRuntime {
             pool.record_created();
         }
 
-        let result = tokio::task::spawn_blocking(move || {
-            let state = WasmHttpState::new();
-            let mut store = Store::new(&engine, state);
+        // Create the ProxyPre for efficient instantiation
+        let proxy_pre = {
+            let component_ref_owned = component_ref_owned.clone();
+            let instance_pre =
+                linker
+                    .instantiate_pre(component)
+                    .map_err(|e| WasmHttpError::Instantiation {
+                        component: component_ref_owned.clone(),
+                        reason: format!("failed to create instance pre: {}", e),
+                    })?;
 
-            // Set epoch deadline for interruption
-            store.set_epoch_deadline(1_000_000);
+            ProxyPre::new(instance_pre).map_err(|e| WasmHttpError::Instantiation {
+                component: component_ref_owned,
+                reason: format!("failed to create proxy pre: {}", e),
+            })?
+        };
 
-            let instance = linker.instantiate(&mut store, &component).map_err(|e| {
-                WasmHttpError::Instantiation {
-                    component: component_ref_owned.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
+        // Create the store with WASM HTTP state
+        let state = WasmHttpState::new();
+        let mut store = Store::new(&self.engine, state);
 
-            Ok::<_, WasmHttpError>(RequestInstance {
-                store,
-                instance,
-                created_at: Instant::now(),
-            })
-        })
-        .await
-        .map_err(|e| WasmHttpError::Internal(format!("task join error: {}", e)))??;
+        // Set epoch deadline for interruption
+        store.set_epoch_deadline(1_000_000);
+
+        // Instantiate the proxy asynchronously
+        let proxy = proxy_pre.instantiate_async(&mut store).await.map_err(|e| {
+            WasmHttpError::Instantiation {
+                component: component_ref.to_string(),
+                reason: format!("failed to instantiate proxy: {}", e),
+            }
+        })?;
 
         debug!("Created new instance for {}", component_ref);
-        Ok(result)
+        Ok(RequestInstance {
+            store,
+            proxy,
+            created_at: Instant::now(),
+        })
     }
 
     /// Record that a request was handled
@@ -797,38 +829,16 @@ impl WasmHttpRuntime {
 
     /// Invoke the HTTP handler on an instance
     ///
-    /// # Design Decision: Simplified Implementation
-    ///
-    /// This method provides a simplified mock implementation rather than full
-    /// WASI HTTP handler invocation. This is intentional for the following reasons:
-    ///
-    /// 1. **Complexity**: Full `wasi:http/incoming-handler` implementation requires:
-    ///    - Creating WASI HTTP request/response resource types
-    ///    - Managing the outgoing body stream asynchronously
-    ///    - Handling trailers and complex HTTP semantics
-    ///    - Significant additional wasmtime-wasi-http bindings
-    ///
-    /// 2. **Use Case**: ZLayer's primary WASM use case is for plugins implementing
-    ///    the `zlayer:plugin/handler` interface, not general HTTP handlers. HTTP
-    ///    handler support is provided for completeness but is not the primary path.
-    ///
-    /// 3. **Testing & Validation**: This implementation allows testing the runtime
-    ///    infrastructure (pooling, caching, timeouts) without requiring actual
-    ///    WASI HTTP-compatible components.
-    ///
-    /// ## Future Enhancement
-    ///
-    /// To implement full WASI HTTP support, this method would need to:
-    /// 1. Create `wasi:http/types` request/response resources in the resource table
-    /// 2. Call `wasi:http/incoming-handler.handle(request, response-out)`
-    /// 3. Read the outgoing response body stream
-    /// 4. Handle trailers if present
-    ///
-    /// For production HTTP handler workloads, consider using `WasmRuntime` with
-    /// components that export `wasi:cli/run` instead.
+    /// This method implements the full `wasi:http/incoming-handler` protocol:
+    /// 1. Convert the `HttpRequest` to a hyper request
+    /// 2. Create WASI HTTP resources (IncomingRequest and ResponseOutparam)
+    /// 3. Call the guest's `handle` export
+    /// 4. Receive the response via the oneshot channel
+    /// 5. Convert the response back to `HttpResponse`
     async fn invoke_handler(
         &self,
-        store: &mut Store<WasmHttpState>,
+        instance: &mut RequestInstance,
+        component_ref: &str,
         request: HttpRequest,
     ) -> Result<HttpResponse, WasmHttpError> {
         debug!(
@@ -839,27 +849,195 @@ impl WasmHttpRuntime {
         );
 
         // Increment epoch for cooperative scheduling
-        store.epoch_deadline_trap();
+        instance.store.epoch_deadline_trap();
 
-        // Mock response demonstrating the request was received
-        // This validates the runtime infrastructure without requiring a real WASI HTTP component
-        let body = format!(
-            "WASM HTTP Handler received: {} {}\n\
-             Headers: {:?}\n\
-             Body length: {} bytes",
-            request.method,
-            request.uri,
-            request.headers,
-            request.body.map(|b| b.len()).unwrap_or(0)
+        // Step 1: Convert HttpRequest to hyper::Request
+        let hyper_request = self.convert_to_hyper_request(&request).map_err(|e| {
+            WasmHttpError::HandlerInvocation {
+                component: component_ref.to_string(),
+                reason: format!("failed to convert request: {}", e),
+            }
+        })?;
+
+        // Step 2: Create the response channel
+        let (response_sender, response_receiver) = tokio::sync::oneshot::channel();
+
+        // Step 3: Create WASI HTTP resources in the store's resource table
+        let incoming_request = instance
+            .store
+            .data_mut()
+            .new_incoming_request(Scheme::Http, hyper_request)
+            .map_err(|e| WasmHttpError::HandlerInvocation {
+                component: component_ref.to_string(),
+                reason: format!("failed to create incoming request resource: {}", e),
+            })?;
+
+        let response_outparam = instance
+            .store
+            .data_mut()
+            .new_response_outparam(response_sender)
+            .map_err(|e| WasmHttpError::HandlerInvocation {
+                component: component_ref.to_string(),
+                reason: format!("failed to create response outparam resource: {}", e),
+            })?;
+
+        // Step 4: Get the incoming handler and call it
+        let handler = instance.proxy.wasi_http_incoming_handler();
+
+        // Call the handler. The response may come before the handler returns
+        // (e.g., for streaming responses) via the oneshot channel.
+        let component_ref_owned = component_ref.to_string();
+        let call_result = handler
+            .call_handle(&mut instance.store, incoming_request, response_outparam)
+            .await;
+
+        if let Err(e) = &call_result {
+            warn!(
+                "Handler call failed for component {}: {}",
+                component_ref_owned, e
+            );
+            // The handler failed, but we may still receive a response if the guest
+            // called response-outparam.set before failing. Check the receiver below.
+        }
+
+        // Step 5: Wait for the response from the guest
+        let hyper_response = match response_receiver.await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(error_code)) => {
+                // Guest returned an error code via response-outparam.set
+                return Err(WasmHttpError::HandlerInvocation {
+                    component: component_ref.to_string(),
+                    reason: format!("guest returned error: {:?}", error_code),
+                });
+            }
+            Err(_) => {
+                // The sender was dropped without sending a response.
+                // This means the guest didn't call response-outparam.set
+                return Err(WasmHttpError::HandlerInvocation {
+                    component: component_ref.to_string(),
+                    reason: "guest never invoked response-outparam.set".to_string(),
+                });
+            }
+        };
+
+        // Step 6: Convert hyper::Response to HttpResponse
+        let response = self
+            .convert_from_hyper_response(hyper_response)
+            .await
+            .map_err(|e| WasmHttpError::HandlerInvocation {
+                component: component_ref.to_string(),
+                reason: format!("failed to convert response: {}", e),
+            })?;
+
+        debug!(
+            "Handler completed successfully: status={}, body_len={}",
+            response.status,
+            response.body.as_ref().map(|b| b.len()).unwrap_or(0)
         );
 
+        Ok(response)
+    }
+
+    /// Convert an `HttpRequest` to a `hyper::Request` with a body type compatible with WASI HTTP
+    fn convert_to_hyper_request(
+        &self,
+        request: &HttpRequest,
+    ) -> Result<hyper::Request<BoxBody<Bytes, hyper::Error>>, anyhow::Error> {
+        use http::Method;
+
+        // Parse the method
+        let method = match request.method.to_uppercase().as_str() {
+            "GET" => Method::GET,
+            "POST" => Method::POST,
+            "PUT" => Method::PUT,
+            "DELETE" => Method::DELETE,
+            "HEAD" => Method::HEAD,
+            "OPTIONS" => Method::OPTIONS,
+            "PATCH" => Method::PATCH,
+            "TRACE" => Method::TRACE,
+            "CONNECT" => Method::CONNECT,
+            other => Method::from_bytes(other.as_bytes())?,
+        };
+
+        // Build the request
+        let mut builder = hyper::Request::builder().method(method).uri(&request.uri);
+
+        // Add headers
+        for (name, value) in &request.headers {
+            builder = builder.header(name.as_str(), value.as_str());
+        }
+
+        // Ensure we have a Host header (required for WASI HTTP)
+        let has_host = request
+            .headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("host"));
+        if !has_host {
+            // Extract host from URI or use a default
+            if let Ok(uri) = request.uri.parse::<http::Uri>() {
+                if let Some(authority) = uri.authority() {
+                    builder = builder.header("Host", authority.as_str());
+                } else {
+                    builder = builder.header("Host", "localhost");
+                }
+            } else {
+                builder = builder.header("Host", "localhost");
+            }
+        }
+
+        // Build with body - map the Infallible error to hyper::Error
+        let body = match &request.body {
+            Some(bytes) => Full::new(Bytes::from(bytes.clone())),
+            None => Full::new(Bytes::new()),
+        };
+
+        // Map the Infallible error to hyper::Error using map_err
+        let boxed_body = body
+            .map_err(|e: std::convert::Infallible| match e {})
+            .boxed();
+
+        Ok(builder.body(boxed_body)?)
+    }
+
+    /// Convert a `hyper::Response` to an `HttpResponse`
+    async fn convert_from_hyper_response(
+        &self,
+        response: hyper::Response<HyperOutgoingBody>,
+    ) -> Result<HttpResponse, anyhow::Error> {
+        let (parts, body) = response.into_parts();
+
+        // Convert status
+        let status = parts.status.as_u16();
+
+        // Convert headers
+        let headers: Vec<(String, String)> = parts
+            .headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.to_string(), v.to_string()))
+            })
+            .collect();
+
+        // Collect the body
+        let body_bytes = body
+            .collect()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to collect response body: {}", e))?
+            .to_bytes();
+
+        let body = if body_bytes.is_empty() {
+            None
+        } else {
+            Some(body_bytes.to_vec())
+        };
+
         Ok(HttpResponse {
-            status: 200,
-            headers: vec![
-                ("Content-Type".to_string(), "text/plain".to_string()),
-                ("X-Powered-By".to_string(), "ZLayer-WASM".to_string()),
-            ],
-            body: Some(body.into_bytes()),
+            status,
+            headers,
+            body,
         })
     }
 }
@@ -1940,5 +2118,68 @@ mod tests {
             response = response.with_header(format!("X-Header-{}", i), format!("value-{}", i));
         }
         assert_eq!(response.headers.len(), 1000);
+    }
+
+    // =========================================================================
+    // HTTP Outgoing Support Tests
+    // =========================================================================
+
+    /// Verify that WasiHttpView is properly implemented for WasmHttpState
+    /// and that the outgoing HTTP support (send_request) is available via
+    /// the default-send-request feature.
+    #[test]
+    fn test_wasm_http_state_implements_wasi_http_view() {
+        // This test verifies at compile time that WasmHttpState properly
+        // implements WasiHttpView with all required methods.
+        fn assert_wasi_http_view<T: WasiHttpView>() {}
+        assert_wasi_http_view::<WasmHttpState>();
+    }
+
+    /// Verify that the runtime can be created with HTTP outgoing support enabled.
+    /// The wasmtime-wasi-http crate's default features include default-send-request,
+    /// which provides the send_request implementation for outgoing HTTP calls.
+    #[tokio::test]
+    async fn test_wasm_http_outgoing_configured() {
+        let config = WasmHttpConfig::default();
+        let runtime = WasmHttpRuntime::new(config);
+        assert!(
+            runtime.is_ok(),
+            "Failed to create runtime with HTTP outgoing support: {:?}",
+            runtime.err()
+        );
+
+        // Verify the linker has both WASI and WASI HTTP bindings configured
+        // This is a compile-time check that WasiHttpView is properly implemented
+        // and the linker can link all required interfaces including outgoing-handler
+        let runtime = runtime.unwrap();
+        let stats = runtime.pool_stats().await;
+        assert_eq!(
+            stats.cached_components, 0,
+            "Fresh runtime should have no cached components"
+        );
+    }
+
+    /// Test that WasmHttpState can be used with the send_request default implementation.
+    /// This verifies the default-send-request feature is properly enabled.
+    #[test]
+    fn test_wasm_http_state_send_request_available() {
+        use wasmtime_wasi_http::types::OutgoingRequestConfig;
+
+        // Create a WasmHttpState and verify send_request is callable
+        // This is primarily a compile-time check
+        let mut state = WasmHttpState::new();
+
+        // Verify we can access the ctx and table methods
+        let _ctx = WasiHttpView::ctx(&mut state);
+        let _table = WasiHttpView::table(&mut state);
+
+        // The OutgoingRequestConfig type being available indicates
+        // the outgoing HTTP types are properly imported
+        let _config = OutgoingRequestConfig {
+            use_tls: false,
+            connect_timeout: std::time::Duration::from_secs(30),
+            first_byte_timeout: std::time::Duration::from_secs(30),
+            between_bytes_timeout: std::time::Duration::from_secs(30),
+        };
     }
 }

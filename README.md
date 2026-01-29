@@ -585,6 +585,35 @@ ZLayer supports WebAssembly (WASM) as a first-class runtime alongside traditiona
 | **Portability** | Arch-specific (x86/ARM) | Universal bytecode |
 | **exec() support** | Yes | No (single process model) |
 
+### WASIp2 Capabilities
+
+ZLayer provides comprehensive WASIp2 support with the following interfaces:
+
+| Interface | Description | Status |
+|-----------|-------------|--------|
+| wasi:cli/* | Environment, args, stdin/stdout/stderr | Supported |
+| wasi:sockets/* | TCP/UDP networking, DNS resolution | Supported |
+| wasi:filesystem/* | Preopened directory access | Supported |
+| wasi:clocks/* | Monotonic and wall clock time | Supported |
+| wasi:random/* | Secure random number generation | Supported |
+| wasi:http/* | HTTP client and incoming handler | Supported |
+
+### ZLayer Plugin Host Interfaces
+
+Custom host interfaces available to WASM plugins:
+
+| Interface | Description |
+|-----------|-------------|
+| zlayer:plugin/config | Configuration access (get, get_required, get_prefix, get_bool, get_int) |
+| zlayer:plugin/keyvalue | Key-value storage (get, set, delete, increment, compare_and_swap, TTL support) |
+| zlayer:plugin/logging | Structured logging with levels (trace, debug, info, warn, error) |
+| zlayer:plugin/secrets | Secure secret access (get, get_required, exists, list_names) |
+| zlayer:plugin/metrics | Counter, gauge, histogram metrics with labels |
+
+### Custom HTTP Interfaces
+
+For advanced HTTP handling (router, middleware, websocket, caching), see [WASM_PLUGINS.md](./docs/WASM_PLUGINS.md).
+
 ### Building WASM Plugins
 
 **Using ZLayer CLI (Recommended):**
