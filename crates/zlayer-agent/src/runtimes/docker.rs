@@ -626,10 +626,7 @@ impl Runtime for DockerRuntime {
             .unwrap_or(0);
 
         // Extract memory limit
-        let memory_limit = stats
-            .memory_stats
-            .and_then(|s| s.limit)
-            .unwrap_or(u64::MAX);
+        let memory_limit = stats.memory_stats.and_then(|s| s.limit).unwrap_or(u64::MAX);
 
         let container_stats = ContainerStats {
             cpu_usage_usec,
