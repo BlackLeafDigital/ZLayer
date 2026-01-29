@@ -155,12 +155,13 @@ impl YoukiRuntime {
                 reason: format!("failed to create storage manager: {}", e),
             })?;
 
-        // Initialize shared blob cache (single instance for the runtime lifetime)
+        // Initialize shared blob cache with persistent disk storage (like Docker's /var/lib/docker/)
+        // This ensures layers are cached across process restarts and test runs
         let cache_path = config.cache_dir.join("blobs.redb");
-        let blob_cache = zlayer_registry::BlobCache::open(&cache_path).map_err(|e| {
+        let blob_cache = zlayer_registry::PersistentBlobCache::open(&cache_path).map_err(|e| {
             AgentError::CreateFailed {
                 id: "runtime".to_string(),
-                reason: format!("failed to open blob cache: {}", e),
+                reason: format!("failed to open persistent blob cache: {}", e),
             }
         })?;
 
@@ -207,12 +208,13 @@ impl YoukiRuntime {
                 reason: format!("failed to create storage manager: {}", e),
             })?;
 
-        // Initialize shared blob cache (single instance for the runtime lifetime)
+        // Initialize shared blob cache with persistent disk storage (like Docker's /var/lib/docker/)
+        // This ensures layers are cached across process restarts and test runs
         let cache_path = config.cache_dir.join("blobs.redb");
-        let blob_cache = zlayer_registry::BlobCache::open(&cache_path).map_err(|e| {
+        let blob_cache = zlayer_registry::PersistentBlobCache::open(&cache_path).map_err(|e| {
             AgentError::CreateFailed {
                 id: "runtime".to_string(),
-                reason: format!("failed to open blob cache: {}", e),
+                reason: format!("failed to open persistent blob cache: {}", e),
             }
         })?;
 

@@ -197,12 +197,25 @@ impl ImagePuller {
 
     /// Pull an image manifest from the registry
     ///
-    /// Returns the manifest and its digest.
+    /// Returns the manifest and its digest. Manifests are cached to avoid
+    /// repeated network requests for the same image reference.
     pub async fn pull_manifest(
         &self,
         image: &str,
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
+        // Cache key: use "manifest:" prefix + image reference
+        let cache_key = format!("manifest:{}", image);
+
+        // Check cache first
+        if let Ok(Some(data)) = self.cache.get(&cache_key).await {
+            if let Ok(manifest) = serde_json::from_slice::<OciImageManifest>(&data) {
+                let digest = crate::cache::compute_digest(&data);
+                tracing::debug!(image = %image, "manifest cache hit");
+                return Ok((manifest, digest));
+            }
+        }
+
         let reference: Reference = image.parse().map_err(|_| RegistryError::NotFound {
             registry: "unknown".to_string(),
             image: image.to_string(),
@@ -225,6 +238,11 @@ impl ImagePuller {
             layers = manifest.layers.len(),
             "manifest pulled successfully"
         );
+
+        // Cache for next time
+        if let Ok(bytes) = serde_json::to_vec(&manifest) {
+            let _ = self.cache.put(&cache_key, &bytes).await;
+        }
 
         Ok((manifest, digest))
     }

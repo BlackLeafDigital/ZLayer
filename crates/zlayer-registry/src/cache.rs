@@ -65,13 +65,15 @@ impl BlobCache {
     pub fn put(&self, digest: &str, data: &[u8]) -> Result<(), CacheError> {
         validate_digest(digest)?;
 
-        // Verify digest matches data
-        let actual_digest = compute_digest(data);
-        if actual_digest != digest {
-            return Err(CacheError::Corrupted(format!(
-                "digest mismatch: expected {}, got {}",
-                digest, actual_digest
-            )));
+        // Verify digest matches data (skip for manifest cache keys)
+        if !digest.starts_with("manifest:") {
+            let actual_digest = compute_digest(data);
+            if actual_digest != digest {
+                return Err(CacheError::Corrupted(format!(
+                    "digest mismatch: expected {}, got {}",
+                    digest, actual_digest
+                )));
+            }
         }
 
         {
@@ -169,10 +171,20 @@ impl BlobCacheBackend for BlobCache {
 }
 
 /// Validate that a digest string is properly formatted
+///
+/// Accepts two formats:
+/// - `sha256:<64 hex chars>` - Standard blob digest
+/// - `manifest:<image reference>` - Manifest cache key
 pub(crate) fn validate_digest(digest: &str) -> Result<(), CacheError> {
+    // Allow manifest cache keys
+    if digest.starts_with("manifest:") {
+        return Ok(());
+    }
+
+    // Standard sha256 digest validation
     if !digest.starts_with("sha256:") {
         return Err(CacheError::InvalidDigest(
-            "digest must start with sha256:".to_string(),
+            "digest must start with sha256: or manifest:".to_string(),
         ));
     }
 

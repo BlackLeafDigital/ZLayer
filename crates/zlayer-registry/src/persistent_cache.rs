@@ -3,8 +3,9 @@
 //! This module provides a persistent blob cache backed by redb for durability.
 //! Blobs are stored with metadata for LRU eviction.
 
-use crate::cache::{compute_digest, validate_digest};
+use crate::cache::{compute_digest, validate_digest, BlobCacheBackend};
 use crate::error::{CacheError, Result};
+use async_trait::async_trait;
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
 use std::sync::Arc;
@@ -183,13 +184,15 @@ impl PersistentBlobCache {
     pub fn put(&self, digest: &str, data: &[u8]) -> Result<(), CacheError> {
         validate_digest(digest)?;
 
-        // Verify digest matches data
-        let actual_digest = compute_digest(data);
-        if actual_digest != digest {
-            return Err(CacheError::Corrupted(format!(
-                "digest mismatch: expected {}, got {}",
-                digest, actual_digest
-            )));
+        // Verify digest matches data (skip for manifest cache keys)
+        if !digest.starts_with("manifest:") {
+            let actual_digest = compute_digest(data);
+            if actual_digest != digest {
+                return Err(CacheError::Corrupted(format!(
+                    "digest mismatch: expected {}, got {}",
+                    digest, actual_digest
+                )));
+            }
         }
 
         let write_txn = self.db.begin_write().map_err(|e| {
@@ -420,6 +423,24 @@ impl PersistentBlobCache {
         );
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl BlobCacheBackend for PersistentBlobCache {
+    async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, CacheError> {
+        // Delegate to the synchronous method
+        PersistentBlobCache::get(self, digest)
+    }
+
+    async fn put(&self, digest: &str, data: &[u8]) -> Result<(), CacheError> {
+        // Delegate to the synchronous method
+        PersistentBlobCache::put(self, digest, data)
+    }
+
+    async fn contains(&self, digest: &str) -> Result<bool, CacheError> {
+        // Delegate to the synchronous method
+        PersistentBlobCache::contains(self, digest)
     }
 }
 

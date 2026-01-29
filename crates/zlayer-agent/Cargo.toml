@@ -35,7 +35,7 @@ uuid.workspace = true
 zlayer-core = { version = "0.1.0", path = "../zlayer-core" }
 zlayer-proxy = { version = "0.1.0", path = "../zlayer-proxy" }
 libcontainer = "0.5"
-zlayer-registry = { version = "0.1.0", path = "../zlayer-registry" }
+zlayer-registry = { version = "0.1.0", path = "../zlayer-registry", features = ["persistent"] }
 zlayer-overlay = { version = "0.1.0", path = "../zlayer-overlay" }
 ipnetwork = "0.21.1"
 num_cpus.workspace = true
