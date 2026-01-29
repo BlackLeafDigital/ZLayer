@@ -123,7 +123,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
       - name: Install cross
         run: cargo install cross
       - name: Install system deps
@@ -147,16 +147,14 @@ jobs:
     strategy:
       matrix:
         include:
-          - os: macos-13
-            target: x86_64-apple-darwin
+          - target: x86_64-apple-darwin
             artifact: darwin-amd64
-          - os: macos-14
-            target: aarch64-apple-darwin
+          - target: aarch64-apple-darwin
             artifact: darwin-arm64
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
         with:
           targets: ${{ matrix.target }}
       - name: Install protobuf
@@ -177,7 +175,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev protobuf-compiler
       - name: Publish
@@ -191,7 +189,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev protobuf-compiler
       - name: Publish all in dependency order
@@ -211,7 +209,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-action@stable
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
       - name: Publish
         working-directory: clients/zlayer-sdk/rust
         env:
