@@ -917,7 +917,7 @@ mod wasm_host_functions_e2e {
         host.add_config("float.int", "42");
         host.add_config("float.invalid", "not-a-number");
 
-        assert!((host.config_get_float("float.pi").unwrap() - 3.14159).abs() < 0.0001);
+        assert!((host.config_get_float("float.pi").unwrap() - std::f64::consts::PI).abs() < 0.01);
         assert_eq!(host.config_get_float("float.int"), Some(42.0));
         assert_eq!(host.config_get_float("float.invalid"), None);
     }

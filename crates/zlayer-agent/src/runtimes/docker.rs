@@ -735,7 +735,6 @@ impl Runtime for DockerRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zlayer_spec::ServiceType;
 
     #[test]
     fn test_container_name() {

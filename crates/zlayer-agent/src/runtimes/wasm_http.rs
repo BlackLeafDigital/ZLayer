@@ -1448,9 +1448,11 @@ mod tests {
 
     #[test]
     fn test_pool_stats_debug_formatting() {
-        let mut stats = PoolStats::default();
-        stats.cached_components = 2;
-        stats.total_requests = 50;
+        let stats = PoolStats {
+            cached_components: 2,
+            total_requests: 50,
+            ..Default::default()
+        };
 
         let debug_str = format!("{:?}", stats);
         assert!(debug_str.contains("PoolStats"));
@@ -1460,9 +1462,11 @@ mod tests {
 
     #[test]
     fn test_pool_stats_clone() {
-        let mut original = PoolStats::default();
-        original.cached_components = 5;
-        original.total_requests = 100;
+        let mut original = PoolStats {
+            cached_components: 5,
+            total_requests: 100,
+            ..Default::default()
+        };
         original.components.insert(
             "test-component".to_string(),
             ComponentStats {

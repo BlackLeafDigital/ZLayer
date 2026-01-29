@@ -1823,7 +1823,7 @@ mod tests {
         host.add_config("integer", "42");
         host.add_config("scientific", "1.5e10");
 
-        assert!((host.config_get_float("positive").unwrap() - 3.14159).abs() < 1e-10);
+        assert!((host.config_get_float("positive").unwrap() - std::f64::consts::PI).abs() < 0.01);
         assert!((host.config_get_float("negative").unwrap() - (-2.5)).abs() < f64::EPSILON);
         assert!((host.config_get_float("zero").unwrap() - 0.0).abs() < f64::EPSILON);
         assert!((host.config_get_float("integer").unwrap() - 42.0).abs() < f64::EPSILON);

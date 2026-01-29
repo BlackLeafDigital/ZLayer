@@ -135,6 +135,6 @@ mod tests {
     #[test]
     fn test_module_compiles() {
         // Basic smoke test that the module compiles
-        assert!(true);
+        // The test passing means the module compiled successfully
     }
 }
