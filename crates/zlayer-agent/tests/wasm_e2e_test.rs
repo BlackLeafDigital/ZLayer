@@ -2201,7 +2201,7 @@ mod wasm_http_interfaces_e2e {
             .with_tls("TLSv1.3", "TLS_AES_256_GCM_SHA384")
             .with_server_name("api.example.com")
             .with_http_version(HttpVersion::Http2)
-            .with_timestamp(1234567890_000_000_000);
+            .with_timestamp(1_234_567_890_000_000_000);
 
         assert_eq!(metadata.client_ip, "192.168.1.100");
         assert_eq!(metadata.client_port, 54321);
@@ -2212,7 +2212,7 @@ mod wasm_http_interfaces_e2e {
         );
         assert_eq!(metadata.server_name, Some("api.example.com".to_string()));
         assert_eq!(metadata.http_version, HttpVersion::Http2);
-        assert_eq!(metadata.received_at, 1234567890_000_000_000);
+        assert_eq!(metadata.received_at, 1_234_567_890_000_000_000);
     }
 
     /// Test RequestMetadata local convenience constructor

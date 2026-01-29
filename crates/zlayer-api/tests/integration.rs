@@ -12,8 +12,7 @@ use tower::ServiceExt;
 use zlayer_agent::{MockRuntime, ServiceManager};
 use zlayer_api::storage::InMemoryStorage;
 use zlayer_api::{
-    build_router, build_router_with_internal, create_token, ApiConfig, InternalState,
-    INTERNAL_AUTH_HEADER,
+    build_router, build_router_with_internal, create_token, ApiConfig, INTERNAL_AUTH_HEADER,
 };
 
 fn test_config() -> ApiConfig {
