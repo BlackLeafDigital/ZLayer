@@ -118,6 +118,8 @@ pub struct YoukiRuntime {
     auth_resolver: zlayer_core::AuthResolver,
     /// Storage volume manager
     storage_manager: std::sync::Arc<tokio::sync::RwLock<StorageManager>>,
+    /// Shared blob cache for image layers (avoids repeated opens and ensures cache persistence)
+    blob_cache: std::sync::Arc<Box<dyn zlayer_registry::BlobCacheBackend>>,
 }
 
 impl std::fmt::Debug for YoukiRuntime {
@@ -153,11 +155,23 @@ impl YoukiRuntime {
                 reason: format!("failed to create storage manager: {}", e),
             })?;
 
+        // Initialize shared blob cache (single instance for the runtime lifetime)
+        let cache_path = config.cache_dir.join("blobs.redb");
+        let blob_cache = zlayer_registry::BlobCache::open(&cache_path).map_err(|e| {
+            AgentError::CreateFailed {
+                id: "runtime".to_string(),
+                reason: format!("failed to open blob cache: {}", e),
+            }
+        })?;
+
         Ok(Self {
             config,
             containers: RwLock::new(HashMap::new()),
             auth_resolver: zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()),
             storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
+            blob_cache: std::sync::Arc::new(
+                Box::new(blob_cache) as Box<dyn zlayer_registry::BlobCacheBackend>
+            ),
         })
     }
 
@@ -193,11 +207,23 @@ impl YoukiRuntime {
                 reason: format!("failed to create storage manager: {}", e),
             })?;
 
+        // Initialize shared blob cache (single instance for the runtime lifetime)
+        let cache_path = config.cache_dir.join("blobs.redb");
+        let blob_cache = zlayer_registry::BlobCache::open(&cache_path).map_err(|e| {
+            AgentError::CreateFailed {
+                id: "runtime".to_string(),
+                reason: format!("failed to open blob cache: {}", e),
+            }
+        })?;
+
         Ok(Self {
             config,
             containers: RwLock::new(HashMap::new()),
             auth_resolver: zlayer_core::AuthResolver::new(auth_config),
             storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
+            blob_cache: std::sync::Arc::new(
+                Box::new(blob_cache) as Box<dyn zlayer_registry::BlobCacheBackend>
+            ),
         })
     }
 
@@ -291,15 +317,11 @@ impl YoukiRuntime {
     }
 
     /// Pull image layers and return them for extraction
+    ///
+    /// Uses the shared blob cache to avoid repeated network requests for cached layers.
     async fn pull_image_layers(&self, image: &str) -> Result<Vec<(Vec<u8>, String)>> {
-        let cache_path = self.config.cache_dir.join("blobs.redb");
-        let cache =
-            zlayer_registry::BlobCache::open(&cache_path).map_err(|e| AgentError::PullFailed {
-                image: image.to_string(),
-                reason: format!("failed to open blob cache: {}", e),
-            })?;
-
-        let puller = zlayer_registry::ImagePuller::new(cache);
+        // Use the shared blob cache instead of opening a new one each time
+        let puller = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
         let auth = self.auth_resolver.resolve(image);
 
         puller
@@ -476,14 +498,6 @@ impl Runtime for YoukiRuntime {
         image: &str,
         policy: zlayer_spec::PullPolicy,
     ) -> Result<()> {
-        // Check blob cache to see if image layers are already cached
-        let cache_path = self.config.cache_dir.join("blobs.redb");
-        let cache =
-            zlayer_registry::BlobCache::open(&cache_path).map_err(|e| AgentError::PullFailed {
-                image: image.to_string(),
-                reason: format!("failed to open blob cache: {}", e),
-            })?;
-
         // For Never policy, we just check if we can pull from cache
         // The actual extraction happens in create_container
         if matches!(policy, zlayer_spec::PullPolicy::Never) {
@@ -494,8 +508,8 @@ impl Runtime for YoukiRuntime {
         }
 
         // For IfNotPresent, check if image layers are in cache by trying to pull
-        // The ImagePuller uses the blob cache internally
-        let puller = zlayer_registry::ImagePuller::new(cache);
+        // Use the shared blob cache to avoid repeated opens and ensure persistence
+        let puller = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
         let auth = self.auth_resolver.resolve(image);
 
         tracing::info!(image = %image, "pulling image layers to cache");

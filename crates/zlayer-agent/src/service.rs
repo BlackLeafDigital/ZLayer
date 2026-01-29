@@ -43,11 +43,15 @@ impl ServiceInstance {
     }
 
     /// Scale to the desired number of replicas
+    ///
+    /// This method uses short-lived locks to avoid blocking concurrent operations.
+    /// I/O operations (pull, create, start, stop, remove) are performed without
+    /// holding the containers lock to allow other operations to proceed.
     pub async fn scale_to(&self, replicas: u32) -> Result<()> {
-        let mut containers = self.containers.write().await;
-        let current_replicas = containers.len() as u32;
+        // Phase 1: Determine current state (short read lock)
+        let current_replicas = { self.containers.read().await.len() as u32 }; // Lock released here
 
-        // Scale up
+        // Phase 2: Scale up - create new containers (no lock held during I/O)
         if replicas > current_replicas {
             for i in current_replicas..replicas {
                 let id = ContainerId {
@@ -55,7 +59,7 @@ impl ServiceInstance {
                     replica: i + 1,
                 };
 
-                // Pull image
+                // Pull image (no lock needed - I/O operation)
                 self.runtime
                     .pull_image_with_policy(&self.spec.image.name, self.spec.image.pull_policy)
                     .await
@@ -64,7 +68,7 @@ impl ServiceInstance {
                         reason: e.to_string(),
                     })?;
 
-                // Create container
+                // Create container (no lock needed - I/O operation)
                 self.runtime
                     .create_container(&id, &self.spec)
                     .await
@@ -73,7 +77,7 @@ impl ServiceInstance {
                         reason: e.to_string(),
                     })?;
 
-                // Run init actions with error policy enforcement
+                // Run init actions with error policy enforcement (no lock needed)
                 let init_orchestrator = InitOrchestrator::with_error_policy(
                     id.clone(),
                     self.spec.init.clone(),
@@ -81,7 +85,7 @@ impl ServiceInstance {
                 );
                 init_orchestrator.run().await?;
 
-                // Start container
+                // Start container (no lock needed - I/O operation)
                 self.runtime
                     .start_container(&id)
                     .await
@@ -90,7 +94,7 @@ impl ServiceInstance {
                         reason: e.to_string(),
                     })?;
 
-                // Start health monitoring
+                // Start health monitoring (no lock needed)
                 {
                     let check = self.spec.health.check.clone();
                     let interval = self.spec.health.interval.unwrap_or(Duration::from_secs(10));
@@ -102,19 +106,23 @@ impl ServiceInstance {
                     let _monitor = monitor;
                 }
 
-                containers.insert(
-                    id.clone(),
-                    Container {
-                        id: id.clone(),
-                        state: ContainerState::Running,
-                        pid: None,
-                        task: None,
-                    },
-                );
+                // Update state (short write lock)
+                {
+                    let mut containers = self.containers.write().await;
+                    containers.insert(
+                        id.clone(),
+                        Container {
+                            id: id.clone(),
+                            state: ContainerState::Running,
+                            pid: None,
+                            task: None,
+                        },
+                    );
+                } // Lock released here
             }
         }
 
-        // Scale down
+        // Phase 3: Scale down - remove containers (short write lock per removal)
         if replicas < current_replicas {
             for i in replicas..current_replicas {
                 let id = ContainerId {
@@ -122,7 +130,14 @@ impl ServiceInstance {
                     replica: i + 1,
                 };
 
-                if let Some(_container) = containers.remove(&id) {
+                // Remove from state first (short write lock)
+                let existed = {
+                    let mut containers = self.containers.write().await;
+                    containers.remove(&id).is_some()
+                }; // Lock released here
+
+                // Then perform cleanup (no lock held - I/O operations)
+                if existed {
                     // Stop container
                     self.runtime
                         .stop_container(&id, Duration::from_secs(30))
