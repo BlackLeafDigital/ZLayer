@@ -1,6 +1,17 @@
 name: Build
 
 on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version for artifacts'
+        required: false
+        default: '0.0.0'
+        type: string
+      sha:
+        description: 'Commit SHA to build'
+        required: false
+        type: string
   workflow_call:
     inputs:
       version:
