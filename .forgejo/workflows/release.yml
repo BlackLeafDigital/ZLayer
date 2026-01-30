@@ -127,14 +127,22 @@ jobs:
           ref: ${{ inputs.sha || github.ref }}
       - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
       - name: Install cross
-        run: cargo install cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
+      - name: Verify Docker available
+        run: docker --version
       - name: Build (with docker + wasm features)
-        run: cross build --release --target ${{ matrix.target }} --package runtime --features "docker,wasm"
+        run: |
+          cross build --release --target ${{ matrix.target }} --package runtime --features "docker,wasm"
+          echo "Build completed, checking output..."
+          find target -name "zlayer" -type f 2>/dev/null || echo "Binary not found in target/"
       - name: Package
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
+          echo "Looking for binary in target/${{ matrix.target }}/release/"
+          ls -la target/${{ matrix.target }}/release/ || echo "Directory not found"
+          ls -la target/ || echo "Target dir not found"
           tar czf "zlayer-linux-${{ matrix.arch }}.tar.gz" -C target/${{ matrix.target }}/release zlayer
       - name: Upload to Forgejo Packages
         run: |
