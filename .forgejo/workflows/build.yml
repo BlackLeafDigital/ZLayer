@@ -1,0 +1,147 @@
+name: Build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version for artifacts'
+        required: true
+        type: string
+      sha:
+        description: 'Commit SHA to build'
+        required: false
+        type: string
+    outputs:
+      success:
+        description: 'Whether all builds succeeded'
+        value: ${{ jobs.verify.outputs.success }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ===========================================
+  # Build Linux amd64 (native)
+  # ===========================================
+  build-linux-amd64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
+      - name: Build
+        run: cargo build --release --package runtime --features "docker,wasm"
+      - name: Package
+        run: tar czf "zlayer-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zlayer-linux-amd64
+          path: zlayer-linux-amd64.tar.gz
+          retention-days: 1
+      - name: Cleanup
+        run: rm -rf $CARGO_TARGET_DIR zlayer-linux-amd64.tar.gz
+
+  # ===========================================
+  # Build Linux arm64 (cross-compile)
+  # ===========================================
+  build-linux-arm64:
+    needs: build-linux-amd64
+    runs-on: ubuntu-latest
+    env:
+      CROSS_TARGET_DIR: ${{ github.workspace }}/cross-target
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+      - name: Install cross
+        run: cargo install cross
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
+      - name: Create target directory
+        run: mkdir -p $CROSS_TARGET_DIR
+      - name: Build
+        run: cross build --release --target aarch64-unknown-linux-gnu --package runtime --features "docker,wasm" --target-dir $CROSS_TARGET_DIR
+      - name: Package
+        run: tar czf "zlayer-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zlayer-linux-arm64
+          path: zlayer-linux-arm64.tar.gz
+          retention-days: 1
+      - name: Cleanup
+        run: rm -rf $CROSS_TARGET_DIR zlayer-linux-arm64.tar.gz
+
+  # ===========================================
+  # Build macOS amd64
+  # ===========================================
+  build-macos-amd64:
+    needs: build-linux-arm64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        with:
+          targets: x86_64-apple-darwin
+      - name: Install protobuf
+        run: brew install protobuf
+      - name: Build
+        run: cargo build --release --target x86_64-apple-darwin --package runtime --features "docker,wasm"
+      - name: Package
+        run: tar czf "zlayer-darwin-amd64.tar.gz" -C $CARGO_TARGET_DIR/x86_64-apple-darwin/release zlayer
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zlayer-darwin-amd64
+          path: zlayer-darwin-amd64.tar.gz
+          retention-days: 1
+      - name: Cleanup
+        run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-amd64.tar.gz
+
+  # ===========================================
+  # Build macOS arm64
+  # ===========================================
+  build-macos-arm64:
+    needs: build-macos-amd64
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        with:
+          targets: aarch64-apple-darwin
+      - name: Install protobuf
+        run: brew install protobuf
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin --package runtime --features "docker,wasm"
+      - name: Package
+        run: tar czf "zlayer-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: zlayer-darwin-arm64
+          path: zlayer-darwin-arm64.tar.gz
+          retention-days: 1
+      - name: Cleanup
+        run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-arm64.tar.gz
+
+  # ===========================================
+  # Verify all builds passed
+  # ===========================================
+  verify:
+    needs: [build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64]
+    runs-on: ubuntu-latest
+    outputs:
+      success: ${{ steps.check.outputs.success }}
+    steps:
+      - name: Check all builds
+        id: check
+        run: echo "success=true" >> $GITHUB_OUTPUT

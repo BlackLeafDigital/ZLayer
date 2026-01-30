@@ -3,7 +3,7 @@ name: Release
 on:
   push:
     tags:
-      # Crate-specific releases (direct tag push is fine)
+      # Crate-specific releases (no builds needed)
       - 'spec-v*'
       - 'core-v*'
       - 'registry-v*'
@@ -19,7 +19,7 @@ on:
       - 'go-sdk-v*'
       - 'c-sdk-v*'
       - 'docker-v*'
-      # General version tags
+      # General version tags (triggers full release)
       - 'v[0-9]*'
       - 'major-v*'
   workflow_dispatch:
@@ -37,6 +37,9 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # ===========================================
+  # Detect release type
+  # ===========================================
   detect:
     runs-on: ubuntu-latest
     outputs:
@@ -55,7 +58,6 @@ jobs:
       - name: Detect release type
         id: check
         run: |
-          # Use inputs.version for workflow_dispatch, otherwise use tag name
           if [[ -n "${{ inputs.version }}" ]]; then
             TAG="${{ inputs.version }}"
           else
@@ -97,7 +99,7 @@ jobs:
             echo "sdk_name=rust" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == py-sdk-v* ]]; then
             echo "sdk_name=python" >> $GITHUB_OUTPUT
-          elif [[ "$TAG" == ts-sdk-v*  ]]; then
+          elif [[ "$TAG" == ts-sdk-v* ]]; then
             echo "sdk_name=typescript" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == go-sdk-v* ]]; then
             echo "sdk_name=go" >> $GITHUB_OUTPUT
@@ -106,106 +108,45 @@ jobs:
           fi
 
   # ===========================================
-  # Build Linux amd64 (native build)
+  # Build all binaries (only for general releases)
   # ===========================================
-  build-linux-amd64:
+  build:
     needs: detect
     if: needs.detect.outputs.binary == 'true'
+    uses: ./.forgejo/workflows/build.yml
+    with:
+      version: ${{ needs.detect.outputs.version }}
+      sha: ${{ inputs.sha || github.sha }}
+
+  # ===========================================
+  # Upload binaries to registry (after ALL builds pass)
+  # ===========================================
+  upload-binaries:
+    needs: [detect, build]
+    if: needs.detect.outputs.binary == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
-          ref: ${{ inputs.sha || github.ref }}
-      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
-      - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
-      - name: Build (native, with docker + wasm features)
-        run: cargo build --release --package runtime --features "docker,wasm"
-      - name: Package
-        run: |
-          ls -la target/release/
-          tar czf "zlayer-linux-amd64.tar.gz" -C target/release zlayer
+          path: artifacts
+
       - name: Upload to Forgejo Packages
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
-          curl --fail --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
-            --upload-file "zlayer-linux-amd64.tar.gz" \
-            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-linux-amd64.tar.gz"
+          for artifact in artifacts/zlayer-*/*.tar.gz; do
+            filename=$(basename "$artifact")
+            echo "Uploading $filename..."
+            curl --fail --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
+              --upload-file "$artifact" \
+              "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${filename}"
+          done
 
   # ===========================================
-  # Build Linux arm64 (cross-compile)
-  # ===========================================
-  build-linux-arm64:
-    needs: [detect, build-linux-amd64]
-    if: needs.detect.outputs.binary == 'true'
-    runs-on: ubuntu-latest
-    env:
-      CROSS_TARGET_DIR: ${{ github.workspace }}/cross-target
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.ref }}
-      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
-      - name: Install cross
-        run: cargo install cross
-      - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
-      - name: Create target directory
-        run: mkdir -p $CROSS_TARGET_DIR
-      - name: Build (cross-compile for arm64)
-        run: |
-          cross build --release --target aarch64-unknown-linux-gnu --package runtime --features "docker,wasm" --target-dir $CROSS_TARGET_DIR
-      - name: Package
-        run: |
-          ls -la $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release/
-          tar czf "zlayer-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer
-      - name: Upload to Forgejo Packages
-        run: |
-          VERSION="${{ needs.detect.outputs.version }}"
-          curl --fail --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
-            --upload-file "zlayer-linux-arm64.tar.gz" \
-            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-linux-arm64.tar.gz"
-
-  # ===========================================
-  # Build macOS (sequential, after Linux)
-  # ===========================================
-  build-macos:
-    needs: [detect, build-linux-amd64, build-linux-arm64]
-    if: needs.detect.outputs.binary == 'true'
-    strategy:
-      fail-fast: true
-      max-parallel: 1
-      matrix:
-        include:
-          - target: x86_64-apple-darwin
-            artifact: darwin-amd64
-          - target: aarch64-apple-darwin
-            artifact: darwin-arm64
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.ref }}
-      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
-        with:
-          targets: ${{ matrix.target }}
-      - name: Install protobuf
-        run: brew install protobuf
-      - name: Build (with docker + wasm features)
-        run: cargo build --release --target ${{ matrix.target }} --package runtime --features "docker,wasm"
-      - name: Package and upload
-        run: |
-          VERSION="${{ needs.detect.outputs.version }}"
-          tar czf "zlayer-${{ matrix.artifact }}.tar.gz" -C target/${{ matrix.target }}/release zlayer
-          curl --fail --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
-            --upload-file "zlayer-${{ matrix.artifact }}.tar.gz" \
-            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-${{ matrix.artifact }}.tar.gz"
-
-  # ===========================================
-  # Merge to main (AFTER ALL builds succeed)
+  # Merge to main (after binaries uploaded)
   # ===========================================
   merge-to-main:
-    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
+    needs: [detect, upload-binaries]
     if: needs.detect.outputs.binary == 'true' || needs.detect.outputs.is_major == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -228,7 +169,6 @@ jobs:
 
   # ===========================================
   # Publish single crate (specific crate tag only)
-  # No build dependency - just publishes one crate
   # ===========================================
   publish-crate:
     needs: detect
@@ -247,12 +187,11 @@ jobs:
         run: cargo publish -p ${{ needs.detect.outputs.crate_name }} --allow-dirty
 
   # ===========================================
-  # Smart publish all crates (general tag)
-  # REQUIRES builds to pass first
+  # Publish all crates (general release, after builds)
   # ===========================================
   publish-all-crates:
-    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
-    if: needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success'
+    needs: [detect, upload-binaries]
+    if: needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -268,18 +207,15 @@ jobs:
         run: |
           INPUT_VERSION="${{ needs.detect.outputs.version }}"
 
-          # Function to compare semver (returns 0 if $1 > $2)
           version_gt() {
             test "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" != "$1"
           }
 
-          # Function to get latest tag version for a crate prefix
           get_latest_tag_version() {
             local prefix="$1"
             git tag -l "${prefix}-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0"
           }
 
-          # Crate name -> tag prefix mapping
           declare -A CRATE_TAGS=(
             ["zlayer-spec"]="spec"
             ["zlayer-observability"]="obs"
@@ -292,7 +228,6 @@ jobs:
             ["zlayer-scheduler"]="scheduler"
           )
 
-          # Publish order (dependency order)
           CRATES="zlayer-spec zlayer-observability zlayer-overlay zlayer-storage zlayer-core zlayer-builder zlayer-init-actions zlayer-registry zlayer-scheduler"
 
           for crate in $CRATES; do
@@ -302,10 +237,9 @@ jobs:
             echo "Checking $crate: latest tag=$latest_tag, input=$INPUT_VERSION"
 
             if [[ "$latest_tag" == "0.0.0" ]] || version_gt "$INPUT_VERSION" "$latest_tag"; then
-              echo "Publishing $crate (tag $latest_tag < input $INPUT_VERSION)..."
+              echo "Publishing $crate..."
               if cargo publish -p "$crate" --allow-dirty; then
                 echo "Successfully published $crate"
-                # Create tag for this crate
                 git tag "${prefix}-v${INPUT_VERSION}"
                 git push origin "${prefix}-v${INPUT_VERSION}" || true
               else
@@ -313,18 +247,18 @@ jobs:
               fi
               sleep 30
             else
-              echo "Skipping $crate (tag $latest_tag >= input $INPUT_VERSION)"
+              echo "Skipping $crate (already at or above $INPUT_VERSION)"
             fi
           done
 
   # ===========================================
-  # SDK Publishing - General tags require builds
+  # SDK Publishing
   # ===========================================
   publish-rust-sdk:
-    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
+    needs: [detect, upload-binaries]
     if: |
-      (needs.detect.outputs.sdk_name == 'rust') ||
-      (needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success')
+      needs.detect.outputs.sdk_name == 'rust' ||
+      (needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -339,19 +273,18 @@ jobs:
         run: |
           INPUT_VERSION="${{ needs.detect.outputs.version }}"
           LATEST_TAG=$(git tag -l "rust-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
-
           if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
-            echo "Publishing rust-sdk (tag $LATEST_TAG < input $INPUT_VERSION)..."
+            echo "Publishing rust-sdk..."
             cargo publish --allow-dirty || echo "May already exist"
           else
-            echo "Skipping rust-sdk (tag $LATEST_TAG >= input $INPUT_VERSION)"
+            echo "Skipping rust-sdk (already at or above $INPUT_VERSION)"
           fi
 
   publish-python-sdk:
-    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
+    needs: [detect, upload-binaries]
     if: |
-      (needs.detect.outputs.sdk_name == 'python') ||
-      (needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success')
+      needs.detect.outputs.sdk_name == 'python' ||
+      (needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -369,21 +302,20 @@ jobs:
         run: |
           INPUT_VERSION="${{ needs.detect.outputs.version }}"
           LATEST_TAG=$(git tag -l "py-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
-
           if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
-            echo "Publishing python-sdk (tag $LATEST_TAG < input $INPUT_VERSION)..."
+            echo "Publishing python-sdk..."
             pip install build twine
             python -m build
             twine upload dist/* || echo "May already exist"
           else
-            echo "Skipping python-sdk (tag $LATEST_TAG >= input $INPUT_VERSION)"
+            echo "Skipping python-sdk (already at or above $INPUT_VERSION)"
           fi
 
   publish-typescript-sdk:
-    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
+    needs: [detect, upload-binaries]
     if: |
-      (needs.detect.outputs.sdk_name == 'typescript') ||
-      (needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success')
+      needs.detect.outputs.sdk_name == 'typescript' ||
+      (needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -401,21 +333,20 @@ jobs:
         run: |
           INPUT_VERSION="${{ needs.detect.outputs.version }}"
           LATEST_TAG=$(git tag -l "ts-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
-
           if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
-            echo "Publishing typescript-sdk (tag $LATEST_TAG < input $INPUT_VERSION)..."
+            echo "Publishing typescript-sdk..."
             npm ci
             npm run build
             npm publish --access public || echo "May already exist"
           else
-            echo "Skipping typescript-sdk (tag $LATEST_TAG >= input $INPUT_VERSION)"
+            echo "Skipping typescript-sdk (already at or above $INPUT_VERSION)"
           fi
 
   publish-go-sdk:
-    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
+    needs: [detect, upload-binaries]
     if: |
-      (needs.detect.outputs.sdk_name == 'go') ||
-      (needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success')
+      needs.detect.outputs.sdk_name == 'go' ||
+      (needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -429,10 +360,10 @@ jobs:
         run: go mod verify
 
   publish-c-sdk:
-    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
+    needs: [detect, upload-binaries]
     if: |
-      (needs.detect.outputs.sdk_name == 'c') ||
-      (needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success')
+      needs.detect.outputs.sdk_name == 'c' ||
+      (needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -447,7 +378,7 @@ jobs:
           cmake --build build
 
   # ===========================================
-  # Docker (after merge, which requires builds)
+  # Docker (after merge)
   # ===========================================
   docker:
     needs: [detect, merge-to-main]
@@ -456,7 +387,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.sha || github.ref }}
+          ref: main
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Login to Docker Hub
@@ -484,11 +415,11 @@ jobs:
             ghcr.io/blackleafdigital/zlayer-node:latest
 
   # ===========================================
-  # Trigger GitHub mirror (only after everything)
+  # Trigger GitHub release
   # ===========================================
   trigger-github:
-    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos, merge-to-main, docker, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk]
-    if: always() && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success'
+    needs: [detect, upload-binaries, merge-to-main, docker, publish-all-crates]
+    if: always() && needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Trigger GitHub Actions
@@ -498,4 +429,4 @@ jobs:
             -H "Authorization: Bearer ${{ secrets.GH_ACCESS_TOKEN }}" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/BlackLeafDigital/ZLayer/actions/workflows/release.yml/dispatches \
-            -d '{"ref":"main","inputs":{"version":"${{ github.ref_name }}"}}'
+            -d '{"ref":"main","inputs":{"version":"${{ needs.detect.outputs.version }}"}}'
