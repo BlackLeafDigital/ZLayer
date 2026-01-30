@@ -12,7 +12,7 @@ readme = "README.md"
 
 [features]
 default = []
-docker = ["bollard"]
+docker = ["dep:bollard"]
 wasm = [
     "dep:wasmtime",
     "dep:wasmtime-wasi",
