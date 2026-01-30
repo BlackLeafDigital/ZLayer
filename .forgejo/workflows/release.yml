@@ -19,6 +19,9 @@ on:
       - 'go-sdk-v*'
       - 'c-sdk-v*'
       - 'docker-v*'
+      # General version tags
+      - 'v[0-9]*'
+      - 'major-v*'
   workflow_dispatch:
     inputs:
       version:
@@ -27,7 +30,7 @@ on:
         type: string
       sha:
         description: 'Commit SHA for the release'
-        required: true
+        required: false
         type: string
 
 env:
@@ -42,8 +45,13 @@ jobs:
       sdk_name: ${{ steps.check.outputs.sdk_name }}
       docker: ${{ steps.check.outputs.docker }}
       is_major: ${{ steps.check.outputs.is_major }}
+      is_general: ${{ steps.check.outputs.is_general }}
       version: ${{ steps.check.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
+          fetch-depth: 0
       - name: Detect release type
         id: check
         run: |
@@ -58,9 +66,11 @@ jobs:
 
           if [[ "$TAG" == major-v* ]]; then
             echo "is_major=true" >> $GITHUB_OUTPUT
+            echo "is_general=true" >> $GITHUB_OUTPUT
             echo "binary=true" >> $GITHUB_OUTPUT
             echo "docker=true" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == v[0-9]* ]]; then
+            echo "is_general=true" >> $GITHUB_OUTPUT
             echo "binary=true" >> $GITHUB_OUTPUT
             echo "docker=true" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == docker-v* ]]; then
@@ -95,31 +105,15 @@ jobs:
             echo "sdk_name=c" >> $GITHUB_OUTPUT
           fi
 
-  merge-to-main:
-    needs: detect
-    if: needs.detect.outputs.binary == 'true' || needs.detect.outputs.is_major == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.FORGEJO_TOKEN }}
-
-      - name: Configure git
-        run: |
-          git config user.name "Forgejo CI"
-          git config user.email "ci@forge.blackleafdigital.com"
-
-      - name: Merge dev into main
-        run: |
-          git checkout main
-          git merge origin/dev --no-ff -m "Merge dev into main for release ${{ github.ref_name }}"
-          git push origin main
-
+  # ===========================================
+  # Build binaries (sequential, fail-fast)
+  # ===========================================
   build-linux:
-    needs: [detect, merge-to-main]
+    needs: detect
     if: needs.detect.outputs.binary == 'true'
     strategy:
+      fail-fast: true
+      max-parallel: 1
       matrix:
         include:
           - arch: amd64
@@ -129,6 +123,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
       - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
       - name: Install cross
         run: cargo install cross
@@ -143,14 +139,16 @@ jobs:
       - name: Upload to Forgejo Packages
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
-          curl --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
+          curl --fail --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
             --upload-file "zlayer-linux-${{ matrix.arch }}.tar.gz" \
             "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-linux-${{ matrix.arch }}.tar.gz"
 
   build-macos:
-    needs: [detect, merge-to-main]
+    needs: [detect, build-linux]
     if: needs.detect.outputs.binary == 'true'
     strategy:
+      fail-fast: true
+      max-parallel: 1
       matrix:
         include:
           - target: x86_64-apple-darwin
@@ -160,6 +158,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
       - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
         with:
           targets: ${{ matrix.target }}
@@ -171,16 +171,46 @@ jobs:
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           tar czf "zlayer-${{ matrix.artifact }}.tar.gz" -C target/${{ matrix.target }}/release zlayer
-          curl --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
+          curl --fail --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
             --upload-file "zlayer-${{ matrix.artifact }}.tar.gz" \
             "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-${{ matrix.artifact }}.tar.gz"
 
+  # ===========================================
+  # Merge to main (AFTER builds succeed)
+  # ===========================================
+  merge-to-main:
+    needs: [detect, build-linux, build-macos]
+    if: needs.detect.outputs.binary == 'true' || needs.detect.outputs.is_major == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
+          fetch-depth: 0
+          token: ${{ secrets.FORGEJO_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "Forgejo CI"
+          git config user.email "ci@forge.blackleafdigital.com"
+
+      - name: Merge dev into main
+        run: |
+          git checkout main
+          git merge origin/dev --no-ff -m "Merge dev into main for release ${{ github.ref_name }}"
+          git push origin main
+
+  # ===========================================
+  # Publish single crate (specific tag)
+  # ===========================================
   publish-crate:
     needs: detect
     if: needs.detect.outputs.crate_name != ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
       - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev protobuf-compiler
@@ -189,83 +219,173 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p ${{ needs.detect.outputs.crate_name }} --allow-dirty
 
+  # ===========================================
+  # Smart publish all crates (general tag)
+  # Checks each crate's tag vs input version
+  # ===========================================
   publish-all-crates:
     needs: detect
-    if: needs.detect.outputs.is_major == 'true'
+    if: needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
+          fetch-depth: 0
       - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev protobuf-compiler
-      - name: Publish all in dependency order
+      - name: Publish crates that need updating
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
+          INPUT_VERSION="${{ needs.detect.outputs.version }}"
+
+          # Function to compare semver (returns 0 if $1 > $2)
+          version_gt() {
+            test "$(printf '%s\n' "$1" "$2" | sort -V | head -n1)" != "$1"
+          }
+
+          # Function to get latest tag version for a crate prefix
+          get_latest_tag_version() {
+            local prefix="$1"
+            git tag -l "${prefix}-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0"
+          }
+
+          # Crate name -> tag prefix mapping
+          declare -A CRATE_TAGS=(
+            ["zlayer-spec"]="spec"
+            ["zlayer-observability"]="obs"
+            ["zlayer-overlay"]="overlay"
+            ["zlayer-storage"]="storage"
+            ["zlayer-core"]="core"
+            ["zlayer-builder"]="builder"
+            ["zlayer-init-actions"]="init"
+            ["zlayer-registry"]="registry"
+            ["zlayer-scheduler"]="scheduler"
+          )
+
+          # Publish order (dependency order)
           CRATES="zlayer-spec zlayer-observability zlayer-overlay zlayer-storage zlayer-core zlayer-builder zlayer-init-actions zlayer-registry zlayer-scheduler"
+
           for crate in $CRATES; do
-            echo "Publishing $crate..."
-            cargo publish -p $crate --allow-dirty || true
-            sleep 30
+            prefix="${CRATE_TAGS[$crate]}"
+            latest_tag=$(get_latest_tag_version "$prefix")
+
+            echo "Checking $crate: latest tag=$latest_tag, input=$INPUT_VERSION"
+
+            if [[ "$latest_tag" == "0.0.0" ]] || version_gt "$INPUT_VERSION" "$latest_tag"; then
+              echo "Publishing $crate (tag $latest_tag < input $INPUT_VERSION)..."
+              if cargo publish -p "$crate" --allow-dirty; then
+                echo "Successfully published $crate"
+                # Create tag for this crate
+                git tag "${prefix}-v${INPUT_VERSION}"
+                git push origin "${prefix}-v${INPUT_VERSION}" || true
+              else
+                echo "Failed to publish $crate (may already exist)"
+              fi
+              sleep 30
+            else
+              echo "Skipping $crate (tag $latest_tag >= input $INPUT_VERSION)"
+            fi
           done
 
+  # ===========================================
+  # SDK Publishing
+  # ===========================================
   publish-rust-sdk:
     needs: detect
-    if: needs.detect.outputs.sdk_name == 'rust' || needs.detect.outputs.is_major == 'true'
+    if: needs.detect.outputs.sdk_name == 'rust' || needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
+          fetch-depth: 0
       - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
-      - name: Publish
+      - name: Check and publish
         working-directory: clients/zlayer-sdk/rust
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --allow-dirty
+        run: |
+          INPUT_VERSION="${{ needs.detect.outputs.version }}"
+          LATEST_TAG=$(git tag -l "rust-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
+
+          if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
+            echo "Publishing rust-sdk (tag $LATEST_TAG < input $INPUT_VERSION)..."
+            cargo publish --allow-dirty || echo "May already exist"
+          else
+            echo "Skipping rust-sdk (tag $LATEST_TAG >= input $INPUT_VERSION)"
+          fi
 
   publish-python-sdk:
     needs: detect
-    if: needs.detect.outputs.sdk_name == 'python' || needs.detect.outputs.is_major == 'true'
+    if: needs.detect.outputs.sdk_name == 'python' || needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Build and publish
+      - name: Check and publish
         working-directory: clients/zlayer-sdk/python
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
         run: |
-          pip install build twine
-          python -m build
-          twine upload dist/*
+          INPUT_VERSION="${{ needs.detect.outputs.version }}"
+          LATEST_TAG=$(git tag -l "py-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
+
+          if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
+            echo "Publishing python-sdk (tag $LATEST_TAG < input $INPUT_VERSION)..."
+            pip install build twine
+            python -m build
+            twine upload dist/* || echo "May already exist"
+          else
+            echo "Skipping python-sdk (tag $LATEST_TAG >= input $INPUT_VERSION)"
+          fi
 
   publish-typescript-sdk:
     needs: detect
-    if: needs.detect.outputs.sdk_name == 'typescript' || needs.detect.outputs.is_major == 'true'
+    if: needs.detect.outputs.sdk_name == 'typescript' || needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
-      - name: Publish
+      - name: Check and publish
         working-directory: clients/zlayer-sdk/typescript
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          npm ci
-          npm run build
-          npm publish --access public
+          INPUT_VERSION="${{ needs.detect.outputs.version }}"
+          LATEST_TAG=$(git tag -l "ts-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
+
+          if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
+            echo "Publishing typescript-sdk (tag $LATEST_TAG < input $INPUT_VERSION)..."
+            npm ci
+            npm run build
+            npm publish --access public || echo "May already exist"
+          else
+            echo "Skipping typescript-sdk (tag $LATEST_TAG >= input $INPUT_VERSION)"
+          fi
 
   publish-go-sdk:
     needs: detect
-    if: needs.detect.outputs.sdk_name == 'go' || needs.detect.outputs.is_major == 'true'
+    if: needs.detect.outputs.sdk_name == 'go' || needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
       - uses: actions/setup-go@v5
         with:
           go-version: '1.24'
@@ -275,10 +395,12 @@ jobs:
 
   publish-c-sdk:
     needs: detect
-    if: needs.detect.outputs.sdk_name == 'c' || needs.detect.outputs.is_major == 'true'
+    if: needs.detect.outputs.sdk_name == 'c' || needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y cmake build-essential
       - name: Verify C SDK builds
@@ -287,12 +409,17 @@ jobs:
           cmake -B build
           cmake --build build
 
+  # ===========================================
+  # Docker (after merge)
+  # ===========================================
   docker:
-    needs: [detect, merge-to-main, build-linux]
+    needs: [detect, merge-to-main]
     if: needs.detect.outputs.docker == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Login to Docker Hub
@@ -319,9 +446,12 @@ jobs:
             ghcr.io/blackleafdigital/zlayer-node:${{ needs.detect.outputs.version }}
             ghcr.io/blackleafdigital/zlayer-node:latest
 
+  # ===========================================
+  # Trigger GitHub mirror
+  # ===========================================
   trigger-github:
-    needs: [build-linux, build-macos, docker, publish-crate, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk]
-    if: always() && (needs.build-linux.result == 'success' || needs.build-macos.result == 'success')
+    needs: [detect, build-linux, build-macos, docker, publish-crate, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk]
+    if: always() && (needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - name: Trigger GitHub Actions
