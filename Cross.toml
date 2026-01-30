@@ -1,0 +1,26 @@
+# Cross-compilation configuration for ZLayer
+# This configures the cross tool for ARM64 (aarch64) Linux builds
+
+[build]
+# Use Podman instead of Docker if available
+# runner = "podman"
+
+# Target-specific configuration for aarch64 Linux
+[target.aarch64-unknown-linux-gnu]
+# Use the default cross image which includes gcc cross-compiler
+# The cross tool will handle installing the target toolchain
+
+# Pre-build script to install required dependencies
+pre-build = [
+    # Install libseccomp development files for ARM64
+    "dpkg --add-architecture arm64",
+    "apt-get update",
+    "apt-get install -y libseccomp-dev:arm64 protobuf-compiler",
+]
+
+# Target-specific configuration for x86_64 Linux
+[target.x86_64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update",
+    "apt-get install -y libseccomp-dev protobuf-compiler",
+]
