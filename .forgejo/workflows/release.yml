@@ -44,7 +44,8 @@ jobs:
       is_major: ${{ steps.check.outputs.is_major }}
       version: ${{ steps.check.outputs.version }}
     steps:
-      - id: check
+      - name: Detect release type
+        id: check
         run: |
           TAG="${{ github.ref_name }}"
           VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
@@ -107,7 +108,7 @@ jobs:
       - name: Merge dev into main
         run: |
           git checkout main
-          git merge dev --no-ff -m "Merge dev into main for release ${{ github.ref_name }}"
+          git merge origin/dev --no-ff -m "Merge dev into main for release ${{ github.ref_name }}"
           git push origin main
 
   build-linux:
@@ -267,6 +268,20 @@ jobs:
         working-directory: clients/zlayer-sdk/go
         run: go mod verify
 
+  publish-c-sdk:
+    needs: detect
+    if: needs.detect.outputs.sdk_name == 'c' || needs.detect.outputs.is_major == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - name: Verify C SDK builds
+        working-directory: clients/zlayer-sdk/c
+        run: |
+          cmake -B build
+          cmake --build build
+
   docker:
     needs: [detect, merge-to-main, build-linux]
     if: needs.detect.outputs.docker == 'true'
@@ -300,7 +315,7 @@ jobs:
             ghcr.io/blackleafdigital/zlayer-node:latest
 
   trigger-github:
-    needs: [build-linux, build-macos, docker, publish-crate, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk]
+    needs: [build-linux, build-macos, docker, publish-crate, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk]
     if: always() && (needs.build-linux.result == 'success' || needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
