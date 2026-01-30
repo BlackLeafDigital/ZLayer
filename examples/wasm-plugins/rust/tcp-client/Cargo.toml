@@ -1,0 +1,30 @@
+[package]
+name = "tcp-client"
+version = "0.1.0"
+edition = "2021"
+description = "A TCP client WASM plugin demonstrating wasi:sockets networking"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# Build for WASI Preview 2 (WASIp2) as a WebAssembly component
+[package.metadata.component]
+package = "zlayer:examples"
+
+[dependencies]
+wit-bindgen = "0.36"
+
+[profile.release]
+opt-level = "s"      # Optimize for size
+lto = true           # Link-time optimization
+strip = true         # Strip debug symbols
+codegen-units = 1    # Better optimization
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

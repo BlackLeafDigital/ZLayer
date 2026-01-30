@@ -1,0 +1,9 @@
+.PHONY: build clean
+
+PLUGIN_NAME = {{name}}
+
+build:
+	componentize-py -d wit -w zlayer-plugin componentize app -o $(PLUGIN_NAME).wasm
+
+clean:
+	rm -f *.wasm

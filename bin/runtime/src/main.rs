@@ -19,12 +19,14 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-use agent::{RuntimeConfig, YoukiConfig};
-use observability::{init_observability, LogFormat, LogLevel, LoggingConfig, ObservabilityConfig};
-use spec::DeploymentSpec;
+use zlayer_agent::{RuntimeConfig, YoukiConfig};
+use zlayer_observability::{
+    init_observability, LogFormat, LogLevel, LoggingConfig, ObservabilityConfig,
+};
+use zlayer_spec::DeploymentSpec;
 
 // Import API crate functions for token management
-use api::create_token;
+use zlayer_api::create_token;
 
 #[cfg(feature = "node")]
 use serde::{Deserialize, Serialize};
@@ -237,6 +239,163 @@ enum Commands {
     #[cfg(feature = "node")]
     #[command(subcommand)]
     Node(NodeCommands),
+
+    /// Export an image to a tar file (OCI Image Layout)
+    ///
+    /// Exports a locally stored image to an OCI Image Layout tar archive
+    /// that can be imported on another system or loaded into Docker.
+    ///
+    /// Examples:
+    ///   zlayer export myapp:latest -o myapp.tar
+    ///   zlayer export myapp:v1.0 -o myapp.tar.gz --gzip
+    ///   zlayer export myapp@sha256:abc123... -o myapp.tar
+    #[command(verbatim_doc_comment)]
+    Export {
+        /// Image reference (name:tag or name@digest)
+        image: String,
+
+        /// Output file path (.tar or .tar.gz)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Compress output with gzip
+        #[arg(long)]
+        gzip: bool,
+    },
+
+    /// Import an image from a tar file
+    ///
+    /// Imports an OCI Image Layout tar archive into the local registry.
+    /// The archive can be created by `zlayer export` or `docker save`.
+    ///
+    /// Examples:
+    ///   zlayer import myapp.tar
+    ///   zlayer import myapp.tar.gz -t myapp:imported
+    ///   zlayer import /path/to/image.tar --tag myapp:v1.0
+    #[command(verbatim_doc_comment)]
+    Import {
+        /// Input tar file path
+        input: PathBuf,
+
+        /// Tag to apply to imported image
+        #[arg(short, long)]
+        tag: Option<String>,
+    },
+
+    /// WASM build, export, and management commands
+    #[command(subcommand)]
+    Wasm(WasmCommands),
+}
+
+/// WASM management subcommands
+#[derive(Subcommand, Debug)]
+enum WasmCommands {
+    /// Build WASM from source code
+    ///
+    /// Compiles source code to a WebAssembly binary using the appropriate
+    /// compiler for the detected or specified language.
+    ///
+    /// Examples:
+    ///   zlayer wasm build .
+    ///   zlayer wasm build --language rust ./my-rust-app
+    ///   zlayer wasm build --target wasip2 -o output.wasm .
+    #[command(verbatim_doc_comment)]
+    Build {
+        /// Path to the source directory
+        context: PathBuf,
+
+        /// Language (auto-detected if not specified)
+        #[arg(short, long)]
+        language: Option<String>,
+
+        /// WASI target (preview1 or preview2)
+        #[arg(short, long, default_value = "preview2")]
+        target: String,
+
+        /// Output file path
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Optimize the output (release mode)
+        #[arg(long)]
+        optimize: bool,
+
+        /// WIT directory path
+        #[arg(long)]
+        wit: Option<PathBuf>,
+    },
+
+    /// Export WASM binary as OCI artifact
+    ///
+    /// Creates an OCI-compliant artifact from a WASM binary that can be
+    /// pushed to any OCI registry (ghcr.io, Docker Hub, etc).
+    ///
+    /// Examples:
+    ///   zlayer wasm export ./app.wasm --name myapp:v1
+    ///   zlayer wasm export ./app.wasm --name ghcr.io/myorg/myapp:latest
+    #[command(verbatim_doc_comment)]
+    Export {
+        /// Path to the WASM file
+        wasm_file: PathBuf,
+
+        /// Name/tag for the artifact (e.g., "myapp:v1" or "ghcr.io/org/app:tag")
+        #[arg(short, long)]
+        name: String,
+
+        /// Output directory for OCI artifact (default: current directory)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
+
+    /// Push WASM artifact to registry
+    ///
+    /// Pushes a WASM binary to an OCI registry as a WASM artifact.
+    ///
+    /// Examples:
+    ///   zlayer wasm push ./app.wasm ghcr.io/myorg/myapp:v1
+    ///   zlayer wasm push ./app.wasm --username user --password pass registry.example.com/app:v1
+    #[command(verbatim_doc_comment)]
+    Push {
+        /// Path to the WASM file
+        wasm_file: PathBuf,
+
+        /// Registry reference (e.g., ghcr.io/org/name:tag)
+        reference: String,
+
+        /// Registry username
+        #[arg(short, long)]
+        username: Option<String>,
+
+        /// Registry password
+        #[arg(short, long)]
+        password: Option<String>,
+    },
+
+    /// Validate a WASM binary
+    ///
+    /// Checks that a file is a valid WebAssembly binary by verifying
+    /// its magic bytes and structure.
+    ///
+    /// Examples:
+    ///   zlayer wasm validate ./app.wasm
+    #[command(verbatim_doc_comment)]
+    Validate {
+        /// Path to the WASM file
+        wasm_file: PathBuf,
+    },
+
+    /// Show information about a WASM binary
+    ///
+    /// Displays detailed information about a WASM binary including
+    /// WASI version, size, and whether it's a component or core module.
+    ///
+    /// Examples:
+    ///   zlayer wasm info ./app.wasm
+    #[command(verbatim_doc_comment)]
+    Info {
+        /// Path to the WASM file
+        wasm_file: PathBuf,
+    },
 }
 
 /// Node management subcommands
@@ -537,6 +696,13 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Runtimes => handle_runtimes().await,
         Commands::Token(token_cmd) => handle_token(token_cmd),
         Commands::Spec(spec_cmd) => handle_spec(spec_cmd).await,
+        Commands::Export {
+            image,
+            output,
+            gzip,
+        } => handle_export(&cli, image, output, *gzip).await,
+        Commands::Import { input, tag } => handle_import(&cli, input, tag.clone()).await,
+        Commands::Wasm(wasm_cmd) => handle_wasm(&cli, wasm_cmd).await,
         #[cfg(feature = "node")]
         Commands::Node(node_cmd) => match node_cmd {
             NodeCommands::Init {
@@ -611,7 +777,7 @@ fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
 fn parse_spec(spec_path: &Path) -> Result<DeploymentSpec> {
     info!(path = %spec_path.display(), "Parsing deployment spec");
 
-    let spec = spec::from_yaml_file(spec_path)
+    let spec = zlayer_spec::from_yaml_file(spec_path)
         .with_context(|| format!("Failed to parse spec file: {}", spec_path.display()))?;
 
     info!(
@@ -643,7 +809,7 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
     info!(runtime = ?cli.runtime, "Creating container runtime");
 
     // Create the runtime
-    let runtime = agent::create_runtime(runtime_config)
+    let runtime = zlayer_agent::create_runtime(runtime_config)
         .await
         .context("Failed to create container runtime")?;
 
@@ -653,7 +819,7 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
     print_deployment_plan(&spec);
 
     // Create ServiceManager (wrap in Arc for autoscaler)
-    let manager = Arc::new(agent::ServiceManager::new(runtime.clone()));
+    let manager = Arc::new(zlayer_agent::ServiceManager::new(runtime.clone()));
 
     println!("\n=== Deploying Services ===\n");
 
@@ -684,9 +850,9 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
 
         // Determine initial replica count from scale spec
         let replicas = match &service_spec.scale {
-            spec::ScaleSpec::Fixed { replicas } => *replicas,
-            spec::ScaleSpec::Adaptive { min, .. } => *min,
-            spec::ScaleSpec::Manual => 0,
+            zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+            zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
+            zlayer_spec::ScaleSpec::Manual => 0,
         };
 
         if replicas > 0 {
@@ -792,12 +958,12 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
     }
 
     // Check if any service uses adaptive scaling
-    let has_adaptive = agent::has_adaptive_scaling(&spec.services);
+    let has_adaptive = zlayer_agent::has_adaptive_scaling(&spec.services);
 
     if has_adaptive {
         // Create autoscale controller
         let autoscale_interval = Duration::from_secs(10);
-        let controller = Arc::new(agent::AutoscaleController::new(
+        let controller = Arc::new(zlayer_agent::AutoscaleController::new(
             manager.clone(),
             runtime.clone(),
             autoscale_interval,
@@ -805,7 +971,7 @@ async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
 
         // Register adaptive services with the controller
         for (name, service_spec) in &spec.services {
-            if let spec::ScaleSpec::Adaptive { .. } = &service_spec.scale {
+            if let zlayer_spec::ScaleSpec::Adaptive { .. } = &service_spec.scale {
                 let replicas = manager.service_replica_count(name).await.unwrap_or(0) as u32;
                 controller
                     .register_service(name, &service_spec.scale, replicas)
@@ -869,13 +1035,13 @@ fn print_deployment_plan(spec: &DeploymentSpec) {
 
         // Print scaling info
         match &service.scale {
-            spec::ScaleSpec::Fixed { replicas } => {
+            zlayer_spec::ScaleSpec::Fixed { replicas } => {
                 println!("    Scale: fixed ({} replicas)", replicas);
             }
-            spec::ScaleSpec::Adaptive { min, max, .. } => {
+            zlayer_spec::ScaleSpec::Adaptive { min, max, .. } => {
                 println!("    Scale: adaptive ({}-{} replicas)", min, max);
             }
-            spec::ScaleSpec::Manual => {
+            zlayer_spec::ScaleSpec::Manual => {
                 println!("    Scale: manual");
             }
         }
@@ -1034,19 +1200,20 @@ async fn join(
 
     // Step 4: Determine which service(s) to join
     let target_service = service.or(join_token.service.as_deref());
-    let services_to_join: Vec<(String, spec::ServiceSpec)> = if let Some(svc) = target_service {
-        // Join specific service
-        if !spec.services.contains_key(svc) {
-            anyhow::bail!("Service '{}' not found in deployment", svc);
-        }
-        vec![(svc.to_string(), spec.services.get(svc).unwrap().clone())]
-    } else {
-        // Join all services (for global join)
-        spec.services
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect()
-    };
+    let services_to_join: Vec<(String, zlayer_spec::ServiceSpec)> =
+        if let Some(svc) = target_service {
+            // Join specific service
+            if !spec.services.contains_key(svc) {
+                anyhow::bail!("Service '{}' not found in deployment", svc);
+            }
+            vec![(svc.to_string(), spec.services.get(svc).unwrap().clone())]
+        } else {
+            // Join all services (for global join)
+            spec.services
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect()
+        };
 
     println!("\nServices to join:");
     for (name, svc_spec) in &services_to_join {
@@ -1057,13 +1224,13 @@ async fn join(
     let runtime_config = build_runtime_config(cli);
     info!(runtime = ?cli.runtime, "Creating container runtime");
 
-    let runtime = agent::create_runtime(runtime_config)
+    let runtime = zlayer_agent::create_runtime(runtime_config)
         .await
         .context("Failed to create container runtime")?;
     info!("Runtime created successfully");
 
     // Step 6: Setup overlay networks
-    let overlay_manager = match agent::OverlayManager::new(spec.deployment.clone()).await {
+    let overlay_manager = match zlayer_agent::OverlayManager::new(spec.deployment.clone()).await {
         Ok(mut om) => {
             // Setup global overlay
             if let Err(e) = om.setup_global_overlay().await {
@@ -1084,9 +1251,9 @@ async fn join(
 
     // Step 7: Create ServiceManager with overlay support
     let manager = if let Some(om) = overlay_manager.clone() {
-        agent::ServiceManager::with_overlay(runtime.clone(), om)
+        zlayer_agent::ServiceManager::with_overlay(runtime.clone(), om)
     } else {
-        agent::ServiceManager::new(runtime.clone())
+        zlayer_agent::ServiceManager::new(runtime.clone())
     };
 
     println!("\n=== Starting Services ===\n");
@@ -1118,9 +1285,12 @@ async fn join(
                 info!(service = %service_name, step = %step.id, "Running init step");
                 println!("    Step: {}", step.id);
 
-                let action =
-                    init_actions::from_spec(&step.uses, &step.with, Duration::from_secs(300))
-                        .context(format!("Invalid init action: {}", step.uses))?;
+                let action = zlayer_init_actions::from_spec(
+                    &step.uses,
+                    &step.with,
+                    Duration::from_secs(300),
+                )
+                .context(format!("Invalid init action: {}", step.uses))?;
 
                 action
                     .execute()
@@ -1143,9 +1313,9 @@ async fn join(
             replicas
         } else {
             match &service_spec.scale {
-                spec::ScaleSpec::Fixed { replicas } => *replicas,
-                spec::ScaleSpec::Adaptive { min, .. } => *min,
-                spec::ScaleSpec::Manual => 1, // Join implies at least 1 replica
+                zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+                zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
+                zlayer_spec::ScaleSpec::Manual => 1, // Join implies at least 1 replica
             }
         };
 
@@ -1214,7 +1384,7 @@ async fn status(cli: &Cli) -> Result<()> {
                 ..Default::default()
             };
 
-            match agent::create_runtime(RuntimeConfig::Youki(config)).await {
+            match zlayer_agent::create_runtime(RuntimeConfig::Youki(config)).await {
                 Ok(_) => {
                     println!("Status: Youki runtime ready");
                 }
@@ -1262,7 +1432,7 @@ async fn serve(bind: &str, jwt_secret: Option<String>, no_swagger: bool) -> Resu
         .parse()
         .context(format!("Invalid bind address: {}", bind))?;
 
-    let config = api::ApiConfig {
+    let config = zlayer_api::ApiConfig {
         bind: bind_addr,
         jwt_secret,
         swagger_enabled: !no_swagger,
@@ -1275,7 +1445,7 @@ async fn serve(bind: &str, jwt_secret: Option<String>, no_swagger: bool) -> Resu
         "Starting ZLayer API server"
     );
 
-    let server = api::ApiServer::new(config);
+    let server = zlayer_api::ApiServer::new(config);
 
     // Setup graceful shutdown on SIGTERM/SIGINT
     let shutdown = async {
@@ -1391,7 +1561,7 @@ async fn handle_build(
     no_tui: bool,
     verbose_build: bool,
 ) -> Result<()> {
-    use builder::{detect_runtime, BuildEvent, ImageBuilder, PlainLogger, Runtime};
+    use zlayer_builder::{detect_runtime, BuildEvent, ImageBuilder, PlainLogger, Runtime};
 
     info!(
         context = %context.display(),
@@ -1487,7 +1657,7 @@ async fn handle_build(
 
     if use_tui {
         // TUI mode - run build with interactive progress display
-        use builder::BuildTui;
+        use zlayer_builder::BuildTui;
 
         // Spawn build in background
         let build_handle = tokio::spawn(async move { builder.build().await });
@@ -1553,7 +1723,7 @@ async fn handle_build(
 
 /// List available runtime templates
 async fn handle_runtimes() -> Result<()> {
-    use builder::{list_templates, Runtime};
+    use zlayer_builder::{list_templates, Runtime};
 
     println!("Available runtime templates:\n");
 
@@ -1574,6 +1744,556 @@ async fn handle_runtimes() -> Result<()> {
             .map(|r| r.name)
             .collect::<Vec<_>>()
             .join(", ")
+    );
+
+    Ok(())
+}
+
+// =============================================================================
+// Image Export/Import Commands
+// =============================================================================
+
+/// Handle export command - export image to OCI tar archive
+async fn handle_export(cli: &Cli, image: &str, output: &Path, gzip: bool) -> Result<()> {
+    use zlayer_registry::{export_image, LocalRegistry};
+
+    let registry_path = cli.state_dir.join("registry");
+    let registry = LocalRegistry::new(registry_path)
+        .await
+        .context("Failed to open local registry")?;
+
+    // If gzip flag is set and output doesn't end in .gz, append it
+    let output = if gzip && output.extension().is_none_or(|e| e != "gz") {
+        output.with_extension("tar.gz")
+    } else {
+        output.to_path_buf()
+    };
+
+    info!("Exporting {} to {}", image, output.display());
+    println!("Exporting {} to {}...", image, output.display());
+
+    let export_info = export_image(&registry, image, &output)
+        .await
+        .context("Failed to export image")?;
+
+    println!("Exported successfully!");
+    println!("  Digest: {}", export_info.digest);
+    println!("  Layers: {}", export_info.layers);
+    println!("  Size: {} bytes", export_info.size);
+    println!("  Output: {}", export_info.output_path.display());
+
+    Ok(())
+}
+
+/// Handle import command - import image from OCI tar archive
+async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) -> Result<()> {
+    use zlayer_registry::{import_image, LocalRegistry};
+
+    let registry_path = cli.state_dir.join("registry");
+    let registry = LocalRegistry::new(registry_path)
+        .await
+        .context("Failed to open local registry")?;
+
+    info!("Importing from {}", input.display());
+    println!("Importing from {}...", input.display());
+
+    let import_info = import_image(&registry, input, tag.as_deref())
+        .await
+        .context("Failed to import image")?;
+
+    println!("Imported successfully!");
+    println!("  Digest: {}", import_info.digest);
+    println!("  Layers: {}", import_info.layers);
+    if let Some(tag) = import_info.tag {
+        println!("  Tagged as: {}", tag);
+    }
+
+    Ok(())
+}
+
+// =============================================================================
+// WASM Management Commands
+// =============================================================================
+
+/// Handle WASM subcommands
+async fn handle_wasm(cli: &Cli, cmd: &WasmCommands) -> Result<()> {
+    match cmd {
+        WasmCommands::Build {
+            context,
+            language,
+            target,
+            output,
+            optimize,
+            wit,
+        } => {
+            handle_wasm_build(
+                context.clone(),
+                language.clone(),
+                target.clone(),
+                output.clone(),
+                *optimize,
+                wit.clone(),
+            )
+            .await
+        }
+        WasmCommands::Export {
+            wasm_file,
+            name,
+            output,
+        } => handle_wasm_export(wasm_file, name, output.clone()).await,
+        WasmCommands::Push {
+            wasm_file,
+            reference,
+            username,
+            password,
+        } => {
+            handle_wasm_push(
+                cli,
+                wasm_file,
+                reference,
+                username.clone(),
+                password.clone(),
+            )
+            .await
+        }
+        WasmCommands::Validate { wasm_file } => handle_wasm_validate(wasm_file).await,
+        WasmCommands::Info { wasm_file } => handle_wasm_info(wasm_file).await,
+    }
+}
+
+/// Build WASM from source code
+async fn handle_wasm_build(
+    context: PathBuf,
+    language: Option<String>,
+    target: String,
+    output: Option<PathBuf>,
+    optimize: bool,
+    wit: Option<PathBuf>,
+) -> Result<()> {
+    use zlayer_builder::wasm_builder::{build_wasm, WasiTarget, WasmBuildConfig, WasmLanguage};
+
+    info!(
+        context = %context.display(),
+        language = ?language,
+        target = %target,
+        optimize = optimize,
+        "Building WASM"
+    );
+
+    // Parse target
+    let wasi_target = match target.to_lowercase().as_str() {
+        "preview1" | "wasip1" | "p1" => WasiTarget::Preview1,
+        "preview2" | "wasip2" | "p2" => WasiTarget::Preview2,
+        _ => {
+            anyhow::bail!(
+                "Invalid WASI target '{}'. Valid options: preview1, preview2, wasip1, wasip2, p1, p2",
+                target
+            );
+        }
+    };
+
+    // Parse language if specified
+    let wasm_language = match language.as_deref() {
+        Some(lang) => {
+            let lang_lower = lang.to_lowercase();
+            match lang_lower.as_str() {
+                "rust" => Some(WasmLanguage::Rust),
+                "rust-component" | "cargo-component" => Some(WasmLanguage::RustComponent),
+                "go" | "tinygo" => Some(WasmLanguage::Go),
+                "python" | "py" => Some(WasmLanguage::Python),
+                "typescript" | "ts" => Some(WasmLanguage::TypeScript),
+                "assemblyscript" | "as" => Some(WasmLanguage::AssemblyScript),
+                "c" => Some(WasmLanguage::C),
+                "zig" => Some(WasmLanguage::Zig),
+                _ => {
+                    anyhow::bail!(
+                        "Unknown language '{}'. Supported: rust, rust-component, go, python, typescript, assemblyscript, c, zig",
+                        lang
+                    );
+                }
+            }
+        }
+        None => None, // Auto-detect
+    };
+
+    // Build config
+    let mut config = WasmBuildConfig::new()
+        .target(wasi_target)
+        .optimize(optimize);
+
+    if let Some(lang) = wasm_language {
+        config = config.language(lang);
+    }
+
+    if let Some(wit_path) = wit {
+        config = config.wit_path(wit_path);
+    }
+
+    if let Some(out_path) = output.clone() {
+        config = config.output_path(out_path);
+    }
+
+    println!("Building WASM from {}...", context.display());
+    println!("  Target: {}", wasi_target);
+    if let Some(lang) = &wasm_language {
+        println!("  Language: {}", lang);
+    } else {
+        println!("  Language: auto-detect");
+    }
+    if optimize {
+        println!("  Mode: release (optimized)");
+    } else {
+        println!("  Mode: debug");
+    }
+
+    let result = build_wasm(&context, config)
+        .await
+        .context("WASM build failed")?;
+
+    println!("\nBuild successful!");
+    println!("  Output: {}", result.wasm_path.display());
+    println!("  Language: {}", result.language);
+    println!("  Target: {}", result.target);
+    println!("  Size: {} bytes", result.size);
+
+    Ok(())
+}
+
+/// Export WASM binary as OCI artifact
+async fn handle_wasm_export(wasm_file: &Path, name: &str, output: Option<PathBuf>) -> Result<()> {
+    use std::collections::HashMap;
+    use zlayer_registry::{export_wasm_as_oci, WasmExportConfig};
+
+    info!(
+        wasm_file = %wasm_file.display(),
+        name = %name,
+        "Exporting WASM as OCI artifact"
+    );
+
+    // Parse name to extract module name (strip tag/digest if present)
+    let module_name = name
+        .rsplit('/')
+        .next()
+        .unwrap_or(name)
+        .split(':')
+        .next()
+        .unwrap_or(name)
+        .split('@')
+        .next()
+        .unwrap_or(name);
+
+    let config = WasmExportConfig {
+        wasm_path: wasm_file.to_path_buf(),
+        module_name: module_name.to_string(),
+        wasi_version: None, // Auto-detect
+        annotations: HashMap::new(),
+    };
+
+    println!("Exporting WASM as OCI artifact...");
+    println!("  Input: {}", wasm_file.display());
+    println!("  Name: {}", name);
+
+    let result = export_wasm_as_oci(&config)
+        .await
+        .context("Failed to export WASM as OCI artifact")?;
+
+    // Determine output directory
+    let output_dir = output.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+    // Create OCI layout directory structure
+    let artifact_dir = output_dir.join(format!("{}-oci", module_name));
+    tokio::fs::create_dir_all(&artifact_dir)
+        .await
+        .context("Failed to create output directory")?;
+
+    // Write oci-layout file
+    let oci_layout = serde_json::json!({
+        "imageLayoutVersion": "1.0.0"
+    });
+    tokio::fs::write(
+        artifact_dir.join("oci-layout"),
+        serde_json::to_string_pretty(&oci_layout)?,
+    )
+    .await
+    .context("Failed to write oci-layout")?;
+
+    // Create blobs directory
+    let blobs_dir = artifact_dir.join("blobs").join("sha256");
+    tokio::fs::create_dir_all(&blobs_dir)
+        .await
+        .context("Failed to create blobs directory")?;
+
+    // Write config blob
+    let config_hash = result
+        .config_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&result.config_digest);
+    tokio::fs::write(blobs_dir.join(config_hash), &result.config_blob)
+        .await
+        .context("Failed to write config blob")?;
+
+    // Write WASM layer blob
+    let wasm_hash = result
+        .wasm_layer_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&result.wasm_layer_digest);
+    tokio::fs::write(blobs_dir.join(wasm_hash), &result.wasm_binary)
+        .await
+        .context("Failed to write WASM blob")?;
+
+    // Write manifest blob
+    let manifest_hash = result
+        .manifest_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(&result.manifest_digest);
+    tokio::fs::write(blobs_dir.join(manifest_hash), &result.manifest_json)
+        .await
+        .context("Failed to write manifest blob")?;
+
+    // Write index.json
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": result.manifest_digest,
+            "size": result.manifest_size,
+            "annotations": {
+                "org.opencontainers.image.ref.name": name
+            }
+        }]
+    });
+    tokio::fs::write(
+        artifact_dir.join("index.json"),
+        serde_json::to_string_pretty(&index)?,
+    )
+    .await
+    .context("Failed to write index.json")?;
+
+    println!("\nExport successful!");
+    println!("  Output directory: {}", artifact_dir.display());
+    println!("  WASI version: {}", result.wasi_version);
+    println!("  Artifact type: {}", result.artifact_type);
+    println!("  Manifest digest: {}", result.manifest_digest);
+    println!("  WASM layer digest: {}", result.wasm_layer_digest);
+    println!("  WASM size: {} bytes", result.wasm_size);
+
+    Ok(())
+}
+
+/// Push WASM artifact to registry
+async fn handle_wasm_push(
+    cli: &Cli,
+    wasm_file: &Path,
+    reference: &str,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<()> {
+    use std::collections::HashMap;
+    use zlayer_registry::{
+        export_wasm_as_oci, BlobCache, ImagePuller, RegistryAuth, WasmExportConfig,
+    };
+
+    info!(
+        wasm_file = %wasm_file.display(),
+        reference = %reference,
+        "Pushing WASM to registry"
+    );
+
+    // Parse reference to extract module name
+    let module_name = reference
+        .rsplit('/')
+        .next()
+        .unwrap_or(reference)
+        .split(':')
+        .next()
+        .unwrap_or(reference)
+        .split('@')
+        .next()
+        .unwrap_or(reference);
+
+    // Export WASM as OCI artifact first
+    let config = WasmExportConfig {
+        wasm_path: wasm_file.to_path_buf(),
+        module_name: module_name.to_string(),
+        wasi_version: None, // Auto-detect
+        annotations: HashMap::new(),
+    };
+
+    println!("Preparing WASM artifact for push...");
+    println!("  Input: {}", wasm_file.display());
+    println!("  Reference: {}", reference);
+
+    let export_result = export_wasm_as_oci(&config)
+        .await
+        .context("Failed to prepare WASM artifact")?;
+
+    println!("  WASI version: {}", export_result.wasi_version);
+    println!("  Artifact type: {}", export_result.artifact_type);
+    println!("  WASM size: {} bytes", export_result.wasm_size);
+
+    // Setup authentication
+    let auth = match (username, password) {
+        (Some(user), Some(pass)) => {
+            println!("  Auth: Basic (username provided)");
+            RegistryAuth::Basic(user, pass)
+        }
+        (Some(user), None) => {
+            // Try to get password from environment
+            let pass = std::env::var("ZLAYER_REGISTRY_PASSWORD")
+                .or_else(|_| std::env::var("REGISTRY_PASSWORD"))
+                .context(
+                    "Password not provided. Use --password or set ZLAYER_REGISTRY_PASSWORD env var",
+                )?;
+            println!("  Auth: Basic (password from env)");
+            RegistryAuth::Basic(user, pass)
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("Password provided without username");
+        }
+        (None, None) => {
+            // Try to get credentials from environment
+            if let (Ok(user), Ok(pass)) = (
+                std::env::var("ZLAYER_REGISTRY_USERNAME")
+                    .or_else(|_| std::env::var("REGISTRY_USERNAME")),
+                std::env::var("ZLAYER_REGISTRY_PASSWORD")
+                    .or_else(|_| std::env::var("REGISTRY_PASSWORD")),
+            ) {
+                println!("  Auth: Basic (from env)");
+                RegistryAuth::Basic(user, pass)
+            } else {
+                println!("  Auth: Anonymous");
+                RegistryAuth::Anonymous
+            }
+        }
+    };
+
+    // Create blob cache and image puller
+    let cache_dir = cli.state_dir.join("cache");
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .context("Failed to create cache directory")?;
+
+    let cache = BlobCache::open(&cache_dir).context("Failed to create blob cache")?;
+    let puller = ImagePuller::new(cache);
+
+    println!("\nPushing to registry...");
+
+    let push_result = puller
+        .push_wasm(reference, &export_result, &auth)
+        .await
+        .context("Failed to push WASM to registry")?;
+
+    println!("\nPush successful!");
+    println!("  Reference: {}", push_result.reference);
+    println!("  Manifest digest: {}", push_result.manifest_digest);
+    println!("  Blobs pushed: {}", push_result.blobs_pushed.len());
+    for blob in &push_result.blobs_pushed {
+        println!("    - {}", blob);
+    }
+
+    Ok(())
+}
+
+/// Validate a WASM binary
+async fn handle_wasm_validate(wasm_file: &Path) -> Result<()> {
+    use zlayer_registry::wasm::{extract_wasm_binary_info, validate_wasm_magic};
+
+    info!(wasm_file = %wasm_file.display(), "Validating WASM binary");
+
+    println!("Validating WASM binary: {}", wasm_file.display());
+
+    // Read the file
+    let data = tokio::fs::read(wasm_file)
+        .await
+        .with_context(|| format!("Failed to read file: {}", wasm_file.display()))?;
+
+    // Check magic bytes first
+    if !validate_wasm_magic(&data) {
+        println!("\nValidation FAILED!");
+        println!("  Error: Not a valid WASM binary (invalid magic bytes)");
+        println!("  Expected: \\0asm (0x00, 0x61, 0x73, 0x6d)");
+        if data.len() >= 4 {
+            println!(
+                "  Got: {:02x} {:02x} {:02x} {:02x}",
+                data[0], data[1], data[2], data[3]
+            );
+        } else {
+            println!("  Got: file too short ({} bytes)", data.len());
+        }
+        anyhow::bail!("Invalid WASM binary");
+    }
+
+    // Extract full info
+    match extract_wasm_binary_info(&data) {
+        Ok(info) => {
+            println!("\nValidation PASSED!");
+            println!("  WASI version: {}", info.wasi_version);
+            println!(
+                "  Type: {}",
+                if info.is_component {
+                    "Component (WASIp2)"
+                } else {
+                    "Core Module (WASIp1)"
+                }
+            );
+            println!("  Binary version: {}", info.binary_version);
+            println!("  Size: {} bytes", info.size);
+            Ok(())
+        }
+        Err(e) => {
+            println!("\nValidation FAILED!");
+            println!("  Error: {}", e);
+            anyhow::bail!("Invalid WASM binary: {}", e);
+        }
+    }
+}
+
+/// Show information about a WASM binary
+async fn handle_wasm_info(wasm_file: &Path) -> Result<()> {
+    use zlayer_registry::wasm::{extract_wasm_binary_info, WasiVersion};
+
+    info!(wasm_file = %wasm_file.display(), "Getting WASM info");
+
+    // Read the file
+    let data = tokio::fs::read(wasm_file)
+        .await
+        .with_context(|| format!("Failed to read file: {}", wasm_file.display()))?;
+
+    let info = extract_wasm_binary_info(&data)
+        .with_context(|| format!("Failed to parse WASM binary: {}", wasm_file.display()))?;
+
+    println!("WASM Binary Information");
+    println!("=======================");
+    println!();
+    println!("File: {}", wasm_file.display());
+    println!(
+        "Size: {} bytes ({:.2} KB)",
+        info.size,
+        info.size as f64 / 1024.0
+    );
+    println!();
+    println!("Format:");
+    println!(
+        "  Type: {}",
+        if info.is_component {
+            "Component Model (WASIp2)"
+        } else {
+            "Core Module (WASIp1)"
+        }
+    );
+    println!("  WASI Version: {}", info.wasi_version);
+    println!("  Binary Version: {}", info.binary_version);
+    println!();
+    println!("OCI Artifact:");
+    println!("  Media Type: {}", info.wasi_version.artifact_type());
+    println!(
+        "  Target Triple: {}",
+        match info.wasi_version {
+            WasiVersion::Preview1 => "wasm32-wasip1",
+            WasiVersion::Preview2 => "wasm32-wasip2",
+            WasiVersion::Unknown => "wasm32-wasi",
+        }
     );
 
     Ok(())
@@ -1783,7 +2503,7 @@ async fn handle_node_init(
     data_dir: PathBuf,
     overlay_cidr: String,
 ) -> Result<()> {
-    use overlay::WireGuardManager;
+    use zlayer_overlay::WireGuardManager;
 
     println!("Initializing ZLayer node as cluster leader...");
 
@@ -1836,14 +2556,14 @@ async fn handle_node_init(
 
     // 6. Initialize Raft as leader (bootstrap single-node cluster)
     println!("  Starting Raft consensus...");
-    let raft_config = scheduler::RaftConfig {
+    let raft_config = zlayer_scheduler::RaftConfig {
         node_id: raft_node_id,
         address: format!("{}:{}", advertise_addr, raft_port),
         raft_port,
         ..Default::default()
     };
 
-    let raft = scheduler::RaftCoordinator::new(raft_config)
+    let raft = zlayer_scheduler::RaftCoordinator::new(raft_config)
         .await
         .context("Failed to create Raft coordinator")?;
 
@@ -1894,8 +2614,8 @@ async fn handle_node_join(
     mode: String,
     services: Option<Vec<String>>,
 ) -> Result<()> {
-    use overlay::WireGuardManager;
     use std::time::Duration;
+    use zlayer_overlay::WireGuardManager;
 
     println!("Joining ZLayer cluster at {}...", leader_addr);
 
@@ -2615,7 +3335,7 @@ async fn handle_spec(action: &SpecCommands) -> Result<()> {
                 std::fs::read_to_string(&spec).context("Failed to read specification file")?;
 
             let parsed_spec =
-                spec::from_yaml_str(&content).context("Failed to parse specification")?;
+                zlayer_spec::from_yaml_str(&content).context("Failed to parse specification")?;
 
             match format.to_lowercase().as_str() {
                 "json" => {

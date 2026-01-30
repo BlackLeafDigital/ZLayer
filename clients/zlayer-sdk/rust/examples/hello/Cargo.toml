@@ -1,0 +1,23 @@
+[package]
+name = "hello-plugin"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "A hello world ZLayer plugin demonstrating SDK usage"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zlayer-sdk = { path = "../.." }
+
+[package.metadata.component]
+package = "zlayer:plugin"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

@@ -1,0 +1,21 @@
+[package]
+name = "zlayer-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "ZLayer deployment specification parsing and validation"
+keywords = ["container", "orchestration", "deployment", "spec", "yaml"]
+categories = ["config", "parsing"]
+readme = "README.md"
+
+[dependencies]
+cron.workspace = true
+humantime = "2.3.0"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+serde_yaml.workspace = true
+thiserror.workspace = true
+validator.workspace = true
+regex = "1"

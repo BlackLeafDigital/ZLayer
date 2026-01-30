@@ -1,0 +1,56 @@
+# Nginx Static Content Server
+#
+# A simple deployment serving static files with nginx.
+# Demonstrates basic container configuration, health checks,
+# and public endpoint exposure.
+#
+# Usage:
+#   zlayer deploy -f deployment.yaml
+#
+# Prerequisites:
+#   - Static files in ./html/ directory (or use default nginx page)
+
+version: v1
+deployment: nginx-static
+
+services:
+  web:
+    rtype: service
+    image:
+      name: nginx:1.25-alpine
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 0.25
+      memory: 64Mi
+
+    # Mount static content (optional)
+    # volumes:
+    #   - name: static-content
+    #     path: /usr/share/nginx/html
+    #     source: ./html
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 80
+        expose: public
+
+    scale:
+      mode: fixed
+      replicas: 2
+
+    health:
+      start_grace: 5s
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      check:
+        type: http
+        url: http://localhost:80/
+        expect_status: 200
+
+    # Nginx-specific configuration via environment
+    # For custom nginx.conf, mount as a volume
+    env:
+      NGINX_ENTRYPOINT_QUIET_LOGS: "1"

@@ -1,0 +1,51 @@
+[package]
+name = "zlayer-secrets"
+description = "Secure secrets management for ZLayer container workloads"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Async
+async-trait.workspace = true
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Cryptography
+hex.workspace = true
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+rand.workspace = true
+
+# Secret handling
+secrecy = { version = "0.10", features = ["serde"] }
+zeroize = { version = "1.7", features = ["derive"] }
+
+# Storage (optional)
+redb = { workspace = true, optional = true }
+
+# HashiCorp Vault (optional)
+vaultrs = { version = "0.7", optional = true }
+
+[features]
+default = ["persistent"]
+persistent = ["redb"]
+vault = ["vaultrs"]
+
+[dev-dependencies]
+tempfile = "3"
+serial_test = "3"
+
+[lints]
+workspace = true

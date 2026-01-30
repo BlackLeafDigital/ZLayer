@@ -9,7 +9,7 @@ FROM ubuntu:22.04
 
 LABEL org.opencontainers.image.title="ZLayer Node"
 LABEL org.opencontainers.image.description="ZLayer runtime with embedded containerd"
-LABEL org.opencontainers.image.source="https://github.com/ZachHandley/ZLayer"
+LABEL org.opencontainers.image.source="https://github.com/zachhandley/ZLayer"
 LABEL org.opencontainers.image.licenses="MIT"
 LABEL maintainer="Zach Handley <zachhandley@gmail.com>"
 

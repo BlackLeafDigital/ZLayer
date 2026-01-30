@@ -1,0 +1,13 @@
+.PHONY: build clean generate
+
+PLUGIN_NAME = {{name}}
+
+build: generate
+	tinygo build -target=wasip2 -scheduler=none -gc=leaking -o $(PLUGIN_NAME).wasm .
+
+generate:
+	wit-bindgen-go generate --world zlayer-plugin --out gen ../wit/zlayer
+
+clean:
+	rm -f *.wasm
+	rm -rf gen/

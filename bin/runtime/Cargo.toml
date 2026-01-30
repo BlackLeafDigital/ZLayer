@@ -13,30 +13,38 @@ path = "src/main.rs"
 
 [features]
 default = ["full"]
-# Full runtime with all CLI commands
-full = ["serve", "join", "deploy", "node"]
-# Enable serve command (API server mode)
+# Full runtime with all CLI commands and capabilities
+full = ["serve", "join", "deploy", "node", "docker", "wasm", "s3", "persistent", "observability"]
+
+# CLI commands
 serve = []
-# Enable join command (agent/worker node mode)
 join = []
-# Enable deploy command (orchestration mode)
 deploy = []
-# Enable node command (cluster management)
 node = []
+
+# Runtime capabilities (forwarded to deps)
+docker = ["zlayer-agent/docker"]
+wasm = ["zlayer-agent/wasm"]
+s3 = ["zlayer-agent/s3", "zlayer-registry/s3"]
+persistent = ["zlayer-scheduler/persistent", "zlayer-registry/persistent"]
+observability = ["zlayer-observability/axum", "zlayer-observability/propagation"]
 
 [dependencies]
 # Internal crates - always required
-agent = { path = "../../crates/agent" }
-spec = { path = "../../crates/spec" }
-observability = { path = "../../crates/observability" }
-init_actions = { path = "../../crates/init_actions" }
-builder = { path = "../../crates/builder" }
-scheduler = { path = "../../crates/scheduler" }
-overlay = { path = "../../crates/overlay" }
+zlayer-agent = { path = "../../crates/zlayer-agent" }
+zlayer-spec = { path = "../../crates/zlayer-spec" }
+zlayer-observability = { path = "../../crates/zlayer-observability" }
+zlayer-init-actions = { path = "../../crates/zlayer-init-actions" }
+zlayer-builder = { path = "../../crates/zlayer-builder" }
+zlayer-scheduler = { path = "../../crates/zlayer-scheduler" }
+zlayer-overlay = { path = "../../crates/zlayer-overlay" }
 zlayer-core = { path = "../../crates/zlayer-core" }
 
 # API server
-api = { path = "../../crates/api" }
+zlayer-api = { path = "../../crates/zlayer-api" }
+
+# Registry for export/import commands
+zlayer-registry = { path = "../../crates/zlayer-registry", features = ["local"] }
 
 # External dependencies
 clap = { workspace = true }

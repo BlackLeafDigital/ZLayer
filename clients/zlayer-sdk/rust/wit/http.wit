@@ -1,0 +1,198 @@
+/// ZLayer Plugin System - HTTP Types and Interfaces
+///
+/// Additional HTTP-specific types and interfaces for plugins
+/// that need fine-grained HTTP control beyond the standard
+/// wasi:http interfaces.
+
+/// Extended HTTP types for ZLayer
+interface http-types {
+    use common.{key-value, timestamp, duration};
+
+    /// HTTP version
+    enum http-version {
+        http-one-zero,
+        http-one-one,
+        http-two,
+        http-three,
+    }
+
+    /// Request metadata from the proxy layer
+    record request-metadata {
+        /// Original client IP address
+        client-ip: string,
+        /// Client port
+        client-port: u16,
+        /// TLS version if HTTPS (e.g., "TLSv1.3")
+        tls-version: option<string>,
+        /// TLS cipher suite if HTTPS
+        tls-cipher: option<string>,
+        /// Server name from SNI
+        server-name: option<string>,
+        /// HTTP version used
+        http-version: http-version,
+        /// Request received timestamp
+        received-at: timestamp,
+    }
+
+    /// Upstream backend information
+    record upstream {
+        /// Backend host
+        host: string,
+        /// Backend port
+        port: u16,
+        /// Use TLS for upstream connection
+        tls: bool,
+        /// Connection timeout in nanoseconds
+        connect-timeout: duration,
+        /// Request timeout in nanoseconds
+        request-timeout: duration,
+    }
+
+    /// Routing decision for requests
+    variant routing-decision {
+        /// Forward to the specified upstream
+        forward(upstream),
+        /// Redirect the client
+        redirect(redirect-info),
+        /// Return a response directly
+        respond-immediate(immediate-response),
+        /// Continue to next handler
+        continue-processing,
+    }
+
+    /// Redirect information
+    record redirect-info {
+        /// Redirect location URL
+        location: string,
+        /// HTTP status code (301, 302, 307, 308)
+        status: u16,
+        /// Preserve request body on redirect (307/308 only)
+        preserve-body: bool,
+    }
+
+    /// Immediate response without forwarding
+    record immediate-response {
+        /// HTTP status code
+        status: u16,
+        /// Response headers
+        headers: list<key-value>,
+        /// Response body
+        body: list<u8>,
+    }
+}
+
+/// HTTP routing interface for custom routing logic
+interface router {
+    use http-types.{request-metadata, routing-decision};
+    use request-types.{plugin-request};
+
+    /// Determine routing for an incoming request
+    /// Called before the request is forwarded to any backend
+    route: func(request: plugin-request, metadata: request-metadata) -> routing-decision;
+}
+
+/// Request/response middleware interface
+interface middleware {
+    use common.{key-value};
+    use http-types.{request-metadata};
+
+    /// Abort information for middleware
+    record abort-info {
+        status: u16,
+        message: string,
+    }
+
+    /// Middleware decision
+    variant middleware-action {
+        /// Continue processing with modified headers
+        continue-with(list<key-value>),
+        /// Abort with error response
+        abort(abort-info),
+    }
+
+    /// Called before request is forwarded
+    /// Can modify headers or abort the request
+    on-request: func(method: string, path: string, headers: list<key-value>, metadata: request-metadata) -> middleware-action;
+
+    /// Called after response is received from upstream
+    /// Can modify response headers
+    on-response: func(status: u16, headers: list<key-value>) -> middleware-action;
+}
+
+/// WebSocket support interface
+interface websocket {
+    use common.{key-value};
+
+    /// WebSocket message type
+    enum message-type {
+        text,
+        binary,
+        ping,
+        pong,
+        close,
+    }
+
+    /// WebSocket message
+    record message {
+        msg-type: message-type,
+        data: list<u8>,
+    }
+
+    /// WebSocket rejection info
+    record reject-info {
+        status: u16,
+        reason: string,
+    }
+
+    /// WebSocket upgrade decision
+    variant upgrade-decision {
+        /// Accept the upgrade
+        accept,
+        /// Accept with modified headers
+        accept-with-headers(list<key-value>),
+        /// Reject the upgrade with status and reason
+        reject(reject-info),
+    }
+
+    /// Called when a WebSocket upgrade is requested
+    on-upgrade: func(path: string, headers: list<key-value>) -> upgrade-decision;
+
+    /// Called when a WebSocket message is received from client
+    on-client-message: func(message: message) -> option<message>;
+
+    /// Called when a WebSocket message is received from upstream
+    on-upstream-message: func(message: message) -> option<message>;
+}
+
+/// Caching interface for HTTP responses
+interface caching {
+    use common.{key-value, duration};
+
+    /// Cache control decision
+    variant cache-decision {
+        /// Don't cache this response
+        no-cache,
+        /// Cache with specified TTL
+        cache-for(duration),
+        /// Cache with specified TTL and tags for invalidation
+        cache-with-tags(cache-entry),
+    }
+
+    /// Cache entry with metadata
+    record cache-entry {
+        /// Time to live in nanoseconds
+        ttl: duration,
+        /// Tags for cache invalidation
+        tags: list<string>,
+        /// Vary headers - cache separately for different values of these headers
+        vary: list<string>,
+        /// Allow serving stale content while revalidating
+        stale-while-revalidate: option<duration>,
+    }
+
+    /// Determine caching policy for a response
+    cache-policy: func(method: string, path: string, status: u16, headers: list<key-value>) -> cache-decision;
+
+    /// Generate cache key for a request
+    cache-key: func(method: string, path: string, headers: list<key-value>) -> string;
+}

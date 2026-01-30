@@ -1,0 +1,10 @@
+{
+  "name": "python",
+  "display_name": "Python Plugin",
+  "description": "A Python plugin template for ZLayer using componentize-py",
+  "placeholders": {
+    "name": "Plugin name (kebab-case)",
+    "version": "Plugin version",
+    "description": "Plugin description"
+  }
+}

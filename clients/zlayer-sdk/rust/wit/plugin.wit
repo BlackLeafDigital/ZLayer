@@ -1,0 +1,137 @@
+/// ZLayer Plugin System - Plugin Interface
+///
+/// This interface defines what plugins must export to be loaded
+/// and executed by the ZLayer runtime. Plugins implement the
+/// handler interface to process requests.
+
+/// The main plugin handler interface that plugins must export
+interface handler {
+    use common.{error, key-value};
+    use plugin-metadata.{plugin-info, capabilities};
+    use request-types.{plugin-request, handle-result};
+
+    /// Plugin initialization error
+    variant init-error {
+        /// Required configuration is missing
+        config-missing(string),
+        /// Configuration value is invalid
+        config-invalid(string),
+        /// Required capability not available
+        capability-unavailable(string),
+        /// Generic initialization failure
+        failed(string),
+    }
+
+    /// Initialize the plugin with provided configuration.
+    /// Called once when the plugin is loaded.
+    /// Returns capabilities the plugin requires.
+    ///
+    /// The plugin should:
+    /// 1. Read any required configuration
+    /// 2. Initialize internal state
+    /// 3. Return the capabilities it needs
+    ///
+    /// If initialization fails, the plugin will not be loaded.
+    init: func() -> result<capabilities, init-error>;
+
+    /// Return plugin metadata.
+    /// Called after successful initialization.
+    /// This information is used for logging, metrics, and management.
+    info: func() -> plugin-info;
+
+    /// Handle an incoming request.
+    /// Called for each request that matches the plugin's routing rules.
+    ///
+    /// The plugin should:
+    /// 1. Examine the request
+    /// 2. Process it or decide to pass through
+    /// 3. Return an appropriate result
+    ///
+    /// Possible returns:
+    /// - response: Plugin handled the request, return the response
+    /// - pass-through: Plugin chose not to handle, continue to next handler
+    /// - error: Plugin encountered an error processing the request
+    handle: func(request: plugin-request) -> handle-result;
+
+    /// Graceful shutdown hook.
+    /// Called when the plugin is being unloaded.
+    /// Plugins should clean up any resources.
+    /// This is a best-effort call - plugins may be terminated
+    /// without shutdown if they don't respond in time.
+    shutdown: func();
+}
+
+/// A simpler plugin interface for stateless transformations
+interface transformer {
+    use common.{key-value};
+
+    /// Transform request headers before forwarding
+    transform-request-headers: func(headers: list<key-value>) -> list<key-value>;
+
+    /// Transform response headers before returning
+    transform-response-headers: func(headers: list<key-value>) -> list<key-value>;
+
+    /// Transform request body before forwarding
+    transform-request-body: func(body: list<u8>) -> list<u8>;
+
+    /// Transform response body before returning
+    transform-response-body: func(body: list<u8>) -> list<u8>;
+}
+
+/// Authentication plugin interface
+interface authenticator {
+    use common.{key-value, error};
+    use request-types.{plugin-request};
+
+    /// Authentication result
+    variant auth-result {
+        /// Authentication successful, include identity claims
+        authenticated(list<key-value>),
+        /// Authentication failed with reason
+        denied(string),
+        /// No credentials provided, challenge required
+        challenge(string),
+        /// Skip authentication for this request
+        skip,
+    }
+
+    /// Authenticate an incoming request
+    /// Returns authentication result with identity claims on success
+    authenticate: func(request: plugin-request) -> auth-result;
+
+    /// Validate a token (e.g., JWT, API key)
+    /// Returns claims if valid, error if invalid
+    validate-token: func(token: string) -> result<list<key-value>, error>;
+}
+
+/// Rate limiting plugin interface
+interface rate-limiter {
+    use common.{duration};
+    use request-types.{plugin-request};
+
+    /// Rate limit decision
+    variant rate-limit-result {
+        /// Request allowed, remaining quota info
+        allowed(rate-limit-info),
+        /// Request denied, retry after duration
+        denied(rate-limit-info),
+    }
+
+    /// Rate limit information
+    record rate-limit-info {
+        /// Requests remaining in current window
+        remaining: u64,
+        /// Total limit for the window
+        limit: u64,
+        /// Time until limit resets (nanoseconds)
+        reset-after: duration,
+        /// Retry after this duration if denied (nanoseconds)
+        retry-after: option<duration>,
+    }
+
+    /// Check if request should be rate limited
+    check: func(request: plugin-request) -> rate-limit-result;
+
+    /// Get current rate limit status for a key
+    status: func(key: string) -> option<rate-limit-info>;
+}

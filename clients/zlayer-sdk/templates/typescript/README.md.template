@@ -1,0 +1,128 @@
+# {{name}}
+
+{{description}}
+
+## Overview
+
+This is a ZLayer plugin built with TypeScript. It compiles to WebAssembly using [jco](https://github.com/bytecodealliance/jco).
+
+## Prerequisites
+
+- Node.js 18+
+- pnpm (or npm/yarn)
+
+## Installation
+
+```bash
+pnpm install
+```
+
+## Development
+
+### Build the Plugin
+
+Compile TypeScript to JavaScript, then build the WASM component:
+
+```bash
+pnpm run build
+```
+
+This produces `{{name}}.wasm` in the project root.
+
+### Clean Build Artifacts
+
+```bash
+pnpm run clean
+```
+
+## Project Structure
+
+```
+{{name}}/
+  src/
+    plugin.ts      # Main plugin implementation
+  wit/             # WIT interface definitions (from ZLayer)
+  package.json
+  tsconfig.json
+  README.md
+```
+
+## Plugin Interface
+
+Your plugin implements the `ZLayerPlugin` interface:
+
+- `init()` - Called once when the plugin loads. Return required capabilities.
+- `info()` - Return plugin metadata (name, version, description, etc.)
+- `handle(request)` - Process incoming requests
+- `shutdown()` - Cleanup before unload (optional)
+
+## Capabilities
+
+Request capabilities your plugin needs in `init()`:
+
+```typescript
+init(): Capabilities {
+  return {
+    logging: true,    // Log messages
+    config: true,     // Read configuration
+    keyvalue: true,   // Key-value storage
+    secrets: true,    // Access secrets
+    metrics: true,    // Emit metrics
+    httpClient: true, // Make HTTP requests
+  };
+}
+```
+
+## SDK Features
+
+The `@zlayer/sdk` package provides:
+
+### Logging
+```typescript
+import { log } from '@zlayer/sdk';
+log.info('Processing request');
+log.error('Something went wrong');
+```
+
+### Configuration
+```typescript
+import { getConfig, getConfigRequired } from '@zlayer/sdk';
+const timeout = getConfig('timeout') ?? '30';
+const apiKey = getConfigRequired('api_key');
+```
+
+### Key-Value Storage
+```typescript
+import { kvGet, kvSet, kvGetJson, kvSetJson } from '@zlayer/sdk';
+kvSetJson('cache', 'user:123', { name: 'Alice' });
+const user = kvGetJson('cache', 'user:123');
+```
+
+### Metrics
+```typescript
+import { metrics } from '@zlayer/sdk';
+metrics.counterInc('requests_total');
+metrics.histogramObserve('request_duration_seconds', 0.045);
+```
+
+### Response Helpers
+```typescript
+import { jsonResponse, textResponse, errorResponse, passThrough } from '@zlayer/sdk';
+
+// Return JSON
+return { type: 'response', response: jsonResponse({ status: 'ok' }) };
+
+// Return error
+return errorResponse('Not found', 404);
+
+// Pass to next handler
+return passThrough();
+```
+
+## License
+
+{{license}}
+
+## Author
+
+{{author}}

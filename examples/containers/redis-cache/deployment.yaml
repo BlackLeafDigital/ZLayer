@@ -1,0 +1,133 @@
+# Redis Cache
+#
+# A Redis deployment with optional persistence and memory management.
+# Demonstrates caching configuration, persistence options, and
+# internal service communication.
+#
+# Usage:
+#   zlayer deploy -f deployment.yaml
+#
+# Modes:
+#   - Cache-only (default): No persistence, pure in-memory cache
+#   - Persistent: AOF or RDB persistence enabled
+
+version: v1
+deployment: redis-cache
+
+services:
+  cache:
+    rtype: service
+    image:
+      name: redis:7-alpine
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 0.5
+      memory: 256Mi
+
+    # Redis configuration via command arguments
+    # These override redis.conf defaults
+    command:
+      - redis-server
+      - --maxmemory
+      - 200mb
+      - --maxmemory-policy
+      - allkeys-lru
+      # Disable persistence for cache-only mode
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      # Performance optimizations
+      - --tcp-keepalive
+      - "300"
+      - --timeout
+      - "0"
+
+    # For password protection (recommended)
+    # env:
+    #   REDIS_PASSWORD: $S:REDIS_PASSWORD
+    # command:
+    #   - redis-server
+    #   - --requirepass
+    #   - $(REDIS_PASSWORD)
+
+    endpoints:
+      - name: redis
+        protocol: tcp
+        port: 6379
+        expose: internal
+
+    scale:
+      mode: fixed
+      replicas: 1
+
+    health:
+      start_grace: 5s
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      check:
+        type: exec
+        command:
+          - redis-cli
+          - ping
+
+---
+# Alternative: Redis with persistence
+# Uncomment this section and comment out the above for persistent Redis
+
+# services:
+#   cache:
+#     rtype: service
+#     image:
+#       name: redis:7-alpine
+#       pull_policy: if_not_present
+#
+#     resources:
+#       cpu: 0.5
+#       memory: 256Mi
+#
+#     command:
+#       - redis-server
+#       - --maxmemory
+#       - 200mb
+#       - --maxmemory-policy
+#       - allkeys-lru
+#       # Enable AOF persistence
+#       - --appendonly
+#       - "yes"
+#       - --appendfsync
+#       - everysec
+#       # RDB snapshots as backup
+#       - --save
+#       - "900 1"
+#       - --save
+#       - "300 10"
+#
+#     volumes:
+#       - name: redis-data
+#         path: /data
+#         size: 5Gi
+#         persist: true
+#
+#     endpoints:
+#       - name: redis
+#         protocol: tcp
+#         port: 6379
+#         expose: internal
+#
+#     scale:
+#       mode: fixed
+#       replicas: 1
+#
+#     health:
+#       start_grace: 5s
+#       interval: 10s
+#       timeout: 3s
+#       retries: 3
+#       check:
+#         type: exec
+#         command:
+#           - redis-cli
+#           - ping

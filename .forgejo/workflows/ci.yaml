@@ -113,7 +113,11 @@ jobs:
         run: cargo test --workspace --lib --bins
 
       - name: Run integration tests
-        run: cargo test --workspace --test '*'
+        run: |
+          # Scheduler tests need test-skip-http feature to skip agent HTTP calls
+          cargo test -p zlayer-scheduler --features test-skip-http --test '*'
+          # Run all other integration tests
+          cargo test --workspace --test '*' --exclude zlayer-scheduler
 
       - name: Run doc tests
         run: cargo test --workspace --doc

@@ -1,0 +1,37 @@
+{
+  "name": "@zlayer/sdk",
+  "version": "0.1.0",
+  "description": "ZLayer Plugin Development Kit for TypeScript",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc",
+    "generate": "jco types ../wit/zlayer -o src/bindings",
+    "clean": "rm -rf dist",
+    "test": "vitest run",
+    "lint": "eslint src --ext .ts",
+    "format": "prettier --write src"
+  },
+  "keywords": ["wasm", "wasi", "plugin", "zlayer"],
+  "license": "MIT",
+  "devDependencies": {
+    "@bytecodealliance/jco": "^1.4.0",
+    "@types/node": "^20.11.0",
+    "typescript": "^5.3.0",
+    "vitest": "^1.2.0",
+    "eslint": "^8.56.0",
+    "@typescript-eslint/eslint-plugin": "^6.19.0",
+    "@typescript-eslint/parser": "^6.19.0",
+    "prettier": "^3.2.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

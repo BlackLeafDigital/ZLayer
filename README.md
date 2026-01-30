@@ -1,6 +1,18 @@
-# ZLayer
+<p align="center">
+  <img src="assets/zlayer_logo.png" alt="ZLayer Logo" width="150">
+</p>
 
-A lightweight, Rust-based container orchestration platform with built-in networking, scaling, and observability.
+<h1 align="center">ZLayer</h1>
+
+<p align="center">
+  A lightweight, Rust-based container orchestration platform with built-in networking, scaling, and observability.
+</p>
+
+<p align="center">
+  <a href="https://zlayer.dev">Website</a> •
+  <a href="https://zlayer.dev/docs">Documentation</a> •
+  <a href="https://crates.io/crates/zlayer-spec">Crates.io</a>
+</p>
 
 ## Overview
 
@@ -9,6 +21,8 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 ### Key Features
 
 - **Daemonless Runtime** - Uses libcontainer directly, no containerd/Docker daemon needed
+- **WebAssembly Support** - First-class WASM runtime with WASIp1 & WASIp2 support via wasmtime
+- **Multi-Language WASM SDKs** - Build WASM workloads from Rust, Go, Python, TypeScript, C, Zig, and more
 - **Built-in Image Builder** - Dockerfile parser with buildah integration and runtime templates
 - **Encrypted Overlay Networks** - WireGuard-based mesh networking with IP allocation and health checking
 - **Smart Scheduler** - Node placement with Shared/Dedicated/Exclusive allocation modes
@@ -39,13 +53,16 @@ graph TB
 
         subgraph Runtime[Runtime Layer]
             LC[libcontainer]
+            WT[wasmtime]
             SM[Storage Manager]
             LC --> C1[Container]
             LC --> C2[Container]
-            LC --> C3[Container]
+            WT --> W1[WASM Module]
+            WT --> W2[WASM Module]
         end
 
         Agent --> LC
+        Agent --> WT
         Agent --> SM
     end
 
@@ -120,20 +137,20 @@ sudo pacman -S libseccomp
 ### Quick Install (Recommended)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | bash
+curl -fsSL https://zlayer.dev/install.sh | bash
 ```
 
-### From Package Registry
+### From GitHub Releases
 
 Download the latest release for your architecture:
 
 ```bash
 # For amd64 (latest)
-curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/latest/zlayer-linux-amd64.tar.gz | tar xz
+curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-linux-amd64.tar.gz | tar xz
 sudo mv zlayer /usr/local/bin/
 
 # For arm64 (latest)
-curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/latest/zlayer-linux-arm64.tar.gz | tar xz
+curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-linux-arm64.tar.gz | tar xz
 sudo mv zlayer /usr/local/bin/
 ```
 
@@ -141,7 +158,7 @@ Or pin to a specific version:
 
 ```bash
 # Replace VERSION with desired version (e.g., v0.1.0)
-curl -fsSL https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/VERSION/zlayer-linux-amd64.tar.gz | tar xz
+curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/download/VERSION/zlayer-linux-amd64.tar.gz | tar xz
 ```
 
 ### From Source
@@ -191,13 +208,33 @@ services:
         expect_status: 200
 ```
 
-### 2. Deploy
+### 2. Deploy a WASM workload
+
+ZLayer auto-detects WASM artifacts from OCI registries:
+
+```yaml
+# wasm-deployment.yaml
+version: v1
+deployment: my-wasm-app
+
+services:
+  handler:
+    rtype: service
+    image:
+      # ZLayer auto-detects WASM artifacts by media type
+      name: ghcr.io/myorg/my-wasm-handler:v1
+    env:
+      - name: LOG_LEVEL
+        value: info
+```
+
+### 3. Deploy
 
 ```bash
 zlayer deploy deployment.yaml
 ```
 
-### 3. Check status
+### 4. Check status
 
 ```bash
 zlayer status my-app
@@ -500,6 +537,208 @@ zlayer run deployment.yaml --port-offset 1000
 # Production environment
 zlayer run deployment.yaml --env prod
 ```
+
+### WASM Commands
+
+```bash
+# Build WASM from source (auto-detects language)
+zlayer wasm build .
+zlayer wasm build --language rust --target wasip2 --optimize ./my-rust-app
+
+# Export WASM as OCI artifact
+zlayer wasm export ./app.wasm --name myapp:v1
+zlayer wasm export ./app.wasm --name ghcr.io/myorg/myapp:latest --output ./oci-dir
+
+# Push WASM to registry
+zlayer wasm push ./app.wasm ghcr.io/myorg/myapp:v1
+zlayer wasm push ./app.wasm --username $USER --password $TOKEN registry.example.com/app:v1
+
+# Validate a WASM binary
+zlayer wasm validate ./handler.wasm
+
+# Inspect WASM binary info
+zlayer wasm info ./handler.wasm
+
+# Run a WASM image (auto-detected from registry)
+zlayer run ghcr.io/myorg/my-wasm-handler:v1
+```
+
+## WebAssembly Support
+
+ZLayer supports WebAssembly (WASM) as a first-class runtime alongside traditional OCI containers. WASM workloads benefit from near-instant cold starts, smaller image sizes, and universal portability.
+
+### Supported Languages
+
+| Tier | Languages | Notes |
+|------|-----------|-------|
+| **Tier 1** | Rust, Go, C/C++, Zig, AssemblyScript | Direct compilation to WASM |
+| **Tier 2** | C#/.NET, Kotlin, Swift | Experimental/growing support |
+| **Tier 3** | Python, JavaScript, Ruby, PHP, Lua | Interpreter-based (via WASM-compiled runtimes) |
+
+### WASM vs Container Comparison
+
+| Aspect | Container | WASM |
+|--------|-----------|------|
+| **Cold Start** | ~300ms | ~1-5ms |
+| **Image Size** | 10MB - 1GB+ | 100KB - 10MB |
+| **Isolation** | Linux namespaces/cgroups | WASM sandbox |
+| **Portability** | Arch-specific (x86/ARM) | Universal bytecode |
+| **exec() support** | Yes | No (single process model) |
+
+### WASIp2 Capabilities
+
+ZLayer provides comprehensive WASIp2 support with the following interfaces:
+
+| Interface | Description | Status |
+|-----------|-------------|--------|
+| wasi:cli/* | Environment, args, stdin/stdout/stderr | Supported |
+| wasi:sockets/* | TCP/UDP networking, DNS resolution | Supported |
+| wasi:filesystem/* | Preopened directory access | Supported |
+| wasi:clocks/* | Monotonic and wall clock time | Supported |
+| wasi:random/* | Secure random number generation | Supported |
+| wasi:http/* | HTTP client and incoming handler | Supported |
+
+### ZLayer Plugin Host Interfaces
+
+Custom host interfaces available to WASM plugins:
+
+| Interface | Description |
+|-----------|-------------|
+| zlayer:plugin/config | Configuration access (get, get_required, get_prefix, get_bool, get_int) |
+| zlayer:plugin/keyvalue | Key-value storage (get, set, delete, increment, compare_and_swap, TTL support) |
+| zlayer:plugin/logging | Structured logging with levels (trace, debug, info, warn, error) |
+| zlayer:plugin/secrets | Secure secret access (get, get_required, exists, list_names) |
+| zlayer:plugin/metrics | Counter, gauge, histogram metrics with labels |
+
+### Custom HTTP Interfaces
+
+For advanced HTTP handling (router, middleware, websocket, caching), see [WASM_PLUGINS.md](./docs/WASM_PLUGINS.md).
+
+### Building WASM Plugins
+
+**Using ZLayer CLI (Recommended):**
+
+```bash
+# Build and push in one workflow (auto-detects language)
+zlayer wasm build .
+zlayer wasm push ./target/wasm32-wasip2/release/handler.wasm ghcr.io/myorg/handler:v1
+
+# Or specify language and target explicitly
+zlayer wasm build --language rust --target wasip2 --optimize .
+zlayer wasm push ./handler.wasm ghcr.io/myorg/handler:v1
+```
+
+**Manual Build Commands:**
+
+```bash
+# Rust
+cargo build --target wasm32-wasip2 --release
+zlayer wasm push target/wasm32-wasip2/release/handler.wasm ghcr.io/myorg/handler:v1
+
+# Go (TinyGo)
+tinygo build -target=wasip2 -o handler.wasm .
+zlayer wasm push handler.wasm ghcr.io/myorg/handler:v1
+
+# C/C++ (WASI SDK)
+clang --target=wasm32-wasip2 -o handler.wasm handler.c
+zlayer wasm push handler.wasm ghcr.io/myorg/handler:v1
+
+# Zig
+zig build -Dtarget=wasm32-wasi
+zlayer wasm push zig-out/bin/handler.wasm ghcr.io/myorg/handler:v1
+
+# AssemblyScript
+asc handler.ts -o handler.wasm
+zlayer wasm push handler.wasm ghcr.io/myorg/handler:v1
+
+# TypeScript (via jco)
+jco componentize handler.js -o handler.wasm
+zlayer wasm push handler.wasm ghcr.io/myorg/handler:v1
+```
+
+### WASM Detection
+
+ZLayer auto-detects WASM artifacts using multiple signals:
+
+1. **OCI 1.1+ `artifactType`** - Most authoritative
+2. **Config `mediaType`** - `application/vnd.wasm.config.v0+json`
+3. **Layer `mediaType`** - `application/wasm` fallback
+
+No configuration required - just reference the image and ZLayer handles the rest.
+
+### Building with WASM Support
+
+```bash
+# Build ZLayer with WASM runtime enabled
+cargo build --release --features wasm
+
+# Build with both Docker and WASM support
+cargo build --release --features "docker,wasm"
+```
+
+For detailed WASM implementation documentation, see [WASM_DONE.md](./WASM_DONE.md).
+
+## Runtime Modes
+
+ZLayer supports multiple container runtime backends:
+
+### Youki Runtime (Default on Linux)
+Direct container management via libcontainer - no daemon required. Optimal performance with minimal overhead.
+
+### Docker Runtime (Cross-Platform)
+Uses the Docker daemon via bollard for cross-platform support (macOS, Windows, Linux). Enable with the `docker` feature:
+
+```bash
+# Build with Docker runtime support
+cargo build --release --features docker
+
+# Or build with all runtimes
+cargo build --release --features "docker,wasm"
+```
+
+**Runtime Selection**:
+- Linux: Prefers youki, falls back to Docker if unavailable
+- macOS/Windows: Uses Docker automatically
+
+### WASM Runtime
+WebAssembly workloads via wasmtime. See [WebAssembly Support](#webassembly-support).
+
+| Runtime | Platform | Daemon Required | Use Case |
+|---------|----------|-----------------|----------|
+| Youki | Linux only | No | Production (optimal) |
+| Docker | All | Yes | Development, cross-platform |
+| WASM | All | No | Lightweight, portable workloads |
+
+## GitHub Action
+
+ZLayer is available as a GitHub Action for CI/CD workflows:
+
+```yaml
+- uses: BlackLeafDigital/ZLayer@v1
+  with:
+    command: wasm build .
+```
+
+### Quick Examples
+
+```yaml
+# Build WASM plugin
+- uses: BlackLeafDigital/ZLayer@v1
+  with:
+    command: wasm build --language rust --target wasip2
+
+# Push to registry
+- uses: BlackLeafDigital/ZLayer@v1
+  with:
+    command: wasm push ./handler.wasm ghcr.io/myorg/handler:latest
+
+# Validate deployment spec
+- uses: BlackLeafDigital/ZLayer@v1
+  with:
+    command: validate deployment.yaml
+```
+
+See [ACTION.md](./ACTION.md) for full documentation and examples.
 
 ## Observability
 

@@ -1,0 +1,148 @@
+# Example ZLayer deployment with WASM services
+#
+# This deployment demonstrates running WebAssembly modules on ZLayer.
+# ZLayer automatically detects WASM modules and runs them using the
+# integrated WebAssembly runtime.
+#
+# Usage:
+#   zlayer deploy -f deployment.yaml
+
+version: v1
+deployment: wasm-examples
+
+services:
+  # Rust WASM example
+  # Built from: examples/wasm/rust-hello/
+  rust-hello:
+    rtype: service
+    image:
+      # WASM modules can be referenced by:
+      # 1. Container registry (recommended for production)
+      name: ghcr.io/zlayer/examples/rust-hello:latest
+      # 2. Local file path (for development)
+      # name: file://./rust-hello/target/wasm32-wasip2/release/rust_hello_wasm.wasm
+      pull_policy: if_not_present
+
+    # Resource limits for WASM modules
+    # These are enforced by the WebAssembly runtime
+    resources:
+      cpu: 0.5
+      memory: 64Mi
+
+    # Environment variables passed to the WASM module
+    # Accessible via WASI environment interfaces
+    env:
+      GREETING: "Hello from ZLayer"
+      LOG_LEVEL: info
+
+    # WASM-specific configuration
+    # ZLayer auto-detects WASM but you can be explicit
+    runtime:
+      type: wasm
+      # Capabilities granted to the module
+      capabilities:
+        - wasi:cli/stdout
+        - wasi:cli/stderr
+        - wasi:cli/environment
+      # Memory limits
+      max_memory: 64Mi
+      # Fuel (instruction count limit, 0 = unlimited)
+      max_fuel: 0
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+        expose: internal
+
+    scale:
+      mode: fixed
+      replicas: 2
+
+    health:
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      check:
+        type: tcp
+        port: 8080
+
+  # Go WASM example (built with TinyGo)
+  # Built from: examples/wasm/go-hello/
+  go-hello:
+    rtype: service
+    image:
+      name: ghcr.io/zlayer/examples/go-hello:latest
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 0.5
+      memory: 128Mi
+
+    env:
+      GREETING: "Greetings from Go"
+
+    runtime:
+      type: wasm
+      capabilities:
+        - wasi:cli/stdout
+        - wasi:cli/stderr
+        - wasi:cli/environment
+      max_memory: 128Mi
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+        expose: internal
+
+    scale:
+      mode: fixed
+      replicas: 1
+
+  # API Gateway that routes to WASM backends
+  gateway:
+    rtype: service
+    image:
+      name: ghcr.io/zlayer/gateway:latest
+      pull_policy: always
+
+    resources:
+      cpu: 1.0
+      memory: 256Mi
+
+    env:
+      RUST_BACKEND: rust-hello.service:8080
+      GO_BACKEND: go-hello.service:8080
+
+    endpoints:
+      - name: http
+        protocol: https
+        port: 443
+        path: /api
+        expose: public
+
+    depends:
+      - service: rust-hello
+        condition: healthy
+        timeout: 60s
+      - service: go-hello
+        condition: healthy
+        timeout: 60s
+
+    scale:
+      mode: adaptive
+      min: 1
+      max: 10
+      targets:
+        cpu: 70
+        rps: 500
+
+    health:
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      check:
+        type: http
+        url: http://localhost:443/health
+        expect_status: 200

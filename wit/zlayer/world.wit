@@ -1,0 +1,114 @@
+/// ZLayer Plugin System - World Definitions
+///
+/// This file defines the worlds for ZLayer plugins:
+/// 1. zlayer-plugin - General purpose plugins with full host access
+/// 2. zlayer-http-handler - HTTP request handler plugins
+/// 3. zlayer-transformer - Simple request/response transformations
+/// 4. zlayer-authenticator - Authentication plugins
+/// 5. zlayer-rate-limiter - Rate limiting plugins
+
+/// The main ZLayer plugin world with full host capabilities.
+/// Plugins implementing this world have access to:
+/// - WASI CLI interfaces (args, env, stdio, filesystem)
+/// - WASI HTTP interfaces (outgoing requests)
+/// - ZLayer host interfaces (config, keyvalue, logging, secrets, metrics)
+world zlayer-plugin {
+    // WASI standard imports for CLI and HTTP
+    include wasi:cli/imports@0.2.0;
+    include wasi:http/imports@0.2.0;
+
+    // ZLayer host-provided capabilities (local interfaces)
+    import config;
+    import keyvalue;
+    import logging;
+    import secrets;
+    import metrics;
+
+    // Plugin must export its handler interface (local interface)
+    export handler;
+}
+
+/// HTTP handler world for request/response processing.
+/// Designed for plugins that primarily handle HTTP traffic.
+/// More restricted than the full plugin world for better sandboxing.
+world zlayer-http-handler {
+    // HTTP capabilities for making outgoing requests
+    include wasi:http/imports@0.2.0;
+
+    // Subset of host capabilities for HTTP handlers
+    import config;
+    import keyvalue;
+    import logging;
+
+    // Export WASI HTTP incoming handler
+    export wasi:http/incoming-handler@0.2.0;
+}
+
+/// Minimal plugin world for simple request/response transformations
+world zlayer-transformer {
+    // Minimal WASI imports
+    include wasi:cli/imports@0.2.0;
+
+    // Only logging for debugging
+    import logging;
+
+    // Export transformer interface
+    export transformer;
+}
+
+/// Authentication plugin world
+world zlayer-authenticator {
+    // HTTP imports for token validation via external services
+    include wasi:http/imports@0.2.0;
+
+    // Full host access for auth plugins
+    import config;
+    import keyvalue;
+    import logging;
+    import secrets;
+
+    // Export authenticator interface
+    export authenticator;
+}
+
+/// Rate limiting plugin world
+world zlayer-rate-limiter {
+    // Minimal WASI imports
+    include wasi:cli/imports@0.2.0;
+
+    // Host capabilities for rate limiting state
+    import config;
+    import keyvalue;
+    import logging;
+    import metrics;
+
+    // Export rate limiter interface
+    export rate-limiter;
+}
+
+/// Middleware plugin world for request/response interception
+world zlayer-middleware {
+    // HTTP capabilities
+    include wasi:http/imports@0.2.0;
+
+    // Host capabilities
+    import config;
+    import logging;
+
+    // Export middleware interface
+    export middleware;
+}
+
+/// Router plugin world for custom request routing
+world zlayer-router {
+    // HTTP capabilities
+    include wasi:http/imports@0.2.0;
+
+    // Host capabilities
+    import config;
+    import keyvalue;
+    import logging;
+
+    // Export router interface
+    export router;
+}

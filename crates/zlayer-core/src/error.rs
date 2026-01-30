@@ -10,7 +10,7 @@ use thiserror::Error;
 pub enum ZLayerError {
     /// Spec-related errors
     #[error("spec error: {0}")]
-    Spec(#[from] spec::SpecError),
+    Spec(#[from] zlayer_spec::SpecError),
 
     /// Container runtime errors
     #[error("container error: {0}")]

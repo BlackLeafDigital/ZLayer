@@ -1,0 +1,38 @@
+[package]
+name = "zlayer-registry"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OCI container registry client with blob caching"
+keywords = ["container", "oci", "registry", "docker", "image"]
+categories = ["network-programming", "caching"]
+readme = "README.md"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+aws-config = { version = "1.8.11", features = ["behavior-version-latest"], optional = true }
+aws-sdk-s3 = { version = "1.96.0", optional = true }
+flate2 = "1.1.8"
+hex.workspace = true
+oci-client.workspace = true
+redb.workspace = true
+serde = { workspace = true, optional = true }
+serde_json.workspace = true
+sha2.workspace = true
+tar = "0.4.44"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+zstd = "0.13.3"
+
+[dev-dependencies]
+serial_test = "3"
+tempfile = "3.24.0"
+
+[features]
+persistent = []
+s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+local = ["dep:serde"]

@@ -1,0 +1,71 @@
+# {{name}}
+
+{{description}}
+
+## Prerequisites
+
+1. **Rust toolchain** with the `wasm32-wasip2` target:
+   ```bash
+   rustup target add wasm32-wasip2
+   ```
+
+2. **cargo-component** for building WebAssembly components:
+   ```bash
+   cargo install cargo-component
+   ```
+
+## Building
+
+Build the plugin as a WebAssembly component:
+
+```bash
+cargo component build --release
+```
+
+The compiled component will be at:
+```
+target/wasm32-wasip2/release/{{name_underscore}}.wasm
+```
+
+## Configuration
+
+Add configuration options in your ZLayer deployment:
+
+```yaml
+plugins:
+  - name: {{name}}
+    path: ./{{name_underscore}}.wasm
+    config:
+      # Add your configuration keys here
+```
+
+## Development
+
+### Project Structure
+
+```
+{{name}}/
+├── Cargo.toml        # Package manifest with WASMp2 configuration
+├── README.md         # This file
+└── src/
+    └── lib.rs        # Plugin implementation
+```
+
+### Testing
+
+Run tests with:
+
+```bash
+cargo test
+```
+
+### Linting
+
+```bash
+cargo clippy --all-targets
+cargo fmt --check
+```
+
+## License
+
+MIT OR Apache-2.0

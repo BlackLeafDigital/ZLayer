@@ -1,0 +1,78 @@
+name: 'ZLayer CLI'
+description: 'Install and run ZLayer CLI commands for container orchestration and WASM plugin management'
+author: 'BlackLeaf Digital'
+
+branding:
+  icon: 'box'
+  color: 'blue'
+
+inputs:
+  version:
+    description: 'ZLayer version (default: latest)'
+    required: false
+    default: 'latest'
+  command:
+    description: 'ZLayer command to run'
+    required: true
+  working-directory:
+    description: 'Working directory for the command'
+    required: false
+    default: '.'
+
+outputs:
+  version:
+    description: 'Installed ZLayer version'
+    value: ${{ steps.install.outputs.version }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Detect platform
+      id: platform
+      shell: bash
+      run: |
+        OS=$(uname -s | tr '[:upper:]' '[:lower:]')
+        ARCH=$(uname -m)
+        case "$ARCH" in
+          x86_64) ARCH="amd64" ;;
+          aarch64|arm64) ARCH="arm64" ;;
+        esac
+        case "$OS" in
+          darwin) PLATFORM="${OS}-${ARCH}" ;;
+          linux) PLATFORM="linux-${ARCH}" ;;
+          *) echo "Unsupported OS: $OS"; exit 1 ;;
+        esac
+        echo "platform=$PLATFORM" >> $GITHUB_OUTPUT
+
+    - name: Install ZLayer
+      id: install
+      shell: bash
+      run: |
+        VERSION="${{ inputs.version }}"
+        PLATFORM="${{ steps.platform.outputs.platform }}"
+
+        if [ "$VERSION" = "latest" ]; then
+          # Get latest version from GitHub releases
+          VERSION=$(curl -fsSL https://api.github.com/repos/BlackLeafDigital/ZLayer/releases/latest | jq -r .tag_name)
+        fi
+
+        # Strip 'v' prefix for download URL
+        DL_VERSION="${VERSION#v}"
+
+        echo "Installing ZLayer $VERSION for $PLATFORM..."
+
+        # Download from GitHub releases
+        curl -fsSL "https://github.com/BlackLeafDigital/ZLayer/releases/download/${VERSION}/zlayer-${DL_VERSION}-${PLATFORM}.tar.gz" \
+          -o zlayer.tar.gz
+
+        tar xzf zlayer.tar.gz
+        sudo mv zlayer /usr/local/bin/
+        rm zlayer.tar.gz
+
+        zlayer --version
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Run ZLayer command
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: zlayer ${{ inputs.command }}

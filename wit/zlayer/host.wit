@@ -1,0 +1,171 @@
+/// ZLayer Plugin System - Host Interfaces
+///
+/// These interfaces define the capabilities that the ZLayer host
+/// provides to plugins. Plugins import these interfaces to access
+/// configuration, storage, logging, secrets, and metrics.
+
+/// Configuration interface for reading plugin and deployment config
+interface config {
+    use common.{error};
+
+    /// Get a configuration value by key
+    /// Returns none if the key doesn't exist
+    get: func(key: string) -> option<string>;
+
+    /// Get a configuration value, returning error if not found
+    get-required: func(key: string) -> result<string, error>;
+
+    /// Get multiple configuration values at once
+    /// Returns list of (key, value) pairs for keys that exist
+    get-many: func(keys: list<string>) -> list<tuple<string, string>>;
+
+    /// Get all configuration keys with a given prefix
+    /// Example: get-prefix("database.") returns all database.* keys
+    get-prefix: func(prefix: string) -> list<tuple<string, string>>;
+
+    /// Check if a configuration key exists
+    exists: func(key: string) -> bool;
+
+    /// Get a configuration value as a boolean
+    /// Recognizes: "true", "false", "1", "0", "yes", "no"
+    get-bool: func(key: string) -> option<bool>;
+
+    /// Get a configuration value as an integer
+    get-int: func(key: string) -> option<s64>;
+
+    /// Get a configuration value as a float
+    get-float: func(key: string) -> option<f64>;
+}
+
+/// Key-value storage interface for plugin state
+interface keyvalue {
+    use common.{duration};
+
+    /// Error types specific to key-value operations
+    variant kv-error {
+        /// Key not found
+        not-found,
+        /// Value too large
+        value-too-large,
+        /// Storage quota exceeded
+        quota-exceeded,
+        /// Key format invalid
+        invalid-key,
+        /// Generic storage error
+        storage(string),
+    }
+
+    /// Get a value by key
+    get: func(key: string) -> result<option<list<u8>>, kv-error>;
+
+    /// Get a value as a string
+    get-string: func(key: string) -> result<option<string>, kv-error>;
+
+    /// Set a value
+    set: func(key: string, value: list<u8>) -> result<_, kv-error>;
+
+    /// Set a string value
+    set-string: func(key: string, value: string) -> result<_, kv-error>;
+
+    /// Set a value with a TTL (time-to-live) in nanoseconds
+    set-with-ttl: func(key: string, value: list<u8>, ttl: duration) -> result<_, kv-error>;
+
+    /// Delete a key
+    delete: func(key: string) -> result<bool, kv-error>;
+
+    /// Check if a key exists
+    exists: func(key: string) -> bool;
+
+    /// List all keys with a given prefix
+    list-keys: func(prefix: string) -> result<list<string>, kv-error>;
+
+    /// Increment a numeric value atomically
+    /// Returns the new value after increment
+    increment: func(key: string, delta: s64) -> result<s64, kv-error>;
+
+    /// Compare and swap - set value only if current value matches expected
+    /// Returns true if swap succeeded, false if current value didn't match
+    compare-and-swap: func(key: string, expected: option<list<u8>>, new-value: list<u8>) -> result<bool, kv-error>;
+}
+
+/// Logging interface for structured log output
+interface logging {
+    use common.{key-value};
+
+    /// Log severity levels
+    enum level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Emit a log message at the specified level
+    log: func(level: level, message: string);
+
+    /// Emit a structured log with key-value fields
+    log-structured: func(level: level, message: string, fields: list<key-value>);
+
+    /// Convenience methods for each log level
+    trace: func(message: string);
+    debug: func(message: string);
+    info: func(message: string);
+    warn: func(message: string);
+    error: func(message: string);
+
+    /// Check if a log level is enabled (for expensive log construction)
+    is-enabled: func(level: level) -> bool;
+}
+
+/// Secrets interface for accessing sensitive configuration
+interface secrets {
+    use common.{error};
+
+    /// Get a secret by name
+    /// Secrets are write-once by the deployment, read-only by plugins
+    get: func(name: string) -> result<option<string>, error>;
+
+    /// Get a required secret, error if not found
+    get-required: func(name: string) -> result<string, error>;
+
+    /// Check if a secret exists
+    exists: func(name: string) -> bool;
+
+    /// List available secret names (not values)
+    /// Useful for diagnostics without exposing sensitive data
+    list-names: func() -> list<string>;
+}
+
+/// Metrics interface for observability
+interface metrics {
+    use common.{key-value};
+
+    /// Increment a counter metric
+    counter-inc: func(name: string, value: u64);
+
+    /// Increment a counter with labels
+    counter-inc-labeled: func(name: string, value: u64, labels: list<key-value>);
+
+    /// Set a gauge metric to a value
+    gauge-set: func(name: string, value: f64);
+
+    /// Set a gauge with labels
+    gauge-set-labeled: func(name: string, value: f64, labels: list<key-value>);
+
+    /// Add a gauge value (can be negative)
+    gauge-add: func(name: string, delta: f64);
+
+    /// Record a histogram observation
+    histogram-observe: func(name: string, value: f64);
+
+    /// Record a histogram observation with labels
+    histogram-observe-labeled: func(name: string, value: f64, labels: list<key-value>);
+
+    /// Record request duration in nanoseconds
+    /// Convenience method that records to a standard histogram
+    record-duration: func(name: string, duration-ns: u64);
+
+    /// Record request duration with labels
+    record-duration-labeled: func(name: string, duration-ns: u64, labels: list<key-value>);
+}

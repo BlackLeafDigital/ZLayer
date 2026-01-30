@@ -1,0 +1,132 @@
+/// ZLayer Plugin System - Shared Types
+///
+/// Common type definitions used across all ZLayer interfaces.
+/// These types provide a consistent API surface for plugins.
+
+/// Common types shared across all ZLayer interfaces
+interface common {
+    /// A key-value pair for metadata, headers, environment, etc.
+    record key-value {
+        key: string,
+        value: string,
+    }
+
+    /// Timestamp in nanoseconds since Unix epoch
+    type timestamp = u64;
+
+    /// Duration in nanoseconds
+    type duration = u64;
+
+    /// Generic error with code and message
+    record error {
+        code: string,
+        message: string,
+    }
+}
+
+/// Plugin metadata types
+interface plugin-metadata {
+    use common.{key-value};
+
+    /// Plugin version following semver
+    record version {
+        major: u32,
+        minor: u32,
+        patch: u32,
+        pre-release: option<string>,
+    }
+
+    /// Plugin information returned by info()
+    record plugin-info {
+        /// Unique plugin identifier (e.g., "zlayer:auth-jwt")
+        id: string,
+        /// Human-readable name
+        name: string,
+        /// Plugin version
+        version: version,
+        /// Brief description of plugin functionality
+        description: string,
+        /// Plugin author or organization
+        author: string,
+        /// License identifier (e.g., "MIT", "Apache-2.0")
+        license: option<string>,
+        /// Homepage or repository URL
+        homepage: option<string>,
+        /// Additional metadata as key-value pairs
+        metadata: list<key-value>,
+    }
+
+    /// Plugin capabilities that can be requested
+    flags capabilities {
+        /// Access to configuration values
+        config,
+        /// Access to key-value storage
+        keyvalue,
+        /// Ability to emit logs
+        logging,
+        /// Access to secrets management
+        secrets,
+        /// Ability to emit metrics
+        metrics,
+        /// Ability to make HTTP requests
+        http-client,
+    }
+}
+
+/// Request and response types for plugin handlers
+interface request-types {
+    use common.{key-value, timestamp};
+
+    /// HTTP method enum
+    enum http-method {
+        get,
+        post,
+        put,
+        delete,
+        patch,
+        head,
+        options,
+        connect,
+        trace,
+    }
+
+    /// Incoming request to be processed by a plugin
+    record plugin-request {
+        /// Unique request identifier for tracing
+        request-id: string,
+        /// Request path (e.g., "/api/users/123")
+        path: string,
+        /// HTTP method
+        method: http-method,
+        /// Query string (without leading ?)
+        query: option<string>,
+        /// Request headers
+        headers: list<key-value>,
+        /// Request body as bytes (empty for GET/HEAD)
+        body: list<u8>,
+        /// Request timestamp
+        timestamp: timestamp,
+        /// Additional context from the host
+        context: list<key-value>,
+    }
+
+    /// Plugin response returned to the host
+    record plugin-response {
+        /// HTTP status code (200, 404, 500, etc.)
+        status: u16,
+        /// Response headers
+        headers: list<key-value>,
+        /// Response body
+        body: list<u8>,
+    }
+
+    /// Result of handling a request
+    variant handle-result {
+        /// Successfully handled, return response
+        response(plugin-response),
+        /// Plugin declined to handle, pass to next handler
+        pass-through,
+        /// Plugin encountered an error
+        error(string),
+    }
+}

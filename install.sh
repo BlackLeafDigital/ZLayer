@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ZLayer Installer
-# Usage: curl -fsSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | bash
+# Usage: curl -fsSL https://zlayer.dev/install.sh | bash
 
 REPO="BlackLeafDigital/ZLayer"
 BINARY_NAME="zlayer"

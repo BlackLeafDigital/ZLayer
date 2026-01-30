@@ -1,0 +1,85 @@
+[package]
+name = "zlayer-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Container runtime agent using libcontainer/youki"
+keywords = ["container", "runtime", "youki", "libcontainer", "orchestration"]
+categories = ["os", "virtualization"]
+readme = "README.md"
+
+[features]
+default = []
+docker = ["bollard"]
+wasm = [
+    "dep:wasmtime",
+    "dep:wasmtime-wasi",
+    "dep:wasmtime-wasi-http",
+    "dep:bytes",
+    "dep:http",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:anyhow",
+]
+s3 = ["zlayer-init-actions/s3", "zlayer-registry/s3"]
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+cron.workspace = true
+zlayer-init-actions = { version = "0.1.0", path = "../zlayer-init-actions" }
+libc.workspace = true
+nix.workspace = true
+oci-spec.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+serde_json.workspace = true
+serde_yaml.workspace = true
+zlayer-secrets = { version = "0.1.0", path = "../zlayer-secrets" }
+zlayer-spec = { version = "0.1.0", path = "../zlayer-spec" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+zlayer-core = { version = "0.1.0", path = "../zlayer-core" }
+zlayer-proxy = { version = "0.1.0", path = "../zlayer-proxy" }
+libcontainer = "0.5"
+zlayer-registry = { version = "0.1.0", path = "../zlayer-registry", features = ["persistent"] }
+zlayer-overlay = { version = "0.1.0", path = "../zlayer-overlay" }
+ipnetwork = "0.21.1"
+num_cpus.workspace = true
+zlayer-scheduler = { version = "0.1.0", path = "../zlayer-scheduler" }
+ulid = "1.2.1"
+
+# Docker runtime support (optional)
+# Features:
+# - ssl: TLS support for secure connections
+# - time: Timestamp support
+# - pipe: Unix socket/Windows named pipe support (required for connect_with_local_defaults)
+# - http: HTTP transport support
+bollard = { version = "0.20", default-features = false, features = ["ssl", "time", "pipe", "http"], optional = true }
+
+# Streaming utilities (needed for Docker streaming)
+futures-util.workspace = true
+
+# WebAssembly runtime support (optional)
+# Features:
+# - async: Tokio integration for async execution
+# - cranelift: JIT compilation backend
+# - component-model: WASIp2 component model support
+wasmtime = { version = "41", default-features = false, features = ["async", "cranelift", "component-model"], optional = true }
+wasmtime-wasi = { version = "41", optional = true }
+wasmtime-wasi-http = { version = "41", optional = true }
+
+# HTTP types for WASM HTTP handler support (enabled with wasm feature)
+bytes = { version = "1", optional = true }
+http = { version = "1", optional = true }
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1", optional = true }
+anyhow = { version = "1", optional = true }
+
+[dev-dependencies]
+rand = "0.9"
+tempfile = "3.24.0"
+wat = "1.244.0"

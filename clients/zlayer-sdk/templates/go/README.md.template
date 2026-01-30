@@ -1,0 +1,98 @@
+# {{name}}
+
+{{description}}
+
+## Prerequisites
+
+- [TinyGo](https://tinygo.org/getting-started/install/) (0.32.0 or later recommended)
+- [wit-bindgen-go](https://github.com/bytecodealliance/wit-bindgen) for WIT bindings generation
+
+### Installing TinyGo
+
+```bash
+# macOS
+brew install tinygo
+
+# Linux (Ubuntu/Debian)
+wget https://github.com/tinygo-org/tinygo/releases/download/v0.32.0/tinygo_0.32.0_amd64.deb
+sudo dpkg -i tinygo_0.32.0_amd64.deb
+
+# Verify installation
+tinygo version
+```
+
+### Installing wit-bindgen-go
+
+```bash
+go install go.bytecodealliance.org/cmd/wit-bindgen-go@latest
+```
+
+## Building
+
+```bash
+# Generate WIT bindings and build the WASM module
+make build
+
+# Or manually:
+wit-bindgen-go generate --world zlayer-plugin --out gen ../wit/zlayer
+tinygo build -target=wasip2 -scheduler=none -gc=leaking -o {{name}}.wasm .
+```
+
+## Build Output
+
+After building, you will have a `{{name}}.wasm` file that can be loaded by ZLayer.
+
+## Project Structure
+
+```
+{{name}}/
+├── main.go          # Plugin implementation
+├── go.mod           # Go module definition
+├── Makefile         # Build automation
+├── gen/             # Generated WIT bindings (created by make generate)
+└── {{name}}.wasm    # Compiled WASM module (created by make build)
+```
+
+## Development
+
+### Plugin Interface
+
+Your plugin must implement these methods:
+
+- `Init()` - Called when the plugin is loaded
+- `Info()` - Returns plugin metadata
+- `Handle(eventType string, payload []byte)` - Processes incoming events
+- `Shutdown()` - Called when the plugin is unloaded
+
+### Logging
+
+Use the ZLayer SDK logging functions:
+
+```go
+zlayer.LogInfo("Information message")
+zlayer.LogInfof("Formatted message: %s", value)
+zlayer.LogError("Error message")
+zlayer.LogDebug("Debug message")
+```
+
+### TinyGo Considerations
+
+When developing with TinyGo for WASM, keep in mind:
+
+- Not all standard library packages are supported
+- Reflection has limited support
+- Some third-party packages may not compile
+- Use `-gc=leaking` for smaller binaries (memory is not reclaimed)
+- Use `-scheduler=none` when goroutines are not needed
+
+## Cleaning
+
+```bash
+make clean
+```
+
+This removes the compiled WASM file and generated bindings.
+
+## Version
+
+{{version}}
