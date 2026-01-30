@@ -205,7 +205,12 @@ pub struct ServiceSpec {
     #[validate(nested)]
     pub resources: ResourcesSpec,
 
-    /// Environment variables
+    /// Environment variables for the service
+    ///
+    /// Values can be:
+    /// - Plain strings: `"value"`
+    /// - Host env refs: `$E:VAR_NAME`
+    /// - Secret refs: `$S:secret-name` or `$S:@service/secret-name`
     #[serde(default)]
     pub env: HashMap<String, String>,
 

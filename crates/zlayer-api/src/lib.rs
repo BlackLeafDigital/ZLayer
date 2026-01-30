@@ -39,8 +39,9 @@ pub use ratelimit::{
 };
 pub use router::{
     build_internal_routes, build_router, build_router_full, build_router_with_builds,
-    build_router_with_internal, build_router_with_jobs, build_router_with_services,
-    build_router_with_storage,
+    build_router_with_internal, build_router_with_internal_and_secrets, build_router_with_jobs,
+    build_router_with_secrets, build_router_with_services, build_router_with_services_and_secrets,
+    build_router_with_storage, build_secrets_routes,
 };
 pub use server::ApiServer;
 
@@ -52,6 +53,7 @@ pub use handlers::internal::{
     InternalScaleRequest, InternalScaleResponse, InternalState, INTERNAL_AUTH_HEADER,
 };
 pub use handlers::jobs::JobState;
+pub use handlers::secrets::{CreateSecretRequest, SecretMetadataResponse, SecretsState};
 pub use handlers::services::ServiceState;
 
 // Re-export storage types

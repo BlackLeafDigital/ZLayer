@@ -19,6 +19,7 @@ use crate::handlers::cron::CronState;
 use crate::handlers::deployments::DeploymentState;
 use crate::handlers::internal::InternalState;
 use crate::handlers::jobs::JobState;
+use crate::handlers::secrets::SecretsState;
 use crate::handlers::services::ServiceState;
 use crate::openapi::ApiDoc;
 use crate::ratelimit::{rate_limit_middleware, IpRateLimiter, RateLimitState};
@@ -26,6 +27,7 @@ use crate::storage::{DeploymentStorage, InMemoryStorage};
 
 use crate::handlers::build::{build_routes, BuildState};
 use zlayer_agent::{CronScheduler, JobExecutor, ServiceManager};
+use zlayer_secrets::SecretsStore;
 
 /// Build the API router with default in-memory storage
 pub fn build_router(config: &ApiConfig) -> Router {
@@ -414,6 +416,128 @@ pub fn build_router_with_internal(
 
     // Merge internal routes
     base_router.nest("/api/v1/internal", internal_routes)
+}
+
+/// Build routes for secrets management
+///
+/// Creates the routes for CRUD operations on secrets. These routes require
+/// authentication and use the user's ID as the scope for secrets.
+///
+/// # Arguments
+/// * `secrets_state` - State containing the secrets store
+///
+/// # Returns
+/// A Router with the secrets endpoints
+pub fn build_secrets_routes(secrets_state: SecretsState) -> Router<()> {
+    Router::new()
+        .route("/", post(handlers::secrets::create_secret))
+        .route("/", get(handlers::secrets::list_secrets))
+        .route("/{name}", get(handlers::secrets::get_secret_metadata))
+        .route("/{name}", delete(handlers::secrets::delete_secret))
+        .with_state(secrets_state)
+}
+
+/// Build the API router with secrets management capabilities
+///
+/// This extends the basic router with endpoints for secrets management.
+/// Secrets are scoped to the authenticated user's ID.
+///
+/// # Arguments
+/// * `config` - API configuration
+/// * `storage` - Deployment storage backend
+/// * `secrets_store` - Secrets store for CRUD operations
+///
+/// # Example
+///
+/// ```no_run
+/// use zlayer_api::{ApiConfig, build_router_with_secrets};
+/// use zlayer_api::storage::InMemoryStorage;
+/// use zlayer_secrets::PersistentSecretsStore;
+/// use std::sync::Arc;
+///
+/// # async fn example() -> anyhow::Result<()> {
+/// let config = ApiConfig::default();
+/// let storage = Arc::new(InMemoryStorage::new());
+/// // let secrets_store = Arc::new(PersistentSecretsStore::open(...)?);
+/// // let router = build_router_with_secrets(&config, storage, secrets_store);
+/// # Ok(())
+/// # }
+/// ```
+pub fn build_router_with_secrets(
+    config: &ApiConfig,
+    storage: Arc<dyn DeploymentStorage + Send + Sync>,
+    secrets_store: Arc<dyn SecretsStore + Send + Sync>,
+) -> Router {
+    // Start with the basic router with storage
+    let base_router = build_router_with_storage(config, storage);
+
+    // Create secrets state
+    let secrets_state = SecretsState::new(secrets_store);
+
+    // Build secrets routes
+    let secrets_routes = build_secrets_routes(secrets_state);
+
+    // Merge secrets routes into API v1
+    base_router.nest("/api/v1/secrets", secrets_routes)
+}
+
+/// Build the API router with services and secrets capabilities
+///
+/// This extends the services router with endpoints for secrets management.
+///
+/// # Arguments
+/// * `config` - API configuration
+/// * `storage` - Deployment storage backend
+/// * `service_manager` - ServiceManager for container lifecycle operations
+/// * `secrets_store` - Secrets store for CRUD operations
+pub fn build_router_with_services_and_secrets(
+    config: &ApiConfig,
+    storage: Arc<dyn DeploymentStorage + Send + Sync>,
+    service_manager: Arc<RwLock<ServiceManager>>,
+    secrets_store: Arc<dyn SecretsStore + Send + Sync>,
+) -> Router {
+    // Start with the services router
+    let base_router = build_router_with_services(config, storage, service_manager);
+
+    // Create secrets state
+    let secrets_state = SecretsState::new(secrets_store);
+
+    // Build secrets routes
+    let secrets_routes = build_secrets_routes(secrets_state);
+
+    // Merge secrets routes into API v1
+    base_router.nest("/api/v1/secrets", secrets_routes)
+}
+
+/// Build the API router with internal and secrets capabilities
+///
+/// This extends the internal router with endpoints for secrets management.
+/// Includes all features: services, internal scheduler endpoints, and secrets.
+///
+/// # Arguments
+/// * `config` - API configuration
+/// * `storage` - Deployment storage backend
+/// * `service_manager` - ServiceManager for container lifecycle operations
+/// * `internal_token` - Shared secret for authenticating internal API calls
+/// * `secrets_store` - Secrets store for CRUD operations
+pub fn build_router_with_internal_and_secrets(
+    config: &ApiConfig,
+    storage: Arc<dyn DeploymentStorage + Send + Sync>,
+    service_manager: Arc<RwLock<ServiceManager>>,
+    internal_token: String,
+    secrets_store: Arc<dyn SecretsStore + Send + Sync>,
+) -> Router {
+    // Start with the internal router
+    let base_router = build_router_with_internal(config, storage, service_manager, internal_token);
+
+    // Create secrets state
+    let secrets_state = SecretsState::new(secrets_store);
+
+    // Build secrets routes
+    let secrets_routes = build_secrets_routes(secrets_state);
+
+    // Merge secrets routes into API v1
+    base_router.nest("/api/v1/secrets", secrets_routes)
 }
 
 fn build_cors_layer(config: &ApiConfig) -> CorsLayer {

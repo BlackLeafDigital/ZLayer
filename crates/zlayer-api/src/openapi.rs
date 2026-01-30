@@ -11,6 +11,7 @@ use crate::handlers::build::{
 };
 use crate::handlers::deployments::{CreateDeploymentRequest, DeploymentDetails, DeploymentSummary};
 use crate::handlers::health::HealthResponse;
+use crate::handlers::secrets::{CreateSecretRequest, SecretMetadataResponse};
 use crate::handlers::services::{
     ScaleRequest, ServiceDetails, ServiceEndpoint, ServiceMetrics, ServiceSummary,
 };
@@ -31,6 +32,9 @@ use crate::handlers::deployments::{
 };
 use crate::handlers::health::{__path_liveness, __path_readiness};
 use crate::handlers::internal::{__path_get_replicas_internal, __path_scale_service_internal};
+use crate::handlers::secrets::{
+    __path_create_secret, __path_delete_secret, __path_get_secret_metadata, __path_list_secrets,
+};
 use crate::handlers::services::{
     __path_get_service, __path_get_service_logs, __path_list_services, __path_scale_service,
 };
@@ -94,6 +98,11 @@ impl Modify for SecurityAddon {
         // Internal (scheduler-to-agent)
         scale_service_internal,
         get_replicas_internal,
+        // Secrets
+        create_secret,
+        list_secrets,
+        get_secret_metadata,
+        delete_secret,
     ),
     components(
         schemas(
@@ -118,6 +127,9 @@ impl Modify for SecurityAddon {
             // Internal schemas
             InternalScaleRequest,
             InternalScaleResponse,
+            // Secrets schemas
+            CreateSecretRequest,
+            SecretMetadataResponse,
         )
     ),
     modifiers(&SecurityAddon),
@@ -128,6 +140,7 @@ impl Modify for SecurityAddon {
         (name = "Services", description = "Service management"),
         (name = "Build", description = "Container image building"),
         (name = "Internal", description = "Internal scheduler-to-agent communication"),
+        (name = "Secrets", description = "Secrets management"),
     )
 )]
 pub struct ApiDoc;

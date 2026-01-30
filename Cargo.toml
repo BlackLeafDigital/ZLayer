@@ -16,6 +16,7 @@ members = [
   "crates/zlayer-storage",
   "crates/zlayer-py",
   "crates/zlayer-web",
+  "crates/zlayer-secrets",
   "bin/runtime",
 ]
 

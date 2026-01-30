@@ -160,6 +160,145 @@ pub fn validate_schedule_wrapper(schedule: &String) -> Result<(), validator::Val
     })
 }
 
+/// Validate a secret reference name format
+///
+/// Secret names must:
+/// - Start with a letter (a-z, A-Z)
+/// - Contain only alphanumeric characters, hyphens, and underscores
+/// - Optionally be prefixed with `@service/` for cross-service references
+///
+/// Examples of valid secret refs:
+/// - `$S:my-secret`
+/// - `$S:api_key`
+/// - `$S:@auth-service/jwt-secret`
+pub fn validate_secret_reference(value: &str) -> Result<(), validator::ValidationError> {
+    // Only validate values that start with $S:
+    if !value.starts_with("$S:") {
+        return Ok(());
+    }
+
+    let secret_ref = &value[3..]; // Remove "$S:" prefix
+
+    if secret_ref.is_empty() {
+        return Err(make_validation_error(
+            "invalid_secret_reference",
+            "secret reference cannot be empty after $S:",
+        ));
+    }
+
+    // Check for cross-service reference format: @service/secret-name
+    let secret_name = if let Some(rest) = secret_ref.strip_prefix('@') {
+        // Cross-service reference: @service/secret-name
+        let parts: Vec<&str> = rest.splitn(2, '/').collect();
+        if parts.len() != 2 {
+            return Err(make_validation_error(
+                "invalid_secret_reference",
+                format!(
+                    "cross-service secret reference '{}' must have format @service/secret-name",
+                    value
+                ),
+            ));
+        }
+
+        let service_name = parts[0];
+        let secret_name = parts[1];
+
+        // Validate service name part
+        if service_name.is_empty() {
+            return Err(make_validation_error(
+                "invalid_secret_reference",
+                format!(
+                    "service name in secret reference '{}' cannot be empty",
+                    value
+                ),
+            ));
+        }
+
+        if !service_name.chars().next().unwrap().is_ascii_alphabetic() {
+            return Err(make_validation_error(
+                "invalid_secret_reference",
+                format!(
+                    "service name in secret reference '{}' must start with a letter",
+                    value
+                ),
+            ));
+        }
+
+        for c in service_name.chars() {
+            if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
+                return Err(make_validation_error(
+                    "invalid_secret_reference",
+                    format!(
+                        "service name in secret reference '{}' contains invalid character '{}'",
+                        value, c
+                    ),
+                ));
+            }
+        }
+
+        secret_name
+    } else {
+        secret_ref
+    };
+
+    // Validate the secret name
+    if secret_name.is_empty() {
+        return Err(make_validation_error(
+            "invalid_secret_reference",
+            format!("secret name in '{}' cannot be empty", value),
+        ));
+    }
+
+    // Must start with a letter
+    let first_char = secret_name.chars().next().unwrap();
+    if !first_char.is_ascii_alphabetic() {
+        return Err(make_validation_error(
+            "invalid_secret_reference",
+            format!(
+                "secret name in '{}' must start with a letter, found '{}'",
+                value, first_char
+            ),
+        ));
+    }
+
+    // All characters must be alphanumeric, hyphen, or underscore
+    for c in secret_name.chars() {
+        if !c.is_ascii_alphanumeric() && c != '-' && c != '_' {
+            return Err(make_validation_error(
+                "invalid_secret_reference",
+                format!(
+                    "secret name in '{}' contains invalid character '{}' (only alphanumeric, hyphens, underscores allowed)",
+                    value, c
+                ),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate all environment variable values in a service spec
+pub fn validate_env_vars(
+    service_name: &str,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<(), crate::error::ValidationError> {
+    for (key, value) in env {
+        if let Err(e) = validate_secret_reference(value) {
+            return Err(crate::error::ValidationError {
+                kind: crate::error::ValidationErrorKind::InvalidEnvVar {
+                    key: key.clone(),
+                    reason: e
+                        .message
+                        .map(|m| m.to_string())
+                        .unwrap_or_else(|| "invalid secret reference".to_string()),
+                },
+                path: format!("services.{}.env.{}", service_name, key),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Validate storage name format (lowercase alphanumeric with hyphens)
 pub fn validate_storage_name(name: &str) -> Result<(), validator::ValidationError> {
     // Must be lowercase alphanumeric with hyphens, not starting/ending with hyphen
@@ -703,5 +842,66 @@ mod tests {
         assert!(validate_schedule_wrapper(&"0 0 * * *".to_string()).is_err()); // 5-field (standard unix cron) not supported
         assert!(validate_schedule_wrapper(&"60 0 0 * * * *".to_string()).is_err());
         // Invalid second (60)
+    }
+
+    // Secret reference validation tests
+    #[test]
+    fn test_validate_secret_reference_plain_values() {
+        // Plain values should pass (not secret refs)
+        assert!(validate_secret_reference("my-value").is_ok());
+        assert!(validate_secret_reference("").is_ok());
+        assert!(validate_secret_reference("some string").is_ok());
+        assert!(validate_secret_reference("$E:MY_VAR").is_ok()); // Host env ref, not secret
+    }
+
+    #[test]
+    fn test_validate_secret_reference_valid() {
+        // Valid secret references
+        assert!(validate_secret_reference("$S:my-secret").is_ok());
+        assert!(validate_secret_reference("$S:api_key").is_ok());
+        assert!(validate_secret_reference("$S:MySecret123").is_ok());
+        assert!(validate_secret_reference("$S:a").is_ok()); // Single letter is valid
+    }
+
+    #[test]
+    fn test_validate_secret_reference_cross_service() {
+        // Valid cross-service references
+        assert!(validate_secret_reference("$S:@auth-service/jwt-secret").is_ok());
+        assert!(validate_secret_reference("$S:@my_service/api_key").is_ok());
+        assert!(validate_secret_reference("$S:@svc/secret").is_ok());
+    }
+
+    #[test]
+    fn test_validate_secret_reference_empty_after_prefix() {
+        // Empty after $S:
+        assert!(validate_secret_reference("$S:").is_err());
+    }
+
+    #[test]
+    fn test_validate_secret_reference_must_start_with_letter() {
+        // Secret name must start with letter
+        assert!(validate_secret_reference("$S:123-secret").is_err());
+        assert!(validate_secret_reference("$S:-my-secret").is_err());
+        assert!(validate_secret_reference("$S:_underscore").is_err());
+    }
+
+    #[test]
+    fn test_validate_secret_reference_invalid_chars() {
+        // Invalid characters in secret name
+        assert!(validate_secret_reference("$S:my.secret").is_err());
+        assert!(validate_secret_reference("$S:my secret").is_err());
+        assert!(validate_secret_reference("$S:my@secret").is_err());
+    }
+
+    #[test]
+    fn test_validate_secret_reference_cross_service_invalid() {
+        // Missing slash in cross-service ref
+        assert!(validate_secret_reference("$S:@service").is_err());
+        // Empty service name
+        assert!(validate_secret_reference("$S:@/secret").is_err());
+        // Empty secret name
+        assert!(validate_secret_reference("$S:@service/").is_err());
+        // Service name must start with letter
+        assert!(validate_secret_reference("$S:@123-service/secret").is_err());
     }
 }

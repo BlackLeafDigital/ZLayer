@@ -89,8 +89,8 @@ pub enum ValidationErrorKind {
     /// Scale targets are empty in adaptive mode
     EmptyScaleTargets,
 
-    /// Invalid environment variable name
-    InvalidEnvVar { name: String },
+    /// Invalid environment variable
+    InvalidEnvVar { key: String, reason: String },
 
     /// Invalid cron schedule expression
     InvalidCronSchedule { schedule: String, reason: String },
@@ -144,8 +144,8 @@ impl fmt::Display for ValidationErrorKind {
                 write!(f, "invalid scale range: min {} > max {}", min, max)
             }
             Self::EmptyScaleTargets => write!(f, "scale targets are empty in adaptive mode"),
-            Self::InvalidEnvVar { name } => {
-                write!(f, "invalid environment variable name '{}'", name)
+            Self::InvalidEnvVar { key, reason } => {
+                write!(f, "invalid environment variable '{}': {}", key, reason)
             }
             Self::InvalidCronSchedule { schedule, reason } => {
                 write!(f, "invalid cron schedule '{}': {}", schedule, reason)

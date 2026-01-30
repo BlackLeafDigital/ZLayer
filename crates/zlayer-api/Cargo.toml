@@ -17,6 +17,7 @@ zlayer-builder = { path = "../zlayer-builder" }
 zlayer-spec = { path = "../zlayer-spec" }
 zlayer-scheduler = { path = "../zlayer-scheduler" }
 zlayer-observability = { path = "../zlayer-observability" }
+zlayer-secrets = { path = "../zlayer-secrets" }
 
 # Web framework
 axum.workspace = true

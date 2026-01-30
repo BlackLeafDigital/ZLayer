@@ -29,6 +29,7 @@ tracing.workspace = true
 zstd = "0.13.3"
 
 [dev-dependencies]
+serial_test = "3"
 tempfile = "3.24.0"
 
 [features]

@@ -214,6 +214,44 @@ impl CacheType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::env;
+
+    /// Environment variable names used by cache configuration
+    const ENV_CACHE_TYPE: &str = "ZLAYER_CACHE_TYPE";
+    const ENV_CACHE_DIR: &str = "ZLAYER_CACHE_DIR";
+    const ENV_S3_BUCKET: &str = "ZLAYER_S3_BUCKET";
+    const ENV_S3_REGION: &str = "ZLAYER_S3_REGION";
+    const ENV_S3_ENDPOINT: &str = "ZLAYER_S3_ENDPOINT";
+    const ENV_S3_PREFIX: &str = "ZLAYER_S3_PREFIX";
+    const ENV_S3_PATH_STYLE: &str = "ZLAYER_S3_PATH_STYLE";
+
+    /// Guard that clears environment variables on drop to ensure test isolation.
+    struct EnvGuard;
+
+    impl EnvGuard {
+        fn new() -> Self {
+            // Clear any existing env vars at test start
+            Self::clear_all();
+            Self
+        }
+
+        fn clear_all() {
+            env::remove_var(ENV_CACHE_TYPE);
+            env::remove_var(ENV_CACHE_DIR);
+            env::remove_var(ENV_S3_BUCKET);
+            env::remove_var(ENV_S3_REGION);
+            env::remove_var(ENV_S3_ENDPOINT);
+            env::remove_var(ENV_S3_PREFIX);
+            env::remove_var(ENV_S3_PATH_STYLE);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            Self::clear_all();
+        }
+    }
 
     #[test]
     fn test_default_cache_type() {
@@ -255,50 +293,51 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_from_env_memory() {
-        // Set environment variable
-        std::env::set_var("ZLAYER_CACHE_TYPE", "memory");
+        let _guard = EnvGuard::new();
+
+        env::set_var(ENV_CACHE_TYPE, "memory");
 
         let cache = CacheType::from_env().unwrap();
         assert!(cache.is_memory());
-
-        // Clean up
-        std::env::remove_var("ZLAYER_CACHE_TYPE");
     }
 
     #[test]
+    #[serial]
     fn test_from_env_unknown_type() {
-        std::env::set_var("ZLAYER_CACHE_TYPE", "invalid");
+        let _guard = EnvGuard::new();
+
+        env::set_var(ENV_CACHE_TYPE, "invalid");
 
         let result = CacheType::from_env();
         assert!(result.is_err());
-
-        // Clean up
-        std::env::remove_var("ZLAYER_CACHE_TYPE");
     }
 
     #[cfg(feature = "s3")]
     #[test]
+    #[serial]
     fn test_from_env_s3_missing_bucket() {
-        std::env::set_var("ZLAYER_CACHE_TYPE", "s3");
-        std::env::remove_var("ZLAYER_S3_BUCKET");
+        let _guard = EnvGuard::new();
+
+        env::set_var(ENV_CACHE_TYPE, "s3");
 
         let result = CacheType::from_env();
         assert!(result.is_err());
-
-        // Clean up
-        std::env::remove_var("ZLAYER_CACHE_TYPE");
     }
 
     #[cfg(feature = "s3")]
     #[test]
+    #[serial]
     fn test_from_env_s3_with_all_options() {
-        std::env::set_var("ZLAYER_CACHE_TYPE", "s3");
-        std::env::set_var("ZLAYER_S3_BUCKET", "my-bucket");
-        std::env::set_var("ZLAYER_S3_REGION", "us-west-2");
-        std::env::set_var("ZLAYER_S3_ENDPOINT", "https://s3.example.com");
-        std::env::set_var("ZLAYER_S3_PREFIX", "custom/prefix/");
-        std::env::set_var("ZLAYER_S3_PATH_STYLE", "true");
+        let _guard = EnvGuard::new();
+
+        env::set_var(ENV_CACHE_TYPE, "s3");
+        env::set_var(ENV_S3_BUCKET, "my-bucket");
+        env::set_var(ENV_S3_REGION, "us-west-2");
+        env::set_var(ENV_S3_ENDPOINT, "https://s3.example.com");
+        env::set_var(ENV_S3_PREFIX, "custom/prefix/");
+        env::set_var(ENV_S3_PATH_STYLE, "true");
 
         let cache = CacheType::from_env().unwrap();
         if let CacheType::S3(config) = cache {
@@ -310,14 +349,6 @@ mod tests {
         } else {
             panic!("expected S3 variant");
         }
-
-        // Clean up
-        std::env::remove_var("ZLAYER_CACHE_TYPE");
-        std::env::remove_var("ZLAYER_S3_BUCKET");
-        std::env::remove_var("ZLAYER_S3_REGION");
-        std::env::remove_var("ZLAYER_S3_ENDPOINT");
-        std::env::remove_var("ZLAYER_S3_PREFIX");
-        std::env::remove_var("ZLAYER_S3_PATH_STYLE");
     }
 
     #[tokio::test]
