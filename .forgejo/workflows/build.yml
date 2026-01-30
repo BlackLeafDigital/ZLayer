@@ -48,7 +48,7 @@ jobs:
       - name: Package
         run: tar czf "zlayer-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: zlayer-linux-amd64
           path: zlayer-linux-amd64.tar.gz
@@ -80,7 +80,7 @@ jobs:
       - name: Package
         run: tar czf "zlayer-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: zlayer-linux-arm64
           path: zlayer-linux-arm64.tar.gz
@@ -108,7 +108,7 @@ jobs:
       - name: Package
         run: tar czf "zlayer-darwin-amd64.tar.gz" -C $CARGO_TARGET_DIR/x86_64-apple-darwin/release zlayer
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: zlayer-darwin-amd64
           path: zlayer-darwin-amd64.tar.gz
@@ -136,7 +136,7 @@ jobs:
       - name: Package
         run: tar czf "zlayer-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v3
         with:
           name: zlayer-darwin-arm64
           path: zlayer-darwin-arm64.tar.gz
