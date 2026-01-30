@@ -44,13 +44,16 @@ tracing.workspace = true
 uuid.workspace = true
 zlayer-core = { version = "0.1.0", path = "../zlayer-core" }
 zlayer-proxy = { version = "0.1.0", path = "../zlayer-proxy" }
-libcontainer = "0.5"
 zlayer-registry = { version = "0.1.0", path = "../zlayer-registry", features = ["persistent"] }
 zlayer-overlay = { version = "0.1.0", path = "../zlayer-overlay" }
 ipnetwork = "0.21.1"
 num_cpus.workspace = true
 zlayer-scheduler = { version = "0.1.0", path = "../zlayer-scheduler" }
 ulid = "1.2.1"
+
+# Linux-specific dependencies for native container runtime (youki/libcontainer)
+[target.'cfg(target_os = "linux")'.dependencies]
+libcontainer = "0.5"
 
 # Docker runtime support (optional)
 # Features:

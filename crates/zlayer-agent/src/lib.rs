@@ -42,9 +42,11 @@ pub use metrics_providers::{RuntimeStatsProvider, ServiceManagerContainerProvide
 pub use overlay_manager::OverlayManager;
 pub use proxy_manager::{ProxyManager, ProxyManagerConfig};
 pub use runtime::*;
-pub use runtimes::{
-    create_runtime_for_image, detect_image_artifact_type, YoukiConfig, YoukiRuntime,
-};
+pub use runtimes::{create_runtime_for_image, detect_image_artifact_type};
+
+// Youki runtime types are only available on Linux
+#[cfg(target_os = "linux")]
+pub use runtimes::{YoukiConfig, YoukiRuntime};
 
 #[cfg(feature = "docker")]
 pub use runtimes::DockerRuntime;
@@ -69,7 +71,8 @@ pub enum RuntimeConfig {
     Auto,
     /// Use the mock runtime for testing and development
     Mock,
-    /// Use youki/libcontainer as the container runtime
+    /// Use youki/libcontainer as the container runtime (Linux only)
+    #[cfg(target_os = "linux")]
     Youki(YoukiConfig),
     /// Use Docker daemon as the container runtime (cross-platform)
     #[cfg(feature = "docker")]
@@ -85,20 +88,15 @@ impl Default for RuntimeConfig {
     }
 }
 
-/// Check if the youki binary is available on the system
+/// Check if the youki binary is available on the system (Linux only)
 ///
 /// Youki is only available on Linux. This function checks:
-/// 1. If we're on Linux
-/// 2. If the youki binary exists in common locations or PATH
+/// 1. If the youki binary exists in common locations or PATH
 ///
 /// # Returns
 /// `true` if youki is available, `false` otherwise
+#[cfg(target_os = "linux")]
 pub fn is_youki_available() -> bool {
-    // Youki is Linux-only
-    if !cfg!(target_os = "linux") {
-        return false;
-    }
-
     // Check common locations for youki binary
     let common_paths = [
         "/usr/local/bin/youki",
@@ -125,6 +123,12 @@ pub fn is_youki_available() -> bool {
             false
         }
     }
+}
+
+/// Check if the youki binary is available (stub for non-Linux platforms)
+#[cfg(not(target_os = "linux"))]
+pub fn is_youki_available() -> bool {
+    false
 }
 
 /// Check if Docker daemon is available and responsive
@@ -230,6 +234,7 @@ pub async fn create_runtime(config: RuntimeConfig) -> Result<Arc<dyn Runtime + S
     match config {
         RuntimeConfig::Auto => create_auto_runtime().await,
         RuntimeConfig::Mock => Ok(Arc::new(MockRuntime::new())),
+        #[cfg(target_os = "linux")]
         RuntimeConfig::Youki(youki_config) => {
             let runtime = YoukiRuntime::new(youki_config).await?;
             Ok(Arc::new(runtime))

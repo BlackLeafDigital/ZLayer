@@ -97,7 +97,8 @@ metrics-exporter-prometheus = "0.18"
 
 # OCI
 oci-spec = "0.8"
-oci-client = "0.15"
+# Use rustls instead of native-tls to avoid OpenSSL cross-compilation issues
+oci-client = { version = "0.15", default-features = false, features = ["rustls-tls-native-roots"] }
 
 # Async traits
 async-trait = "0.1"

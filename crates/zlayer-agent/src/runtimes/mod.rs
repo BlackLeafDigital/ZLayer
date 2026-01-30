@@ -5,6 +5,7 @@
 //!
 //! - **youki**: Linux-native container runtime using libcontainer. Preferred on Linux
 //!   for its performance (no daemon overhead) and tight integration with the kernel.
+//!   Only available on Linux targets.
 //! - **docker**: Cross-platform runtime using Docker daemon. Works on Linux, Windows,
 //!   and macOS. Requires Docker Desktop or Docker daemon to be running.
 //! - **wasm**: WebAssembly runtime using wasmtime for executing WASM workloads with
@@ -67,6 +68,11 @@
 //! - `docker`: Enables the Docker runtime (uses bollard crate)
 //! - `wasm`: Enables the WebAssembly runtime (uses wasmtime crate)
 //!
+//! # Platform Support
+//!
+//! - The youki runtime (using libcontainer) is only available on Linux targets.
+//!   On non-Linux platforms, use Docker or WASM runtimes.
+//!
 //! # Examples
 //!
 //! ```no_run
@@ -89,6 +95,9 @@
 //! # }
 //! ```
 
+// Youki runtime is Linux-only as it depends on libcontainer which uses
+// Linux-specific APIs (cgroups, namespaces, procfs)
+#[cfg(target_os = "linux")]
 mod youki;
 
 #[cfg(feature = "docker")]
@@ -109,6 +118,7 @@ mod wasm_http_interfaces;
 #[cfg(feature = "wasm")]
 pub mod wasm_test;
 
+#[cfg(target_os = "linux")]
 pub use youki::{YoukiConfig, YoukiRuntime};
 
 #[cfg(feature = "docker")]
