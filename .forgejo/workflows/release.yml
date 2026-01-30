@@ -106,21 +106,41 @@ jobs:
           fi
 
   # ===========================================
-  # Build Linux (sequential, one at a time)
+  # Build Linux amd64 (native build)
   # ===========================================
-  build-linux:
+  build-linux-amd64:
     needs: detect
     if: needs.detect.outputs.binary == 'true'
-    strategy:
-      fail-fast: true
-      max-parallel: 1
-      matrix:
-        include:
-          - arch: amd64
-            target: x86_64-unknown-linux-gnu
-          - arch: arm64
-            target: aarch64-unknown-linux-gnu
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
+      - name: Build (native, with docker + wasm features)
+        run: cargo build --release --package runtime --features "docker,wasm"
+      - name: Package
+        run: |
+          ls -la target/release/
+          tar czf "zlayer-linux-amd64.tar.gz" -C target/release zlayer
+      - name: Upload to Forgejo Packages
+        run: |
+          VERSION="${{ needs.detect.outputs.version }}"
+          curl --fail --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
+            --upload-file "zlayer-linux-amd64.tar.gz" \
+            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-linux-amd64.tar.gz"
+
+  # ===========================================
+  # Build Linux arm64 (cross-compile)
+  # ===========================================
+  build-linux-arm64:
+    needs: [detect, build-linux-amd64]
+    if: needs.detect.outputs.binary == 'true'
+    runs-on: ubuntu-latest
+    env:
+      CROSS_TARGET_DIR: ${{ github.workspace }}/cross-target
     steps:
       - uses: actions/checkout@v4
         with:
@@ -130,32 +150,27 @@ jobs:
         run: cargo install cross
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
-      - name: Verify Docker available
-        run: docker --version
-      - name: Build (with docker + wasm features)
+      - name: Create target directory
+        run: mkdir -p $CROSS_TARGET_DIR
+      - name: Build (cross-compile for arm64)
         run: |
-          cross build --release --target ${{ matrix.target }} --package runtime --features "docker,wasm"
-          echo "Build completed, checking output..."
-          find target -name "zlayer" -type f 2>/dev/null || echo "Binary not found in target/"
+          cross build --release --target aarch64-unknown-linux-gnu --package runtime --features "docker,wasm" --target-dir $CROSS_TARGET_DIR
       - name: Package
         run: |
-          VERSION="${{ needs.detect.outputs.version }}"
-          echo "Looking for binary in target/${{ matrix.target }}/release/"
-          ls -la target/${{ matrix.target }}/release/ || echo "Directory not found"
-          ls -la target/ || echo "Target dir not found"
-          tar czf "zlayer-linux-${{ matrix.arch }}.tar.gz" -C target/${{ matrix.target }}/release zlayer
+          ls -la $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release/
+          tar czf "zlayer-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer
       - name: Upload to Forgejo Packages
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           curl --fail --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
-            --upload-file "zlayer-linux-${{ matrix.arch }}.tar.gz" \
-            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-linux-${{ matrix.arch }}.tar.gz"
+            --upload-file "zlayer-linux-arm64.tar.gz" \
+            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-linux-arm64.tar.gz"
 
   # ===========================================
   # Build macOS (sequential, after Linux)
   # ===========================================
   build-macos:
-    needs: [detect, build-linux]
+    needs: [detect, build-linux-amd64, build-linux-arm64]
     if: needs.detect.outputs.binary == 'true'
     strategy:
       fail-fast: true
@@ -190,7 +205,7 @@ jobs:
   # Merge to main (AFTER ALL builds succeed)
   # ===========================================
   merge-to-main:
-    needs: [detect, build-linux, build-macos]
+    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
     if: needs.detect.outputs.binary == 'true' || needs.detect.outputs.is_major == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -236,8 +251,8 @@ jobs:
   # REQUIRES builds to pass first
   # ===========================================
   publish-all-crates:
-    needs: [detect, build-linux, build-macos]
-    if: needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success'
+    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
+    if: needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -306,10 +321,10 @@ jobs:
   # SDK Publishing - General tags require builds
   # ===========================================
   publish-rust-sdk:
-    needs: [detect, build-linux, build-macos]
+    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
     if: |
       (needs.detect.outputs.sdk_name == 'rust') ||
-      (needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
+      (needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -333,10 +348,10 @@ jobs:
           fi
 
   publish-python-sdk:
-    needs: [detect, build-linux, build-macos]
+    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
     if: |
       (needs.detect.outputs.sdk_name == 'python') ||
-      (needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
+      (needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -365,10 +380,10 @@ jobs:
           fi
 
   publish-typescript-sdk:
-    needs: [detect, build-linux, build-macos]
+    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
     if: |
       (needs.detect.outputs.sdk_name == 'typescript') ||
-      (needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
+      (needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -397,10 +412,10 @@ jobs:
           fi
 
   publish-go-sdk:
-    needs: [detect, build-linux, build-macos]
+    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
     if: |
       (needs.detect.outputs.sdk_name == 'go') ||
-      (needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
+      (needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -414,10 +429,10 @@ jobs:
         run: go mod verify
 
   publish-c-sdk:
-    needs: [detect, build-linux, build-macos]
+    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos]
     if: |
       (needs.detect.outputs.sdk_name == 'c') ||
-      (needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
+      (needs.detect.outputs.is_general == 'true' && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -472,8 +487,8 @@ jobs:
   # Trigger GitHub mirror (only after everything)
   # ===========================================
   trigger-github:
-    needs: [detect, build-linux, build-macos, merge-to-main, docker, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk]
-    if: always() && needs.build-linux.result == 'success' && needs.build-macos.result == 'success'
+    needs: [detect, build-linux-amd64, build-linux-arm64, build-macos, merge-to-main, docker, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk]
+    if: always() && needs.build-linux-amd64.result == 'success' && needs.build-linux-arm64.result == 'success' && needs.build-macos.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Trigger GitHub Actions
