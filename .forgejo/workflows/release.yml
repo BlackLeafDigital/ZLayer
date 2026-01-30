@@ -97,7 +97,7 @@ jobs:
             echo "sdk_name=rust" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == py-sdk-v* ]]; then
             echo "sdk_name=python" >> $GITHUB_OUTPUT
-          elif [[ "$TAG" == ts-sdk-v* ]]; then
+          elif [[ "$TAG" == ts-sdk-v*  ]]; then
             echo "sdk_name=typescript" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == go-sdk-v* ]]; then
             echo "sdk_name=go" >> $GITHUB_OUTPUT
@@ -106,7 +106,7 @@ jobs:
           fi
 
   # ===========================================
-  # Build binaries (sequential, fail-fast)
+  # Build Linux (sequential, one at a time)
   # ===========================================
   build-linux:
     needs: detect
@@ -127,7 +127,7 @@ jobs:
           ref: ${{ inputs.sha || github.ref }}
       - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
       - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
       - name: Verify Docker available
@@ -151,6 +151,9 @@ jobs:
             --upload-file "zlayer-linux-${{ matrix.arch }}.tar.gz" \
             "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-linux-${{ matrix.arch }}.tar.gz"
 
+  # ===========================================
+  # Build macOS (sequential, after Linux)
+  # ===========================================
   build-macos:
     needs: [detect, build-linux]
     if: needs.detect.outputs.binary == 'true'
@@ -184,7 +187,7 @@ jobs:
             "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-${{ matrix.artifact }}.tar.gz"
 
   # ===========================================
-  # Merge to main (AFTER builds succeed)
+  # Merge to main (AFTER ALL builds succeed)
   # ===========================================
   merge-to-main:
     needs: [detect, build-linux, build-macos]
@@ -209,7 +212,8 @@ jobs:
           git push origin main
 
   # ===========================================
-  # Publish single crate (specific tag)
+  # Publish single crate (specific crate tag only)
+  # No build dependency - just publishes one crate
   # ===========================================
   publish-crate:
     needs: detect
@@ -229,11 +233,11 @@ jobs:
 
   # ===========================================
   # Smart publish all crates (general tag)
-  # Checks each crate's tag vs input version
+  # REQUIRES builds to pass first
   # ===========================================
   publish-all-crates:
-    needs: detect
-    if: needs.detect.outputs.is_general == 'true'
+    needs: [detect, build-linux, build-macos]
+    if: needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -299,11 +303,13 @@ jobs:
           done
 
   # ===========================================
-  # SDK Publishing
+  # SDK Publishing - General tags require builds
   # ===========================================
   publish-rust-sdk:
-    needs: detect
-    if: needs.detect.outputs.sdk_name == 'rust' || needs.detect.outputs.is_general == 'true'
+    needs: [detect, build-linux, build-macos]
+    if: |
+      (needs.detect.outputs.sdk_name == 'rust') ||
+      (needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -327,8 +333,10 @@ jobs:
           fi
 
   publish-python-sdk:
-    needs: detect
-    if: needs.detect.outputs.sdk_name == 'python' || needs.detect.outputs.is_general == 'true'
+    needs: [detect, build-linux, build-macos]
+    if: |
+      (needs.detect.outputs.sdk_name == 'python') ||
+      (needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -357,8 +365,10 @@ jobs:
           fi
 
   publish-typescript-sdk:
-    needs: detect
-    if: needs.detect.outputs.sdk_name == 'typescript' || needs.detect.outputs.is_general == 'true'
+    needs: [detect, build-linux, build-macos]
+    if: |
+      (needs.detect.outputs.sdk_name == 'typescript') ||
+      (needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -387,8 +397,10 @@ jobs:
           fi
 
   publish-go-sdk:
-    needs: detect
-    if: needs.detect.outputs.sdk_name == 'go' || needs.detect.outputs.is_general == 'true'
+    needs: [detect, build-linux, build-macos]
+    if: |
+      (needs.detect.outputs.sdk_name == 'go') ||
+      (needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -402,8 +414,10 @@ jobs:
         run: go mod verify
 
   publish-c-sdk:
-    needs: detect
-    if: needs.detect.outputs.sdk_name == 'c' || needs.detect.outputs.is_general == 'true'
+    needs: [detect, build-linux, build-macos]
+    if: |
+      (needs.detect.outputs.sdk_name == 'c') ||
+      (needs.detect.outputs.is_general == 'true' && needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -418,7 +432,7 @@ jobs:
           cmake --build build
 
   # ===========================================
-  # Docker (after merge)
+  # Docker (after merge, which requires builds)
   # ===========================================
   docker:
     needs: [detect, merge-to-main]
@@ -455,11 +469,11 @@ jobs:
             ghcr.io/blackleafdigital/zlayer-node:latest
 
   # ===========================================
-  # Trigger GitHub mirror
+  # Trigger GitHub mirror (only after everything)
   # ===========================================
   trigger-github:
-    needs: [detect, build-linux, build-macos, docker, publish-crate, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk]
-    if: always() && (needs.build-linux.result == 'success' && needs.build-macos.result == 'success')
+    needs: [detect, build-linux, build-macos, merge-to-main, docker, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk]
+    if: always() && needs.build-linux.result == 'success' && needs.build-macos.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Trigger GitHub Actions
