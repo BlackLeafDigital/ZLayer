@@ -47,7 +47,12 @@ jobs:
       - name: Detect release type
         id: check
         run: |
-          TAG="${{ github.ref_name }}"
+          # Use inputs.version for workflow_dispatch, otherwise use tag name
+          if [[ -n "${{ inputs.version }}" ]]; then
+            TAG="${{ inputs.version }}"
+          else
+            TAG="${{ github.ref_name }}"
+          fi
           VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
