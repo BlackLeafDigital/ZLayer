@@ -103,6 +103,8 @@ jobs:
           targets: x86_64-apple-darwin
       - name: Ensure target installed
         run: rustup target add x86_64-apple-darwin
+      - name: Clean build state
+        run: cargo clean
       - name: Install protobuf
         run: brew install protobuf
       - name: Build
@@ -133,6 +135,8 @@ jobs:
           targets: aarch64-apple-darwin
       - name: Ensure target installed
         run: rustup target add aarch64-apple-darwin
+      - name: Clean build state
+        run: cargo clean
       - name: Install protobuf
         run: brew install protobuf
       - name: Build
