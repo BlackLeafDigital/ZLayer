@@ -103,8 +103,18 @@ jobs:
           targets: x86_64-apple-darwin
       - name: Ensure target installed
         run: rustup target add x86_64-apple-darwin
-      - name: Clean build state
-        run: cargo clean
+      - name: Debug - Show environment
+        run: |
+          echo "=== Rust/Cargo versions ==="
+          rustc --version
+          cargo --version
+          echo "=== Installed targets ==="
+          rustup target list --installed
+          echo "=== CARGO_HOME / RUSTUP_HOME ==="
+          echo "CARGO_HOME=$CARGO_HOME"
+          echo "RUSTUP_HOME=$RUSTUP_HOME"
+          echo "=== Check dependency tree ==="
+          cargo tree -p runtime --features "docker,wasm" 2>&1 | grep -E "(bollard|wasmtime)" | head -10 || echo "cargo tree failed"
       - name: Install protobuf
         run: brew install protobuf
       - name: Build
