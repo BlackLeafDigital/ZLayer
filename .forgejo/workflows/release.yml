@@ -106,7 +106,7 @@ jobs:
           for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64; do
             echo "Downloading ${name}.tar.gz from temp storage..."
             curl -L --fail \
-              -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+              --user "zachhandley:${{ secrets.FORGEJO_TOKEN }}" \
               -o "artifacts/${name}.tar.gz" \
               "${BASE_URL}/${name}.tar.gz"
           done
@@ -129,8 +129,8 @@ jobs:
           RUN_ID=$(echo "${{ inputs.artifact_base_url }}" | grep -oP 'zlayer-temp/\K[^/]+')
           echo "Cleaning up temp packages for run_id: ${RUN_ID}"
           curl -X DELETE \
-            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
-            "${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/zlayer-temp/${RUN_ID}" || true
+            --user "zachhandley:${{ secrets.FORGEJO_TOKEN }}" \
+            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-temp/${RUN_ID}" || true
 
   # ===========================================
   # Merge to main (after binaries uploaded)

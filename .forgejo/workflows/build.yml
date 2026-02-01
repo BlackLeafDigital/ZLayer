@@ -182,13 +182,12 @@ jobs:
         run: |
           RUN_ID="${{ github.run_id }}"
           VERSION="${{ inputs.version }}"
-          BASE_URL="${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/zlayer-temp/${RUN_ID}"
+          BASE_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-temp/${RUN_ID}"
 
           for artifact in artifacts/zlayer-*/*.tar.gz; do
             filename=$(basename "$artifact")
             echo "Uploading $filename to temp storage..."
-            curl --fail -X PUT \
-              -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            curl --fail --user "zachhandley:${{ secrets.FORGEJO_TOKEN }}" \
               --upload-file "$artifact" \
               "${BASE_URL}/${filename}"
           done
