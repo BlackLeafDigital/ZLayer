@@ -5,27 +5,12 @@ on:
     inputs:
       version:
         description: 'Version for artifacts'
-        required: false
-        default: '0.0.0'
-        type: string
-      sha:
-        description: 'Commit SHA to build'
-        required: false
-        type: string
-  workflow_call:
-    inputs:
-      version:
-        description: 'Version for artifacts'
         required: true
         type: string
       sha:
         description: 'Commit SHA to build'
         required: false
         type: string
-    outputs:
-      success:
-        description: 'Whether all builds succeeded'
-        value: ${{ jobs.verify.outputs.success }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -176,3 +161,69 @@ jobs:
       - name: Check all builds
         id: check
         run: echo "success=true" >> $GITHUB_OUTPUT
+
+  # ===========================================
+  # Upload artifacts to temp Forgejo Packages
+  # ===========================================
+  upload-temp-packages:
+    needs: [verify, build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64]
+    if: needs.verify.outputs.success == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      package_base_url: ${{ steps.upload.outputs.package_base_url }}
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: artifacts
+
+      - name: Upload to temp packages
+        id: upload
+        run: |
+          RUN_ID="${{ github.run_id }}"
+          VERSION="${{ inputs.version }}"
+          BASE_URL="${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/zlayer-temp/${RUN_ID}"
+
+          for artifact in artifacts/zlayer-*/*.tar.gz; do
+            filename=$(basename "$artifact")
+            echo "Uploading $filename to temp storage..."
+            curl --fail -X PUT \
+              -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+              --upload-file "$artifact" \
+              "${BASE_URL}/${filename}"
+          done
+
+          echo "package_base_url=${BASE_URL}" >> $GITHUB_OUTPUT
+
+  # ===========================================
+  # Dispatch Release workflow
+  # ===========================================
+  dispatch-release:
+    needs: [verify, upload-temp-packages]
+    if: needs.verify.outputs.success == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch Release
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/release.yml/dispatches" \
+            -d '{
+              "ref": "${{ github.ref }}",
+              "inputs": {
+                "version": "${{ inputs.version }}",
+                "sha": "${{ inputs.sha || github.sha }}",
+                "artifact_base_url": "${{ needs.upload-temp-packages.outputs.package_base_url }}"
+              }
+            }'
+
+      - name: Summary
+        run: |
+          echo "## Build Complete" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **SHA**: ${{ inputs.sha || github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Artifacts**: ${{ needs.upload-temp-packages.outputs.package_base_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Release workflow dispatched." >> $GITHUB_STEP_SUMMARY

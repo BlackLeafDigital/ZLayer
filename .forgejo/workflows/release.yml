@@ -1,27 +1,6 @@
 name: Release
 
 on:
-  push:
-    tags:
-      # Crate-specific releases (no builds needed)
-      - 'spec-v*'
-      - 'core-v*'
-      - 'registry-v*'
-      - 'obs-v*'
-      - 'builder-v*'
-      - 'overlay-v*'
-      - 'init-v*'
-      - 'scheduler-v*'
-      - 'storage-v*'
-      - 'rust-sdk-v*'
-      - 'py-sdk-v*'
-      - 'ts-sdk-v*'
-      - 'go-sdk-v*'
-      - 'c-sdk-v*'
-      - 'docker-v*'
-      # General version tags (triggers full release)
-      - 'v[0-9]*'
-      - 'major-v*'
   workflow_dispatch:
     inputs:
       version:
@@ -31,6 +10,10 @@ on:
       sha:
         description: 'Commit SHA for the release'
         required: false
+        type: string
+      artifact_base_url:
+        description: 'Base URL for temp artifact packages from build workflow'
+        required: true
         type: string
 
 env:
@@ -108,39 +91,46 @@ jobs:
           fi
 
   # ===========================================
-  # Build all binaries (only for general releases)
-  # ===========================================
-  build:
-    needs: detect
-    if: needs.detect.outputs.binary == 'true'
-    uses: ./.forgejo/workflows/build.yml
-    with:
-      version: ${{ needs.detect.outputs.version }}
-      sha: ${{ inputs.sha || github.sha }}
-
-  # ===========================================
-  # Upload binaries to registry (after ALL builds pass)
+  # Upload binaries to registry (download from temp packages)
   # ===========================================
   upload-binaries:
-    needs: [detect, build]
+    needs: [detect]
     if: needs.detect.outputs.binary == 'true'
     runs-on: ubuntu-latest
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v3
-        with:
-          path: artifacts
+      - name: Download artifacts from temp storage
+        run: |
+          BASE_URL="${{ inputs.artifact_base_url }}"
+          mkdir -p artifacts
+
+          for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64; do
+            echo "Downloading ${name}.tar.gz from temp storage..."
+            curl -L --fail \
+              -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+              -o "artifacts/${name}.tar.gz" \
+              "${BASE_URL}/${name}.tar.gz"
+          done
 
       - name: Upload to Forgejo Packages
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
-          for artifact in artifacts/zlayer-*/*.tar.gz; do
+          for artifact in artifacts/*.tar.gz; do
             filename=$(basename "$artifact")
-            echo "Uploading $filename..."
+            echo "Uploading $filename to final location..."
             curl --fail --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
               --upload-file "$artifact" \
               "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${filename}"
           done
+
+      - name: Cleanup temp packages
+        if: always()
+        run: |
+          # Extract run_id from the artifact URL and delete temp packages
+          RUN_ID=$(echo "${{ inputs.artifact_base_url }}" | grep -oP 'zlayer-temp/\K[^/]+')
+          echo "Cleaning up temp packages for run_id: ${RUN_ID}"
+          curl -X DELETE \
+            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            "${{ github.server_url }}/api/packages/${{ github.repository_owner }}/generic/zlayer-temp/${RUN_ID}" || true
 
   # ===========================================
   # Merge to main (after binaries uploaded)
