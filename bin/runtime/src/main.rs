@@ -19,7 +19,9 @@ use std::sync::mpsc;
 use std::time::Duration;
 use tracing::{info, warn};
 
-use zlayer_agent::{RuntimeConfig, YoukiConfig};
+use zlayer_agent::RuntimeConfig;
+#[cfg(target_os = "linux")]
+use zlayer_agent::YoukiConfig;
 use zlayer_observability::{
     init_observability, LogFormat, LogLevel, LoggingConfig, ObservabilityConfig,
 };
@@ -58,7 +60,8 @@ struct Cli {
 enum RuntimeType {
     /// Mock runtime for testing and development
     Mock,
-    /// Youki runtime for production deployments
+    /// Youki runtime for production deployments (Linux only)
+    #[cfg(target_os = "linux")]
     Youki,
 }
 
@@ -766,6 +769,7 @@ async fn run(cli: Cli) -> Result<()> {
 fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
     match cli.runtime {
         RuntimeType::Mock => RuntimeConfig::Mock,
+        #[cfg(target_os = "linux")]
         RuntimeType::Youki => RuntimeConfig::Youki(YoukiConfig {
             state_dir: cli.state_dir.clone(),
             ..Default::default()
@@ -1375,6 +1379,7 @@ async fn status(cli: &Cli) -> Result<()> {
             println!("Status: Ready (mock mode)");
             println!("Note: Using mock runtime - no actual containers will be created");
         }
+        #[cfg(target_os = "linux")]
         RuntimeType::Youki => {
             println!("State Dir: {}", cli.state_dir.display());
 
@@ -3371,6 +3376,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_cli_youki_runtime() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -3585,7 +3591,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
+    #[cfg(all(feature = "deploy", target_os = "linux"))]
     fn test_build_runtime_config_youki() {
         let cli = Cli::try_parse_from([
             "zlayer",

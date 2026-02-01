@@ -113,10 +113,10 @@ jobs:
           echo "=== CARGO_HOME / RUSTUP_HOME ==="
           echo "CARGO_HOME=$CARGO_HOME"
           echo "RUSTUP_HOME=$RUSTUP_HOME"
-          echo "=== Check dependency tree (full error) ==="
-          cargo tree -p runtime --features "docker,wasm" 2>&1 | head -50 || true
-          echo "=== Try cargo metadata ==="
-          cargo metadata --format-version 1 2>&1 | head -20 || true
+          echo "=== Feature resolution for x86_64-apple-darwin ==="
+          cargo tree -p runtime --features "docker,wasm" --target x86_64-apple-darwin 2>&1 | grep -E "(zlayer-agent|bollard|wasmtime|futures-util)" | head -30 || true
+          echo "=== Full zlayer-agent deps ==="
+          cargo tree -p zlayer-agent --features "docker,wasm" --target x86_64-apple-darwin 2>&1 | head -50 || true
       - name: Install protobuf
         run: brew install protobuf
       - name: Build
