@@ -187,7 +187,7 @@ jobs:
           for artifact in artifacts/zlayer-*/*.tar.gz; do
             filename=$(basename "$artifact")
             echo "Uploading $filename to temp storage..."
-            curl --fail --user "zachhandley:${{ secrets.FORGEJO_TOKEN }}" \
+            curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
               --upload-file "$artifact" \
               "${BASE_URL}/${filename}"
           done
@@ -205,7 +205,7 @@ jobs:
       - name: Dispatch Release
         run: |
           curl -X POST \
-            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            -H "Authorization: token ${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
             -H "Content-Type: application/json" \
             "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/release.yml/dispatches" \
             -d '{
