@@ -33,7 +33,7 @@ pub use install::{
 
 use crate::dockerfile::{
     AddInstruction, CopyInstruction, EnvInstruction, ExposeInstruction, HealthcheckInstruction,
-    Instruction, ShellOrExec,
+    Instruction, RunInstruction, ShellOrExec,
 };
 
 use std::collections::HashMap;
@@ -248,6 +248,34 @@ impl BuildahCommand {
         match command {
             ShellOrExec::Shell(s) => Self::run_shell(container, s),
             ShellOrExec::Exec(args) => Self::run_exec(container, args),
+        }
+    }
+
+    /// Run a command with mount specifications from a RunInstruction.
+    ///
+    /// Buildah requires `--mount` arguments to appear BEFORE the container ID:
+    /// `buildah run [--mount=...] <container> -- <command>`
+    ///
+    /// This method properly orders the arguments to ensure mounts are applied.
+    pub fn run_with_mounts(container: &str, run: &RunInstruction) -> Self {
+        let mut cmd = Self::new("run");
+
+        // Add --mount arguments BEFORE the container ID
+        for mount in &run.mounts {
+            cmd = cmd.arg(format!("--mount={}", mount.to_buildah_arg()));
+        }
+
+        // Now add container and the command
+        cmd = cmd.arg(container).arg("--");
+
+        match &run.command {
+            ShellOrExec::Shell(s) => cmd.arg("/bin/sh").arg("-c").arg(s),
+            ShellOrExec::Exec(args) => {
+                for arg in args {
+                    cmd = cmd.arg(arg);
+                }
+                cmd
+            }
         }
     }
 
@@ -580,7 +608,12 @@ impl BuildahCommand {
     pub fn from_instruction(container: &str, instruction: &Instruction) -> Vec<Self> {
         match instruction {
             Instruction::Run(run) => {
-                vec![Self::run(container, &run.command)]
+                // Use run_with_mounts if there are any mounts, otherwise use simple run
+                if run.mounts.is_empty() {
+                    vec![Self::run(container, &run.command)]
+                } else {
+                    vec![Self::run_with_mounts(container, run)]
+                }
             }
 
             Instruction::Copy(copy) => {
@@ -789,5 +822,155 @@ mod tests {
         assert_eq!(escape_json_string("hello"), "hello");
         assert_eq!(escape_json_string("hello \"world\""), "hello \\\"world\\\"");
         assert_eq!(escape_json_string("line1\nline2"), "line1\\nline2");
+    }
+
+    #[test]
+    fn test_run_with_mounts_cache() {
+        use crate::dockerfile::{CacheSharing, RunMount};
+
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("apt-get update".to_string()),
+            mounts: vec![RunMount::Cache {
+                target: "/var/cache/apt".to_string(),
+                id: Some("apt-cache".to_string()),
+                sharing: CacheSharing::Shared,
+                readonly: false,
+            }],
+            network: None,
+            security: None,
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+
+        // Verify --mount comes BEFORE container ID
+        let mount_idx = cmd
+            .args
+            .iter()
+            .position(|a| a.starts_with("--mount="))
+            .expect("should have --mount arg");
+        let container_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "container-1")
+            .expect("should have container id");
+
+        assert!(
+            mount_idx < container_idx,
+            "--mount should come before container ID"
+        );
+
+        // Verify mount argument content
+        assert!(cmd.args[mount_idx].contains("type=cache"));
+        assert!(cmd.args[mount_idx].contains("target=/var/cache/apt"));
+        assert!(cmd.args[mount_idx].contains("id=apt-cache"));
+        assert!(cmd.args[mount_idx].contains("sharing=shared"));
+    }
+
+    #[test]
+    fn test_run_with_multiple_mounts() {
+        use crate::dockerfile::{CacheSharing, RunMount};
+
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("cargo build".to_string()),
+            mounts: vec![
+                RunMount::Cache {
+                    target: "/usr/local/cargo/registry".to_string(),
+                    id: Some("cargo-registry".to_string()),
+                    sharing: CacheSharing::Shared,
+                    readonly: false,
+                },
+                RunMount::Cache {
+                    target: "/app/target".to_string(),
+                    id: Some("cargo-target".to_string()),
+                    sharing: CacheSharing::Locked,
+                    readonly: false,
+                },
+            ],
+            network: None,
+            security: None,
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+
+        // Count --mount arguments
+        let mount_count = cmd
+            .args
+            .iter()
+            .filter(|a| a.starts_with("--mount="))
+            .count();
+        assert_eq!(mount_count, 2, "should have 2 mount arguments");
+
+        // Verify all mounts come before container ID
+        let container_idx = cmd
+            .args
+            .iter()
+            .position(|a| a == "container-1")
+            .expect("should have container id");
+
+        for (idx, arg) in cmd.args.iter().enumerate() {
+            if arg.starts_with("--mount=") {
+                assert!(
+                    idx < container_idx,
+                    "--mount at index {} should come before container ID at {}",
+                    idx,
+                    container_idx
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_from_instruction_run_with_mounts() {
+        use crate::dockerfile::{CacheSharing, RunMount};
+
+        let instruction = Instruction::Run(RunInstruction {
+            command: ShellOrExec::Shell("npm install".to_string()),
+            mounts: vec![RunMount::Cache {
+                target: "/root/.npm".to_string(),
+                id: Some("npm-cache".to_string()),
+                sharing: CacheSharing::Shared,
+                readonly: false,
+            }],
+            network: None,
+            security: None,
+        });
+
+        let cmds = BuildahCommand::from_instruction("container-1", &instruction);
+        assert_eq!(cmds.len(), 1);
+
+        let cmd = &cmds[0];
+        assert!(
+            cmd.args.iter().any(|a| a.starts_with("--mount=")),
+            "should include --mount argument"
+        );
+    }
+
+    #[test]
+    fn test_run_with_mounts_exec_form() {
+        use crate::dockerfile::{CacheSharing, RunMount};
+
+        let run = RunInstruction {
+            command: ShellOrExec::Exec(vec![
+                "pip".to_string(),
+                "install".to_string(),
+                "-r".to_string(),
+                "requirements.txt".to_string(),
+            ]),
+            mounts: vec![RunMount::Cache {
+                target: "/root/.cache/pip".to_string(),
+                id: Some("pip-cache".to_string()),
+                sharing: CacheSharing::Shared,
+                readonly: false,
+            }],
+            network: None,
+            security: None,
+        };
+
+        let cmd = BuildahCommand::run_with_mounts("container-1", &run);
+
+        // Should have mount, container, --, and then the exec args
+        assert!(cmd.args.contains(&"--".to_string()));
+        assert!(cmd.args.contains(&"pip".to_string()));
+        assert!(cmd.args.contains(&"install".to_string()));
     }
 }

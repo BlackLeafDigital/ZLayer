@@ -12,7 +12,7 @@ readme = "README.md"
 
 [features]
 default = []
-docker = ["bollard"]
+docker = ["dep:bollard"]
 wasm = [
     "dep:wasmtime",
     "dep:wasmtime-wasi",
@@ -51,9 +51,8 @@ num_cpus.workspace = true
 zlayer-scheduler = { version = "0.1.0", path = "../zlayer-scheduler" }
 ulid = "1.2.1"
 
-# Linux-specific dependencies for native container runtime (youki/libcontainer)
-[target.'cfg(target_os = "linux")'.dependencies]
-libcontainer = "0.5"
+# Streaming utilities (needed for Docker streaming)
+futures-util.workspace = true
 
 # Docker runtime support (optional)
 # Features:
@@ -62,9 +61,6 @@ libcontainer = "0.5"
 # - pipe: Unix socket/Windows named pipe support (required for connect_with_local_defaults)
 # - http: HTTP transport support
 bollard = { version = "0.20", default-features = false, features = ["ssl", "time", "pipe", "http"], optional = true }
-
-# Streaming utilities (needed for Docker streaming)
-futures-util.workspace = true
 
 # WebAssembly runtime support (optional)
 # Features:
@@ -81,6 +77,10 @@ http = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", optional = true }
 anyhow = { version = "1", optional = true }
+
+# Linux-specific dependencies for native container runtime (youki/libcontainer)
+[target.'cfg(target_os = "linux")'.dependencies]
+libcontainer = "0.5"
 
 [dev-dependencies]
 rand = "0.9"

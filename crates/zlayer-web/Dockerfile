@@ -1,5 +1,14 @@
-# Build stage
-FROM rust:1.83-bookworm AS builder
+# Stage 1: Chef base with cargo-chef installed
+FROM lukemathwalker/cargo-chef:latest-rust-1.83 AS chef
+WORKDIR /build
+
+# Stage 2: Generate recipe.json (dependency manifest)
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Stage 3: Build dependencies (cached layer)
+FROM chef AS builder
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -12,12 +21,12 @@ RUN apt-get update && apt-get install -y \
 RUN rustup target add wasm32-unknown-unknown && \
     cargo install cargo-leptos
 
-WORKDIR /build
+# Copy recipe and build dependencies only
+COPY --from=planner /build/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
-# Copy the entire workspace (needed for workspace dependencies)
+# Copy source and build application (only rebuilds changed code)
 COPY . .
-
-# Build the zlayer-web crate
 RUN cd crates/zlayer-web && cargo leptos build --release
 
 # Runtime stage

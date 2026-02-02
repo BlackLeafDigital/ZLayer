@@ -6,13 +6,21 @@
 //! # Example
 //!
 //! ```rust,ignore
+//! #![no_std]
+//! extern crate alloc;
+//!
+//! use alloc::string::String;
+//! use alloc::vec::Vec;
 //! use zlayer_sdk::bindings::{
 //!     export_handler,
 //!     exports::zlayer::plugin::handler::{
-//!         Guest, Capabilities, HandleResult, InitError, PluginInfo,
-//!         PluginRequest, PluginResponse, Version,
+//!         Guest, Capabilities, HandleResult, InitError, PluginInfo, PluginRequest,
 //!     },
-//!     zlayer::plugin::{config, logging},
+//!     zlayer::plugin::{
+//!         config, logging,
+//!         plugin_metadata::Version,
+//!         request_types::PluginResponse,
+//!     },
 //! };
 //!
 //! struct MyPlugin;
@@ -50,7 +58,8 @@
 //!     }
 //! }
 //!
-//! export_handler!(MyPlugin);
+//! // Note: `with_types_in` is required when using the SDK from an external crate
+//! export_handler!(MyPlugin with_types_in zlayer_sdk::bindings);
 //! ```
 //!
 //! # Features
@@ -59,9 +68,41 @@
 //! - **Host function access** - Config, KV storage, logging, secrets, metrics
 //! - **HTTP capabilities** - Make outbound HTTP requests
 //! - **`no_std` compatible** - Minimal runtime dependencies
+//!
+//! # `no_std` Support
+//!
+//! This crate is `no_std` by default for WASM plugin compilation.
+//! Enable the `std` feature for native testing or non-WASM targets.
 
-#![no_std]
+// Conditional no_std based on feature flag
+#![cfg_attr(not(feature = "std"), no_std)]
+
 extern crate alloc;
+
+// =============================================================================
+// no_std Runtime Support
+// =============================================================================
+
+// Use dlmalloc as the global allocator for no_std WASM builds
+#[cfg(all(feature = "wasm-alloc", not(feature = "std")))]
+#[global_allocator]
+static ALLOC: dlmalloc::GlobalDlmalloc = dlmalloc::GlobalDlmalloc;
+
+// Panic handler for no_std WASM targets
+// When std is enabled, the standard library provides this
+#[cfg(all(not(feature = "std"), target_arch = "wasm32"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    // In WASM, we can use unreachable to trap
+    core::arch::wasm32::unreachable()
+}
+
+// For non-WASM no_std targets (rare, but handle gracefully)
+#[cfg(all(not(feature = "std"), not(target_arch = "wasm32")))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
 
 /// Generated bindings from WIT definitions.
 ///
@@ -84,13 +125,17 @@ extern crate alloc;
 /// };
 /// ```
 pub mod bindings {
+    // Allow the generated code to use alloc types
+    extern crate alloc;
+
     wit_bindgen::generate!({
         // Use the minimal world that doesn't require WASI dependencies
         // For full WASI support, use cargo-component which fetches deps automatically
         world: "zlayer-plugin-minimal",
         path: "wit",
-        // Export macro for handler registration
+        // Export macro for handler registration - made public for SDK users
         export_macro_name: "export_handler",
+        pub_export_macro: true,
     });
 }
 
@@ -105,8 +150,10 @@ pub mod prelude {
     // Re-export the main handler trait and types
     pub use crate::bindings::exports::zlayer::plugin::handler::{
         Capabilities, Guest as Handler, HandleResult, InitError, PluginInfo, PluginRequest,
-        PluginResponse, Version,
     };
+    // These types come from their source interfaces, not the handler export
+    pub use crate::bindings::zlayer::plugin::plugin_metadata::Version;
+    pub use crate::bindings::zlayer::plugin::request_types::PluginResponse;
 
     // Re-export common types
     pub use crate::bindings::zlayer::plugin::common::{Error, KeyValue};
@@ -161,7 +208,7 @@ pub mod testing;
 ///
 /// Provides convenience functions for common response patterns.
 pub mod response {
-    use crate::bindings::exports::zlayer::plugin::handler::PluginResponse;
+    use crate::bindings::zlayer::plugin::request_types::PluginResponse;
     use crate::bindings::zlayer::plugin::common::KeyValue;
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -254,8 +301,9 @@ pub mod response {
 
 /// Helper module for working with plugin metadata.
 pub mod metadata {
-    use crate::bindings::exports::zlayer::plugin::handler::{PluginInfo, Version};
+    use crate::bindings::exports::zlayer::plugin::handler::PluginInfo;
     use crate::bindings::zlayer::plugin::common::KeyValue;
+    use crate::bindings::zlayer::plugin::plugin_metadata::Version;
     use alloc::string::String;
     use alloc::vec::Vec;
 
@@ -621,6 +669,7 @@ pub mod config {
 /// ```
 pub mod kv {
     use super::*;
+    use alloc::string::ToString;
     use crate::bindings::zlayer::plugin::keyvalue as host_kv;
 
     /// Get a value by key.
@@ -1168,9 +1217,8 @@ macro_rules! zlayer_plugin {
             fn handle(
                 request: $crate::bindings::exports::zlayer::plugin::handler::PluginRequest,
             ) -> $crate::bindings::exports::zlayer::plugin::handler::HandleResult {
-                use $crate::bindings::exports::zlayer::plugin::handler::{
-                    HandleResult, HttpMethod, PluginResponse,
-                };
+                use $crate::bindings::exports::zlayer::plugin::handler::{HandleResult, HttpMethod};
+                use $crate::bindings::zlayer::plugin::request_types::PluginResponse;
 
                 let plugin = <$plugin_type as Default>::default();
 
@@ -1225,8 +1273,8 @@ pub fn kv_pair(key: impl Into<String>, value: impl Into<String>) -> bindings::zl
 
 /// Create a Version struct.
 #[must_use]
-pub fn version(major: u32, minor: u32, patch: u32) -> bindings::exports::zlayer::plugin::handler::Version {
-    bindings::exports::zlayer::plugin::handler::Version {
+pub fn version(major: u32, minor: u32, patch: u32) -> bindings::zlayer::plugin::plugin_metadata::Version {
+    bindings::zlayer::plugin::plugin_metadata::Version {
         major,
         minor,
         patch,
@@ -1241,8 +1289,8 @@ pub fn version_pre(
     minor: u32,
     patch: u32,
     pre_release: &str,
-) -> bindings::exports::zlayer::plugin::handler::Version {
-    bindings::exports::zlayer::plugin::handler::Version {
+) -> bindings::zlayer::plugin::plugin_metadata::Version {
+    bindings::zlayer::plugin::plugin_metadata::Version {
         major,
         minor,
         patch,

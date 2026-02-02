@@ -178,6 +178,8 @@ pub use buildah::{
     CommandOutput,
     InstallError,
 };
+#[cfg(feature = "cache")]
+pub use builder::CacheBackendConfig;
 pub use builder::{BuildOptions, BuiltImage, ImageBuilder, RegistryAuth};
 pub use dockerfile::{
     expand_variables,

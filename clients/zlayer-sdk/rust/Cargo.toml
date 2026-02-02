@@ -14,7 +14,12 @@ readme = "README.md"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-wit-bindgen = "0.36"
+# wit-bindgen 0.51+ has proper std/no_std feature support
+wit-bindgen = { version = "0.51", default-features = false, features = ["macros", "realloc"] }
+
+# Allocator for no_std WASM targets
+# This is conditionally enabled via features, not target cfg
+dlmalloc = { version = "0.2", features = ["global"], optional = true }
 
 [dev-dependencies]
 # For testing plugins locally
@@ -24,14 +29,17 @@ wasmtime = "41"
 # wit-bindgen generates bindings at compile time
 
 [features]
-default = []
+default = ["wasm-alloc"]
 # Enable additional debugging features
 debug = []
 # Enable testing utilities (MockHost, zlayer_test! macro)
 # Note: testing feature enables std for allocator/panic handler in tests
 testing = ["std"]
 # Enable std library (for testing and non-WASM targets)
-std = []
+std = ["wit-bindgen/std"]
+# Enable WASM allocator for no_std builds (enabled by default)
+# Disable this when building with std feature
+wasm-alloc = ["dep:dlmalloc"]
 
 [package.metadata.component]
 package = "zlayer:plugin"
@@ -47,6 +55,14 @@ dead_code = "warn"
 all = "warn"
 pedantic = "warn"
 
+# Configure panic behavior for release builds (abort instead of unwind for smaller binaries)
+[profile.release]
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
 # This crate is independent of the ZLayer workspace
 # (it's meant to be published and used by plugin authors)
 [workspace]
+exclude = ["examples/hello"]
