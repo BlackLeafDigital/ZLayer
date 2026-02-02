@@ -586,6 +586,11 @@ pub struct EndpointSpec {
     /// Exposure type
     #[serde(default = "default_expose")]
     pub expose: ExposeType,
+
+    /// Optional stream (L4) proxy configuration
+    /// Only applicable when protocol is tcp or udp
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<StreamEndpointConfig>,
 }
 
 fn default_expose() -> ExposeType {
@@ -609,6 +614,44 @@ pub enum Protocol {
 pub enum ExposeType {
     Public,
     Internal,
+}
+
+/// Stream (L4) proxy configuration for TCP/UDP endpoints
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct StreamEndpointConfig {
+    /// Enable TLS termination for TCP (auto-provision cert)
+    #[serde(default)]
+    pub tls: bool,
+
+    /// Enable PROXY protocol for passing client IP
+    #[serde(default)]
+    pub proxy_protocol: bool,
+
+    /// Custom session timeout for UDP (default: 60s)
+    /// Format: duration string like "60s", "5m"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_timeout: Option<String>,
+
+    /// Health check configuration for L4
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<StreamHealthCheck>,
+}
+
+/// Health check types for stream (L4) endpoints
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamHealthCheck {
+    /// TCP connect check - verifies port is accepting connections
+    TcpConnect,
+    /// UDP probe - sends request and optionally validates response
+    UdpProbe {
+        /// Request payload to send (can use hex escapes like \\xFF)
+        request: String,
+        /// Expected response pattern (optional regex)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<String>,
+    },
 }
 
 /// Scaling configuration

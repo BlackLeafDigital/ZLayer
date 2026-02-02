@@ -529,6 +529,7 @@ pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResu
             port: p,
             path: None,
             expose: zlayer_spec::ExposeType::Internal,
+            stream: None,
         });
     }
 

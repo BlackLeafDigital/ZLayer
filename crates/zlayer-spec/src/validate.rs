@@ -751,6 +751,7 @@ mod tests {
                 port: 8080,
                 path: None,
                 expose: ExposeType::Public,
+                stream: None,
             },
             EndpointSpec {
                 name: "grpc".to_string(),
@@ -758,6 +759,7 @@ mod tests {
                 port: 9090,
                 path: None,
                 expose: ExposeType::Internal,
+                stream: None,
             },
         ];
         assert!(validate_unique_endpoints(&endpoints).is_ok());
@@ -778,6 +780,7 @@ mod tests {
                 port: 8080,
                 path: None,
                 expose: ExposeType::Public,
+                stream: None,
             },
             EndpointSpec {
                 name: "http".to_string(), // duplicate name
@@ -785,6 +788,7 @@ mod tests {
                 port: 8443,
                 path: None,
                 expose: ExposeType::Public,
+                stream: None,
             },
         ];
         let result = validate_unique_endpoints(&endpoints);

@@ -81,6 +81,10 @@ pub enum OverlayError {
     /// Network configuration error
     #[error("Network configuration error: {0}")]
     NetworkConfig(String),
+
+    /// DNS error
+    #[error("DNS error: {0}")]
+    Dns(String),
 }
 
 /// Result type alias for overlay operations

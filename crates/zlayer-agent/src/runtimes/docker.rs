@@ -924,6 +924,7 @@ mod tests {
                 port,
                 path: None,
                 expose: ExposeType::Internal,
+                stream: None,
             })
             .collect();
 
