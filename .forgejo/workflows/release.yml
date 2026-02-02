@@ -106,7 +106,7 @@ jobs:
           for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64; do
             echo "Downloading ${name}.tar.gz from temp storage..."
             curl -L --fail \
-              --user "zachhandley:${{ secrets.FORGEJO_TOKEN }}" \
+              --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
               -o "artifacts/${name}.tar.gz" \
               "${BASE_URL}/${name}.tar.gz"
           done
@@ -117,7 +117,7 @@ jobs:
           for artifact in artifacts/*.tar.gz; do
             filename=$(basename "$artifact")
             echo "Uploading $filename to final location..."
-            curl --fail --user "${{ secrets.FORGEJO_USER }}:${{ secrets.FORGEJO_TOKEN }}" \
+            curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
               --upload-file "$artifact" \
               "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${filename}"
           done
@@ -129,7 +129,7 @@ jobs:
           RUN_ID=$(echo "${{ inputs.artifact_base_url }}" | grep -oP 'zlayer-temp/\K[^/]+')
           echo "Cleaning up temp packages for run_id: ${RUN_ID}"
           curl -X DELETE \
-            --user "zachhandley:${{ secrets.FORGEJO_TOKEN }}" \
+            --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
             "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-temp/${RUN_ID}" || true
 
   # ===========================================
