@@ -154,7 +154,8 @@ jobs:
       - name: Merge dev into main
         run: |
           git checkout main
-          git merge origin/dev --no-ff -m "Merge dev into main for release ${{ github.ref_name }}"
+          # Use -X theirs to prefer dev changes on conflicts
+          git merge origin/dev --no-ff -X theirs -m "Merge dev into main for release ${{ github.ref_name }}"
           git push origin main
 
   # ===========================================
@@ -177,10 +178,10 @@ jobs:
         run: cargo publish -p ${{ needs.detect.outputs.crate_name }} --allow-dirty
 
   # ===========================================
-  # Publish all crates (general release, after builds)
+  # Publish all crates (general release, after merge)
   # ===========================================
   publish-all-crates:
-    needs: [detect, upload-binaries]
+    needs: [detect, upload-binaries, merge-to-main]
     if: needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -245,10 +246,10 @@ jobs:
   # SDK Publishing
   # ===========================================
   publish-rust-sdk:
-    needs: [detect, upload-binaries]
+    needs: [detect, upload-binaries, merge-to-main]
     if: |
       needs.detect.outputs.sdk_name == 'rust' ||
-      (needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success')
+      (needs.detect.outputs.is_general == 'true' && needs.merge-to-main.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -271,10 +272,10 @@ jobs:
           fi
 
   publish-python-sdk:
-    needs: [detect, upload-binaries]
+    needs: [detect, upload-binaries, merge-to-main]
     if: |
       needs.detect.outputs.sdk_name == 'python' ||
-      (needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success')
+      (needs.detect.outputs.is_general == 'true' && needs.merge-to-main.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -294,6 +295,9 @@ jobs:
           LATEST_TAG=$(git tag -l "py-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
           if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
             echo "Publishing python-sdk..."
+            # Update version in pyproject.toml and __init__.py
+            sed -i "s/^version = .*/version = \"$INPUT_VERSION\"/" pyproject.toml
+            sed -i "s/__version__ = .*/__version__ = \"$INPUT_VERSION\"/" zlayer/__init__.py
             pip install build twine
             python -m build
             twine upload dist/* || echo "May already exist"
@@ -302,10 +306,10 @@ jobs:
           fi
 
   publish-typescript-sdk:
-    needs: [detect, upload-binaries]
+    needs: [detect, upload-binaries, merge-to-main]
     if: |
       needs.detect.outputs.sdk_name == 'typescript' ||
-      (needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success')
+      (needs.detect.outputs.is_general == 'true' && needs.merge-to-main.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -325,6 +329,8 @@ jobs:
           LATEST_TAG=$(git tag -l "ts-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
           if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
             echo "Publishing typescript-sdk..."
+            # Update version in package.json
+            npm version "$INPUT_VERSION" --no-git-tag-version
             npm ci
             npm run build
             npm publish --access public || echo "May already exist"
@@ -333,10 +339,10 @@ jobs:
           fi
 
   publish-go-sdk:
-    needs: [detect, upload-binaries]
+    needs: [detect, upload-binaries, merge-to-main]
     if: |
       needs.detect.outputs.sdk_name == 'go' ||
-      (needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success')
+      (needs.detect.outputs.is_general == 'true' && needs.merge-to-main.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -350,10 +356,10 @@ jobs:
         run: go mod verify
 
   publish-c-sdk:
-    needs: [detect, upload-binaries]
+    needs: [detect, upload-binaries, merge-to-main]
     if: |
       needs.detect.outputs.sdk_name == 'c' ||
-      (needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success')
+      (needs.detect.outputs.is_general == 'true' && needs.merge-to-main.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

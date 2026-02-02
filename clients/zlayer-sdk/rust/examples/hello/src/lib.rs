@@ -29,6 +29,7 @@ extern crate alloc;
 
 use alloc::format;
 use alloc::string::String;
+use alloc::vec;
 use alloc::vec::Vec;
 
 // Import the ZLayer SDK bindings
@@ -37,12 +38,14 @@ use alloc::vec::Vec;
 use zlayer_sdk::bindings::{
     export_handler,
     exports::zlayer::plugin::handler::{
-        Capabilities, Guest, HandleResult, InitError, PluginInfo, PluginRequest, PluginResponse,
-        Version,
+        Capabilities, Guest, HandleResult, InitError, PluginInfo, PluginRequest,
     },
     zlayer::plugin::{
+        common::KeyValue,
         config,
         logging::{self, Level},
+        plugin_metadata::Version,
+        request_types::PluginResponse,
     },
 };
 
@@ -126,11 +129,11 @@ impl Guest for HelloPlugin {
             Level::Debug,
             "Received request",
             &[
-                zlayer_sdk::bindings::zlayer::plugin::common::KeyValue {
+                KeyValue {
                     key: String::from("request_id"),
                     value: request.request_id.clone(),
                 },
-                zlayer_sdk::bindings::zlayer::plugin::common::KeyValue {
+                KeyValue {
                     key: String::from("path"),
                     value: request.path.clone(),
                 },
@@ -200,7 +203,7 @@ fn handle_greet(request: &PluginRequest) -> HandleResult {
 
     HandleResult::Response(PluginResponse {
         status: 200,
-        headers: vec![zlayer_sdk::bindings::zlayer::plugin::common::KeyValue {
+        headers: vec![KeyValue {
             key: String::from("Content-Type"),
             value: String::from("text/plain; charset=utf-8"),
         }],
@@ -216,7 +219,7 @@ fn handle_echo(request: &PluginRequest) -> HandleResult {
 
     HandleResult::Response(PluginResponse {
         status: 200,
-        headers: vec![zlayer_sdk::bindings::zlayer::plugin::common::KeyValue {
+        headers: vec![KeyValue {
             key: String::from("Content-Type"),
             value: String::from("application/octet-stream"),
         }],
@@ -234,7 +237,7 @@ fn handle_info() -> HandleResult {
 
     HandleResult::Response(PluginResponse {
         status: 200,
-        headers: vec![zlayer_sdk::bindings::zlayer::plugin::common::KeyValue {
+        headers: vec![KeyValue {
             key: String::from("Content-Type"),
             value: String::from("application/json"),
         }],
@@ -245,4 +248,5 @@ fn handle_info() -> HandleResult {
 // Register the plugin implementation with the ZLayer runtime.
 // This macro generates the necessary FFI exports that allow the
 // WebAssembly runtime to call into our plugin.
-export_handler!(HelloPlugin);
+// The `with_types_in` parameter tells wit-bindgen where to find the generated types.
+export_handler!(HelloPlugin with_types_in zlayer_sdk::bindings);
