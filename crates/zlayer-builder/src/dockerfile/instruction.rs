@@ -127,6 +127,197 @@ impl Instruction {
     pub fn creates_layer(&self) -> bool {
         matches!(self, Self::Run(_) | Self::Copy(_) | Self::Add(_))
     }
+
+    /// Generate a cache key for this instruction.
+    ///
+    /// The key uniquely identifies the instruction and its parameters,
+    /// enabling cache hit detection when combined with the base layer digest.
+    ///
+    /// # Returns
+    ///
+    /// A 16-character hexadecimal string representing the hash of the instruction.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use zlayer_builder::dockerfile::Instruction;
+    /// use zlayer_builder::dockerfile::RunInstruction;
+    ///
+    /// let run = Instruction::Run(RunInstruction::shell("echo hello"));
+    /// let key = run.cache_key();
+    /// assert_eq!(key.len(), 16);
+    /// ```
+    pub fn cache_key(&self) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+
+        match self {
+            Self::Run(run) => {
+                "RUN".hash(&mut hasher);
+                // Hash the command representation
+                match &run.command {
+                    ShellOrExec::Shell(s) => {
+                        "shell".hash(&mut hasher);
+                        s.hash(&mut hasher);
+                    }
+                    ShellOrExec::Exec(args) => {
+                        "exec".hash(&mut hasher);
+                        args.hash(&mut hasher);
+                    }
+                }
+                // Include mounts in the hash - they affect layer content
+                for mount in &run.mounts {
+                    format!("{:?}", mount).hash(&mut hasher);
+                }
+                // Include network mode if set
+                if let Some(network) = &run.network {
+                    format!("{:?}", network).hash(&mut hasher);
+                }
+                // Include security mode if set
+                if let Some(security) = &run.security {
+                    format!("{:?}", security).hash(&mut hasher);
+                }
+            }
+            Self::Copy(copy) => {
+                "COPY".hash(&mut hasher);
+                copy.sources.hash(&mut hasher);
+                copy.destination.hash(&mut hasher);
+                copy.from.hash(&mut hasher);
+                copy.chown.hash(&mut hasher);
+                copy.chmod.hash(&mut hasher);
+                copy.link.hash(&mut hasher);
+                copy.exclude.hash(&mut hasher);
+            }
+            Self::Add(add) => {
+                "ADD".hash(&mut hasher);
+                add.sources.hash(&mut hasher);
+                add.destination.hash(&mut hasher);
+                add.chown.hash(&mut hasher);
+                add.chmod.hash(&mut hasher);
+                add.link.hash(&mut hasher);
+                add.checksum.hash(&mut hasher);
+                add.keep_git_dir.hash(&mut hasher);
+            }
+            Self::Env(env) => {
+                "ENV".hash(&mut hasher);
+                // Sort keys for deterministic hashing
+                let mut keys: Vec<_> = env.vars.keys().collect();
+                keys.sort();
+                for key in keys {
+                    key.hash(&mut hasher);
+                    env.vars.get(key).hash(&mut hasher);
+                }
+            }
+            Self::Workdir(path) => {
+                "WORKDIR".hash(&mut hasher);
+                path.hash(&mut hasher);
+            }
+            Self::Expose(expose) => {
+                "EXPOSE".hash(&mut hasher);
+                expose.port.hash(&mut hasher);
+                format!("{:?}", expose.protocol).hash(&mut hasher);
+            }
+            Self::Label(labels) => {
+                "LABEL".hash(&mut hasher);
+                // Sort keys for deterministic hashing
+                let mut keys: Vec<_> = labels.keys().collect();
+                keys.sort();
+                for key in keys {
+                    key.hash(&mut hasher);
+                    labels.get(key).hash(&mut hasher);
+                }
+            }
+            Self::User(user) => {
+                "USER".hash(&mut hasher);
+                user.hash(&mut hasher);
+            }
+            Self::Entrypoint(cmd) => {
+                "ENTRYPOINT".hash(&mut hasher);
+                match cmd {
+                    ShellOrExec::Shell(s) => {
+                        "shell".hash(&mut hasher);
+                        s.hash(&mut hasher);
+                    }
+                    ShellOrExec::Exec(args) => {
+                        "exec".hash(&mut hasher);
+                        args.hash(&mut hasher);
+                    }
+                }
+            }
+            Self::Cmd(cmd) => {
+                "CMD".hash(&mut hasher);
+                match cmd {
+                    ShellOrExec::Shell(s) => {
+                        "shell".hash(&mut hasher);
+                        s.hash(&mut hasher);
+                    }
+                    ShellOrExec::Exec(args) => {
+                        "exec".hash(&mut hasher);
+                        args.hash(&mut hasher);
+                    }
+                }
+            }
+            Self::Volume(paths) => {
+                "VOLUME".hash(&mut hasher);
+                paths.hash(&mut hasher);
+            }
+            Self::Shell(shell) => {
+                "SHELL".hash(&mut hasher);
+                shell.hash(&mut hasher);
+            }
+            Self::Arg(arg) => {
+                "ARG".hash(&mut hasher);
+                arg.name.hash(&mut hasher);
+                arg.default.hash(&mut hasher);
+            }
+            Self::Stopsignal(signal) => {
+                "STOPSIGNAL".hash(&mut hasher);
+                signal.hash(&mut hasher);
+            }
+            Self::Healthcheck(health) => {
+                "HEALTHCHECK".hash(&mut hasher);
+                match health {
+                    HealthcheckInstruction::None => {
+                        "none".hash(&mut hasher);
+                    }
+                    HealthcheckInstruction::Check {
+                        command,
+                        interval,
+                        timeout,
+                        start_period,
+                        start_interval,
+                        retries,
+                    } => {
+                        "check".hash(&mut hasher);
+                        match command {
+                            ShellOrExec::Shell(s) => {
+                                "shell".hash(&mut hasher);
+                                s.hash(&mut hasher);
+                            }
+                            ShellOrExec::Exec(args) => {
+                                "exec".hash(&mut hasher);
+                                args.hash(&mut hasher);
+                            }
+                        }
+                        interval.map(|d| d.as_nanos()).hash(&mut hasher);
+                        timeout.map(|d| d.as_nanos()).hash(&mut hasher);
+                        start_period.map(|d| d.as_nanos()).hash(&mut hasher);
+                        start_interval.map(|d| d.as_nanos()).hash(&mut hasher);
+                        retries.hash(&mut hasher);
+                    }
+                }
+            }
+            Self::Onbuild(inner) => {
+                "ONBUILD".hash(&mut hasher);
+                // Recursively hash the inner instruction
+                inner.cache_key().hash(&mut hasher);
+            }
+        }
+
+        format!("{:016x}", hasher.finish())
+    }
 }
 
 /// RUN instruction with optional BuildKit features
@@ -200,6 +391,110 @@ pub enum RunMount {
     },
 }
 
+impl RunMount {
+    /// Convert the mount specification to a buildah `--mount` argument string.
+    ///
+    /// Returns a string in the format `type=<type>,<option>=<value>,...`
+    /// suitable for use with `buildah run --mount=<result>`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use zlayer_builder::dockerfile::{RunMount, CacheSharing};
+    ///
+    /// let cache_mount = RunMount::Cache {
+    ///     target: "/var/cache/apt".to_string(),
+    ///     id: Some("apt-cache".to_string()),
+    ///     sharing: CacheSharing::Shared,
+    ///     readonly: false,
+    /// };
+    /// assert_eq!(
+    ///     cache_mount.to_buildah_arg(),
+    ///     "type=cache,target=/var/cache/apt,id=apt-cache,sharing=shared"
+    /// );
+    /// ```
+    pub fn to_buildah_arg(&self) -> String {
+        match self {
+            Self::Bind {
+                target,
+                source,
+                from,
+                readonly,
+            } => {
+                let mut parts = vec![format!("type=bind,target={}", target)];
+                if let Some(src) = source {
+                    parts.push(format!("source={}", src));
+                }
+                if let Some(from_stage) = from {
+                    parts.push(format!("from={}", from_stage));
+                }
+                if *readonly {
+                    parts.push("ro".to_string());
+                }
+                parts.join(",")
+            }
+            Self::Cache {
+                target,
+                id,
+                sharing,
+                readonly,
+            } => {
+                let mut parts = vec![format!("type=cache,target={}", target)];
+                if let Some(cache_id) = id {
+                    parts.push(format!("id={}", cache_id));
+                }
+                // Only add sharing if not the default (locked)
+                if *sharing != CacheSharing::Locked {
+                    parts.push(format!("sharing={}", sharing.as_str()));
+                }
+                if *readonly {
+                    parts.push("ro".to_string());
+                }
+                parts.join(",")
+            }
+            Self::Tmpfs { target, size } => {
+                let mut parts = vec![format!("type=tmpfs,target={}", target)];
+                if let Some(sz) = size {
+                    parts.push(format!("tmpfs-size={}", sz));
+                }
+                parts.join(",")
+            }
+            Self::Secret {
+                target,
+                id,
+                required,
+            } => {
+                let mut parts = vec![format!("type=secret,id={}", id)];
+                // Only add target if it's not empty (some secrets use default paths)
+                if !target.is_empty() {
+                    parts.push(format!("target={}", target));
+                }
+                if *required {
+                    parts.push("required".to_string());
+                }
+                parts.join(",")
+            }
+            Self::Ssh {
+                target,
+                id,
+                required,
+            } => {
+                let mut parts = vec!["type=ssh".to_string()];
+                if let Some(ssh_id) = id {
+                    parts.push(format!("id={}", ssh_id));
+                }
+                if !target.is_empty() {
+                    parts.push(format!("target={}", target));
+                }
+                if *required {
+                    parts.push("required".to_string());
+                }
+                parts.join(",")
+            }
+        }
+    }
+}
+
 /// Cache sharing mode for RUN --mount=type=cache
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum CacheSharing {
@@ -210,6 +505,17 @@ pub enum CacheSharing {
     Shared,
     /// Each build gets a private copy
     Private,
+}
+
+impl CacheSharing {
+    /// Returns the string representation for buildah mount arguments
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Locked => "locked",
+            Self::Shared => "shared",
+            Self::Private => "private",
+        }
+    }
 }
 
 /// Network mode for RUN --network
@@ -519,5 +825,245 @@ mod tests {
 
         let arg_with_default = ArgInstruction::with_default("VERSION", "1.0");
         assert_eq!(arg_with_default.default, Some("1.0".to_string()));
+    }
+
+    #[test]
+    fn test_cache_sharing_as_str() {
+        assert_eq!(CacheSharing::Locked.as_str(), "locked");
+        assert_eq!(CacheSharing::Shared.as_str(), "shared");
+        assert_eq!(CacheSharing::Private.as_str(), "private");
+    }
+
+    #[test]
+    fn test_run_mount_cache_to_buildah_arg() {
+        let mount = RunMount::Cache {
+            target: "/var/cache/apt".to_string(),
+            id: Some("apt-cache".to_string()),
+            sharing: CacheSharing::Shared,
+            readonly: false,
+        };
+        assert_eq!(
+            mount.to_buildah_arg(),
+            "type=cache,target=/var/cache/apt,id=apt-cache,sharing=shared"
+        );
+
+        // Test with default sharing (locked) - should not include sharing
+        let mount_locked = RunMount::Cache {
+            target: "/cache".to_string(),
+            id: None,
+            sharing: CacheSharing::Locked,
+            readonly: false,
+        };
+        assert_eq!(mount_locked.to_buildah_arg(), "type=cache,target=/cache");
+
+        // Test readonly
+        let mount_ro = RunMount::Cache {
+            target: "/cache".to_string(),
+            id: Some("mycache".to_string()),
+            sharing: CacheSharing::Locked,
+            readonly: true,
+        };
+        assert_eq!(
+            mount_ro.to_buildah_arg(),
+            "type=cache,target=/cache,id=mycache,ro"
+        );
+    }
+
+    #[test]
+    fn test_run_mount_bind_to_buildah_arg() {
+        let mount = RunMount::Bind {
+            target: "/app".to_string(),
+            source: Some("/src".to_string()),
+            from: Some("builder".to_string()),
+            readonly: true,
+        };
+        assert_eq!(
+            mount.to_buildah_arg(),
+            "type=bind,target=/app,source=/src,from=builder,ro"
+        );
+
+        // Minimal bind mount
+        let mount_minimal = RunMount::Bind {
+            target: "/app".to_string(),
+            source: None,
+            from: None,
+            readonly: false,
+        };
+        assert_eq!(mount_minimal.to_buildah_arg(), "type=bind,target=/app");
+    }
+
+    #[test]
+    fn test_run_mount_tmpfs_to_buildah_arg() {
+        let mount = RunMount::Tmpfs {
+            target: "/tmp".to_string(),
+            size: Some(1048576),
+        };
+        assert_eq!(
+            mount.to_buildah_arg(),
+            "type=tmpfs,target=/tmp,tmpfs-size=1048576"
+        );
+
+        let mount_no_size = RunMount::Tmpfs {
+            target: "/tmp".to_string(),
+            size: None,
+        };
+        assert_eq!(mount_no_size.to_buildah_arg(), "type=tmpfs,target=/tmp");
+    }
+
+    #[test]
+    fn test_run_mount_secret_to_buildah_arg() {
+        let mount = RunMount::Secret {
+            target: "/run/secrets/mysecret".to_string(),
+            id: "mysecret".to_string(),
+            required: true,
+        };
+        assert_eq!(
+            mount.to_buildah_arg(),
+            "type=secret,id=mysecret,target=/run/secrets/mysecret,required"
+        );
+
+        // Without target (uses default)
+        let mount_no_target = RunMount::Secret {
+            target: String::new(),
+            id: "mysecret".to_string(),
+            required: false,
+        };
+        assert_eq!(mount_no_target.to_buildah_arg(), "type=secret,id=mysecret");
+    }
+
+    #[test]
+    fn test_run_mount_ssh_to_buildah_arg() {
+        let mount = RunMount::Ssh {
+            target: "/root/.ssh".to_string(),
+            id: Some("default".to_string()),
+            required: true,
+        };
+        assert_eq!(
+            mount.to_buildah_arg(),
+            "type=ssh,id=default,target=/root/.ssh,required"
+        );
+
+        // Minimal SSH mount
+        let mount_minimal = RunMount::Ssh {
+            target: String::new(),
+            id: None,
+            required: false,
+        };
+        assert_eq!(mount_minimal.to_buildah_arg(), "type=ssh");
+    }
+
+    #[test]
+    fn test_cache_key_length() {
+        // All cache keys should be 16 hex characters
+        let run = Instruction::Run(RunInstruction::shell("echo hello"));
+        assert_eq!(run.cache_key().len(), 16);
+
+        let copy = Instruction::Copy(CopyInstruction::new(vec!["src".into()], "/app".into()));
+        assert_eq!(copy.cache_key().len(), 16);
+
+        let workdir = Instruction::Workdir("/app".into());
+        assert_eq!(workdir.cache_key().len(), 16);
+    }
+
+    #[test]
+    fn test_cache_key_deterministic() {
+        // Same instruction should produce the same cache key
+        let run1 = Instruction::Run(RunInstruction::shell("apt-get update"));
+        let run2 = Instruction::Run(RunInstruction::shell("apt-get update"));
+        assert_eq!(run1.cache_key(), run2.cache_key());
+
+        let copy1 = Instruction::Copy(CopyInstruction::new(vec!["src".into()], "/app".into()));
+        let copy2 = Instruction::Copy(CopyInstruction::new(vec!["src".into()], "/app".into()));
+        assert_eq!(copy1.cache_key(), copy2.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_different_for_different_instructions() {
+        // Different instructions should produce different cache keys
+        let run = Instruction::Run(RunInstruction::shell("echo hello"));
+        let workdir = Instruction::Workdir("echo hello".into());
+        assert_ne!(run.cache_key(), workdir.cache_key());
+
+        // Different commands should produce different cache keys
+        let run1 = Instruction::Run(RunInstruction::shell("apt-get update"));
+        let run2 = Instruction::Run(RunInstruction::shell("apt-get upgrade"));
+        assert_ne!(run1.cache_key(), run2.cache_key());
+
+        // Same sources, different destinations
+        let copy1 = Instruction::Copy(CopyInstruction::new(vec!["src".into()], "/app".into()));
+        let copy2 = Instruction::Copy(CopyInstruction::new(vec!["src".into()], "/opt".into()));
+        assert_ne!(copy1.cache_key(), copy2.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_shell_vs_exec() {
+        // Shell form vs exec form should produce different keys even with similar commands
+        let shell = Instruction::Run(RunInstruction::shell("echo hello"));
+        let exec = Instruction::Run(RunInstruction::exec(vec![
+            "echo".to_string(),
+            "hello".to_string(),
+        ]));
+        assert_ne!(shell.cache_key(), exec.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_with_mounts() {
+        // RUN with mounts should differ from RUN without mounts
+        let run_no_mount = Instruction::Run(RunInstruction::shell("apt-get install -y curl"));
+
+        let mut run_with_mount = RunInstruction::shell("apt-get install -y curl");
+        run_with_mount.mounts = vec![RunMount::Cache {
+            target: "/var/cache/apt".to_string(),
+            id: Some("apt-cache".to_string()),
+            sharing: CacheSharing::Shared,
+            readonly: false,
+        }];
+        let run_mounted = Instruction::Run(run_with_mount);
+
+        assert_ne!(run_no_mount.cache_key(), run_mounted.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_env_ordering() {
+        // ENV with same variables in different insertion order should have same key
+        // (because we sort keys before hashing)
+        let mut vars1 = HashMap::new();
+        vars1.insert("A".to_string(), "1".to_string());
+        vars1.insert("B".to_string(), "2".to_string());
+        let env1 = Instruction::Env(EnvInstruction::from_vars(vars1));
+
+        let mut vars2 = HashMap::new();
+        vars2.insert("B".to_string(), "2".to_string());
+        vars2.insert("A".to_string(), "1".to_string());
+        let env2 = Instruction::Env(EnvInstruction::from_vars(vars2));
+
+        assert_eq!(env1.cache_key(), env2.cache_key());
+    }
+
+    #[test]
+    fn test_cache_key_onbuild() {
+        // ONBUILD instructions should incorporate the inner instruction's cache key
+        let inner = RunInstruction::shell("echo hello");
+        let onbuild = Instruction::Onbuild(Box::new(Instruction::Run(inner.clone())));
+
+        // The ONBUILD key should be different from the inner RUN key
+        let run_key = Instruction::Run(inner).cache_key();
+        let onbuild_key = onbuild.cache_key();
+        assert_ne!(run_key, onbuild_key);
+    }
+
+    #[test]
+    fn test_cache_key_copy_with_options() {
+        // COPY with --from should differ from COPY without
+        let copy_simple = Instruction::Copy(CopyInstruction::new(
+            vec!["binary".into()],
+            "/app/binary".into(),
+        ));
+
+        let copy_from = Instruction::Copy(
+            CopyInstruction::new(vec!["binary".into()], "/app/binary".into()).from_stage("builder"),
+        );
+
+        assert_ne!(copy_simple.cache_key(), copy_from.cache_key());
     }
 }

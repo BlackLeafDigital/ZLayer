@@ -1,4 +1,14 @@
-FROM rust:latest
+# Stage 1: Chef base with cargo-chef installed
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+WORKDIR /workspace
+
+# Stage 2: Generate recipe.json (dependency manifest)
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+
+# Stage 3: Build dependencies (cached layer)
+FROM chef AS builder
 
 RUN apt-get update && apt-get install -y \
     protobuf-compiler \
@@ -8,9 +18,12 @@ RUN apt-get update && apt-get install -y \
     cmake \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace
-COPY . .
+# Copy recipe and build dependencies only
+COPY --from=planner /workspace/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json --package runtime
 
+# Copy source and build application (only rebuilds changed code)
+COPY . .
 RUN cargo build --release --package runtime
 
 # Output binaries to a known location for extraction

@@ -33,5 +33,17 @@ dirs = "5"
 ratatui = "0.29"
 crossterm = "0.28"
 
+# Cache backend (optional)
+zlayer-registry = { path = "../zlayer-registry", optional = true }
+
 [dev-dependencies]
 tempfile = "3"
+
+[features]
+default = []
+# Enable remote cache backend integration with zlayer-registry
+cache = ["zlayer-registry"]
+# Enable persistent disk-based cache (requires cache feature)
+cache-persistent = ["cache", "zlayer-registry/persistent"]
+# Enable S3-compatible storage backend (requires cache feature)
+cache-s3 = ["cache", "zlayer-registry/s3"]

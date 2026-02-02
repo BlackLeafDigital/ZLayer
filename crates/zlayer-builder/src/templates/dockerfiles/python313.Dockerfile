@@ -1,5 +1,6 @@
 # Multi-stage build for Python 3.13
 # Optimized for production with minimal image size
+# Uses cache mounts for faster rebuilds
 
 FROM python:3.13-slim AS builder
 WORKDIR /app
@@ -9,9 +10,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies to user directory
+# Install Python dependencies with pip cache mount
 COPY requirements.txt ./
-RUN pip install --no-cache-dir --user -r requirements.txt
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install --user -r requirements.txt
 
 FROM python:3.13-slim
 WORKDIR /app
