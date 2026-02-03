@@ -9,23 +9,22 @@ use crate::types::{ContainerLayerId, LayerSnapshot, PendingUpload, SyncState};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart as S3CompletedPart};
 use aws_sdk_s3::Client as S3Client;
-use redb::{Database, ReadableTable, TableDefinition};
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 
-const SYNC_STATE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("sync_state");
-const SNAPSHOT_META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshot_meta");
-
 /// Manages layer synchronization between local storage and S3
 pub struct LayerSyncManager {
     config: LayerStorageConfig,
     s3_client: S3Client,
-    db: Database,
+    pool: SqlitePool,
     /// In-memory cache of sync states
     states: Arc<RwLock<HashMap<String, SyncState>>>,
 }
@@ -60,76 +59,80 @@ impl LayerSyncManager {
 
         let s3_client = S3Client::from_conf(s3_config);
 
-        // Open/create database
-        let db = Database::create(&config.state_db_path)
+        // Open/create SQLite database
+        let db_url = format!("sqlite:{}?mode=rwc", config.state_db_path.display());
+        let connect_options = SqliteConnectOptions::from_str(&db_url)
+            .map_err(|e| LayerStorageError::Database(e.to_string()))?
+            .create_if_missing(true);
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(connect_options)
+            .await
             .map_err(|e| LayerStorageError::Database(e.to_string()))?;
 
-        // Initialize tables
-        {
-            let write_txn = db
-                .begin_write()
-                .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-            {
-                let _ = write_txn.open_table(SYNC_STATE_TABLE);
-                let _ = write_txn.open_table(SNAPSHOT_META_TABLE);
-            }
-            write_txn
-                .commit()
-                .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-        }
+        // Enable WAL mode for better concurrent access
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await
+            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
+
+        // Create sync_state table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS sync_state (
+                container_key TEXT PRIMARY KEY NOT NULL,
+                state_json TEXT NOT NULL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .map_err(|e| LayerStorageError::Database(e.to_string()))?;
 
         // Load existing states into memory
-        let states = Arc::new(RwLock::new(Self::load_all_states(&db)?));
+        let states = Arc::new(RwLock::new(Self::load_all_states(&pool).await?));
 
         Ok(Self {
             config,
             s3_client,
-            db,
+            pool,
             states,
         })
     }
 
-    fn load_all_states(db: &Database) -> Result<HashMap<String, SyncState>> {
-        let read_txn = db
-            .begin_read()
-            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-        let table = read_txn
-            .open_table(SYNC_STATE_TABLE)
-            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
+    async fn load_all_states(pool: &SqlitePool) -> Result<HashMap<String, SyncState>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT container_key, state_json FROM sync_state")
+                .fetch_all(pool)
+                .await
+                .map_err(|e| LayerStorageError::Database(e.to_string()))?;
 
         let mut states = HashMap::new();
-        let iter = table
-            .iter()
-            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-
-        for entry in iter {
-            let (key, value) = entry.map_err(|e| LayerStorageError::Database(e.to_string()))?;
-            let state: SyncState = serde_json::from_slice(value.value())?;
-            states.insert(key.value().to_string(), state);
+        for (key, json) in rows {
+            let state: SyncState = serde_json::from_str(&json)?;
+            states.insert(key, state);
         }
 
         Ok(states)
     }
 
-    fn save_state(&self, state: &SyncState) -> Result<()> {
+    async fn save_state(&self, state: &SyncState) -> Result<()> {
         let key = state.container_id.to_key();
-        let value = serde_json::to_vec(state)?;
+        let value = serde_json::to_string(state)?;
 
-        let write_txn = self
-            .db
-            .begin_write()
-            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-        {
-            let mut table = write_txn
-                .open_table(SYNC_STATE_TABLE)
-                .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-            table
-                .insert(key.as_str(), value.as_slice())
-                .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-        }
-        write_txn
-            .commit()
-            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO sync_state (container_key, state_json, updated_at)
+            VALUES (?, ?, CURRENT_TIMESTAMP)
+            "#,
+        )
+        .bind(&key)
+        .bind(&value)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| LayerStorageError::Database(e.to_string()))?;
 
         Ok(())
     }
@@ -142,7 +145,7 @@ impl LayerSyncManager {
 
         if let std::collections::hash_map::Entry::Vacant(e) = states.entry(key) {
             let state = SyncState::new(container_id);
-            self.save_state(&state)?;
+            self.save_state(&state).await?;
             e.insert(state);
             info!("Registered new container for layer sync");
         }
@@ -233,7 +236,7 @@ impl LayerSyncManager {
                 state.remote_digest = Some(snapshot.digest.clone());
                 state.last_sync = Some(chrono::Utc::now());
                 state.pending_upload = None;
-                self.save_state(state)?;
+                self.save_state(state).await?;
             }
         }
 
@@ -294,7 +297,7 @@ impl LayerSyncManager {
             let mut states = self.states.write().await;
             if let Some(state) = states.get_mut(&key) {
                 state.pending_upload = Some(pending.clone());
-                self.save_state(state)?;
+                self.save_state(state).await?;
             }
         }
 
@@ -423,7 +426,7 @@ impl LayerSyncManager {
                 let mut states = self.states.write().await;
                 if let Some(state) = states.get_mut(&key) {
                     state.pending_upload = None;
-                    self.save_state(state)?;
+                    self.save_state(state).await?;
                 }
 
                 return Err(LayerStorageError::UploadInterrupted(
@@ -509,7 +512,7 @@ impl LayerSyncManager {
                 state.remote_digest = Some(pending.digest.clone());
                 state.last_sync = Some(chrono::Utc::now());
                 state.pending_upload = None;
-                self.save_state(state)?;
+                self.save_state(state).await?;
             }
         }
 
@@ -598,7 +601,7 @@ impl LayerSyncManager {
             let mut states = self.states.write().await;
             if let Some(state) = states.get_mut(&key) {
                 state.local_digest = Some(remote_digest);
-                self.save_state(state)?;
+                self.save_state(state).await?;
             }
         }
 

@@ -27,6 +27,15 @@ pub enum LayerStorageError {
 
     #[error("Invalid state: {0}")]
     InvalidState(String),
+
+    #[error("WAL parse error: {0}")]
+    WalParse(String),
+
+    #[error("Replication error: {0}")]
+    Replication(String),
+
+    #[error("Restore failed: {0}")]
+    RestoreFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, LayerStorageError>;

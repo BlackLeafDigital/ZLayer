@@ -75,7 +75,7 @@ tar.workspace = true
 flate2.workspace = true
 
 # Embedded database
-redb = "2"
+sqlx.workspace = true
 
 # Temp directories for tests
 [dev-dependencies]
