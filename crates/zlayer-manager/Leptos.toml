@@ -1,0 +1,41 @@
+# Leptos configuration for cargo-leptos
+# zlayer-manager - Komodo-like management UI for ZLayer
+
+[package]
+# Name used for the WASM output artifacts
+output-name = "zlayer-manager"
+
+# The package in the workspace that contains the Leptos app
+lib-package = "zlayer-manager"
+bin-package = "zlayer-manager"
+
+# Site configuration
+site-root = "target/site"
+site-pkg-dir = "pkg"
+site-addr = "127.0.0.1:9120"
+
+# Tailwind v4 CSS input file
+tailwind-input-file = "./tailwind.css"
+
+# Features for compilation
+bin-features = ["ssr"]
+lib-features = ["hydrate"]
+
+# Binary target
+bin-target = "zlayer-manager"
+
+# WASM optimization settings
+[package.lib-profile-release]
+opt-level = 'z'
+lto = true
+
+# Development settings
+[package.watch]
+additional-files = ["src"]
+
+# Environment settings
+[env]
+LEPTOS_HASH_FILES = "true"
+LEPTOS_SITE_ROOT = "target/site"
+LEPTOS_SITE_PKG_DIR = "pkg"
+LEPTOS_OUTPUT_NAME = "zlayer-manager"

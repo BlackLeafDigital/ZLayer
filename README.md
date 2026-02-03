@@ -24,9 +24,9 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 - **WebAssembly Support** - First-class WASM runtime with WASIp1 & WASIp2 support via wasmtime
 - **Multi-Language WASM SDKs** - Build WASM workloads from Rust, Go, Python, TypeScript, C, Zig, and more
 - **Built-in Image Builder** - Dockerfile parser with buildah integration and runtime templates
-- **Encrypted Overlay Networks** - WireGuard-based mesh networking with IP allocation and health checking
+- **Encrypted Overlay Networks** - WireGuard-based mesh networking with IP allocation, DNS service discovery, and health checking
 - **Smart Scheduler** - Node placement with Shared/Dedicated/Exclusive allocation modes
-- **Built-in Proxy** - TLS termination, HTTP/2, load balancing on every node
+- **Built-in Proxy** - L7 (HTTP/HTTPS/WebSocket) and L4 (TCP/UDP) with TLS termination, load balancing on every node
 - **Adaptive Autoscaling** - Scale based on CPU, memory, or requests per second
 - **Init Actions** - Pre-start lifecycle hooks (wait for TCP, HTTP, S3 pull/push, run commands)
 - **Health Checks** - TCP, HTTP, and command-based health monitoring
@@ -78,7 +78,11 @@ graph TB
         IP[IP Allocator]
         Boot[Bootstrap]
         WG[WireGuard Mesh]
+        DNS[DNS Discovery]
+        TUN[Tunneling]
         IP --> Boot --> WG
+        Boot --> DNS
+        WG --> TUN
     end
 
     subgraph Storage[Storage Backends]
@@ -103,12 +107,14 @@ crates/
 ├── builder/        # Dockerfile parser, buildah integration, runtime templates
 ├── init_actions/   # Pre-start lifecycle actions (TCP, HTTP, S3, commands)
 ├── layer-storage/  # S3-backed layer persistence with crash-tolerant uploads
+├── manager/        # Web-based management UI (Leptos SSR + WASM)
 ├── observability/  # Metrics, logging, OpenTelemetry tracing
-├── overlay/        # WireGuard overlay networking, IP allocation, health checks
+├── overlay/        # WireGuard overlay networking, IP allocation, DNS discovery, health checks
 ├── proxy/          # L4/L7 proxy with TLS
 ├── registry/       # OCI image pulling and caching (with optional S3 backend)
 ├── scheduler/      # Raft-based distributed scheduler with placement logic
 ├── spec/           # Deployment specification types
+├── tunnel/         # Secure tunneling for node-to-node and on-demand service access
 └── zlayer-core/    # Shared types and configuration
 
 bin/
@@ -267,6 +273,139 @@ See [V1_SPEC.md](./V1_SPEC.md) for the complete specification.
 | `shared` | Containers bin-packed onto nodes with available capacity |
 | `dedicated` | Each replica gets its own node (1:1 mapping) |
 | `exclusive` | Service has nodes exclusively to itself (no other services) |
+
+### Protocol Support
+
+ZLayer's built-in proxy supports both L7 and L4 protocols:
+
+| Protocol | Type | Use Case |
+|----------|------|----------|
+| `http` | L7 | Web applications, REST APIs |
+| `https` | L7 | Secure web with auto-TLS |
+| `websocket` | L7 | Real-time bidirectional communication |
+| `tcp` | L4 | Databases, game servers, custom protocols |
+| `udp` | L4 | Game servers, DNS, VOIP |
+
+#### L4 TCP/UDP Proxying
+
+TCP and UDP endpoints are automatically proxied with load balancing:
+
+```yaml
+services:
+  postgres:
+    image: { name: postgres:16 }
+    endpoints:
+      - name: db
+        protocol: tcp
+        port: 5432
+        expose: public
+        stream:                    # Optional L4 configuration
+          tls: true                # TLS termination
+          health_check:
+            type: tcp_connect
+
+  game-server:
+    image: { name: my-game:latest }
+    endpoints:
+      - name: game
+        protocol: udp
+        port: 27015
+        expose: public
+        stream:
+          session_timeout: "120s"  # UDP session timeout
+          health_check:
+            type: udp_probe
+            request: "\\xFF\\xFF\\xFF\\xFFTSource Engine Query"
+```
+
+**Stream Configuration Options:**
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `tls` | bool | Enable TLS termination (TCP only) |
+| `proxy_protocol` | bool | Pass client IP via PROXY protocol |
+| `session_timeout` | string | UDP session timeout (default: 60s) |
+| `health_check` | object | L4 health check (tcp_connect or udp_probe) |
+
+### Tunneling
+
+ZLayer provides secure tunneling for accessing internal services, similar to Cloudflare Tunnel or Rathole.
+
+#### Use Cases
+- **SSH to containers** - Access containers without exposing overlay network
+- **Database access** - Securely expose PostgreSQL/MySQL through authenticated tunnels
+- **Home server exposure** - Expose services from NAT'd home server through cloud node
+- **On-demand access** - Temporary local access to internal services via CLI
+
+#### Node-to-Node Tunnels
+
+Expose services from one node through another:
+
+```bash
+# Expose Jellyfin from home server (nas) through cloud server (hetzner)
+zlayer tunnel add jellyfin \
+  --from nas \
+  --to hetzner \
+  --local-port 8096 \
+  --remote-port 8096 \
+  --expose public
+
+# List tunnels
+zlayer tunnel list
+
+# Check status
+zlayer tunnel status
+
+# Remove tunnel
+zlayer tunnel remove jellyfin
+```
+
+#### On-Demand Access
+
+Request temporary local access to internal services:
+
+```bash
+# Access internal postgres - creates local proxy
+zlayer tunnel access postgres:db --local-port 5432
+# Tunnel open at localhost:5432
+
+# Access with time limit
+zlayer tunnel access postgres:db --ttl 1h
+
+# List active sessions
+zlayer tunnel access list
+```
+
+#### Tunnel in Deployment Spec
+
+```yaml
+services:
+  postgres:
+    image: { name: postgres:16 }
+    endpoints:
+      - name: db
+        protocol: tcp
+        port: 5432
+        expose: internal
+        tunnel:
+          enabled: true
+          to: hetzner
+          remote_port: 15432
+          access:
+            enabled: true
+            max_ttl: "4h"
+            audit: true
+
+# Top-level tunnels (node-to-node)
+tunnels:
+  jellyfin:
+    from: nas
+    to: hetzner
+    local_port: 8096
+    remote_port: 8096
+    protocol: tcp
+    expose: public
+```
 
 ### Storage & Persistence
 
@@ -488,6 +627,31 @@ zlayer serve --bind 0.0.0.0:8080
 # With JWT secret
 zlayer serve --bind 0.0.0.0:8080 --jwt-secret <secret>
 ```
+
+### Management UI
+
+ZLayer includes a web-based management dashboard (similar to [Komodo](https://komo.do)):
+
+```bash
+# Connect to existing ZLayer API
+zlayer-manager --connect http://localhost:8080
+
+# With authentication
+zlayer-manager --connect http://localhost:8080 --token <JWT_TOKEN>
+
+# Custom port (default: 9120)
+zlayer-manager --port 9120
+```
+
+Access the dashboard at `http://localhost:9120`. Features include:
+- **Dashboard** - System overview, node counts, uptime
+- **Deployments** - Manage deployments and services
+- **Builds** - View build history and logs
+- **Nodes** - Monitor cluster nodes
+- **Overlay** - WireGuard mesh status, peer health, DNS discovery
+- **Settings** - Secrets management, cluster configuration
+
+See [crates/zlayer-manager/README.md](./crates/zlayer-manager/README.md) for development details.
 
 ### Token Management
 

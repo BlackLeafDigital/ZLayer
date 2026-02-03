@@ -18,7 +18,7 @@ use crate::s3_cache::{S3BlobCache, S3CacheConfig};
 const DEFAULT_CACHE_DIR: &str = "/var/lib/zlayer/cache";
 
 /// Default cache database filename
-const DEFAULT_CACHE_DB: &str = "blobs.redb";
+const DEFAULT_CACHE_DB: &str = "blobs.sqlite";
 
 /// Cache type configuration
 #[derive(Debug, Clone)]
@@ -26,7 +26,7 @@ pub enum CacheType {
     /// In-memory cache (non-persistent, cleared on restart)
     Memory,
 
-    /// Persistent disk-based cache using redb
+    /// Persistent disk-based cache using SQLite
     #[cfg(feature = "persistent")]
     Persistent {
         /// Path to the cache database file
@@ -156,7 +156,7 @@ impl CacheType {
 
             #[cfg(feature = "persistent")]
             CacheType::Persistent { path } => {
-                let cache = PersistentBlobCache::open(path)?;
+                let cache = PersistentBlobCache::open(path).await?;
                 Ok(Arc::new(Box::new(cache) as Box<dyn BlobCacheBackend>))
             }
 
@@ -276,9 +276,9 @@ mod tests {
         let cache = CacheType::persistent();
         assert!(cache.is_persistent());
 
-        let custom = CacheType::persistent_at("/tmp/test.redb");
+        let custom = CacheType::persistent_at("/tmp/test.sqlite");
         if let CacheType::Persistent { path } = custom {
-            assert_eq!(path, PathBuf::from("/tmp/test.redb"));
+            assert_eq!(path, PathBuf::from("/tmp/test.sqlite"));
         } else {
             panic!("expected Persistent variant");
         }
@@ -369,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn test_build_persistent_cache() {
         let temp_dir = tempfile::TempDir::new().unwrap();
-        let cache_path = temp_dir.path().join("test.redb");
+        let cache_path = temp_dir.path().join("test.sqlite");
 
         let cache_type = CacheType::persistent_at(&cache_path);
         let cache = cache_type.build().await.unwrap();

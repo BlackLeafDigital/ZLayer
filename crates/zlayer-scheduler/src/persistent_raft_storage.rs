@@ -1,4 +1,4 @@
-//! Persistent storage implementation for OpenRaft using redb
+//! Persistent storage implementation for OpenRaft using SQLx/SQLite
 //!
 //! Provides durable log storage and state machine for the scheduler's Raft consensus.
 //! Uses the RaftStorage v1 API which combines log and state machine storage.
@@ -11,7 +11,7 @@
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Create or open persistent storage
-//! let storage = PersistentRaftStorage::new("/var/lib/zlayer/raft.db")?;
+//! let storage = PersistentRaftStorage::new("/var/lib/zlayer/raft.db").await?;
 //!
 //! // Storage implements RaftStorage and can be used with OpenRaft
 //! // Storage automatically recovers state on restart
@@ -23,7 +23,7 @@
 //!
 //! - **Crash recovery**: Survives process restarts without data loss
 //! - **Snapshot support**: Efficient state snapshots for faster recovery
-//! - **ACID transactions**: redb provides transactional guarantees
+//! - **ACID transactions**: SQLite provides transactional guarantees
 //! - **No external dependencies**: Embedded database, no separate server needed
 
 // Allow large error types - OpenRaft's StorageError is inherently large
@@ -40,32 +40,59 @@ use openraft::{
     Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder, SnapshotMeta,
     StorageError, StoredMembership, Vote,
 };
-use redb::{Database, ReadableTable, TableDefinition};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::SqlitePool;
 use tokio::sync::RwLock;
+use tracing::{debug, info};
 
 use crate::raft::{ClusterState, NodeId, Response, TypeConfig};
 
 // =============================================================================
-// Table Definitions
+// Schema Definition
 // =============================================================================
 
-/// Log entries: log index -> serialized Entry
-const LOG_ENTRIES: TableDefinition<u64, &[u8]> = TableDefinition::new("log_entries");
+/// SQL schema for Raft storage tables
+const SCHEMA: &str = r"
+-- Raft log entries: log_index -> serialized Entry
+CREATE TABLE IF NOT EXISTS log_entries (
+    log_index INTEGER PRIMARY KEY NOT NULL,
+    entry_data BLOB NOT NULL
+);
 
-/// Log metadata: stores last purged log ID
-const LOG_METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("log_metadata");
+-- Log metadata: stores last purged log ID
+CREATE TABLE IF NOT EXISTS log_metadata (
+    key TEXT PRIMARY KEY NOT NULL,
+    value_data BLOB NOT NULL
+);
 
-/// Raft vote: stores current term and voted_for
-const RAFT_VOTE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_vote");
+-- Raft vote: stores current term and voted_for
+CREATE TABLE IF NOT EXISTS raft_vote (
+    key TEXT PRIMARY KEY NOT NULL,
+    value_data BLOB NOT NULL
+);
 
-/// Snapshot metadata: snapshot_id -> metadata
-const SNAPSHOT_METADATA: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshot_metadata");
+-- Snapshot metadata: snapshot_id -> metadata
+CREATE TABLE IF NOT EXISTS snapshot_metadata (
+    snapshot_id TEXT PRIMARY KEY NOT NULL,
+    metadata BLOB NOT NULL,
+    created_at INTEGER NOT NULL
+);
 
-/// Snapshot data: snapshot_id -> serialized ClusterState
-const SNAPSHOT_DATA: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshot_data");
+-- Snapshot data: snapshot_id -> serialized ClusterState
+CREATE TABLE IF NOT EXISTS snapshot_data (
+    snapshot_id TEXT PRIMARY KEY NOT NULL,
+    data BLOB NOT NULL
+);
 
-/// State machine applied state: stores last applied log ID and membership
-const SM_APPLIED_STATE: TableDefinition<&str, &[u8]> = TableDefinition::new("sm_applied_state");
+-- State machine applied state: stores last applied log ID and membership
+CREATE TABLE IF NOT EXISTS sm_applied_state (
+    key TEXT PRIMARY KEY NOT NULL,
+    value_data BLOB NOT NULL
+);
+
+-- Index for efficient snapshot ordering by creation time
+CREATE INDEX IF NOT EXISTS idx_snapshot_created_at ON snapshot_metadata(created_at DESC);
+";
 
 // =============================================================================
 // Serialization Helpers
@@ -96,129 +123,65 @@ struct AppliedState {
 }
 
 // =============================================================================
+// Error Helpers
+// =============================================================================
+
+/// Convert SQLx error to OpenRaft StorageError
+fn sqlx_to_storage_error(
+    subject: openraft::ErrorSubject<NodeId>,
+    verb: openraft::ErrorVerb,
+    e: sqlx::Error,
+) -> StorageError<NodeId> {
+    StorageError::from_io_error(subject, verb, std::io::Error::other(e))
+}
+
+/// Convert serde_json error to OpenRaft StorageError
+fn json_to_storage_error(
+    subject: openraft::ErrorSubject<NodeId>,
+    verb: openraft::ErrorVerb,
+    e: serde_json::Error,
+) -> StorageError<NodeId> {
+    StorageError::from_io_error(
+        subject,
+        verb,
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+    )
+}
+
+// =============================================================================
 // Persistent Log Store
 // =============================================================================
 
-/// Persistent log storage backed by redb
-#[derive(Debug)]
+/// Persistent log storage backed by SQLite
+#[derive(Debug, Clone)]
 pub struct PersistentLogStore {
-    db: Arc<Database>,
+    pool: SqlitePool,
 }
 
 impl PersistentLogStore {
     /// Create or open a persistent log store
-    pub fn new(path: impl AsRef<Path>) -> Result<Self, StorageError<NodeId>> {
-        let db = Database::create(path.as_ref()).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        // Initialize tables
-        let write_txn = db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        {
-            write_txn.open_table(LOG_ENTRIES).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            write_txn.open_table(LOG_METADATA).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            write_txn.open_table(RAFT_VOTE).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            write_txn.open_table(SNAPSHOT_METADATA).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            write_txn.open_table(SNAPSHOT_DATA).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            write_txn.open_table(SM_APPLIED_STATE).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-        }
-
-        write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        Ok(Self { db: Arc::new(db) })
+    pub async fn new(pool: SqlitePool) -> Result<Self, StorageError<NodeId>> {
+        Ok(Self { pool })
     }
 
     /// Get last purged log ID
-    fn get_last_purged(&self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        let read_txn = self.db.begin_read().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
+    async fn get_last_purged(&self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT value_data FROM log_metadata WHERE key = ?")
+                .bind("last_purged")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    sqlx_to_storage_error(
+                        openraft::ErrorSubject::Store,
+                        openraft::ErrorVerb::Read,
+                        e,
+                    )
+                })?;
 
-        let table = read_txn.open_table(LOG_METADATA).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        let metadata = table.get("last_purged").map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        if let Some(bytes) = metadata {
-            let meta: LogMetadata = serde_json::from_slice(bytes.value()).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-                )
+        if let Some((bytes,)) = row {
+            let meta: LogMetadata = serde_json::from_slice(&bytes).map_err(|e| {
+                json_to_storage_error(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, e)
             })?;
             Ok(meta.last_purged_log_id)
         } else {
@@ -226,104 +189,24 @@ impl PersistentLogStore {
         }
     }
 
-    /// Set last purged log ID
-    fn set_last_purged(&self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let write_txn = self.db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        {
-            let mut table = write_txn.open_table(LOG_METADATA).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            let meta = LogMetadata {
-                last_purged_log_id: Some(log_id),
-            };
-
-            let bytes = serde_json::to_vec(&meta).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            table.insert("last_purged", bytes.as_slice()).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-        }
-
-        write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        Ok(())
-    }
-
     /// Get last log entry
-    fn get_last_log(&self) -> Result<Option<Entry<TypeConfig>>, StorageError<NodeId>> {
-        let read_txn = self.db.begin_read().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
+    async fn get_last_log(&self) -> Result<Option<Entry<TypeConfig>>, StorageError<NodeId>> {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT entry_data FROM log_entries ORDER BY log_index DESC LIMIT 1")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    sqlx_to_storage_error(
+                        openraft::ErrorSubject::Store,
+                        openraft::ErrorVerb::Read,
+                        e,
+                    )
+                })?;
 
-        let table = read_txn.open_table(LOG_ENTRIES).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Store,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        // Get the last entry using reverse iteration
-        let last_entry = table
-            .iter()
-            .map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::other(e),
-                )
-            })?
-            .last();
-
-        if let Some(entry) = last_entry {
-            let (_, value) = entry.map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::other(e),
-                )
+        if let Some((bytes,)) = row {
+            let entry: Entry<TypeConfig> = serde_json::from_slice(&bytes).map_err(|e| {
+                json_to_storage_error(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, e)
             })?;
-
-            let entry: Entry<TypeConfig> = serde_json::from_slice(value.value()).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-                )
-            })?;
-
             Ok(Some(entry))
         } else {
             Ok(None)
@@ -335,50 +218,39 @@ impl PersistentLogStore {
 // Persistent State Machine
 // =============================================================================
 
-/// Persistent state machine backed by redb
-#[derive(Debug)]
+/// Persistent state machine backed by SQLite
+#[derive(Debug, Clone)]
 pub struct PersistentStateMachine {
-    db: Arc<Database>,
+    pool: SqlitePool,
 }
 
 impl PersistentStateMachine {
     /// Create or open a persistent state machine
-    pub fn new(db: Arc<Database>) -> Self {
-        Self { db }
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
     }
 
     /// Get the current applied state
-    fn get_applied_state(&self) -> Result<AppliedState, StorageError<NodeId>> {
-        let read_txn = self.db.begin_read().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
+    async fn get_applied_state(&self) -> Result<AppliedState, StorageError<NodeId>> {
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT value_data FROM sm_applied_state WHERE key = ?")
+                .bind("current")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    sqlx_to_storage_error(
+                        openraft::ErrorSubject::StateMachine,
+                        openraft::ErrorVerb::Read,
+                        e,
+                    )
+                })?;
 
-        let table = read_txn.open_table(SM_APPLIED_STATE).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        let state = table.get("current").map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        if let Some(bytes) = state {
-            let state: AppliedState = serde_json::from_slice(bytes.value()).map_err(|e| {
-                StorageError::from_io_error(
+        if let Some((bytes,)) = row {
+            let state: AppliedState = serde_json::from_slice(&bytes).map_err(|e| {
+                json_to_storage_error(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Read,
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+                    e,
                 )
             })?;
             Ok(state)
@@ -393,55 +265,34 @@ impl PersistentStateMachine {
     }
 
     /// Set the current applied state
-    fn set_applied_state(&self, state: &AppliedState) -> Result<(), StorageError<NodeId>> {
-        let write_txn = self.db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
+    async fn set_applied_state(&self, state: &AppliedState) -> Result<(), StorageError<NodeId>> {
+        let bytes = serde_json::to_vec(state).map_err(|e| {
+            json_to_storage_error(
                 openraft::ErrorSubject::StateMachine,
                 openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
+                e,
             )
         })?;
 
-        {
-            let mut table = write_txn.open_table(SM_APPLIED_STATE).map_err(|e| {
-                StorageError::from_io_error(
+        sqlx::query("INSERT OR REPLACE INTO sm_applied_state (key, value_data) VALUES (?, ?)")
+            .bind("current")
+            .bind(&bytes)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                sqlx_to_storage_error(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
+                    e,
                 )
             })?;
-
-            let bytes = serde_json::to_vec(state).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::StateMachine,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            table.insert("current", bytes.as_slice()).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::StateMachine,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-        }
-
-        write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
-        })?;
 
         Ok(())
     }
 
     /// Get the current cluster state
-    pub fn get_state(&self) -> Result<ClusterState, StorageError<NodeId>> {
-        let applied = self.get_applied_state()?;
+    pub async fn get_state(&self) -> Result<ClusterState, StorageError<NodeId>> {
+        let applied = self.get_applied_state().await?;
         Ok(applied.state)
     }
 }
@@ -453,24 +304,73 @@ impl PersistentStateMachine {
 /// Combined persistent storage for OpenRaft (v1 API)
 ///
 /// This implements the unified `RaftStorage` trait which combines
-/// log storage and state machine operations, backed by redb.
+/// log storage and state machine operations, backed by SQLite.
 pub struct PersistentRaftStorage {
     log_store: Arc<PersistentLogStore>,
     state_machine: Arc<RwLock<PersistentStateMachine>>,
-    db: Arc<Database>,
+    pool: SqlitePool,
+    db_path: PathBuf,
 }
 
 impl PersistentRaftStorage {
     /// Create or open persistent storage at the given path
-    pub fn new(path: impl AsRef<Path>) -> Result<Self, StorageError<NodeId>> {
-        let log_store = PersistentLogStore::new(path.as_ref())?;
-        let db = Arc::clone(&log_store.db);
-        let state_machine = PersistentStateMachine::new(Arc::clone(&db));
+    pub async fn new(path: impl AsRef<Path>) -> Result<Self, StorageError<NodeId>> {
+        let path = path.as_ref();
+
+        // Ensure parent directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    e,
+                )
+            })?;
+        }
+
+        // Configure SQLite connection with FULL synchronous mode for Raft safety
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Full) // FULL for Raft ACID requirements
+            .busy_timeout(std::time::Duration::from_secs(30));
+
+        // Create connection pool
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(options)
+            .await
+            .map_err(|e| {
+                StorageError::from_io_error(
+                    openraft::ErrorSubject::Store,
+                    openraft::ErrorVerb::Write,
+                    std::io::Error::other(format!(
+                        "Failed to open database at {}: {e}",
+                        path.display()
+                    )),
+                )
+            })?;
+
+        // Initialize schema
+        sqlx::query(SCHEMA).execute(&pool).await.map_err(|e| {
+            StorageError::from_io_error(
+                openraft::ErrorSubject::Store,
+                openraft::ErrorVerb::Write,
+                std::io::Error::other(format!("Failed to initialize schema: {e}")),
+            )
+        })?;
+
+        info!("Opened persistent Raft storage at {}", path.display());
+
+        let log_store = PersistentLogStore::new(pool.clone()).await?;
+        let state_machine = PersistentStateMachine::new(pool.clone());
 
         Ok(Self {
             log_store: Arc::new(log_store),
             state_machine: Arc::new(RwLock::new(state_machine)),
-            db,
+            pool,
+            db_path: path.to_path_buf(),
         })
     }
 
@@ -481,9 +381,7 @@ impl PersistentRaftStorage {
 
     /// Get the underlying database path
     pub fn db_path(&self) -> PathBuf {
-        // redb doesn't expose the path directly, so we'll need to track it
-        // For now, return a placeholder
-        PathBuf::from(".")
+        self.db_path.clone()
     }
 }
 
@@ -492,14 +390,17 @@ impl Clone for PersistentRaftStorage {
         Self {
             log_store: Arc::clone(&self.log_store),
             state_machine: Arc::clone(&self.state_machine),
-            db: Arc::clone(&self.db),
+            pool: self.pool.clone(),
+            db_path: self.db_path.clone(),
         }
     }
 }
 
 impl Debug for PersistentRaftStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PersistentRaftStorage").finish()
+        f.debug_struct("PersistentRaftStorage")
+            .field("db_path", &self.db_path)
+            .finish()
     }
 }
 
@@ -509,50 +410,44 @@ impl RaftLogReader<TypeConfig> for PersistentRaftStorage {
         &mut self,
         range: RB,
     ) -> Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
-        let read_txn = self.db.begin_read().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
+        // Convert range bounds to concrete values for SQL
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(&n) => n,
+            std::ops::Bound::Excluded(&n) => n.saturating_add(1),
+            std::ops::Bound::Unbounded => 0,
+        };
+
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(&n) => Some(n),
+            std::ops::Bound::Excluded(&n) => n.checked_sub(1),
+            std::ops::Bound::Unbounded => None,
+        };
+
+        let rows: Vec<(i64, Vec<u8>)> = if let Some(end_val) = end {
+            sqlx::query_as(
+                "SELECT log_index, entry_data FROM log_entries WHERE log_index >= ? AND log_index <= ? ORDER BY log_index",
             )
+            .bind(start as i64)
+            .bind(end_val as i64)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query_as(
+                "SELECT log_index, entry_data FROM log_entries WHERE log_index >= ? ORDER BY log_index",
+            )
+            .bind(start as i64)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| {
+            sqlx_to_storage_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Read, e)
         })?;
 
-        let table = read_txn.open_table(LOG_ENTRIES).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        let mut entries = Vec::new();
-
-        // Iterate over the range
-        let iter = table.range(range).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        for item in iter {
-            let (_, value) = item.map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::other(e),
-                )
+        let mut entries = Vec::with_capacity(rows.len());
+        for (_, bytes) in rows {
+            let entry: Entry<TypeConfig> = serde_json::from_slice(&bytes).map_err(|e| {
+                json_to_storage_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Read, e)
             })?;
-
-            let entry: Entry<TypeConfig> = serde_json::from_slice(value.value()).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-                )
-            })?;
-
             entries.push(entry);
         }
 
@@ -564,13 +459,13 @@ impl RaftLogReader<TypeConfig> for PersistentRaftStorage {
 impl RaftSnapshotBuilder<TypeConfig> for PersistentRaftStorage {
     async fn build_snapshot(&mut self) -> Result<Snapshot<TypeConfig>, StorageError<NodeId>> {
         let sm = self.state_machine.read().await;
-        let applied = sm.get_applied_state()?;
+        let applied = sm.get_applied_state().await?;
 
         let data = serde_json::to_vec(&applied.state).map_err(|e| {
-            StorageError::from_io_error(
+            json_to_storage_error(
                 openraft::ErrorSubject::StateMachine,
                 openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
+                e,
             )
         })?;
 
@@ -594,68 +489,61 @@ impl RaftSnapshotBuilder<TypeConfig> for PersistentRaftStorage {
             size: data.len() as u64,
         };
 
-        // Save snapshot to database
-        let write_txn = self.db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
+        let meta_bytes = serde_json::to_vec(&snapshot_record).map_err(|e| {
+            json_to_storage_error(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
+                e,
             )
         })?;
 
-        {
-            let mut meta_table = write_txn.open_table(SNAPSHOT_METADATA).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            let mut data_table = write_txn.open_table(SNAPSHOT_DATA).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            let meta_bytes = serde_json::to_vec(&snapshot_record).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            meta_table
-                .insert(snapshot_id.as_str(), meta_bytes.as_slice())
-                .map_err(|e| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::Snapshot(None),
-                        openraft::ErrorVerb::Write,
-                        std::io::Error::other(e),
-                    )
-                })?;
-
-            data_table
-                .insert(snapshot_id.as_str(), data.as_slice())
-                .map_err(|e| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::Snapshot(None),
-                        openraft::ErrorVerb::Write,
-                        std::io::Error::other(e),
-                    )
-                })?;
-        }
-
-        write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
+        // Save snapshot atomically using a transaction
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            sqlx_to_storage_error(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
+                e,
             )
         })?;
+
+        sqlx::query(
+            "INSERT OR REPLACE INTO snapshot_metadata (snapshot_id, metadata, created_at) VALUES (?, ?, ?)",
+        )
+        .bind(&snapshot_id)
+        .bind(&meta_bytes)
+        .bind(now as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            sqlx_to_storage_error(
+                openraft::ErrorSubject::Snapshot(None),
+                openraft::ErrorVerb::Write,
+                e,
+            )
+        })?;
+
+        sqlx::query("INSERT OR REPLACE INTO snapshot_data (snapshot_id, data) VALUES (?, ?)")
+            .bind(&snapshot_id)
+            .bind(&data)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                sqlx_to_storage_error(
+                    openraft::ErrorSubject::Snapshot(None),
+                    openraft::ErrorVerb::Write,
+                    e,
+                )
+            })?;
+
+        tx.commit().await.map_err(|e| {
+            sqlx_to_storage_error(
+                openraft::ErrorSubject::Snapshot(None),
+                openraft::ErrorVerb::Write,
+                e,
+            )
+        })?;
+
+        debug!("Built snapshot {} ({} bytes)", snapshot_id, data.len());
 
         let meta = SnapshotMeta {
             last_log_id: applied.last_applied_log,
@@ -679,83 +567,40 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
     // === Vote operations ===
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let write_txn = self.db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Vote,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
+        let bytes = serde_json::to_vec(vote).map_err(|e| {
+            json_to_storage_error(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
         })?;
 
-        {
-            let mut table = write_txn.open_table(RAFT_VOTE).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Vote,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
+        sqlx::query("INSERT OR REPLACE INTO raft_vote (key, value_data) VALUES (?, ?)")
+            .bind("current")
+            .bind(&bytes)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                sqlx_to_storage_error(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
             })?;
 
-            let bytes = serde_json::to_vec(vote).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Vote,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            table.insert("current", bytes.as_slice()).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Vote,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-        }
-
-        write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Vote,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
-        })?;
-
+        debug!("Saved vote: {:?}", vote);
         Ok(())
     }
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        let read_txn = self.db.begin_read().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Vote,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
+        let row: Option<(Vec<u8>,)> =
+            sqlx::query_as("SELECT value_data FROM raft_vote WHERE key = ?")
+                .bind("current")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    sqlx_to_storage_error(
+                        openraft::ErrorSubject::Vote,
+                        openraft::ErrorVerb::Read,
+                        e,
+                    )
+                })?;
 
-        let table = read_txn.open_table(RAFT_VOTE).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Vote,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        let vote = table.get("current").map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Vote,
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        if let Some(bytes) = vote {
-            let vote: Vote<NodeId> = serde_json::from_slice(bytes.value()).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Vote,
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, e),
-                )
+        if let Some((bytes,)) = row {
+            let vote: Vote<NodeId> = serde_json::from_slice(&bytes).map_err(|e| {
+                json_to_storage_error(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Read, e)
             })?;
             Ok(Some(vote))
         } else {
@@ -766,8 +611,8 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
     // === Log operations ===
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
-        let last_purged = self.log_store.get_last_purged()?;
-        let last = self.log_store.get_last_log()?.map(|e| e.log_id);
+        let last_purged = self.log_store.get_last_purged().await?;
+        let last = self.log_store.get_last_log().await?.map(|e| e.log_id);
 
         Ok(LogState {
             last_purged_log_id: last_purged,
@@ -783,52 +628,40 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
     {
-        let write_txn = self.db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        {
-            let mut table = write_txn.open_table(LOG_ENTRIES).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            for entry in entries {
-                let bytes = serde_json::to_vec(&entry).map_err(|e| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Write,
-                        std::io::Error::other(e),
-                    )
-                })?;
-
-                table
-                    .insert(entry.log_id.index, bytes.as_slice())
-                    .map_err(|e| {
-                        StorageError::from_io_error(
-                            openraft::ErrorSubject::Logs,
-                            openraft::ErrorVerb::Write,
-                            std::io::Error::other(e),
-                        )
-                    })?;
-            }
+        let entries: Vec<_> = entries.into_iter().collect();
+        if entries.is_empty() {
+            return Ok(());
         }
 
-        write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
+        // Use a transaction for atomic batch insert
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            sqlx_to_storage_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
         })?;
 
+        for entry in &entries {
+            let bytes = serde_json::to_vec(entry).map_err(|e| {
+                json_to_storage_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+            })?;
+
+            sqlx::query("INSERT OR REPLACE INTO log_entries (log_index, entry_data) VALUES (?, ?)")
+                .bind(entry.log_id.index as i64)
+                .bind(&bytes)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| {
+                    sqlx_to_storage_error(
+                        openraft::ErrorSubject::Logs,
+                        openraft::ErrorVerb::Write,
+                        e,
+                    )
+                })?;
+        }
+
+        tx.commit().await.map_err(|e| {
+            sqlx_to_storage_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+        })?;
+
+        debug!("Appended {} log entries", entries.len());
         Ok(())
     }
 
@@ -836,129 +669,63 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         &mut self,
         log_id: LogId<NodeId>,
     ) -> Result<(), StorageError<NodeId>> {
-        let write_txn = self.db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        {
-            let mut table = write_txn.open_table(LOG_ENTRIES).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
+        let result = sqlx::query("DELETE FROM log_entries WHERE log_index >= ?")
+            .bind(log_id.index as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                sqlx_to_storage_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
             })?;
 
-            // Collect keys to delete
-            let keys_to_delete: Vec<u64> = table
-                .range(log_id.index..)
-                .map_err(|e| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Read,
-                        std::io::Error::other(e),
-                    )
-                })?
-                .map(|item| {
-                    item.map(|(k, _)| k.value()).map_err(|e| {
-                        StorageError::from_io_error(
-                            openraft::ErrorSubject::Logs,
-                            openraft::ErrorVerb::Read,
-                            std::io::Error::other(e),
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            // Delete entries
-            for key in keys_to_delete {
-                table.remove(key).map_err(|e| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Write,
-                        std::io::Error::other(e),
-                    )
-                })?;
-            }
-        }
-
-        write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
-        })?;
-
+        debug!(
+            "Deleted {} conflict logs since index {}",
+            result.rows_affected(),
+            log_id.index
+        );
         Ok(())
     }
 
     async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let write_txn = self.db.begin_write().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
+        // Use a transaction to ensure atomicity
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            sqlx_to_storage_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
         })?;
 
-        {
-            let mut table = write_txn.open_table(LOG_ENTRIES).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    std::io::Error::other(e),
-                )
+        // Delete entries up to and including log_id
+        let result = sqlx::query("DELETE FROM log_entries WHERE log_index <= ?")
+            .bind(log_id.index as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                sqlx_to_storage_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
             })?;
 
-            // Collect keys to delete
-            let keys_to_delete: Vec<u64> = table
-                .range(..=log_id.index)
-                .map_err(|e| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Read,
-                        std::io::Error::other(e),
-                    )
-                })?
-                .map(|item| {
-                    item.map(|(k, _)| k.value()).map_err(|e| {
-                        StorageError::from_io_error(
-                            openraft::ErrorSubject::Logs,
-                            openraft::ErrorVerb::Read,
-                            std::io::Error::other(e),
-                        )
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-
-            // Delete entries
-            for key in keys_to_delete {
-                table.remove(key).map_err(|e| {
-                    StorageError::from_io_error(
-                        openraft::ErrorSubject::Logs,
-                        openraft::ErrorVerb::Write,
-                        std::io::Error::other(e),
-                    )
-                })?;
-            }
-        }
-
-        write_txn.commit().map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                std::io::Error::other(e),
-            )
+        // Update last purged log ID
+        let meta = LogMetadata {
+            last_purged_log_id: Some(log_id),
+        };
+        let meta_bytes = serde_json::to_vec(&meta).map_err(|e| {
+            json_to_storage_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
         })?;
 
-        // Update last purged log ID
-        self.log_store.set_last_purged(log_id)?;
+        sqlx::query("INSERT OR REPLACE INTO log_metadata (key, value_data) VALUES (?, ?)")
+            .bind("last_purged")
+            .bind(&meta_bytes)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| {
+                sqlx_to_storage_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+            })?;
 
+        tx.commit().await.map_err(|e| {
+            sqlx_to_storage_error(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
+        })?;
+
+        debug!(
+            "Purged {} logs up to index {}",
+            result.rows_affected(),
+            log_id.index
+        );
         Ok(())
     }
 
@@ -974,7 +741,7 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         StorageError<NodeId>,
     > {
         let sm = self.state_machine.read().await;
-        let applied = sm.get_applied_state()?;
+        let applied = sm.get_applied_state().await?;
         Ok((applied.last_applied_log, applied.last_membership))
     }
 
@@ -983,7 +750,7 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         entries: &[Entry<TypeConfig>],
     ) -> Result<Vec<Response>, StorageError<NodeId>> {
         let sm = self.state_machine.read().await;
-        let mut applied = sm.get_applied_state()?;
+        let mut applied = sm.get_applied_state().await?;
         let mut responses = Vec::new();
 
         for entry in entries {
@@ -1006,8 +773,9 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         }
 
         // Persist the updated state
-        sm.set_applied_state(&applied)?;
+        sm.set_applied_state(&applied).await?;
 
+        debug!("Applied {} entries to state machine", entries.len());
         Ok(responses)
     }
 
@@ -1030,10 +798,10 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
         let state: ClusterState = serde_json::from_slice(&data).map_err(|e| {
-            StorageError::from_io_error(
+            json_to_storage_error(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Read,
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+                e,
             )
         })?;
 
@@ -1044,88 +812,69 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         };
 
         let sm = self.state_machine.write().await;
-        sm.set_applied_state(&applied)?;
+        sm.set_applied_state(&applied).await?;
 
+        info!("Installed snapshot {}", meta.snapshot_id);
         Ok(())
     }
 
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        // Try to load the latest snapshot from disk
-        let read_txn = self.db.begin_read().map_err(|e| {
-            StorageError::from_io_error(
+        // Get the latest snapshot by created_at timestamp
+        let row: Option<(String, Vec<u8>)> = sqlx::query_as(
+            "SELECT snapshot_id, metadata FROM snapshot_metadata ORDER BY created_at DESC LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            sqlx_to_storage_error(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
+                e,
             )
         })?;
 
-        let meta_table = read_txn.open_table(SNAPSHOT_METADATA).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Snapshot(None),
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        let data_table = read_txn.open_table(SNAPSHOT_DATA).map_err(|e| {
-            StorageError::from_io_error(
-                openraft::ErrorSubject::Snapshot(None),
-                openraft::ErrorVerb::Read,
-                std::io::Error::other(e),
-            )
-        })?;
-
-        // Get the latest snapshot (last entry)
-        let latest_meta = meta_table
-            .iter()
-            .map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::other(e),
-                )
-            })?
-            .last();
-
-        if let Some(meta_entry) = latest_meta {
-            let (snapshot_id, meta_bytes) = meta_entry.map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::other(e),
-                )
-            })?;
-
-            let snapshot_record: SnapshotMetadataRecord =
-                serde_json::from_slice(meta_bytes.value()).map_err(|e| {
-                    StorageError::from_io_error(
+        if let Some((snapshot_id, meta_bytes)) = row {
+            let snapshot_record: SnapshotMetadataRecord = serde_json::from_slice(&meta_bytes)
+                .map_err(|e| {
+                    json_to_storage_error(
                         openraft::ErrorSubject::Snapshot(None),
                         openraft::ErrorVerb::Read,
-                        std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+                        e,
                     )
                 })?;
 
             // Load snapshot data
-            let data_bytes = data_table.get(snapshot_id.value()).map_err(|e| {
-                StorageError::from_io_error(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Read,
-                    std::io::Error::other(e),
-                )
-            })?;
+            let data_row: Option<(Vec<u8>,)> =
+                sqlx::query_as("SELECT data FROM snapshot_data WHERE snapshot_id = ?")
+                    .bind(&snapshot_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        sqlx_to_storage_error(
+                            openraft::ErrorSubject::Snapshot(None),
+                            openraft::ErrorVerb::Read,
+                            e,
+                        )
+                    })?;
 
-            if let Some(data) = data_bytes {
+            if let Some((data,)) = data_row {
                 let meta = SnapshotMeta {
                     last_log_id: snapshot_record.last_log_id,
                     last_membership: snapshot_record.last_membership,
                     snapshot_id: snapshot_record.snapshot_id,
                 };
 
+                debug!(
+                    "Loaded snapshot {} ({} bytes)",
+                    meta.snapshot_id,
+                    data.len()
+                );
+
                 Ok(Some(Snapshot {
                     meta,
-                    snapshot: Box::new(Cursor::new(data.value().to_vec())),
+                    snapshot: Box::new(Cursor::new(data)),
                 }))
             } else {
                 Ok(None)
@@ -1147,7 +896,7 @@ mod tests {
     async fn test_persistent_storage_log_operations() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let mut store = PersistentRaftStorage::new(&db_path).unwrap();
+        let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
 
         // Check initial state
         let log_state = RaftStorage::get_log_state(&mut store).await.unwrap();
@@ -1159,7 +908,7 @@ mod tests {
     async fn test_persistent_vote_operations() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let mut store = PersistentRaftStorage::new(&db_path).unwrap();
+        let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
 
         // Initially no vote
         let vote = RaftStorage::read_vote(&mut store).await.unwrap();
@@ -1178,7 +927,7 @@ mod tests {
     async fn test_persistent_log_append_and_read() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let mut store = PersistentRaftStorage::new(&db_path).unwrap();
+        let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
 
         let leader_id = CommittedLeaderId::new(1, 1);
         let log_id = LogId::new(leader_id, 1);
@@ -1207,7 +956,7 @@ mod tests {
     async fn test_persistent_state_machine_apply() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let mut store = PersistentRaftStorage::new(&db_path).unwrap();
+        let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
 
         let leader_id = CommittedLeaderId::new(1, 1);
         let log_id = LogId::new(leader_id, 1);
@@ -1233,7 +982,7 @@ mod tests {
         // Verify state was persisted
         let sm = store.state_machine();
         let sm = sm.read().await;
-        let state = sm.get_state().unwrap();
+        let state = sm.get_state().await.unwrap();
         let svc = state.get_service("test").unwrap();
         assert_eq!(svc.current_replicas, 3);
     }
@@ -1242,7 +991,7 @@ mod tests {
     async fn test_persistent_snapshot() {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
-        let mut store = PersistentRaftStorage::new(&db_path).unwrap();
+        let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
 
         // Build a snapshot
         let snapshot = RaftSnapshotBuilder::build_snapshot(&mut store)
@@ -1266,7 +1015,7 @@ mod tests {
 
         // Create and write data
         {
-            let mut store = PersistentRaftStorage::new(&db_path).unwrap();
+            let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
 
             let new_vote = Vote::new(1, 1);
             RaftStorage::save_vote(&mut store, &new_vote).await.unwrap();
@@ -1289,7 +1038,7 @@ mod tests {
 
         // Reopen and verify data persisted
         {
-            let mut store = PersistentRaftStorage::new(&db_path).unwrap();
+            let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
 
             let vote = RaftStorage::read_vote(&mut store).await.unwrap();
             assert_eq!(vote, Some(Vote::new(1, 1)));
@@ -1299,5 +1048,94 @@ mod tests {
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].log_id.index, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn test_log_purge() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
+
+        let leader_id = CommittedLeaderId::new(1, 1);
+
+        // Append multiple entries
+        let entries: Vec<Entry<TypeConfig>> = (1..=5)
+            .map(|i| Entry {
+                log_id: LogId::new(leader_id, i),
+                payload: EntryPayload::Normal(Request::RegisterNode {
+                    node_id: i,
+                    address: format!("127.0.0.1:{}", 8000 + i),
+                }),
+            })
+            .collect();
+
+        RaftStorage::append_to_log(&mut store, entries)
+            .await
+            .unwrap();
+
+        // Verify all entries exist
+        let mut reader = RaftStorage::get_log_reader(&mut store).await;
+        let all_entries = reader.try_get_log_entries(0..10).await.unwrap();
+        assert_eq!(all_entries.len(), 5);
+
+        // Purge up to index 3
+        let purge_log_id = LogId::new(leader_id, 3);
+        RaftStorage::purge_logs_upto(&mut store, purge_log_id)
+            .await
+            .unwrap();
+
+        // Verify only entries 4 and 5 remain
+        let mut reader = RaftStorage::get_log_reader(&mut store).await;
+        let remaining = reader.try_get_log_entries(0..10).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].log_id.index, 4);
+        assert_eq!(remaining[1].log_id.index, 5);
+
+        // Verify last_purged is updated
+        let log_state = RaftStorage::get_log_state(&mut store).await.unwrap();
+        assert_eq!(log_state.last_purged_log_id, Some(purge_log_id));
+    }
+
+    #[tokio::test]
+    async fn test_delete_conflict_logs() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
+
+        let leader_id = CommittedLeaderId::new(1, 1);
+
+        // Append multiple entries
+        let entries: Vec<Entry<TypeConfig>> = (1..=5)
+            .map(|i| Entry {
+                log_id: LogId::new(leader_id, i),
+                payload: EntryPayload::Blank,
+            })
+            .collect();
+
+        RaftStorage::append_to_log(&mut store, entries)
+            .await
+            .unwrap();
+
+        // Delete conflict logs since index 3
+        let conflict_log_id = LogId::new(leader_id, 3);
+        RaftStorage::delete_conflict_logs_since(&mut store, conflict_log_id)
+            .await
+            .unwrap();
+
+        // Verify only entries 1 and 2 remain
+        let mut reader = RaftStorage::get_log_reader(&mut store).await;
+        let remaining = reader.try_get_log_entries(0..10).await.unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].log_id.index, 1);
+        assert_eq!(remaining[1].log_id.index, 2);
+    }
+
+    #[tokio::test]
+    async fn test_db_path_accessor() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let store = PersistentRaftStorage::new(&db_path).await.unwrap();
+
+        assert_eq!(store.db_path(), db_path);
     }
 }

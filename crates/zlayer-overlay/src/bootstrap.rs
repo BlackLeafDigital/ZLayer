@@ -5,10 +5,11 @@
 
 use crate::allocator::IpAllocator;
 use crate::config::PeerInfo;
+use crate::dns::{peer_hostname, DnsConfig, DnsHandle, DnsServer, DEFAULT_DNS_PORT};
 use crate::error::{OverlayError, Result};
 use crate::wireguard::WireGuardManager;
 use serde::{Deserialize, Serialize};
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -81,6 +82,12 @@ pub struct PeerConfig {
     /// Optional persistent keepalive interval in seconds
     #[serde(default)]
     pub keepalive: Option<u16>,
+
+    /// Optional custom DNS hostname for this peer (without zone suffix)
+    /// If provided, the peer will be registered with this name in addition
+    /// to the auto-generated IP-based hostname.
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
 impl PeerConfig {
@@ -97,7 +104,14 @@ impl PeerConfig {
             endpoint,
             overlay_ip,
             keepalive: Some(DEFAULT_KEEPALIVE_SECS),
+            hostname: None,
         }
+    }
+
+    /// Set a custom DNS hostname for this peer
+    pub fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
+        self.hostname = Some(hostname.into());
+        self
     }
 
     /// Convert to PeerInfo for WireGuard configuration
@@ -145,6 +159,12 @@ pub struct OverlayBootstrap {
 
     /// IP allocator (only for leader nodes)
     allocator: Option<IpAllocator>,
+
+    /// DNS configuration (opt-in)
+    dns_config: Option<DnsConfig>,
+
+    /// DNS handle for managing records (available after start() if DNS enabled)
+    dns_handle: Option<DnsHandle>,
 }
 
 impl OverlayBootstrap {
@@ -207,6 +227,8 @@ impl OverlayBootstrap {
             peers: Vec::new(),
             data_dir: data_dir.to_path_buf(),
             allocator: Some(allocator),
+            dns_config: None,
+            dns_handle: None,
         };
 
         // Persist state
@@ -273,6 +295,7 @@ impl OverlayBootstrap {
             endpoint: leader_endpoint.to_string(),
             overlay_ip: leader_overlay_ip,
             keepalive: Some(DEFAULT_KEEPALIVE_SECS),
+            hostname: None, // Leader gets its own DNS alias "leader.zone"
         };
 
         info!(
@@ -286,6 +309,8 @@ impl OverlayBootstrap {
             peers: vec![leader_peer],
             data_dir: data_dir.to_path_buf(),
             allocator: None, // Workers don't manage IP allocation
+            dns_config: None,
+            dns_handle: None,
         };
 
         // Persist state
@@ -316,6 +341,8 @@ impl OverlayBootstrap {
             peers: state.peers,
             data_dir: data_dir.to_path_buf(),
             allocator,
+            dns_config: None, // DNS config must be re-enabled after load
+            dns_handle: None,
         })
     }
 
@@ -336,15 +363,61 @@ impl OverlayBootstrap {
         Ok(())
     }
 
+    /// Enable DNS service discovery for the overlay network
+    ///
+    /// When DNS is enabled, peers are automatically registered with both:
+    /// - An IP-based hostname: `node-X-Y.zone` (e.g., `node-0-5.overlay.local`)
+    /// - A custom hostname if provided in PeerConfig
+    ///
+    /// The leader node additionally gets a `leader.zone` alias.
+    ///
+    /// # Arguments
+    /// * `zone` - DNS zone (e.g., "overlay.local.")
+    /// * `port` - DNS server port (default: 15353 to avoid conflicts)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let bootstrap = OverlayBootstrap::init_leader(cidr, port, data_dir)
+    ///     .await?
+    ///     .with_dns("overlay.local.", 15353)?;
+    /// bootstrap.start().await?;
+    /// ```
+    pub fn with_dns(mut self, zone: &str, port: u16) -> Result<Self> {
+        self.dns_config = Some(DnsConfig {
+            zone: zone.to_string(),
+            port,
+            bind_addr: IpAddr::V4(self.config.node_ip),
+        });
+        Ok(self)
+    }
+
+    /// Enable DNS with default port (15353)
+    pub fn with_dns_default(self, zone: &str) -> Result<Self> {
+        self.with_dns(zone, DEFAULT_DNS_PORT)
+    }
+
+    /// Get the DNS handle for managing records
+    ///
+    /// Returns None if DNS is not enabled or start() hasn't been called yet.
+    pub fn dns_handle(&self) -> Option<&DnsHandle> {
+        self.dns_handle.as_ref()
+    }
+
+    /// Check if DNS is enabled
+    pub fn dns_enabled(&self) -> bool {
+        self.dns_config.is_some()
+    }
+
     /// Start the overlay network (create and configure WireGuard interface)
     ///
     /// This creates the WireGuard interface, assigns the overlay IP,
-    /// and configures all known peers.
-    pub async fn start(&self) -> Result<()> {
+    /// configures all known peers, and starts the DNS server if enabled.
+    pub async fn start(&mut self) -> Result<()> {
         info!(
             interface = %self.config.interface,
             overlay_ip = %self.config.node_ip,
             port = self.config.port,
+            dns_enabled = self.dns_config.is_some(),
             "Starting overlay network"
         );
 
@@ -387,6 +460,66 @@ impl OverlayBootstrap {
             .configure_interface(&peer_infos)
             .await
             .map_err(|e| OverlayError::WireGuardCommand(e.to_string()))?;
+
+        // Start DNS server if configured
+        if let Some(dns_config) = &self.dns_config {
+            info!(
+                zone = %dns_config.zone,
+                port = dns_config.port,
+                "Starting DNS server for overlay"
+            );
+
+            let dns_server =
+                DnsServer::from_config(dns_config).map_err(|e| OverlayError::Dns(e.to_string()))?;
+
+            // Register self with IP-based hostname
+            let self_hostname = peer_hostname(self.config.node_ip);
+            dns_server
+                .add_record(&self_hostname, self.config.node_ip)
+                .await
+                .map_err(|e| OverlayError::Dns(e.to_string()))?;
+
+            // If leader, also register "leader" alias
+            if self.config.is_leader {
+                dns_server
+                    .add_record("leader", self.config.node_ip)
+                    .await
+                    .map_err(|e| OverlayError::Dns(e.to_string()))?;
+                debug!(ip = %self.config.node_ip, "Registered leader.{}", dns_config.zone);
+            }
+
+            // Register existing peers
+            for peer in &self.peers {
+                // Always register IP-based hostname
+                let hostname = peer_hostname(peer.overlay_ip);
+                dns_server
+                    .add_record(&hostname, peer.overlay_ip)
+                    .await
+                    .map_err(|e| OverlayError::Dns(e.to_string()))?;
+
+                // Also register custom hostname if provided
+                if let Some(custom) = &peer.hostname {
+                    dns_server
+                        .add_record(custom, peer.overlay_ip)
+                        .await
+                        .map_err(|e| OverlayError::Dns(e.to_string()))?;
+                    debug!(
+                        hostname = custom,
+                        ip = %peer.overlay_ip,
+                        "Registered custom hostname"
+                    );
+                }
+            }
+
+            // Start the DNS server and store the handle
+            let handle = dns_server
+                .start()
+                .await
+                .map_err(|e| OverlayError::Dns(e.to_string()))?;
+            self.dns_handle = Some(handle);
+
+            info!("DNS server started successfully");
+        }
 
         info!("Overlay network started successfully");
         Ok(())
@@ -448,6 +581,26 @@ impl OverlayBootstrap {
             }
         }
 
+        // Register peer in DNS if enabled
+        if let Some(ref dns_handle) = self.dns_handle {
+            // IP-based hostname
+            let hostname = peer_hostname(overlay_ip);
+            dns_handle
+                .add_record(&hostname, overlay_ip)
+                .await
+                .map_err(|e| OverlayError::Dns(e.to_string()))?;
+            debug!(hostname = %hostname, ip = %overlay_ip, "Registered peer in DNS");
+
+            // Custom hostname alias if provided
+            if let Some(ref custom) = peer.hostname {
+                dns_handle
+                    .add_record(custom, overlay_ip)
+                    .await
+                    .map_err(|e| OverlayError::Dns(e.to_string()))?;
+                debug!(hostname = %custom, ip = %overlay_ip, "Registered custom hostname in DNS");
+            }
+        }
+
         // Add to peer list
         self.peers.push(peer);
 
@@ -469,9 +622,33 @@ impl OverlayBootstrap {
 
         let peer = &self.peers[peer_idx];
 
+        // Capture peer info for DNS removal before we lose the reference
+        let peer_overlay_ip = peer.overlay_ip;
+        let peer_custom_hostname = peer.hostname.clone();
+
         // Release IP if we're managing allocation
         if let Some(ref mut allocator) = self.allocator {
-            allocator.release(peer.overlay_ip);
+            allocator.release(peer_overlay_ip);
+        }
+
+        // Remove from DNS if enabled
+        if let Some(ref dns_handle) = self.dns_handle {
+            // Remove IP-based hostname
+            let hostname = peer_hostname(peer_overlay_ip);
+            dns_handle
+                .remove_record(&hostname)
+                .await
+                .map_err(|e| OverlayError::Dns(e.to_string()))?;
+            debug!(hostname = %hostname, "Removed peer from DNS");
+
+            // Remove custom hostname if it was set
+            if let Some(ref custom) = peer_custom_hostname {
+                dns_handle
+                    .remove_record(custom)
+                    .await
+                    .map_err(|e| OverlayError::Dns(e.to_string()))?;
+                debug!(hostname = %custom, "Removed custom hostname from DNS");
+            }
         }
 
         // Remove from WireGuard
@@ -604,6 +781,20 @@ mod tests {
 
         assert_eq!(peer.node_id, "node-1");
         assert_eq!(peer.keepalive, Some(DEFAULT_KEEPALIVE_SECS));
+        assert_eq!(peer.hostname, None);
+    }
+
+    #[test]
+    fn test_peer_config_with_hostname() {
+        let peer = PeerConfig::new(
+            "node-1".to_string(),
+            "pubkey123".to_string(),
+            "192.168.1.100:51820".to_string(),
+            "10.200.0.5".parse().unwrap(),
+        )
+        .with_hostname("web-server");
+
+        assert_eq!(peer.hostname, Some("web-server".to_string()));
     }
 
     #[test]

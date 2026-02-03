@@ -78,6 +78,8 @@ jobs:
             echo "crate_name=zlayer-scheduler" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == storage-v* ]]; then
             echo "crate_name=zlayer-storage" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" == tunnel-v* ]]; then
+            echo "crate_name=zlayer-tunnel" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == rust-sdk-v* ]]; then
             echo "sdk_name=rust" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == py-sdk-v* ]]; then
@@ -217,9 +219,10 @@ jobs:
             ["zlayer-init-actions"]="init"
             ["zlayer-registry"]="registry"
             ["zlayer-scheduler"]="scheduler"
+            ["zlayer-tunnel"]="tunnel"
           )
 
-          CRATES="zlayer-spec zlayer-observability zlayer-overlay zlayer-storage zlayer-core zlayer-builder zlayer-init-actions zlayer-registry zlayer-scheduler"
+          CRATES="zlayer-spec zlayer-observability zlayer-overlay zlayer-storage zlayer-core zlayer-builder zlayer-init-actions zlayer-registry zlayer-scheduler zlayer-tunnel"
 
           for crate in $CRATES; do
             prefix="${CRATE_TAGS[$crate]}"
@@ -389,7 +392,7 @@ jobs:
       - name: Login to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USER }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Login to GHCR
         uses: docker/login-action@v3

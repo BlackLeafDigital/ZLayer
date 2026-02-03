@@ -1,20 +1,17 @@
 //! Deployment storage implementations
 //!
-//! Provides both persistent (redb) and in-memory storage backends.
+//! Provides both persistent (SQLite via sqlx) and in-memory storage backends.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use redb::{Database, ReadableTable, TableDefinition};
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
 use super::StoredDeployment;
-
-/// Table definition for deployments in redb
-const DEPLOYMENTS_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("deployments");
 
 /// Storage errors
 #[derive(Debug, Error)]
@@ -36,38 +33,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
 }
 
-impl From<redb::Error> for StorageError {
-    fn from(err: redb::Error) -> Self {
-        StorageError::Database(err.to_string())
-    }
-}
-
-impl From<redb::DatabaseError> for StorageError {
-    fn from(err: redb::DatabaseError) -> Self {
-        StorageError::Database(err.to_string())
-    }
-}
-
-impl From<redb::TableError> for StorageError {
-    fn from(err: redb::TableError) -> Self {
-        StorageError::Database(err.to_string())
-    }
-}
-
-impl From<redb::TransactionError> for StorageError {
-    fn from(err: redb::TransactionError) -> Self {
-        StorageError::Database(err.to_string())
-    }
-}
-
-impl From<redb::CommitError> for StorageError {
-    fn from(err: redb::CommitError) -> Self {
-        StorageError::Database(err.to_string())
-    }
-}
-
-impl From<redb::StorageError> for StorageError {
-    fn from(err: redb::StorageError) -> Self {
+impl From<sqlx::Error> for StorageError {
+    fn from(err: sqlx::Error) -> Self {
         StorageError::Database(err.to_string())
     }
 }
@@ -99,65 +66,102 @@ pub trait DeploymentStorage: Send + Sync {
     }
 }
 
-/// Redb-based persistent storage for deployments
-pub struct RedbStorage {
-    db: Database,
+/// SQLite-based persistent storage for deployments using sqlx
+pub struct SqlxStorage {
+    pool: SqlitePool,
 }
 
-impl RedbStorage {
-    /// Open or create a redb database at the given path
-    pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
-        let db = Database::create(path)?;
+impl SqlxStorage {
+    /// Open or create a SQLite database at the given path
+    pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
+        let path_str = path.as_ref().display().to_string();
+        let connection_string = format!("sqlite:{}?mode=rwc", path_str);
 
-        // Initialize the table
-        let write_txn = db.begin_write()?;
-        {
-            // Create the table if it doesn't exist
-            let _table = write_txn.open_table(DEPLOYMENTS_TABLE)?;
-        }
-        write_txn.commit()?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(&connection_string)
+            .await?;
 
-        Ok(Self { db })
+        // Enable WAL mode for better concurrent access
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await?;
+        sqlx::query("PRAGMA busy_timeout=5000")
+            .execute(&pool)
+            .await?;
+
+        // Create the deployments table if it doesn't exist
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS deployments (
+                name TEXT PRIMARY KEY NOT NULL,
+                data_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
+
+        Ok(Self { pool })
     }
 
-    /// Create an in-memory redb database (useful for testing)
-    pub fn in_memory() -> Result<Self, StorageError> {
-        let db = Database::builder().create_with_backend(redb::backends::InMemoryBackend::new())?;
+    /// Create an in-memory SQLite database (useful for testing)
+    pub async fn in_memory() -> Result<Self, StorageError> {
+        let pool = SqlitePool::connect(":memory:").await?;
 
-        // Initialize the table
-        let write_txn = db.begin_write()?;
-        {
-            let _table = write_txn.open_table(DEPLOYMENTS_TABLE)?;
-        }
-        write_txn.commit()?;
+        // Create the deployments table
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS deployments (
+                name TEXT PRIMARY KEY NOT NULL,
+                data_json TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await?;
 
-        Ok(Self { db })
+        Ok(Self { pool })
     }
 }
 
 #[async_trait]
-impl DeploymentStorage for RedbStorage {
+impl DeploymentStorage for SqlxStorage {
     async fn store(&self, deployment: &StoredDeployment) -> Result<(), StorageError> {
-        let name = deployment.name.clone();
-        let data = serde_json::to_vec(deployment)?;
+        let data_json = serde_json::to_string(deployment)?;
+        let created_at = deployment.created_at.to_rfc3339();
+        let updated_at = deployment.updated_at.to_rfc3339();
 
-        let write_txn = self.db.begin_write()?;
-        {
-            let mut table = write_txn.open_table(DEPLOYMENTS_TABLE)?;
-            table.insert(name.as_str(), data.as_slice())?;
-        }
-        write_txn.commit()?;
+        sqlx::query(
+            r#"
+            INSERT OR REPLACE INTO deployments (name, data_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            "#,
+        )
+        .bind(&deployment.name)
+        .bind(&data_json)
+        .bind(&created_at)
+        .bind(&updated_at)
+        .execute(&self.pool)
+        .await?;
 
         Ok(())
     }
 
     async fn get(&self, name: &str) -> Result<Option<StoredDeployment>, StorageError> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(DEPLOYMENTS_TABLE)?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT data_json FROM deployments WHERE name = ?")
+                .bind(name)
+                .fetch_optional(&self.pool)
+                .await?;
 
-        match table.get(name)? {
-            Some(data) => {
-                let deployment: StoredDeployment = serde_json::from_slice(data.value())?;
+        match row {
+            Some((data_json,)) => {
+                let deployment: StoredDeployment = serde_json::from_str(&data_json)?;
                 Ok(Some(deployment))
             }
             None => Ok(None),
@@ -165,32 +169,27 @@ impl DeploymentStorage for RedbStorage {
     }
 
     async fn list(&self) -> Result<Vec<StoredDeployment>, StorageError> {
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(DEPLOYMENTS_TABLE)?;
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT data_json FROM deployments ORDER BY name")
+                .fetch_all(&self.pool)
+                .await?;
 
-        let mut deployments = Vec::new();
-        for entry in table.iter()? {
-            let (_, value) = entry?;
-            let deployment: StoredDeployment = serde_json::from_slice(value.value())?;
+        let mut deployments = Vec::with_capacity(rows.len());
+        for (data_json,) in rows {
+            let deployment: StoredDeployment = serde_json::from_str(&data_json)?;
             deployments.push(deployment);
         }
-
-        // Sort by name for consistent ordering
-        deployments.sort_by(|a, b| a.name.cmp(&b.name));
 
         Ok(deployments)
     }
 
     async fn delete(&self, name: &str) -> Result<bool, StorageError> {
-        let write_txn = self.db.begin_write()?;
-        let existed = {
-            let mut table = write_txn.open_table(DEPLOYMENTS_TABLE)?;
-            let result = table.remove(name)?;
-            result.is_some()
-        };
-        write_txn.commit()?;
+        let result = sqlx::query("DELETE FROM deployments WHERE name = ?")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
 
-        Ok(existed)
+        Ok(result.rows_affected() > 0)
     }
 }
 
@@ -289,6 +288,7 @@ mod tests {
             version: "v1".to_string(),
             deployment: name.to_string(),
             services,
+            tunnels: HashMap::new(),
         }
     }
 
@@ -397,12 +397,12 @@ mod tests {
     }
 
     // =========================================================================
-    // RedbStorage tests
+    // SqlxStorage tests
     // =========================================================================
 
     #[tokio::test]
-    async fn test_redb_store_and_get() {
-        let storage = RedbStorage::in_memory().unwrap();
+    async fn test_sqlx_store_and_get() {
+        let storage = SqlxStorage::in_memory().await.unwrap();
         let deployment = create_test_deployment("test-app");
 
         storage.store(&deployment).await.unwrap();
@@ -415,16 +415,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_redb_get_nonexistent() {
-        let storage = RedbStorage::in_memory().unwrap();
+    async fn test_sqlx_get_nonexistent() {
+        let storage = SqlxStorage::in_memory().await.unwrap();
 
         let result = storage.get("nonexistent").await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
-    async fn test_redb_list() {
-        let storage = RedbStorage::in_memory().unwrap();
+    async fn test_sqlx_list() {
+        let storage = SqlxStorage::in_memory().await.unwrap();
 
         storage
             .store(&create_test_deployment("app-c"))
@@ -448,8 +448,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_redb_delete() {
-        let storage = RedbStorage::in_memory().unwrap();
+    async fn test_sqlx_delete() {
+        let storage = SqlxStorage::in_memory().await.unwrap();
         let deployment = create_test_deployment("test-app");
 
         storage.store(&deployment).await.unwrap();
@@ -462,16 +462,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_redb_delete_nonexistent() {
-        let storage = RedbStorage::in_memory().unwrap();
+    async fn test_sqlx_delete_nonexistent() {
+        let storage = SqlxStorage::in_memory().await.unwrap();
 
         let deleted = storage.delete("nonexistent").await.unwrap();
         assert!(!deleted);
     }
 
     #[tokio::test]
-    async fn test_redb_exists() {
-        let storage = RedbStorage::in_memory().unwrap();
+    async fn test_sqlx_exists() {
+        let storage = SqlxStorage::in_memory().await.unwrap();
         let deployment = create_test_deployment("test-app");
 
         assert!(!storage.exists("test-app").await.unwrap());
@@ -482,8 +482,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_redb_update() {
-        let storage = RedbStorage::in_memory().unwrap();
+    async fn test_sqlx_update() {
+        let storage = SqlxStorage::in_memory().await.unwrap();
         let mut deployment = create_test_deployment("test-app");
 
         storage.store(&deployment).await.unwrap();
@@ -497,13 +497,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_redb_persistent_storage() {
+    async fn test_sqlx_persistent_storage() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.redb");
+        let db_path = temp_dir.path().join("test.db");
 
         // Create and populate database
         {
-            let storage = RedbStorage::open(&db_path).unwrap();
+            let storage = SqlxStorage::open(&db_path).await.unwrap();
             storage
                 .store(&create_test_deployment("persistent-app"))
                 .await
@@ -512,7 +512,7 @@ mod tests {
 
         // Reopen and verify data persists
         {
-            let storage = RedbStorage::open(&db_path).unwrap();
+            let storage = SqlxStorage::open(&db_path).await.unwrap();
             let deployment = storage.get("persistent-app").await.unwrap();
             assert!(deployment.is_some());
             assert_eq!(deployment.unwrap().name, "persistent-app");
@@ -520,8 +520,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_redb_failed_status_serialization() {
-        let storage = RedbStorage::in_memory().unwrap();
+    async fn test_sqlx_failed_status_serialization() {
+        let storage = SqlxStorage::in_memory().await.unwrap();
         let mut deployment = create_test_deployment("test-app");
         deployment.update_status(DeploymentStatus::Failed {
             message: "Container OOM killed".to_string(),

@@ -19,8 +19,11 @@ use crate::handlers::cron::CronState;
 use crate::handlers::deployments::DeploymentState;
 use crate::handlers::internal::InternalState;
 use crate::handlers::jobs::JobState;
+use crate::handlers::nodes::NodeApiState;
+use crate::handlers::overlay::OverlayApiState;
 use crate::handlers::secrets::SecretsState;
 use crate::handlers::services::ServiceState;
+use crate::handlers::tunnels::TunnelApiState;
 use crate::openapi::ApiDoc;
 use crate::ratelimit::{rate_limit_middleware, IpRateLimiter, RateLimitState};
 use crate::storage::{DeploymentStorage, InMemoryStorage};
@@ -540,6 +543,123 @@ pub fn build_router_with_internal_and_secrets(
     base_router.nest("/api/v1/secrets", secrets_routes)
 }
 
+/// Build routes for node management
+///
+/// Creates the routes for listing and managing cluster nodes.
+/// These routes require authentication.
+///
+/// # Arguments
+/// * `node_state` - State containing node management references
+///
+/// # Returns
+/// A Router with the node endpoints
+pub fn build_node_routes(node_state: NodeApiState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::nodes::list_nodes))
+        .route("/{id}", get(handlers::nodes::get_node))
+        .route("/{id}/labels", post(handlers::nodes::update_node_labels))
+        .route("/join-token", post(handlers::nodes::generate_join_token))
+        .with_state(node_state)
+}
+
+/// Build routes for overlay network status
+///
+/// Creates the routes for querying overlay network status.
+/// These endpoints provide information about the WireGuard overlay,
+/// peer health, IP allocation, and DNS service.
+///
+/// # Arguments
+/// * `overlay_state` - State containing overlay network references
+///
+/// # Returns
+/// A Router with the overlay endpoints
+pub fn build_overlay_routes(overlay_state: OverlayApiState) -> Router<()> {
+    Router::new()
+        .route("/status", get(handlers::overlay::get_overlay_status))
+        .route("/peers", get(handlers::overlay::get_overlay_peers))
+        .route("/ip-alloc", get(handlers::overlay::get_ip_allocation))
+        .route("/dns", get(handlers::overlay::get_dns_status))
+        .with_state(overlay_state)
+}
+
+/// Build the API router with nodes and overlay capabilities
+///
+/// This extends the services router with endpoints for node management
+/// and overlay network status.
+///
+/// # Arguments
+/// * `config` - API configuration
+/// * `storage` - Deployment storage backend
+/// * `service_manager` - ServiceManager for container lifecycle operations
+/// * `node_state` - State for node management endpoints
+/// * `overlay_state` - State for overlay network endpoints
+pub fn build_router_with_nodes_and_overlay(
+    config: &ApiConfig,
+    storage: Arc<dyn DeploymentStorage + Send + Sync>,
+    service_manager: Arc<RwLock<ServiceManager>>,
+    node_state: NodeApiState,
+    overlay_state: OverlayApiState,
+) -> Router {
+    // Start with the services router
+    let base_router = build_router_with_services(config, storage, service_manager);
+
+    // Build node and overlay routes
+    let node_routes = build_node_routes(node_state);
+    let overlay_routes = build_overlay_routes(overlay_state);
+
+    // Merge routes into API v1
+    base_router
+        .nest("/api/v1/nodes", node_routes)
+        .nest("/api/v1/overlay", overlay_routes)
+}
+
+/// Build routes for tunnel management
+///
+/// Creates the routes for creating, listing, and revoking tunnels.
+/// These routes require authentication.
+///
+/// # Arguments
+/// * `tunnel_state` - State containing tunnel storage
+///
+/// # Returns
+/// A Router with the tunnel endpoints
+pub fn build_tunnel_routes(tunnel_state: TunnelApiState) -> Router<()> {
+    Router::new()
+        .route("/", post(handlers::tunnels::create_tunnel))
+        .route("/", get(handlers::tunnels::list_tunnels))
+        .route("/{id}", delete(handlers::tunnels::revoke_tunnel))
+        .route("/{id}/status", get(handlers::tunnels::get_tunnel_status))
+        .route("/node", post(handlers::tunnels::create_node_tunnel))
+        .route(
+            "/node/{name}",
+            delete(handlers::tunnels::remove_node_tunnel),
+        )
+        .with_state(tunnel_state)
+}
+
+/// Build the API router with tunnel capabilities
+///
+/// This extends the basic router with endpoints for tunnel management.
+///
+/// # Arguments
+/// * `config` - API configuration
+/// * `storage` - Deployment storage backend
+/// * `tunnel_state` - State for tunnel management endpoints
+pub fn build_router_with_tunnels(
+    config: &ApiConfig,
+    storage: Arc<dyn DeploymentStorage + Send + Sync>,
+    tunnel_state: TunnelApiState,
+) -> Router {
+    // Start with the basic router with storage
+    let base_router = build_router_with_storage(config, storage);
+
+    // Build tunnel routes
+    let tunnel_routes = build_tunnel_routes(tunnel_state);
+
+    // Merge tunnel routes into API v1
+    base_router.nest("/api/v1/tunnels", tunnel_routes)
+}
+
 fn build_cors_layer(config: &ApiConfig) -> CorsLayer {
     let cors = CorsLayer::new().max_age(std::time::Duration::from_secs(config.cors.max_age));
 
@@ -629,5 +749,55 @@ mod tests {
 
         let _routes = build_internal_routes(internal_state);
         // Routes build without error
+    }
+
+    #[test]
+    fn test_build_node_routes() {
+        let node_state = NodeApiState::new();
+        let _routes = build_node_routes(node_state);
+        // Routes build without error
+    }
+
+    #[test]
+    fn test_build_overlay_routes() {
+        let overlay_state = OverlayApiState::new();
+        let _routes = build_overlay_routes(overlay_state);
+        // Routes build without error
+    }
+
+    #[test]
+    fn test_build_router_with_nodes_and_overlay() {
+        let config = ApiConfig::default();
+        let storage: Arc<dyn DeploymentStorage + Send + Sync> = Arc::new(InMemoryStorage::new());
+        let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));
+        let node_state = NodeApiState::new();
+        let overlay_state = OverlayApiState::new();
+
+        let _router = build_router_with_nodes_and_overlay(
+            &config,
+            storage,
+            service_manager,
+            node_state,
+            overlay_state,
+        );
+        // Router builds without error
+    }
+
+    #[test]
+    fn test_build_tunnel_routes() {
+        let tunnel_state = TunnelApiState::new();
+        let _routes = build_tunnel_routes(tunnel_state);
+        // Routes build without error
+    }
+
+    #[test]
+    fn test_build_router_with_tunnels() {
+        let config = ApiConfig::default();
+        let storage: Arc<dyn DeploymentStorage + Send + Sync> = Arc::new(InMemoryStorage::new());
+        let tunnel_state = TunnelApiState::new();
+
+        let _router = build_router_with_tunnels(&config, storage, tunnel_state);
+        // Router builds without error
     }
 }

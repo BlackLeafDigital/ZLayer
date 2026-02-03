@@ -41,7 +41,8 @@ pub use router::{
     build_internal_routes, build_router, build_router_full, build_router_with_builds,
     build_router_with_internal, build_router_with_internal_and_secrets, build_router_with_jobs,
     build_router_with_secrets, build_router_with_services, build_router_with_services_and_secrets,
-    build_router_with_storage, build_secrets_routes,
+    build_router_with_storage, build_router_with_tunnels, build_secrets_routes,
+    build_tunnel_routes,
 };
 pub use server::ApiServer;
 
@@ -55,9 +56,13 @@ pub use handlers::internal::{
 pub use handlers::jobs::JobState;
 pub use handlers::secrets::{CreateSecretRequest, SecretMetadataResponse, SecretsState};
 pub use handlers::services::ServiceState;
+pub use handlers::tunnels::{
+    CreateNodeTunnelRequest, CreateNodeTunnelResponse, CreateTunnelRequest, CreateTunnelResponse,
+    TunnelApiState, TunnelStatus, TunnelSummary,
+};
 
 // Re-export storage types
 pub use storage::{
-    DeploymentStatus, DeploymentStorage, InMemoryStorage, RedbStorage, StorageError,
+    DeploymentStatus, DeploymentStorage, InMemoryStorage, SqlxStorage, StorageError,
     StoredDeployment,
 };

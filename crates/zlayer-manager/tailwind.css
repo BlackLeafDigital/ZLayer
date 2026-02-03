@@ -1,0 +1,67 @@
+/* Tailwind CSS v4 - CSS-first configuration */
+/* No tailwind.config.js needed! */
+
+@import "tailwindcss";
+
+/* Source paths for class scanning */
+@source "./src/**/*.rs";
+
+/* DaisyUI plugin for component library */
+@plugin "daisyui" {
+  themes: light --default, dark --prefersdark, dracula;
+}
+
+/* Custom theme variables for ZLayer */
+@theme {
+  /* Primary colors */
+  --color-primary: #667eea;
+  --color-primary-dark: #818cf8;
+  --color-primary-light: #a5b4fc;
+
+  /* Status colors */
+  --color-success: #10b981;
+  --color-warning: #f59e0b;
+  --color-danger: #ef4444;
+  --color-info: #3b82f6;
+
+  /* Dark theme backgrounds */
+  --color-bg-dark: #0f172a;
+  --color-surface-dark: #1e293b;
+  --color-card-dark: #334155;
+
+  /* Text colors */
+  --color-text-primary: #f8fafc;
+  --color-text-secondary: #94a3b8;
+  --color-text-muted: #64748b;
+
+  /* Border colors */
+  --color-border: #334155;
+  --color-border-light: #475569;
+}
+
+/* Custom utility classes for ZLayer Manager */
+@layer components {
+  .zlm-card {
+    @apply bg-base-200 rounded-lg border border-base-300 shadow-sm;
+  }
+
+  .zlm-stat-value {
+    @apply text-3xl font-bold text-primary;
+  }
+
+  .zlm-stat-label {
+    @apply text-sm text-base-content/70;
+  }
+
+  .zlm-status-running {
+    @apply badge badge-success;
+  }
+
+  .zlm-status-stopped {
+    @apply badge badge-error;
+  }
+
+  .zlm-status-pending {
+    @apply badge badge-warning;
+  }
+}

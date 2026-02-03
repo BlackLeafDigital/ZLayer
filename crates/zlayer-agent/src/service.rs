@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
 use zlayer_overlay::DnsServer;
-use zlayer_proxy::{ResolvedService, ServiceRegistry};
+use zlayer_proxy::{ResolvedService, ServiceRegistry, StreamRegistry, StreamService};
 use zlayer_spec::{DependsSpec, Protocol, ResourceType, ServiceSpec};
 
 /// Service instance manages a single service's containers
@@ -380,8 +380,10 @@ pub struct ServiceManager {
     scale_semaphore: Arc<Semaphore>,
     /// Overlay network manager for container networking
     overlay_manager: Option<Arc<RwLock<OverlayManager>>>,
-    /// Service registry for Pingora proxy route registration
+    /// Service registry for Pingora proxy route registration (HTTP/HTTPS/WebSocket)
     service_registry: Option<Arc<ServiceRegistry>>,
+    /// Stream registry for L4 proxy route registration (TCP/UDP)
+    stream_registry: Option<Arc<StreamRegistry>>,
     /// Proxy manager for health-aware load balancing (hyper-based proxy)
     proxy_manager: Option<Arc<ProxyManager>>,
     /// DNS server for service discovery
@@ -407,6 +409,7 @@ impl ServiceManager {
             scale_semaphore: Arc::new(Semaphore::new(10)), // Max 10 concurrent scaling operations
             overlay_manager: None,
             service_registry: None,
+            stream_registry: None,
             proxy_manager: None,
             dns_server: None,
             deployment_name: None,
@@ -428,6 +431,7 @@ impl ServiceManager {
             scale_semaphore: Arc::new(Semaphore::new(10)),
             overlay_manager: Some(overlay_manager),
             service_registry: None,
+            stream_registry: None,
             proxy_manager: None,
             dns_server: None,
             deployment_name: None,
@@ -449,6 +453,7 @@ impl ServiceManager {
             scale_semaphore: Arc::new(Semaphore::new(10)),
             overlay_manager: None,
             service_registry: Some(service_registry),
+            stream_registry: None,
             proxy_manager: None,
             dns_server: None,
             deployment_name: None,
@@ -472,6 +477,7 @@ impl ServiceManager {
             scale_semaphore: Arc::new(Semaphore::new(10)),
             overlay_manager: Some(overlay_manager),
             service_registry: Some(service_registry),
+            stream_registry: None,
             proxy_manager: None,
             dns_server: None,
             deployment_name: Some(deployment_name),
@@ -498,9 +504,25 @@ impl ServiceManager {
         self.deployment_name = Some(name);
     }
 
-    /// Set the service registry for proxy integration
+    /// Set the service registry for proxy integration (HTTP/HTTPS/WebSocket)
     pub fn set_service_registry(&mut self, registry: Arc<ServiceRegistry>) {
         self.service_registry = Some(registry);
+    }
+
+    /// Set the stream registry for L4 proxy integration (TCP/UDP)
+    pub fn set_stream_registry(&mut self, registry: Arc<StreamRegistry>) {
+        self.stream_registry = Some(registry);
+    }
+
+    /// Builder pattern: add stream registry for L4 proxy integration
+    pub fn with_stream_registry(mut self, registry: Arc<StreamRegistry>) -> Self {
+        self.stream_registry = Some(registry);
+        self
+    }
+
+    /// Get the stream registry (if configured)
+    pub fn stream_registry(&self) -> Option<&Arc<StreamRegistry>> {
+        self.stream_registry.as_ref()
     }
 
     /// Set the overlay manager for container networking
@@ -886,7 +908,7 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// Register service routes with the Pingora proxy ServiceRegistry
+    /// Register service routes with the Pingora proxy ServiceRegistry and StreamRegistry
     fn register_service_routes(
         &self,
         registry: &ServiceRegistry,
@@ -896,41 +918,114 @@ impl ServiceManager {
         let deployment = self.deployment_name.as_deref().unwrap_or("default");
 
         for endpoint in &spec.endpoints {
-            // Only register HTTP-compatible endpoints (http, https, websocket)
-            let use_tls = match endpoint.protocol {
-                Protocol::Http | Protocol::Websocket => false,
-                Protocol::Https => true,
-                Protocol::Tcp | Protocol::Udp => continue, // Skip non-HTTP protocols
-            };
+            match endpoint.protocol {
+                Protocol::Http | Protocol::Websocket => {
+                    // HTTP/WebSocket: register with ServiceRegistry (L7 proxy)
+                    let resolved = ResolvedService {
+                        name: service_name.to_string(),
+                        backends: vec![], // Backends are populated on scale operations
+                        use_tls: false,
+                        sni_hostname: format!("{}.{}.service", endpoint.name, service_name),
+                    };
 
-            let resolved = ResolvedService {
-                name: service_name.to_string(),
-                backends: vec![], // Backends are populated on scale operations
-                use_tls,
-                sni_hostname: format!("{}.{}.service", endpoint.name, service_name),
-            };
+                    // Generate the host pattern for this endpoint
+                    // Format: {endpoint_name}.{service_name}.{deployment}
+                    let host = format!("{}.{}.{}", endpoint.name, service_name, deployment);
 
-            // Generate the host pattern for this endpoint
-            // Format: {endpoint_name}.{service_name}.{deployment}
-            let host = format!("{}.{}.{}", endpoint.name, service_name, deployment);
+                    // Register with optional path prefix
+                    registry.register(&host, endpoint.path.as_deref(), resolved.clone());
 
-            // Register with optional path prefix
-            registry.register(&host, endpoint.path.as_deref(), resolved.clone());
+                    // Also register a simpler host pattern for convenience
+                    // Format: {service_name}.{deployment} (matches first endpoint)
+                    if endpoint.name == "http" || endpoint.name == "main" || endpoint.name == "web"
+                    {
+                        let simple_host = format!("{}.{}", service_name, deployment);
+                        registry.register(&simple_host, endpoint.path.as_deref(), resolved);
+                    }
 
-            // Also register a simpler host pattern for convenience
-            // Format: {service_name}.{deployment} (matches first endpoint)
-            if endpoint.name == "http" || endpoint.name == "main" || endpoint.name == "web" {
-                let simple_host = format!("{}.{}", service_name, deployment);
-                registry.register(&simple_host, endpoint.path.as_deref(), resolved);
+                    tracing::debug!(
+                        service = %service_name,
+                        endpoint = %endpoint.name,
+                        host = %host,
+                        path = ?endpoint.path,
+                        "Registered HTTP proxy route"
+                    );
+                }
+                Protocol::Https => {
+                    // HTTPS: register with ServiceRegistry (L7 proxy with TLS)
+                    let resolved = ResolvedService {
+                        name: service_name.to_string(),
+                        backends: vec![], // Backends are populated on scale operations
+                        use_tls: true,
+                        sni_hostname: format!("{}.{}.service", endpoint.name, service_name),
+                    };
+
+                    let host = format!("{}.{}.{}", endpoint.name, service_name, deployment);
+                    registry.register(&host, endpoint.path.as_deref(), resolved.clone());
+
+                    if endpoint.name == "https" || endpoint.name == "main" || endpoint.name == "web"
+                    {
+                        let simple_host = format!("{}.{}", service_name, deployment);
+                        registry.register(&simple_host, endpoint.path.as_deref(), resolved);
+                    }
+
+                    tracing::debug!(
+                        service = %service_name,
+                        endpoint = %endpoint.name,
+                        host = %host,
+                        path = ?endpoint.path,
+                        "Registered HTTPS proxy route"
+                    );
+                }
+                Protocol::Tcp => {
+                    // TCP: register with StreamRegistry (L4 proxy)
+                    if let Some(stream_registry) = &self.stream_registry {
+                        let stream_service = StreamService::new(
+                            service_name.to_string(),
+                            vec![], // Backends populated when containers start
+                        );
+                        stream_registry.register_tcp(endpoint.port, stream_service);
+
+                        tracing::debug!(
+                            service = %service_name,
+                            endpoint = %endpoint.name,
+                            port = endpoint.port,
+                            "Registered TCP stream route"
+                        );
+                    } else {
+                        tracing::warn!(
+                            service = %service_name,
+                            endpoint = %endpoint.name,
+                            port = endpoint.port,
+                            "TCP endpoint defined but StreamRegistry not configured - skipping"
+                        );
+                    }
+                }
+                Protocol::Udp => {
+                    // UDP: register with StreamRegistry (L4 proxy)
+                    if let Some(stream_registry) = &self.stream_registry {
+                        let stream_service = StreamService::new(
+                            service_name.to_string(),
+                            vec![], // Backends populated when containers start
+                        );
+                        stream_registry.register_udp(endpoint.port, stream_service);
+
+                        tracing::debug!(
+                            service = %service_name,
+                            endpoint = %endpoint.name,
+                            port = endpoint.port,
+                            "Registered UDP stream route"
+                        );
+                    } else {
+                        tracing::warn!(
+                            service = %service_name,
+                            endpoint = %endpoint.name,
+                            port = endpoint.port,
+                            "UDP endpoint defined but StreamRegistry not configured - skipping"
+                        );
+                    }
+                }
             }
-
-            tracing::debug!(
-                service = %service_name,
-                endpoint = %endpoint.name,
-                host = %host,
-                path = ?endpoint.path,
-                "Registered proxy route"
-            );
         }
     }
 
@@ -940,8 +1035,53 @@ impl ServiceManager {
             registry.update_backends(service_name, addrs);
             tracing::debug!(
                 service = %service_name,
-                "Updated proxy backends"
+                "Updated HTTP proxy backends"
             );
+        }
+    }
+
+    /// Update backend addresses in the StreamRegistry for TCP/UDP endpoints after scaling
+    fn update_stream_backends(&self, spec: &ServiceSpec, addrs: &[SocketAddr]) {
+        let Some(stream_registry) = &self.stream_registry else {
+            return;
+        };
+
+        for endpoint in &spec.endpoints {
+            match endpoint.protocol {
+                Protocol::Tcp => {
+                    // For TCP, construct backend addresses using the endpoint's port
+                    let tcp_backends: Vec<SocketAddr> = addrs
+                        .iter()
+                        .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
+                        .collect();
+
+                    stream_registry.update_tcp_backends(endpoint.port, tcp_backends);
+
+                    tracing::debug!(
+                        endpoint = %endpoint.name,
+                        port = endpoint.port,
+                        backend_count = addrs.len(),
+                        "Updated TCP stream backends"
+                    );
+                }
+                Protocol::Udp => {
+                    // For UDP, construct backend addresses using the endpoint's port
+                    let udp_backends: Vec<SocketAddr> = addrs
+                        .iter()
+                        .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
+                        .collect();
+
+                    stream_registry.update_udp_backends(endpoint.port, udp_backends);
+
+                    tracing::debug!(
+                        endpoint = %endpoint.name,
+                        port = endpoint.port,
+                        backend_count = addrs.len(),
+                        "Updated UDP stream backends"
+                    );
+                }
+                _ => {} // HTTP endpoints handled by update_proxy_backends
+            }
         }
     }
 
@@ -966,9 +1106,16 @@ impl ServiceManager {
         // from the overlay network or container runtime. For now, we construct
         // backend addresses based on the endpoint port and localhost (for same-node).
         // TODO: Get actual container addresses from overlay_manager or runtime
+        let addrs = self.collect_backend_addrs(instance, replicas).await;
+
+        // Update HTTP backends in ServiceRegistry
         if self.service_registry.is_some() {
-            let addrs = self.collect_backend_addrs(instance, replicas).await;
-            self.update_proxy_backends(name, addrs);
+            self.update_proxy_backends(name, addrs.clone());
+        }
+
+        // Update TCP/UDP backends in StreamRegistry
+        if self.stream_registry.is_some() {
+            self.update_stream_backends(&instance.spec, &addrs);
         }
 
         // Register new containers with supervisor for crash monitoring
@@ -1074,10 +1221,40 @@ impl ServiceManager {
             executor.unregister_job(name).await;
         }
 
-        // Unregister routes from the proxy service registry
+        // Unregister routes from the proxy service registry (HTTP/HTTPS/WebSocket)
         if let Some(registry) = &self.service_registry {
             registry.unregister_service(name);
-            tracing::debug!(service = %name, "Unregistered proxy routes");
+            tracing::debug!(service = %name, "Unregistered HTTP proxy routes");
+        }
+
+        // Unregister stream routes (TCP/UDP) from the stream registry
+        if let Some(stream_registry) = &self.stream_registry {
+            // Need to get the service spec to know which ports to unregister
+            let services = self.services.read().await;
+            if let Some(instance) = services.get(name) {
+                for endpoint in &instance.spec.endpoints {
+                    match endpoint.protocol {
+                        Protocol::Tcp => {
+                            stream_registry.unregister_tcp(endpoint.port);
+                            tracing::debug!(
+                                service = %name,
+                                port = endpoint.port,
+                                "Unregistered TCP stream route"
+                            );
+                        }
+                        Protocol::Udp => {
+                            stream_registry.unregister_udp(endpoint.port);
+                            tracing::debug!(
+                                service = %name,
+                                port = endpoint.port,
+                                "Unregistered UDP stream route"
+                            );
+                        }
+                        _ => {} // HTTP routes handled above
+                    }
+                }
+            }
+            drop(services); // Release read lock
         }
 
         // Unregister containers from the supervisor
@@ -2014,5 +2191,205 @@ services:
         let result = manager.start_container_supervisor();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("not configured"));
+    }
+
+    // ==================== Stream Registry Integration Tests ====================
+
+    fn mock_tcp_spec() -> ServiceSpec {
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+            r#"
+version: v1
+deployment: test
+services:
+  database:
+    rtype: service
+    image:
+      name: postgres:latest
+    endpoints:
+      - name: postgresql
+        protocol: tcp
+        port: 5432
+    scale:
+      mode: fixed
+      replicas: 1
+"#,
+        )
+        .unwrap()
+        .services
+        .remove("database")
+        .unwrap()
+    }
+
+    fn mock_udp_spec() -> ServiceSpec {
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+            r#"
+version: v1
+deployment: test
+services:
+  dns:
+    rtype: service
+    image:
+      name: dns:latest
+    endpoints:
+      - name: dns
+        protocol: udp
+        port: 53
+    scale:
+      mode: fixed
+      replicas: 1
+"#,
+        )
+        .unwrap()
+        .services
+        .remove("dns")
+        .unwrap()
+    }
+
+    fn mock_mixed_spec() -> ServiceSpec {
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+            r#"
+version: v1
+deployment: test
+services:
+  mixed:
+    rtype: service
+    image:
+      name: mixed:latest
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+      - name: grpc
+        protocol: tcp
+        port: 9000
+      - name: metrics
+        protocol: udp
+        port: 8125
+    scale:
+      mode: fixed
+      replicas: 1
+"#,
+        )
+        .unwrap()
+        .services
+        .remove("mixed")
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_service_manager_with_stream_registry_tcp() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let service_registry = Arc::new(ServiceRegistry::new());
+        let stream_registry = Arc::new(StreamRegistry::new());
+
+        let mut manager = ServiceManager::with_proxy(runtime, service_registry);
+        manager.set_stream_registry(stream_registry.clone());
+        manager.set_deployment_name("test".to_string());
+
+        // Add TCP-only service
+        let spec = mock_tcp_spec();
+        manager
+            .upsert_service("database".to_string(), spec)
+            .await
+            .unwrap();
+
+        // Verify TCP route was registered
+        assert_eq!(stream_registry.tcp_count(), 1);
+        assert!(stream_registry.tcp_ports().contains(&5432));
+
+        // Remove service and verify cleanup
+        manager.remove_service("database").await.unwrap();
+        assert_eq!(stream_registry.tcp_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_service_manager_with_stream_registry_udp() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let service_registry = Arc::new(ServiceRegistry::new());
+        let stream_registry = Arc::new(StreamRegistry::new());
+
+        let mut manager = ServiceManager::with_proxy(runtime, service_registry);
+        manager.set_stream_registry(stream_registry.clone());
+        manager.set_deployment_name("test".to_string());
+
+        // Add UDP-only service
+        let spec = mock_udp_spec();
+        manager
+            .upsert_service("dns".to_string(), spec)
+            .await
+            .unwrap();
+
+        // Verify UDP route was registered
+        assert_eq!(stream_registry.udp_count(), 1);
+        assert!(stream_registry.udp_ports().contains(&53));
+
+        // Remove service and verify cleanup
+        manager.remove_service("dns").await.unwrap();
+        assert_eq!(stream_registry.udp_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_service_manager_with_stream_registry_mixed() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let service_registry = Arc::new(ServiceRegistry::new());
+        let stream_registry = Arc::new(StreamRegistry::new());
+
+        let mut manager = ServiceManager::with_proxy(runtime, service_registry.clone());
+        manager.set_stream_registry(stream_registry.clone());
+        manager.set_deployment_name("test".to_string());
+
+        // Add mixed service (HTTP + TCP + UDP)
+        let spec = mock_mixed_spec();
+        manager
+            .upsert_service("mixed".to_string(), spec)
+            .await
+            .unwrap();
+
+        // Verify all routes were registered
+        assert!(service_registry.route_count() > 0); // HTTP routes
+        assert_eq!(stream_registry.tcp_count(), 1); // TCP: 9000
+        assert_eq!(stream_registry.udp_count(), 1); // UDP: 8125
+
+        assert!(stream_registry.tcp_ports().contains(&9000));
+        assert!(stream_registry.udp_ports().contains(&8125));
+
+        // Remove service and verify all cleanup
+        manager.remove_service("mixed").await.unwrap();
+        assert_eq!(service_registry.route_count(), 0);
+        assert_eq!(stream_registry.tcp_count(), 0);
+        assert_eq!(stream_registry.udp_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_service_manager_stream_registry_builder() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let stream_registry = Arc::new(StreamRegistry::new());
+
+        // Test builder pattern
+        let manager = ServiceManager::new(runtime).with_stream_registry(stream_registry.clone());
+
+        // Verify stream registry is accessible
+        assert!(manager.stream_registry().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_tcp_service_without_stream_registry() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+        let service_registry = Arc::new(ServiceRegistry::new());
+
+        // Manager without stream registry
+        let mut manager = ServiceManager::with_proxy(runtime, service_registry);
+        manager.set_deployment_name("test".to_string());
+
+        // Add TCP service - should log warning but not fail
+        let spec = mock_tcp_spec();
+        manager
+            .upsert_service("database".to_string(), spec)
+            .await
+            .unwrap();
+
+        // No stream registry to check, but service should be tracked
+        let services = manager.list_services().await;
+        assert!(services.contains(&"database".to_string()));
     }
 }

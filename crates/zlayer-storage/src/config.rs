@@ -3,6 +3,145 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// ============================================================================
+// SQLite Replicator Configuration
+// ============================================================================
+
+/// Configuration for SQLite WAL-based replication to S3
+///
+/// This configuration controls how the SQLite replicator monitors database changes
+/// and syncs them to S3 for persistence and disaster recovery.
+///
+/// # Example
+///
+/// ```rust
+/// use zlayer_storage::config::SqliteReplicatorConfig;
+/// use std::path::PathBuf;
+///
+/// let config = SqliteReplicatorConfig {
+///     db_path: PathBuf::from("/var/lib/myapp/data.db"),
+///     s3_bucket: "my-bucket".to_string(),
+///     s3_prefix: "sqlite-backups/myapp/".to_string(),
+///     cache_dir: PathBuf::from("/tmp/zlayer-replicator/cache"),
+///     max_cache_size: 100 * 1024 * 1024, // 100MB
+///     auto_restore: true,
+///     snapshot_interval_secs: 3600,
+/// };
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SqliteReplicatorConfig {
+    /// Path to the SQLite database file to replicate
+    pub db_path: PathBuf,
+
+    /// S3 bucket for storing backups
+    pub s3_bucket: String,
+
+    /// S3 key prefix for this database's backups
+    ///
+    /// The replicator will create the following structure under this prefix:
+    /// - `{prefix}/snapshots/` - Full database snapshots
+    /// - `{prefix}/wal/` - WAL segments
+    /// - `{prefix}/metadata.json` - Replication metadata
+    pub s3_prefix: String,
+
+    /// Local directory for caching WAL segments before upload
+    ///
+    /// This provides network tolerance - if S3 is temporarily unavailable,
+    /// WAL segments are cached here and uploaded when connectivity returns.
+    pub cache_dir: PathBuf,
+
+    /// Maximum size of the local cache in bytes
+    ///
+    /// When the cache exceeds this size, the oldest entries will be evicted
+    /// (and lost if not yet uploaded). Default: 100MB
+    #[serde(default = "default_max_cache_size")]
+    pub max_cache_size: u64,
+
+    /// Whether to automatically restore from S3 on startup if local DB is missing
+    ///
+    /// When enabled, the replicator will download and restore the database
+    /// from S3 if the local file doesn't exist. Default: true
+    #[serde(default = "default_auto_restore")]
+    pub auto_restore: bool,
+
+    /// Interval between full database snapshots in seconds
+    ///
+    /// Snapshots provide a restore point and allow cleanup of old WAL segments.
+    /// Default: 3600 (1 hour)
+    #[serde(default = "default_snapshot_interval")]
+    pub snapshot_interval_secs: u64,
+}
+
+fn default_max_cache_size() -> u64 {
+    100 * 1024 * 1024 // 100MB
+}
+
+fn default_auto_restore() -> bool {
+    true
+}
+
+fn default_snapshot_interval() -> u64 {
+    3600 // 1 hour
+}
+
+impl Default for SqliteReplicatorConfig {
+    fn default() -> Self {
+        Self {
+            db_path: PathBuf::new(),
+            s3_bucket: String::new(),
+            s3_prefix: "sqlite-replication/".to_string(),
+            cache_dir: PathBuf::from("/tmp/zlayer-replicator/cache"),
+            max_cache_size: default_max_cache_size(),
+            auto_restore: default_auto_restore(),
+            snapshot_interval_secs: default_snapshot_interval(),
+        }
+    }
+}
+
+impl SqliteReplicatorConfig {
+    /// Create a new config with the required fields
+    pub fn new(
+        db_path: impl Into<PathBuf>,
+        s3_bucket: impl Into<String>,
+        s3_prefix: impl Into<String>,
+    ) -> Self {
+        Self {
+            db_path: db_path.into(),
+            s3_bucket: s3_bucket.into(),
+            s3_prefix: s3_prefix.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Set the cache directory
+    pub fn with_cache_dir(mut self, cache_dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = cache_dir.into();
+        self
+    }
+
+    /// Set the maximum cache size
+    pub fn with_max_cache_size(mut self, size: u64) -> Self {
+        self.max_cache_size = size;
+        self
+    }
+
+    /// Set whether to auto-restore on startup
+    pub fn with_auto_restore(mut self, auto_restore: bool) -> Self {
+        self.auto_restore = auto_restore;
+        self
+    }
+
+    /// Set the snapshot interval
+    pub fn with_snapshot_interval(mut self, interval_secs: u64) -> Self {
+        self.snapshot_interval_secs = interval_secs;
+        self
+    }
+}
+
+// ============================================================================
+// Layer Storage Configuration
+// ============================================================================
+
 /// Configuration for S3-backed layer storage
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LayerStorageConfig {
@@ -70,7 +209,7 @@ impl Default for LayerStorageConfig {
             region: None,
             endpoint_url: None,
             staging_dir: PathBuf::from("/tmp/zlayer-storage/staging"),
-            state_db_path: PathBuf::from("/var/lib/zlayer/layer-state.redb"),
+            state_db_path: PathBuf::from("/var/lib/zlayer/layer-state.sqlite"),
             part_size_bytes: default_part_size(),
             max_concurrent_uploads: default_concurrent_uploads(),
             compression_level: default_compression_level(),

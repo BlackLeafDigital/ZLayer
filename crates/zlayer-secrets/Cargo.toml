@@ -32,15 +32,18 @@ rand.workspace = true
 secrecy = { version = "0.10", features = ["serde"] }
 zeroize = { version = "1.7", features = ["derive"] }
 
+# Time handling
+chrono.workspace = true
+
 # Storage (optional)
-redb = { workspace = true, optional = true }
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"], optional = true }
 
 # HashiCorp Vault (optional)
 vaultrs = { version = "0.7", optional = true }
 
 [features]
 default = ["persistent"]
-persistent = ["redb"]
+persistent = ["sqlx"]
 vault = ["vaultrs"]
 
 [dev-dependencies]

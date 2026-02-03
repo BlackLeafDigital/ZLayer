@@ -54,12 +54,13 @@ num_cpus = { workspace = true }
 serde_json.workspace = true
 
 # Storage (optional, for persistent feature)
-redb = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 
 # Testing utilities
 [dev-dependencies]
 tempfile = "3"
+wiremock = "0.6"
 
 [features]
-persistent = ["redb"]
+persistent = ["sqlx"]
 test-skip-http = []

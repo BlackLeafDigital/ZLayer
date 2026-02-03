@@ -3,7 +3,10 @@
 //! This module provides validators for all spec fields with proper error reporting.
 
 use crate::error::{ValidationError, ValidationErrorKind};
-use crate::types::{DeploymentSpec, EndpointSpec, ResourceType, ScaleSpec, ServiceSpec};
+use crate::types::{
+    DeploymentSpec, EndpointSpec, EndpointTunnelConfig, ResourceType, ScaleSpec, ServiceSpec,
+    TunnelAccessConfig, TunnelDefinition,
+};
 use cron::Schedule;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -565,6 +568,108 @@ pub fn validate_scale_range(min: u32, max: u32) -> Result<(), ValidationError> {
     }
 }
 
+// =============================================================================
+// Tunnel validation functions
+// =============================================================================
+
+/// Validate tunnel TTL format (e.g., "4h", "30m", "1d")
+pub fn validate_tunnel_ttl(ttl: &str) -> Result<(), validator::ValidationError> {
+    humantime::parse_duration(ttl).map(|_| ()).map_err(|e| {
+        make_validation_error(
+            "invalid_tunnel_ttl",
+            format!("invalid TTL format '{}': {}", ttl, e),
+        )
+    })
+}
+
+/// Validate a TunnelAccessConfig
+pub fn validate_tunnel_access_config(
+    config: &TunnelAccessConfig,
+    path: &str,
+) -> Result<(), ValidationError> {
+    if let Some(ref max_ttl) = config.max_ttl {
+        validate_tunnel_ttl(max_ttl).map_err(|e| ValidationError {
+            kind: ValidationErrorKind::InvalidTunnelTtl {
+                value: max_ttl.clone(),
+                reason: e
+                    .message
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|| "invalid duration format".to_string()),
+            },
+            path: format!("{}.access.max_ttl", path),
+        })?;
+    }
+    Ok(())
+}
+
+/// Validate an EndpointTunnelConfig
+pub fn validate_endpoint_tunnel_config(
+    config: &EndpointTunnelConfig,
+    path: &str,
+) -> Result<(), ValidationError> {
+    // remote_port: 0 means auto-assign, otherwise must be valid port
+    // Note: u16 already constrains to 0-65535, so no additional check needed
+
+    // Validate access config if present
+    if let Some(ref access) = config.access {
+        validate_tunnel_access_config(access, path)?;
+    }
+
+    Ok(())
+}
+
+/// Validate a top-level TunnelDefinition
+pub fn validate_tunnel_definition(
+    name: &str,
+    tunnel: &TunnelDefinition,
+) -> Result<(), ValidationError> {
+    let path = format!("tunnels.{}", name);
+
+    // Validate local_port (must be 1-65535, not 0)
+    if tunnel.local_port == 0 {
+        return Err(ValidationError {
+            kind: ValidationErrorKind::InvalidTunnelPort {
+                port: tunnel.local_port,
+                field: "local_port".to_string(),
+            },
+            path: format!("{}.local_port", path),
+        });
+    }
+
+    // Validate remote_port (must be 1-65535, not 0)
+    if tunnel.remote_port == 0 {
+        return Err(ValidationError {
+            kind: ValidationErrorKind::InvalidTunnelPort {
+                port: tunnel.remote_port,
+                field: "remote_port".to_string(),
+            },
+            path: format!("{}.remote_port", path),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validate all tunnels in a deployment spec
+pub fn validate_tunnels(spec: &DeploymentSpec) -> Result<(), ValidationError> {
+    // Validate top-level tunnels
+    for (name, tunnel) in &spec.tunnels {
+        validate_tunnel_definition(name, tunnel)?;
+    }
+
+    // Validate endpoint tunnels
+    for (service_name, service_spec) in &spec.services {
+        for (idx, endpoint) in service_spec.endpoints.iter().enumerate() {
+            if let Some(ref tunnel_config) = endpoint.tunnel {
+                let path = format!("services.{}.endpoints[{}].tunnel", service_name, idx);
+                validate_endpoint_tunnel_config(tunnel_config, &path)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,6 +856,8 @@ mod tests {
                 port: 8080,
                 path: None,
                 expose: ExposeType::Public,
+                stream: None,
+                tunnel: None,
             },
             EndpointSpec {
                 name: "grpc".to_string(),
@@ -758,6 +865,8 @@ mod tests {
                 port: 9090,
                 path: None,
                 expose: ExposeType::Internal,
+                stream: None,
+                tunnel: None,
             },
         ];
         assert!(validate_unique_endpoints(&endpoints).is_ok());
@@ -778,6 +887,8 @@ mod tests {
                 port: 8080,
                 path: None,
                 expose: ExposeType::Public,
+                stream: None,
+                tunnel: None,
             },
             EndpointSpec {
                 name: "http".to_string(), // duplicate name
@@ -785,6 +896,8 @@ mod tests {
                 port: 8443,
                 path: None,
                 expose: ExposeType::Public,
+                stream: None,
+                tunnel: None,
             },
         ];
         let result = validate_unique_endpoints(&endpoints);
@@ -903,5 +1016,127 @@ mod tests {
         assert!(validate_secret_reference("$S:@service/").is_err());
         // Service name must start with letter
         assert!(validate_secret_reference("$S:@123-service/secret").is_err());
+    }
+
+    // =========================================================================
+    // Tunnel validation tests
+    // =========================================================================
+
+    #[test]
+    fn test_validate_tunnel_ttl_valid() {
+        assert!(validate_tunnel_ttl("30m").is_ok());
+        assert!(validate_tunnel_ttl("4h").is_ok());
+        assert!(validate_tunnel_ttl("1d").is_ok());
+        assert!(validate_tunnel_ttl("1h 30m").is_ok());
+        assert!(validate_tunnel_ttl("2h30m").is_ok());
+    }
+
+    #[test]
+    fn test_validate_tunnel_ttl_invalid() {
+        assert!(validate_tunnel_ttl("").is_err());
+        assert!(validate_tunnel_ttl("invalid").is_err());
+        assert!(validate_tunnel_ttl("30").is_err()); // Missing unit
+        assert!(validate_tunnel_ttl("-1h").is_err()); // Negative
+    }
+
+    #[test]
+    fn test_validate_tunnel_definition_valid() {
+        let tunnel = TunnelDefinition {
+            from: "node-a".to_string(),
+            to: "node-b".to_string(),
+            local_port: 8080,
+            remote_port: 9000,
+            protocol: crate::types::TunnelProtocol::Tcp,
+            expose: ExposeType::Internal,
+        };
+        assert!(validate_tunnel_definition("test-tunnel", &tunnel).is_ok());
+    }
+
+    #[test]
+    fn test_validate_tunnel_definition_local_port_zero() {
+        let tunnel = TunnelDefinition {
+            from: "node-a".to_string(),
+            to: "node-b".to_string(),
+            local_port: 0,
+            remote_port: 9000,
+            protocol: crate::types::TunnelProtocol::Tcp,
+            expose: ExposeType::Internal,
+        };
+        let result = validate_tunnel_definition("test-tunnel", &tunnel);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err().kind,
+            ValidationErrorKind::InvalidTunnelPort { field, .. } if field == "local_port"
+        ));
+    }
+
+    #[test]
+    fn test_validate_tunnel_definition_remote_port_zero() {
+        let tunnel = TunnelDefinition {
+            from: "node-a".to_string(),
+            to: "node-b".to_string(),
+            local_port: 8080,
+            remote_port: 0,
+            protocol: crate::types::TunnelProtocol::Tcp,
+            expose: ExposeType::Internal,
+        };
+        let result = validate_tunnel_definition("test-tunnel", &tunnel);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err().kind,
+            ValidationErrorKind::InvalidTunnelPort { field, .. } if field == "remote_port"
+        ));
+    }
+
+    #[test]
+    fn test_validate_endpoint_tunnel_config_valid() {
+        let config = EndpointTunnelConfig {
+            enabled: true,
+            from: Some("node-1".to_string()),
+            to: Some("ingress".to_string()),
+            remote_port: 8080,
+            expose: Some(ExposeType::Public),
+            access: None,
+        };
+        assert!(validate_endpoint_tunnel_config(&config, "test.tunnel").is_ok());
+    }
+
+    #[test]
+    fn test_validate_endpoint_tunnel_config_with_access() {
+        let config = EndpointTunnelConfig {
+            enabled: true,
+            from: None,
+            to: None,
+            remote_port: 0, // auto-assign
+            expose: None,
+            access: Some(TunnelAccessConfig {
+                enabled: true,
+                max_ttl: Some("4h".to_string()),
+                audit: true,
+            }),
+        };
+        assert!(validate_endpoint_tunnel_config(&config, "test.tunnel").is_ok());
+    }
+
+    #[test]
+    fn test_validate_endpoint_tunnel_config_invalid_ttl() {
+        let config = EndpointTunnelConfig {
+            enabled: true,
+            from: None,
+            to: None,
+            remote_port: 0,
+            expose: None,
+            access: Some(TunnelAccessConfig {
+                enabled: true,
+                max_ttl: Some("invalid".to_string()),
+                audit: false,
+            }),
+        };
+        let result = validate_endpoint_tunnel_config(&config, "test.tunnel");
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err().kind,
+            ValidationErrorKind::InvalidTunnelTtl { .. }
+        ));
     }
 }

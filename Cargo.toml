@@ -17,7 +17,8 @@ members = [
   "crates/zlayer-py",
   "crates/zlayer-web",
   "crates/zlayer-secrets",
-  "bin/runtime",
+  "crates/zlayer-tunnel",
+  "bin/runtime", "crates/zlayer-manager",
 ]
 
 [workspace.package]
@@ -115,9 +116,11 @@ trust-dns-client = "0.23"
 
 # Storage
 redb = "2.2"
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 
 # Config
 config = "0.15"
+toml = "0.8"
 
 # UUID
 uuid = { version = "1.19", features = ["v4", "serde"] }
@@ -158,6 +161,12 @@ x509-parser = "0.18"
 
 # Concurrent hashmaps
 dashmap = "6"
+
+# Synchronization primitives
+parking_lot = "0.12"
+
+# Bytes
+bytes = "1"
 
 # System info
 num_cpus = "1.16"

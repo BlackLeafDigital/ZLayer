@@ -1,15 +1,15 @@
 //! Deployment storage traits and implementations
 //!
-//! This module provides persistent storage for deployment specifications.
+//! This module provides persistent storage for deployment specifications using SQLite.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use zlayer_api::storage::{DeploymentStorage, RedbStorage, StoredDeployment, DeploymentStatus};
+//! use zlayer_api::storage::{DeploymentStorage, SqlxStorage, StoredDeployment, DeploymentStatus};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let storage = RedbStorage::open("/tmp/deployments.redb")?;
+//! let storage = SqlxStorage::open("/tmp/deployments.db").await?;
 //! let deployments = storage.list().await?;
 //! # Ok(())
 //! # }
@@ -17,7 +17,7 @@
 
 mod deployments;
 
-pub use deployments::{DeploymentStorage, InMemoryStorage, RedbStorage, StorageError};
+pub use deployments::{DeploymentStorage, InMemoryStorage, SqlxStorage, StorageError};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -155,6 +155,7 @@ mod tests {
             version: "v1".to_string(),
             deployment: name.to_string(),
             services,
+            tunnels: HashMap::new(),
         }
     }
 

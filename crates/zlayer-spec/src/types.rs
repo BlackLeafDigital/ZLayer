@@ -176,6 +176,44 @@ pub struct DeploymentSpec {
     #[serde(default)]
     #[validate(nested)]
     pub services: HashMap<String, ServiceSpec>,
+
+    /// Top-level tunnel definitions (not tied to service endpoints)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub tunnels: HashMap<String, TunnelDefinition>,
+}
+
+/// Top-level tunnel definition (not tied to a service endpoint)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelDefinition {
+    /// Source node
+    pub from: String,
+
+    /// Destination node
+    pub to: String,
+
+    /// Local port on source
+    pub local_port: u16,
+
+    /// Remote port on destination
+    pub remote_port: u16,
+
+    /// Protocol (tcp/udp, defaults to tcp)
+    #[serde(default)]
+    pub protocol: TunnelProtocol,
+
+    /// Exposure type (defaults to internal)
+    #[serde(default)]
+    pub expose: ExposeType,
+}
+
+/// Protocol for tunnel connections (tcp or udp only)
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelProtocol {
+    #[default]
+    Tcp,
+    Udp,
 }
 
 /// Per-service specification
@@ -586,6 +624,61 @@ pub struct EndpointSpec {
     /// Exposure type
     #[serde(default = "default_expose")]
     pub expose: ExposeType,
+
+    /// Optional stream (L4) proxy configuration
+    /// Only applicable when protocol is tcp or udp
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<StreamEndpointConfig>,
+
+    /// Optional tunnel configuration for this endpoint
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tunnel: Option<EndpointTunnelConfig>,
+}
+
+/// Tunnel configuration for an endpoint
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointTunnelConfig {
+    /// Enable tunneling for this endpoint
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Source node name (defaults to service's node)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+
+    /// Destination node name (defaults to cluster ingress)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+
+    /// Remote port to expose (0 = auto-assign)
+    #[serde(default)]
+    pub remote_port: u16,
+
+    /// Override exposure for tunnel (public/internal)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expose: Option<ExposeType>,
+
+    /// On-demand access configuration
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<TunnelAccessConfig>,
+}
+
+/// On-demand access settings for `zlayer tunnel access`
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct TunnelAccessConfig {
+    /// Allow on-demand access via CLI
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Maximum session duration (e.g., "4h", "30m")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_ttl: Option<String>,
+
+    /// Log all access sessions
+    #[serde(default)]
+    pub audit: bool,
 }
 
 fn default_expose() -> ExposeType {
@@ -604,11 +697,50 @@ pub enum Protocol {
 }
 
 /// Exposure type
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum ExposeType {
     Public,
+    #[default]
     Internal,
+}
+
+/// Stream (L4) proxy configuration for TCP/UDP endpoints
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct StreamEndpointConfig {
+    /// Enable TLS termination for TCP (auto-provision cert)
+    #[serde(default)]
+    pub tls: bool,
+
+    /// Enable PROXY protocol for passing client IP
+    #[serde(default)]
+    pub proxy_protocol: bool,
+
+    /// Custom session timeout for UDP (default: 60s)
+    /// Format: duration string like "60s", "5m"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_timeout: Option<String>,
+
+    /// Health check configuration for L4
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<StreamHealthCheck>,
+}
+
+/// Health check types for stream (L4) endpoints
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StreamHealthCheck {
+    /// TCP connect check - verifies port is accepting connections
+    TcpConnect,
+    /// UDP probe - sends request and optionally validates response
+    UdpProbe {
+        /// Request payload to send (can use hex escapes like \\xFF)
+        request: String,
+        /// Expected response pattern (optional regex)
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expect: Option<String>,
+    },
 }
 
 /// Scaling configuration
@@ -1362,5 +1494,170 @@ services:
             }
             _ => panic!("Expected Named storage"),
         }
+    }
+
+    // ==========================================================================
+    // Tunnel configuration tests
+    // ==========================================================================
+
+    #[test]
+    fn test_endpoint_tunnel_config_basic() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  api:
+    image:
+      name: api:latest
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+        tunnel:
+          enabled: true
+          remote_port: 8080
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let endpoint = &spec.services["api"].endpoints[0];
+        let tunnel = endpoint.tunnel.as_ref().unwrap();
+        assert!(tunnel.enabled);
+        assert_eq!(tunnel.remote_port, 8080);
+        assert!(tunnel.from.is_none());
+        assert!(tunnel.to.is_none());
+    }
+
+    #[test]
+    fn test_endpoint_tunnel_config_full() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  api:
+    image:
+      name: api:latest
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+        tunnel:
+          enabled: true
+          from: node-1
+          to: ingress-node
+          remote_port: 9000
+          expose: public
+          access:
+            enabled: true
+            max_ttl: 4h
+            audit: true
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let endpoint = &spec.services["api"].endpoints[0];
+        let tunnel = endpoint.tunnel.as_ref().unwrap();
+        assert!(tunnel.enabled);
+        assert_eq!(tunnel.from, Some("node-1".to_string()));
+        assert_eq!(tunnel.to, Some("ingress-node".to_string()));
+        assert_eq!(tunnel.remote_port, 9000);
+        assert_eq!(tunnel.expose, Some(ExposeType::Public));
+
+        let access = tunnel.access.as_ref().unwrap();
+        assert!(access.enabled);
+        assert_eq!(access.max_ttl, Some("4h".to_string()));
+        assert!(access.audit);
+    }
+
+    #[test]
+    fn test_top_level_tunnel_definition() {
+        let yaml = r#"
+version: v1
+deployment: test
+services: {}
+tunnels:
+  db-tunnel:
+    from: app-node
+    to: db-node
+    local_port: 5432
+    remote_port: 5432
+    protocol: tcp
+    expose: internal
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let tunnel = spec.tunnels.get("db-tunnel").unwrap();
+        assert_eq!(tunnel.from, "app-node");
+        assert_eq!(tunnel.to, "db-node");
+        assert_eq!(tunnel.local_port, 5432);
+        assert_eq!(tunnel.remote_port, 5432);
+        assert_eq!(tunnel.protocol, TunnelProtocol::Tcp);
+        assert_eq!(tunnel.expose, ExposeType::Internal);
+    }
+
+    #[test]
+    fn test_top_level_tunnel_defaults() {
+        let yaml = r#"
+version: v1
+deployment: test
+services: {}
+tunnels:
+  simple-tunnel:
+    from: node-a
+    to: node-b
+    local_port: 3000
+    remote_port: 3000
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let tunnel = spec.tunnels.get("simple-tunnel").unwrap();
+        assert_eq!(tunnel.protocol, TunnelProtocol::Tcp); // default
+        assert_eq!(tunnel.expose, ExposeType::Internal); // default
+    }
+
+    #[test]
+    fn test_tunnel_protocol_udp() {
+        let yaml = r#"
+version: v1
+deployment: test
+services: {}
+tunnels:
+  udp-tunnel:
+    from: node-a
+    to: node-b
+    local_port: 5353
+    remote_port: 5353
+    protocol: udp
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let tunnel = spec.tunnels.get("udp-tunnel").unwrap();
+        assert_eq!(tunnel.protocol, TunnelProtocol::Udp);
+    }
+
+    #[test]
+    fn test_endpoint_without_tunnel() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  api:
+    image:
+      name: api:latest
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        let endpoint = &spec.services["api"].endpoints[0];
+        assert!(endpoint.tunnel.is_none());
+    }
+
+    #[test]
+    fn test_deployment_without_tunnels() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  api:
+    image:
+      name: api:latest
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.tunnels.is_empty());
     }
 }

@@ -110,6 +110,15 @@ pub enum ValidationErrorKind {
         available: usize,
         message: String,
     },
+
+    /// Invalid tunnel protocol (must be tcp or udp)
+    InvalidTunnelProtocol { protocol: String },
+
+    /// Invalid tunnel port (must be 0 or 1-65535)
+    InvalidTunnelPort { port: u16, field: String },
+
+    /// Invalid tunnel TTL format
+    InvalidTunnelTtl { value: String, reason: String },
 }
 
 impl fmt::Display for ValidationErrorKind {
@@ -166,6 +175,21 @@ impl fmt::Display for ValidationErrorKind {
                 "insufficient nodes: need {} but only {} available - {}",
                 required, available, message
             ),
+            Self::InvalidTunnelProtocol { protocol } => write!(
+                f,
+                "invalid tunnel protocol '{}' (must be tcp or udp)",
+                protocol
+            ),
+            Self::InvalidTunnelPort { port, field } => {
+                write!(
+                    f,
+                    "invalid tunnel {} port: {} (must be 0 or 1-65535)",
+                    field, port
+                )
+            }
+            Self::InvalidTunnelTtl { value, reason } => {
+                write!(f, "invalid tunnel max_ttl '{}': {}", value, reason)
+            }
         }
     }
 }

@@ -107,6 +107,11 @@ impl AuthUser {
         &self.claims.sub
     }
 
+    /// Get the subject (alias for id)
+    pub fn subject(&self) -> &str {
+        &self.claims.sub
+    }
+
     /// Check if user has a role
     pub fn has_role(&self, role: &str) -> bool {
         self.claims.has_role(role)

@@ -53,6 +53,31 @@
 //! bootstrap.start().await?;
 //! ```
 //!
+//! ## With DNS service discovery
+//!
+//! ```ignore
+//! use zlayer_overlay::OverlayBootstrap;
+//! use std::path::Path;
+//!
+//! // Enable DNS service discovery on the overlay
+//! let mut bootstrap = OverlayBootstrap::init_leader(
+//!     "10.200.0.0/16",
+//!     51820,
+//!     Path::new("/var/lib/zlayer"),
+//! )
+//! .await?
+//! .with_dns("overlay.local.", 15353)?;  // Zone and port
+//!
+//! bootstrap.start().await?;
+//!
+//! // Peers are auto-registered:
+//! // - node-0-1.overlay.local -> 10.200.0.1 (leader)
+//! // - leader.overlay.local -> 10.200.0.1 (alias)
+//!
+//! // Query DNS from another machine:
+//! // dig @10.200.0.1 -p 15353 node-0-1.overlay.local
+//! ```
+//!
 //! ## Health checking
 //!
 //! ```ignore
