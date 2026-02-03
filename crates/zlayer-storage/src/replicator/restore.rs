@@ -79,10 +79,7 @@ impl RestoreManager {
             .await?;
 
         if !wal_segments.is_empty() {
-            info!(
-                "Downloaded {} WAL segments to apply",
-                wal_segments.len()
-            );
+            info!("Downloaded {} WAL segments to apply", wal_segments.len());
 
             // Apply WAL segments
             self.apply_wal_segments(&temp_db_path, wal_segments).await?;
@@ -227,19 +224,13 @@ mod tests {
         let filename = wal_path.file_name().unwrap_or_default().to_string_lossy();
         wal_path.set_file_name(format!("{filename}-wal"));
 
-        assert_eq!(
-            wal_path,
-            PathBuf::from("/var/lib/app/data.sqlite-wal")
-        );
+        assert_eq!(wal_path, PathBuf::from("/var/lib/app/data.sqlite-wal"));
 
         // Derive SHM path
         let mut shm_path = db_path.clone();
         let filename = shm_path.file_name().unwrap_or_default().to_string_lossy();
         shm_path.set_file_name(format!("{filename}-shm"));
 
-        assert_eq!(
-            shm_path,
-            PathBuf::from("/var/lib/app/data.sqlite-shm")
-        );
+        assert_eq!(shm_path, PathBuf::from("/var/lib/app/data.sqlite-shm"));
     }
 }

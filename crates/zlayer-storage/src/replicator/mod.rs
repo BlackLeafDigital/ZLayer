@@ -135,7 +135,10 @@ impl SqliteReplicator {
     ///
     /// Returns an error if the cache directory cannot be created or if S3 client
     /// initialization fails.
-    pub async fn new(config: SqliteReplicatorConfig, s3_config: &LayerStorageConfig) -> Result<Self> {
+    pub async fn new(
+        config: SqliteReplicatorConfig,
+        s3_config: &LayerStorageConfig,
+    ) -> Result<Self> {
         // Ensure cache directory exists
         tokio::fs::create_dir_all(&config.cache_dir).await?;
 

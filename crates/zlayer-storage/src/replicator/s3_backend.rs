@@ -151,8 +151,7 @@ impl S3Backend {
 
         debug!(
             "WAL segment {} uploaded ({} bytes compressed)",
-            entry.sequence,
-            compressed_len
+            entry.sequence, compressed_len
         );
         Ok(())
     }
@@ -343,7 +342,14 @@ impl S3Backend {
     pub async fn get_metadata(&self) -> Result<ReplicationMetadata> {
         let key = self.metadata_key();
 
-        match self.client.get_object().bucket(&self.bucket).key(&key).send().await {
+        match self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(&key)
+            .send()
+            .await
+        {
             Ok(response) => {
                 let bytes = response
                     .body

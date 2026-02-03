@@ -105,10 +105,13 @@ pub struct Scheduler {
     /// Shutdown signal
     shutdown: Arc<tokio::sync::Notify>,
     /// HTTP client for agent communication
+    #[cfg_attr(feature = "test-skip-http", allow(dead_code))]
     http_client: Client,
     /// Internal token for authenticating with agents
+    #[cfg_attr(feature = "test-skip-http", allow(dead_code))]
     internal_token: String,
     /// Base URL of the agent's HTTP API
+    #[cfg_attr(feature = "test-skip-http", allow(dead_code))]
     agent_base_url: String,
 }
 
@@ -257,7 +260,7 @@ impl Scheduler {
                 replicas = replicas,
                 "Test mode: skipping agent scaling call"
             );
-            return Ok(());
+            Ok(())
         }
 
         #[cfg(not(feature = "test-skip-http"))]

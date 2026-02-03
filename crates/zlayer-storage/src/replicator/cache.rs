@@ -111,9 +111,7 @@ impl WriteCache {
         }
 
         // Sort by sequence number
-        entries
-            .make_contiguous()
-            .sort_by_key(|e| e.sequence);
+        entries.make_contiguous().sort_by_key(|e| e.sequence);
 
         info!(
             "Loaded {} cache entries ({} bytes)",

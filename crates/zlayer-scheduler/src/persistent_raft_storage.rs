@@ -181,11 +181,7 @@ impl PersistentLogStore {
 
         if let Some((bytes,)) = row {
             let meta: LogMetadata = serde_json::from_slice(&bytes).map_err(|e| {
-                json_to_storage_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Read,
-                    e,
-                )
+                json_to_storage_error(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, e)
             })?;
             Ok(meta.last_purged_log_id)
         } else {
@@ -209,11 +205,7 @@ impl PersistentLogStore {
 
         if let Some((bytes,)) = row {
             let entry: Entry<TypeConfig> = serde_json::from_slice(&bytes).map_err(|e| {
-                json_to_storage_error(
-                    openraft::ErrorSubject::Store,
-                    openraft::ErrorVerb::Read,
-                    e,
-                )
+                json_to_storage_error(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, e)
             })?;
             Ok(Some(entry))
         } else {
@@ -599,7 +591,11 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| {
-                    sqlx_to_storage_error(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Read, e)
+                    sqlx_to_storage_error(
+                        openraft::ErrorSubject::Vote,
+                        openraft::ErrorVerb::Read,
+                        e,
+                    )
                 })?;
 
         if let Some((bytes,)) = row {
@@ -840,8 +836,8 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         })?;
 
         if let Some((snapshot_id, meta_bytes)) = row {
-            let snapshot_record: SnapshotMetadataRecord =
-                serde_json::from_slice(&meta_bytes).map_err(|e| {
+            let snapshot_record: SnapshotMetadataRecord = serde_json::from_slice(&meta_bytes)
+                .map_err(|e| {
                     json_to_storage_error(
                         openraft::ErrorSubject::Snapshot(None),
                         openraft::ErrorVerb::Read,
@@ -870,7 +866,11 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
                     snapshot_id: snapshot_record.snapshot_id,
                 };
 
-                debug!("Loaded snapshot {} ({} bytes)", meta.snapshot_id, data.len());
+                debug!(
+                    "Loaded snapshot {} ({} bytes)",
+                    meta.snapshot_id,
+                    data.len()
+                );
 
                 Ok(Some(Snapshot {
                     meta,
