@@ -11,6 +11,15 @@ use crate::handlers::build::{
 };
 use crate::handlers::deployments::{CreateDeploymentRequest, DeploymentDetails, DeploymentSummary};
 use crate::handlers::health::HealthResponse;
+// Note: Node and overlay types are not yet exposed in OpenAPI paths
+// They will be uncommented when the corresponding endpoints are added
+// use crate::handlers::nodes::{
+//     JoinTokenResponse, NodeDetails, NodeResourceInfo, NodeSummary, UpdateLabelsRequest,
+//     UpdateLabelsResponse,
+// };
+// use crate::handlers::overlay::{
+//     DnsStatusResponse, IpAllocationResponse, OverlayStatusResponse, PeerInfo, PeerListResponse,
+// };
 use crate::handlers::secrets::{CreateSecretRequest, SecretMetadataResponse};
 use crate::handlers::services::{
     ScaleRequest, ServiceDetails, ServiceEndpoint, ServiceMetrics, ServiceSummary,
@@ -32,6 +41,15 @@ use crate::handlers::deployments::{
 };
 use crate::handlers::health::{__path_liveness, __path_readiness};
 use crate::handlers::internal::{__path_get_replicas_internal, __path_scale_service_internal};
+// Note: Node and overlay paths are not yet exposed in OpenAPI
+// They will be uncommented when the corresponding endpoints are added
+// use crate::handlers::nodes::{
+//     __path_generate_join_token, __path_get_node, __path_list_nodes, __path_update_node_labels,
+// };
+// use crate::handlers::overlay::{
+//     __path_get_dns_status, __path_get_ip_allocation, __path_get_overlay_peers,
+//     __path_get_overlay_status,
+// };
 use crate::handlers::secrets::{
     __path_create_secret, __path_delete_secret, __path_get_secret_metadata, __path_list_secrets,
 };

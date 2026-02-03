@@ -26,15 +26,16 @@
 //! # Example (Pingora)
 //!
 //! ```rust,ignore
-//! use proxy::{PingoraProxyConfig, ServiceRegistry, start_proxy};
+//! use proxy::{PingoraProxyConfig, ServiceRegistry, StreamRegistry, start_proxy};
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-//!     // Create service registry
+//!     // Create service registries
 //!     let registry = Arc::new(ServiceRegistry::new());
+//!     let stream_registry = Arc::new(StreamRegistry::new());
 //!
-//!     // Register services
+//!     // Register HTTP services
 //!     registry.register("api.example.com", None, proxy::ResolvedService {
 //!         name: "api".to_string(),
 //!         backends: vec!["127.0.0.1:8080".parse()?],
@@ -42,9 +43,9 @@
 //!         sni_hostname: String::new(),
 //!     });
 //!
-//!     // Start proxy
+//!     // Start proxy (includes HTTP, TCP, and UDP support)
 //!     let config = PingoraProxyConfig::default();
-//!     start_proxy(config, registry)?;
+//!     start_proxy(config, registry, stream_registry)?;
 //!
 //!     Ok(())
 //! }
@@ -65,9 +66,11 @@ pub mod acme;
 pub mod proxy;
 pub mod routes;
 pub mod sni_resolver;
+pub mod stream;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 // Re-export main types from original modules
 pub use config::{
@@ -89,9 +92,20 @@ pub use proxy::{ZLayerCtx, ZLayerProxy};
 pub use routes::{ResolvedService, ServiceRegistry};
 pub use sni_resolver::SniCertResolver;
 
+// Re-export stream (L4) proxy types
+pub use stream::{
+    StreamRegistry, StreamService, TcpListenerConfig, TcpStreamService, UdpListenerConfig,
+    UdpStreamService, DEFAULT_UDP_SESSION_TIMEOUT,
+};
+
 // ============================================================================
 // Pingora Server Bootstrap
 // ============================================================================
+
+/// Default UDP session timeout for stream proxying
+fn default_udp_session_timeout() -> Duration {
+    stream::DEFAULT_UDP_SESSION_TIMEOUT
+}
 
 /// Configuration for the Pingora-based proxy server
 ///
@@ -115,6 +129,12 @@ pub struct PingoraProxyConfig {
     pub acme_directory_url: Option<String>,
     /// Domains to auto-provision certificates for on startup
     pub auto_provision_domains: Vec<String>,
+    /// TCP stream proxy listeners for L4 proxying
+    pub tcp: Vec<stream::TcpListenerConfig>,
+    /// UDP stream proxy listeners for L4 proxying
+    pub udp: Vec<stream::UdpListenerConfig>,
+    /// Default UDP session timeout (default: 60 seconds)
+    pub udp_session_timeout: Duration,
 }
 
 impl Default for PingoraProxyConfig {
@@ -128,6 +148,9 @@ impl Default for PingoraProxyConfig {
             acme_staging: false,
             acme_directory_url: None,
             auto_provision_domains: vec![],
+            tcp: vec![],
+            udp: vec![],
+            udp_session_timeout: default_udp_session_timeout(),
         }
     }
 }
@@ -320,11 +343,14 @@ pub async fn load_existing_certs_into_resolver(
 /// - ZLayerProxy with the service registry
 /// - HTTP listener on the configured address
 /// - HTTPS listener (if certificates are available)
+/// - TCP stream proxy services for L4 proxying
+/// - UDP stream proxy services for L4 proxying
 ///
 /// # Arguments
 ///
 /// * `config` - Proxy configuration
-/// * `service_registry` - Service registry for route resolution
+/// * `service_registry` - Service registry for HTTP route resolution
+/// * `stream_registry` - Stream registry for TCP/UDP L4 route resolution
 ///
 /// # Returns
 ///
@@ -334,12 +360,13 @@ pub async fn load_existing_certs_into_resolver(
 /// # Example
 ///
 /// ```rust,ignore
-/// use proxy::{PingoraProxyConfig, ServiceRegistry, start_proxy};
+/// use proxy::{PingoraProxyConfig, ServiceRegistry, StreamRegistry, start_proxy};
 /// use std::sync::Arc;
 ///
 /// let registry = Arc::new(ServiceRegistry::new());
+/// let stream_registry = Arc::new(StreamRegistry::new());
 /// let config = PingoraProxyConfig::default();
-/// start_proxy(config, registry)?;
+/// start_proxy(config, registry, stream_registry)?;
 /// ```
 ///
 /// # Note
@@ -349,6 +376,7 @@ pub async fn load_existing_certs_into_resolver(
 pub fn start_proxy(
     config: PingoraProxyConfig,
     service_registry: Arc<ServiceRegistry>,
+    stream_registry: Arc<stream::StreamRegistry>,
 ) -> std::result::Result<(), ProxyStartError> {
     // We need to create the CertManager in sync context, then run the server
     // Since CertManager::new is async, we use a runtime for initialization
@@ -456,11 +484,69 @@ pub fn start_proxy(
     // Add the service to the server
     server.add_service(proxy_service);
 
+    // TCP stream services (L4 proxying using Pingora's ServerApp)
+    for tcp_config in &config.tcp {
+        let tcp_service = stream::TcpStreamService::new(stream_registry.clone(), tcp_config.port);
+
+        let tcp_addr = format!("0.0.0.0:{}", tcp_config.port);
+        let mut service = pingora_core::services::listening::Service::new(
+            format!("tcp-stream-{}", tcp_config.port),
+            tcp_service,
+        );
+        service.add_tcp(&tcp_addr);
+        server.add_service(service);
+
+        tracing::info!(
+            port = tcp_config.port,
+            protocol_hint = ?tcp_config.protocol_hint,
+            "TCP stream proxy enabled"
+        );
+    }
+
+    // UDP stream services (custom implementation, not Pingora - uses tokio task)
+    // UDP doesn't use Pingora's ServerApp because UDP is connectionless
+    for udp_config in &config.udp {
+        let udp_service = Arc::new(stream::UdpStreamService::new(
+            stream_registry.clone(),
+            udp_config.port,
+            udp_config
+                .session_timeout
+                .or(Some(config.udp_session_timeout)),
+        ));
+
+        tracing::info!(
+            port = udp_config.port,
+            protocol_hint = ?udp_config.protocol_hint,
+            session_timeout = ?udp_service.session_timeout(),
+            "UDP stream proxy enabled"
+        );
+
+        // Spawn UDP service as a separate tokio task (runs in the runtime created below)
+        let udp_handle = udp_service.clone();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create UDP runtime");
+
+            rt.block_on(async move {
+                if let Err(e) = udp_handle.run().await {
+                    tracing::error!(
+                        error = %e,
+                        "UDP stream proxy service failed"
+                    );
+                }
+            });
+        });
+    }
+
     tracing::info!(
         http_addr = %config.http_addr,
         https_addr = %config.https_addr,
         https_enabled = https_enabled,
         cert_count = loaded_count,
+        tcp_listeners = config.tcp.len(),
+        udp_listeners = config.udp.len(),
         "Starting ZLayer Pingora proxy"
     );
 
@@ -477,7 +563,8 @@ pub fn start_proxy(
 /// # Arguments
 ///
 /// * `config` - Proxy configuration
-/// * `service_registry` - Service registry for route resolution
+/// * `service_registry` - Service registry for HTTP route resolution
+/// * `stream_registry` - Stream registry for TCP/UDP L4 route resolution
 ///
 /// # Returns
 ///
@@ -487,15 +574,16 @@ pub fn start_proxy(
 /// # Example
 ///
 /// ```rust,ignore
-/// use proxy::{PingoraProxyConfig, ServiceRegistry, start_proxy_async};
+/// use proxy::{PingoraProxyConfig, ServiceRegistry, StreamRegistry, start_proxy_async};
 /// use std::sync::Arc;
 ///
 /// #[tokio::main]
 /// async fn main() {
 ///     let registry = Arc::new(ServiceRegistry::new());
+///     let stream_registry = Arc::new(StreamRegistry::new());
 ///     let config = PingoraProxyConfig::default();
 ///
-///     let proxy_handle = start_proxy_async(config, registry);
+///     let proxy_handle = start_proxy_async(config, registry, stream_registry);
 ///
 ///     // Do other async work...
 ///
@@ -506,8 +594,9 @@ pub fn start_proxy(
 pub fn start_proxy_async(
     config: PingoraProxyConfig,
     service_registry: Arc<ServiceRegistry>,
+    stream_registry: Arc<stream::StreamRegistry>,
 ) -> tokio::task::JoinHandle<std::result::Result<(), ProxyStartError>> {
-    tokio::task::spawn_blocking(move || start_proxy(config, service_registry))
+    tokio::task::spawn_blocking(move || start_proxy(config, service_registry, stream_registry))
 }
 
 #[cfg(test)]
@@ -525,6 +614,9 @@ mod tests {
         assert!(!config.acme_staging);
         assert!(config.acme_directory_url.is_none());
         assert!(config.auto_provision_domains.is_empty());
+        assert!(config.tcp.is_empty());
+        assert!(config.udp.is_empty());
+        assert_eq!(config.udp_session_timeout, DEFAULT_UDP_SESSION_TIMEOUT);
     }
 
     #[test]
@@ -538,6 +630,18 @@ mod tests {
             acme_staging: true,
             acme_directory_url: None,
             auto_provision_domains: vec!["example.com".to_string(), "api.example.com".to_string()],
+            tcp: vec![TcpListenerConfig {
+                port: 5432,
+                protocol_hint: Some("postgresql".to_string()),
+                tls: false,
+                proxy_protocol: false,
+            }],
+            udp: vec![UdpListenerConfig {
+                port: 27015,
+                protocol_hint: Some("source-engine".to_string()),
+                session_timeout: Some(Duration::from_secs(120)),
+            }],
+            udp_session_timeout: Duration::from_secs(90),
         };
         assert_eq!(config.http_addr, "127.0.0.1:8080");
         assert_eq!(config.https_addr, "127.0.0.1:8443");
@@ -547,6 +651,11 @@ mod tests {
         assert!(config.acme_staging);
         assert!(config.acme_directory_url.is_none());
         assert_eq!(config.auto_provision_domains.len(), 2);
+        assert_eq!(config.tcp.len(), 1);
+        assert_eq!(config.tcp[0].port, 5432);
+        assert_eq!(config.udp.len(), 1);
+        assert_eq!(config.udp[0].port, 27015);
+        assert_eq!(config.udp_session_timeout, Duration::from_secs(90));
     }
 
     #[test]

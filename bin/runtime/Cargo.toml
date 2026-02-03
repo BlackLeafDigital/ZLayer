@@ -39,6 +39,7 @@ zlayer-builder = { path = "../../crates/zlayer-builder" }
 zlayer-scheduler = { path = "../../crates/zlayer-scheduler" }
 zlayer-overlay = { path = "../../crates/zlayer-overlay" }
 zlayer-core = { path = "../../crates/zlayer-core" }
+zlayer-tunnel = { path = "../../crates/zlayer-tunnel" }
 
 # API server
 zlayer-api = { path = "../../crates/zlayer-api" }

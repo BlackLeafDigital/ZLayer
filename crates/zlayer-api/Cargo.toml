@@ -59,6 +59,13 @@ chrono.workspace = true
 # UUID
 uuid.workspace = true
 
+# Cryptography (for token hashing)
+sha2.workspace = true
+hex.workspace = true
+
+# Synchronization
+parking_lot.workspace = true
+
 # Streaming
 tokio-stream.workspace = true
 futures-util.workspace = true

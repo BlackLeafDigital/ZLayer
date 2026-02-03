@@ -30,6 +30,7 @@ pub fn from_yaml_str(yaml: &str) -> Result<DeploymentSpec, SpecError> {
     validate_dependencies(&spec)?;
     validate_unique_service_endpoints(&spec)?;
     validate_cron_schedules(&spec)?;
+    validate_tunnels(&spec)?;
 
     Ok(spec)
 }
@@ -514,5 +515,173 @@ services:
         assert_eq!(spec.services["api"].rtype, ResourceType::Service);
         assert_eq!(spec.services["backup"].rtype, ResourceType::Job);
         assert_eq!(spec.services["cleanup"].rtype, ResourceType::Cron);
+    }
+
+    // =========================================================================
+    // Tunnel integration tests
+    // =========================================================================
+
+    #[test]
+    fn test_valid_endpoint_tunnel() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services:
+  api:
+    image:
+      name: api:latest
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+        tunnel:
+          enabled: true
+          remote_port: 8080
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(
+            result.is_ok(),
+            "Valid endpoint tunnel should pass: {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_valid_top_level_tunnel() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services:
+  api:
+    image:
+      name: api:latest
+tunnels:
+  db-access:
+    from: api-node
+    to: db-node
+    local_port: 5432
+    remote_port: 5432
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(
+            result.is_ok(),
+            "Valid top-level tunnel should pass: {:?}",
+            result
+        );
+        let spec = result.unwrap();
+        assert!(spec.tunnels.contains_key("db-access"));
+    }
+
+    #[test]
+    fn test_invalid_tunnel_ttl_rejected() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services:
+  api:
+    image:
+      name: api:latest
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+        tunnel:
+          enabled: true
+          access:
+            enabled: true
+            max_ttl: invalid
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("ttl") || err_str.contains("TTL") || err_str.contains("invalid"),
+            "Error should mention invalid TTL: {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_invalid_tunnel_local_port_zero_rejected() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services: {}
+tunnels:
+  bad-tunnel:
+    from: node-a
+    to: node-b
+    local_port: 0
+    remote_port: 8080
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("port") || err_str.contains("local"),
+            "Error should mention invalid port: {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_invalid_tunnel_remote_port_zero_rejected() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services: {}
+tunnels:
+  bad-tunnel:
+    from: node-a
+    to: node-b
+    local_port: 8080
+    remote_port: 0
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("port") || err_str.contains("remote"),
+            "Error should mention invalid port: {}",
+            err_str
+        );
+    }
+
+    #[test]
+    fn test_valid_tunnel_with_access_config() {
+        let yaml = r#"
+version: v1
+deployment: my-app
+services:
+  api:
+    image:
+      name: api:latest
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+        tunnel:
+          enabled: true
+          remote_port: 0
+          access:
+            enabled: true
+            max_ttl: 4h
+            audit: true
+"#;
+        let result = from_yaml_str(yaml);
+        assert!(
+            result.is_ok(),
+            "Valid tunnel with access config should pass: {:?}",
+            result
+        );
+        let spec = result.unwrap();
+        let tunnel = spec.services["api"].endpoints[0].tunnel.as_ref().unwrap();
+        let access = tunnel.access.as_ref().unwrap();
+        assert!(access.enabled);
+        assert_eq!(access.max_ttl, Some("4h".to_string()));
+        assert!(access.audit);
     }
 }

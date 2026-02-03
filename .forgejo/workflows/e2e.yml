@@ -156,12 +156,50 @@ jobs:
           RUST_LOG: debug
 
   # ===========================================
+  # E2E Tests (Manager UI)
+  # ===========================================
+  manager-tests:
+    name: E2E Tests (Manager)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
+
+      - name: Setup Rust
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+
+      - name: Restore cache
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Run Manager tests
+        run: cargo test --package zlayer-manager --lib --features ssr -- --nocapture
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug
+
+  # ===========================================
   # Trigger Build (if version provided)
   # ===========================================
   trigger-build:
     name: Trigger Build
     runs-on: ubuntu-latest
-    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests]
+    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests]
     if: inputs.version != ''
     steps:
       - name: Trigger Build workflow

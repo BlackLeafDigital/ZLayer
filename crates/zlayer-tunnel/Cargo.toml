@@ -1,0 +1,44 @@
+[package]
+name = "zlayer-tunnel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Secure tunneling for ZLayer services"
+keywords = ["tunnel", "proxy", "networking", "container"]
+categories = ["network-programming"]
+readme = "README.md"
+
+[dependencies]
+# Async runtime
+tokio.workspace = true
+
+# Data structures
+dashmap.workspace = true
+bytes.workspace = true
+parking_lot.workspace = true
+
+# Serialization
+serde.workspace = true
+toml.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# UUID for IDs
+uuid.workspace = true
+
+# WebSocket support
+tokio-tungstenite = "0.26"
+futures-util.workspace = true
+
+# Cryptography (token hashing)
+sha2.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tokio-test = "0.4"
