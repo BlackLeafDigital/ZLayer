@@ -1,13 +1,18 @@
-# Stage 1: Chef base with cargo-chef installed
-FROM lukemathwalker/cargo-chef:latest-rust-1.83 AS chef
+# ZLayer Web - Full-stack Leptos SSR + Hydration
+#
+# Usage:
+#   docker build -f docker/Dockerfile.zlayer-web -t zlayer-web .
+
+# Stage 1: Chef base
+FROM lukemathwalker/cargo-chef:latest-rust-1.85 AS chef
 WORKDIR /build
 
-# Stage 2: Generate recipe.json (dependency manifest)
+# Stage 2: Generate dependency recipe
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
 
-# Stage 3: Build dependencies (cached layer)
+# Stage 3: Build
 FROM chef AS builder
 
 # Install system dependencies
@@ -21,11 +26,11 @@ RUN apt-get update && apt-get install -y \
 RUN rustup target add wasm32-unknown-unknown && \
     cargo install cargo-leptos
 
-# Copy recipe and build dependencies only
+# Cook dependencies (cached layer)
 COPY --from=planner /build/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Copy source and build application (only rebuilds changed code)
+# Copy source and build
 COPY . .
 RUN cd crates/zlayer-web && cargo leptos build --release
 
@@ -44,7 +49,6 @@ COPY --from=builder /build/target/release/zlayer-web /app/zlayer-web
 # Copy the site assets (WASM, CSS, etc.)
 COPY --from=builder /build/target/site /app/target/site
 
-# Set environment variables
 ENV ZLAYER_WEB_ADDR=0.0.0.0:3000
 ENV LEPTOS_SITE_ROOT=/app/target/site
 ENV RUST_LOG=info

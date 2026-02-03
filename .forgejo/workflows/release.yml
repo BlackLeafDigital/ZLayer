@@ -380,13 +380,30 @@ jobs:
   # Docker (after merge)
   # ===========================================
   docker:
+    name: Docker (${{ matrix.image }})
     needs: [detect, merge-to-main]
     if: needs.detect.outputs.docker == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: zlayer-node
+            dockerfile: docker/Dockerfile.zlayer-node
+            platforms: linux/amd64,linux/arm64
+          - image: zlayer-web
+            dockerfile: docker/Dockerfile.zlayer-web
+            platforms: linux/amd64
+          - image: zlayer-manager
+            dockerfile: docker/Dockerfile.zlayer-manager
+            platforms: linux/amd64
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
+      - name: Set up QEMU
+        if: contains(matrix.platforms, 'arm64')
+        uses: docker/setup-qemu-action@v3
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       - name: Login to Docker Hub
@@ -397,14 +414,14 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: docker/Dockerfile.zlayer-node
-          platforms: linux/amd64,linux/arm64
+          file: ${{ matrix.dockerfile }}
+          platforms: ${{ matrix.platforms }}
           push: true
           tags: |
-            zlayer/zlayer-node:${{ needs.detect.outputs.version }}
-            zlayer/zlayer-node:latest
-            ghcr.io/blackleafdigital/zlayer-node:${{ needs.detect.outputs.version }}
-            ghcr.io/blackleafdigital/zlayer-node:latest
+            zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }}
+            zlayer/${{ matrix.image }}:latest
+            ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.detect.outputs.version }}
+            ghcr.io/blackleafdigital/${{ matrix.image }}:latest
 
   # ===========================================
   # Trigger GitHub release
