@@ -9,6 +9,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 use zlayer_scheduler::{
     MockMetricsSource, RaftConfig, ScalingDecision, Scheduler, SchedulerConfig, ServiceMetrics,
 };
@@ -241,10 +243,22 @@ async fn test_manual_scaling() {
 /// Test apply_scaling records state correctly
 #[tokio::test]
 async fn test_apply_scaling() {
+    // Start a mock HTTP server to simulate the zlayer agent
+    let mock_server = MockServer::start().await;
+
+    // Mock the scale endpoint to return success
+    Mock::given(method("POST"))
+        .and(path("/api/v1/internal/scale"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "success": true
+        })))
+        .mount(&mock_server)
+        .await;
+
     let scheduler = Scheduler::new_standalone(
         SchedulerConfig::default(),
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        mock_server.uri(),
     );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;

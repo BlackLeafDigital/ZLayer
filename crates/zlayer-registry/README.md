@@ -11,7 +11,7 @@ OCI image pulling, caching, and WASM artifact detection for ZLayer.
 
 ### Feature Flags
 
-- `persistent`: Enable persistent disk-based blob cache using redb
+- `persistent`: Enable persistent disk-based blob cache using SQLite (via SQLx)
 - `s3`: Enable S3-compatible storage backend for blob caching
 - `local`: Enable local OCI registry for storing built images
 
@@ -37,7 +37,7 @@ use std::path::Path;
 
 async fn pull_image() -> Result<(), Box<dyn std::error::Error>> {
     // Create blob cache
-    let cache = BlobCache::open(Path::new("/var/lib/zlayer/cache.redb"))?;
+    let cache = BlobCache::open(Path::new("/var/lib/zlayer/cache.sqlite"))?;
 
     // Create puller
     let puller = ImagePuller::new(cache);
@@ -131,7 +131,7 @@ WASM artifacts are detected through multiple signals in order of specificity:
 use zlayer_registry::{ImagePuller, BlobCache, RegistryAuth};
 
 async fn pull_wasm(image: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let cache = BlobCache::open("/var/lib/zlayer/cache.redb")?;
+    let cache = BlobCache::open("/var/lib/zlayer/cache.sqlite")?;
     let puller = ImagePuller::new(cache);
     let auth = RegistryAuth::Anonymous;
 
@@ -151,7 +151,7 @@ async fn pull_wasm(image: &str) -> Result<(), Box<dyn std::error::Error>> {
 use zlayer_registry::{ImagePuller, BlobCache, RegistryAuth};
 
 async fn check_wasm(image: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let cache = BlobCache::open("/var/lib/zlayer/cache.redb")?;
+    let cache = BlobCache::open("/var/lib/zlayer/cache.sqlite")?;
     let puller = ImagePuller::new(cache);
     let auth = RegistryAuth::Anonymous;
 
@@ -245,7 +245,7 @@ use zlayer_registry::wasm::{detect_artifact_type, ArtifactType};
 use zlayer_registry::{ImagePuller, BlobCache, RegistryAuth};
 
 async fn handle_image(image: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let cache = BlobCache::open("/var/lib/zlayer/cache.redb")?;
+    let cache = BlobCache::open("/var/lib/zlayer/cache.sqlite")?;
     let puller = ImagePuller::new(cache);
     let auth = RegistryAuth::Anonymous;
 

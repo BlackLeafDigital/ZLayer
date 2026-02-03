@@ -493,7 +493,9 @@ mod tests {
 
         // Write data
         {
-            let store = PersistentSecretsStore::open(&db_path, key.clone()).await.unwrap();
+            let store = PersistentSecretsStore::open(&db_path, key.clone())
+                .await
+                .unwrap();
             store
                 .set_secret("scope", "persistent", &Secret::new("persistent-value"))
                 .await
@@ -538,7 +540,9 @@ mod tests {
         let key = EncryptionKey::generate();
 
         // Pass directory path instead of file path
-        let store = PersistentSecretsStore::open(temp_dir.path(), key).await.unwrap();
+        let store = PersistentSecretsStore::open(temp_dir.path(), key)
+            .await
+            .unwrap();
 
         store
             .set_secret("scope", "test", &Secret::new("value"))

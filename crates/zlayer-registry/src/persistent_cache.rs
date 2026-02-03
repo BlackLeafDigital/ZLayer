@@ -52,15 +52,13 @@ impl PersistentBlobCache {
         }
 
         // Build connection options with WAL mode and busy timeout
-        let connect_options = SqliteConnectOptions::from_str(&format!(
-            "sqlite:{}?mode=rwc",
-            db_path.display()
-        ))
-        .map_err(|e| CacheError::Database(format!("invalid database path: {}", e)))?
-        .pragma("journal_mode", "WAL")
-        .pragma("busy_timeout", "5000")
-        .pragma("synchronous", "NORMAL")
-        .create_if_missing(true);
+        let connect_options =
+            SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", db_path.display()))
+                .map_err(|e| CacheError::Database(format!("invalid database path: {}", e)))?
+                .pragma("journal_mode", "WAL")
+                .pragma("busy_timeout", "5000")
+                .pragma("synchronous", "NORMAL")
+                .create_if_missing(true);
 
         // Create connection pool
         let pool = SqlitePoolOptions::new()
@@ -113,12 +111,11 @@ impl PersistentBlobCache {
     pub async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, CacheError> {
         validate_digest(digest)?;
 
-        let result: Option<Vec<u8>> =
-            sqlx::query_scalar("SELECT data FROM blobs WHERE digest = ?")
-                .bind(digest)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| CacheError::Database(format!("failed to get blob: {}", e)))?;
+        let result: Option<Vec<u8>> = sqlx::query_scalar("SELECT data FROM blobs WHERE digest = ?")
+            .bind(digest)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| CacheError::Database(format!("failed to get blob: {}", e)))?;
 
         // Update last_accessed timestamp asynchronously (best effort)
         if result.is_some() {
@@ -261,12 +258,13 @@ impl PersistentBlobCache {
         );
 
         // Get oldest entries sorted by last_accessed
-        let entries: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT digest, size_bytes FROM blobs ORDER BY last_accessed ASC",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CacheError::Database(format!("failed to get blobs for eviction: {}", e)))?;
+        let entries: Vec<(String, i64)> =
+            sqlx::query_as("SELECT digest, size_bytes FROM blobs ORDER BY last_accessed ASC")
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| {
+                    CacheError::Database(format!("failed to get blobs for eviction: {}", e))
+                })?;
 
         // Evict oldest entries until we reach target
         let mut evicted_size = 0u64;
