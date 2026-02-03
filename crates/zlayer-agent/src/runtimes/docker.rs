@@ -925,6 +925,7 @@ mod tests {
                 path: None,
                 expose: ExposeType::Internal,
                 stream: None,
+                tunnel: None,
             })
             .collect();
 

@@ -155,6 +155,7 @@ mod tests {
             version: "v1".to_string(),
             deployment: name.to_string(),
             services,
+            tunnels: HashMap::new(),
         }
     }
 
