@@ -1083,7 +1083,8 @@ mod tests {
             connection_id: Uuid::new_v4(),
             client_addr: "127.0.0.1:12345".to_string(),
         };
-        let _heartbeat = ControlEvent::Heartbeat { timestamp: 12345 };
+        let heartbeat = ControlEvent::Heartbeat { timestamp: 12345 };
+        assert!(matches!(heartbeat, ControlEvent::Heartbeat { .. }));
         let _disconnected = ControlEvent::Disconnected {
             reason: "test".to_string(),
         };
@@ -1111,7 +1112,8 @@ mod tests {
             connection_id: Uuid::new_v4(),
             reason: "error".to_string(),
         };
-        let _disconnect = ControlCommand::Disconnect;
+        let disconnect = ControlCommand::Disconnect;
+        assert!(matches!(disconnect, ControlCommand::Disconnect));
     }
 
     #[test]

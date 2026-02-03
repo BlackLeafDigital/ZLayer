@@ -624,28 +624,28 @@ mod tests {
     use super::*;
 
     /// Helper to test encode/decode roundtrip
-    fn roundtrip(msg: Message) {
+    fn roundtrip(msg: &Message) {
         let encoded = msg.encode();
         let (decoded, consumed) = Message::decode(&encoded).expect("decode failed");
         assert_eq!(consumed, encoded.len(), "consumed bytes mismatch");
-        assert_eq!(decoded, msg, "roundtrip mismatch");
+        assert_eq!(&decoded, msg, "roundtrip mismatch");
     }
 
     #[test]
     fn test_auth_roundtrip() {
-        roundtrip(Message::Auth {
+        roundtrip(&Message::Auth {
             token: "tun_abc123".to_string(),
             client_id: Uuid::new_v4(),
         });
 
         // Test with empty token
-        roundtrip(Message::Auth {
+        roundtrip(&Message::Auth {
             token: String::new(),
             client_id: Uuid::nil(),
         });
 
         // Test with long token
-        roundtrip(Message::Auth {
+        roundtrip(&Message::Auth {
             token: "a".repeat(1000),
             client_id: Uuid::new_v4(),
         });
@@ -653,47 +653,47 @@ mod tests {
 
     #[test]
     fn test_auth_ok_roundtrip() {
-        roundtrip(Message::AuthOk {
+        roundtrip(&Message::AuthOk {
             tunnel_id: Uuid::new_v4(),
         });
 
-        roundtrip(Message::AuthOk {
+        roundtrip(&Message::AuthOk {
             tunnel_id: Uuid::nil(),
         });
     }
 
     #[test]
     fn test_auth_fail_roundtrip() {
-        roundtrip(Message::AuthFail {
+        roundtrip(&Message::AuthFail {
             reason: "invalid token".to_string(),
         });
 
-        roundtrip(Message::AuthFail {
+        roundtrip(&Message::AuthFail {
             reason: String::new(),
         });
 
-        roundtrip(Message::AuthFail {
+        roundtrip(&Message::AuthFail {
             reason: "x".repeat(500),
         });
     }
 
     #[test]
     fn test_register_roundtrip() {
-        roundtrip(Message::Register {
+        roundtrip(&Message::Register {
             name: "ssh".to_string(),
             protocol: ServiceProtocol::Tcp,
             local_port: 22,
             remote_port: 2222,
         });
 
-        roundtrip(Message::Register {
+        roundtrip(&Message::Register {
             name: "game".to_string(),
             protocol: ServiceProtocol::Udp,
             local_port: 27015,
             remote_port: 0, // Auto-assign
         });
 
-        roundtrip(Message::Register {
+        roundtrip(&Message::Register {
             name: "a".repeat(255), // Max name length with u8
             protocol: ServiceProtocol::Tcp,
             local_port: 65535,
@@ -703,27 +703,27 @@ mod tests {
 
     #[test]
     fn test_register_ok_roundtrip() {
-        roundtrip(Message::RegisterOk {
+        roundtrip(&Message::RegisterOk {
             service_id: Uuid::new_v4(),
         });
     }
 
     #[test]
     fn test_register_fail_roundtrip() {
-        roundtrip(Message::RegisterFail {
+        roundtrip(&Message::RegisterFail {
             reason: "port already in use".to_string(),
         });
     }
 
     #[test]
     fn test_connect_roundtrip() {
-        roundtrip(Message::Connect {
+        roundtrip(&Message::Connect {
             service_id: Uuid::new_v4(),
             connection_id: Uuid::new_v4(),
             client_addr: "192.168.1.100:54321".to_string(),
         });
 
-        roundtrip(Message::Connect {
+        roundtrip(&Message::Connect {
             service_id: Uuid::new_v4(),
             connection_id: Uuid::new_v4(),
             client_addr: "[::1]:8080".to_string(),
@@ -732,14 +732,14 @@ mod tests {
 
     #[test]
     fn test_connect_ack_roundtrip() {
-        roundtrip(Message::ConnectAck {
+        roundtrip(&Message::ConnectAck {
             connection_id: Uuid::new_v4(),
         });
     }
 
     #[test]
     fn test_connect_fail_roundtrip() {
-        roundtrip(Message::ConnectFail {
+        roundtrip(&Message::ConnectFail {
             connection_id: Uuid::new_v4(),
             reason: "connection refused".to_string(),
         });
@@ -747,34 +747,34 @@ mod tests {
 
     #[test]
     fn test_heartbeat_roundtrip() {
-        roundtrip(Message::Heartbeat {
+        roundtrip(&Message::Heartbeat {
             timestamp: 1_705_320_000_000,
         });
 
-        roundtrip(Message::Heartbeat { timestamp: 0 });
+        roundtrip(&Message::Heartbeat { timestamp: 0 });
 
-        roundtrip(Message::Heartbeat {
+        roundtrip(&Message::Heartbeat {
             timestamp: u64::MAX,
         });
     }
 
     #[test]
     fn test_heartbeat_ack_roundtrip() {
-        roundtrip(Message::HeartbeatAck {
+        roundtrip(&Message::HeartbeatAck {
             timestamp: 1_705_320_000_000,
         });
     }
 
     #[test]
     fn test_unregister_roundtrip() {
-        roundtrip(Message::Unregister {
+        roundtrip(&Message::Unregister {
             service_id: Uuid::new_v4(),
         });
     }
 
     #[test]
     fn test_disconnect_roundtrip() {
-        roundtrip(Message::Disconnect {
+        roundtrip(&Message::Disconnect {
             reason: "server shutdown".to_string(),
         });
     }

@@ -422,7 +422,7 @@ mod tests {
         assert!(remaining.is_some());
         // Should be close to 3600 seconds (within a second tolerance)
         let remaining_secs = remaining.unwrap().as_secs();
-        assert!(remaining_secs >= 3599 && remaining_secs <= 3600);
+        assert!((3599..=3600).contains(&remaining_secs));
     }
 
     #[test]
@@ -646,10 +646,10 @@ mod tests {
             .await
             .unwrap();
 
-        let sessions = manager.list_sessions();
-        assert_eq!(sessions.len(), 2);
+        let all_sessions = manager.list_sessions();
+        assert_eq!(all_sessions.len(), 2);
 
-        let endpoints: Vec<_> = sessions.iter().map(|s| s.endpoint.as_str()).collect();
+        let endpoints: Vec<_> = all_sessions.iter().map(|s| s.endpoint.as_str()).collect();
         assert!(endpoints.contains(&"endpoint-1"));
         assert!(endpoints.contains(&"endpoint-2"));
 

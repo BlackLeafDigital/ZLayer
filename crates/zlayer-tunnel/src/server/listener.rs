@@ -672,10 +672,10 @@ mod tests {
         assert!(tcp_ports.contains(&port2));
         assert!(tcp_ports.contains(&port3));
 
-        let udp_ports = manager.udp_listener_ports();
-        assert_eq!(udp_ports.len(), 2);
-        assert!(udp_ports.contains(&udp_port1));
-        assert!(udp_ports.contains(&udp_port2));
+        let all_udp_ports = manager.udp_listener_ports();
+        assert_eq!(all_udp_ports.len(), 2);
+        assert!(all_udp_ports.contains(&udp_port1));
+        assert!(all_udp_ports.contains(&udp_port2));
 
         // Shutdown
         manager.shutdown();
@@ -714,7 +714,7 @@ mod tests {
             Uuid::new_v4(),
             PendingConnection {
                 stream: None,
-                expires_at: Instant::now() - Duration::from_secs(1), // Already expired
+                expires_at: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(), // Already expired
             },
         );
         manager.pending_connections.insert(
@@ -830,7 +830,7 @@ mod tests {
                 // The connection should be pending
                 assert!(manager.pending_connection_count() > 0);
             }
-            _ => panic!("expected Connect message, got {:?}", ctrl_msg),
+            _ => panic!("expected Connect message, got {ctrl_msg:?}"),
         }
 
         // Clean up

@@ -428,38 +428,52 @@ mod tests {
         assert!(config.validate().is_ok());
 
         // Empty control path
-        let mut bad = TunnelServerConfig::default();
-        bad.control_path = String::new();
+        let bad = TunnelServerConfig {
+            control_path: String::new(),
+            ..Default::default()
+        };
         assert!(bad.validate().is_err());
 
         // Control path without leading slash
-        let mut bad = TunnelServerConfig::default();
-        bad.control_path = "tunnel/v1".to_string();
+        let bad = TunnelServerConfig {
+            control_path: "tunnel/v1".to_string(),
+            ..Default::default()
+        };
         assert!(bad.validate().is_err());
 
         // Invalid port range
-        let mut bad = TunnelServerConfig::default();
-        bad.data_port_range = (31000, 30000);
+        let bad = TunnelServerConfig {
+            data_port_range: (31000, 30000),
+            ..Default::default()
+        };
         assert!(bad.validate().is_err());
 
         // Privileged port range
-        let mut bad = TunnelServerConfig::default();
-        bad.data_port_range = (80, 100);
+        let bad = TunnelServerConfig {
+            data_port_range: (80, 100),
+            ..Default::default()
+        };
         assert!(bad.validate().is_err());
 
         // Heartbeat timeout <= interval
-        let mut bad = TunnelServerConfig::default();
-        bad.heartbeat_timeout = Duration::from_secs(30);
+        let bad = TunnelServerConfig {
+            heartbeat_timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
         assert!(bad.validate().is_err());
 
         // Zero max tunnels
-        let mut bad = TunnelServerConfig::default();
-        bad.max_tunnels = 0;
+        let bad = TunnelServerConfig {
+            max_tunnels: 0,
+            ..Default::default()
+        };
         assert!(bad.validate().is_err());
 
         // Zero max services
-        let mut bad = TunnelServerConfig::default();
-        bad.max_services_per_tunnel = 0;
+        let bad = TunnelServerConfig {
+            max_services_per_tunnel: 0,
+            ..Default::default()
+        };
         assert!(bad.validate().is_err());
     }
 
