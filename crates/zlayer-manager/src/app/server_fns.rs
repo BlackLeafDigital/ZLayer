@@ -973,8 +973,8 @@ mod tests {
     fn test_secret_info_serialize() {
         let secret = SecretInfo {
             name: "api-key".to_string(),
-            created_at: 1706745600,
-            updated_at: 1706745700,
+            created_at: 1_706_745_600,
+            updated_at: 1_706_745_700,
             version: 2,
         };
         let json = serde_json::to_string(&secret).unwrap();
@@ -993,8 +993,8 @@ mod tests {
         }"#;
         let secret: SecretInfo = serde_json::from_str(json).unwrap();
         assert_eq!(secret.name, "db-password");
-        assert_eq!(secret.created_at, 1706745000);
-        assert_eq!(secret.updated_at, 1706745500);
+        assert_eq!(secret.created_at, 1_706_745_000);
+        assert_eq!(secret.updated_at, 1_706_745_500);
         assert_eq!(secret.version, 5);
     }
 
@@ -1014,7 +1014,7 @@ mod tests {
             logs: Some("Backup completed successfully".to_string()),
             trigger: "manual".to_string(),
             error: None,
-            duration_ms: Some(300000),
+            duration_ms: Some(300_000),
         };
         let json = serde_json::to_string(&execution).unwrap();
         assert!(json.contains("exec-123"));
@@ -1313,8 +1313,8 @@ mod tests {
     fn test_secret_info_roundtrip() {
         let original = SecretInfo {
             name: "test-secret".to_string(),
-            created_at: 1706745600,
-            updated_at: 1706745700,
+            created_at: 1_706_745_600,
+            updated_at: 1_706_745_700,
             version: 3,
         };
         let json = serde_json::to_string(&original).unwrap();
