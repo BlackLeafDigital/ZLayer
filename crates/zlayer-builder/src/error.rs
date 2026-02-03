@@ -135,6 +135,20 @@ pub enum BuildError {
         /// Details about the failure
         message: String,
     },
+
+    /// ZImagefile YAML deserialization failed
+    #[error("ZImagefile parse error: {message}")]
+    ZImagefileParse {
+        /// The underlying YAML parse error message
+        message: String,
+    },
+
+    /// ZImagefile semantic validation failed
+    #[error("ZImagefile validation error: {message}")]
+    ZImagefileValidation {
+        /// Description of what validation rule was violated
+        message: String,
+    },
 }
 
 impl BuildError {
@@ -217,6 +231,20 @@ impl BuildError {
     /// Create a BuildahNotFound error
     pub fn buildah_not_found(message: impl Into<String>) -> Self {
         Self::BuildahNotFound {
+            message: message.into(),
+        }
+    }
+
+    /// Create a ZImagefileParse error
+    pub fn zimagefile_parse(message: impl Into<String>) -> Self {
+        Self::ZImagefileParse {
+            message: message.into(),
+        }
+    }
+
+    /// Create a ZImagefileValidation error
+    pub fn zimagefile_validation(message: impl Into<String>) -> Self {
+        Self::ZImagefileValidation {
             message: message.into(),
         }
     }

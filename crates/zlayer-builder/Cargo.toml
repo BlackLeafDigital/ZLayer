@@ -22,9 +22,16 @@ tracing.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
+# Serialization
+serde_yaml.workspace = true
+
 # Hashing
 sha2.workspace = true
 hex.workspace = true
+
+# ZImagefile support
+indexmap = { version = "2", features = ["serde"] }
+humantime = "2"
 
 # Platform detection
 dirs = "5"

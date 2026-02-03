@@ -51,6 +51,10 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 
+    /// Run in background mode (used with 'up' command)
+    #[arg(short = 'b', long = "background", global = true)]
+    background: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -71,8 +75,8 @@ enum Commands {
     /// Deploy services from a spec file
     #[cfg(feature = "deploy")]
     Deploy {
-        /// Path to the deployment spec YAML file
-        spec_path: PathBuf,
+        /// Path to the deployment spec YAML file (auto-discovers .zlayer.yml if not given)
+        spec_path: Option<PathBuf>,
 
         /// Dry run - parse and validate but don't actually deploy
         #[arg(long)]
@@ -119,8 +123,8 @@ enum Commands {
 
     /// Validate a spec file without deploying
     Validate {
-        /// Path to the deployment spec YAML file
-        spec_path: PathBuf,
+        /// Path to the deployment spec YAML file (auto-discovers .zlayer.yml if not given)
+        spec_path: Option<PathBuf>,
     },
 
     /// Stream logs from a service
@@ -165,6 +169,37 @@ enum Commands {
         timeout: u64,
     },
 
+    /// Deploy and start services (like docker compose up)
+    ///
+    /// Auto-discovers .zlayer.yml in current directory if no spec path given.
+    /// Runs in foreground by default, streaming logs and waiting for Ctrl+C.
+    /// Use -b/--background to deploy and return immediately.
+    ///
+    /// Examples:
+    ///   zlayer up
+    ///   zlayer up my-spec.yml
+    ///   zlayer up -b
+    #[cfg(feature = "deploy")]
+    #[command(verbatim_doc_comment)]
+    Up {
+        /// Path to deployment spec (auto-discovers .zlayer.yml if not given)
+        spec_path: Option<PathBuf>,
+    },
+
+    /// Stop all services in a deployment (like docker compose down)
+    ///
+    /// Auto-discovers deployment name from .zlayer.yml if not given.
+    ///
+    /// Examples:
+    ///   zlayer down
+    ///   zlayer down my-deployment
+    #[cfg(feature = "deploy")]
+    #[command(verbatim_doc_comment)]
+    Down {
+        /// Deployment name (auto-discovers from .zlayer.yml if not given)
+        deployment: Option<String>,
+    },
+
     /// Build a container image from a Dockerfile
     ///
     /// Examples:
@@ -182,6 +217,10 @@ enum Commands {
         /// Dockerfile path (default: Dockerfile in context)
         #[arg(short = 'f', long)]
         file: Option<PathBuf>,
+
+        /// ZImagefile path (alternative to Dockerfile)
+        #[arg(long = "zimagefile", short = 'z')]
+        zimagefile: Option<PathBuf>,
 
         /// Image tag (can be specified multiple times)
         #[arg(short = 't', long = "tag")]
@@ -761,7 +800,10 @@ fn main() -> Result<()> {
 async fn run(cli: Cli) -> Result<()> {
     match &cli.command {
         #[cfg(feature = "deploy")]
-        Commands::Deploy { spec_path, dry_run } => deploy(&cli, spec_path, *dry_run).await,
+        Commands::Deploy { spec_path, dry_run } => {
+            let path = discover_spec_path(spec_path.as_deref())?;
+            deploy(&cli, &path, *dry_run).await
+        }
         #[cfg(feature = "join")]
         Commands::Join {
             token,
@@ -785,7 +827,10 @@ async fn run(cli: Cli) -> Result<()> {
             no_swagger,
         } => serve(bind, jwt_secret.clone(), *no_swagger).await,
         Commands::Status => status(&cli).await,
-        Commands::Validate { spec_path } => validate(spec_path).await,
+        Commands::Validate { spec_path } => {
+            let path = discover_spec_path(spec_path.as_deref())?;
+            validate(&path).await
+        }
         #[cfg(feature = "deploy")]
         Commands::Logs {
             deployment,
@@ -801,9 +846,17 @@ async fn run(cli: Cli) -> Result<()> {
             force,
             timeout,
         } => stop(deployment, service.clone(), *force, *timeout).await,
+        #[cfg(feature = "deploy")]
+        Commands::Up { spec_path } => {
+            let path = discover_spec_path(spec_path.as_deref())?;
+            up(&cli, &path).await
+        }
+        #[cfg(feature = "deploy")]
+        Commands::Down { deployment } => down(deployment.clone()).await,
         Commands::Build {
             context,
             file,
+            zimagefile,
             tags,
             runtime,
             runtime_auto,
@@ -817,6 +870,7 @@ async fn run(cli: Cli) -> Result<()> {
             handle_build(
                 context.clone(),
                 file.clone(),
+                zimagefile.clone(),
                 tags.clone(),
                 runtime.clone(),
                 *runtime_auto,
@@ -909,6 +963,21 @@ fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
             ..Default::default()
         }),
     }
+}
+
+/// Discover spec path from explicit argument or auto-discovery
+fn discover_spec_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    let candidates = [".zlayer.yml", ".zlayer.yaml", "zlayer.yml", "zlayer.yaml"];
+    for candidate in &candidates {
+        let path = PathBuf::from(candidate);
+        if path.exists() {
+            return Ok(path);
+        }
+    }
+    anyhow::bail!("No deployment spec found. Create .zlayer.yml or specify a path.");
 }
 
 /// Parse and validate a deployment spec file
@@ -1685,11 +1754,226 @@ async fn stop(deployment: &str, service: Option<String>, force: bool, timeout: u
     Ok(())
 }
 
+/// Deploy and start services (like docker compose up)
+///
+/// If `cli.background` is true, deploys and returns immediately.
+/// Otherwise (foreground, the default), deploys and waits for Ctrl+C.
+#[cfg(feature = "deploy")]
+async fn up(cli: &Cli, spec_path: &Path) -> Result<()> {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    let spec = parse_spec(spec_path)?;
+
+    // Build runtime configuration
+    let runtime_config = build_runtime_config(cli);
+    info!(runtime = ?cli.runtime, "Creating container runtime");
+
+    let runtime = zlayer_agent::create_runtime(runtime_config)
+        .await
+        .context("Failed to create container runtime")?;
+
+    info!("Runtime created successfully");
+    print_deployment_plan(&spec);
+
+    // Create ServiceManager
+    let manager = Arc::new(zlayer_agent::ServiceManager::new(runtime.clone()));
+
+    println!("\n=== Starting Services ===\n");
+
+    let mut deployed_services: Vec<(String, u32)> = Vec::new();
+    let mut failed_services: Vec<(String, String)> = Vec::new();
+
+    for (name, service_spec) in &spec.services {
+        info!(service = %name, "Deploying service");
+        println!("Deploying service: {}", name);
+
+        match manager
+            .upsert_service(name.clone(), service_spec.clone())
+            .await
+        {
+            Ok(()) => {
+                info!(service = %name, "Service registered");
+            }
+            Err(e) => {
+                let error_msg = format!("Failed to register service: {}", e);
+                warn!(service = %name, error = %e, "Failed to register service");
+                failed_services.push((name.clone(), error_msg));
+                continue;
+            }
+        }
+
+        let replicas = match &service_spec.scale {
+            zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+            zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
+            zlayer_spec::ScaleSpec::Manual => 0,
+        };
+
+        if replicas > 0 {
+            info!(service = %name, replicas = replicas, "Scaling service");
+            println!("  Scaling to {} replica(s)...", replicas);
+
+            match manager.scale_service(name, replicas).await {
+                Ok(()) => {
+                    info!(service = %name, replicas = replicas, "Service scaled successfully");
+                    deployed_services.push((name.clone(), replicas));
+                }
+                Err(e) => {
+                    let error_msg = format!("Failed to scale service: {}", e);
+                    warn!(service = %name, error = %e, "Failed to scale service");
+                    failed_services.push((name.clone(), error_msg));
+                }
+            }
+        } else {
+            info!(service = %name, "Service registered with manual scaling (0 replicas)");
+            println!("  Registered (manual scaling - 0 replicas)");
+            deployed_services.push((name.clone(), 0));
+        }
+    }
+
+    // Wait for services to stabilize
+    if !deployed_services.is_empty() {
+        println!("\nWaiting for services to stabilize...");
+        let stabilize_timeout = Duration::from_secs(30);
+        let start = std::time::Instant::now();
+
+        while start.elapsed() < stabilize_timeout {
+            let mut all_ready = true;
+
+            for (name, expected_replicas) in &deployed_services {
+                if *expected_replicas == 0 {
+                    continue;
+                }
+                match manager.service_replica_count(name).await {
+                    Ok(count) if count as u32 == *expected_replicas => {}
+                    _ => {
+                        all_ready = false;
+                    }
+                }
+            }
+
+            if all_ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+
+        if start.elapsed() >= stabilize_timeout {
+            warn!("Timeout waiting for all services to stabilize");
+            println!("Warning: Timeout waiting for all services to reach desired state");
+        }
+    }
+
+    // Print summary
+    println!("\n=== Deployment Summary ===\n");
+    println!("Deployment: {}", spec.deployment);
+    println!("Version: {}", spec.version);
+    println!();
+
+    if !deployed_services.is_empty() {
+        println!("Successfully deployed services:");
+        for (name, replicas) in &deployed_services {
+            let actual_count = manager.service_replica_count(name).await.unwrap_or(0);
+            println!(
+                "  - {} ({}/{} replicas running)",
+                name, actual_count, replicas
+            );
+        }
+    }
+
+    if !failed_services.is_empty() {
+        println!("\nFailed services:");
+        for (name, error) in &failed_services {
+            println!("  - {}: {}", name, error);
+        }
+        anyhow::bail!(
+            "Deployment completed with {} failed service(s)",
+            failed_services.len()
+        );
+    }
+
+    if cli.background {
+        // Background mode: deploy and return
+        println!("\nDeployment completed successfully (background mode).");
+    } else {
+        // Foreground mode: start autoscaler if needed and wait for Ctrl+C
+        let has_adaptive = zlayer_agent::has_adaptive_scaling(&spec.services);
+
+        if has_adaptive {
+            let autoscale_interval = Duration::from_secs(10);
+            let controller = Arc::new(zlayer_agent::AutoscaleController::new(
+                manager.clone(),
+                runtime.clone(),
+                autoscale_interval,
+            ));
+
+            for (name, service_spec) in &spec.services {
+                if let zlayer_spec::ScaleSpec::Adaptive { .. } = &service_spec.scale {
+                    let replicas = manager.service_replica_count(name).await.unwrap_or(0) as u32;
+                    controller
+                        .register_service(name, &service_spec.scale, replicas)
+                        .await;
+                }
+            }
+
+            let adaptive_count = controller.registered_service_count().await;
+            println!("\nAutoscaling enabled for {} service(s)", adaptive_count);
+
+            let controller_clone = controller.clone();
+            let autoscale_handle = tokio::spawn(async move {
+                if let Err(e) = controller_clone.run_loop().await {
+                    tracing::error!(error = %e, "Autoscale controller failed");
+                }
+            });
+
+            println!("Services running. Press Ctrl+C to stop.");
+            tokio::signal::ctrl_c()
+                .await
+                .context("Failed to wait for Ctrl+C")?;
+
+            println!("\nShutting down...");
+            controller.shutdown();
+            if let Err(e) = autoscale_handle.await {
+                warn!(error = %e, "Autoscale handle join error");
+            }
+        } else {
+            println!("\nServices running. Press Ctrl+C to stop.");
+            tokio::signal::ctrl_c()
+                .await
+                .context("Failed to wait for Ctrl+C")?;
+            println!("\nShutting down...");
+        }
+    }
+
+    Ok(())
+}
+
+/// Stop all services in a deployment (like docker compose down)
+#[cfg(feature = "deploy")]
+async fn down(deployment: Option<String>) -> Result<()> {
+    let deployment_name = match deployment {
+        Some(name) => name,
+        None => {
+            // Try to discover spec and extract deployment name
+            let spec_path = discover_spec_path(None)?;
+            let spec = parse_spec(&spec_path)?;
+            spec.deployment.clone()
+        }
+    };
+
+    info!(deployment = %deployment_name, "Stopping deployment");
+    println!("Stopping deployment: {}...", deployment_name);
+
+    // Delegate to the existing stop logic with no specific service, graceful, 30s timeout
+    stop(&deployment_name, None, false, 30).await
+}
+
 /// Build a container image from a Dockerfile or runtime template
 #[allow(clippy::too_many_arguments)]
 async fn handle_build(
     context: PathBuf,
     file: Option<PathBuf>,
+    zimagefile: Option<PathBuf>,
     tags: Vec<String>,
     runtime: Option<String>,
     runtime_auto: bool,
@@ -1761,6 +2045,11 @@ async fn handle_build(
     // Apply Dockerfile path if specified
     if let Some(dockerfile) = file {
         builder = builder.dockerfile(dockerfile);
+    }
+
+    // Apply ZImagefile path if specified
+    if let Some(zimage) = zimagefile {
+        builder = builder.zimagefile(zimage);
     }
 
     // Apply runtime template if resolved
@@ -3915,7 +4204,21 @@ mod tests {
 
         match cli.command {
             Commands::Deploy { spec_path, dry_run } => {
-                assert_eq!(spec_path, PathBuf::from("test-spec.yaml"));
+                assert_eq!(spec_path, Some(PathBuf::from("test-spec.yaml")));
+                assert!(!dry_run);
+            }
+            _ => panic!("Expected Deploy command"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "deploy")]
+    fn test_cli_deploy_command_no_spec() {
+        let cli = Cli::try_parse_from(["zlayer", "deploy"]).unwrap();
+
+        match cli.command {
+            Commands::Deploy { spec_path, dry_run } => {
+                assert!(spec_path.is_none());
                 assert!(!dry_run);
             }
             _ => panic!("Expected Deploy command"),
@@ -4080,7 +4383,19 @@ mod tests {
 
         match cli.command {
             Commands::Validate { spec_path } => {
-                assert_eq!(spec_path, PathBuf::from("test-spec.yaml"));
+                assert_eq!(spec_path, Some(PathBuf::from("test-spec.yaml")));
+            }
+            _ => panic!("Expected Validate command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_validate_command_no_spec() {
+        let cli = Cli::try_parse_from(["zlayer", "validate"]).unwrap();
+
+        match cli.command {
+            Commands::Validate { spec_path } => {
+                assert!(spec_path.is_none());
             }
             _ => panic!("Expected Validate command"),
         }
@@ -4412,6 +4727,7 @@ mod tests {
             Commands::Build {
                 context,
                 file,
+                zimagefile,
                 tags,
                 runtime,
                 runtime_auto,
@@ -4424,6 +4740,7 @@ mod tests {
             } => {
                 assert_eq!(context, PathBuf::from("."));
                 assert!(file.is_none());
+                assert!(zimagefile.is_none());
                 assert!(tags.is_empty());
                 assert!(runtime.is_none());
                 assert!(!runtime_auto);
@@ -4433,6 +4750,18 @@ mod tests {
                 assert!(!push);
                 assert!(!no_tui);
                 assert!(!verbose_build);
+            }
+            _ => panic!("Expected Build command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_build_command_with_zimagefile() {
+        let cli = Cli::try_parse_from(["zlayer", "build", "-z", "ZImagefile.yml", "."]).unwrap();
+
+        match cli.command {
+            Commands::Build { zimagefile, .. } => {
+                assert_eq!(zimagefile, Some(PathBuf::from("ZImagefile.yml")));
             }
             _ => panic!("Expected Build command"),
         }
@@ -4960,5 +5289,83 @@ mod tests {
         let result = super::parse_cluster_join_token(&invalid_json);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("JSON"));
+    }
+
+    #[test]
+    #[cfg(feature = "deploy")]
+    fn test_cli_up_command_no_spec() {
+        let cli = Cli::try_parse_from(["zlayer", "up"]).unwrap();
+
+        match cli.command {
+            Commands::Up { spec_path } => {
+                assert!(spec_path.is_none());
+            }
+            _ => panic!("Expected Up command"),
+        }
+        assert!(!cli.background);
+    }
+
+    #[test]
+    #[cfg(feature = "deploy")]
+    fn test_cli_up_command_with_spec() {
+        let cli = Cli::try_parse_from(["zlayer", "up", "my-spec.yml"]).unwrap();
+
+        match cli.command {
+            Commands::Up { spec_path } => {
+                assert_eq!(spec_path, Some(PathBuf::from("my-spec.yml")));
+            }
+            _ => panic!("Expected Up command"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "deploy")]
+    fn test_cli_up_command_background() {
+        let cli = Cli::try_parse_from(["zlayer", "up", "-b"]).unwrap();
+
+        assert!(cli.background);
+        assert!(matches!(cli.command, Commands::Up { .. }));
+    }
+
+    #[test]
+    #[cfg(feature = "deploy")]
+    fn test_cli_up_command_background_global() {
+        // Background flag before subcommand
+        let cli = Cli::try_parse_from(["zlayer", "-b", "up"]).unwrap();
+
+        assert!(cli.background);
+        assert!(matches!(cli.command, Commands::Up { .. }));
+    }
+
+    #[test]
+    #[cfg(feature = "deploy")]
+    fn test_cli_down_command_no_deployment() {
+        let cli = Cli::try_parse_from(["zlayer", "down"]).unwrap();
+
+        match cli.command {
+            Commands::Down { deployment } => {
+                assert!(deployment.is_none());
+            }
+            _ => panic!("Expected Down command"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "deploy")]
+    fn test_cli_down_command_with_deployment() {
+        let cli = Cli::try_parse_from(["zlayer", "down", "my-app"]).unwrap();
+
+        match cli.command {
+            Commands::Down { deployment } => {
+                assert_eq!(deployment, Some("my-app".to_string()));
+            }
+            _ => panic!("Expected Down command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_background_flag_default() {
+        let cli = Cli::try_parse_from(["zlayer", "status"]).unwrap();
+        assert!(!cli.background);
     }
 }

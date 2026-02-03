@@ -4,7 +4,7 @@
 #   docker build -f docker/Dockerfile.zlayer-web -t zlayer-web .
 
 # Stage 1: Chef base
-FROM lukemathwalker/cargo-chef:latest-rust-1.85 AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.90 AS chef
 WORKDIR /build
 
 # Stage 2: Generate dependency recipe

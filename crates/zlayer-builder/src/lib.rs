@@ -164,6 +164,7 @@ pub mod error;
 pub mod templates;
 pub mod tui;
 pub mod wasm_builder;
+pub mod zimage;
 
 // Re-export main types at crate root
 pub use buildah::{

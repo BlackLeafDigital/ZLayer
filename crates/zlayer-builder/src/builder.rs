@@ -354,6 +354,8 @@ impl RegistryAuth {
 pub struct BuildOptions {
     /// Dockerfile path (default: Dockerfile in context)
     pub dockerfile: Option<PathBuf>,
+    /// ZImagefile path (alternative to Dockerfile)
+    pub zimagefile: Option<PathBuf>,
     /// Use runtime template instead of Dockerfile
     pub runtime: Option<Runtime>,
     /// Build arguments (ARG values)
@@ -436,6 +438,7 @@ impl Default for BuildOptions {
     fn default() -> Self {
         Self {
             dockerfile: None,
+            zimagefile: None,
             runtime: None,
             build_args: HashMap::new(),
             target: None,
@@ -607,6 +610,27 @@ impl ImageBuilder {
     /// ```
     pub fn dockerfile(mut self, path: impl AsRef<Path>) -> Self {
         self.options.dockerfile = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Set a custom ZImagefile path
+    ///
+    /// ZImagefiles are a YAML-based alternative to Dockerfiles. When set,
+    /// the builder will parse the ZImagefile and convert it to the internal
+    /// Dockerfile IR for execution.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use zlayer_builder::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// let builder = ImageBuilder::new("./my-project").await?
+    ///     .zimagefile("./my-project/ZImagefile");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn zimagefile(mut self, path: impl AsRef<Path>) -> Self {
+        self.options.zimagefile = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -1155,14 +1179,11 @@ impl ImageBuilder {
 
         info!("Starting build in context: {}", self.context.display());
 
-        // 1. Get Dockerfile content
-        let dockerfile_content = self.get_dockerfile_content().await?;
-
-        // 2. Parse Dockerfile
-        let dockerfile = Dockerfile::parse(&dockerfile_content)?;
+        // 1. Get parsed Dockerfile (from template, ZImagefile, or Dockerfile)
+        let dockerfile = self.get_dockerfile().await?;
         debug!("Parsed Dockerfile with {} stages", dockerfile.stages.len());
 
-        // 3. Determine stages to build
+        // 2. Determine stages to build
         let stages = self.resolve_stages(&dockerfile)?;
         debug!("Building {} stages", stages.len());
 
@@ -1391,13 +1412,53 @@ impl ImageBuilder {
         })
     }
 
-    /// Get Dockerfile content from template or file
-    async fn get_dockerfile_content(&self) -> Result<String> {
+    /// Get a parsed [`Dockerfile`] from the configured source.
+    ///
+    /// Detection order:
+    /// 1. If `runtime` is set → use template string → parse as Dockerfile
+    /// 2. If `zimagefile` is explicitly set → read & parse ZImagefile → convert
+    /// 3. If a file called `ZImagefile` exists in the context dir → same as (2)
+    /// 4. Fall back to reading a Dockerfile (from `dockerfile` option or default)
+    async fn get_dockerfile(&self) -> Result<Dockerfile> {
+        // (a) Runtime template takes highest priority.
         if let Some(runtime) = &self.options.runtime {
             debug!("Using runtime template: {}", runtime);
-            return Ok(get_template(*runtime).to_string());
+            let content = get_template(*runtime);
+            return Dockerfile::parse(content);
         }
 
+        // (b) Explicit ZImagefile path.
+        if let Some(ref zimage_path) = self.options.zimagefile {
+            debug!("Reading ZImagefile: {}", zimage_path.display());
+            let content =
+                fs::read_to_string(zimage_path)
+                    .await
+                    .map_err(|e| BuildError::ContextRead {
+                        path: zimage_path.clone(),
+                        source: e,
+                    })?;
+            let zimage = crate::zimage::parse_zimagefile(&content)?;
+            return self.handle_zimage(&zimage);
+        }
+
+        // (c) Auto-detect ZImagefile in context directory.
+        let auto_zimage_path = self.context.join("ZImagefile");
+        if auto_zimage_path.exists() {
+            debug!(
+                "Found ZImagefile in context: {}",
+                auto_zimage_path.display()
+            );
+            let content = fs::read_to_string(&auto_zimage_path).await.map_err(|e| {
+                BuildError::ContextRead {
+                    path: auto_zimage_path,
+                    source: e,
+                }
+            })?;
+            let zimage = crate::zimage::parse_zimagefile(&content)?;
+            return self.handle_zimage(&zimage);
+        }
+
+        // (d) Fall back to Dockerfile.
         let dockerfile_path = self
             .options
             .dockerfile
@@ -1406,12 +1467,45 @@ impl ImageBuilder {
 
         debug!("Reading Dockerfile: {}", dockerfile_path.display());
 
-        fs::read_to_string(&dockerfile_path)
-            .await
-            .map_err(|e| BuildError::ContextRead {
-                path: dockerfile_path,
-                source: e,
-            })
+        let content =
+            fs::read_to_string(&dockerfile_path)
+                .await
+                .map_err(|e| BuildError::ContextRead {
+                    path: dockerfile_path,
+                    source: e,
+                })?;
+
+        Dockerfile::parse(&content)
+    }
+
+    /// Convert a parsed [`ZImage`] into the internal [`Dockerfile`] IR.
+    ///
+    /// Handles the three ZImage modes that can produce a Dockerfile:
+    /// - **Runtime** mode: delegates to the template system
+    /// - **Single-stage / Multi-stage**: converts via [`zimage_to_dockerfile`]
+    /// - **WASM** mode: errors out (WASM uses `zlayer wasm build`, not `zlayer build`)
+    fn handle_zimage(&self, zimage: &crate::zimage::ZImage) -> Result<Dockerfile> {
+        // Runtime mode: delegate to template system.
+        if let Some(ref runtime_name) = zimage.runtime {
+            let rt = Runtime::from_name(runtime_name).ok_or_else(|| {
+                BuildError::zimagefile_validation(format!(
+                    "unknown runtime '{runtime_name}' in ZImagefile"
+                ))
+            })?;
+            let content = get_template(rt);
+            return Dockerfile::parse(content);
+        }
+
+        // WASM mode: not supported through `zlayer build`.
+        if zimage.wasm.is_some() {
+            return Err(BuildError::invalid_instruction(
+                "ZImagefile",
+                "WASM builds use `zlayer wasm build`, not `zlayer build`",
+            ));
+        }
+
+        // Single-stage or multi-stage: convert to Dockerfile IR directly.
+        crate::zimage::zimage_to_dockerfile(zimage)
     }
 
     /// Resolve which stages need to be built
@@ -1560,6 +1654,7 @@ mod tests {
     fn test_build_options_default() {
         let opts = BuildOptions::default();
         assert!(opts.dockerfile.is_none());
+        assert!(opts.zimagefile.is_none());
         assert!(opts.runtime.is_none());
         assert!(opts.build_args.is_empty());
         assert!(opts.target.is_none());
