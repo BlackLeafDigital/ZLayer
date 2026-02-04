@@ -50,13 +50,16 @@ fn validate_version(image: &ZImage) -> Result<()> {
 // Mode exclusivity
 // ---------------------------------------------------------------------------
 
-/// Exactly one of `runtime`, `wasm`, `stages`, or `base` must be set.
+/// Exactly one of `runtime`, `wasm`, `stages`, `base`, or `build` must be set.
+/// `base` and `build` are treated as the same mode (single-stage) and are
+/// mutually exclusive with each other.
 fn validate_mode_exclusivity(image: &ZImage) -> Result<()> {
     let modes_present: Vec<&str> = [
         image.runtime.as_ref().map(|_| "runtime"),
         image.wasm.as_ref().map(|_| "wasm"),
         image.stages.as_ref().map(|_| "stages"),
         image.base.as_ref().map(|_| "base"),
+        image.build.as_ref().map(|_| "build"),
     ]
     .into_iter()
     .flatten()
@@ -64,12 +67,13 @@ fn validate_mode_exclusivity(image: &ZImage) -> Result<()> {
 
     match modes_present.len() {
         0 => Err(BuildError::zimagefile_validation(
-            "exactly one of 'runtime', 'wasm', 'stages', or 'base' must be set, but none were found"
+            "exactly one of 'runtime', 'wasm', 'stages', 'base', or 'build' must be set, \
+             but none were found"
                 .to_string(),
         )),
         1 => Ok(()),
         _ => Err(BuildError::zimagefile_validation(format!(
-            "exactly one of 'runtime', 'wasm', 'stages', or 'base' must be set, \
+            "exactly one of 'runtime', 'wasm', 'stages', 'base', or 'build' must be set, \
              but multiple were found: {}",
             modes_present.join(", ")
         ))),
@@ -83,15 +87,32 @@ fn validate_mode_exclusivity(image: &ZImage) -> Result<()> {
 /// Validate all steps reachable from the current image configuration.
 fn validate_steps(image: &ZImage) -> Result<()> {
     // Single-stage mode: validate top-level steps.
-    if image.base.is_some() {
+    if image.base.is_some() || image.build.is_some() {
         for (i, step) in image.steps.iter().enumerate() {
             validate_step(step, i, None)?;
         }
     }
 
-    // Multi-stage mode: validate steps in every stage.
+    // Multi-stage mode: validate steps in every stage + base/build exclusivity.
     if let Some(ref stages) = image.stages {
         for (stage_name, stage) in stages {
+            // Exactly one of base or build must be set per stage.
+            match (&stage.base, &stage.build) {
+                (None, None) => {
+                    return Err(BuildError::zimagefile_validation(format!(
+                        "stage '{stage_name}': exactly one of 'base' or 'build' must be set, \
+                         but neither was found"
+                    )));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(BuildError::zimagefile_validation(format!(
+                        "stage '{stage_name}': 'base' and 'build' are mutually exclusive, \
+                         but both were set"
+                    )));
+                }
+                _ => {}
+            }
+
             for (i, step) in stage.steps.iter().enumerate() {
                 validate_step(step, i, Some(stage_name))?;
             }
@@ -531,5 +552,105 @@ steps:
   - user: "nobody"
 "#;
         parse_zimagefile(yaml).unwrap();
+    }
+
+    // -- Build directive tests ------------------------------------------------
+
+    #[test]
+    fn test_build_short_form() {
+        let yaml = r#"
+version: "1"
+build: "."
+steps:
+  - run: "echo hello"
+"#;
+        let img = parse_zimagefile(yaml).unwrap();
+        assert!(img.build.is_some());
+        assert!(img.base.is_none());
+    }
+
+    #[test]
+    fn test_build_long_form() {
+        let yaml = r#"
+version: "1"
+build:
+  context: "./subdir"
+  file: "ZImagefile.prod"
+  args:
+    RUST_VERSION: "1.90"
+steps:
+  - run: "echo hello"
+"#;
+        let img = parse_zimagefile(yaml).unwrap();
+        assert!(img.build.is_some());
+        assert!(img.base.is_none());
+    }
+
+    #[test]
+    fn test_build_and_base_rejected() {
+        let yaml = r#"
+version: "1"
+base: "alpine:3.19"
+build: "."
+steps:
+  - run: "echo hi"
+"#;
+        let err = parse_zimagefile(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("multiple were found"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_stage_build_directive() {
+        let yaml = r#"
+version: "1"
+stages:
+  builder:
+    build: "."
+    steps:
+      - run: "make build"
+  runtime:
+    base: "debian:bookworm-slim"
+    steps:
+      - copy: "target/release/app"
+        from: builder
+        to: "/usr/local/bin/app"
+"#;
+        let img = parse_zimagefile(yaml).unwrap();
+        let stages = img.stages.as_ref().unwrap();
+        assert!(stages["builder"].build.is_some());
+        assert!(stages["builder"].base.is_none());
+        assert!(stages["runtime"].base.is_some());
+        assert!(stages["runtime"].build.is_none());
+    }
+
+    #[test]
+    fn test_stage_build_and_base_rejected() {
+        let yaml = r#"
+version: "1"
+stages:
+  builder:
+    base: "rust:1.90"
+    build: "."
+    steps:
+      - run: "cargo build"
+"#;
+        let err = parse_zimagefile(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mutually exclusive"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_stage_neither_base_nor_build_rejected() {
+        let yaml = r#"
+version: "1"
+stages:
+  builder:
+    steps:
+      - run: "echo hi"
+"#;
+        let err = parse_zimagefile(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("neither was found"), "got: {msg}");
     }
 }

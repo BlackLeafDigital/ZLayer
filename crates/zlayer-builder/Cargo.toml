@@ -54,3 +54,5 @@ cache = ["zlayer-registry"]
 cache-persistent = ["cache", "zlayer-registry/persistent"]
 # Enable S3-compatible storage backend (requires cache feature)
 cache-s3 = ["cache", "zlayer-registry/s3"]
+# Enable local OCI registry for image resolution (check local store before pulling)
+local-registry = ["cache", "zlayer-registry/local"]

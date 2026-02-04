@@ -384,7 +384,7 @@ fn print_zimagefile_summary(zimage: &zlayer_builder::zimage::ZImage) {
         for (name, stage) in stages {
             println!(
                 "    [{name}] FROM {} ({} steps)",
-                stage.base,
+                stage.base.as_deref().unwrap_or("scratch"),
                 stage.steps.len()
             );
         }

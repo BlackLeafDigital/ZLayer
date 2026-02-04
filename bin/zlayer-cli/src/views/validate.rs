@@ -362,7 +362,7 @@ fn summarize_zimagefile(zimage: &zlayer_builder::zimage::ZImage) -> String {
                 format!(
                     "  {} (FROM {}, {} steps)",
                     name,
-                    stage.base,
+                    stage.base.as_deref().unwrap_or("scratch"),
                     stage.steps.len()
                 )
             })

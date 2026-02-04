@@ -5,14 +5,84 @@
 //! mutually exclusive build modes:
 //!
 //! 1. **Runtime template** - shorthand like `runtime: node22`
-//! 2. **Single-stage** - `base:` + `steps:` at top level
+//! 2. **Single-stage** - `base:` or `build:` + `steps:` at top level
 //! 3. **Multi-stage** - `stages:` map (IndexMap for insertion order, last = output)
 //! 4. **WASM** - `wasm:` configuration for WebAssembly builds
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+
+// ---------------------------------------------------------------------------
+// Build context (for `build:` directive)
+// ---------------------------------------------------------------------------
+
+/// Build context for building a base image from a local Dockerfile or ZImagefile.
+///
+/// Supports two forms:
+///
+/// ```yaml
+/// # Short form: just a path (defaults to auto-detecting build file)
+/// build: "."
+///
+/// # Long form: explicit configuration
+/// build:
+///   context: "./subdir"     # or use `workdir:` (context is an alias)
+///   file: "ZImagefile.prod" # specific build file
+///   args:
+///     RUST_VERSION: "1.90"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ZBuildContext {
+    /// Short form: just a path to the build context directory.
+    Short(String),
+    /// Long form: explicit build configuration.
+    Full {
+        /// Build context directory. Defaults to the current working directory.
+        /// `context` is accepted as an alias for Docker Compose compatibility.
+        #[serde(alias = "context", default)]
+        workdir: Option<String>,
+        /// Path to the build file (Dockerfile or ZImagefile).
+        /// Auto-detected if omitted (prefers ZImagefile over Dockerfile).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        file: Option<String>,
+        /// Build arguments passed to the nested build.
+        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+        args: HashMap<String, String>,
+    },
+}
+
+impl ZBuildContext {
+    /// Resolve the build context directory relative to a base path.
+    pub fn context_dir(&self, base: &Path) -> PathBuf {
+        match self {
+            Self::Short(path) => base.join(path),
+            Self::Full { workdir, .. } => match workdir {
+                Some(dir) => base.join(dir),
+                None => base.to_path_buf(),
+            },
+        }
+    }
+
+    /// Get the explicit build file path, if specified.
+    pub fn file(&self) -> Option<&str> {
+        match self {
+            Self::Short(_) => None,
+            Self::Full { file, .. } => file.as_deref(),
+        }
+    }
+
+    /// Get build arguments.
+    pub fn args(&self) -> HashMap<String, String> {
+        match self {
+            Self::Short(_) => HashMap::new(),
+            Self::Full { args, .. } => args.clone(),
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Top-level ZImage
@@ -41,9 +111,15 @@ pub struct ZImage {
     pub runtime: Option<String>,
 
     // -- Mode 2: single-stage --
-    /// Base image for single-stage builds (e.g. "alpine:3.19")
+    /// Base image for single-stage builds (e.g. "alpine:3.19").
+    /// Mutually exclusive with `build`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+
+    /// Build a base image from a local Dockerfile/ZImagefile context.
+    /// Mutually exclusive with `base`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<ZBuildContext>,
 
     /// Build steps for single-stage mode
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -118,8 +194,15 @@ pub struct ZImage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZStage {
-    /// Base image for this stage (e.g. "node:22-alpine")
-    pub base: String,
+    /// Base image for this stage (e.g. "node:22-alpine").
+    /// Mutually exclusive with `build`. One of `base` or `build` must be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+
+    /// Build a base image from a local Dockerfile/ZImagefile context.
+    /// Mutually exclusive with `base`. One of `base` or `build` must be set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<ZBuildContext>,
 
     /// Target platform override (e.g. "linux/arm64")
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -537,7 +620,7 @@ expose: 3000
         assert_eq!(keys, vec!["builder", "runtime"]);
 
         let builder = &stages["builder"];
-        assert_eq!(builder.base, "node:22-alpine");
+        assert_eq!(builder.base.as_deref(), Some("node:22-alpine"));
         assert_eq!(builder.steps.len(), 4);
 
         let runtime = &stages["runtime"];

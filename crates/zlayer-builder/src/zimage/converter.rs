@@ -46,13 +46,20 @@ pub fn zimage_to_dockerfile(zimage: &ZImage) -> Result<Dockerfile> {
     let global_args = convert_global_args(&zimage.args);
 
     // Choose single-stage or multi-stage.
+    // Note: `build:` directives must be resolved to `base:` by the caller
+    // (ImageBuilder) before calling this function.
     let stages = if let Some(ref base) = zimage.base {
         vec![convert_single_stage(zimage, base)?]
     } else if let Some(ref stage_map) = zimage.stages {
         convert_multi_stage(zimage, stage_map)?
+    } else if zimage.build.is_some() {
+        return Err(BuildError::zimagefile_validation(
+            "ZImage has 'build' set but it was not resolved to a 'base' image. \
+             This is an internal error — build directives must be resolved before conversion.",
+        ));
     } else {
         return Err(BuildError::zimagefile_validation(
-            "ZImage must have 'base' or 'stages' set to convert to a Dockerfile",
+            "ZImage must have 'base', 'build', or 'stages' set to convert to a Dockerfile",
         ));
     };
 
@@ -168,10 +175,24 @@ fn convert_multi_stage(
     let mut stages = Vec::with_capacity(stage_map.len());
 
     for (idx, (name, zstage)) in stage_map.iter().enumerate() {
-        let base_image = if stage_names.contains(&&zstage.base) {
-            ImageRef::Stage(zstage.base.clone())
+        // `build:` directives must be resolved to `base:` before conversion.
+        let base_str = zstage.base.as_deref().ok_or_else(|| {
+            if zstage.build.is_some() {
+                BuildError::zimagefile_validation(format!(
+                    "stage '{name}': 'build' directive was not resolved to a 'base' image. \
+                     This is an internal error."
+                ))
+            } else {
+                BuildError::zimagefile_validation(format!(
+                    "stage '{name}': must have 'base' or 'build' set"
+                ))
+            }
+        })?;
+
+        let base_image = if stage_names.iter().any(|s| s.as_str() == base_str) {
+            ImageRef::Stage(base_str.to_string())
         } else {
-            ImageRef::parse(&zstage.base)
+            ImageRef::parse(base_str)
         };
 
         let mut instructions = Vec::new();
