@@ -1,0 +1,84 @@
+# ZImagefile: Multi-stage Rust build with cache mounts
+#
+# Demonstrates a production Rust build with:
+#   1. "builder" stage compiles the release binary with cached cargo registry
+#      and target directory for incremental compilation
+#   2. "runtime" stage uses a minimal Debian slim image with only the binary
+#
+# Build with:
+#   zlayer build -f ZImagefile -t my-rust-app:latest .
+
+version: "1"
+
+args:
+  RUST_VERSION: "1.83"
+
+stages:
+  builder:
+    base: "rust:${RUST_VERSION}-bookworm"
+    workdir: "/build"
+    steps:
+      # Copy manifests first for dependency caching
+      - copy: ["Cargo.toml", "Cargo.lock"]
+        to: "./"
+      # Create a dummy main.rs so cargo can fetch and compile dependencies
+      - run: "mkdir src && echo 'fn main() {}' > src/main.rs"
+      - run: "cargo build --release"
+        cache:
+          - target: /usr/local/cargo/registry
+            id: cargo-registry
+            sharing: shared
+          - target: /build/target
+            id: cargo-target
+            sharing: shared
+      # Now copy real source and rebuild (only changed crates recompile)
+      - copy: "src"
+        to: "/build/src"
+      # Touch main.rs to invalidate the dummy binary
+      - run: "touch src/main.rs && cargo build --release"
+        cache:
+          - target: /usr/local/cargo/registry
+            id: cargo-registry
+            sharing: shared
+          - target: /build/target
+            id: cargo-target
+            sharing: shared
+      # Copy the binary out of the cache mount so it persists to the layer
+      - run: "cp target/release/myapp /build/myapp"
+        cache:
+          - target: /build/target
+            id: cargo-target
+            sharing: shared
+            readonly: true
+
+  runtime:
+    base: "debian:bookworm-slim"
+    steps:
+      - run: "apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*"
+        cache:
+          - target: /var/cache/apt
+            id: apt-cache
+            sharing: shared
+          - target: /var/lib/apt
+            id: apt-lib
+            sharing: shared
+      - run: "groupadd -r app && useradd -r -g app app"
+      - copy: "myapp"
+        from: builder
+        to: "/usr/local/bin/myapp"
+        chmod: "755"
+    workdir: "/app"
+    user: "app"
+    cmd: ["/usr/local/bin/myapp"]
+
+expose: 8080
+
+healthcheck:
+  cmd: ["curl", "-f", "http://localhost:8080/health"]
+  interval: "15s"
+  timeout: "5s"
+  start_period: "5s"
+  retries: 3
+
+labels:
+  org.opencontainers.image.source: "https://github.com/example/my-rust-app"

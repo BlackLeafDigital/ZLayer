@@ -236,7 +236,13 @@ services:
 
 ### 3. Deploy
 
+`.zlayer.yml` is the canonical deployment spec filename. When present in the current directory, `zlayer deploy` and `zlayer up` auto-discover it:
+
 ```bash
+# Auto-discovers .zlayer.yml in current directory
+zlayer deploy
+
+# Or specify explicitly
 zlayer deploy deployment.yaml
 ```
 
@@ -551,6 +557,134 @@ zlayer build /path/to/app -t myapp:latest --runtime node22
 zlayer runtimes
 ```
 
+## ZImagefile
+
+ZImagefile is ZLayer's YAML-based alternative to Dockerfiles. It provides a cleaner syntax for defining image builds, with first-class support for cache mounts, multi-stage builds, and WASM targets -- all in familiar YAML instead of Dockerfile DSL.
+
+### Why ZImagefile?
+
+- **YAML syntax** -- No new DSL to learn, works with existing YAML tooling and linting
+- **Declarative cache mounts** -- Cache directories are a simple `cache:` list instead of `--mount=type=cache,...` strings
+- **Cleaner multi-stage** -- Named stages as a YAML map with `from:` references instead of `COPY --from=`
+- **Four build modes** -- Runtime templates, single-stage, multi-stage, and WASM in one format
+
+### Mode 1: Runtime Template Shorthand
+
+The simplest form -- just specify a runtime template name:
+
+```yaml
+# ZImagefile
+runtime: node22
+cmd: "node server.js"
+```
+
+This expands to the full `node22` runtime template (Alpine-based Node.js image with dependency caching).
+
+### Mode 2: Single-Stage Build
+
+A single base image with ordered build steps:
+
+```yaml
+# ZImagefile
+base: "node:22-alpine"
+workdir: /app
+steps:
+  - copy: ["package.json", "package-lock.json"]
+    to: "./"
+  - run: "npm ci"
+  - copy: "."
+    to: "."
+  - run: "npm run build"
+env:
+  NODE_ENV: production
+expose: 3000
+cmd: ["node", "dist/index.js"]
+```
+
+### Mode 3: Multi-Stage Build
+
+Named stages as a YAML map. The last stage is the output image:
+
+```yaml
+# ZImagefile
+stages:
+  builder:
+    base: "rust:1.83-slim"
+    workdir: /src
+    steps:
+      - copy: ["Cargo.toml", "Cargo.lock"]
+        to: "./"
+      - run: "cargo fetch"
+        cache:
+          - target: /usr/local/cargo/registry
+            id: cargo-registry
+            sharing: shared
+          - target: /src/target
+            id: cargo-target
+            sharing: shared
+      - copy: "src"
+        to: "./src"
+      - run: "cargo build --release"
+        cache:
+          - target: /src/target
+            id: cargo-target
+            sharing: shared
+
+  runtime:
+    base: "debian:bookworm-slim"
+    steps:
+      - run: "apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*"
+      - copy: "target/release/myapp"
+        from: builder
+        to: "/usr/local/bin/myapp"
+        chmod: "755"
+    cmd: ["/usr/local/bin/myapp"]
+
+expose: 8080
+user: "nobody"
+```
+
+### Mode 4: WASM Build
+
+Build WebAssembly components directly:
+
+```yaml
+# ZImagefile
+wasm:
+  target: preview2
+  optimize: true
+  language: rust
+  wit: "./wit"
+  output: "./output.wasm"
+```
+
+WASM ZImagefiles are built with `zlayer wasm build`, not `zlayer build`.
+
+### Key Differences from Dockerfile
+
+- **`steps:` list** replaces inline instructions -- each step has exactly one action (`run`, `copy`, `add`, `env`, `workdir`, `user`)
+- **`copy:` / `to:`** replaces `COPY src dest` -- source and destination are separate fields
+- **`from:`** replaces `COPY --from=stage` -- a field on copy/add steps
+- **`owner:` / `chmod:`** replace `--chown` and `--chmod` flags
+- **`cache:` list** on `run` steps replaces `--mount=type=cache,target=...` syntax
+- **`stages:` map** replaces multiple `FROM` blocks -- named stages in insertion order
+- **Top-level metadata** (`env`, `expose`, `cmd`, `entrypoint`, `user`, etc.) is applied to the final output image
+
+### Building with ZImagefile
+
+```bash
+# Auto-detects ZImagefile in context directory
+zlayer build .
+
+# Specify a ZImagefile path explicitly
+zlayer build -z path/to/ZImagefile .
+
+# Combine with tags
+zlayer build -z ZImagefile -t myapp:latest .
+```
+
+Detection order: runtime template > explicit `-z` path > `ZImagefile` in context > `Dockerfile` in context.
+
 ## CLI Reference
 
 The `zlayer` binary provides comprehensive command-line management:
@@ -580,8 +714,26 @@ zlayer node generate-join-token -d my-deploy -a http://10.0.0.1:8080
 ### Deployment Management
 
 ```bash
-# Deploy from spec file
+# Auto-discovers .zlayer.yml in current directory
+zlayer deploy
+
+# Deploy from explicit spec file
 zlayer deploy deployment.yaml
+
+# Deploy and run (foreground, streams logs, Ctrl+C to stop)
+zlayer up
+
+# Deploy and run in background
+zlayer up -b
+# or equivalently
+zlayer -b up
+
+# Deploy a specific spec file in foreground
+zlayer up my-spec.yml
+
+# Stop a running deployment (auto-discovers from .zlayer.yml)
+zlayer down
+zlayer down my-app
 
 # Validate a deployment spec
 zlayer validate deployment.yaml
@@ -601,6 +753,12 @@ zlayer stop my-app --service web
 ```bash
 # Build from Dockerfile
 zlayer build . -t myapp:latest
+
+# Build from ZImagefile (auto-detected if present)
+zlayer build . -t myapp:latest
+
+# Build from explicit ZImagefile path
+zlayer build -z path/to/ZImagefile . -t myapp:latest
 
 # Build with runtime template
 zlayer build . --runtime node22 -t myapp:latest
