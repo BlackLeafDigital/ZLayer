@@ -381,10 +381,7 @@ async fn build_single_image(
     }
 
     // Apply no_cache (per-image overrides default)
-    if image_config
-        .no_cache
-        .unwrap_or(pipeline.defaults.no_cache)
-    {
+    if image_config.no_cache.unwrap_or(pipeline.defaults.no_cache) {
         builder = builder.no_cache();
     }
 
@@ -585,7 +582,9 @@ images:
                 build_time_ms: 50,
             },
         );
-        result.failed.insert("app2".to_string(), "error".to_string());
+        result
+            .failed
+            .insert("app2".to_string(), "error".to_string());
 
         assert_eq!(result.total_images(), 2);
     }

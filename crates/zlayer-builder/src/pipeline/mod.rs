@@ -237,7 +237,10 @@ images:
         assert_eq!(app.file.to_string_lossy(), "docker/Dockerfile.app");
         assert_eq!(app.context.to_string_lossy(), "./app");
         assert_eq!(app.tags.len(), 2);
-        assert_eq!(app.build_args.get("NODE_ENV"), Some(&"production".to_string()));
+        assert_eq!(
+            app.build_args.get("NODE_ENV"),
+            Some(&"production".to_string())
+        );
         assert_eq!(app.depends_on, vec!["base", "utils"]);
         assert_eq!(app.no_cache, Some(true));
         assert_eq!(app.format, Some("oci".to_string()));

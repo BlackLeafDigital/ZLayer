@@ -236,7 +236,10 @@ pub use templates::{
 pub use tui::{BuildEvent, BuildTui, InstructionStatus, PlainLogger};
 
 // Pipeline re-exports
-pub use pipeline::{parse_pipeline, PipelineDefaults, PipelineExecutor, PipelineImage, PipelineResult, PushConfig, ZPipeline};
+pub use pipeline::{
+    parse_pipeline, PipelineDefaults, PipelineExecutor, PipelineImage, PipelineResult, PushConfig,
+    ZPipeline,
+};
 
 #[cfg(test)]
 mod tests {

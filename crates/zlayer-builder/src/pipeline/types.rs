@@ -129,7 +129,10 @@ pub struct PipelineImage {
     pub file: PathBuf,
 
     /// Build context directory. Defaults to "."
-    #[serde(default = "default_context", skip_serializing_if = "is_default_context")]
+    #[serde(
+        default = "default_context",
+        skip_serializing_if = "is_default_context"
+    )]
     pub context: PathBuf,
 
     /// Image tags to apply. Supports variable substitution.
