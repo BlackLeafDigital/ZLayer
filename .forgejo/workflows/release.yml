@@ -420,12 +420,12 @@ jobs:
             -o zlayer.tar.gz
           tar xzf zlayer.tar.gz -C target/release/
       - name: Login to Docker Hub
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | buildah login -u zachhandley --password-stdin docker.io
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo buildah login -u zachhandley --password-stdin docker.io
       - name: Login to GHCR
-        run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | buildah login -u "${{ github.actor }}" --password-stdin ghcr.io
+        run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | sudo buildah login -u "${{ github.actor }}" --password-stdin ghcr.io
       - name: Build image
         run: |
-          zlayer-build build --no-tui \
+          sudo zlayer-build build --no-tui \
             -f ${{ matrix.zimagefile }} \
             -t zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
             -t zlayer/${{ matrix.image }}:latest \
@@ -434,11 +434,11 @@ jobs:
             --format oci .
       - name: Export OCI archive
         run: |
-          buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
+          sudo buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
             oci-archive:${{ matrix.image }}-${{ needs.detect.outputs.version }}-oci.tar
       - name: Export Docker archive
         run: |
-          buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
+          sudo buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
             docker-archive:${{ matrix.image }}-${{ needs.detect.outputs.version }}-docker.tar
       - name: Upload image archives to Forgejo Packages
         run: |
@@ -451,12 +451,12 @@ jobs:
           done
       - name: Push to Docker Hub
         run: |
-          buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }}
-          buildah push zlayer/${{ matrix.image }}:latest
+          sudo buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }}
+          sudo buildah push zlayer/${{ matrix.image }}:latest
       - name: Push to GHCR
         run: |
-          buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.detect.outputs.version }}
-          buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:latest
+          sudo buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.detect.outputs.version }}
+          sudo buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:latest
 
   # ===========================================
   # Trigger GitHub release

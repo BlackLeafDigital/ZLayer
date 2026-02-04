@@ -65,7 +65,6 @@ jobs:
   # Build Linux arm64 (cross-compile)
   # ===========================================
   build-linux-arm64:
-    needs: build-linux-amd64
     runs-on: ubuntu-latest
     env:
       CROSS_TARGET_DIR: ${{ github.workspace }}/cross-target
@@ -117,7 +116,7 @@ jobs:
   # Build macOS amd64
   # ===========================================
   build-macos-amd64:
-    needs: build-linux-arm64
+    needs: [build-linux-amd64, build-linux-arm64]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -181,7 +180,7 @@ jobs:
   # Build macOS arm64
   # ===========================================
   build-macos-arm64:
-    needs: build-macos-amd64
+    needs: [build-linux-amd64, build-linux-arm64]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -284,7 +283,7 @@ jobs:
           mkdir -p target/release
           tar xzf zlayer-linux-amd64.tar.gz -C target/release/
       - name: Build image
-        run: zlayer-build build --no-tui -f ${{ matrix.zimagefile }} -t zlayer/${{ matrix.image }}:build-${{ github.run_id }} --format oci .
+        run: sudo zlayer-build build --no-tui -f ${{ matrix.zimagefile }} -t zlayer/${{ matrix.image }}:build-${{ github.run_id }} --format oci .
 
   # ===========================================
   # Upload artifacts to temp Forgejo Packages
