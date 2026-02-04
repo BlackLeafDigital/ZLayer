@@ -129,6 +129,27 @@ docker logs -f zlayer
 
 This is conceptually similar to KIND (Kubernetes IN Docker), where the outer container provides isolation while running a full container runtime inside.
 
+## ZImagefiles
+
+ZImagefile equivalents of the Dockerfiles are available for use with `zlayer-build`:
+
+| File | Description |
+|------|-------------|
+| `ZImagefile.zlayer-web` | ZLayer web frontend (Leptos SSR + hydration) |
+| `ZImagefile.zlayer-manager` | ZLayer management UI (Leptos SSR + hydration + Tailwind v4) |
+
+These use declarative YAML syntax with cache mounts instead of the `cargo-chef` pattern used in the corresponding Dockerfiles.
+
+```bash
+# Build the web frontend using ZImagefile
+zlayer-build build -f docker/ZImagefile.zlayer-web -t zlayer-web .
+
+# Build the manager UI using ZImagefile
+zlayer-build build -f docker/ZImagefile.zlayer-manager -t zlayer-manager .
+```
+
+See the root [README](../README.md#zimagefile) for full ZImagefile format documentation.
+
 ## Limitations
 
 - **Privileged mode required**: Without `--privileged`, containerd cannot manage cgroups properly

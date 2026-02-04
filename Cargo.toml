@@ -18,7 +18,10 @@ members = [
   "crates/zlayer-web",
   "crates/zlayer-secrets",
   "crates/zlayer-tunnel",
-  "bin/runtime", "crates/zlayer-manager",
+  "bin/runtime",
+  "bin/zlayer-build",
+  "bin/zlayer-cli",
+  "crates/zlayer-manager",
 ]
 
 [workspace.package]

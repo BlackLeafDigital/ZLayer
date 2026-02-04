@@ -1,0 +1,33 @@
+[package]
+name = "zlayer-build"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Lightweight container image builder - ZImagefile, Dockerfile, and runtime templates"
+
+[[bin]]
+name = "zlayer-build"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates - builder subsystem only (NO cache feature!)
+zlayer-builder = { path = "../../crates/zlayer-builder" }
+zlayer-spec = { path = "../../crates/zlayer-spec" }
+
+# CLI
+clap = { workspace = true, features = ["derive"] }
+
+# Async runtime
+tokio = { workspace = true, features = ["full"] }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization (for JSON output)
+serde_json = { workspace = true }

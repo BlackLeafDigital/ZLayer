@@ -1,0 +1,78 @@
+# ZLayer Web - Full-stack Leptos SSR + Hydration
+#
+# ZImagefile equivalent of Dockerfile.zlayer-web
+# Uses cache mounts instead of cargo-chef for dependency caching.
+#
+# Usage:
+#   zlayer build -f docker/ZImagefile.zlayer-web -t zlayer-web .
+
+version: "1"
+
+stages:
+  builder:
+    base: "rust:1.90-bookworm"
+    workdir: "/build"
+    steps:
+      # Install system dependencies
+      - run: "apt-get update && apt-get install -y protobuf-compiler libseccomp-dev pkg-config cmake libssl-dev && rm -rf /var/lib/apt/lists/*"
+
+      # Install wasm target and cargo-leptos
+      - run: "rustup target add wasm32-unknown-unknown && cargo install cargo-leptos"
+        cache:
+          - target: /usr/local/cargo/registry
+            id: cargo-registry
+            sharing: shared
+
+      # Copy full workspace source
+      - copy: "."
+        to: "/build"
+
+      # Build zlayer-web with cargo-leptos
+      - run: "cd crates/zlayer-web && cargo leptos build --release"
+        cache:
+          - target: /usr/local/cargo/registry
+            id: cargo-registry
+            sharing: shared
+          - target: /build/target
+            id: cargo-target-web
+            sharing: shared
+
+      # Copy binary out of cached target dir
+      - run: "cp target/release/zlayer-web /build/zlayer-web"
+        cache:
+          - target: /build/target
+            id: cargo-target-web
+            sharing: shared
+            readonly: true
+
+      # Copy site assets out of cached target dir
+      - run: "cp -r target/site /build/site"
+        cache:
+          - target: /build/target
+            id: cargo-target-web
+            sharing: shared
+            readonly: true
+
+  runtime:
+    base: "debian:bookworm-slim"
+    workdir: "/app"
+    steps:
+      - run: "apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*"
+
+      # Copy the binary
+      - copy: "zlayer-web"
+        from: builder
+        to: "/app/zlayer-web"
+        chmod: "755"
+
+      # Copy the site assets (WASM, CSS, etc.)
+      - copy: "site"
+        from: builder
+        to: "/app/target/site"
+    env:
+      ZLAYER_WEB_ADDR: "0.0.0.0:3000"
+      LEPTOS_SITE_ROOT: "/app/target/site"
+      RUST_LOG: "info"
+    cmd: ["/app/zlayer-web"]
+
+expose: 3000

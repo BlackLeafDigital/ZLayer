@@ -45,7 +45,7 @@ mod build_view;
 mod logger;
 mod widgets;
 
-pub use app::BuildTui;
+pub use app::{BuildState, BuildTui, InstructionState, OutputLine, StageState};
 pub use build_view::BuildView;
 pub use logger::PlainLogger;
 

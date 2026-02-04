@@ -20,6 +20,8 @@ RUN apt-get update && apt-get install -y \
     protobuf-compiler \
     libseccomp-dev \
     pkg-config \
+    cmake \
+    libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install wasm target and cargo-leptos

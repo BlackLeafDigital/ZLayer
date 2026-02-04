@@ -118,7 +118,9 @@ crates/
 └── zlayer-core/    # Shared types and configuration
 
 bin/
-└── runtime/        # Main zlayer binary
+├── runtime/        # Main zlayer binary (full orchestration runtime)
+├── zlayer-build/   # Lightweight builder CLI
+└── zlayer-cli/     # Interactive TUI for image building
 ```
 
 ## Requirements
@@ -167,6 +169,38 @@ Or pin to a specific version:
 curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/download/VERSION/zlayer-linux-amd64.tar.gz | tar xz
 ```
 
+### Standalone Builder (Lightweight)
+
+If you only need image building (no runtime/orchestration), install the lightweight `zlayer-build` binary (~10MB):
+
+```bash
+# Install just the builder
+curl -sSL https://zlayer.dev/install.py | python3
+
+# Or install a specific binary
+python3 install.py --binary zlayer-build
+```
+
+`zlayer-build` depends only on `zlayer-builder` and `zlayer-spec` -- it does not pull in the agent, scheduler, overlay, or proxy crates.
+
+```
+zlayer-build build [OPTIONS] <CONTEXT>   Build an image from Dockerfile, ZImagefile, or runtime template
+zlayer-build runtimes [--json]           List available runtime templates
+zlayer-build validate <PATH>             Parse and validate a Dockerfile or ZImagefile
+```
+
+See [bin/zlayer-build/README.md](./bin/zlayer-build/README.md) for full usage details.
+
+### Interactive TUI
+
+`zlayer-cli` provides the same build capabilities as `zlayer-build` but with a menu-driven terminal interface:
+
+```bash
+python3 install.py --binary zlayer-cli
+```
+
+See [bin/zlayer-cli/README.md](./bin/zlayer-cli/README.md) for details.
+
 ### From Source
 
 ```bash
@@ -177,11 +211,19 @@ cd ZLayer
 # Install dependencies (Ubuntu/Debian)
 sudo apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config cmake
 
-# Build release binary
+# Build release binary (full runtime)
 cargo build --release --package runtime
 
-# Install
+# Build just the lightweight builder
+cargo build --release -p zlayer-build
+
+# Build the interactive TUI
+cargo build --release -p zlayer-cli
+
+# Install whichever binaries you need
 sudo cp target/release/zlayer /usr/local/bin/
+sudo cp target/release/zlayer-build /usr/local/bin/
+sudo cp target/release/zlayer-cli /usr/local/bin/
 ```
 
 ## Quick Start

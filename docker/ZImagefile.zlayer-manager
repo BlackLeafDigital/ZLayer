@@ -1,0 +1,80 @@
+# ZLayer Manager - Management UI (Leptos SSR + Hydration + Tailwind v4)
+#
+# ZImagefile equivalent of Dockerfile.zlayer-manager
+# Uses cache mounts instead of cargo-chef for dependency caching.
+# cargo-leptos auto-downloads the Tailwind v4 CLI when tailwind-input-file
+# is configured in Leptos.toml, so no manual Tailwind installation is needed.
+#
+# Usage:
+#   zlayer build -f docker/ZImagefile.zlayer-manager -t zlayer-manager .
+
+version: "1"
+
+stages:
+  builder:
+    base: "rust:1.90-bookworm"
+    workdir: "/build"
+    steps:
+      # Install system dependencies
+      - run: "apt-get update && apt-get install -y protobuf-compiler libseccomp-dev pkg-config cmake libssl-dev && rm -rf /var/lib/apt/lists/*"
+
+      # Install wasm target and cargo-leptos
+      - run: "rustup target add wasm32-unknown-unknown && cargo install cargo-leptos"
+        cache:
+          - target: /usr/local/cargo/registry
+            id: cargo-registry
+            sharing: shared
+
+      # Copy full workspace source
+      - copy: "."
+        to: "/build"
+
+      # Build zlayer-manager with cargo-leptos
+      - run: "cd crates/zlayer-manager && cargo leptos build --release"
+        cache:
+          - target: /usr/local/cargo/registry
+            id: cargo-registry
+            sharing: shared
+          - target: /build/target
+            id: cargo-target-manager
+            sharing: shared
+
+      # Copy binary out of cached target dir
+      - run: "cp target/release/zlayer-manager /build/zlayer-manager"
+        cache:
+          - target: /build/target
+            id: cargo-target-manager
+            sharing: shared
+            readonly: true
+
+      # Copy site assets out of cached target dir
+      - run: "cp -r target/site /build/site"
+        cache:
+          - target: /build/target
+            id: cargo-target-manager
+            sharing: shared
+            readonly: true
+
+  runtime:
+    base: "debian:bookworm-slim"
+    workdir: "/app"
+    steps:
+      - run: "apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*"
+
+      # Copy the binary
+      - copy: "zlayer-manager"
+        from: builder
+        to: "/app/zlayer-manager"
+        chmod: "755"
+
+      # Copy the site assets (WASM, CSS, JS, etc.)
+      - copy: "site"
+        from: builder
+        to: "/app/target/site"
+    env:
+      ZLAYER_MANAGER_ADDR: "0.0.0.0:9120"
+      LEPTOS_SITE_ROOT: "/app/target/site"
+      RUST_LOG: "info"
+    cmd: ["/app/zlayer-manager"]
+
+expose: 9120
