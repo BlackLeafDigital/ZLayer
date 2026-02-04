@@ -1247,7 +1247,9 @@ impl ImageBuilder {
             });
 
             // Create container from base image
-            let base = self.resolve_base_image(&stage.base_image, &stage_images).await?;
+            let base = self
+                .resolve_base_image(&stage.base_image, &stage_images)
+                .await?;
             let container_id = self.create_container(&base).await?;
 
             debug!(
@@ -1635,8 +1637,7 @@ impl ImageBuilder {
         // Apply explicit build file if specified.
         if let Some(file) = build_ctx.file() {
             let file_path = context_dir.join(file);
-            if file.ends_with(".yml") || file.ends_with(".yaml") || file.starts_with("ZImagefile")
-            {
+            if file.ends_with(".yml") || file.ends_with(".yaml") || file.starts_with("ZImagefile") {
                 nested = nested.zimagefile(file_path);
             } else {
                 nested = nested.dockerfile(file_path);
@@ -1783,11 +1784,7 @@ impl ImageBuilder {
                 );
                 // Build an OCI reference pointing to the local registry path.
                 // buildah can pull from an OCI layout directory.
-                let oci_path = format!(
-                    "oci:{}:{}",
-                    local_reg.root().display(),
-                    tag_str
-                );
+                let oci_path = format!("oci:{}:{}", local_reg.root().display(), tag_str);
                 return Some(oci_path);
             }
         }
@@ -1795,10 +1792,7 @@ impl ImageBuilder {
         // 2. Check configured default registry
         if let Some(ref registry) = self.options.default_registry {
             let qualified = format!("{}/{}:{}", registry, name, tag_str);
-            debug!(
-                "Checking default registry for image: {}",
-                qualified
-            );
+            debug!("Checking default registry for image: {}", qualified);
             // Return the qualified name for the configured registry.
             // buildah will attempt to pull from this registry; if it fails,
             // the build will error (the user explicitly configured this registry).
