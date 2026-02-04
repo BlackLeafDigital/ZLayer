@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "dependencies": {
+    "daisyui": "^5"
+  }
+}
