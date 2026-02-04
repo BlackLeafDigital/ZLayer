@@ -1277,7 +1277,26 @@ impl ImageBuilder {
                 // Track instruction start time for potential cache hit heuristics
                 let instruction_start = std::time::Instant::now();
 
-                let commands = BuildahCommand::from_instruction(&container_id, instruction);
+                // Resolve COPY --from references to actual committed image names
+                let resolved_instruction;
+                let instruction_ref = if let Instruction::Copy(copy) = instruction {
+                    if let Some(ref from) = copy.from {
+                        if let Some(image_name) = stage_images.get(from) {
+                            let mut resolved_copy = copy.clone();
+                            resolved_copy.from = Some(image_name.clone());
+                            resolved_instruction = Instruction::Copy(resolved_copy);
+                            &resolved_instruction
+                        } else {
+                            instruction
+                        }
+                    } else {
+                        instruction
+                    }
+                } else {
+                    instruction
+                };
+
+                let commands = BuildahCommand::from_instruction(&container_id, instruction_ref);
 
                 let mut combined_output = String::new();
                 for cmd in commands {
