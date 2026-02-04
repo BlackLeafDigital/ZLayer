@@ -108,7 +108,7 @@ jobs:
           BASE_URL="${{ inputs.artifact_base_url }}"
           mkdir -p artifacts
 
-          for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64 zlayer-build-linux-amd64 zlayer-build-linux-arm64 zlayer-build-darwin-amd64 zlayer-build-darwin-arm64; do
+          for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64 zlayer-build-linux-amd64 zlayer-build-linux-arm64 zlayer-build-darwin-amd64 zlayer-build-darwin-arm64 zlayer-cli-linux-amd64 zlayer-cli-linux-arm64 zlayer-cli-darwin-amd64 zlayer-cli-darwin-arm64; do
             echo "Downloading ${name}.tar.gz from temp storage..."
             curl -L --fail \
               --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
@@ -432,6 +432,23 @@ jobs:
             -t ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
             -t ghcr.io/blackleafdigital/${{ matrix.image }}:latest \
             --format oci .
+      - name: Export OCI archive
+        run: |
+          buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
+            oci-archive:${{ matrix.image }}-${{ needs.detect.outputs.version }}-oci.tar
+      - name: Export Docker archive
+        run: |
+          buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
+            docker-archive:${{ matrix.image }}-${{ needs.detect.outputs.version }}-docker.tar
+      - name: Upload image archives to Forgejo Packages
+        run: |
+          VERSION="${{ needs.detect.outputs.version }}"
+          for archive in ${{ matrix.image }}-${VERSION}-oci.tar ${{ matrix.image }}-${VERSION}-docker.tar; do
+            echo "Uploading ${archive}..."
+            curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+              --upload-file "${archive}" \
+              "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${archive}"
+          done
       - name: Push to Docker Hub
         run: |
           buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }}

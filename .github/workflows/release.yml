@@ -116,6 +116,19 @@ jobs:
               -o "artifacts/zlayer-build-${VERSION}-${artifact}.tar.gz" || echo "zlayer-build ${artifact} not available"
           done
 
+          # Download zlayer-cli artifacts
+          for arch in amd64 arm64; do
+            echo "Downloading zlayer-cli-linux-${arch}.tar.gz..."
+            curl -fsSL "${BASE_URL}/zlayer-cli-linux-${arch}.tar.gz" \
+              -o "artifacts/zlayer-cli-${VERSION}-linux-${arch}.tar.gz" || echo "zlayer-cli linux ${arch} not available"
+          done
+
+          for artifact in darwin-amd64 darwin-arm64; do
+            echo "Downloading zlayer-cli-${artifact}.tar.gz..."
+            curl -fsSL "${BASE_URL}/zlayer-cli-${artifact}.tar.gz" \
+              -o "artifacts/zlayer-cli-${VERSION}-${artifact}.tar.gz" || echo "zlayer-cli ${artifact} not available"
+          done
+
           ls -la artifacts/
 
       - name: Delete existing release if exists
@@ -132,9 +145,30 @@ jobs:
           files: artifacts/*.tar.gz
           generate_release_notes: true
           body: |
-            ## Release ${{ steps.version.outputs.version }}
+            ## ZLayer ${{ steps.version.outputs.version }}
 
-            This release was automatically created after E2E tests passed.
+            ### Install
+
+            ```bash
+            curl -sSL https://zlayer.dev/install.sh | sh
+            ```
+
+            This installs `zlayer-cli`, the interactive TUI that manages installing
+            and configuring all ZLayer components.
+
+            ### Binaries
+
+            | Binary | Size | Description |
+            |--------|------|-------------|
+            | `zlayer-cli` | ~5MB | Interactive TUI — install, build, and manage ZLayer |
+            | `zlayer-build` | ~4MB | Lightweight image builder CLI (Dockerfile, ZImagefile, runtime templates) |
+            | `zlayer` | ~50MB | Full container orchestration runtime |
+
+            ### Container Images
+
+            Available on GHCR (`ghcr.io/blackleafdigital/`):
+            - `zlayer-node` — Runtime with embedded containerd
+            - `zlayer-manager` — Management UI
 
             See the [CHANGELOG](https://github.com/zachhandley/ZLayer/blob/main/CHANGELOG.md) for details.
         env:
@@ -154,8 +188,6 @@ jobs:
         include:
           - image: zlayer-node
             zimagefile: docker/ZImagefile.zlayer-node
-          - image: zlayer-web
-            zimagefile: docker/ZImagefile.zlayer-web
           - image: zlayer-manager
             zimagefile: docker/ZImagefile.zlayer-manager
     permissions:
@@ -191,6 +223,23 @@ jobs:
             -t ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.setup.outputs.version }} \
             -t ghcr.io/blackleafdigital/${{ matrix.image }}:latest \
             --format oci .
+      - name: Export OCI archive
+        run: |
+          buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.setup.outputs.version }} \
+            oci-archive:${{ matrix.image }}-${{ needs.setup.outputs.version }}-oci.tar
+      - name: Export Docker archive
+        run: |
+          buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.setup.outputs.version }} \
+            docker-archive:${{ matrix.image }}-${{ needs.setup.outputs.version }}-docker.tar
+      - name: Upload image archives to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+        run: |
+          TAG="${{ needs.setup.outputs.version }}"
+          for archive in ${{ matrix.image }}-${TAG}-oci.tar ${{ matrix.image }}-${TAG}-docker.tar; do
+            echo "Uploading ${archive} to release..."
+            gh release upload "${TAG}" "${archive}" --clobber || echo "Upload failed for ${archive}"
+          done
       - name: Push to GHCR
         run: |
           buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.setup.outputs.version }}
