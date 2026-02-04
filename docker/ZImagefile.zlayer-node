@@ -1,0 +1,50 @@
+# ZLayer Node - Container image with embedded containerd
+# Run ZLayer inside a Docker container (like KIND for Kubernetes)
+#
+# ZImagefile equivalent of Dockerfile.zlayer-node
+# Single-stage build: copies a pre-built zlayer binary into an Ubuntu image
+# with containerd, runc, and networking tools.
+#
+# Usage:
+#   zlayer build -f docker/ZImagefile.zlayer-node -t zlayer-node .
+
+version: "1"
+
+base: "ubuntu:22.04"
+
+env:
+  DEBIAN_FRONTEND: "noninteractive"
+  CONTAINERD_SOCKET: "/run/containerd/containerd.sock"
+  ZLAYER_NAMESPACE: "zlayer"
+  ZLAYER_STATE_DIR: "/var/lib/zlayer/containers"
+
+steps:
+  # Install containerd and networking tools
+  - run: "apt-get update && apt-get install -y --no-install-recommends containerd runc iptables iproute2 ca-certificates wireguard-tools curl && apt-get clean && rm -rf /var/lib/apt/lists/*"
+
+  # Create containerd config with native snapshotter
+  - run: "mkdir -p /etc/containerd && containerd config default > /etc/containerd/config.toml"
+
+  # Create required directories
+  - run: "mkdir -p /run/containerd /var/lib/containerd /var/lib/zlayer/containers /var/lib/zlayer/state"
+
+  # Copy pre-built ZLayer binary
+  - copy: "target/release/zlayer"
+    to: "/usr/local/bin/zlayer"
+
+  # Copy entrypoint script
+  - copy: "docker/entrypoint.sh"
+    to: "/entrypoint.sh"
+    chmod: "755"
+
+expose: [80, 443]
+
+entrypoint: ["/entrypoint.sh"]
+cmd: ["serve"]
+
+labels:
+  org.opencontainers.image.title: "ZLayer Node"
+  org.opencontainers.image.description: "ZLayer runtime with embedded containerd"
+  org.opencontainers.image.source: "https://github.com/zachhandley/ZLayer"
+  org.opencontainers.image.licenses: "MIT"
+  maintainer: "Zach Handley <zachhandley@gmail.com>"

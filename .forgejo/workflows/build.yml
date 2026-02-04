@@ -203,35 +203,48 @@ jobs:
         run: echo "success=true" >> $GITHUB_OUTPUT
 
   # ===========================================
-  # Build Docker images (verify only, no push)
+  # Build container images (verify only, no push)
+  # Uses zlayer-build + buildah with ZImagefiles
   # ===========================================
-  docker-build:
-    name: Docker Build (${{ matrix.image }})
-    needs: verify
+  image-build:
+    name: Image Build (${{ matrix.image }})
+    needs: [verify, build-linux-amd64]
     if: needs.verify.outputs.success == 'true'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
+          - image: zlayer-node
+            zimagefile: docker/ZImagefile.zlayer-node
           - image: zlayer-web
-            dockerfile: docker/Dockerfile.zlayer-web
+            zimagefile: docker/ZImagefile.zlayer-web
           - image: zlayer-manager
-            dockerfile: docker/Dockerfile.zlayer-manager
+            zimagefile: docker/ZImagefile.zlayer-manager
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Build (no push)
-        uses: docker/build-push-action@v5
+      - name: Install buildah
+        run: sudo apt-get update && sudo apt-get install -y buildah
+      - name: Download zlayer-build
+        uses: actions/download-artifact@v3
         with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: linux/amd64
-          push: false
-          tags: zlayer/${{ matrix.image }}:build-${{ github.run_id }}
+          name: zlayer-build-linux-amd64
+      - name: Install zlayer-build
+        run: tar xzf zlayer-build-linux-amd64.tar.gz && chmod +x zlayer-build && sudo mv zlayer-build /usr/local/bin/
+      - name: Download zlayer binary
+        if: matrix.image == 'zlayer-node'
+        uses: actions/download-artifact@v3
+        with:
+          name: zlayer-linux-amd64
+      - name: Prepare zlayer binary for node image
+        if: matrix.image == 'zlayer-node'
+        run: |
+          mkdir -p target/release
+          tar xzf zlayer-linux-amd64.tar.gz -C target/release/
+      - name: Build image
+        run: zlayer-build build --no-tui -f ${{ matrix.zimagefile }} -t zlayer/${{ matrix.image }}:build-${{ github.run_id }} --format oci .
 
   # ===========================================
   # Upload artifacts to temp Forgejo Packages
@@ -269,7 +282,7 @@ jobs:
   # Dispatch Release workflow
   # ===========================================
   dispatch-release:
-    needs: [verify, upload-temp-packages, docker-build]
+    needs: [verify, upload-temp-packages, image-build]
     if: needs.verify.outputs.success == 'true'
     runs-on: ubuntu-latest
     steps:

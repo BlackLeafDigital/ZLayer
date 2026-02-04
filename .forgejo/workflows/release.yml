@@ -380,7 +380,7 @@ jobs:
           cmake --build build
 
   # ===========================================
-  # Docker (after merge)
+  # Docker (after merge) - uses zlayer-build + buildah
   # ===========================================
   docker:
     name: Docker (${{ matrix.image }})
@@ -392,39 +392,54 @@ jobs:
       matrix:
         include:
           - image: zlayer-node
-            dockerfile: docker/Dockerfile.zlayer-node
-            platforms: linux/amd64,linux/arm64
+            zimagefile: docker/ZImagefile.zlayer-node
           - image: zlayer-web
-            dockerfile: docker/Dockerfile.zlayer-web
-            platforms: linux/amd64
+            zimagefile: docker/ZImagefile.zlayer-web
           - image: zlayer-manager
-            dockerfile: docker/Dockerfile.zlayer-manager
-            platforms: linux/amd64
+            zimagefile: docker/ZImagefile.zlayer-manager
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
-      - name: Set up QEMU
-        if: contains(matrix.platforms, 'arm64')
-        uses: docker/setup-qemu-action@v3
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Install buildah
+        run: sudo apt-get update && sudo apt-get install -y buildah
+      - name: Download zlayer-build
+        run: |
+          curl -fsSL "${{ inputs.artifact_base_url }}/zlayer-build-linux-amd64.tar.gz" \
+            --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+            -o zlayer-build.tar.gz
+          tar xzf zlayer-build.tar.gz
+          chmod +x zlayer-build
+          sudo mv zlayer-build /usr/local/bin/
+      - name: Download zlayer binary (for node image)
+        if: matrix.image == 'zlayer-node'
+        run: |
+          mkdir -p target/release
+          curl -fsSL "${{ inputs.artifact_base_url }}/zlayer-linux-amd64.tar.gz" \
+            --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+            -o zlayer.tar.gz
+          tar xzf zlayer.tar.gz -C target/release/
       - name: Login to Docker Hub
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u zachhandley --password-stdin
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | buildah login -u zachhandley --password-stdin docker.io
       - name: Login to GHCR
-        run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ${{ matrix.dockerfile }}
-          platforms: ${{ matrix.platforms }}
-          push: true
-          tags: |
-            zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }}
-            zlayer/${{ matrix.image }}:latest
-            ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.detect.outputs.version }}
-            ghcr.io/blackleafdigital/${{ matrix.image }}:latest
+        run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | buildah login -u "${{ github.actor }}" --password-stdin ghcr.io
+      - name: Build image
+        run: |
+          zlayer-build build --no-tui \
+            -f ${{ matrix.zimagefile }} \
+            -t zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
+            -t zlayer/${{ matrix.image }}:latest \
+            -t ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
+            -t ghcr.io/blackleafdigital/${{ matrix.image }}:latest \
+            --format oci .
+      - name: Push to Docker Hub
+        run: |
+          buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }}
+          buildah push zlayer/${{ matrix.image }}:latest
+      - name: Push to GHCR
+        run: |
+          buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.detect.outputs.version }}
+          buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:latest
 
   # ===========================================
   # Trigger GitHub release
