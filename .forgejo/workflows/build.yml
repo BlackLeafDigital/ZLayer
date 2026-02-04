@@ -98,6 +98,24 @@ jobs:
             --set VERSION=build-${{ github.run_id }} \
             --set REGISTRY=zlayer
 
+      - name: Export images as OCI archives
+        run: |
+          for img in zlayer-node zlayer-web zlayer-manager; do
+            echo "Exporting ${img}..."
+            sudo buildah push zlayer/${img}:build-${{ github.run_id }} \
+              oci-archive:${img}-oci.tar
+          done
+
+      - name: Upload image artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: container-images
+          path: |
+            zlayer-node-oci.tar
+            zlayer-web-oci.tar
+            zlayer-manager-oci.tar
+          retention-days: 1
+
   # ===========================================
   # Build Linux arm64 (cross-compile)
   # Runs after image-build succeeds
@@ -304,11 +322,21 @@ jobs:
           VERSION="${{ inputs.version }}"
           BASE_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-temp/${RUN_ID}"
 
+          # Upload binary artifacts
           for artifact in artifacts/zlayer-*/*.tar.gz; do
             filename=$(basename "$artifact")
             echo "Uploading $filename to temp storage..."
             curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
               --upload-file "$artifact" \
+              "${BASE_URL}/${filename}"
+          done
+
+          # Upload container image archives
+          for archive in artifacts/container-images/*.tar; do
+            filename=$(basename "$archive")
+            echo "Uploading container image $filename to temp storage..."
+            curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+              --upload-file "$archive" \
               "${BASE_URL}/${filename}"
           done
 

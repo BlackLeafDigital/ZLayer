@@ -36,7 +36,7 @@
 //! ```
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::task::JoinSet;
@@ -225,7 +225,7 @@ impl PipelineExecutor {
             }
 
             // Build all images in this wave concurrently
-            let wave_results = self.build_wave(&wave).await;
+            let wave_results = self.build_wave(wave).await;
 
             // Process results
             for (name, result) in wave_results {
@@ -335,7 +335,7 @@ impl PipelineExecutor {
 async fn build_single_image(
     name: &str,
     pipeline: &ZPipeline,
-    base_dir: &PathBuf,
+    base_dir: &Path,
     executor: BuildahExecutor,
 ) -> Result<BuiltImage> {
     let image_config = &pipeline.images[name];

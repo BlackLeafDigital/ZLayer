@@ -127,16 +127,6 @@ jobs:
               "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${filename}"
           done
 
-      - name: Cleanup temp packages
-        if: always()
-        run: |
-          # Extract run_id from the artifact URL and delete temp packages
-          RUN_ID=$(echo "${{ inputs.artifact_base_url }}" | grep -oP 'zlayer-temp/\K[^/]+')
-          echo "Cleaning up temp packages for run_id: ${RUN_ID}"
-          curl -X DELETE \
-            --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-temp/${RUN_ID}" || true
-
   # ===========================================
   # Merge to main (after binaries uploaded)
   # ===========================================
@@ -380,89 +370,85 @@ jobs:
           cmake --build build
 
   # ===========================================
-  # Docker (after merge) - uses zlayer-build + buildah
+  # Docker Push (uses pre-built images from build workflow)
   # ===========================================
-  docker:
-    name: Docker (${{ matrix.image }})
+  docker-push:
     needs: [detect, merge-to-main]
     if: needs.detect.outputs.docker == 'true'
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: zlayer-node
-            zimagefile: docker/ZImagefile.zlayer-node
-          - image: zlayer-web
-            zimagefile: docker/ZImagefile.zlayer-web
-          - image: zlayer-manager
-            zimagefile: docker/ZImagefile.zlayer-manager
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: main
       - name: Install buildah
         run: sudo apt-get update && sudo apt-get install -y buildah
-      - name: Download zlayer-build
+
+      - name: Download pre-built image archives
         run: |
-          curl -fsSL "${{ inputs.artifact_base_url }}/zlayer-build-linux-amd64.tar.gz" \
-            --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-            -o zlayer-build.tar.gz
-          tar xzf zlayer-build.tar.gz
-          chmod +x zlayer-build
-          sudo mv zlayer-build /usr/local/bin/
-      - name: Download zlayer binary (for node image)
-        if: matrix.image == 'zlayer-node'
-        run: |
-          mkdir -p target/release
-          curl -fsSL "${{ inputs.artifact_base_url }}/zlayer-linux-amd64.tar.gz" \
-            --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-            -o zlayer.tar.gz
-          tar xzf zlayer.tar.gz -C target/release/
+          for img in zlayer-node zlayer-web zlayer-manager; do
+            echo "Downloading ${img}-oci.tar..."
+            curl -fsSL "${{ inputs.artifact_base_url }}/${img}-oci.tar" \
+              --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+              -o ${img}-oci.tar
+          done
+
       - name: Login to Docker Hub
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo buildah login -u zachhandley --password-stdin docker.io
+
       - name: Login to GHCR
         run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | sudo buildah login -u "${{ github.actor }}" --password-stdin ghcr.io
-      - name: Build image
+
+      - name: Load, tag, and push images
         run: |
-          sudo zlayer-build build --no-tui \
-            -f ${{ matrix.zimagefile }} \
-            -t zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
-            -t zlayer/${{ matrix.image }}:latest \
-            -t ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
-            -t ghcr.io/blackleafdigital/${{ matrix.image }}:latest \
-            --format oci .
-      - name: Export OCI archive
-        run: |
-          sudo buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
-            oci-archive:${{ matrix.image }}-${{ needs.detect.outputs.version }}-oci.tar
-      - name: Export Docker archive
-        run: |
-          sudo buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
-            docker-archive:${{ matrix.image }}-${{ needs.detect.outputs.version }}-docker.tar
+          VERSION="${{ needs.detect.outputs.version }}"
+          for img in zlayer-node zlayer-web zlayer-manager; do
+            echo "Processing ${img}..."
+
+            # Load from OCI archive
+            sudo buildah pull oci-archive:${img}-oci.tar
+
+            # Get the image ID from the loaded archive
+            IMAGE_ID=$(sudo buildah images --format "{{.ID}}" --filter "reference=localhost/${img}" | head -1)
+            if [ -z "$IMAGE_ID" ]; then
+              # Try without localhost prefix
+              IMAGE_ID=$(sudo buildah images --format "{{.ID}}" | head -1)
+            fi
+
+            # Tag for all destinations
+            sudo buildah tag ${IMAGE_ID} zlayer/${img}:${VERSION}
+            sudo buildah tag ${IMAGE_ID} zlayer/${img}:latest
+            sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/${img}:${VERSION}
+            sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/${img}:latest
+
+            # Push to Docker Hub
+            sudo buildah push zlayer/${img}:${VERSION}
+            sudo buildah push zlayer/${img}:latest
+
+            # Push to GHCR
+            sudo buildah push ghcr.io/blackleafdigital/${img}:${VERSION}
+            sudo buildah push ghcr.io/blackleafdigital/${img}:latest
+
+            # Export versioned archives for Forgejo Packages
+            sudo buildah push zlayer/${img}:${VERSION} \
+              oci-archive:${img}-${VERSION}-oci.tar
+            sudo buildah push zlayer/${img}:${VERSION} \
+              docker-archive:${img}-${VERSION}-docker.tar
+          done
+
       - name: Upload image archives to Forgejo Packages
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
-          for archive in ${{ matrix.image }}-${VERSION}-oci.tar ${{ matrix.image }}-${VERSION}-docker.tar; do
-            echo "Uploading ${archive}..."
-            curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-              --upload-file "${archive}" \
-              "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${archive}"
+          for img in zlayer-node zlayer-web zlayer-manager; do
+            for archive in ${img}-${VERSION}-oci.tar ${img}-${VERSION}-docker.tar; do
+              echo "Uploading ${archive}..."
+              curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+                --upload-file "${archive}" \
+                "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${archive}"
+            done
           done
-      - name: Push to Docker Hub
-        run: |
-          sudo buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }}
-          sudo buildah push zlayer/${{ matrix.image }}:latest
-      - name: Push to GHCR
-        run: |
-          sudo buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.detect.outputs.version }}
-          sudo buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:latest
 
   # ===========================================
   # Trigger GitHub release
   # ===========================================
   trigger-github:
-    needs: [detect, upload-binaries, merge-to-main, docker, publish-all-crates]
+    needs: [detect, upload-binaries, merge-to-main, docker-push, publish-all-crates]
     if: always() && needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success'
     runs-on: ubuntu-latest
     steps:
@@ -474,3 +460,19 @@ jobs:
             -H "X-GitHub-Api-Version: 2022-11-28" \
             https://api.github.com/repos/BlackLeafDigital/ZLayer/actions/workflows/release.yml/dispatches \
             -d '{"ref":"main","inputs":{"version":"${{ needs.detect.outputs.version }}"}}'
+
+  # ===========================================
+  # Cleanup temp packages (runs after all jobs)
+  # ===========================================
+  cleanup:
+    needs: [detect, upload-binaries, merge-to-main, docker-push, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk, trigger-github]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Cleanup temp packages
+        run: |
+          RUN_ID=$(echo "${{ inputs.artifact_base_url }}" | grep -oP 'zlayer-temp/\K[^/]+')
+          echo "Cleaning up temp packages for run_id: ${RUN_ID}"
+          curl -X DELETE \
+            --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+            "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-temp/${RUN_ID}" || true
