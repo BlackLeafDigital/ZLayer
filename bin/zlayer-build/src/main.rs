@@ -335,6 +335,7 @@ async fn cmd_pipeline(args: PipelineArgs) -> Result<()> {
     let base_dir = args
         .file
         .parent()
+        .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
         .canonicalize()
         .context("Failed to resolve pipeline directory")?;
