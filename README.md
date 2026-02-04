@@ -843,7 +843,9 @@ zlayer-manager --connect http://localhost:8080 --token <JWT_TOKEN>
 zlayer-manager --port 9120
 ```
 
-Access the dashboard at `http://localhost:9120`. Features include:
+Access the dashboard at `http://localhost:9120`. 
+
+Features include:
 - **Dashboard** - System overview, node counts, uptime
 - **Deployments** - Manage deployments and services
 - **Builds** - View build history and logs
