@@ -17,7 +17,8 @@ env:
 
 jobs:
   # ===========================================
-  # Build Linux amd64 (native)
+  # Build Linux amd64 (native) - FIRST
+  # Required for image-build pipeline
   # ===========================================
   build-linux-amd64:
     runs-on: ubuntu-latest
@@ -62,9 +63,47 @@ jobs:
         run: rm -rf $CARGO_TARGET_DIR zlayer-linux-amd64.tar.gz zlayer-build-linux-amd64.tar.gz zlayer-cli-linux-amd64.tar.gz
 
   # ===========================================
+  # Build container images using pipeline - EARLY
+  # Runs after linux-amd64, gates all other builds
+  # ===========================================
+  image-build:
+    name: Image Build (Pipeline)
+    needs: [build-linux-amd64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - name: Install buildah
+        run: sudo apt-get update && sudo apt-get install -y buildah
+      - name: Download zlayer-build
+        uses: actions/download-artifact@v3
+        with:
+          name: zlayer-build-linux-amd64
+      - name: Install zlayer-build
+        run: tar xzf zlayer-build-linux-amd64.tar.gz && chmod +x zlayer-build && sudo mv zlayer-build /usr/local/bin/
+      - name: Download zlayer binary (for zlayer-node image)
+        uses: actions/download-artifact@v3
+        with:
+          name: zlayer-linux-amd64
+      - name: Prepare zlayer binary for node image
+        run: |
+          mkdir -p target/release
+          tar xzf zlayer-linux-amd64.tar.gz -C target/release/
+      - name: Build all images with pipeline
+        run: |
+          sudo zlayer-build pipeline \
+            -f ZPipeline.yaml \
+            --no-tui \
+            --set VERSION=build-${{ github.run_id }} \
+            --set REGISTRY=zlayer
+
+  # ===========================================
   # Build Linux arm64 (cross-compile)
+  # Runs after image-build succeeds
   # ===========================================
   build-linux-arm64:
+    needs: [image-build]
     runs-on: ubuntu-latest
     env:
       CROSS_TARGET_DIR: ${{ github.workspace }}/cross-target
@@ -114,9 +153,10 @@ jobs:
 
   # ===========================================
   # Build macOS amd64
+  # Runs after image-build succeeds
   # ===========================================
   build-macos-amd64:
-    needs: [build-linux-amd64, build-linux-arm64]
+    needs: [image-build]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -178,9 +218,10 @@ jobs:
 
   # ===========================================
   # Build macOS arm64
+  # Runs after image-build succeeds
   # ===========================================
   build-macos-arm64:
-    needs: [build-linux-amd64, build-linux-arm64]
+    needs: [image-build]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -232,7 +273,7 @@ jobs:
   # Verify all builds passed
   # ===========================================
   verify:
-    needs: [build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64]
+    needs: [build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64, image-build]
     runs-on: ubuntu-latest
     outputs:
       success: ${{ steps.check.outputs.success }}
@@ -242,54 +283,10 @@ jobs:
         run: echo "success=true" >> $GITHUB_OUTPUT
 
   # ===========================================
-  # Build container images (verify only, no push)
-  # Uses zlayer-build + buildah with ZImagefiles
-  # ===========================================
-  image-build:
-    name: Image Build (${{ matrix.image }})
-    needs: [verify, build-linux-amd64]
-    if: needs.verify.outputs.success == 'true'
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: zlayer-node
-            zimagefile: docker/ZImagefile.zlayer-node
-          - image: zlayer-web
-            zimagefile: docker/ZImagefile.zlayer-web
-          - image: zlayer-manager
-            zimagefile: docker/ZImagefile.zlayer-manager
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.sha }}
-      - name: Install buildah
-        run: sudo apt-get update && sudo apt-get install -y buildah
-      - name: Download zlayer-build
-        uses: actions/download-artifact@v3
-        with:
-          name: zlayer-build-linux-amd64
-      - name: Install zlayer-build
-        run: tar xzf zlayer-build-linux-amd64.tar.gz && chmod +x zlayer-build && sudo mv zlayer-build /usr/local/bin/
-      - name: Download zlayer binary
-        if: matrix.image == 'zlayer-node'
-        uses: actions/download-artifact@v3
-        with:
-          name: zlayer-linux-amd64
-      - name: Prepare zlayer binary for node image
-        if: matrix.image == 'zlayer-node'
-        run: |
-          mkdir -p target/release
-          tar xzf zlayer-linux-amd64.tar.gz -C target/release/
-      - name: Build image
-        run: sudo zlayer-build build --no-tui -f ${{ matrix.zimagefile }} -t zlayer/${{ matrix.image }}:build-${{ github.run_id }} --format oci .
-
-  # ===========================================
   # Upload artifacts to temp Forgejo Packages
   # ===========================================
   upload-temp-packages:
-    needs: [verify, build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64]
+    needs: [verify]
     if: needs.verify.outputs.success == 'true'
     runs-on: ubuntu-latest
     outputs:
@@ -321,7 +318,7 @@ jobs:
   # Dispatch Release workflow
   # ===========================================
   dispatch-release:
-    needs: [verify, upload-temp-packages, image-build]
+    needs: [verify, upload-temp-packages]
     if: needs.verify.outputs.success == 'true'
     runs-on: ubuntu-latest
     steps:

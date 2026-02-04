@@ -1229,6 +1229,9 @@ impl ImageBuilder {
 
         // 4. Build each stage
         let mut stage_images: HashMap<String, String> = HashMap::new();
+        // Track the final WORKDIR for each committed stage, used to resolve
+        // relative source paths in COPY --from instructions.
+        let mut stage_workdirs: HashMap<String, String> = HashMap::new();
         let mut final_container: Option<String> = None;
         let mut total_instructions = 0;
 
@@ -1263,6 +1266,10 @@ impl ImageBuilder {
             // Each instruction modifies the container, so we update this after each instruction.
             let mut current_base_layer = container_id.clone();
 
+            // Track the current WORKDIR for this stage. Used to resolve relative paths
+            // when this stage is used as a source for COPY --from in a later stage.
+            let mut current_workdir = String::from("/");
+
             // Execute instructions
             for (inst_idx, instruction) in stage.instructions.iter().enumerate() {
                 self.send_event(BuildEvent::InstructionStarted {
@@ -1277,13 +1284,38 @@ impl ImageBuilder {
                 // Track instruction start time for potential cache hit heuristics
                 let instruction_start = std::time::Instant::now();
 
-                // Resolve COPY --from references to actual committed image names
+                // Resolve COPY --from references to actual committed image names,
+                // and resolve relative source paths using the source stage's WORKDIR.
                 let resolved_instruction;
                 let instruction_ref = if let Instruction::Copy(copy) = instruction {
                     if let Some(ref from) = copy.from {
                         if let Some(image_name) = stage_images.get(from) {
                             let mut resolved_copy = copy.clone();
                             resolved_copy.from = Some(image_name.clone());
+
+                            // Resolve relative source paths using the source stage's WORKDIR.
+                            // If the source stage had `workdir: "/build"` and the copy source
+                            // is `"app"`, we need to resolve it to `"/build/app"`.
+                            if let Some(source_workdir) = stage_workdirs.get(from) {
+                                resolved_copy.sources = resolved_copy
+                                    .sources
+                                    .iter()
+                                    .map(|src| {
+                                        if src.starts_with('/') {
+                                            // Absolute path - use as-is
+                                            src.clone()
+                                        } else {
+                                            // Relative path - prepend source stage's workdir
+                                            if source_workdir == "/" {
+                                                format!("/{}", src)
+                                            } else {
+                                                format!("{}/{}", source_workdir, src)
+                                            }
+                                        }
+                                    })
+                                    .collect();
+                            }
+
                             resolved_instruction = Instruction::Copy(resolved_copy);
                             &resolved_instruction
                         } else {
@@ -1334,6 +1366,13 @@ impl ImageBuilder {
 
                 let instruction_elapsed_ms = instruction_start.elapsed().as_millis() as u64;
 
+                // Track WORKDIR changes for later COPY --from resolution.
+                // We need to know the final WORKDIR of each stage so we can resolve
+                // relative paths when copying from that stage.
+                if let Instruction::Workdir(dir) = instruction {
+                    current_workdir = dir.clone();
+                }
+
                 // Attempt to detect if this was a cache hit.
                 // TODO: Implement proper cache detection. Currently always returns false.
                 // Possible approaches:
@@ -1376,8 +1415,13 @@ impl ImageBuilder {
                     .await?;
                 stage_images.insert(name.clone(), image_name.clone());
 
+                // Store the final WORKDIR for this stage so COPY --from can resolve
+                // relative paths correctly.
+                stage_workdirs.insert(name.clone(), current_workdir.clone());
+
                 // Also add by index
-                stage_images.insert(stage.index.to_string(), image_name);
+                stage_images.insert(stage.index.to_string(), image_name.clone());
+                stage_workdirs.insert(stage.index.to_string(), current_workdir.clone());
 
                 // If this is also the final stage (named target), keep reference
                 if is_final_stage {
@@ -1398,6 +1442,8 @@ impl ImageBuilder {
                 self.commit_container(&container_id, &image_name, false)
                     .await?;
                 stage_images.insert(stage.index.to_string(), image_name);
+                // Store the final WORKDIR for this stage
+                stage_workdirs.insert(stage.index.to_string(), current_workdir.clone());
                 let _ = self
                     .executor
                     .execute(&BuildahCommand::rm(&container_id))

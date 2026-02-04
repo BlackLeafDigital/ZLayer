@@ -31,6 +31,8 @@ struct Cli {
 enum Commands {
     /// Build an image from Dockerfile, ZImagefile, or runtime template
     Build(BuildArgs),
+    /// Build multiple images from a pipeline manifest
+    Pipeline(PipelineArgs),
     /// List available runtime templates
     Runtimes(RuntimesArgs),
     /// Parse and validate a Dockerfile or ZImagefile without building
@@ -97,6 +99,33 @@ struct ValidateArgs {
     path: PathBuf,
 }
 
+#[derive(Parser)]
+struct PipelineArgs {
+    /// Path to pipeline file
+    #[arg(short = 'f', long = "file", default_value = "ZPipeline.yaml")]
+    file: PathBuf,
+
+    /// Set pipeline variables (KEY=VALUE, repeatable)
+    #[arg(long = "set")]
+    set: Vec<String>,
+
+    /// Push all images after successful builds
+    #[arg(long)]
+    push: bool,
+
+    /// Stop on first build failure (default: true)
+    #[arg(long, default_value = "true")]
+    fail_fast: bool,
+
+    /// Disable TUI progress display
+    #[arg(long)]
+    no_tui: bool,
+
+    /// Only build specific images (comma-separated)
+    #[arg(long)]
+    only: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------------
@@ -116,6 +145,7 @@ async fn main() -> ExitCode {
 
     let result = match cli.command {
         Commands::Build(args) => cmd_build(args).await,
+        Commands::Pipeline(args) => cmd_pipeline(args).await,
         Commands::Runtimes(args) => cmd_runtimes(args),
         Commands::Validate(args) => cmd_validate(args).await,
     };
@@ -263,6 +293,81 @@ fn print_build_result(result: &zlayer_builder::BuiltImage) {
     }
     println!("Layers:   {}", result.layer_count);
     println!("Time:     {:.1}s", result.build_time_ms as f64 / 1000.0);
+}
+
+// ---------------------------------------------------------------------------
+// pipeline subcommand
+// ---------------------------------------------------------------------------
+
+async fn cmd_pipeline(args: PipelineArgs) -> Result<()> {
+    use std::collections::HashSet;
+    use zlayer_builder::{parse_pipeline, BuildahExecutor, PipelineExecutor};
+
+    // 1. Read and parse pipeline file
+    let content = tokio::fs::read_to_string(&args.file)
+        .await
+        .with_context(|| format!("Failed to read pipeline file: {}", args.file.display()))?;
+
+    let mut pipeline = parse_pipeline(&content).context("Failed to parse pipeline")?;
+
+    // 2. Merge --set variables
+    for s in &args.set {
+        let (key, value) = s
+            .split_once('=')
+            .with_context(|| format!("Invalid --set format '{}', expected KEY=VALUE", s))?;
+        pipeline.vars.insert(key.to_string(), value.to_string());
+    }
+
+    // 3. Filter --only images
+    if let Some(ref only) = args.only {
+        let names: HashSet<&str> = only.split(',').map(|s| s.trim()).collect();
+        pipeline.images.retain(|k, _| names.contains(k.as_str()));
+        if pipeline.images.is_empty() {
+            bail!("No images match --only filter: {}", only);
+        }
+    }
+
+    // 4. Create executor
+    let buildah = BuildahExecutor::new_async()
+        .await
+        .context("Failed to initialize buildah")?;
+
+    let base_dir = args
+        .file
+        .parent()
+        .unwrap_or(Path::new("."))
+        .canonicalize()
+        .context("Failed to resolve pipeline directory")?;
+
+    // 5. Run pipeline
+    info!(
+        "Building {} images from {}",
+        pipeline.images.len(),
+        args.file.display()
+    );
+
+    let executor = PipelineExecutor::new(pipeline, base_dir, buildah)
+        .fail_fast(args.fail_fast)
+        .push(args.push);
+
+    let result = executor.run().await?;
+
+    // 6. Print summary
+    println!();
+    println!(
+        "Pipeline complete in {:.1}s",
+        result.total_time_ms as f64 / 1000.0
+    );
+    println!("  Succeeded: {}", result.succeeded.len());
+    if !result.failed.is_empty() {
+        println!("  Failed: {}", result.failed.len());
+        for (name, err) in &result.failed {
+            println!("    {}: {}", name, err);
+        }
+        bail!("Pipeline failed with {} errors", result.failed.len());
+    }
+
+    Ok(())
 }
 
 fn parse_build_args(raw: &[String]) -> Result<HashMap<String, String>> {

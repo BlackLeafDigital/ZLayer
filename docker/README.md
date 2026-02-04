@@ -150,6 +150,164 @@ zlayer-build build -f docker/ZImagefile.zlayer-manager -t zlayer-manager .
 
 See the root [README](../README.md#zimagefile) for full ZImagefile format documentation.
 
+## ZImagefile Format
+
+ZImagefiles are YAML-based alternatives to Dockerfiles. They provide:
+
+- **Cleaner syntax** - Familiar YAML instead of Dockerfile DSL
+- **Declarative cache mounts** - Simple `cache:` lists instead of `--mount=type=cache,...` strings
+- **Multi-stage builds** - Named stages as a YAML map with `from:` references
+
+### Build Modes
+
+| Mode | Top-level key | Description |
+|------|--------------|-------------|
+| Runtime template | `runtime` | Shorthand like `runtime: node22` |
+| Single-stage | `base` + `steps` | One base image with ordered build steps |
+| Multi-stage | `stages` | Named stages (last stage is the output image) |
+| WASM | `wasm` | WebAssembly component builds |
+
+### Example: Multi-stage Rust build
+
+```yaml
+# ZImagefile
+version: "1"
+
+stages:
+  builder:
+    base: "rust:1.90-bookworm"
+    workdir: "/build"
+    steps:
+      - copy: "."
+        to: "/build"
+      - run: "cargo build --release"
+        cache:
+          - target: /usr/local/cargo/registry
+            id: cargo-registry
+            sharing: shared
+
+  runtime:
+    base: "debian:bookworm-slim"
+    steps:
+      - copy: "target/release/myapp"
+        from: builder
+        to: "/usr/local/bin/myapp"
+        chmod: "755"
+    cmd: ["/usr/local/bin/myapp"]
+
+expose: 8080
+```
+
+### Key Differences from Dockerfile
+
+| Dockerfile | ZImagefile |
+|------------|------------|
+| `COPY src dest` | `copy: src` + `to: dest` |
+| `COPY --from=stage` | `from: stage` on copy step |
+| `RUN --mount=type=cache,...` | `cache:` list on run step |
+| Multiple `FROM` blocks | `stages:` map |
+| `--chown` / `--chmod` flags | `owner:` / `chmod:` fields |
+
+## ZPipeline Format
+
+ZPipeline.yaml coordinates building multiple images with dependency ordering, shared caches, and push operations.
+
+### Schema
+
+```yaml
+version: "1"
+
+vars:
+  VERSION: "1.0.0"
+  REGISTRY: "ghcr.io/myorg"
+
+defaults:
+  format: oci
+  build_args:
+    RUST_VERSION: "1.90"
+
+images:
+  base:
+    file: docker/Dockerfile.base
+    context: "."
+    tags:
+      - "${REGISTRY}/base:${VERSION}"
+      - "${REGISTRY}/base:latest"
+    build_args:
+      EXTRA_ARG: "value"
+
+  app:
+    file: docker/ZImagefile.app
+    context: "."
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/app:${VERSION}"
+
+push:
+  after_all: true
+```
+
+### Fields
+
+| Field | Description |
+|-------|-------------|
+| `version` | Pipeline format version (currently "1") |
+| `vars` | Global variables for `${VAR}` substitution in tags |
+| `defaults` | Default settings inherited by all images |
+| `images` | Named images to build (order preserved) |
+| `push.after_all` | Push all images after successful builds |
+
+### Image Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `file` | Yes | Path to Dockerfile or ZImagefile |
+| `context` | No | Build context directory (default: ".") |
+| `tags` | No | Image tags (supports variable substitution) |
+| `depends_on` | No | Images that must build first |
+| `build_args` | No | Build arguments (merged with defaults) |
+| `no_cache` | No | Skip cache for this image |
+| `format` | No | Output format: "oci" or "docker" |
+
+### Execution Model
+
+Images are built in "waves" based on dependency depth:
+- **Wave 0**: Images with no dependencies (run in parallel)
+- **Wave 1**: Images depending only on Wave 0 images
+- **Wave N**: Images depending only on earlier waves
+
+## Building Images Locally
+
+### Single Image
+
+```bash
+# Build from ZImagefile (auto-detected)
+zlayer-build build -f docker/ZImagefile.zlayer-web -t zlayer-web .
+
+# Build from Dockerfile
+zlayer-build build -f docker/Dockerfile.zlayer-node -t zlayer-node .
+```
+
+### Multiple Images with Pipeline
+
+```bash
+# Build all images with default VERSION=dev
+zlayer-build pipeline -f ZPipeline.yaml
+
+# Build with specific version
+zlayer-build pipeline -f ZPipeline.yaml --set VERSION=0.1.0
+
+# Build and push (CI mode)
+zlayer-build pipeline -f ZPipeline.yaml --no-tui --set VERSION=$VERSION --push
+```
+
+### Interactive TUI
+
+```bash
+# Use zlayer-cli for menu-driven builds
+zlayer-cli
+```
+
 ## Limitations
 
 - **Privileged mode required**: Without `--privileged`, containerd cannot manage cgroups properly

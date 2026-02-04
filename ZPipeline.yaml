@@ -1,0 +1,43 @@
+# ZPipeline.yaml - ZLayer container image pipeline
+#
+# Build all ZLayer images with coordinated caching:
+#   zlayer-build pipeline -f ZPipeline.yaml --set VERSION=0.1.0
+#
+# In CI:
+#   zlayer-build pipeline -f ZPipeline.yaml --no-tui --set VERSION=$VERSION --push
+
+version: "1"
+
+vars:
+  VERSION: "dev"
+  REGISTRY: "zlayer"
+
+defaults:
+  format: oci
+
+images:
+  zlayer-node:
+    file: docker/ZImagefile.zlayer-node
+    context: "."
+    tags:
+      - "${REGISTRY}/zlayer-node:${VERSION}"
+      - "${REGISTRY}/zlayer-node:latest"
+
+  zlayer-web:
+    file: docker/ZImagefile.zlayer-web
+    context: "."
+    tags:
+      - "${REGISTRY}/zlayer-web:${VERSION}"
+      - "${REGISTRY}/zlayer-web:latest"
+    depends_on: [zlayer-node]
+
+  zlayer-manager:
+    file: docker/ZImagefile.zlayer-manager
+    context: "."
+    tags:
+      - "${REGISTRY}/zlayer-manager:${VERSION}"
+      - "${REGISTRY}/zlayer-manager:latest"
+    depends_on: [zlayer-web]
+
+push:
+  after_all: false

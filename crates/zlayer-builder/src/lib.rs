@@ -187,6 +187,7 @@ pub mod buildah;
 pub mod builder;
 pub mod dockerfile;
 pub mod error;
+pub mod pipeline;
 pub mod templates;
 pub mod tui;
 pub mod wasm_builder;
@@ -233,6 +234,9 @@ pub use templates::{
     list_templates, resolve_runtime, Runtime, RuntimeInfo,
 };
 pub use tui::{BuildEvent, BuildTui, InstructionStatus, PlainLogger};
+
+// Pipeline re-exports
+pub use pipeline::{parse_pipeline, PipelineDefaults, PipelineExecutor, PipelineImage, PipelineResult, PushConfig, ZPipeline};
 
 #[cfg(test)]
 mod tests {

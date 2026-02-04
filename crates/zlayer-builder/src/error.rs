@@ -149,6 +149,13 @@ pub enum BuildError {
         /// Description of what validation rule was violated
         message: String,
     },
+
+    /// Pipeline validation or execution error
+    #[error("Pipeline error: {message}")]
+    PipelineError {
+        /// Description of the pipeline error
+        message: String,
+    },
 }
 
 impl BuildError {
@@ -245,6 +252,13 @@ impl BuildError {
     /// Create a ZImagefileValidation error
     pub fn zimagefile_validation(message: impl Into<String>) -> Self {
         Self::ZImagefileValidation {
+            message: message.into(),
+        }
+    }
+
+    /// Create a PipelineError
+    pub fn pipeline_error(message: impl Into<String>) -> Self {
+        Self::PipelineError {
             message: message.into(),
         }
     }

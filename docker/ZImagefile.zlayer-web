@@ -59,7 +59,7 @@ stages:
     steps:
       - run: "apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*"
 
-      # Copy the binary
+      # Copy the binary (relative to builder's workdir /build)
       - copy: "zlayer-web"
         from: builder
         to: "/app/zlayer-web"
