@@ -397,19 +397,14 @@ jobs:
 
       - name: Load, tag, and push images
         run: |
+          set +o pipefail  # Disable pipefail to avoid SIGPIPE issues
           VERSION="${{ needs.detect.outputs.version }}"
           for img in zlayer-node zlayer-web zlayer-manager; do
             echo "Processing ${img}..."
 
-            # Load from OCI archive
-            sudo buildah pull oci-archive:${img}-oci.tar
-
-            # Get the image ID from the loaded archive
-            IMAGE_ID=$(sudo buildah images --format "{{.ID}}" --filter "reference=localhost/${img}" | head -1)
-            if [ -z "$IMAGE_ID" ]; then
-              # Try without localhost prefix
-              IMAGE_ID=$(sudo buildah images --format "{{.ID}}" | head -1)
-            fi
+            # Load from OCI archive - capture image ID from output
+            IMAGE_ID=$(sudo buildah pull oci-archive:${img}-oci.tar | tail -1)
+            echo "Loaded image ID: ${IMAGE_ID}"
 
             # zlayer-web only goes to Forgejo, others go to Docker Hub + GHCR
             if [ "$img" != "zlayer-web" ]; then
