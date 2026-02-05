@@ -333,6 +333,23 @@ enum Commands {
     /// Create, manage, and connect tunnels for secure access to services.
     #[command(subcommand)]
     Tunnel(TunnelCommands),
+
+    /// ZLayer Manager commands
+    ///
+    /// Initialize, configure, and manage the ZLayer Manager web UI.
+    #[command(subcommand)]
+    Manager(ManagerCommands),
+
+    /// Pull an image from a registry
+    ///
+    /// Examples:
+    ///   zlayer pull zachhandley/zlayer-node:latest
+    ///   zlayer pull ghcr.io/blackleafdigital/zlayer-manager:0.9.6
+    #[command(verbatim_doc_comment)]
+    Pull {
+        /// Image reference (e.g., zachhandley/zlayer-node:latest)
+        image: String,
+    },
 }
 
 /// Tunnel management subcommands
@@ -459,6 +476,48 @@ enum TunnelCommands {
         /// Time-to-live for the access (e.g., 1h, 30m)
         #[arg(long, default_value = "1h")]
         ttl: String,
+    },
+}
+
+/// ZLayer Manager subcommands
+#[derive(Subcommand, Debug)]
+enum ManagerCommands {
+    /// Initialize zlayer-manager deployment
+    ///
+    /// Creates a deployment spec file for zlayer-manager and optionally
+    /// deploys it immediately.
+    ///
+    /// Examples:
+    ///   zlayer manager init
+    ///   zlayer manager init --port 8080
+    ///   zlayer manager init --deploy
+    #[command(verbatim_doc_comment)]
+    Init {
+        /// Output directory for spec file (default: current directory)
+        #[arg(short, long, default_value = ".")]
+        output: PathBuf,
+
+        /// Port to expose manager on (default: 3000)
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+
+        /// Deploy immediately after creating spec
+        #[arg(long)]
+        deploy: bool,
+
+        /// ZLayer version to use (default: latest)
+        #[arg(long)]
+        version: Option<String>,
+    },
+
+    /// Show manager status
+    Status,
+
+    /// Stop the manager
+    Stop {
+        /// Force stop without graceful shutdown
+        #[arg(short, long)]
+        force: bool,
     },
 }
 
@@ -894,6 +953,8 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Import { input, tag } => handle_import(&cli, input, tag.clone()).await,
         Commands::Wasm(wasm_cmd) => handle_wasm(&cli, wasm_cmd).await,
         Commands::Tunnel(tunnel_cmd) => handle_tunnel(&cli, tunnel_cmd).await,
+        Commands::Manager(manager_cmd) => handle_manager(manager_cmd).await,
+        Commands::Pull { image } => handle_pull(image).await,
         #[cfg(feature = "node")]
         Commands::Node(node_cmd) => match node_cmd {
             NodeCommands::Init {
@@ -3107,6 +3168,262 @@ fn parse_duration(s: &str) -> Result<u64> {
         "Invalid duration format: {}. Use formats like: 1h, 30m, 3600s",
         s
     )
+}
+
+// =============================================================================
+// Manager Commands
+// =============================================================================
+
+/// Handle zlayer-manager commands
+async fn handle_manager(cmd: &ManagerCommands) -> Result<()> {
+    match cmd {
+        ManagerCommands::Init {
+            output,
+            port,
+            deploy,
+            version,
+        } => handle_manager_init(output.clone(), *port, *deploy, version.clone()).await,
+        ManagerCommands::Status => handle_manager_status().await,
+        ManagerCommands::Stop { force } => handle_manager_stop(*force).await,
+    }
+}
+
+/// Initialize zlayer-manager deployment spec
+async fn handle_manager_init(
+    output: PathBuf,
+    port: u16,
+    deploy: bool,
+    version: Option<String>,
+) -> Result<()> {
+    let version = version.unwrap_or_else(|| "latest".to_string());
+    info!(port = port, version = %version, "Initializing zlayer-manager deployment");
+
+    // Build the manager service spec
+    let spec = format!(
+        r#"version: v1
+deployment: zlayer-manager
+
+services:
+  manager:
+    rtype: service
+    image:
+      name: zachhandley/zlayer-manager:{version}
+      pull_policy: always
+    resources:
+      cpu: 0.5
+      memory: 256Mi
+    endpoints:
+      - name: http
+        protocol: http
+        port: {port}
+        expose: public
+    scale:
+      mode: fixed
+      replicas: 1
+    health:
+      check:
+        type: http
+        url: http://localhost:{port}/health
+"#,
+        version = version,
+        port = port
+    );
+
+    // Ensure output directory exists
+    if !output.exists() {
+        std::fs::create_dir_all(&output)
+            .with_context(|| format!("Failed to create output directory: {}", output.display()))?;
+    }
+
+    // Write the spec file
+    let spec_path = output.join("zlayer-manager.yaml");
+    std::fs::write(&spec_path, &spec)
+        .with_context(|| format!("Failed to write spec file: {}", spec_path.display()))?;
+
+    println!("Created deployment spec: {}", spec_path.display());
+    println!();
+    println!("Manager configuration:");
+    println!("  - Image: zachhandley/zlayer-manager:{}", version);
+    println!("  - Port: {}", port);
+    println!();
+
+    if deploy {
+        println!("Deploying zlayer-manager...");
+        // TODO: Integrate with deploy command
+        // For now, print instructions
+        println!();
+        println!("To deploy manually, run:");
+        println!("  zlayer deploy {}", spec_path.display());
+    } else {
+        println!("To deploy, run:");
+        println!("  zlayer deploy {}", spec_path.display());
+        println!();
+        println!("Or use --deploy flag to deploy immediately:");
+        println!("  zlayer manager init --deploy");
+    }
+
+    Ok(())
+}
+
+/// Show manager status
+async fn handle_manager_status() -> Result<()> {
+    info!("Checking zlayer-manager status");
+
+    // TODO: Query the actual manager service status
+    // This would check if the manager container is running, its health, etc.
+    println!("zlayer-manager status:");
+    println!("  Status: unknown (status check not yet implemented)");
+    println!();
+    println!("To check container status manually:");
+    println!("  zlayer ps | grep manager");
+
+    Ok(())
+}
+
+/// Stop the manager
+async fn handle_manager_stop(force: bool) -> Result<()> {
+    info!(force = force, "Stopping zlayer-manager");
+
+    // TODO: Actually stop the manager service
+    // This would find and stop the manager container
+    if force {
+        println!("Force stopping zlayer-manager...");
+    } else {
+        println!("Gracefully stopping zlayer-manager...");
+    }
+
+    println!();
+    println!("Manager stop not yet implemented.");
+    println!("To stop manually:");
+    println!("  zlayer stop zlayer-manager");
+
+    Ok(())
+}
+
+// =============================================================================
+// Image Pull Command
+// =============================================================================
+
+/// Handle pull command - pull an image from a remote registry to local cache
+async fn handle_pull(image: &str) -> Result<()> {
+    use zlayer_registry::{BlobCache, ImagePuller, LocalRegistry, RegistryAuth};
+
+    info!(image = %image, "Pulling image from registry");
+    println!("Pulling {}...", image);
+
+    // Set up directories
+    let data_dir = PathBuf::from("/var/lib/zlayer");
+    let cache_dir = data_dir.join("cache");
+    let registry_path = data_dir.join("registry");
+
+    tokio::fs::create_dir_all(&cache_dir)
+        .await
+        .context("Failed to create cache directory")?;
+
+    // Create blob cache and image puller
+    let cache = BlobCache::open(&cache_dir).context("Failed to create blob cache")?;
+    let puller = ImagePuller::new(cache);
+
+    // Use anonymous auth (for public images) or check for credentials
+    // TODO: Support authenticated registries via config or env vars
+    let auth = RegistryAuth::Anonymous;
+
+    // Pull manifest first to show what we're pulling
+    println!("Fetching manifest...");
+    let (manifest, manifest_digest) = puller
+        .pull_manifest(image, &auth)
+        .await
+        .context("Failed to pull manifest")?;
+
+    println!(
+        "  Manifest: {} ({} layers)",
+        &manifest_digest[..19],
+        manifest.layers.len()
+    );
+
+    // Calculate total size
+    let total_size: i64 = manifest.layers.iter().map(|l| l.size).sum();
+    let total_mb = total_size as f64 / 1024.0 / 1024.0;
+    println!("  Total size: {:.2} MB", total_mb);
+
+    // Pull all layers
+    println!("\nPulling layers...");
+    let layers = puller
+        .pull_image(image, &auth)
+        .await
+        .context("Failed to pull image layers")?;
+
+    println!("  Downloaded {} layers", layers.len());
+
+    // Store in local registry
+    let registry = LocalRegistry::new(registry_path)
+        .await
+        .context("Failed to open local registry")?;
+
+    // Store each layer blob
+    for (i, (layer_data, _media_type)) in layers.iter().enumerate() {
+        let digest = registry
+            .put_blob(layer_data)
+            .await
+            .context("Failed to store layer blob")?;
+        println!(
+            "  Layer {}: {} ({:.2} MB)",
+            i + 1,
+            &digest[..19],
+            layer_data.len() as f64 / 1024.0 / 1024.0
+        );
+    }
+
+    // Store config blob
+    let config_digest = &manifest.config.digest;
+    let config_data = puller
+        .pull_blob(image, config_digest, &auth)
+        .await
+        .context("Failed to pull config blob")?;
+    registry
+        .put_blob(&config_data)
+        .await
+        .context("Failed to store config blob")?;
+
+    // Store manifest with proper name/tag
+    // Parse image reference to get name and tag
+    let (name, tag) = parse_image_reference(image);
+    let manifest_json = serde_json::to_vec(&manifest).context("Failed to serialize manifest")?;
+    registry
+        .put_manifest(&name, &tag, &manifest_json)
+        .await
+        .context("Failed to store manifest")?;
+
+    println!("\nPull complete!");
+    println!("  Image: {}:{}", name, tag);
+    println!("  Digest: {}", manifest_digest);
+    println!("  Layers: {}", layers.len());
+
+    Ok(())
+}
+
+/// Parse an image reference into name and tag components
+fn parse_image_reference(image: &str) -> (String, String) {
+    // Handle digest references (image@sha256:...)
+    if let Some(at_pos) = image.rfind('@') {
+        let name = &image[..at_pos];
+        let digest = &image[at_pos + 1..];
+        return (name.to_string(), digest.to_string());
+    }
+
+    // Handle tag references (image:tag)
+    if let Some(colon_pos) = image.rfind(':') {
+        // Make sure we're not splitting on a port number
+        let after_colon = &image[colon_pos + 1..];
+        if !after_colon.contains('/') {
+            let name = &image[..colon_pos];
+            let tag = after_colon;
+            return (name.to_string(), tag.to_string());
+        }
+    }
+
+    // No tag specified, use "latest"
+    (image.to_string(), "latest".to_string())
 }
 
 // =============================================================================

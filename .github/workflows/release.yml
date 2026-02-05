@@ -144,103 +144,95 @@ jobs:
           name: ZLayer ${{ steps.version.outputs.version }}
           files: artifacts/*.tar.gz
           generate_release_notes: true
+          draft: false
+          prerelease: false
           body: |
             ## ZLayer ${{ steps.version.outputs.version }}
 
             ### Install
 
             ```bash
-            curl -sSL https://zlayer.dev/install.sh | sh
-            ```
+            # Install CLI (interactive TUI)
+            curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | sh
 
-            This installs `zlayer-cli`, the interactive TUI that manages installing
-            and configuring all ZLayer components.
+            # Install runtime (for deploying containers)
+            curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=runtime sh
+            ```
 
             ### Binaries
 
-            | Binary | Size | Description |
-            |--------|------|-------------|
-            | `zlayer-cli` | ~5MB | Interactive TUI — install, build, and manage ZLayer |
-            | `zlayer-build` | ~4MB | Lightweight image builder CLI (Dockerfile, ZImagefile, runtime templates) |
-            | `zlayer` | ~50MB | Full container orchestration runtime |
+            | Binary | Description |
+            |--------|-------------|
+            | `zlayer-cli` | Interactive TUI — install, build, and manage ZLayer |
+            | `zlayer-build` | Lightweight image builder CLI (Dockerfile, ZImagefile, runtime templates) |
+            | `zlayer` | Full container orchestration runtime |
 
             ### Container Images
 
-            Available on GHCR (`ghcr.io/blackleafdigital/`):
-            - `zlayer-node` — Runtime with embedded containerd
-            - `zlayer-manager` — Management UI
+            **Docker Hub** (`zachhandley/`):
+            ```bash
+            docker pull zachhandley/zlayer-node:${{ steps.version.outputs.version }}
+            docker pull zachhandley/zlayer-manager:${{ steps.version.outputs.version }}
+            ```
 
-            See the [CHANGELOG](https://github.com/zachhandley/ZLayer/blob/main/CHANGELOG.md) for details.
+            **GHCR** (`ghcr.io/blackleafdigital/`):
+            ```bash
+            docker pull ghcr.io/blackleafdigital/zlayer-node:${{ steps.version.outputs.version }}
+            docker pull ghcr.io/blackleafdigital/zlayer-manager:${{ steps.version.outputs.version }}
+            ```
+
+            | Image | Description |
+            |-------|-------------|
+            | `zlayer-node` | Container orchestration runtime with embedded containerd |
+            | `zlayer-manager` | Web-based management UI |
+
+            ### Using with ZLayer
+
+            ```bash
+            # Initialize and deploy zlayer-manager
+            zlayer manager init
+            zlayer deploy zlayer-manager.yaml
+
+            # Or pull images directly
+            zlayer pull zachhandley/zlayer-node:${{ steps.version.outputs.version }}
+            zlayer pull zachhandley/zlayer-manager:${{ steps.version.outputs.version }}
+            ```
+
+            See the [CHANGELOG](https://github.com/BlackLeafDigital/ZLayer/blob/main/CHANGELOG.md) for details.
         env:
           GITHUB_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
 
   # ===========================================
-  # Docker Images - uses zlayer-build + buildah
+  # Download and attach container image archives
+  # (Images already built and pushed by Forgejo)
   # ===========================================
-  docker:
-    name: Docker (${{ matrix.image }})
+  attach-images:
+    name: Attach Container Images
     runs-on: ubuntu-latest
     needs: [setup, release]
     if: needs.setup.outputs.skip_release != 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - image: zlayer-node
-            zimagefile: docker/ZImagefile.zlayer-node
-          - image: zlayer-manager
-            zimagefile: docker/ZImagefile.zlayer-manager
-    permissions:
-      packages: write
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.setup.outputs.sha }}
-      - name: Install buildah
-        run: sudo apt-get update && sudo apt-get install -y buildah
-      - name: Download and install zlayer-build
+      - name: Download image archives from Forgejo
         run: |
           VERSION=$(echo "${{ needs.setup.outputs.version }}" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
-          curl -fsSL "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-build-linux-amd64.tar.gz" \
-            -o zlayer-build.tar.gz
-          tar xzf zlayer-build.tar.gz
-          chmod +x zlayer-build
-          sudo mv zlayer-build /usr/local/bin/
-      - name: Download zlayer binary (for node image)
-        if: matrix.image == 'zlayer-node'
-        run: |
-          VERSION=$(echo "${{ needs.setup.outputs.version }}" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
-          mkdir -p target/release
-          curl -fsSL "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/zlayer-linux-amd64.tar.gz" \
-            -o zlayer.tar.gz
-          tar xzf zlayer.tar.gz -C target/release/
-      - name: Login to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | buildah login -u "${{ github.actor }}" --password-stdin ghcr.io
-      - name: Build image
-        run: |
-          zlayer-build build --no-tui \
-            -f ${{ matrix.zimagefile }} \
-            -t ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.setup.outputs.version }} \
-            -t ghcr.io/blackleafdigital/${{ matrix.image }}:latest \
-            --format oci .
-      - name: Export OCI archive
-        run: |
-          buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.setup.outputs.version }} \
-            oci-archive:${{ matrix.image }}-${{ needs.setup.outputs.version }}-oci.tar
-      - name: Export Docker archive
-        run: |
-          buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.setup.outputs.version }} \
-            docker-archive:${{ matrix.image }}-${{ needs.setup.outputs.version }}-docker.tar
+          BASE_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
+
+          for img in zlayer-node zlayer-manager; do
+            echo "Downloading ${img} archives..."
+            curl -fsSL "${BASE_URL}/${img}-${VERSION}-oci.tar" -o "${img}-${VERSION}-oci.tar" || echo "${img} OCI not available"
+            curl -fsSL "${BASE_URL}/${img}-${VERSION}-docker.tar" -o "${img}-${VERSION}-docker.tar" || echo "${img} Docker not available"
+          done
+
+          ls -la *.tar 2>/dev/null || echo "No archives downloaded"
+
       - name: Upload image archives to GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
         run: |
           TAG="${{ needs.setup.outputs.version }}"
-          for archive in ${{ matrix.image }}-${TAG}-oci.tar ${{ matrix.image }}-${TAG}-docker.tar; do
-            echo "Uploading ${archive} to release..."
-            gh release upload "${TAG}" "${archive}" --clobber || echo "Upload failed for ${archive}"
+          for archive in *-oci.tar *-docker.tar; do
+            if [ -f "$archive" ]; then
+              echo "Uploading ${archive} to release..."
+              gh release upload "${TAG}" "${archive}" --clobber || echo "Upload failed for ${archive}"
+            fi
           done
-      - name: Push to GHCR
-        run: |
-          buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.setup.outputs.version }}
-          buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:latest

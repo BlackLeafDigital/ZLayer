@@ -442,6 +442,98 @@ jobs:
           done
 
   # ===========================================
+  # Create Forgejo Release
+  # ===========================================
+  create-forgejo-release:
+    needs: [detect, upload-binaries, docker-push]
+    if: needs.detect.outputs.is_general == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Create Forgejo Release
+        run: |
+          VERSION="${{ needs.detect.outputs.version }}"
+          TAG="v${VERSION}"
+          PACKAGES_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
+
+          # Create release body
+          cat > release_body.md << 'RELEASE_EOF'
+          ## ZLayer ${VERSION}
+
+          ### Install
+
+          ```bash
+          # Install CLI (interactive TUI)
+          curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | sh
+
+          # Install runtime (for running containers)
+          curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=runtime sh
+          ```
+
+          ### Binaries
+
+          | Binary | Linux | macOS |
+          |--------|-------|-------|
+          | `zlayer-cli` | [amd64](${PACKAGES_URL}/zlayer-cli-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-cli-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-cli-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-cli-darwin-arm64.tar.gz) |
+          | `zlayer-build` | [amd64](${PACKAGES_URL}/zlayer-build-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-build-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-build-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-build-darwin-arm64.tar.gz) |
+          | `zlayer` | [amd64](${PACKAGES_URL}/zlayer-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-darwin-arm64.tar.gz) |
+
+          ### Container Images
+
+          **Docker Hub** (`zachhandley/`):
+          ```bash
+          docker pull zachhandley/zlayer-node:${VERSION}
+          docker pull zachhandley/zlayer-manager:${VERSION}
+          ```
+
+          **GHCR** (`ghcr.io/blackleafdigital/`):
+          ```bash
+          docker pull ghcr.io/blackleafdigital/zlayer-node:${VERSION}
+          docker pull ghcr.io/blackleafdigital/zlayer-manager:${VERSION}
+          ```
+
+          **Forgejo Packages** (includes `zlayer-web`):
+          - [zlayer-node OCI](${PACKAGES_URL}/zlayer-node-${VERSION}-oci.tar) / [Docker](${PACKAGES_URL}/zlayer-node-${VERSION}-docker.tar)
+          - [zlayer-manager OCI](${PACKAGES_URL}/zlayer-manager-${VERSION}-oci.tar) / [Docker](${PACKAGES_URL}/zlayer-manager-${VERSION}-docker.tar)
+          - [zlayer-web OCI](${PACKAGES_URL}/zlayer-web-${VERSION}-oci.tar) / [Docker](${PACKAGES_URL}/zlayer-web-${VERSION}-docker.tar) *(Forgejo only)*
+
+          ### Using with ZLayer
+
+          Pull and run images directly with ZLayer:
+          ```bash
+          # Pull images
+          zlayer pull zachhandley/zlayer-node:${VERSION}
+          zlayer pull zachhandley/zlayer-manager:${VERSION}
+
+          # Or deploy from a spec file
+          zlayer deploy my-deployment.yaml
+          ```
+
+          ### What's Changed
+
+          See the [CHANGELOG](https://forge.blackleafdigital.com/BlackLeafDigital/ZLayer/src/branch/main/CHANGELOG.md) for details.
+          RELEASE_EOF
+
+          # Substitute VERSION in the body
+          sed -i "s/\${VERSION}/${VERSION}/g" release_body.md
+          sed -i "s|\${PACKAGES_URL}|${PACKAGES_URL}|g" release_body.md
+
+          # Create release via Forgejo API
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases" \
+            -d "$(jq -n \
+              --arg tag "$TAG" \
+              --arg name "ZLayer $VERSION" \
+              --arg body "$(cat release_body.md)" \
+              '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}'
+            )"
+
+  # ===========================================
   # Trigger GitHub release
   # ===========================================
   trigger-github:
@@ -462,7 +554,7 @@ jobs:
   # Cleanup temp packages (runs after all jobs)
   # ===========================================
   cleanup:
-    needs: [detect, upload-binaries, merge-to-main, docker-push, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk, trigger-github]
+    needs: [detect, upload-binaries, merge-to-main, docker-push, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk, create-forgejo-release, trigger-github]
     if: always()
     runs-on: ubuntu-latest
     steps:
