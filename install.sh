@@ -1,12 +1,36 @@
 #!/bin/sh
 set -eu
 
-# ZLayer CLI Installer
-# Usage: curl -sSL https://zlayer.dev/install.sh | sh
-#   or:  ZLAYER_VERSION=v0.9.0 curl -sSL https://zlayer.dev/install.sh | sh
+# ZLayer Installer
+# Usage: curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | sh
+#
+# Options (via env vars):
+#   ZLAYER_VERSION=v0.9.0    - Install specific version
+#   ZLAYER_COMPONENT=runtime - Install runtime instead of CLI (options: cli, runtime, build)
+#   ZLAYER_INSTALL_DIR=/path - Custom install directory
+#
+# Examples:
+#   # Install CLI (default)
+#   curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | sh
+#
+#   # Install runtime
+#   curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=runtime sh
+#
+#   # Install zlayer-build
+#   curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=build sh
 
-REPO="zachhandley/ZLayer"
-BINARY="zlayer-cli"
+REPO="BlackLeafDigital/ZLayer"
+COMPONENT="${ZLAYER_COMPONENT:-cli}"
+
+case "$COMPONENT" in
+    cli)      BINARY="zlayer-cli" ;;
+    runtime)  BINARY="zlayer" ;;
+    build)    BINARY="zlayer-build" ;;
+    *)
+        echo "Error: Unknown component '$COMPONENT'. Use: cli, runtime, or build" >&2
+        exit 1
+        ;;
+esac
 
 # --- Detect OS ---
 OS="$(uname -s)"
@@ -68,7 +92,13 @@ fi
 mkdir -p "$INSTALL_DIR"
 
 # --- Download and install ---
-URL="https://github.com/${REPO}/releases/download/${TAG}/${BINARY}-${VERSION_NUM}-${OS}-${ARCH}.tar.gz"
+# Artifact naming: zlayer-cli-0.9.6-linux-amd64.tar.gz, zlayer-0.9.6-linux-amd64.tar.gz, etc.
+if [ "$BINARY" = "zlayer" ]; then
+    ARTIFACT_NAME="zlayer-${VERSION_NUM}-${OS}-${ARCH}.tar.gz"
+else
+    ARTIFACT_NAME="${BINARY}-${VERSION_NUM}-${OS}-${ARCH}.tar.gz"
+fi
+URL="https://github.com/${REPO}/releases/download/${TAG}/${ARTIFACT_NAME}"
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
@@ -100,10 +130,10 @@ fi
 # --- Verify ---
 if "${INSTALL_DIR}/${BINARY}" --version >/dev/null 2>&1; then
     echo ""
-    echo "zlayer-cli ${TAG} installed successfully!"
+    echo "${BINARY} ${TAG} installed successfully!"
 else
     echo ""
-    echo "zlayer-cli ${TAG} installed to ${INSTALL_DIR}/${BINARY}"
+    echo "${BINARY} ${TAG} installed to ${INSTALL_DIR}/${BINARY}"
 fi
 
 # Check PATH
@@ -117,4 +147,24 @@ case ":${PATH}:" in
 esac
 
 echo ""
-echo "Run 'zlayer-cli' to get started."
+case "$BINARY" in
+    zlayer-cli)
+        echo "Run 'zlayer-cli' to get started with the interactive TUI."
+        echo ""
+        echo "To install the full runtime:"
+        echo "  curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=runtime sh"
+        ;;
+    zlayer)
+        echo "Run 'zlayer --help' to see available commands."
+        echo ""
+        echo "Quick start:"
+        echo "  zlayer manager init    # Initialize zlayer-manager"
+        echo "  zlayer deploy spec.yaml # Deploy from a spec file"
+        ;;
+    zlayer-build)
+        echo "Run 'zlayer-build --help' to see available commands."
+        echo ""
+        echo "Quick start:"
+        echo "  zlayer-build build -f Dockerfile -t myapp:latest ."
+        ;;
+esac
