@@ -169,6 +169,8 @@ jobs:
       - name: Build release binaries
         run: |
           cargo build --release --package runtime
+          cargo build --release --package zlayer-build
+          cargo build --release --package zlayer-cli
 
       - name: Upload artifacts
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
@@ -176,6 +178,8 @@ jobs:
           name: binaries
           path: |
             target/release/zlayer
+            target/release/zlayer-build
+            target/release/zlayer-cli
           retention-days: 7
 
   # ===========================================

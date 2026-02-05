@@ -1,0 +1,35 @@
+# ZImagefile: Runtime template shorthand
+#
+# Demonstrates the simplest possible ZImagefile -- a single "runtime" field
+# that selects a pre-built template. ZLayer provides templates for common
+# runtimes so you don't need to write build steps at all.
+#
+# Available runtimes: node20, node22, python312, python313, rust, go, deno, bun
+#
+# The template handles:
+#   - Base image selection
+#   - Dependency installation (npm ci, pip install, cargo build, etc.)
+#   - Multi-stage optimization
+#   - Non-root user
+#
+# Build with:
+#   zlayer build -t my-node-app:latest .
+
+# Just specify the runtime -- ZLayer handles everything else.
+runtime: node22
+
+# Override the default CMD if your entrypoint differs.
+cmd: "node server.js"
+
+# Common image metadata still works alongside runtime templates.
+env:
+  NODE_ENV: production
+  PORT: "3000"
+
+expose: 3000
+
+healthcheck:
+  cmd: "wget -qO- http://localhost:3000/health || exit 1"
+  interval: "30s"
+  timeout: "5s"
+  retries: 3

@@ -14,7 +14,11 @@ ZLayer is a unified deployment platform that supports:
 examples/
 ├── README.md                    # This file
 ├── simple.yaml                  # Minimal deployment example
+├── simple.zlayer.yml            # Same as above, canonical filename
 ├── full-service.yaml            # Complete service configuration
+├── zimagefile-node/             # ZImagefile + Dockerfile: Node.js multi-stage
+├── zimagefile-rust/             # ZImagefile + Dockerfile: Rust with cache mounts
+├── zimagefile-runtime/          # ZImagefile: runtime template shorthand
 ├── wasm/                        # WebAssembly examples
 │   ├── rust-hello/              # Rust WASM module
 │   ├── go-hello/                # Go WASM module (TinyGo)
@@ -97,6 +101,44 @@ export POSTGRES_PASSWORD="secure-password"
 export API_SECRET_KEY="your-secret"
 zlayer deploy -f examples/containers/multi-service/deployment.yaml
 ```
+
+### ZImagefile Examples (Image Builds)
+
+ZImagefiles are ZLayer's YAML-based alternative to Dockerfiles. They support
+the same features (multi-stage builds, cache mounts, cross-stage copies) in
+a structured YAML format.
+
+| Example | Mode | Description |
+|---------|------|-------------|
+| [zimagefile-node](zimagefile-node/) | Multi-stage | Node.js app with builder + runtime stages |
+| [zimagefile-rust](zimagefile-rust/) | Multi-stage | Rust binary with cargo cache mounts |
+| [zimagefile-runtime](zimagefile-runtime/) | Runtime template | Zero-config Node.js build via `runtime: node22` |
+
+Each ZImagefile example includes a side-by-side Dockerfile so you can compare
+the two formats directly.
+
+**Build ZImagefile examples:**
+```bash
+# ZLayer auto-detects ZImagefile in the current directory
+cd examples/zimagefile-node
+zlayer build -t my-node-app:latest .
+
+# Or specify explicitly
+zlayer build -f ZImagefile -t my-rust-app:latest examples/zimagefile-rust/
+```
+
+### Canonical Deployment Filename (.zlayer.yml)
+
+ZLayer auto-detects files named `*.zlayer.yml` in the current directory, so
+you can deploy without specifying `-f`:
+
+```bash
+# Deploys using simple.zlayer.yml automatically
+cd examples
+zlayer deploy
+```
+
+See [simple.zlayer.yml](simple.zlayer.yml) for an example.
 
 ## Deployment Manifest Reference
 

@@ -1,0 +1,38 @@
+[package]
+name = "zlayer-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Interactive TUI for ZLayer container image building"
+
+[[bin]]
+name = "zlayer-cli"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates - builder subsystem only
+zlayer-builder = { path = "../../crates/zlayer-builder" }
+zlayer-spec = { path = "../../crates/zlayer-spec" }
+
+# TUI - same versions as zlayer-builder
+ratatui = "0.29"
+crossterm = "0.28"
+
+# CLI bootstrap (for --help, --version, non-interactive mode)
+clap = { workspace = true, features = ["derive"] }
+
+# Async
+tokio = { workspace = true, features = ["full"] }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde_json = { workspace = true }

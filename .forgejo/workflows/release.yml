@@ -80,6 +80,9 @@ jobs:
             echo "crate_name=zlayer-storage" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == tunnel-v* ]]; then
             echo "crate_name=zlayer-tunnel" >> $GITHUB_OUTPUT
+          elif [[ "$TAG" == build-v* ]]; then
+            echo "crate_name=zlayer-builder" >> $GITHUB_OUTPUT
+            echo "binary=true" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == rust-sdk-v* ]]; then
             echo "sdk_name=rust" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == py-sdk-v* ]]; then
@@ -105,7 +108,7 @@ jobs:
           BASE_URL="${{ inputs.artifact_base_url }}"
           mkdir -p artifacts
 
-          for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64; do
+          for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64 zlayer-build-linux-amd64 zlayer-build-linux-arm64 zlayer-build-darwin-amd64 zlayer-build-darwin-arm64 zlayer-cli-linux-amd64 zlayer-cli-linux-arm64 zlayer-cli-darwin-amd64 zlayer-cli-darwin-arm64; do
             echo "Downloading ${name}.tar.gz from temp storage..."
             curl -L --fail \
               --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
@@ -377,34 +380,83 @@ jobs:
           cmake --build build
 
   # ===========================================
-  # Docker (after merge)
+  # Docker (after merge) - uses zlayer-build + buildah
   # ===========================================
   docker:
+    name: Docker (${{ matrix.image }})
     needs: [detect, merge-to-main]
     if: needs.detect.outputs.docker == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: zlayer-node
+            zimagefile: docker/ZImagefile.zlayer-node
+          - image: zlayer-web
+            zimagefile: docker/ZImagefile.zlayer-web
+          - image: zlayer-manager
+            zimagefile: docker/ZImagefile.zlayer-manager
     steps:
       - uses: actions/checkout@v4
         with:
           ref: main
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Install buildah
+        run: sudo apt-get update && sudo apt-get install -y buildah
+      - name: Download zlayer-build
+        run: |
+          curl -fsSL "${{ inputs.artifact_base_url }}/zlayer-build-linux-amd64.tar.gz" \
+            --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+            -o zlayer-build.tar.gz
+          tar xzf zlayer-build.tar.gz
+          chmod +x zlayer-build
+          sudo mv zlayer-build /usr/local/bin/
+      - name: Download zlayer binary (for node image)
+        if: matrix.image == 'zlayer-node'
+        run: |
+          mkdir -p target/release
+          curl -fsSL "${{ inputs.artifact_base_url }}/zlayer-linux-amd64.tar.gz" \
+            --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+            -o zlayer.tar.gz
+          tar xzf zlayer.tar.gz -C target/release/
       - name: Login to Docker Hub
-        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo buildah login -u zachhandley --password-stdin docker.io
       - name: Login to GHCR
-        run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-      - name: Build and push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: docker/Dockerfile.zlayer-node
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            zlayer/zlayer-node:${{ needs.detect.outputs.version }}
-            zlayer/zlayer-node:latest
-            ghcr.io/blackleafdigital/zlayer-node:${{ needs.detect.outputs.version }}
-            ghcr.io/blackleafdigital/zlayer-node:latest
+        run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | sudo buildah login -u "${{ github.actor }}" --password-stdin ghcr.io
+      - name: Build image
+        run: |
+          sudo zlayer-build build --no-tui \
+            -f ${{ matrix.zimagefile }} \
+            -t zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
+            -t zlayer/${{ matrix.image }}:latest \
+            -t ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
+            -t ghcr.io/blackleafdigital/${{ matrix.image }}:latest \
+            --format oci .
+      - name: Export OCI archive
+        run: |
+          sudo buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
+            oci-archive:${{ matrix.image }}-${{ needs.detect.outputs.version }}-oci.tar
+      - name: Export Docker archive
+        run: |
+          sudo buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }} \
+            docker-archive:${{ matrix.image }}-${{ needs.detect.outputs.version }}-docker.tar
+      - name: Upload image archives to Forgejo Packages
+        run: |
+          VERSION="${{ needs.detect.outputs.version }}"
+          for archive in ${{ matrix.image }}-${VERSION}-oci.tar ${{ matrix.image }}-${VERSION}-docker.tar; do
+            echo "Uploading ${archive}..."
+            curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+              --upload-file "${archive}" \
+              "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${archive}"
+          done
+      - name: Push to Docker Hub
+        run: |
+          sudo buildah push zlayer/${{ matrix.image }}:${{ needs.detect.outputs.version }}
+          sudo buildah push zlayer/${{ matrix.image }}:latest
+      - name: Push to GHCR
+        run: |
+          sudo buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:${{ needs.detect.outputs.version }}
+          sudo buildah push ghcr.io/blackleafdigital/${{ matrix.image }}:latest
 
   # ===========================================
   # Trigger GitHub release

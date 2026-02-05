@@ -24,7 +24,7 @@ use crate::cache::{compute_digest, validate_digest};
 use crate::error::CacheError;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 use tokio::sync::RwLock;
 
@@ -155,6 +155,11 @@ impl LocalRegistry {
             root,
             index: RwLock::new(index),
         })
+    }
+
+    /// Get the root directory of this registry
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
     /// Get the path to the blobs directory

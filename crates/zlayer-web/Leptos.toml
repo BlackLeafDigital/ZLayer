@@ -17,9 +17,6 @@ site-pkg-dir = "pkg"
 # Address for the server (used in dev mode)
 site-addr = "127.0.0.1:3000"
 
-# No style file (we use inline CSS)
-style-file = ""
-
 # Features for compilation
 # Server binary gets ssr feature
 bin-features = ["ssr"]

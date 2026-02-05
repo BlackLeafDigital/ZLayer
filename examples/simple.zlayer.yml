@@ -1,0 +1,28 @@
+# simple.zlayer.yml - Canonical deployment filename
+#
+# ZLayer auto-detects files named *.zlayer.yml in the current directory,
+# so you can deploy without specifying -f:
+#
+#   zlayer deploy
+#
+# This is the same content as simple.yaml, just using the canonical filename.
+
+version: v1
+deployment: my-simple-app
+
+services:
+  web:
+    rtype: service
+    image:
+      name: nginx:alpine
+      pull_policy: if_not_present
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 80
+        expose: public
+
+    scale:
+      mode: fixed
+      replicas: 2

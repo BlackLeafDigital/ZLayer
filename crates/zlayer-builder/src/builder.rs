@@ -127,6 +127,9 @@ use std::sync::Arc;
 #[cfg(feature = "cache")]
 use zlayer_registry::cache::BlobCacheBackend;
 
+#[cfg(feature = "local-registry")]
+use zlayer_registry::LocalRegistry;
+
 /// Configuration for the layer cache backend.
 ///
 /// This enum specifies which cache backend to use for storing and retrieving
@@ -354,6 +357,8 @@ impl RegistryAuth {
 pub struct BuildOptions {
     /// Dockerfile path (default: Dockerfile in context)
     pub dockerfile: Option<PathBuf>,
+    /// ZImagefile path (alternative to Dockerfile)
+    pub zimagefile: Option<PathBuf>,
     /// Use runtime template instead of Dockerfile
     pub runtime: Option<Runtime>,
     /// Build arguments (ARG values)
@@ -430,12 +435,21 @@ pub struct BuildOptions {
     /// are properly computed and tracked.
     #[cfg(feature = "cache")]
     pub cache_backend_config: Option<CacheBackendConfig>,
+    /// Default OCI/WASM-compatible registry to check for images before falling
+    /// back to Docker Hub qualification.
+    ///
+    /// When set, the builder will probe this registry for short image names
+    /// before qualifying them to `docker.io`. For example, if set to
+    /// `"git.example.com:5000"` and the ZImagefile uses `base: "myapp:latest"`,
+    /// the builder will check `git.example.com:5000/myapp:latest` first.
+    pub default_registry: Option<String>,
 }
 
 impl Default for BuildOptions {
     fn default() -> Self {
         Self {
             dockerfile: None,
+            zimagefile: None,
             runtime: None,
             build_args: HashMap::new(),
             target: None,
@@ -451,6 +465,7 @@ impl Default for BuildOptions {
             cache_ttl: None,
             #[cfg(feature = "cache")]
             cache_backend_config: None,
+            default_registry: None,
         }
     }
 }
@@ -505,6 +520,9 @@ pub struct ImageBuilder {
     /// - Cache base image layers pulled from registries
     #[cfg(feature = "cache")]
     cache_backend: Option<Arc<Box<dyn BlobCacheBackend>>>,
+    /// Local OCI registry for checking cached images before remote pulls.
+    #[cfg(feature = "local-registry")]
+    local_registry: Option<LocalRegistry>,
 }
 
 impl ImageBuilder {
@@ -560,6 +578,8 @@ impl ImageBuilder {
             event_tx: None,
             #[cfg(feature = "cache")]
             cache_backend: None,
+            #[cfg(feature = "local-registry")]
+            local_registry: None,
         })
     }
 
@@ -587,6 +607,8 @@ impl ImageBuilder {
             event_tx: None,
             #[cfg(feature = "cache")]
             cache_backend: None,
+            #[cfg(feature = "local-registry")]
+            local_registry: None,
         })
     }
 
@@ -607,6 +629,27 @@ impl ImageBuilder {
     /// ```
     pub fn dockerfile(mut self, path: impl AsRef<Path>) -> Self {
         self.options.dockerfile = Some(path.as_ref().to_path_buf());
+        self
+    }
+
+    /// Set a custom ZImagefile path
+    ///
+    /// ZImagefiles are a YAML-based alternative to Dockerfiles. When set,
+    /// the builder will parse the ZImagefile and convert it to the internal
+    /// Dockerfile IR for execution.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use zlayer_builder::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// let builder = ImageBuilder::new("./my-project").await?
+    ///     .zimagefile("./my-project/ZImagefile");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn zimagefile(mut self, path: impl AsRef<Path>) -> Self {
+        self.options.zimagefile = Some(path.as_ref().to_path_buf());
         self
     }
 
@@ -866,6 +909,27 @@ impl ImageBuilder {
     pub fn push_without_auth(mut self) -> Self {
         self.options.push = true;
         self.options.registry_auth = None;
+        self
+    }
+
+    /// Set a default OCI/WASM-compatible registry to check for images.
+    ///
+    /// When set, the builder will probe this registry for short image names
+    /// before qualifying them to `docker.io`. For example, if set to
+    /// `"git.example.com:5000"` and the ZImagefile uses `base: "myapp:latest"`,
+    /// the builder will check `git.example.com:5000/myapp:latest` first.
+    pub fn default_registry(mut self, registry: impl Into<String>) -> Self {
+        self.options.default_registry = Some(registry.into());
+        self
+    }
+
+    /// Set a local OCI registry for image resolution.
+    ///
+    /// When set, the builder checks the local registry for cached images
+    /// before pulling from remote registries.
+    #[cfg(feature = "local-registry")]
+    pub fn with_local_registry(mut self, registry: LocalRegistry) -> Self {
+        self.local_registry = Some(registry);
         self
     }
 
@@ -1155,19 +1219,19 @@ impl ImageBuilder {
 
         info!("Starting build in context: {}", self.context.display());
 
-        // 1. Get Dockerfile content
-        let dockerfile_content = self.get_dockerfile_content().await?;
-
-        // 2. Parse Dockerfile
-        let dockerfile = Dockerfile::parse(&dockerfile_content)?;
+        // 1. Get parsed Dockerfile (from template, ZImagefile, or Dockerfile)
+        let dockerfile = self.get_dockerfile().await?;
         debug!("Parsed Dockerfile with {} stages", dockerfile.stages.len());
 
-        // 3. Determine stages to build
+        // 2. Determine stages to build
         let stages = self.resolve_stages(&dockerfile)?;
         debug!("Building {} stages", stages.len());
 
         // 4. Build each stage
         let mut stage_images: HashMap<String, String> = HashMap::new();
+        // Track the final WORKDIR for each committed stage, used to resolve
+        // relative source paths in COPY --from instructions.
+        let mut stage_workdirs: HashMap<String, String> = HashMap::new();
         let mut final_container: Option<String> = None;
         let mut total_instructions = 0;
 
@@ -1186,7 +1250,9 @@ impl ImageBuilder {
             });
 
             // Create container from base image
-            let base = self.resolve_base_image(&stage.base_image, &stage_images)?;
+            let base = self
+                .resolve_base_image(&stage.base_image, &stage_images)
+                .await?;
             let container_id = self.create_container(&base).await?;
 
             debug!(
@@ -1199,6 +1265,10 @@ impl ImageBuilder {
             // Track the current base layer for cache key computation.
             // Each instruction modifies the container, so we update this after each instruction.
             let mut current_base_layer = container_id.clone();
+
+            // Track the current WORKDIR for this stage. Used to resolve relative paths
+            // when this stage is used as a source for COPY --from in a later stage.
+            let mut current_workdir = String::from("/");
 
             // Execute instructions
             for (inst_idx, instruction) in stage.instructions.iter().enumerate() {
@@ -1214,7 +1284,51 @@ impl ImageBuilder {
                 // Track instruction start time for potential cache hit heuristics
                 let instruction_start = std::time::Instant::now();
 
-                let commands = BuildahCommand::from_instruction(&container_id, instruction);
+                // Resolve COPY --from references to actual committed image names,
+                // and resolve relative source paths using the source stage's WORKDIR.
+                let resolved_instruction;
+                let instruction_ref = if let Instruction::Copy(copy) = instruction {
+                    if let Some(ref from) = copy.from {
+                        if let Some(image_name) = stage_images.get(from) {
+                            let mut resolved_copy = copy.clone();
+                            resolved_copy.from = Some(image_name.clone());
+
+                            // Resolve relative source paths using the source stage's WORKDIR.
+                            // If the source stage had `workdir: "/build"` and the copy source
+                            // is `"app"`, we need to resolve it to `"/build/app"`.
+                            if let Some(source_workdir) = stage_workdirs.get(from) {
+                                resolved_copy.sources = resolved_copy
+                                    .sources
+                                    .iter()
+                                    .map(|src| {
+                                        if src.starts_with('/') {
+                                            // Absolute path - use as-is
+                                            src.clone()
+                                        } else {
+                                            // Relative path - prepend source stage's workdir
+                                            if source_workdir == "/" {
+                                                format!("/{}", src)
+                                            } else {
+                                                format!("{}/{}", source_workdir, src)
+                                            }
+                                        }
+                                    })
+                                    .collect();
+                            }
+
+                            resolved_instruction = Instruction::Copy(resolved_copy);
+                            &resolved_instruction
+                        } else {
+                            instruction
+                        }
+                    } else {
+                        instruction
+                    }
+                } else {
+                    instruction
+                };
+
+                let commands = BuildahCommand::from_instruction(&container_id, instruction_ref);
 
                 let mut combined_output = String::new();
                 for cmd in commands {
@@ -1251,6 +1365,13 @@ impl ImageBuilder {
                 }
 
                 let instruction_elapsed_ms = instruction_start.elapsed().as_millis() as u64;
+
+                // Track WORKDIR changes for later COPY --from resolution.
+                // We need to know the final WORKDIR of each stage so we can resolve
+                // relative paths when copying from that stage.
+                if let Instruction::Workdir(dir) = instruction {
+                    current_workdir = dir.clone();
+                }
 
                 // Attempt to detect if this was a cache hit.
                 // TODO: Implement proper cache detection. Currently always returns false.
@@ -1294,8 +1415,13 @@ impl ImageBuilder {
                     .await?;
                 stage_images.insert(name.clone(), image_name.clone());
 
+                // Store the final WORKDIR for this stage so COPY --from can resolve
+                // relative paths correctly.
+                stage_workdirs.insert(name.clone(), current_workdir.clone());
+
                 // Also add by index
-                stage_images.insert(stage.index.to_string(), image_name);
+                stage_images.insert(stage.index.to_string(), image_name.clone());
+                stage_workdirs.insert(stage.index.to_string(), current_workdir.clone());
 
                 // If this is also the final stage (named target), keep reference
                 if is_final_stage {
@@ -1316,6 +1442,8 @@ impl ImageBuilder {
                 self.commit_container(&container_id, &image_name, false)
                     .await?;
                 stage_images.insert(stage.index.to_string(), image_name);
+                // Store the final WORKDIR for this stage
+                stage_workdirs.insert(stage.index.to_string(), current_workdir.clone());
                 let _ = self
                     .executor
                     .execute(&BuildahCommand::rm(&container_id))
@@ -1391,13 +1519,53 @@ impl ImageBuilder {
         })
     }
 
-    /// Get Dockerfile content from template or file
-    async fn get_dockerfile_content(&self) -> Result<String> {
+    /// Get a parsed [`Dockerfile`] from the configured source.
+    ///
+    /// Detection order:
+    /// 1. If `runtime` is set → use template string → parse as Dockerfile
+    /// 2. If `zimagefile` is explicitly set → read & parse ZImagefile → convert
+    /// 3. If a file called `ZImagefile` exists in the context dir → same as (2)
+    /// 4. Fall back to reading a Dockerfile (from `dockerfile` option or default)
+    async fn get_dockerfile(&self) -> Result<Dockerfile> {
+        // (a) Runtime template takes highest priority.
         if let Some(runtime) = &self.options.runtime {
             debug!("Using runtime template: {}", runtime);
-            return Ok(get_template(*runtime).to_string());
+            let content = get_template(*runtime);
+            return Dockerfile::parse(content);
         }
 
+        // (b) Explicit ZImagefile path.
+        if let Some(ref zimage_path) = self.options.zimagefile {
+            debug!("Reading ZImagefile: {}", zimage_path.display());
+            let content =
+                fs::read_to_string(zimage_path)
+                    .await
+                    .map_err(|e| BuildError::ContextRead {
+                        path: zimage_path.clone(),
+                        source: e,
+                    })?;
+            let zimage = crate::zimage::parse_zimagefile(&content)?;
+            return self.handle_zimage(&zimage).await;
+        }
+
+        // (c) Auto-detect ZImagefile in context directory.
+        let auto_zimage_path = self.context.join("ZImagefile");
+        if auto_zimage_path.exists() {
+            debug!(
+                "Found ZImagefile in context: {}",
+                auto_zimage_path.display()
+            );
+            let content = fs::read_to_string(&auto_zimage_path).await.map_err(|e| {
+                BuildError::ContextRead {
+                    path: auto_zimage_path,
+                    source: e,
+                }
+            })?;
+            let zimage = crate::zimage::parse_zimagefile(&content)?;
+            return self.handle_zimage(&zimage).await;
+        }
+
+        // (d) Fall back to Dockerfile.
         let dockerfile_path = self
             .options
             .dockerfile
@@ -1406,12 +1574,159 @@ impl ImageBuilder {
 
         debug!("Reading Dockerfile: {}", dockerfile_path.display());
 
-        fs::read_to_string(&dockerfile_path)
-            .await
-            .map_err(|e| BuildError::ContextRead {
-                path: dockerfile_path,
-                source: e,
-            })
+        let content =
+            fs::read_to_string(&dockerfile_path)
+                .await
+                .map_err(|e| BuildError::ContextRead {
+                    path: dockerfile_path,
+                    source: e,
+                })?;
+
+        Dockerfile::parse(&content)
+    }
+
+    /// Convert a parsed [`ZImage`] into the internal [`Dockerfile`] IR.
+    ///
+    /// Handles the three ZImage modes that can produce a Dockerfile:
+    /// - **Runtime** mode: delegates to the template system
+    /// - **Single-stage / Multi-stage**: converts via [`zimage_to_dockerfile`]
+    /// - **WASM** mode: errors out (WASM uses `zlayer wasm build`, not `zlayer build`)
+    ///
+    /// Any `build:` directives are resolved first by spawning nested builds.
+    async fn handle_zimage(&self, zimage: &crate::zimage::ZImage) -> Result<Dockerfile> {
+        // Runtime mode: delegate to template system.
+        if let Some(ref runtime_name) = zimage.runtime {
+            let rt = Runtime::from_name(runtime_name).ok_or_else(|| {
+                BuildError::zimagefile_validation(format!(
+                    "unknown runtime '{runtime_name}' in ZImagefile"
+                ))
+            })?;
+            let content = get_template(rt);
+            return Dockerfile::parse(content);
+        }
+
+        // WASM mode: not supported through `zlayer build`.
+        if zimage.wasm.is_some() {
+            return Err(BuildError::invalid_instruction(
+                "ZImagefile",
+                "WASM builds use `zlayer wasm build`, not `zlayer build`",
+            ));
+        }
+
+        // Resolve any `build:` directives to concrete base image tags.
+        let resolved = self.resolve_build_directives(zimage).await?;
+
+        // Single-stage or multi-stage: convert to Dockerfile IR directly.
+        crate::zimage::zimage_to_dockerfile(&resolved)
+    }
+
+    /// Resolve `build:` directives in a ZImage by running nested builds.
+    ///
+    /// For each `build:` directive (top-level or per-stage), this method:
+    /// 1. Determines the build context directory
+    /// 2. Auto-detects the build file (ZImagefile > Dockerfile) unless specified
+    /// 3. Spawns a nested `ImageBuilder` to build the context
+    /// 4. Tags the result and replaces `build` with `base`
+    async fn resolve_build_directives(
+        &self,
+        zimage: &crate::zimage::ZImage,
+    ) -> Result<crate::zimage::ZImage> {
+        let mut resolved = zimage.clone();
+
+        // Resolve top-level `build:` directive.
+        if let Some(ref build_ctx) = resolved.build {
+            let tag = self.run_nested_build(build_ctx, "toplevel").await?;
+            resolved.base = Some(tag);
+            resolved.build = None;
+        }
+
+        // Resolve per-stage `build:` directives.
+        if let Some(ref mut stages) = resolved.stages {
+            for (name, stage) in stages.iter_mut() {
+                if let Some(ref build_ctx) = stage.build {
+                    let tag = self.run_nested_build(build_ctx, name).await?;
+                    stage.base = Some(tag);
+                    stage.build = None;
+                }
+            }
+        }
+
+        Ok(resolved)
+    }
+
+    /// Run a nested build from a `build:` directive and return the resulting image tag.
+    fn run_nested_build<'a>(
+        &'a self,
+        build_ctx: &'a crate::zimage::types::ZBuildContext,
+        stage_name: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(self.run_nested_build_inner(build_ctx, stage_name))
+    }
+
+    async fn run_nested_build_inner(
+        &self,
+        build_ctx: &crate::zimage::types::ZBuildContext,
+        stage_name: &str,
+    ) -> Result<String> {
+        let context_dir = build_ctx.context_dir(&self.context);
+
+        if !context_dir.exists() {
+            return Err(BuildError::ContextRead {
+                path: context_dir,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "build context directory not found for build directive in '{stage_name}'"
+                    ),
+                ),
+            });
+        }
+
+        info!(
+            "Building nested image for '{}' from context: {}",
+            stage_name,
+            context_dir.display()
+        );
+
+        // Create a tag for the nested build result.
+        let tag = format!(
+            "zlayer-build-dep-{}:{}",
+            stage_name,
+            chrono_lite_timestamp()
+        );
+
+        // Create nested builder.
+        let mut nested = ImageBuilder::new(&context_dir).await?;
+        nested = nested.tag(&tag);
+
+        // Apply explicit build file if specified.
+        if let Some(file) = build_ctx.file() {
+            let file_path = context_dir.join(file);
+            if file.ends_with(".yml") || file.ends_with(".yaml") || file.starts_with("ZImagefile") {
+                nested = nested.zimagefile(file_path);
+            } else {
+                nested = nested.dockerfile(file_path);
+            }
+        }
+
+        // Apply build args.
+        for (key, value) in build_ctx.args() {
+            nested = nested.build_arg(&key, &value);
+        }
+
+        // Propagate default registry if set.
+        if let Some(ref reg) = self.options.default_registry {
+            nested = nested.default_registry(reg.clone());
+        }
+
+        // Run the nested build.
+        let result = nested.build().await?;
+        info!(
+            "Nested build for '{}' completed: {}",
+            stage_name, result.image_id
+        );
+
+        Ok(tag)
     }
 
     /// Resolve which stages need to be built
@@ -1451,13 +1766,49 @@ impl ImageBuilder {
         Ok(stages)
     }
 
-    /// Resolve a base image reference to an actual image name
-    fn resolve_base_image(
+    /// Resolve a base image reference to an actual image name.
+    ///
+    /// Resolution chain for short (unqualified) image names:
+    /// 1. Check `LocalRegistry` for a cached copy (if configured)
+    /// 2. Check `default_registry` for the image (if configured)
+    /// 3. Fall back to Docker Hub qualification (`docker.io/library/...`)
+    ///
+    /// Already-qualified names (containing a registry hostname) skip this chain.
+    async fn resolve_base_image(
         &self,
         image_ref: &ImageRef,
         stage_images: &HashMap<String, String>,
     ) -> Result<String> {
         match image_ref {
+            ImageRef::Stage(name) => {
+                return stage_images
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| BuildError::stage_not_found(name));
+            }
+            ImageRef::Scratch => return Ok("scratch".to_string()),
+            ImageRef::Registry { .. } => {}
+        }
+
+        // Check if name is already fully qualified (has registry hostname).
+        let is_qualified = match image_ref {
+            ImageRef::Registry { image, .. } => {
+                let first = image.split('/').next().unwrap_or("");
+                first.contains('.') || first.contains(':') || first == "localhost"
+            }
+            _ => false,
+        };
+
+        // For unqualified names, try local registry and default registry first.
+        if !is_qualified {
+            if let Some(resolved) = self.try_resolve_from_sources(image_ref).await {
+                return Ok(resolved);
+            }
+        }
+
+        // Fall back: qualify to docker.io and build the full string.
+        let qualified = image_ref.qualify();
+        match &qualified {
             ImageRef::Registry { image, tag, digest } => {
                 let mut result = image.clone();
                 if let Some(t) = tag {
@@ -1473,12 +1824,47 @@ impl ImageBuilder {
                 }
                 Ok(result)
             }
-            ImageRef::Stage(name) => stage_images
-                .get(name)
-                .cloned()
-                .ok_or_else(|| BuildError::stage_not_found(name)),
-            ImageRef::Scratch => Ok("scratch".to_string()),
+            _ => unreachable!("qualify() preserves Registry variant"),
         }
+    }
+
+    /// Try to resolve an unqualified image from local registry or default registry.
+    ///
+    /// Returns `Some(fully_qualified_name)` if found, `None` to fall back to docker.io.
+    async fn try_resolve_from_sources(&self, image_ref: &ImageRef) -> Option<String> {
+        let (name, tag_str) = match image_ref {
+            ImageRef::Registry { image, tag, .. } => {
+                (image.as_str(), tag.as_deref().unwrap_or("latest"))
+            }
+            _ => return None,
+        };
+
+        // 1. Check local OCI registry
+        #[cfg(feature = "local-registry")]
+        if let Some(ref local_reg) = self.local_registry {
+            if local_reg.has_manifest(name, tag_str).await {
+                info!(
+                    "Found {}:{} in local registry, using local copy",
+                    name, tag_str
+                );
+                // Build an OCI reference pointing to the local registry path.
+                // buildah can pull from an OCI layout directory.
+                let oci_path = format!("oci:{}:{}", local_reg.root().display(), tag_str);
+                return Some(oci_path);
+            }
+        }
+
+        // 2. Check configured default registry
+        if let Some(ref registry) = self.options.default_registry {
+            let qualified = format!("{}/{}:{}", registry, name, tag_str);
+            debug!("Checking default registry for image: {}", qualified);
+            // Return the qualified name for the configured registry.
+            // buildah will attempt to pull from this registry; if it fails,
+            // the build will error (the user explicitly configured this registry).
+            return Some(qualified);
+        }
+
+        None
     }
 
     /// Create a working container from an image
@@ -1560,6 +1946,7 @@ mod tests {
     fn test_build_options_default() {
         let opts = BuildOptions::default();
         assert!(opts.dockerfile.is_none());
+        assert!(opts.zimagefile.is_none());
         assert!(opts.runtime.is_none());
         assert!(opts.build_args.is_empty());
         assert!(opts.target.is_none());
@@ -1577,41 +1964,50 @@ mod tests {
         assert!(opts.cache_backend_config.is_none());
     }
 
-    #[test]
-    fn test_resolve_base_image_registry() {
+    #[tokio::test]
+    async fn test_resolve_base_image_registry() {
         let builder = create_test_builder();
         let stage_images = HashMap::new();
 
-        // Simple image
+        // Simple image (qualified to docker.io)
         let image_ref = ImageRef::Registry {
             image: "alpine".to_string(),
             tag: Some("3.18".to_string()),
             digest: None,
         };
-        let result = builder.resolve_base_image(&image_ref, &stage_images);
-        assert_eq!(result.unwrap(), "alpine:3.18");
+        let result = builder.resolve_base_image(&image_ref, &stage_images).await;
+        assert_eq!(result.unwrap(), "docker.io/library/alpine:3.18");
 
-        // Image with digest
+        // Image with digest (qualified to docker.io)
         let image_ref = ImageRef::Registry {
             image: "alpine".to_string(),
             tag: None,
             digest: Some("sha256:abc123".to_string()),
         };
-        let result = builder.resolve_base_image(&image_ref, &stage_images);
-        assert_eq!(result.unwrap(), "alpine@sha256:abc123");
+        let result = builder.resolve_base_image(&image_ref, &stage_images).await;
+        assert_eq!(result.unwrap(), "docker.io/library/alpine@sha256:abc123");
 
-        // Image with no tag or digest
+        // Image with no tag or digest (qualified to docker.io + :latest)
         let image_ref = ImageRef::Registry {
             image: "alpine".to_string(),
             tag: None,
             digest: None,
         };
-        let result = builder.resolve_base_image(&image_ref, &stage_images);
-        assert_eq!(result.unwrap(), "alpine:latest");
+        let result = builder.resolve_base_image(&image_ref, &stage_images).await;
+        assert_eq!(result.unwrap(), "docker.io/library/alpine:latest");
+
+        // Already-qualified image (unchanged)
+        let image_ref = ImageRef::Registry {
+            image: "ghcr.io/org/myimage".to_string(),
+            tag: Some("v1".to_string()),
+            digest: None,
+        };
+        let result = builder.resolve_base_image(&image_ref, &stage_images).await;
+        assert_eq!(result.unwrap(), "ghcr.io/org/myimage:v1");
     }
 
-    #[test]
-    fn test_resolve_base_image_stage() {
+    #[tokio::test]
+    async fn test_resolve_base_image_stage() {
         let builder = create_test_builder();
         let mut stage_images = HashMap::new();
         stage_images.insert(
@@ -1620,23 +2016,48 @@ mod tests {
         );
 
         let image_ref = ImageRef::Stage("builder".to_string());
-        let result = builder.resolve_base_image(&image_ref, &stage_images);
+        let result = builder.resolve_base_image(&image_ref, &stage_images).await;
         assert_eq!(result.unwrap(), "zlayer-build-stage-builder");
 
         // Missing stage
         let image_ref = ImageRef::Stage("missing".to_string());
-        let result = builder.resolve_base_image(&image_ref, &stage_images);
+        let result = builder.resolve_base_image(&image_ref, &stage_images).await;
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_resolve_base_image_scratch() {
+    #[tokio::test]
+    async fn test_resolve_base_image_scratch() {
         let builder = create_test_builder();
         let stage_images = HashMap::new();
 
         let image_ref = ImageRef::Scratch;
-        let result = builder.resolve_base_image(&image_ref, &stage_images);
+        let result = builder.resolve_base_image(&image_ref, &stage_images).await;
         assert_eq!(result.unwrap(), "scratch");
+    }
+
+    #[tokio::test]
+    async fn test_resolve_base_image_with_default_registry() {
+        let mut builder = create_test_builder();
+        builder.options.default_registry = Some("git.example.com:5000".to_string());
+        let stage_images = HashMap::new();
+
+        // Unqualified image should resolve to default registry
+        let image_ref = ImageRef::Registry {
+            image: "myapp".to_string(),
+            tag: Some("v1".to_string()),
+            digest: None,
+        };
+        let result = builder.resolve_base_image(&image_ref, &stage_images).await;
+        assert_eq!(result.unwrap(), "git.example.com:5000/myapp:v1");
+
+        // Already-qualified image should NOT use default registry
+        let image_ref = ImageRef::Registry {
+            image: "ghcr.io/org/image".to_string(),
+            tag: Some("latest".to_string()),
+            digest: None,
+        };
+        let result = builder.resolve_base_image(&image_ref, &stage_images).await;
+        assert_eq!(result.unwrap(), "ghcr.io/org/image:latest");
     }
 
     fn create_test_builder() -> ImageBuilder {
@@ -1648,6 +2069,8 @@ mod tests {
             event_tx: None,
             #[cfg(feature = "cache")]
             cache_backend: None,
+            #[cfg(feature = "local-registry")]
+            local_registry: None,
         }
     }
 

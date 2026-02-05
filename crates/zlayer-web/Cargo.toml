@@ -113,8 +113,6 @@ output-name = "zlayer-web"
 site-root = "target/site"
 # Package directory for WASM artifacts
 site-pkg-dir = "pkg"
-# Tailwind/assets directory (we use inline CSS)
-style-file = ""
 # Enable hash-based filenames
 hash-files = true
 # Browser reload on change

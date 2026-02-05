@@ -1,0 +1,60 @@
+# ZImagefile: Multi-stage Node.js application
+#
+# Demonstrates a two-stage build for a Node.js app:
+#   1. "builder" stage installs dependencies and compiles TypeScript
+#   2. "runtime" stage copies only the production output
+#
+# This is the ZImagefile equivalent of a multi-stage Dockerfile.
+# Build with:
+#   zlayer build -f ZImagefile -t my-node-app:latest .
+
+version: "1"
+
+stages:
+  builder:
+    base: "node:22-alpine"
+    workdir: "/src"
+    steps:
+      # Copy dependency manifests first for better layer caching
+      - copy: ["package.json", "package-lock.json"]
+        to: "./"
+      - run: "npm ci"
+        cache:
+          - target: /root/.npm
+            id: npm-cache
+            sharing: shared
+      # Copy the rest of the source and build
+      - copy: "."
+        to: "."
+      - run: "npm run build"
+
+  runtime:
+    base: "node:22-alpine"
+    workdir: "/app"
+    steps:
+      # Copy only production node_modules
+      - copy: ["package.json", "package-lock.json"]
+        to: "./"
+      - run: "npm ci --omit=dev"
+        cache:
+          - target: /root/.npm
+            id: npm-cache
+            sharing: shared
+      # Copy compiled output from builder
+      - copy: "dist"
+        from: builder
+        to: "/app/dist"
+    user: "node"
+    cmd: ["node", "dist/index.js"]
+
+env:
+  NODE_ENV: production
+
+expose: 3000
+
+healthcheck:
+  cmd: "wget -qO- http://localhost:3000/health || exit 1"
+  interval: "30s"
+  timeout: "5s"
+  start_period: "10s"
+  retries: 3

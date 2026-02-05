@@ -105,6 +105,56 @@ impl ImageRef {
     pub fn is_scratch(&self) -> bool {
         matches!(self, Self::Scratch)
     }
+
+    /// Qualify a short image name to a fully-qualified registry reference.
+    ///
+    /// Converts short Docker image names to their fully-qualified equivalents
+    /// for systems without unqualified-search registries configured (e.g. buildah
+    /// on CI runners without `/etc/containers/registries.conf`).
+    ///
+    /// - `rust:1.90` → `docker.io/library/rust:1.90` (official image)
+    /// - `user/image:tag` → `docker.io/user/image:tag` (user image)
+    /// - `ghcr.io/org/image:tag` → unchanged (already qualified)
+    /// - `localhost:5000/image:tag` → unchanged (already qualified)
+    /// - `scratch` / stage refs → unchanged
+    pub fn qualify(&self) -> Self {
+        match self {
+            Self::Scratch | Self::Stage(_) => self.clone(),
+            Self::Registry { image, tag, digest } => {
+                let qualified = qualify_image_name(image);
+                Self::Registry {
+                    image: qualified,
+                    tag: tag.clone(),
+                    digest: digest.clone(),
+                }
+            }
+        }
+    }
+}
+
+/// Qualify a short image name to a fully-qualified registry reference.
+///
+/// If the first path segment contains `.` or `:` or equals `localhost`,
+/// the name is already qualified and returned as-is. Otherwise:
+/// - No `/` → official Docker Hub image: `docker.io/library/{name}`
+/// - Has `/` → Docker Hub user image: `docker.io/{name}`
+fn qualify_image_name(image: &str) -> String {
+    let parts: Vec<&str> = image.split('/').collect();
+
+    if parts.is_empty() {
+        return format!("docker.io/library/{}", image);
+    }
+
+    let first = parts[0];
+    if first.contains('.') || first.contains(':') || first == "localhost" {
+        return image.to_string();
+    }
+
+    if parts.len() == 1 {
+        format!("docker.io/library/{}", image)
+    } else {
+        format!("docker.io/{}", image)
+    }
 }
 
 /// A single stage in a multi-stage Dockerfile
@@ -581,6 +631,110 @@ mod tests {
                 ..
             } if image == "localhost:5000/myimage" && t == "latest"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // ImageRef::qualify() tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_qualify_official_image_no_tag() {
+        let img = ImageRef::parse("alpine");
+        let q = img.qualify();
+        assert!(matches!(
+            q,
+            ImageRef::Registry { ref image, tag: None, digest: None }
+            if image == "docker.io/library/alpine"
+        ));
+    }
+
+    #[test]
+    fn test_qualify_official_image_with_tag() {
+        let img = ImageRef::parse("rust:1.90-bookworm");
+        let q = img.qualify();
+        assert!(matches!(
+            q,
+            ImageRef::Registry { ref image, tag: Some(ref t), digest: None }
+            if image == "docker.io/library/rust" && t == "1.90-bookworm"
+        ));
+    }
+
+    #[test]
+    fn test_qualify_user_image() {
+        let img = ImageRef::parse("lukemathwalker/cargo-chef:latest-rust-1.90");
+        let q = img.qualify();
+        assert!(matches!(
+            q,
+            ImageRef::Registry { ref image, tag: Some(ref t), .. }
+            if image == "docker.io/lukemathwalker/cargo-chef" && t == "latest-rust-1.90"
+        ));
+    }
+
+    #[test]
+    fn test_qualify_already_qualified_ghcr() {
+        let img = ImageRef::parse("ghcr.io/org/image:v1");
+        let q = img.qualify();
+        assert_eq!(q.to_string_ref(), "ghcr.io/org/image:v1");
+    }
+
+    #[test]
+    fn test_qualify_already_qualified_quay() {
+        let img = ImageRef::parse("quay.io/org/image:latest");
+        let q = img.qualify();
+        assert_eq!(q.to_string_ref(), "quay.io/org/image:latest");
+    }
+
+    #[test]
+    fn test_qualify_already_qualified_custom_registry() {
+        let img = ImageRef::parse("registry.example.com/org/image:v2");
+        let q = img.qualify();
+        assert_eq!(q.to_string_ref(), "registry.example.com/org/image:v2");
+    }
+
+    #[test]
+    fn test_qualify_localhost_with_port() {
+        let img = ImageRef::parse("localhost:5000/myimage:latest");
+        let q = img.qualify();
+        assert_eq!(q.to_string_ref(), "localhost:5000/myimage:latest");
+    }
+
+    #[test]
+    fn test_qualify_localhost_without_port() {
+        let img = ImageRef::parse("localhost/myimage:v1");
+        let q = img.qualify();
+        assert_eq!(q.to_string_ref(), "localhost/myimage:v1");
+    }
+
+    #[test]
+    fn test_qualify_with_digest() {
+        let img = ImageRef::parse("alpine@sha256:abc123def");
+        let q = img.qualify();
+        assert!(matches!(
+            q,
+            ImageRef::Registry { ref image, tag: None, digest: Some(ref d) }
+            if image == "docker.io/library/alpine" && d == "sha256:abc123def"
+        ));
+    }
+
+    #[test]
+    fn test_qualify_docker_io_explicit() {
+        let img = ImageRef::parse("docker.io/library/nginx:alpine");
+        let q = img.qualify();
+        assert_eq!(q.to_string_ref(), "docker.io/library/nginx:alpine");
+    }
+
+    #[test]
+    fn test_qualify_scratch() {
+        let img = ImageRef::parse("scratch");
+        let q = img.qualify();
+        assert!(matches!(q, ImageRef::Scratch));
+    }
+
+    #[test]
+    fn test_qualify_stage_ref() {
+        let img = ImageRef::Stage("builder".to_string());
+        let q = img.qualify();
+        assert!(matches!(q, ImageRef::Stage(ref name) if name == "builder"));
     }
 
     #[test]

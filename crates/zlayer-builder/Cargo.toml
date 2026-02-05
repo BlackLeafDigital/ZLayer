@@ -22,9 +22,16 @@ tracing.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
+# Serialization
+serde_yaml.workspace = true
+
 # Hashing
 sha2.workspace = true
 hex.workspace = true
+
+# ZImagefile support
+indexmap = { version = "2", features = ["serde"] }
+humantime = "2"
 
 # Platform detection
 dirs = "5"
@@ -47,3 +54,5 @@ cache = ["zlayer-registry"]
 cache-persistent = ["cache", "zlayer-registry/persistent"]
 # Enable S3-compatible storage backend (requires cache feature)
 cache-s3 = ["cache", "zlayer-registry/s3"]
+# Enable local OCI registry for image resolution (check local store before pulling)
+local-registry = ["cache", "zlayer-registry/local"]
