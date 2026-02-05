@@ -411,25 +411,27 @@ jobs:
               IMAGE_ID=$(sudo buildah images --format "{{.ID}}" | head -1)
             fi
 
-            # Tag for all destinations
-            sudo buildah tag ${IMAGE_ID} zlayer/${img}:${VERSION}
-            sudo buildah tag ${IMAGE_ID} zlayer/${img}:latest
-            sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/${img}:${VERSION}
-            sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/${img}:latest
+            # zlayer-web only goes to Forgejo, others go to Docker Hub + GHCR
+            if [ "$img" != "zlayer-web" ]; then
+              # Tag for Docker Hub and GHCR
+              sudo buildah tag ${IMAGE_ID} zachhandley/${img}:${VERSION}
+              sudo buildah tag ${IMAGE_ID} zachhandley/${img}:latest
+              sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/${img}:${VERSION}
+              sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/${img}:latest
 
-            # Push to Docker Hub
-            sudo buildah push zlayer/${img}:${VERSION}
-            sudo buildah push zlayer/${img}:latest
+              # Push to Docker Hub (zachhandley namespace)
+              sudo buildah push zachhandley/${img}:${VERSION}
+              sudo buildah push zachhandley/${img}:latest
 
-            # Push to GHCR
-            sudo buildah push ghcr.io/blackleafdigital/${img}:${VERSION}
-            sudo buildah push ghcr.io/blackleafdigital/${img}:latest
+              # Push to GHCR (BlackLeafDigital namespace)
+              sudo buildah push ghcr.io/blackleafdigital/${img}:${VERSION}
+              sudo buildah push ghcr.io/blackleafdigital/${img}:latest
+            fi
 
-            # Export versioned archives for Forgejo Packages
-            sudo buildah push zlayer/${img}:${VERSION} \
-              oci-archive:${img}-${VERSION}-oci.tar
-            sudo buildah push zlayer/${img}:${VERSION} \
-              docker-archive:${img}-${VERSION}-docker.tar
+            # Export versioned archives for Forgejo Packages (all images)
+            sudo buildah tag ${IMAGE_ID} ${img}:${VERSION}
+            sudo buildah push ${img}:${VERSION} oci-archive:${img}-${VERSION}-oci.tar
+            sudo buildah push ${img}:${VERSION} docker-archive:${img}-${VERSION}-docker.tar
           done
 
       - name: Upload image archives to Forgejo Packages
