@@ -6,84 +6,40 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version tag (e.g., v0.1.0)'
+        description: 'Version (e.g., 0.9.6 or v0.9.6)'
         required: true
-      sha:
-        description: 'Commit SHA'
-        required: false
 
 env:
   CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
 
 jobs:
-  # ===========================================
-  # Setup and check if release exists
-  # ===========================================
-  setup:
-    name: Setup Release
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.get-version.outputs.version }}
-      sha: ${{ steps.get-version.outputs.sha }}
-      skip_release: ${{ steps.check-existing.outputs.skip }}
-    steps:
-      - name: Get version from trigger
-        id: get-version
-        run: |
-          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
-            VERSION="${{ github.event.client_payload.version }}"
-            SHA="${{ github.event.client_payload.sha }}"
-            echo "Triggered by E2E workflow for version ${VERSION}"
-          else
-            VERSION="${{ inputs.version }}"
-            SHA="${{ inputs.sha || github.sha }}"
-            echo "Manual trigger for version ${VERSION}"
-          fi
-
-          echo "version=${VERSION}" >> $GITHUB_OUTPUT
-          echo "sha=${SHA}" >> $GITHUB_OUTPUT
-          echo "Version: ${VERSION}, SHA: ${SHA}"
-
-      - name: Check if release already exists
-        id: check-existing
-        env:
-          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
-          VERSION: ${{ steps.get-version.outputs.version }}
-        run: |
-          RELEASE_EXISTS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${VERSION}")
-
-          if [[ "${RELEASE_EXISTS}" == "200" ]]; then
-            echo "Release ${VERSION} already exists. Skipping."
-            echo "skip=true" >> $GITHUB_OUTPUT
-          else
-            echo "Release ${VERSION} does not exist. Proceeding."
-            echo "skip=false" >> $GITHUB_OUTPUT
-          fi
-
-  # ===========================================
-  # Create GitHub Release
-  # ===========================================
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: setup
-    if: needs.setup.outputs.skip_release != 'true'
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.setup.outputs.sha }}
+          fetch-depth: 0
 
-      - name: Extract version
+      - name: Setup version
         id: version
         run: |
-          TAG="${{ needs.setup.outputs.version }}"
-          VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          # Handle both workflow_dispatch and repository_dispatch
+          if [[ "${{ github.event_name }}" == "repository_dispatch" ]]; then
+            INPUT_VERSION="${{ github.event.client_payload.version }}"
+          else
+            INPUT_VERSION="${{ inputs.version }}"
+          fi
+          # Extract numeric version (strip v prefix if present)
+          VERSION_NUM=$(echo "$INPUT_VERSION" | sed 's/^v//')
+          # Tag always has v prefix
+          TAG="v${VERSION_NUM}"
+
+          echo "version=${VERSION_NUM}" >> $GITHUB_OUTPUT
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Version: ${VERSION_NUM}, Tag: ${TAG}"
 
       - name: Download all artifacts from Forgejo
         run: |
@@ -91,148 +47,131 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           BASE_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
 
-          for arch in amd64 arm64; do
-            echo "Downloading zlayer-linux-${arch}.tar.gz..."
-            curl -fsSL "${BASE_URL}/zlayer-linux-${arch}.tar.gz" \
-              -o "artifacts/zlayer-${VERSION}-linux-${arch}.tar.gz" || echo "Linux ${arch} not available yet"
+          echo "Downloading from: ${BASE_URL}"
+
+          # Download zlayer runtime
+          for os in linux darwin; do
+            for arch in amd64 arm64; do
+              artifact="zlayer-${os}-${arch}.tar.gz"
+              output="artifacts/zlayer-${VERSION}-${os}-${arch}.tar.gz"
+              echo "Downloading ${artifact}..."
+              curl -fsSL "${BASE_URL}/${artifact}" -o "${output}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
+            done
           done
 
-          for artifact in darwin-amd64 darwin-arm64; do
-            echo "Downloading zlayer-${artifact}.tar.gz..."
-            curl -fsSL "${BASE_URL}/zlayer-${artifact}.tar.gz" \
-              -o "artifacts/zlayer-${VERSION}-${artifact}.tar.gz" || echo "macOS ${artifact} not available yet"
+          # Download zlayer-build
+          for os in linux darwin; do
+            for arch in amd64 arm64; do
+              artifact="zlayer-build-${os}-${arch}.tar.gz"
+              output="artifacts/zlayer-build-${VERSION}-${os}-${arch}.tar.gz"
+              echo "Downloading ${artifact}..."
+              curl -fsSL "${BASE_URL}/${artifact}" -o "${output}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
+            done
           done
 
-          # Download zlayer-build artifacts
-          for arch in amd64 arm64; do
-            echo "Downloading zlayer-build-linux-${arch}.tar.gz..."
-            curl -fsSL "${BASE_URL}/zlayer-build-linux-${arch}.tar.gz" \
-              -o "artifacts/zlayer-build-${VERSION}-linux-${arch}.tar.gz" || echo "zlayer-build linux ${arch} not available"
+          # Download zlayer-cli
+          for os in linux darwin; do
+            for arch in amd64 arm64; do
+              artifact="zlayer-cli-${os}-${arch}.tar.gz"
+              output="artifacts/zlayer-cli-${VERSION}-${os}-${arch}.tar.gz"
+              echo "Downloading ${artifact}..."
+              curl -fsSL "${BASE_URL}/${artifact}" -o "${output}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
+            done
           done
 
-          for artifact in darwin-amd64 darwin-arm64; do
-            echo "Downloading zlayer-build-${artifact}.tar.gz..."
-            curl -fsSL "${BASE_URL}/zlayer-build-${artifact}.tar.gz" \
-              -o "artifacts/zlayer-build-${VERSION}-${artifact}.tar.gz" || echo "zlayer-build ${artifact} not available"
+          # Download container image archives
+          for img in zlayer-node zlayer-manager; do
+            for fmt in oci docker; do
+              artifact="${img}-${VERSION}-${fmt}.tar"
+              echo "Downloading ${artifact}..."
+              curl -fsSL "${BASE_URL}/${artifact}" -o "artifacts/${artifact}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
+            done
           done
 
-          # Download zlayer-cli artifacts
-          for arch in amd64 arm64; do
-            echo "Downloading zlayer-cli-linux-${arch}.tar.gz..."
-            curl -fsSL "${BASE_URL}/zlayer-cli-linux-${arch}.tar.gz" \
-              -o "artifacts/zlayer-cli-${VERSION}-linux-${arch}.tar.gz" || echo "zlayer-cli linux ${arch} not available"
-          done
-
-          for artifact in darwin-amd64 darwin-arm64; do
-            echo "Downloading zlayer-cli-${artifact}.tar.gz..."
-            curl -fsSL "${BASE_URL}/zlayer-cli-${artifact}.tar.gz" \
-              -o "artifacts/zlayer-cli-${VERSION}-${artifact}.tar.gz" || echo "zlayer-cli ${artifact} not available"
-          done
-
+          echo ""
+          echo "Downloaded artifacts:"
           ls -la artifacts/
 
-      - name: Delete existing release if exists
-        env:
-          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+      - name: Create or update tag
         run: |
-          gh release delete "${{ steps.version.outputs.tag }}" --yes --cleanup-tag=false 2>/dev/null || echo "No existing release"
+          TAG="${{ steps.version.outputs.tag }}"
+          git tag -f "${TAG}"
+          git push origin "${TAG}" --force
+
+      - name: Delete existing release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete "${{ steps.version.outputs.tag }}" --yes 2>/dev/null || echo "No existing release to delete"
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: ZLayer ${{ steps.version.outputs.version }}
-          files: artifacts/*.tar.gz
-          generate_release_notes: true
-          draft: false
-          prerelease: false
-          body: |
-            ## ZLayer ${{ steps.version.outputs.version }}
-
-            ### Install
-
-            ```bash
-            # Install CLI (interactive TUI)
-            curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | sh
-
-            # Install runtime (for deploying containers)
-            curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=runtime sh
-            ```
-
-            ### Binaries
-
-            | Binary | Description |
-            |--------|-------------|
-            | `zlayer-cli` | Interactive TUI — install, build, and manage ZLayer |
-            | `zlayer-build` | Lightweight image builder CLI (Dockerfile, ZImagefile, runtime templates) |
-            | `zlayer` | Full container orchestration runtime |
-
-            ### Container Images
-
-            **Docker Hub** (`zachhandley/`):
-            ```bash
-            docker pull zachhandley/zlayer-node:${{ steps.version.outputs.version }}
-            docker pull zachhandley/zlayer-manager:${{ steps.version.outputs.version }}
-            ```
-
-            **GHCR** (`ghcr.io/blackleafdigital/`):
-            ```bash
-            docker pull ghcr.io/blackleafdigital/zlayer-node:${{ steps.version.outputs.version }}
-            docker pull ghcr.io/blackleafdigital/zlayer-manager:${{ steps.version.outputs.version }}
-            ```
-
-            | Image | Description |
-            |-------|-------------|
-            | `zlayer-node` | Container orchestration runtime with embedded containerd |
-            | `zlayer-manager` | Web-based management UI |
-
-            ### Using with ZLayer
-
-            ```bash
-            # Initialize and deploy zlayer-manager
-            zlayer manager init
-            zlayer deploy zlayer-manager.yaml
-
-            # Or pull images directly
-            zlayer pull zachhandley/zlayer-node:${{ steps.version.outputs.version }}
-            zlayer pull zachhandley/zlayer-manager:${{ steps.version.outputs.version }}
-            ```
-
-            See the [CHANGELOG](https://github.com/BlackLeafDigital/ZLayer/blob/main/CHANGELOG.md) for details.
         env:
-          GITHUB_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
-
-  # ===========================================
-  # Download and attach container image archives
-  # (Images already built and pushed by Forgejo)
-  # ===========================================
-  attach-images:
-    name: Attach Container Images
-    runs-on: ubuntu-latest
-    needs: [setup, release]
-    if: needs.setup.outputs.skip_release != 'true'
-    steps:
-      - name: Download image archives from Forgejo
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VERSION=$(echo "${{ needs.setup.outputs.version }}" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
-          BASE_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="${{ steps.version.outputs.tag }}"
 
-          for img in zlayer-node zlayer-manager; do
-            echo "Downloading ${img} archives..."
-            curl -fsSL "${BASE_URL}/${img}-${VERSION}-oci.tar" -o "${img}-${VERSION}-oci.tar" || echo "${img} OCI not available"
-            curl -fsSL "${BASE_URL}/${img}-${VERSION}-docker.tar" -o "${img}-${VERSION}-docker.tar" || echo "${img} Docker not available"
-          done
+          # Build release notes
+          cat > release_notes.md << 'EOF'
+          ## Install
 
-          ls -la *.tar 2>/dev/null || echo "No archives downloaded"
+          ```bash
+          # Install CLI (interactive TUI)
+          curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | sh
 
-      - name: Upload image archives to GitHub Release
-        env:
-          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
-        run: |
-          TAG="${{ needs.setup.outputs.version }}"
-          for archive in *-oci.tar *-docker.tar; do
-            if [ -f "$archive" ]; then
-              echo "Uploading ${archive} to release..."
-              gh release upload "${TAG}" "${archive}" --clobber || echo "Upload failed for ${archive}"
-            fi
-          done
+          # Install runtime (for deploying containers)
+          curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=runtime sh
+          ```
+
+          ## Binaries
+
+          | Binary | Description |
+          |--------|-------------|
+          | `zlayer-cli` | Interactive TUI — install, build, and manage ZLayer |
+          | `zlayer-build` | Lightweight image builder CLI (Dockerfile, ZImagefile, runtime templates) |
+          | `zlayer` | Full container orchestration runtime |
+
+          ## Container Images
+
+          **Docker Hub** (`zachhandley/`):
+          ```bash
+          docker pull zachhandley/zlayer-node:VERSION_PLACEHOLDER
+          docker pull zachhandley/zlayer-manager:VERSION_PLACEHOLDER
+          ```
+
+          **GHCR** (`ghcr.io/blackleafdigital/`):
+          ```bash
+          docker pull ghcr.io/blackleafdigital/zlayer-node:VERSION_PLACEHOLDER
+          docker pull ghcr.io/blackleafdigital/zlayer-manager:VERSION_PLACEHOLDER
+          ```
+
+          ## Using with ZLayer
+
+          ```bash
+          # Initialize and deploy zlayer-manager
+          zlayer manager init
+          zlayer deploy zlayer-manager.yaml
+
+          # Or pull images directly
+          zlayer pull zachhandley/zlayer-node:VERSION_PLACEHOLDER
+          ```
+
+          See the [CHANGELOG](https://github.com/BlackLeafDigital/ZLayer/blob/main/CHANGELOG.md) for details.
+          EOF
+
+          # Replace version placeholder
+          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" release_notes.md
+
+          # Create the release with all artifacts
+          gh release create "${TAG}" \
+            --title "ZLayer ${VERSION}" \
+            --notes-file release_notes.md \
+            --latest \
+            artifacts/*.tar.gz artifacts/*.tar 2>/dev/null || \
+          gh release create "${TAG}" \
+            --title "ZLayer ${VERSION}" \
+            --notes-file release_notes.md \
+            --latest \
+            artifacts/*.tar.gz
+
+          echo "✓ Release ${TAG} created successfully"

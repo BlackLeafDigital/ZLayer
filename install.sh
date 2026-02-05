@@ -1,23 +1,13 @@
 #!/bin/sh
 set -eu
 
-# ZLayer Installer
+# ZLayer Installer - Downloads from GitHub Releases
 # Usage: curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | sh
 #
-# Options (via env vars):
-#   ZLAYER_VERSION=v0.9.0    - Install specific version
-#   ZLAYER_COMPONENT=runtime - Install runtime instead of CLI (options: cli, runtime, build)
+# Options:
+#   ZLAYER_VERSION=0.9.6     - Install specific version
+#   ZLAYER_COMPONENT=runtime - Component: cli, runtime, build
 #   ZLAYER_INSTALL_DIR=/path - Custom install directory
-#
-# Examples:
-#   # Install CLI (default)
-#   curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | sh
-#
-#   # Install runtime
-#   curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=runtime sh
-#
-#   # Install zlayer-build
-#   curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=build sh
 
 REPO="BlackLeafDigital/ZLayer"
 COMPONENT="${ZLAYER_COMPONENT:-cli}"
@@ -35,16 +25,8 @@ esac
 # --- Detect OS ---
 OS="$(uname -s)"
 case "$OS" in
-    Linux)
-        if [ -f /proc/version ] && grep -qi microsoft /proc/version 2>/dev/null; then
-            echo "Error: WSL detected. Please install ZLayer natively on your Linux distro or Windows." >&2
-            exit 1
-        fi
-        OS="linux"
-        ;;
-    Darwin)
-        OS="darwin"
-        ;;
+    Linux)  OS="linux" ;;
+    Darwin) OS="darwin" ;;
     *)
         echo "Error: Unsupported OS: $OS" >&2
         exit 1
@@ -62,22 +44,21 @@ case "$ARCH" in
         ;;
 esac
 
-# --- Resolve version ---
+# --- Resolve version from GitHub ---
 VERSION="${ZLAYER_VERSION:-}"
 if [ -z "$VERSION" ]; then
-    echo "Fetching latest version..."
-    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')"
+    echo "Fetching latest version from GitHub..."
+    VERSION="$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
     if [ -z "$VERSION" ]; then
         echo "Error: Could not determine latest version. Set ZLAYER_VERSION and retry." >&2
         exit 1
     fi
 fi
 
-# Strip leading 'v' for filename, use original for tag
-TAG="$VERSION"
+# Normalize: TAG has v prefix, VERSION_NUM does not
 case "$VERSION" in
-    v*) VERSION_NUM="${VERSION#v}" ;;
-    *)  VERSION_NUM="$VERSION" ;;
+    v*) TAG="$VERSION"; VERSION_NUM="${VERSION#v}" ;;
+    *)  TAG="v${VERSION}"; VERSION_NUM="$VERSION" ;;
 esac
 
 # --- Resolve install dir ---
@@ -91,24 +72,22 @@ if [ -z "$INSTALL_DIR" ]; then
 fi
 mkdir -p "$INSTALL_DIR"
 
-# --- Download and install ---
-# Artifact naming: zlayer-cli-0.9.6-linux-amd64.tar.gz, zlayer-0.9.6-linux-amd64.tar.gz, etc.
-if [ "$BINARY" = "zlayer" ]; then
-    ARTIFACT_NAME="zlayer-${VERSION_NUM}-${OS}-${ARCH}.tar.gz"
-else
-    ARTIFACT_NAME="${BINARY}-${VERSION_NUM}-${OS}-${ARCH}.tar.gz"
-fi
-URL="https://github.com/${REPO}/releases/download/${TAG}/${ARTIFACT_NAME}"
+# --- Download from GitHub Releases ---
+ARTIFACT="${BINARY}-${VERSION_NUM}-${OS}-${ARCH}.tar.gz"
+URL="https://github.com/${REPO}/releases/download/${TAG}/${ARTIFACT}"
+
 TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "Downloading ${BINARY} ${TAG} (${OS}/${ARCH})..."
-curl -fsSL "$URL" -o "${TMPDIR}/archive.tar.gz"
+if ! curl -fsSL "$URL" -o "${TMPDIR}/archive.tar.gz"; then
+    echo "Error: Download failed from ${URL}" >&2
+    exit 1
+fi
 
 echo "Installing to ${INSTALL_DIR}..."
 tar -xzf "${TMPDIR}/archive.tar.gz" -C "$TMPDIR"
 
-# Find the binary in the extracted files
 BIN_PATH="$(find "$TMPDIR" -name "$BINARY" -type f | head -1)"
 if [ -z "$BIN_PATH" ]; then
     echo "Error: ${BINARY} not found in archive" >&2
@@ -122,49 +101,24 @@ elif command -v sudo >/dev/null 2>&1; then
     sudo cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
     sudo chmod +x "${INSTALL_DIR}/${BINARY}"
 else
-    echo "Error: Cannot write to ${INSTALL_DIR} and sudo is not available." >&2
-    echo "Set ZLAYER_INSTALL_DIR to a writable directory and retry." >&2
+    echo "Error: Cannot write to ${INSTALL_DIR}" >&2
     exit 1
 fi
 
-# --- Verify ---
-if "${INSTALL_DIR}/${BINARY}" --version >/dev/null 2>&1; then
-    echo ""
-    echo "${BINARY} ${TAG} installed successfully!"
-else
-    echo ""
-    echo "${BINARY} ${TAG} installed to ${INSTALL_DIR}/${BINARY}"
-fi
+echo ""
+echo "${BINARY} ${TAG} installed to ${INSTALL_DIR}/${BINARY}"
 
-# Check PATH
 case ":${PATH}:" in
     *":${INSTALL_DIR}:"*) ;;
     *)
         echo ""
-        echo "Add ${INSTALL_DIR} to your PATH:"
-        echo "  export PATH=\"${INSTALL_DIR}:\$PATH\""
+        echo "Add to PATH: export PATH=\"${INSTALL_DIR}:\$PATH\""
         ;;
 esac
 
 echo ""
 case "$BINARY" in
-    zlayer-cli)
-        echo "Run 'zlayer-cli' to get started with the interactive TUI."
-        echo ""
-        echo "To install the full runtime:"
-        echo "  curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=runtime sh"
-        ;;
-    zlayer)
-        echo "Run 'zlayer --help' to see available commands."
-        echo ""
-        echo "Quick start:"
-        echo "  zlayer manager init    # Initialize zlayer-manager"
-        echo "  zlayer deploy spec.yaml # Deploy from a spec file"
-        ;;
-    zlayer-build)
-        echo "Run 'zlayer-build --help' to see available commands."
-        echo ""
-        echo "Quick start:"
-        echo "  zlayer-build build -f Dockerfile -t myapp:latest ."
-        ;;
+    zlayer-cli) echo "Run 'zlayer-cli' to start." ;;
+    zlayer)     echo "Run 'zlayer --help' for commands." ;;
+    zlayer-build) echo "Run 'zlayer-build --help' for commands." ;;
 esac
