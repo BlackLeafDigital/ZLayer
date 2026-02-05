@@ -73,11 +73,11 @@ if [ -z "$VERSION" ]; then
     fi
 fi
 
-# Strip leading 'v' for filename, keep for tag
+# Strip leading 'v' for filename, use original for tag
 TAG="$VERSION"
 case "$VERSION" in
     v*) VERSION_NUM="${VERSION#v}" ;;
-    *)  VERSION_NUM="$VERSION"; TAG="v${VERSION}" ;;
+    *)  VERSION_NUM="$VERSION" ;;
 esac
 
 # --- Resolve install dir ---
