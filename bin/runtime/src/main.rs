@@ -491,7 +491,6 @@ enum ManagerCommands {
     ///   zlayer manager init
     ///   zlayer manager init --port 8080
     ///   zlayer manager init --deploy
-    ///   zlayer manager init --with-web
     #[command(verbatim_doc_comment)]
     Init {
         /// Output directory for spec file (default: current directory)
@@ -505,10 +504,6 @@ enum ManagerCommands {
         /// Deploy immediately after creating spec
         #[arg(long)]
         deploy: bool,
-
-        /// Include zlayer-web in the deployment
-        #[arg(long)]
-        with_web: bool,
 
         /// ZLayer version to use (default: latest)
         #[arg(long)]
@@ -3186,9 +3181,8 @@ async fn handle_manager(cmd: &ManagerCommands) -> Result<()> {
             output,
             port,
             deploy,
-            with_web,
             version,
-        } => handle_manager_init(output.clone(), *port, *deploy, *with_web, version.clone()).await,
+        } => handle_manager_init(output.clone(), *port, *deploy, version.clone()).await,
         ManagerCommands::Status => handle_manager_status().await,
         ManagerCommands::Stop { force } => handle_manager_stop(*force).await,
     }
@@ -3199,14 +3193,13 @@ async fn handle_manager_init(
     output: PathBuf,
     port: u16,
     deploy: bool,
-    with_web: bool,
     version: Option<String>,
 ) -> Result<()> {
     let version = version.unwrap_or_else(|| "latest".to_string());
-    info!(port = port, with_web = with_web, version = %version, "Initializing zlayer-manager deployment");
+    info!(port = port, version = %version, "Initializing zlayer-manager deployment");
 
     // Build the manager service spec
-    let mut spec = format!(
+    let spec = format!(
         r#"version: v1
 deployment: zlayer-manager
 
@@ -3236,37 +3229,6 @@ services:
         port = port
     );
 
-    // Add zlayer-web service if requested
-    if with_web {
-        let web_port = if port == 3001 { 3002 } else { 3001 };
-        spec.push_str(&format!(
-            r#"
-  web:
-    rtype: service
-    image:
-      name: zachhandley/zlayer-web:{version}
-      pull_policy: always
-    resources:
-      cpu: 0.5
-      memory: 256Mi
-    endpoints:
-      - name: http
-        protocol: http
-        port: {web_port}
-        expose: public
-    scale:
-      mode: fixed
-      replicas: 1
-    health:
-      check:
-        type: http
-        url: http://localhost:{web_port}/health
-"#,
-            version = version,
-            web_port = web_port
-        ));
-    }
-
     // Ensure output directory exists
     if !output.exists() {
         std::fs::create_dir_all(&output)
@@ -3283,13 +3245,6 @@ services:
     println!("Manager configuration:");
     println!("  - Image: zachhandley/zlayer-manager:{}", version);
     println!("  - Port: {}", port);
-    if with_web {
-        let web_port = if port == 3001 { 3002 } else { 3001 };
-        println!(
-            "  - Web UI: zachhandley/zlayer-web:{} on port {}",
-            version, web_port
-        );
-    }
     println!();
 
     if deploy {

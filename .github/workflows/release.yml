@@ -144,6 +144,8 @@ jobs:
           name: ZLayer ${{ steps.version.outputs.version }}
           files: artifacts/*.tar.gz
           generate_release_notes: true
+          draft: false
+          prerelease: false
           body: |
             ## ZLayer ${{ steps.version.outputs.version }}
 
