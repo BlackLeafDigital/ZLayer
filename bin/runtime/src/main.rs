@@ -5,10 +5,12 @@
 //!
 //! # Feature Flags
 //!
-//! - `full` (default): Enable all commands
-//! - `serve`: Enable the API server command
-//! - `join`: Enable the join command for worker nodes
-//! - `deploy`: Enable the deploy/orchestration commands
+//! - `full` (default): Enable all runtime capabilities
+//! - `docker`: Docker runtime support
+//! - `wasm`: WebAssembly runtime support
+//! - `s3`: S3 storage backend
+//! - `persistent`: Persistent scheduler/registry storage
+//! - `observability`: Axum metrics and trace propagation
 
 mod cli;
 mod commands;
@@ -63,12 +65,10 @@ fn main() -> Result<()> {
 
 async fn run(cli: Cli) -> Result<()> {
     match &cli.command {
-        #[cfg(feature = "deploy")]
         Commands::Deploy { spec_path, dry_run } => {
             let path = util::discover_spec_path(spec_path.as_deref())?;
             commands::deploy::deploy(&cli, &path, *dry_run).await
         }
-        #[cfg(feature = "join")]
         Commands::Join {
             token,
             spec_dir,
@@ -84,7 +84,6 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        #[cfg(feature = "serve")]
         Commands::Serve {
             bind,
             jwt_secret,
@@ -95,7 +94,6 @@ async fn run(cli: Cli) -> Result<()> {
             let path = util::discover_spec_path(spec_path.as_deref())?;
             commands::lifecycle::validate(&path).await
         }
-        #[cfg(feature = "deploy")]
         Commands::Logs {
             deployment,
             service,
@@ -105,19 +103,16 @@ async fn run(cli: Cli) -> Result<()> {
         } => {
             commands::lifecycle::logs(deployment, service, *lines, *follow, instance.clone()).await
         }
-        #[cfg(feature = "deploy")]
         Commands::Stop {
             deployment,
             service,
             force,
             timeout,
         } => commands::lifecycle::stop(deployment, service.clone(), *force, *timeout).await,
-        #[cfg(feature = "deploy")]
         Commands::Up { spec_path } => {
             let path = util::discover_spec_path(spec_path.as_deref())?;
             commands::deploy::up(&cli, &path).await
         }
-        #[cfg(feature = "deploy")]
         Commands::Down { deployment } => commands::deploy::down(deployment.clone()).await,
         Commands::Build {
             context,
@@ -164,7 +159,6 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Tunnel(tunnel_cmd) => commands::tunnel::handle_tunnel(&cli, tunnel_cmd).await,
         Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd).await,
         Commands::Pull { image } => commands::registry::handle_pull(image).await,
-        #[cfg(feature = "node")]
         Commands::Node(node_cmd) => commands::node::handle_node(node_cmd).await,
     }
 }

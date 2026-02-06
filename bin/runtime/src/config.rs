@@ -8,7 +8,6 @@ use zlayer_agent::RuntimeConfig;
 use zlayer_agent::YoukiConfig;
 
 /// Build runtime configuration from CLI arguments
-#[cfg(any(feature = "deploy", feature = "join"))]
 pub(crate) fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
     match cli.runtime {
         RuntimeType::Auto => RuntimeConfig::Auto,

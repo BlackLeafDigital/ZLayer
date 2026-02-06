@@ -41,7 +41,6 @@ pub(crate) enum RuntimeType {
 }
 
 /// Deploy mode controls whether the runtime stays in foreground or returns after deploying
-#[cfg(feature = "deploy")]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum DeployMode {
     /// Stay running in foreground, wait for Ctrl+C
@@ -54,7 +53,6 @@ pub(crate) enum DeployMode {
 #[derive(Subcommand)]
 pub(crate) enum Commands {
     /// Deploy services from a spec file
-    #[cfg(feature = "deploy")]
     Deploy {
         /// Path to the deployment spec YAML file (auto-discovers .zlayer.yml if not given)
         spec_path: Option<PathBuf>,
@@ -65,7 +63,6 @@ pub(crate) enum Commands {
     },
 
     /// Join an existing deployment
-    #[cfg(feature = "join")]
     Join {
         /// Join token (contains deployment key and service info)
         token: String,
@@ -84,7 +81,6 @@ pub(crate) enum Commands {
     },
 
     /// Start the API server
-    #[cfg(feature = "serve")]
     Serve {
         /// Bind address (e.g., 0.0.0.0:8080)
         #[arg(long, default_value = "0.0.0.0:8080")]
@@ -109,7 +105,6 @@ pub(crate) enum Commands {
     },
 
     /// Stream logs from a service
-    #[cfg(feature = "deploy")]
     Logs {
         /// Deployment name
         #[arg(short, long)]
@@ -132,7 +127,6 @@ pub(crate) enum Commands {
     },
 
     /// Stop a deployment or service
-    #[cfg(feature = "deploy")]
     Stop {
         /// Deployment name
         deployment: String,
@@ -160,7 +154,6 @@ pub(crate) enum Commands {
     ///   zlayer up
     ///   zlayer up my-spec.yml
     ///   zlayer up -b
-    #[cfg(feature = "deploy")]
     #[command(verbatim_doc_comment)]
     Up {
         /// Path to deployment spec (auto-discovers .zlayer.yml if not given)
@@ -174,7 +167,6 @@ pub(crate) enum Commands {
     /// Examples:
     ///   zlayer down
     ///   zlayer down my-deployment
-    #[cfg(feature = "deploy")]
     #[command(verbatim_doc_comment)]
     Down {
         /// Deployment name (auto-discovers from .zlayer.yml if not given)
@@ -259,7 +251,6 @@ pub(crate) enum Commands {
     Spec(SpecCommands),
 
     /// Manage cluster nodes
-    #[cfg(feature = "node")]
     #[command(subcommand)]
     Node(NodeCommands),
 
@@ -614,7 +605,6 @@ pub(crate) enum WasmCommands {
 }
 
 /// Node management subcommands
-#[cfg(feature = "node")]
 #[derive(Subcommand)]
 pub(crate) enum NodeCommands {
     /// Initialize this node as cluster leader
@@ -830,7 +820,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_deploy_command() {
         let cli = Cli::try_parse_from(["zlayer", "deploy", "test-spec.yaml"]).unwrap();
 
@@ -844,7 +833,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_deploy_command_no_spec() {
         let cli = Cli::try_parse_from(["zlayer", "deploy"]).unwrap();
 
@@ -858,7 +846,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_deploy_dry_run() {
         let cli = Cli::try_parse_from(["zlayer", "deploy", "--dry-run", "test-spec.yaml"]).unwrap();
 
@@ -871,7 +858,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "join")]
     fn test_cli_join_command() {
         let cli = Cli::try_parse_from(["zlayer", "join", "some-token"]).unwrap();
 
@@ -892,7 +878,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "join")]
     fn test_cli_join_command_all_options() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -924,7 +909,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "join")]
     fn test_cli_join_command_short_flags() {
         let cli =
             Cli::try_parse_from(["zlayer", "join", "-s", "api", "-r", "5", "token123"]).unwrap();
@@ -945,7 +929,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "join")]
     fn test_parse_join_token() {
         use base64::Engine;
 
@@ -967,7 +950,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "join")]
     fn test_parse_join_token_minimal() {
         use base64::Engine;
 
@@ -988,7 +970,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "join")]
     fn test_parse_join_token_invalid_base64() {
         let result = crate::commands::join::parse_join_token("not-valid-base64!!!");
         assert!(result.is_err());
@@ -997,7 +978,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "join")]
     fn test_parse_join_token_invalid_json() {
         use base64::Engine;
 
@@ -1046,7 +1026,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_build_runtime_config_auto() {
         let cli = Cli::try_parse_from(["zlayer", "status"]).unwrap();
         let config = crate::config::build_runtime_config(&cli);
@@ -1054,7 +1033,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(all(feature = "deploy", target_os = "linux"))]
+    #[cfg(target_os = "linux")]
     fn test_build_runtime_config_youki() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -1076,7 +1055,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "serve")]
     fn test_cli_serve_command_defaults() {
         let cli = Cli::try_parse_from(["zlayer", "serve"]).unwrap();
 
@@ -1095,7 +1073,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "serve")]
     fn test_cli_serve_command_custom_bind() {
         let cli = Cli::try_parse_from(["zlayer", "serve", "--bind", "127.0.0.1:9090"]).unwrap();
 
@@ -1108,7 +1085,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "serve")]
     fn test_cli_serve_command_jwt_secret() {
         let cli = Cli::try_parse_from(["zlayer", "serve", "--jwt-secret", "my-super-secret-key"])
             .unwrap();
@@ -1122,7 +1098,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "serve")]
     fn test_cli_serve_command_no_swagger() {
         let cli = Cli::try_parse_from(["zlayer", "serve", "--no-swagger"]).unwrap();
 
@@ -1135,7 +1110,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "serve")]
     fn test_cli_serve_command_all_options() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -1163,7 +1137,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_logs_command_minimal() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -1193,7 +1166,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_logs_command_all_options() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -1228,7 +1200,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_logs_command_short_flags() {
         let cli = Cli::try_parse_from([
             "zlayer", "logs", "-d", "staging", "-n", "25", "-f", "-i", "inst-456", "api",
@@ -1254,7 +1225,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_stop_command_minimal() {
         let cli = Cli::try_parse_from(["zlayer", "stop", "my-deployment"]).unwrap();
 
@@ -1275,7 +1245,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_stop_command_with_service() {
         let cli =
             Cli::try_parse_from(["zlayer", "stop", "--service", "web", "my-deployment"]).unwrap();
@@ -1294,7 +1263,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_stop_command_force() {
         let cli = Cli::try_parse_from(["zlayer", "stop", "--force", "my-deployment"]).unwrap();
 
@@ -1307,7 +1275,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_stop_command_timeout() {
         let cli =
             Cli::try_parse_from(["zlayer", "stop", "--timeout", "60", "my-deployment"]).unwrap();
@@ -1321,7 +1288,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_stop_command_all_options() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -1596,7 +1562,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_init_command() {
         let cli = Cli::try_parse_from(["zlayer", "node", "init", "--advertise-addr", "10.0.0.1"])
             .unwrap();
@@ -1622,7 +1587,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_init_command_all_options() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -1664,7 +1628,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_join_command() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -1697,7 +1660,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_join_command_with_services() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -1727,7 +1689,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_list_command() {
         let cli = Cli::try_parse_from(["zlayer", "node", "list"]).unwrap();
 
@@ -1740,7 +1701,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_list_command_json() {
         let cli = Cli::try_parse_from(["zlayer", "node", "list", "--output", "json"]).unwrap();
 
@@ -1753,7 +1713,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_status_command() {
         let cli = Cli::try_parse_from(["zlayer", "node", "status"]).unwrap();
 
@@ -1766,7 +1725,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_status_command_with_id() {
         let cli = Cli::try_parse_from(["zlayer", "node", "status", "node-abc-123"]).unwrap();
 
@@ -1779,7 +1737,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_remove_command() {
         let cli = Cli::try_parse_from(["zlayer", "node", "remove", "node-123"]).unwrap();
 
@@ -1793,7 +1750,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_remove_command_force() {
         let cli = Cli::try_parse_from(["zlayer", "node", "remove", "--force", "node-123"]).unwrap();
 
@@ -1807,7 +1763,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_set_mode_command() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -1836,7 +1791,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "node")]
     fn test_cli_node_label_command() {
         let cli = Cli::try_parse_from([
             "zlayer",
@@ -1860,7 +1814,6 @@ mod tests {
     // generate_join_token_data, parse_cluster_join_token) are in commands/node.rs
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_up_command_no_spec() {
         let cli = Cli::try_parse_from(["zlayer", "up"]).unwrap();
 
@@ -1874,7 +1827,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_up_command_with_spec() {
         let cli = Cli::try_parse_from(["zlayer", "up", "my-spec.yml"]).unwrap();
 
@@ -1887,7 +1839,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_up_command_background() {
         let cli = Cli::try_parse_from(["zlayer", "up", "-b"]).unwrap();
 
@@ -1896,7 +1847,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_up_command_background_global() {
         // Background flag before subcommand
         let cli = Cli::try_parse_from(["zlayer", "-b", "up"]).unwrap();
@@ -1906,7 +1856,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_down_command_no_deployment() {
         let cli = Cli::try_parse_from(["zlayer", "down"]).unwrap();
 
@@ -1919,7 +1868,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "deploy")]
     fn test_cli_down_command_with_deployment() {
         let cli = Cli::try_parse_from(["zlayer", "down", "my-app"]).unwrap();
 

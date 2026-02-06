@@ -87,7 +87,6 @@ pub(crate) async fn validate(spec_path: &Path) -> Result<()> {
 }
 
 /// Stream logs from a service
-#[cfg(feature = "deploy")]
 pub(crate) async fn logs(
     deployment: &str,
     service: &str,
@@ -123,7 +122,6 @@ pub(crate) async fn logs(
 }
 
 /// Stop a deployment or service
-#[cfg(feature = "deploy")]
 pub(crate) async fn stop(
     deployment: &str,
     service: Option<String>,

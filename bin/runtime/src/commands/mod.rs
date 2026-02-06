@@ -1,10 +1,6 @@
-#[cfg(feature = "deploy")]
 pub mod deploy;
-#[cfg(feature = "join")]
 pub mod join;
-#[cfg(feature = "node")]
 pub mod node;
-#[cfg(feature = "serve")]
 pub mod serve;
 
 pub mod build;

@@ -14,13 +14,7 @@ path = "src/main.rs"
 [features]
 default = ["full"]
 # Full runtime with all CLI commands and capabilities
-full = ["serve", "join", "deploy", "node", "docker", "wasm", "s3", "persistent", "observability"]
-
-# CLI commands
-serve = []
-join = []
-deploy = []
-node = []
+full = ["docker", "wasm", "s3", "persistent", "observability"]
 
 # Runtime capabilities (forwarded to deps)
 docker = ["zlayer-agent/docker"]

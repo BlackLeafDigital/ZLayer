@@ -192,9 +192,7 @@ jobs:
     strategy:
       matrix:
         features:
-          - "--no-default-features --features join"
-          - "--no-default-features --features serve"
-          - "--no-default-features --features deploy"
+          - "--no-default-features"
           - "--features full"
     steps:
       - name: Checkout
