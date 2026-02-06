@@ -97,7 +97,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler
+          sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Run WASM E2E tests
         run: cargo test --package zlayer-agent --features wasm --test wasm_e2e_test -- --nocapture
