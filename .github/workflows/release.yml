@@ -79,13 +79,11 @@ jobs:
             done
           done
 
-          # Download container image archives
+          # Download container image archives (OCI format only)
           for img in zlayer-node zlayer-manager; do
-            for fmt in oci docker; do
-              artifact="${img}-${VERSION}-${fmt}.tar"
-              echo "Downloading ${artifact}..."
-              curl -fsSL "${BASE_URL}/${artifact}" -o "artifacts/${artifact}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
-            done
+            artifact="${img}-${VERSION}-oci.tar"
+            echo "Downloading ${artifact}..."
+            curl -fsSL "${BASE_URL}/${artifact}" -o "artifacts/${artifact}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
           done
 
           echo ""
