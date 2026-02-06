@@ -22,6 +22,7 @@ jobs:
   # ===========================================
   build-linux-amd64:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     container: node:20-bullseye
     steps:
       - uses: actions/checkout@v4
@@ -71,6 +72,7 @@ jobs:
     name: Image Build (Pipeline)
     needs: [build-linux-amd64]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -124,6 +126,7 @@ jobs:
   build-linux-arm64:
     needs: [image-build]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       CROSS_TARGET_DIR: ${{ github.workspace }}/cross-target
     steps:
@@ -177,6 +180,7 @@ jobs:
   build-macos-amd64:
     needs: [image-build]
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -242,6 +246,7 @@ jobs:
   build-macos-arm64:
     needs: [image-build]
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -294,6 +299,7 @@ jobs:
   verify:
     needs: [build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64, image-build]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     outputs:
       success: ${{ steps.check.outputs.success }}
     steps:
@@ -308,6 +314,7 @@ jobs:
     needs: [verify]
     if: needs.verify.outputs.success == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     outputs:
       package_base_url: ${{ steps.upload.outputs.package_base_url }}
     steps:
@@ -316,30 +323,107 @@ jobs:
         with:
           path: artifacts
 
+      - name: List artifacts for debugging
+        run: |
+          echo "=== Downloaded artifacts ==="
+          find artifacts -type f -ls
+
       - name: Upload to temp packages
         id: upload
         run: |
           RUN_ID="${{ github.run_id }}"
           VERSION="${{ inputs.version }}"
           BASE_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-temp/${RUN_ID}"
+          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
+
+          # Resilient upload function with retry, timeout, and conflict handling
+          upload_with_retry() {
+            local file="$1"
+            local url="$2"
+            local max_retries=5
+            local retry=0
+            local backoff=5
+
+            while [ $retry -lt $max_retries ]; do
+              echo "Uploading $(basename "$file") (attempt $((retry + 1))/$max_retries)..."
+
+              # Try upload with timeout (5 min for large files)
+              http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+                --max-time 300 \
+                --connect-timeout 30 \
+                --retry 3 \
+                --retry-delay 5 \
+                --user "$AUTH" \
+                --upload-file "$file" \
+                "$url" 2>/dev/null) || http_code="000"
+
+              case "$http_code" in
+                200|201)
+                  echo "✓ Successfully uploaded $(basename "$file")"
+                  return 0
+                  ;;
+                409)
+                  echo "File already exists (409), attempting to delete and re-upload..."
+                  # Try to delete existing file
+                  curl -s -X DELETE --user "$AUTH" "$url" || true
+                  sleep 2
+                  # Retry upload after delete
+                  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
+                    --max-time 300 \
+                    --connect-timeout 30 \
+                    --user "$AUTH" \
+                    --upload-file "$file" \
+                    "$url" 2>/dev/null) || http_code="000"
+
+                  if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
+                    echo "✓ Successfully uploaded $(basename "$file") after delete"
+                    return 0
+                  fi
+                  ;;
+                000)
+                  echo "Connection failed or timed out"
+                  ;;
+                *)
+                  echo "Upload failed with HTTP $http_code"
+                  ;;
+              esac
+
+              retry=$((retry + 1))
+              if [ $retry -lt $max_retries ]; then
+                echo "Retrying in ${backoff}s..."
+                sleep $backoff
+                backoff=$((backoff * 2))
+              fi
+            done
+
+            echo "✗ Failed to upload $(basename "$file") after $max_retries attempts"
+            return 1
+          }
+
+          failed=0
 
           # Upload binary artifacts
           for artifact in artifacts/zlayer-*/*.tar.gz; do
+            [ -f "$artifact" ] || continue
             filename=$(basename "$artifact")
-            echo "Uploading $filename to temp storage..."
-            curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-              --upload-file "$artifact" \
-              "${BASE_URL}/${filename}"
+            if ! upload_with_retry "$artifact" "${BASE_URL}/${filename}"; then
+              failed=1
+            fi
           done
 
           # Upload container image archives
           for archive in artifacts/container-images/*.tar; do
+            [ -f "$archive" ] || continue
             filename=$(basename "$archive")
-            echo "Uploading container image $filename to temp storage..."
-            curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-              --upload-file "$archive" \
-              "${BASE_URL}/${filename}"
+            if ! upload_with_retry "$archive" "${BASE_URL}/${filename}"; then
+              failed=1
+            fi
           done
+
+          if [ $failed -ne 0 ]; then
+            echo "::error::Some uploads failed"
+            exit 1
+          fi
 
           echo "package_base_url=${BASE_URL}" >> $GITHUB_OUTPUT
 
@@ -350,6 +434,7 @@ jobs:
     needs: [verify, upload-temp-packages]
     if: needs.verify.outputs.success == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Dispatch Release
         run: |
