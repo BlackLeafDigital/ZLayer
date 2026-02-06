@@ -37,7 +37,7 @@ jobs:
           ref: ${{ github.event.client_payload.sha || inputs.sha || github.sha }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -89,7 +89,7 @@ jobs:
           ref: ${{ github.event.client_payload.sha || inputs.sha || github.sha }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -124,7 +124,7 @@ jobs:
           ref: ${{ github.event.client_payload.sha || inputs.sha || github.sha }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -165,7 +165,7 @@ jobs:
           ref: ${{ github.event.client_payload.sha || inputs.sha || github.sha }}
 
       - name: Setup Rust
-        uses: dtolnay/rust-action@stable
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo
         uses: actions/cache@v4
