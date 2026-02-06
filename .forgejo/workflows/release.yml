@@ -426,19 +426,16 @@ jobs:
             # Export versioned archives for Forgejo Packages (all images)
             sudo buildah tag ${IMAGE_ID} ${img}:${VERSION}
             sudo buildah push ${img}:${VERSION} oci-archive:${img}-${VERSION}-oci.tar
-            sudo buildah push ${img}:${VERSION} docker-archive:${img}-${VERSION}-docker.tar
           done
 
       - name: Upload image archives to Forgejo Packages
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           for img in zlayer-node zlayer-web zlayer-manager; do
-            for archive in ${img}-${VERSION}-oci.tar ${img}-${VERSION}-docker.tar; do
-              echo "Uploading ${archive}..."
-              curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-                --upload-file "${archive}" \
-                "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${archive}"
-            done
+            echo "Uploading ${img}-${VERSION}-oci.tar..."
+            curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+              --upload-file "${img}-${VERSION}-oci.tar" \
+              "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${img}-${VERSION}-oci.tar"
           done
 
   # ===========================================
@@ -496,9 +493,9 @@ jobs:
           ```
 
           **Forgejo Packages** (includes `zlayer-web`):
-          - [zlayer-node OCI](${PACKAGES_URL}/zlayer-node-${VERSION}-oci.tar) / [Docker](${PACKAGES_URL}/zlayer-node-${VERSION}-docker.tar)
-          - [zlayer-manager OCI](${PACKAGES_URL}/zlayer-manager-${VERSION}-oci.tar) / [Docker](${PACKAGES_URL}/zlayer-manager-${VERSION}-docker.tar)
-          - [zlayer-web OCI](${PACKAGES_URL}/zlayer-web-${VERSION}-oci.tar) / [Docker](${PACKAGES_URL}/zlayer-web-${VERSION}-docker.tar) *(Forgejo only)*
+          - [zlayer-node](${PACKAGES_URL}/zlayer-node-${VERSION}-oci.tar)
+          - [zlayer-manager](${PACKAGES_URL}/zlayer-manager-${VERSION}-oci.tar)
+          - [zlayer-web](${PACKAGES_URL}/zlayer-web-${VERSION}-oci.tar) *(Forgejo only)*
 
           ### Using with ZLayer
 
