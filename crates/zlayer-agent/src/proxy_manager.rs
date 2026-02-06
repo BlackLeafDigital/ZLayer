@@ -11,9 +11,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 use zlayer_proxy::{Backend, HealthStatus, ProxyConfig, ProxyServer, Route, Router};
-use zlayer_spec::{Protocol, ServiceSpec};
+use zlayer_spec::{ExposeType, Protocol, ServiceSpec};
 
 /// Configuration for the ProxyManager
 #[derive(Debug, Clone)]
@@ -62,14 +62,16 @@ impl ProxyManagerConfig {
 /// Manages proxy routing for agent-controlled services
 ///
 /// The `ProxyManager` coordinates between the agent's service lifecycle and
-/// the proxy crate's routing/load balancing infrastructure.
+/// the proxy crate's routing/load balancing infrastructure. It supports listening
+/// on multiple ports simultaneously, with all port listeners sharing the same
+/// router for request matching and load balancing.
 pub struct ProxyManager {
     /// Configuration
     config: ProxyManagerConfig,
     /// Shared router for request matching
     router: Arc<Router>,
-    /// Proxy server handle (set after start)
-    server: RwLock<Option<Arc<ProxyServer>>>,
+    /// Per-port proxy server handles
+    servers: RwLock<HashMap<u16, Arc<ProxyServer>>>,
     /// Tracked services and their endpoints
     services: RwLock<HashMap<String, Vec<String>>>,
 }
@@ -80,7 +82,7 @@ impl ProxyManager {
         Self {
             config,
             router: Arc::new(Router::new()),
-            server: RwLock::new(None),
+            servers: RwLock::new(HashMap::new()),
             services: RwLock::new(HashMap::new()),
         }
     }
@@ -90,56 +92,55 @@ impl ProxyManager {
         self.router.clone()
     }
 
-    /// Start the proxy server
-    ///
-    /// This starts the HTTP server (and optionally HTTPS) in a background task.
-    /// The server will begin accepting connections and routing requests to
-    /// registered backends.
-    pub async fn start(&self) -> Result<()> {
-        let mut server_guard = self.server.write().await;
+    /// Start listening on a specific port. If already listening on this port, skip.
+    /// All port listeners share the same Router for request matching.
+    pub async fn listen_on(&self, port: u16) -> Result<()> {
+        let mut servers = self.servers.write().await;
 
-        if server_guard.is_some() {
-            warn!("Proxy server already started");
+        if servers.contains_key(&port) {
+            debug!(port = port, "Already listening on port");
             return Ok(());
         }
 
+        let addr: SocketAddr = format!("0.0.0.0:{}", port).parse().unwrap();
         let mut proxy_config = ProxyConfig::default();
-        proxy_config.server.http_addr = self.config.http_addr;
+        proxy_config.server.http_addr = addr;
         proxy_config.server.http2_enabled = self.config.http2_enabled;
-
-        if let Some(https_addr) = self.config.https_addr {
-            proxy_config.server.https_addr = https_addr;
-        }
 
         let server = ProxyServer::with_router(proxy_config, self.router.clone());
         let server = Arc::new(server);
 
-        info!(
-            http_addr = %self.config.http_addr,
-            "Starting proxy server"
-        );
+        info!(port = port, "Proxy listening on port");
 
-        // Spawn the server in a background task
         let server_clone = server.clone();
         tokio::spawn(async move {
             if let Err(e) = server_clone.run().await {
-                tracing::error!(error = %e, "Proxy server error");
+                tracing::error!(port = port, error = %e, "Proxy server error on port");
             }
         });
 
-        *server_guard = Some(server);
-
+        servers.insert(port, server);
         Ok(())
     }
 
-    /// Stop the proxy server
+    /// Stop all proxy servers on all ports
     pub async fn stop(&self) {
-        let mut server_guard = self.server.write().await;
-
-        if let Some(server) = server_guard.take() {
-            info!("Stopping proxy server");
+        let mut servers = self.servers.write().await;
+        for (port, server) in servers.drain() {
+            info!(port = port, "Stopping proxy on port");
             server.shutdown();
         }
+    }
+
+    /// Scan a service's endpoints and ensure the proxy is listening on all
+    /// ports that have `expose: public` or `expose: internal`.
+    pub async fn ensure_ports_for_service(&self, spec: &ServiceSpec) -> Result<()> {
+        for endpoint in &spec.endpoints {
+            if endpoint.expose == ExposeType::Public || endpoint.expose == ExposeType::Internal {
+                self.listen_on(endpoint.port).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Add routes for a service based on its specification

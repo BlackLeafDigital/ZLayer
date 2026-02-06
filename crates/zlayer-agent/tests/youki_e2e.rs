@@ -920,13 +920,13 @@ async fn test_cleanup_state_directory() {
 ///
 /// Note: This requires root privileges for WireGuard key generation
 /// and network interface operations.
-async fn create_test_overlay_manager() -> Option<Arc<OverlayManager>> {
+async fn create_test_overlay_manager() -> Option<Arc<tokio::sync::RwLock<OverlayManager>>> {
     if !has_root_privileges() {
         return None;
     }
 
     match OverlayManager::new("e2e-test".to_string()).await {
-        Ok(manager) => Some(Arc::new(manager)),
+        Ok(manager) => Some(Arc::new(tokio::sync::RwLock::new(manager))),
         Err(e) => {
             eprintln!("Could not create overlay manager: {}", e);
             None

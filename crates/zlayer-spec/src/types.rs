@@ -160,6 +160,38 @@ impl Default for WasmHttpConfig {
     }
 }
 
+fn default_api_bind() -> String {
+    "0.0.0.0:8080".to_string()
+}
+
+/// API server configuration (embedded in deploy/up flows)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ApiSpec {
+    /// Enable the API server (default: true)
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Bind address (default: "0.0.0.0:8080")
+    #[serde(default = "default_api_bind")]
+    pub bind: String,
+    /// JWT secret (reads ZLAYER_JWT_SECRET env var if not set)
+    #[serde(default)]
+    pub jwt_secret: Option<String>,
+    /// Enable Swagger UI (default: true)
+    #[serde(default = "default_true")]
+    pub swagger: bool,
+}
+
+impl Default for ApiSpec {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            bind: default_api_bind(),
+            jwt_secret: None,
+            swagger: true,
+        }
+    }
+}
+
 /// Top-level deployment specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Validate)]
 #[serde(deny_unknown_fields)]
@@ -180,6 +212,10 @@ pub struct DeploymentSpec {
     /// Top-level tunnel definitions (not tied to service endpoints)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tunnels: HashMap<String, TunnelDefinition>,
+
+    /// API server configuration (enabled by default)
+    #[serde(default)]
+    pub api: ApiSpec,
 }
 
 /// Top-level tunnel definition (not tied to a service endpoint)
@@ -1659,5 +1695,67 @@ services:
 "#;
         let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         assert!(spec.tunnels.is_empty());
+    }
+
+    // ==========================================================================
+    // ApiSpec tests
+    // ==========================================================================
+
+    #[test]
+    fn test_spec_without_api_block_uses_defaults() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  hello:
+    image:
+      name: hello-world:latest
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.api.enabled);
+        assert_eq!(spec.api.bind, "0.0.0.0:8080");
+        assert!(spec.api.jwt_secret.is_none());
+        assert!(spec.api.swagger);
+    }
+
+    #[test]
+    fn test_spec_with_explicit_api_block() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  hello:
+    image:
+      name: hello-world:latest
+api:
+  enabled: false
+  bind: "127.0.0.1:9090"
+  jwt_secret: "my-secret"
+  swagger: false
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(!spec.api.enabled);
+        assert_eq!(spec.api.bind, "127.0.0.1:9090");
+        assert_eq!(spec.api.jwt_secret, Some("my-secret".to_string()));
+        assert!(!spec.api.swagger);
+    }
+
+    #[test]
+    fn test_spec_with_partial_api_block() {
+        let yaml = r#"
+version: v1
+deployment: test
+services:
+  hello:
+    image:
+      name: hello-world:latest
+api:
+  bind: "0.0.0.0:3000"
+"#;
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
+        assert!(spec.api.enabled); // default true
+        assert_eq!(spec.api.bind, "0.0.0.0:3000");
+        assert!(spec.api.jwt_secret.is_none()); // default None
+        assert!(spec.api.swagger); // default true
     }
 }

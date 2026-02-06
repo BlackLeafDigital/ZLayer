@@ -229,6 +229,26 @@ impl DnsServer {
         Ok(handle)
     }
 
+    /// Start the DNS server in a background task without consuming self.
+    ///
+    /// Unlike `start(self)`, this method borrows self, allowing the DnsServer
+    /// to be wrapped in an Arc and shared (e.g., with ServiceManager) while
+    /// the server runs in the background.
+    pub async fn start_background(&self) -> Result<DnsHandle, DnsError> {
+        let handle = self.handle();
+        let listen_addr = self.listen_addr;
+        let zone_origin = self.zone_origin.clone();
+        let authority = Arc::clone(&self.authority);
+
+        tokio::spawn(async move {
+            if let Err(e) = Self::run_server(listen_addr, zone_origin, authority).await {
+                tracing::error!("DNS server error: {}", e);
+            }
+        });
+
+        Ok(handle)
+    }
+
     /// Internal method to run the DNS server
     async fn run_server(
         listen_addr: SocketAddr,
