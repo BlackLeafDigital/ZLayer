@@ -4,7 +4,9 @@
 //! suitable for terminals, CI pipelines, and log files. It follows the same
 //! pattern as the build `PlainLogger` in `zlayer-builder`.
 
-use super::{DeployEvent, LogLevel};
+use super::DeployEvent;
+use zlayer_tui::palette::ansi;
+use zlayer_tui::widgets::scrollable_pane::LogLevel;
 
 /// Plain-text deployment logger for non-interactive output
 ///
@@ -37,7 +39,7 @@ impl PlainDeployLogger {
     /// Create a new plain deploy logger with auto-detected color support
     pub fn new() -> Self {
         Self {
-            color: Self::detect_color_support(),
+            color: zlayer_tui::logger::detect_color_support(),
         }
     }
 
@@ -46,45 +48,10 @@ impl PlainDeployLogger {
         Self { color }
     }
 
-    /// Detect if the terminal supports color output
-    fn detect_color_support() -> bool {
-        if std::env::var("NO_COLOR").is_ok() {
-            return false;
-        }
-
-        if std::env::var("FORCE_COLOR").is_ok() {
-            return true;
-        }
-
-        // Most CI systems support ANSI colors
-        if std::env::var("CI").is_ok() {
-            return true;
-        }
-
-        if let Ok(term) = std::env::var("TERM") {
-            return term != "dumb";
-        }
-
-        false
-    }
-
     /// Apply ANSI color codes if color is enabled
     fn colorize(&self, text: &str, color: &str) -> String {
-        if self.color {
-            format!("{}{}{}", color, text, Self::RESET)
-        } else {
-            text.to_string()
-        }
+        zlayer_tui::logger::colorize(text, color, self.color)
     }
-
-    // ANSI color codes
-    const GREEN: &'static str = "\x1b[32m";
-    const YELLOW: &'static str = "\x1b[33m";
-    const RED: &'static str = "\x1b[31m";
-    const CYAN: &'static str = "\x1b[36m";
-    const DIM: &'static str = "\x1b[2m";
-    const BOLD: &'static str = "\x1b[1m";
-    const RESET: &'static str = "\x1b[0m";
 
     /// Handle a deploy event and print appropriate output
     pub fn handle_event(&self, event: &DeployEvent) {
@@ -95,14 +62,14 @@ impl PlainDeployLogger {
                 services,
             } => {
                 let header = "=== Deployment Plan ===".to_string();
-                println!("\n{}", self.colorize(&header, Self::BOLD));
-                println!("Deployment: {}", self.colorize(deployment_name, Self::CYAN));
+                println!("\n{}", self.colorize(&header, ansi::BOLD));
+                println!("Deployment: {}", self.colorize(deployment_name, ansi::CYAN));
                 println!("Version: {}", version);
                 println!("Services: {}", services.len());
                 println!();
 
                 for svc in services {
-                    println!("  Service: {}", self.colorize(&svc.name, Self::BOLD));
+                    println!("  Service: {}", self.colorize(&svc.name, ansi::BOLD));
                     println!("    Image: {}", svc.image);
                     println!("    Scale: {}", svc.scale_mode);
                     if !svc.endpoints.is_empty() {
@@ -117,7 +84,7 @@ impl PlainDeployLogger {
 
             DeployEvent::InfraPhaseStarted { phase } => {
                 let line = format!("-> Starting {}...", phase);
-                println!("{}", self.colorize(&line, Self::DIM));
+                println!("{}", self.colorize(&line, ansi::DIM));
             }
 
             DeployEvent::InfraPhaseComplete {
@@ -126,20 +93,20 @@ impl PlainDeployLogger {
                 message,
             } => {
                 if *success {
-                    let check = self.colorize("v", Self::GREEN);
+                    let check = self.colorize("v", ansi::GREEN);
                     let msg = message
                         .as_deref()
                         .map(|m| format!(" ({})", m))
                         .unwrap_or_default();
                     println!("  {} {}{}", check, phase, msg);
                 } else {
-                    let x_mark = self.colorize("x", Self::RED);
+                    let x_mark = self.colorize("x", ansi::RED);
                     let msg = message
                         .as_deref()
                         .map(|m| format!(": {}", m))
                         .unwrap_or_default();
                     let line = format!("  {} {} failed{}", x_mark, phase, msg);
-                    println!("{}", self.colorize(&line, Self::YELLOW));
+                    println!("{}", self.colorize(&line, ansi::YELLOW));
                 }
             }
 
@@ -152,11 +119,11 @@ impl PlainDeployLogger {
                 let line = format!("-> Deploying service: {}", name);
                 // Suppress the header here; it's implied by the PlanReady event.
                 let _ = header;
-                println!("{}", self.colorize(&line, Self::CYAN));
+                println!("{}", self.colorize(&line, ansi::CYAN));
             }
 
             DeployEvent::ServiceRegistered { name } => {
-                let check = self.colorize("v", Self::GREEN);
+                let check = self.colorize("v", ansi::GREEN);
                 println!("  {} {} registered", check, name);
             }
 
@@ -166,7 +133,7 @@ impl PlainDeployLogger {
             } => {
                 println!(
                     "  {} Scaling {} to {} replica(s)...",
-                    self.colorize("->", Self::DIM),
+                    self.colorize("->", ansi::DIM),
                     name,
                     target_replicas
                 );
@@ -181,7 +148,7 @@ impl PlainDeployLogger {
                 if current != target {
                     println!(
                         "  {} {} {}/{} replicas",
-                        self.colorize("..", Self::DIM),
+                        self.colorize("..", ansi::DIM),
                         name,
                         current,
                         target
@@ -190,20 +157,20 @@ impl PlainDeployLogger {
             }
 
             DeployEvent::ServiceDeployComplete { name, replicas } => {
-                let check = self.colorize("v", Self::GREEN);
+                let check = self.colorize("v", ansi::GREEN);
                 println!("  {} {} running ({} replicas)", check, name, replicas);
             }
 
             DeployEvent::ServiceDeployFailed { name, error } => {
-                let x_mark = self.colorize("x", Self::RED);
+                let x_mark = self.colorize("x", ansi::RED);
                 let line = format!("  {} {} FAILED: {}", x_mark, name, error);
-                eprintln!("{}", self.colorize(&line, Self::RED));
+                eprintln!("{}", self.colorize(&line, ansi::RED));
             }
 
             DeployEvent::DeploymentRunning { services } => {
                 println!();
                 let header = "=== Deployment Summary ===".to_string();
-                println!("{}", self.colorize(&header, Self::BOLD));
+                println!("{}", self.colorize(&header, ansi::BOLD));
                 println!();
 
                 if services.is_empty() {
@@ -211,7 +178,7 @@ impl PlainDeployLogger {
                 } else {
                     println!("  Running services:");
                     for (name, replicas) in services {
-                        let check = self.colorize("v", Self::GREEN);
+                        let check = self.colorize("v", ansi::GREEN);
                         println!("    {} {} ({} replicas)", check, name, replicas);
                     }
                 }
@@ -219,7 +186,7 @@ impl PlainDeployLogger {
                 println!();
                 println!(
                     "{}",
-                    self.colorize("Services running. Press Ctrl+C to stop.", Self::DIM)
+                    self.colorize("Services running. Press Ctrl+C to stop.", ansi::DIM)
                 );
             }
 
@@ -229,20 +196,20 @@ impl PlainDeployLogger {
 
             DeployEvent::ShutdownStarted => {
                 println!();
-                println!("{}", self.colorize("Shutting down...", Self::YELLOW));
+                println!("{}", self.colorize("Shutting down...", ansi::YELLOW));
             }
 
             DeployEvent::ServiceStopping { name } => {
-                println!("  {} Stopping {}...", self.colorize("->", Self::DIM), name);
+                println!("  {} Stopping {}...", self.colorize("->", ansi::DIM), name);
             }
 
             DeployEvent::ServiceStopped { name } => {
-                let check = self.colorize("v", Self::GREEN);
+                let check = self.colorize("v", ansi::GREEN);
                 println!("  {} {} stopped", check, name);
             }
 
             DeployEvent::ShutdownComplete => {
-                println!("{}", self.colorize("Shutdown complete.", Self::GREEN));
+                println!("{}", self.colorize("Shutdown complete.", ansi::GREEN));
             }
 
             DeployEvent::Log { level, message } => match level {
@@ -250,11 +217,11 @@ impl PlainDeployLogger {
                     println!("{}", message);
                 }
                 LogLevel::Warn => {
-                    let prefix = self.colorize("WARNING:", Self::YELLOW);
+                    let prefix = self.colorize("WARNING:", ansi::YELLOW);
                     println!("{} {}", prefix, message);
                 }
                 LogLevel::Error => {
-                    let prefix = self.colorize("ERROR:", Self::RED);
+                    let prefix = self.colorize("ERROR:", ansi::RED);
                     eprintln!("{} {}", prefix, message);
                 }
             },
@@ -298,7 +265,7 @@ mod tests {
     #[test]
     fn test_colorize_enabled() {
         let logger = PlainDeployLogger::with_color(true);
-        let result = logger.colorize("test", PlainDeployLogger::GREEN);
+        let result = logger.colorize("test", ansi::GREEN);
         assert!(result.contains("\x1b[32m"));
         assert!(result.contains("\x1b[0m"));
         assert!(result.contains("test"));
@@ -307,7 +274,7 @@ mod tests {
     #[test]
     fn test_colorize_disabled() {
         let logger = PlainDeployLogger::with_color(false);
-        let result = logger.colorize("test", PlainDeployLogger::GREEN);
+        let result = logger.colorize("test", ansi::GREEN);
         assert_eq!(result, "test");
         assert!(!result.contains("\x1b["));
     }

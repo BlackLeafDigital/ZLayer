@@ -13,6 +13,7 @@ members = [
   "crates/zlayer-observability",
   "crates/zlayer-api",
   "crates/zlayer-builder",
+  "crates/zlayer-tui",
   "crates/zlayer-storage",
   "crates/zlayer-py",
   "crates/zlayer-web",

@@ -210,16 +210,8 @@ pub enum ServiceHealth {
     Unknown,
 }
 
-/// Log severity level for deploy events
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LogLevel {
-    /// Informational message
-    Info,
-    /// Warning (non-fatal issue)
-    Warn,
-    /// Error (operation failed)
-    Error,
-}
+/// Log severity level for deploy events (re-exported from zlayer-tui)
+pub use zlayer_tui::widgets::scrollable_pane::LogLevel;
 
 #[cfg(test)]
 mod tests {

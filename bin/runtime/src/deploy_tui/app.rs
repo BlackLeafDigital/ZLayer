@@ -23,16 +23,12 @@
 use std::io::{self, Stdout};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
 use ratatui::prelude::*;
 use ratatui::Terminal;
 use tokio::sync::Notify;
+use zlayer_tui::widgets::scrollable_pane::LogLevel;
 
 use super::deploy_view::DeployView;
 use super::state::{DeployPhase, DeployState};
@@ -83,21 +79,9 @@ impl DeployTui {
     /// - The user presses q/Esc during the Running phase
     /// - The event channel disconnects
     pub fn run(&mut self) -> io::Result<()> {
-        // Setup terminal
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-
-        // Main loop
+        let mut terminal = zlayer_tui::terminal::setup_terminal()?;
         let result = self.run_loop(&mut terminal);
-
-        // Restore terminal (always, even on error)
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        terminal.show_cursor()?;
-
+        zlayer_tui::terminal::restore_terminal(&mut terminal)?;
         result
     }
 
@@ -116,7 +100,7 @@ impl DeployTui {
             terminal.draw(|frame| self.render(frame))?;
 
             // Handle keyboard input with a short timeout (~20fps)
-            if event::poll(Duration::from_millis(50))? {
+            if event::poll(zlayer_tui::terminal::POLL_DURATION)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         self.handle_input(key.code, key.modifiers);
@@ -169,7 +153,7 @@ impl DeployTui {
                             // Unexpected disconnect during Initializing/Deploying/Stabilizing.
                             // Show error and let the user review logs before quitting.
                             self.state.apply_event(&DeployEvent::Log {
-                                level: super::LogLevel::Error,
+                                level: LogLevel::Error,
                                 message: "Deploy process ended unexpectedly".to_string(),
                             });
                             self.state.apply_event(&DeployEvent::ShutdownComplete);
@@ -203,7 +187,7 @@ impl DeployTui {
                 // Signal the deploy task to begin graceful shutdown
                 self.shutdown_signal.notify_one();
                 self.state.apply_event(&DeployEvent::Log {
-                    level: super::LogLevel::Warn,
+                    level: LogLevel::Warn,
                     message: "Shutdown requested via Ctrl+C...".to_string(),
                 });
             }
@@ -262,7 +246,7 @@ impl DeployTui {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deploy_tui::{InfraPhase, LogLevel, ServiceHealth, ServicePlan, ServiceStatus};
+    use crate::deploy_tui::{InfraPhase, ServiceHealth, ServicePlan, ServiceStatus};
     use std::sync::mpsc;
 
     fn create_tui() -> (mpsc::Sender<DeployEvent>, DeployTui) {

@@ -30,8 +30,11 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use zlayer_tui::palette::color;
+use zlayer_tui::widgets::scrollable_pane::ScrollablePane;
+
 use super::state::{DeployPhase, DeployState};
-use super::widgets::{InfraProgress, LogPane, ServiceTable};
+use super::widgets::{InfraProgress, ServiceTable};
 
 /// Main deploy progress view widget
 ///
@@ -159,7 +162,7 @@ impl DeployView<'_> {
         match self.state.phase {
             DeployPhase::Initializing => (
                 "INITIALIZING".to_string(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(color::INACTIVE),
             ),
             DeployPhase::Deploying => (
                 format!(
@@ -168,31 +171,31 @@ impl DeployView<'_> {
                     self.state.services.len()
                 ),
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(color::ACCENT)
                     .add_modifier(Modifier::BOLD),
             ),
             DeployPhase::Stabilizing => (
                 "STABILIZING".to_string(),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(color::WARNING)
                     .add_modifier(Modifier::BOLD),
             ),
             DeployPhase::Running => (
                 "RUNNING".to_string(),
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(color::SUCCESS)
                     .add_modifier(Modifier::BOLD),
             ),
             DeployPhase::ShuttingDown => (
                 "SHUTTING DOWN".to_string(),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(color::WARNING)
                     .add_modifier(Modifier::BOLD),
             ),
             DeployPhase::Complete => (
                 "COMPLETE".to_string(),
                 Style::default()
-                    .fg(Color::Green)
+                    .fg(color::SUCCESS)
                     .add_modifier(Modifier::BOLD),
             ),
         }
@@ -201,10 +204,12 @@ impl DeployView<'_> {
     /// Border style for the header based on deployment phase
     fn header_border_style(&self) -> Style {
         match self.state.phase {
-            DeployPhase::Initializing => Style::default().fg(Color::DarkGray),
-            DeployPhase::Deploying | DeployPhase::Stabilizing => Style::default().fg(Color::Blue),
-            DeployPhase::Running | DeployPhase::Complete => Style::default().fg(Color::Green),
-            DeployPhase::ShuttingDown => Style::default().fg(Color::Yellow),
+            DeployPhase::Initializing => Style::default().fg(color::INACTIVE),
+            DeployPhase::Deploying | DeployPhase::Stabilizing => {
+                Style::default().fg(color::ACTIVE_BORDER)
+            }
+            DeployPhase::Running | DeployPhase::Complete => Style::default().fg(color::SUCCESS),
+            DeployPhase::ShuttingDown => Style::default().fg(color::WARNING),
         }
     }
 
@@ -232,12 +237,11 @@ impl DeployView<'_> {
 
     // ---- Logs ----
 
-    /// Render the scrollable log section by delegating to [`LogPane`]
+    /// Render the scrollable log section by delegating to [`ScrollablePane`]
     fn render_logs(&self, area: Rect, buf: &mut Buffer) {
-        let widget = LogPane {
-            entries: &self.state.log_entries,
-            scroll_offset: self.state.log_scroll_offset,
-        };
+        let widget = ScrollablePane::new(&self.state.log_entries, self.state.log_scroll_offset)
+            .with_title("Logs")
+            .with_empty_text("No log output yet");
         widget.render(area, buf);
     }
 
@@ -252,7 +256,7 @@ impl DeployView<'_> {
         };
 
         Paragraph::new(help_text)
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(color::INACTIVE))
             .render(area, buf);
     }
 }

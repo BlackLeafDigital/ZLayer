@@ -118,7 +118,7 @@ fn render_result(area: Rect, frame: &mut Frame, result: &ValidateResult) {
 
                 lines.push(Line::from(vec![
                     Span::styled(
-                        format!("  {} ", "\u{2713}"),
+                        format!("  {} ", zlayer_tui::icons::COMPLETE),
                         Style::default().fg(Color::Green),
                     ),
                     Span::styled(

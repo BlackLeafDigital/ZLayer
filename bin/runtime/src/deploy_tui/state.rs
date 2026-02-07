@@ -5,7 +5,9 @@
 //! It follows the same state-tracking pattern as `BuildState` in
 //! `zlayer-builder::tui::app`.
 
-use super::{DeployEvent, InfraPhase, LogLevel, ServiceHealth, ServicePlan};
+use zlayer_tui::widgets::scrollable_pane::LogEntry;
+
+use super::{DeployEvent, InfraPhase, ServiceHealth, ServicePlan};
 
 /// Current phase of the overall deployment
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,15 +86,6 @@ pub enum ServiceDeployPhase {
     Stopping,
     /// Fully stopped
     Stopped,
-}
-
-/// A log entry for the TUI log pane
-#[derive(Debug, Clone)]
-pub struct LogEntry {
-    /// Severity level
-    pub level: LogLevel,
-    /// Log message text
-    pub message: String,
 }
 
 /// Full deployment state tracked by the TUI
@@ -353,7 +346,7 @@ impl Default for DeployState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deploy_tui::{ServicePlan, ServiceStatus};
+    use crate::deploy_tui::{LogLevel, ServicePlan, ServiceStatus};
 
     #[test]
     fn test_new_state_has_all_infra_phases() {

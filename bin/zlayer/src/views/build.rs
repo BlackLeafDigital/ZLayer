@@ -94,15 +94,15 @@ fn render_step_indicator(area: Rect, buf: &mut Buffer, current: BuildStep) {
             Style::default().fg(Color::DarkGray)
         };
 
-        let prefix = if i < current_idx {
-            "\u{2713} " // check mark
+        let icon = if i < current_idx {
+            zlayer_tui::icons::COMPLETE
         } else if i == current_idx {
-            "\u{25B6} " // arrow
+            zlayer_tui::icons::RUNNING
         } else {
-            "\u{25CB} " // circle
+            zlayer_tui::icons::PENDING
         };
 
-        let text = format!("{}{}", prefix, label);
+        let text = format!("{} {}", icon, label);
         let width = text.len() as u16;
 
         if x + width < area.x + area.width {

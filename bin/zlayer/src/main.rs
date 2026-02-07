@@ -5,18 +5,10 @@
 //! handled in-process via `zlayer-builder`.  All other subcommands are delegated
 //! to `zlayer-runtime`.
 
-use std::io;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::Parser;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
-use ratatui::prelude::*;
-use ratatui::Terminal;
 
 mod app;
 mod cli;
@@ -67,11 +59,7 @@ fn run_tui_entry(context: Option<PathBuf>) -> ExitCode {
     let _guard = init_file_logging();
 
     // Install a panic hook that restores the terminal before printing the panic
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = restore_terminal();
-        original_hook(panic_info);
-    }));
+    zlayer_tui::terminal::install_panic_hook();
 
     match run_tui(context) {
         Ok(()) => ExitCode::SUCCESS,
@@ -84,28 +72,26 @@ fn run_tui_entry(context: Option<PathBuf>) -> ExitCode {
 
 /// Set up and run the TUI application
 fn run_tui(context: Option<PathBuf>) -> anyhow::Result<()> {
-    // Setup terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
+    // Setup terminal using shared utilities
+    let mut terminal = zlayer_tui::terminal::setup_terminal()?;
+
+    // Enable mouse capture for the interactive TUI (not needed in builder/deploy)
+    crossterm::execute!(terminal.backend_mut(), crossterm::event::EnableMouseCapture)?;
 
     // Create and run the app
     let mut app = app::App::new(context);
     let result = app.run(&mut terminal);
 
+    // Disable mouse capture before restoring
+    let _ = crossterm::execute!(
+        terminal.backend_mut(),
+        crossterm::event::DisableMouseCapture
+    );
+
     // Always restore terminal, even if the app returned an error
-    restore_terminal()?;
+    zlayer_tui::terminal::restore_terminal(&mut terminal)?;
 
     result
-}
-
-/// Restore the terminal to its original state
-fn restore_terminal() -> anyhow::Result<()> {
-    disable_raw_mode()?;
-    execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture)?;
-    Ok(())
 }
 
 /// Initialize tracing that writes to a log file instead of stderr

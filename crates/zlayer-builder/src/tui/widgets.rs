@@ -1,88 +1,17 @@
 //! Custom TUI widgets for build progress display
 //!
 //! This module contains reusable widgets for displaying:
-//! - Build progress bars
-//! - Instruction lists with status indicators
-//! - Scrollable output logs
+//! - Build progress bars (delegated to `zlayer_tui::widgets::progress_bar`)
+//! - Instruction lists with status indicators (domain-specific, kept here)
+//! - Scrollable output logs (delegated to `zlayer_tui::widgets::scrollable_pane`)
 
 use ratatui::prelude::*;
-use ratatui::widgets::Paragraph;
 
-use super::app::{InstructionState, OutputLine};
+use zlayer_tui::icons;
+use zlayer_tui::palette::color;
+
+use super::app::InstructionState;
 use super::InstructionStatus;
-
-/// Progress bar widget for build progress
-pub struct BuildProgress {
-    /// Current progress value
-    pub current: usize,
-    /// Total value
-    pub total: usize,
-    /// Label to display
-    pub label: String,
-}
-
-impl Widget for BuildProgress {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 3 || area.height < 1 {
-            return;
-        }
-
-        let ratio = if self.total == 0 {
-            0.0
-        } else {
-            (self.current as f64 / self.total as f64).clamp(0.0, 1.0)
-        };
-
-        // Calculate bar width (leave room for label)
-        let label_width = self.label.len() as u16 + 2; // 2 for spacing
-        let bar_width = area.width.saturating_sub(label_width);
-
-        if bar_width < 5 {
-            // Not enough room for bar, just show label
-            Paragraph::new(self.label)
-                .style(Style::default().fg(Color::Cyan))
-                .render(area, buf);
-            return;
-        }
-
-        // Draw progress bar
-        let filled = (bar_width as f64 * ratio).round() as u16;
-        let empty = bar_width.saturating_sub(filled);
-
-        let bar_area = Rect {
-            x: area.x,
-            y: area.y,
-            width: bar_width,
-            height: 1,
-        };
-
-        // Build the bar string - take exactly bar_width characters
-        let bar_chars: String = std::iter::repeat_n('\u{2588}', filled as usize) // full block
-            .chain(std::iter::repeat_n('\u{2591}', empty as usize)) // light shade
-            .take(bar_width as usize)
-            .collect();
-
-        // Render bar - the string is already the right length in characters
-        buf.set_string(
-            bar_area.x,
-            bar_area.y,
-            &bar_chars,
-            Style::default().fg(Color::Cyan),
-        );
-
-        // Render label after bar
-        let label_area = Rect {
-            x: area.x + bar_width + 1,
-            y: area.y,
-            width: label_width.saturating_sub(1),
-            height: 1,
-        };
-
-        Paragraph::new(self.label)
-            .style(Style::default().fg(Color::White))
-            .render(label_area, buf);
-    }
-}
 
 /// List of instructions with status indicators
 pub struct InstructionList<'a> {
@@ -129,28 +58,22 @@ impl Widget for InstructionList<'_> {
 
             // Status indicator
             let (indicator, indicator_style) = match inst.status {
-                InstructionStatus::Pending => (
-                    '\u{25CB}', // ○
-                    Style::default().fg(Color::DarkGray),
-                ),
+                InstructionStatus::Pending => {
+                    (icons::PENDING, Style::default().fg(color::INACTIVE))
+                }
                 InstructionStatus::Running => (
-                    '\u{25B6}', // ▶
+                    icons::RUNNING,
                     Style::default()
-                        .fg(Color::Yellow)
+                        .fg(color::WARNING)
                         .add_modifier(Modifier::BOLD),
                 ),
-                InstructionStatus::Complete { cached: false } => (
-                    '\u{2713}', // ✓
-                    Style::default().fg(Color::Green),
-                ),
-                InstructionStatus::Complete { cached: true } => (
-                    '\u{2713}', // ✓
-                    Style::default().fg(Color::Green),
-                ),
-                InstructionStatus::Failed => (
-                    '\u{2717}', // ✗
-                    Style::default().fg(Color::Red),
-                ),
+                InstructionStatus::Complete { cached: false } => {
+                    (icons::COMPLETE, Style::default().fg(color::SUCCESS))
+                }
+                InstructionStatus::Complete { cached: true } => {
+                    (icons::COMPLETE, Style::default().fg(color::SUCCESS))
+                }
+                InstructionStatus::Failed => (icons::FAILED, Style::default().fg(color::ERROR)),
             };
 
             // Render indicator
@@ -158,12 +81,12 @@ impl Widget for InstructionList<'_> {
 
             // Instruction text style
             let text_style = match inst.status {
-                InstructionStatus::Pending => Style::default().fg(Color::DarkGray),
+                InstructionStatus::Pending => Style::default().fg(color::INACTIVE),
                 InstructionStatus::Running => Style::default()
-                    .fg(Color::Yellow)
+                    .fg(color::WARNING)
                     .add_modifier(Modifier::BOLD),
-                InstructionStatus::Complete { .. } => Style::default().fg(Color::White),
-                InstructionStatus::Failed => Style::default().fg(Color::Red),
+                InstructionStatus::Complete { .. } => Style::default().fg(color::TEXT),
+                InstructionStatus::Failed => Style::default().fg(color::ERROR),
             };
 
             // Truncate instruction text if needed
@@ -189,7 +112,9 @@ impl Widget for InstructionList<'_> {
                         cached_x,
                         y,
                         cached_str,
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                        Style::default()
+                            .fg(color::ACCENT)
+                            .add_modifier(Modifier::DIM),
                     );
                 }
             }
@@ -200,88 +125,7 @@ impl Widget for InstructionList<'_> {
             let indicator = format!("({}/{})", end.min(total), total);
             let x = area.x + area.width.saturating_sub(indicator.len() as u16);
             if x >= area.x {
-                buf.set_string(x, area.y, &indicator, Style::default().fg(Color::DarkGray));
-            }
-        }
-    }
-}
-
-/// Scrollable output log widget
-pub struct OutputLog<'a> {
-    /// Output lines to display
-    pub lines: &'a [OutputLine],
-    /// Current scroll offset
-    pub scroll: usize,
-}
-
-impl Widget for OutputLog<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 || self.lines.is_empty() {
-            // Show placeholder when no output
-            if area.height > 0 {
-                Paragraph::new("Waiting for output...")
-                    .style(
-                        Style::default()
-                            .fg(Color::DarkGray)
-                            .add_modifier(Modifier::ITALIC),
-                    )
-                    .render(area, buf);
-            }
-            return;
-        }
-
-        let visible_count = area.height as usize;
-        let total = self.lines.len();
-
-        // Calculate visible range
-        let start = self.scroll.min(total.saturating_sub(visible_count));
-        let end = (start + visible_count).min(total);
-
-        // Render each visible line
-        for (display_idx, idx) in (start..end).enumerate() {
-            if display_idx >= area.height as usize {
-                break;
-            }
-
-            let line = &self.lines[idx];
-            let y = area.y + display_idx as u16;
-
-            // Style based on stderr/stdout
-            let style = if line.is_stderr {
-                Style::default().fg(Color::Yellow)
-            } else {
-                Style::default().fg(Color::White)
-            };
-
-            // Truncate line if needed
-            let available_width = area.width as usize;
-            let text = if line.text.len() > available_width {
-                format!("{}...", &line.text[..available_width.saturating_sub(3)])
-            } else {
-                line.text.clone()
-            };
-
-            buf.set_string(area.x, y, &text, style);
-        }
-
-        // Show scroll position indicator if scrollable
-        if total > visible_count {
-            let percent = if total == 0 {
-                100
-            } else {
-                ((end as f64 / total as f64) * 100.0) as usize
-            };
-            let indicator = format!(" {}% ", percent);
-            let x = area.x + area.width.saturating_sub(indicator.len() as u16 + 1);
-            let y = area.y + area.height.saturating_sub(1);
-
-            if x >= area.x && y >= area.y {
-                buf.set_string(
-                    x,
-                    y,
-                    &indicator,
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
-                );
+                buf.set_string(x, area.y, &indicator, Style::default().fg(color::INACTIVE));
             }
         }
     }
@@ -290,22 +134,19 @@ impl Widget for OutputLog<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlayer_tui::widgets::progress_bar::ProgressBar;
+    use zlayer_tui::widgets::scrollable_pane::{OutputLine, ScrollablePane};
 
     fn create_buffer(width: u16, height: u16) -> Buffer {
         Buffer::empty(Rect::new(0, 0, width, height))
     }
 
     #[test]
-    fn test_build_progress_full() {
+    fn test_progress_bar_full() {
         let mut buf = create_buffer(40, 1);
         let area = Rect::new(0, 0, 40, 1);
 
-        let progress = BuildProgress {
-            current: 5,
-            total: 10,
-            label: "5/10".to_string(),
-        };
-
+        let progress = ProgressBar::new(5, 10).with_label("5/10");
         progress.render(area, &mut buf);
 
         // Check that something was rendered
@@ -314,16 +155,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_progress_zero() {
+    fn test_progress_bar_zero() {
         let mut buf = create_buffer(40, 1);
         let area = Rect::new(0, 0, 40, 1);
 
-        let progress = BuildProgress {
-            current: 0,
-            total: 0,
-            label: "0/0".to_string(),
-        };
-
+        let progress = ProgressBar::new(0, 0).with_label("0/0");
         progress.render(area, &mut buf);
 
         // Should not panic with zero total
@@ -402,12 +238,9 @@ mod tests {
         let mut buf = create_buffer(40, 5);
         let area = Rect::new(0, 0, 40, 5);
 
-        let log = OutputLog {
-            lines: &[],
-            scroll: 0,
-        };
-
-        log.render(area, &mut buf);
+        let lines: Vec<OutputLine> = vec![];
+        let pane = ScrollablePane::new(&lines, 0).with_empty_text("Waiting for output...");
+        pane.render(area, &mut buf);
 
         let content = buf.content().iter().map(|c| c.symbol()).collect::<String>();
         assert!(content.contains("Waiting"));
@@ -429,12 +262,8 @@ mod tests {
             },
         ];
 
-        let log = OutputLog {
-            lines: &lines,
-            scroll: 0,
-        };
-
-        log.render(area, &mut buf);
+        let pane = ScrollablePane::new(&lines, 0);
+        pane.render(area, &mut buf);
 
         let content = buf.content().iter().map(|c| c.symbol()).collect::<String>();
         assert!(content.contains("stdout") || content.contains("stderr"));
@@ -442,8 +271,8 @@ mod tests {
 
     #[test]
     fn test_output_log_scroll() {
-        let mut buf = create_buffer(40, 2);
-        let area = Rect::new(0, 0, 40, 2);
+        let mut buf = create_buffer(40, 5);
+        let area = Rect::new(0, 0, 40, 5);
 
         let lines: Vec<OutputLine> = (0..10)
             .map(|i| OutputLine {
@@ -453,12 +282,8 @@ mod tests {
             .collect();
 
         // Scroll to middle
-        let log = OutputLog {
-            lines: &lines,
-            scroll: 5,
-        };
-
-        log.render(area, &mut buf);
+        let pane = ScrollablePane::new(&lines, 5);
+        pane.render(area, &mut buf);
 
         // Check that we're showing lines from the scrolled position
         let content = buf.content().iter().map(|c| c.symbol()).collect::<String>();

@@ -15,6 +15,7 @@ path = "src/main.rs"
 # Internal crates - builder subsystem only
 zlayer-builder = { path = "../../crates/zlayer-builder" }
 zlayer-spec = { path = "../../crates/zlayer-spec" }
+zlayer-tui = { path = "../../crates/zlayer-tui" }
 
 # TUI - same versions as zlayer-builder
 ratatui = "0.29"

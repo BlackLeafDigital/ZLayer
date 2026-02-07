@@ -10,11 +10,12 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
-use super::state::{LogEntry, PhaseStatus, ServiceDeployPhase, ServiceState};
-use super::{InfraPhase, LogLevel, ServiceHealth};
+use zlayer_tui::icons::{self, SPINNER_FRAMES};
+use zlayer_tui::palette::color;
+use zlayer_tui::widgets::progress_bar::ProgressBar;
 
-/// Spinner frames for in-progress indicators
-const SPINNER_FRAMES: &[char] = &['|', '/', '-', '\\'];
+use super::state::{PhaseStatus, ServiceDeployPhase, ServiceState};
+use super::{InfraPhase, ServiceHealth};
 
 // ───────────────────────────────────────────────────────────────────
 // InfraProgress widget
@@ -48,9 +49,9 @@ impl Widget for InfraProgress<'_> {
             .title(title)
             .borders(Borders::ALL)
             .border_style(if done_count == total {
-                Style::default().fg(Color::Green)
+                Style::default().fg(color::SUCCESS)
             } else {
-                Style::default().fg(Color::Blue)
+                Style::default().fg(color::ACTIVE_BORDER)
             });
 
         let inner = block.inner(area);
@@ -75,44 +76,37 @@ impl Widget for InfraProgress<'_> {
 
             let x = inner.x + (col * col_width) as u16;
 
-            // Status indicator
+            // Status indicator: convert icon chars to owned Strings for
+            // branches that use shared constants, or use &'static str directly.
             let (indicator, ind_style) = match status {
                 PhaseStatus::Complete => (
-                    "\u{2713}", // checkmark
-                    Style::default().fg(Color::Green),
+                    String::from(icons::COMPLETE),
+                    Style::default().fg(color::SUCCESS),
                 ),
                 PhaseStatus::Failed(_) => (
-                    "\u{2717}", // x mark
-                    Style::default().fg(Color::Red),
+                    String::from(icons::FAILED),
+                    Style::default().fg(color::ERROR),
                 ),
                 PhaseStatus::InProgress => {
                     let frame_idx = self.tick % SPINNER_FRAMES.len();
-                    let ch = SPINNER_FRAMES[frame_idx];
-                    let s = match ch {
-                        '|' => "|",
-                        '/' => "/",
-                        '-' => "-",
-                        '\\' => "\\",
-                        _ => ">",
-                    };
                     (
-                        s,
+                        String::from(SPINNER_FRAMES[frame_idx]),
                         Style::default()
-                            .fg(Color::Yellow)
+                            .fg(color::WARNING)
                             .add_modifier(Modifier::BOLD),
                     )
                 }
-                PhaseStatus::Pending => ("..", Style::default().fg(Color::DarkGray)),
+                PhaseStatus::Pending => ("..".to_string(), Style::default().fg(color::INACTIVE)),
                 PhaseStatus::Skipped(_) => (
-                    "~",
+                    "~".to_string(),
                     Style::default()
-                        .fg(Color::DarkGray)
+                        .fg(color::INACTIVE)
                         .add_modifier(Modifier::DIM),
                 ),
             };
 
             // Render indicator
-            buf.set_string(x, y, indicator, ind_style);
+            buf.set_string(x, y, &indicator, ind_style);
 
             // Phase name — truncate to fit column
             let name = phase.to_string();
@@ -125,12 +119,12 @@ impl Widget for InfraProgress<'_> {
             };
 
             let name_style = match status {
-                PhaseStatus::Pending => Style::default().fg(Color::DarkGray),
-                PhaseStatus::InProgress => Style::default().fg(Color::Yellow),
-                PhaseStatus::Complete => Style::default().fg(Color::White),
-                PhaseStatus::Failed(_) => Style::default().fg(Color::Red),
+                PhaseStatus::Pending => Style::default().fg(color::INACTIVE),
+                PhaseStatus::InProgress => Style::default().fg(color::WARNING),
+                PhaseStatus::Complete => Style::default().fg(color::TEXT),
+                PhaseStatus::Failed(_) => Style::default().fg(color::ERROR),
                 PhaseStatus::Skipped(_) => Style::default()
-                    .fg(Color::DarkGray)
+                    .fg(color::INACTIVE)
                     .add_modifier(Modifier::DIM),
             };
 
@@ -172,9 +166,9 @@ impl Widget for ServiceTable<'_> {
             .title(title)
             .borders(Borders::ALL)
             .border_style(if self.deployed_count == total && total > 0 {
-                Style::default().fg(Color::Green)
+                Style::default().fg(color::SUCCESS)
             } else {
-                Style::default().fg(Color::Blue)
+                Style::default().fg(color::ACTIVE_BORDER)
             });
 
         let inner = block.inner(area);
@@ -183,7 +177,7 @@ impl Widget for ServiceTable<'_> {
         if inner.height == 0 || self.services.is_empty() {
             if inner.height > 0 {
                 Paragraph::new("No services")
-                    .style(Style::default().fg(Color::DarkGray))
+                    .style(Style::default().fg(color::INACTIVE))
                     .render(inner, buf);
             }
             return;
@@ -207,7 +201,9 @@ impl Widget for ServiceTable<'_> {
             // Progress bar for services that are actively scaling
             let progress_str =
                 if svc.phase == ServiceDeployPhase::Scaling && svc.target_replicas > 0 {
-                    render_progress_bar(svc.current_replicas, svc.target_replicas, 10)
+                    ProgressBar::new(svc.current_replicas as usize, svc.target_replicas as usize)
+                        .with_percentage()
+                        .to_string_compact(10)
                 } else {
                     String::new()
                 };
@@ -215,9 +211,9 @@ impl Widget for ServiceTable<'_> {
             let row = Row::new(vec![
                 Cell::from(indicator).style(ind_style),
                 Cell::from(svc.name.clone()).style(service_name_style(&svc.phase)),
-                Cell::from(replicas).style(Style::default().fg(Color::White)),
+                Cell::from(replicas).style(Style::default().fg(color::TEXT)),
                 Cell::from(health_text).style(health_style),
-                Cell::from(progress_str).style(Style::default().fg(Color::Cyan)),
+                Cell::from(progress_str).style(Style::default().fg(color::ACCENT)),
             ]);
             rows.push(row);
         }
@@ -228,31 +224,33 @@ impl Widget for ServiceTable<'_> {
 }
 
 /// Get the status indicator for a service's deploy phase
-fn service_indicator(phase: &ServiceDeployPhase) -> (&'static str, Style) {
+///
+/// Returns a `String` (since shared icon chars must be converted) and a `Style`.
+fn service_indicator(phase: &ServiceDeployPhase) -> (String, Style) {
     match phase {
-        ServiceDeployPhase::Pending => ("..", Style::default().fg(Color::DarkGray)),
-        ServiceDeployPhase::Registering => ("~", Style::default().fg(Color::Yellow)),
+        ServiceDeployPhase::Pending => ("..".to_string(), Style::default().fg(color::INACTIVE)),
+        ServiceDeployPhase::Registering => ("~".to_string(), Style::default().fg(color::WARNING)),
         ServiceDeployPhase::Scaling => (
-            "\u{25B6}", // ▶
+            String::from(icons::RUNNING),
             Style::default()
-                .fg(Color::Yellow)
+                .fg(color::WARNING)
                 .add_modifier(Modifier::BOLD),
         ),
         ServiceDeployPhase::Running => (
-            "\u{2713}", // ✓
-            Style::default().fg(Color::Green),
+            String::from(icons::COMPLETE),
+            Style::default().fg(color::SUCCESS),
         ),
         ServiceDeployPhase::Failed(_) => (
-            "\u{2717}", // ✗
-            Style::default().fg(Color::Red),
+            String::from(icons::FAILED),
+            Style::default().fg(color::ERROR),
         ),
         ServiceDeployPhase::Stopping => (
-            "\u{25BC}", // ▼
-            Style::default().fg(Color::Yellow),
+            String::from(icons::STOPPING),
+            Style::default().fg(color::WARNING),
         ),
         ServiceDeployPhase::Stopped => (
-            "\u{25A0}", // ■
-            Style::default().fg(Color::DarkGray),
+            String::from(icons::STOPPED),
+            Style::default().fg(color::INACTIVE),
         ),
     }
 }
@@ -260,155 +258,26 @@ fn service_indicator(phase: &ServiceDeployPhase) -> (&'static str, Style) {
 /// Style for service name based on deploy phase
 fn service_name_style(phase: &ServiceDeployPhase) -> Style {
     match phase {
-        ServiceDeployPhase::Pending => Style::default().fg(Color::DarkGray),
-        ServiceDeployPhase::Failed(_) => Style::default().fg(Color::Red),
-        ServiceDeployPhase::Stopped => Style::default().fg(Color::DarkGray),
-        _ => Style::default().fg(Color::White),
+        ServiceDeployPhase::Pending => Style::default().fg(color::INACTIVE),
+        ServiceDeployPhase::Failed(_) => Style::default().fg(color::ERROR),
+        ServiceDeployPhase::Stopped => Style::default().fg(color::INACTIVE),
+        _ => Style::default().fg(color::TEXT),
     }
 }
 
 /// Render a health status label with appropriate color
 fn health_display(health: &ServiceHealth) -> (String, Style) {
     match health {
-        ServiceHealth::Healthy => ("[healthy]".to_string(), Style::default().fg(Color::Green)),
-        ServiceHealth::Degraded => ("[degraded]".to_string(), Style::default().fg(Color::Yellow)),
-        ServiceHealth::Unhealthy => ("[unhealthy]".to_string(), Style::default().fg(Color::Red)),
+        ServiceHealth::Healthy => ("[healthy]".to_string(), Style::default().fg(color::SUCCESS)),
+        ServiceHealth::Degraded => (
+            "[degraded]".to_string(),
+            Style::default().fg(color::WARNING),
+        ),
+        ServiceHealth::Unhealthy => ("[unhealthy]".to_string(), Style::default().fg(color::ERROR)),
         ServiceHealth::Unknown => (
             "[unknown]".to_string(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(color::INACTIVE),
         ),
-    }
-}
-
-/// Render a unicode block progress bar
-///
-/// Uses full block (\u{2588}) for filled and light shade (\u{2591}) for empty,
-/// followed by a percentage label.
-fn render_progress_bar(current: u32, target: u32, width: usize) -> String {
-    if target == 0 {
-        return String::new();
-    }
-
-    let ratio = (current as f64 / target as f64).clamp(0.0, 1.0);
-    let filled = (width as f64 * ratio).round() as usize;
-    let empty = width.saturating_sub(filled);
-    let percent = (ratio * 100.0) as u32;
-
-    let bar: String = std::iter::repeat_n('\u{2588}', filled)
-        .chain(std::iter::repeat_n('\u{2591}', empty))
-        .collect();
-
-    format!("{} {}%", bar, percent)
-}
-
-// ───────────────────────────────────────────────────────────────────
-// LogPane widget
-// ───────────────────────────────────────────────────────────────────
-
-/// Scrollable log output pane with color-coded severity
-///
-/// ```text
-/// Logs
-///  [WARN] Failed to setup overlay for api (non-fatal)
-///  [INFO] Service postgres scaled to 3 replicas
-///  [ERROR] Container restart limit exceeded for worker
-/// ```
-pub struct LogPane<'a> {
-    /// Log entries to display
-    pub entries: &'a [LogEntry],
-    /// Current scroll offset (line index of the bottom of the visible area)
-    pub scroll_offset: usize,
-}
-
-impl Widget for LogPane<'_> {
-    fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.height == 0 {
-            return;
-        }
-
-        let block = Block::default()
-            .title(" Logs ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
-
-        let inner = block.inner(area);
-        block.render(area, buf);
-
-        if inner.height == 0 {
-            return;
-        }
-
-        if self.entries.is_empty() {
-            Paragraph::new("No log output yet")
-                .style(
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::ITALIC),
-                )
-                .render(inner, buf);
-            return;
-        }
-
-        let visible_count = inner.height as usize;
-        let total = self.entries.len();
-
-        // scroll_offset is the "end" position — we show lines ending at scroll_offset.
-        // Clamp so we never go past the end.
-        let end = self.scroll_offset.min(total);
-        let start = end.saturating_sub(visible_count);
-
-        // Render each visible line
-        for (display_idx, idx) in (start..end).enumerate() {
-            if display_idx >= visible_count {
-                break;
-            }
-
-            let entry = &self.entries[idx];
-            let y = inner.y + display_idx as u16;
-
-            // Level prefix and style
-            let (prefix, style) = match entry.level {
-                LogLevel::Info => ("[INFO] ", Style::default().fg(Color::DarkGray)),
-                LogLevel::Warn => ("[WARN] ", Style::default().fg(Color::Yellow)),
-                LogLevel::Error => ("[ERROR] ", Style::default().fg(Color::Red)),
-            };
-
-            // Render prefix
-            let prefix_width = prefix.len() as u16;
-            buf.set_string(inner.x, y, prefix, style.add_modifier(Modifier::BOLD));
-
-            // Render message - truncate if needed
-            let msg_x = inner.x + prefix_width;
-            let available = inner.width.saturating_sub(prefix_width) as usize;
-            let msg = if entry.message.len() > available {
-                format!("{}...", &entry.message[..available.saturating_sub(3)])
-            } else {
-                entry.message.clone()
-            };
-
-            buf.set_string(msg_x, y, &msg, style);
-        }
-
-        // Scroll position indicator
-        if total > visible_count {
-            let percent = if total == 0 {
-                100
-            } else {
-                ((end as f64 / total as f64) * 100.0) as usize
-            };
-            let indicator = format!(" {}% ", percent);
-            let x = inner.x + inner.width.saturating_sub(indicator.len() as u16 + 1);
-            let y = inner.y + inner.height.saturating_sub(1);
-
-            if x >= inner.x && y >= inner.y {
-                buf.set_string(
-                    x,
-                    y,
-                    &indicator,
-                    Style::default().fg(Color::Black).bg(Color::DarkGray),
-                );
-            }
-        }
     }
 }
 
@@ -432,6 +301,9 @@ impl Widget for LogPane<'_> {
 /// ```
 #[cfg(test)]
 use super::state::DeployState;
+
+#[cfg(test)]
+use zlayer_tui::widgets::scrollable_pane::ScrollablePane;
 
 #[cfg(test)]
 pub fn render_deploy_view(state: &DeployState, tick: usize, area: Rect, buf: &mut Buffer) {
@@ -463,11 +335,10 @@ pub fn render_deploy_view(state: &DeployState, tick: usize, area: Rect, buf: &mu
     };
     svc_table.render(chunks[1], buf);
 
-    // Log pane
-    let log_pane = LogPane {
-        entries: &state.log_entries,
-        scroll_offset: state.log_scroll_offset,
-    };
+    // Log pane (using shared ScrollablePane)
+    let log_pane = ScrollablePane::new(&state.log_entries, state.log_scroll_offset)
+        .with_title("Logs")
+        .with_empty_text("No log output yet");
     log_pane.render(chunks[2], buf);
 
     // Footer
@@ -476,7 +347,7 @@ pub fn render_deploy_view(state: &DeployState, tick: usize, area: Rect, buf: &mu
         _ => "q: quit | arrows/jk: scroll | PgUp/PgDn: page",
     };
     Paragraph::new(footer_text)
-        .style(Style::default().fg(Color::DarkGray))
+        .style(Style::default().fg(color::INACTIVE))
         .alignment(Alignment::Center)
         .render(chunks[3], buf);
 }
@@ -486,6 +357,7 @@ mod tests {
     use super::*;
     use crate::deploy_tui::state::{DeployState, ServiceDeployPhase, ServiceState};
     use crate::deploy_tui::{InfraPhase, ServiceHealth};
+    use zlayer_tui::widgets::scrollable_pane::{LogEntry, LogLevel};
 
     fn create_buffer(width: u16, height: u16) -> Buffer {
         Buffer::empty(Rect::new(0, 0, width, height))
@@ -609,14 +481,14 @@ mod tests {
     }
 
     #[test]
-    fn test_log_pane_empty() {
+    fn test_scrollable_log_pane_empty() {
         let mut buf = create_buffer(60, 6);
         let area = Rect::new(0, 0, 60, 6);
 
-        let widget = LogPane {
-            entries: &[],
-            scroll_offset: 0,
-        };
+        let entries: Vec<LogEntry> = vec![];
+        let widget = ScrollablePane::new(&entries, 0)
+            .with_title("Logs")
+            .with_empty_text("No log output yet");
         widget.render(area, &mut buf);
 
         let content: String = buf.content().iter().map(|c| c.symbol()).collect();
@@ -624,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn test_log_pane_with_entries() {
+    fn test_scrollable_log_pane_with_entries() {
         let mut buf = create_buffer(60, 8);
         let area = Rect::new(0, 0, 60, 8);
 
@@ -643,10 +515,7 @@ mod tests {
             },
         ];
 
-        let widget = LogPane {
-            entries: &entries,
-            scroll_offset: 3,
-        };
+        let widget = ScrollablePane::new(&entries, 0).with_title("Logs");
         widget.render(area, &mut buf);
 
         let content: String = buf.content().iter().map(|c| c.symbol()).collect();
@@ -659,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn test_log_pane_scrolled() {
+    fn test_scrollable_log_pane_scrolled() {
         let mut buf = create_buffer(60, 5);
         let area = Rect::new(0, 0, 60, 5);
 
@@ -671,10 +540,7 @@ mod tests {
             .collect();
 
         // Scroll to middle
-        let widget = LogPane {
-            entries: &entries,
-            scroll_offset: 10,
-        };
+        let widget = ScrollablePane::new(&entries, 10).with_title("Logs");
         widget.render(area, &mut buf);
 
         let content: String = buf.content().iter().map(|c| c.symbol()).collect();
@@ -683,20 +549,28 @@ mod tests {
     }
 
     #[test]
-    fn test_render_progress_bar() {
-        let bar = render_progress_bar(1, 3, 10);
+    fn test_progress_bar_compact() {
+        let bar = ProgressBar::new(1, 3)
+            .with_percentage()
+            .to_string_compact(10);
         assert!(bar.contains("33%"));
         assert!(bar.contains('\u{2588}')); // filled
         assert!(bar.contains('\u{2591}')); // empty
 
-        let full = render_progress_bar(3, 3, 10);
+        let full = ProgressBar::new(3, 3)
+            .with_percentage()
+            .to_string_compact(10);
         assert!(full.contains("100%"));
 
-        let empty = render_progress_bar(0, 3, 10);
+        let empty = ProgressBar::new(0, 3)
+            .with_percentage()
+            .to_string_compact(10);
         assert!(empty.contains("0%"));
 
-        let zero_target = render_progress_bar(0, 0, 10);
-        assert!(zero_target.is_empty());
+        let zero_target = ProgressBar::new(0, 0)
+            .with_percentage()
+            .to_string_compact(10);
+        assert!(zero_target.contains("0%"));
     }
 
     #[test]

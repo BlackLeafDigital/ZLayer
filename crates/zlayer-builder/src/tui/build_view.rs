@@ -6,8 +6,12 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use zlayer_tui::palette::color;
+use zlayer_tui::widgets::progress_bar::ProgressBar;
+use zlayer_tui::widgets::scrollable_pane::ScrollablePane;
+
 use super::app::BuildState;
-use super::widgets::{BuildProgress, InstructionList, OutputLog};
+use super::widgets::InstructionList;
 
 /// Main build progress view widget
 pub struct BuildView<'a> {
@@ -80,11 +84,11 @@ impl BuildView<'_> {
         // Stage info
         let stage_info = self.state.current_stage_display();
         let stage_style = if self.state.error.is_some() {
-            Style::default().fg(Color::Red)
+            Style::default().fg(color::ERROR)
         } else if self.state.completed {
-            Style::default().fg(Color::Green)
+            Style::default().fg(color::SUCCESS)
         } else {
-            Style::default().fg(Color::Cyan)
+            Style::default().fg(color::ACCENT)
         };
 
         Paragraph::new(stage_info)
@@ -95,22 +99,19 @@ impl BuildView<'_> {
         let total = self.state.total_instructions().max(1);
         let completed = self.state.completed_instructions();
 
-        let progress = BuildProgress {
-            current: completed,
-            total,
-            label: format!("{}/{} instructions", completed, total),
-        };
+        let progress = ProgressBar::new(completed, total)
+            .with_label(format!("{}/{} instructions", completed, total));
         progress.render(chunks[1], buf);
     }
 
     /// Get the border style for the header based on build status
     fn header_border_style(&self) -> Style {
         if self.state.error.is_some() {
-            Style::default().fg(Color::Red)
+            Style::default().fg(color::ERROR)
         } else if self.state.completed {
-            Style::default().fg(Color::Green)
+            Style::default().fg(color::SUCCESS)
         } else {
-            Style::default().fg(Color::Blue)
+            Style::default().fg(color::ACTIVE_BORDER)
         }
     }
 
@@ -129,7 +130,7 @@ impl BuildView<'_> {
         let block = Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(Style::default().fg(color::INACTIVE));
 
         let inner = block.inner(area);
         block.render(area, buf);
@@ -142,39 +143,46 @@ impl BuildView<'_> {
             list.render(inner, buf);
         } else {
             Paragraph::new("Waiting for build to start...")
-                .style(Style::default().fg(Color::DarkGray))
+                .style(Style::default().fg(color::INACTIVE))
                 .render(inner, buf);
         }
     }
 
     /// Render the output log
     fn render_output(&self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .title(" Output ")
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray));
-
-        let inner = block.inner(area);
-        block.render(area, buf);
-
         // Show completion message or error if build is done
         if let Some(ref error) = self.state.error {
+            let block = Block::default()
+                .title(" Output ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color::INACTIVE));
+
+            let inner = block.inner(area);
+            block.render(area, buf);
+
             let error_text = format!("Build failed: {}", error);
             Paragraph::new(error_text)
-                .style(Style::default().fg(Color::Red))
+                .style(Style::default().fg(color::ERROR))
                 .wrap(Wrap { trim: false })
                 .render(inner, buf);
         } else if let Some(ref image_id) = self.state.image_id {
+            let block = Block::default()
+                .title(" Output ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(color::INACTIVE));
+
+            let inner = block.inner(area);
+            block.render(area, buf);
+
             let success_text = format!("Build complete!\n\nImage: {}", image_id);
             Paragraph::new(success_text)
-                .style(Style::default().fg(Color::Green))
+                .style(Style::default().fg(color::SUCCESS))
                 .render(inner, buf);
         } else {
-            let log = OutputLog {
-                lines: &self.state.output_lines,
-                scroll: self.state.scroll_offset,
-            };
-            log.render(inner, buf);
+            let pane = ScrollablePane::new(&self.state.output_lines, self.state.scroll_offset)
+                .with_title("Output")
+                .with_empty_text("Waiting for output...");
+            pane.render(area, buf);
         }
     }
 
@@ -187,7 +195,7 @@ impl BuildView<'_> {
         };
 
         Paragraph::new(help_text)
-            .style(Style::default().fg(Color::DarkGray))
+            .style(Style::default().fg(color::INACTIVE))
             .alignment(Alignment::Center)
             .render(area, buf);
     }
@@ -196,8 +204,9 @@ impl BuildView<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::app::{InstructionState, OutputLine, StageState};
+    use crate::tui::app::{InstructionState, StageState};
     use crate::tui::InstructionStatus;
+    use zlayer_tui::widgets::scrollable_pane::OutputLine;
 
     fn create_test_state() -> BuildState {
         BuildState {
@@ -276,7 +285,7 @@ mod tests {
         let state = BuildState::default();
         let view = BuildView::new(&state);
         let style = view.header_border_style();
-        assert_eq!(style.fg, Some(Color::Blue));
+        assert_eq!(style.fg, Some(color::ACTIVE_BORDER));
     }
 
     #[test]
@@ -287,7 +296,7 @@ mod tests {
         };
         let view = BuildView::new(&state);
         let style = view.header_border_style();
-        assert_eq!(style.fg, Some(Color::Red));
+        assert_eq!(style.fg, Some(color::ERROR));
     }
 
     #[test]
@@ -299,6 +308,6 @@ mod tests {
         };
         let view = BuildView::new(&state);
         let style = view.header_border_style();
-        assert_eq!(style.fg, Some(Color::Green));
+        assert_eq!(style.fg, Some(color::SUCCESS));
     }
 }

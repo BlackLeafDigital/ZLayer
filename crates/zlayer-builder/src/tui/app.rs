@@ -5,15 +5,12 @@
 
 use std::io::{self, Stdout};
 use std::sync::mpsc::{Receiver, TryRecvError};
-use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
 use ratatui::prelude::*;
 use ratatui::Terminal;
+use zlayer_tui::terminal::{restore_terminal, setup_terminal, POLL_DURATION};
+use zlayer_tui::widgets::scrollable_pane::OutputLine;
 
 use super::build_view::BuildView;
 use super::{BuildEvent, InstructionStatus};
@@ -73,15 +70,6 @@ pub struct InstructionState {
     pub status: InstructionStatus,
 }
 
-/// A single line of output
-#[derive(Debug, Clone)]
-pub struct OutputLine {
-    /// Line content
-    pub text: String,
-    /// Whether this is stderr
-    pub is_stderr: bool,
-}
-
 impl BuildTui {
     /// Create a new TUI with an event receiver
     pub fn new(event_rx: Receiver<BuildEvent>) -> Self {
@@ -97,21 +85,9 @@ impl BuildTui {
     /// This will take over the terminal, display the build progress,
     /// and return when the build completes or the user quits (q key).
     pub fn run(&mut self) -> io::Result<()> {
-        // Setup terminal
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend)?;
-
-        // Main loop
+        let mut terminal = setup_terminal()?;
         let result = self.run_loop(&mut terminal);
-
-        // Restore terminal
-        disable_raw_mode()?;
-        execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-        terminal.show_cursor()?;
-
+        restore_terminal(&mut terminal)?;
         result
     }
 
@@ -125,7 +101,7 @@ impl BuildTui {
             terminal.draw(|frame| self.render(frame))?;
 
             // Handle keyboard input with a short timeout
-            if event::poll(Duration::from_millis(50))? {
+            if event::poll(POLL_DURATION)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
                         self.handle_input(key.code);

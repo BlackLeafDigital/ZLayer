@@ -5,6 +5,8 @@
 //! would not be appropriate.
 
 use super::BuildEvent;
+use zlayer_tui::logger::{colorize, detect_color_support};
+use zlayer_tui::palette::ansi;
 
 /// Simple logging output for CI/non-interactive mode
 ///
@@ -56,7 +58,7 @@ impl PlainLogger {
     pub fn new(verbose: bool) -> Self {
         Self {
             verbose,
-            color: Self::detect_color_support(),
+            color: detect_color_support(),
         }
     }
 
@@ -65,47 +67,13 @@ impl PlainLogger {
         Self { verbose, color }
     }
 
-    /// Detect if the terminal supports color output
-    fn detect_color_support() -> bool {
-        // Check common environment variables
-        if std::env::var("NO_COLOR").is_ok() {
-            return false;
-        }
-
-        if std::env::var("FORCE_COLOR").is_ok() {
-            return true;
-        }
-
-        // Check if we're in a known CI environment that supports color
-        if std::env::var("CI").is_ok() {
-            // Most CI systems support ANSI colors
-            return true;
-        }
-
-        // Check TERM variable
-        if let Ok(term) = std::env::var("TERM") {
-            return term != "dumb";
-        }
-
-        // Default to no color if unsure
-        false
-    }
-
-    /// Apply ANSI color codes if color is enabled
+    /// Apply ANSI color codes if color is enabled.
+    ///
+    /// Thin wrapper around [`zlayer_tui::logger::colorize`] that uses
+    /// this logger's color setting.
     fn colorize(&self, text: &str, color: &str) -> String {
-        if self.color {
-            format!("{}{}{}", color, text, "\x1b[0m")
-        } else {
-            text.to_string()
-        }
+        colorize(text, color, self.color)
     }
-
-    /// ANSI color codes
-    const GREEN: &'static str = "\x1b[32m";
-    const YELLOW: &'static str = "\x1b[33m";
-    const RED: &'static str = "\x1b[31m";
-    const CYAN: &'static str = "\x1b[36m";
-    const DIM: &'static str = "\x1b[2m";
 
     /// Handle a build event and print appropriate output
     pub fn handle_event(&self, event: &BuildEvent) {
@@ -117,17 +85,17 @@ impl PlainLogger {
             } => {
                 let stage_name = name.as_deref().unwrap_or("unnamed");
                 let header = format!("==> Stage {}: {} ({})", index + 1, stage_name, base_image);
-                println!("{}", self.colorize(&header, Self::CYAN));
+                println!("{}", self.colorize(&header, ansi::CYAN));
             }
 
             BuildEvent::InstructionStarted { instruction, .. } => {
                 let line = format!("  -> {}", instruction);
-                println!("{}", self.colorize(&line, Self::YELLOW));
+                println!("{}", self.colorize(&line, ansi::YELLOW));
             }
 
             BuildEvent::Output { line, is_stderr } if self.verbose => {
                 if *is_stderr {
-                    eprintln!("     {}", self.colorize(line, Self::DIM));
+                    eprintln!("     {}", self.colorize(line, ansi::DIM));
                 } else {
                     println!("     {}", line);
                 }
@@ -139,27 +107,27 @@ impl PlainLogger {
 
             BuildEvent::InstructionComplete { cached, .. } => {
                 if *cached && self.verbose {
-                    println!("     {}", self.colorize("[cached]", Self::CYAN));
+                    println!("     {}", self.colorize("[cached]", ansi::CYAN));
                 }
             }
 
             BuildEvent::StageComplete { index } => {
                 if self.verbose {
                     let line = format!("  Stage {} complete", index + 1);
-                    println!("{}", self.colorize(&line, Self::GREEN));
+                    println!("{}", self.colorize(&line, ansi::GREEN));
                 }
             }
 
             BuildEvent::BuildComplete { image_id } => {
                 println!();
                 let success = format!("Build complete: {}", image_id);
-                println!("{}", self.colorize(&success, Self::GREEN));
+                println!("{}", self.colorize(&success, ansi::GREEN));
             }
 
             BuildEvent::BuildFailed { error } => {
                 println!();
                 let failure = format!("Build failed: {}", error);
-                eprintln!("{}", self.colorize(&failure, Self::RED));
+                eprintln!("{}", self.colorize(&failure, ansi::RED));
             }
         }
     }
@@ -202,7 +170,7 @@ mod tests {
     #[test]
     fn test_colorize_enabled() {
         let logger = PlainLogger::with_color(false, true);
-        let result = logger.colorize("test", PlainLogger::GREEN);
+        let result = logger.colorize("test", ansi::GREEN);
         assert!(result.contains("\x1b[32m"));
         assert!(result.contains("\x1b[0m"));
         assert!(result.contains("test"));
@@ -211,7 +179,7 @@ mod tests {
     #[test]
     fn test_colorize_disabled() {
         let logger = PlainLogger::with_color(false, false);
-        let result = logger.colorize("test", PlainLogger::GREEN);
+        let result = logger.colorize("test", ansi::GREEN);
         assert_eq!(result, "test");
         assert!(!result.contains("\x1b["));
     }
