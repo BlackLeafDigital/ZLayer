@@ -10,6 +10,7 @@ pub mod cron_scheduler;
 pub mod dependency;
 pub mod env;
 pub mod error;
+pub mod gpu_detector;
 pub mod health;
 pub mod init;
 pub mod job;
@@ -33,6 +34,7 @@ pub use dependency::{
 };
 pub use env::{resolve_env_value, resolve_env_vars, EnvResolutionError, ResolvedEnv};
 pub use error::*;
+pub use gpu_detector::{detect_gpus, GpuInfo};
 pub use health::*;
 pub use init::{BackoffConfig, InitOrchestrator};
 pub use job::{

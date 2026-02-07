@@ -34,6 +34,7 @@ libc.workspace = true
 nix.workspace = true
 oci-spec.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 zlayer-secrets = { version = "0.1.0", path = "../zlayer-secrets" }
