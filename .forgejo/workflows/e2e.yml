@@ -70,6 +70,14 @@ jobs:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
 
+      - name: Fix permissions after sudo test
+        if: always()
+        run: |
+          # sudo cargo test creates root-owned files in CARGO_HOME and CARGO_TARGET_DIR
+          # The runner's cache mechanism can't tar them up without this
+          sudo chown -R "$(id -u):$(id -g)" "${CARGO_HOME}" 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" "${CARGO_TARGET_DIR}" 2>/dev/null || true
+
       - name: Cleanup
         if: always()
         run: |

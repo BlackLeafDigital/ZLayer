@@ -28,7 +28,7 @@ pub struct ServiceInstance {
     runtime: Arc<dyn Runtime + Send + Sync>,
     containers: tokio::sync::RwLock<std::collections::HashMap<ContainerId, Container>>,
     /// Overlay network manager for container networking (optional, not needed for Docker runtime)
-    overlay_manager: Option<Arc<OverlayManager>>,
+    overlay_manager: Option<Arc<RwLock<OverlayManager>>>,
     /// Proxy manager for updating backend health (optional)
     proxy_manager: Option<Arc<ProxyManager>>,
     /// DNS server for service discovery (optional)
@@ -41,7 +41,7 @@ impl ServiceInstance {
         service_name: String,
         spec: ServiceSpec,
         runtime: Arc<dyn Runtime + Send + Sync>,
-        overlay_manager: Option<Arc<OverlayManager>>,
+        overlay_manager: Option<Arc<RwLock<OverlayManager>>>,
     ) -> Self {
         Self {
             service_name,
@@ -59,7 +59,7 @@ impl ServiceInstance {
         service_name: String,
         spec: ServiceSpec,
         runtime: Arc<dyn Runtime + Send + Sync>,
-        overlay_manager: Option<Arc<OverlayManager>>,
+        overlay_manager: Option<Arc<RwLock<OverlayManager>>>,
         proxy_manager: Arc<ProxyManager>,
     ) -> Self {
         Self {
@@ -145,7 +145,8 @@ impl ServiceInstance {
                 let overlay_ip = if let Some(overlay) = &self.overlay_manager {
                     // Get container PID for network namespace attachment
                     if let Ok(Some(pid)) = self.runtime.get_container_pid(&id).await {
-                        match overlay
+                        let overlay_guard = overlay.read().await;
+                        match overlay_guard
                             .attach_container(pid, &self.service_name, true)
                             .await
                         {
@@ -370,6 +371,21 @@ impl ServiceInstance {
         &self,
     ) -> &tokio::sync::RwLock<std::collections::HashMap<ContainerId, Container>> {
         &self.containers
+    }
+
+    /// Check if this service instance has an overlay manager configured
+    pub fn has_overlay_manager(&self) -> bool {
+        self.overlay_manager.is_some()
+    }
+
+    /// Check if this service instance has a proxy manager configured
+    pub fn has_proxy_manager(&self) -> bool {
+        self.proxy_manager.is_some()
+    }
+
+    /// Check if this service instance has a DNS server configured
+    pub fn has_dns_server(&self) -> bool {
+        self.dns_server.is_some()
     }
 }
 
@@ -842,16 +858,17 @@ impl ServiceManager {
                     }
                 } else {
                     // Create new service with proxy manager for health-aware load balancing
+                    let overlay = self.overlay_manager.as_ref().map(Arc::clone);
                     let mut instance = if let Some(proxy) = &self.proxy_manager {
                         ServiceInstance::with_proxy(
                             name.clone(),
                             spec,
                             self.runtime.clone(),
-                            None, // TODO: pass overlay_manager when available
+                            overlay,
                             Arc::clone(proxy),
                         )
                     } else {
-                        ServiceInstance::new(name.clone(), spec, self.runtime.clone(), None)
+                        ServiceInstance::new(name.clone(), spec, self.runtime.clone(), overlay)
                     };
                     // Set DNS server if configured
                     if let Some(dns) = &self.dns_server {
@@ -873,16 +890,17 @@ impl ServiceManager {
                     );
                     // Fallback: store as service instance for reference
                     let mut services = self.services.write().await;
+                    let overlay = self.overlay_manager.as_ref().map(Arc::clone);
                     let mut instance = if let Some(proxy) = &self.proxy_manager {
                         ServiceInstance::with_proxy(
                             name.clone(),
                             spec,
                             self.runtime.clone(),
-                            None,
+                            overlay,
                             Arc::clone(proxy),
                         )
                     } else {
-                        ServiceInstance::new(name.clone(), spec, self.runtime.clone(), None)
+                        ServiceInstance::new(name.clone(), spec, self.runtime.clone(), overlay)
                     };
                     // Set DNS server if configured
                     if let Some(dns) = &self.dns_server {
@@ -1308,6 +1326,19 @@ impl ServiceManager {
         }
 
         Ok(())
+    }
+
+    /// Introspect service infrastructure wiring.
+    /// Returns (has_overlay, has_proxy, has_dns), or None if service not found.
+    pub async fn service_infrastructure(&self, name: &str) -> Option<(bool, bool, bool)> {
+        let services = self.services.read().await;
+        services.get(name).map(|i| {
+            (
+                i.has_overlay_manager(),
+                i.has_proxy_manager(),
+                i.has_dns_server(),
+            )
+        })
     }
 
     /// List all services

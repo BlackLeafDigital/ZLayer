@@ -289,6 +289,7 @@ mod tests {
             deployment: name.to_string(),
             services,
             tunnels: HashMap::new(),
+            api: Default::default(),
         }
     }
 

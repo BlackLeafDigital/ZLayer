@@ -1,31 +1,16 @@
-//! Workspace-level integration tests
+//! Integration tests for the zlayer runtime binary
 //!
-//! These tests verify that all crates work together correctly.
+//! Uses the pre-compiled binary via CARGO_BIN_EXE to avoid re-compilation at test time.
 
 use std::process::Command;
-
-/// Test that all crates compile together
-#[test]
-fn test_workspace_compiles() {
-    let output = Command::new("cargo")
-        .args(["check", "--workspace"])
-        .output()
-        .expect("Failed to run cargo check");
-
-    assert!(
-        output.status.success(),
-        "Workspace check failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
 
 /// Test that the runtime binary has expected commands
 #[test]
 fn test_runtime_help() {
-    let output = Command::new("cargo")
-        .args(["run", "--package", "runtime", "--", "--help"])
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
+        .args(["--help"])
         .output()
-        .expect("Failed to run runtime");
+        .expect("Failed to run zlayer");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -36,18 +21,10 @@ fn test_runtime_help() {
 /// Test that runtime has feature-gated commands when built with full features
 #[test]
 fn test_runtime_full_features_help() {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--package",
-            "runtime",
-            "--features",
-            "full",
-            "--",
-            "--help",
-        ])
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
+        .args(["--help"])
         .output()
-        .expect("Failed to run runtime with full features");
+        .expect("Failed to run zlayer");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -68,10 +45,10 @@ fn test_runtime_full_features_help() {
 /// Test that runtime status command works
 #[test]
 fn test_runtime_status() {
-    let output = Command::new("cargo")
-        .args(["run", "--package", "runtime", "--", "status"])
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
+        .args(["status"])
         .output()
-        .expect("Failed to run runtime status");
+        .expect("Failed to run zlayer status");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
@@ -85,17 +62,8 @@ fn test_runtime_status() {
 /// Test that zlayer token info command works
 #[test]
 fn test_zlayer_token_info() {
-    let output = Command::new("cargo")
-        .args([
-            "run",
-            "--package",
-            "runtime",
-            "--features",
-            "full",
-            "--",
-            "token",
-            "info",
-        ])
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
+        .args(["token", "info"])
         .output()
         .expect("Failed to run zlayer token info");
 
@@ -108,14 +76,8 @@ fn test_zlayer_token_info() {
 /// Test that zlayer can create tokens
 #[test]
 fn test_zlayer_token_create() {
-    let output = Command::new("cargo")
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
         .args([
-            "run",
-            "--package",
-            "runtime",
-            "--features",
-            "full",
-            "--",
             "token",
             "create",
             "--quiet",
@@ -146,14 +108,8 @@ fn test_zlayer_token_create() {
 /// Test that zlayer can generate join tokens
 #[test]
 fn test_zlayer_generate_join_token() {
-    let output = Command::new("cargo")
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
         .args([
-            "run",
-            "--package",
-            "runtime",
-            "--features",
-            "full",
-            "--",
             "node",
             "generate-join-token",
             "-d",
