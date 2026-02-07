@@ -10,7 +10,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
-use super::state::{DeployState, LogEntry, PhaseStatus, ServiceDeployPhase, ServiceState};
+use super::state::{LogEntry, PhaseStatus, ServiceDeployPhase, ServiceState};
 use super::{InfraPhase, LogLevel, ServiceHealth};
 
 /// Spinner frames for in-progress indicators
@@ -430,9 +430,13 @@ impl Widget for LogPane<'_> {
 /// | footer help text           |
 /// +----------------------------+
 /// ```
+#[cfg(test)]
+use super::state::DeployState;
+
+#[cfg(test)]
 pub fn render_deploy_view(state: &DeployState, tick: usize, area: Rect, buf: &mut Buffer) {
     // Vertical layout: infra, services, logs, footer
-    let infra_height = 2 + ((state.infra_phases.len() + 2) / 3) as u16; // border + rows
+    let infra_height = 2 + state.infra_phases.len().div_ceil(3) as u16; // border + rows
     let service_count = state.services.len().max(1) as u16;
 
     let chunks = Layout::default()

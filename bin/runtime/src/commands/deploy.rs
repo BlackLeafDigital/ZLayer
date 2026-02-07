@@ -17,7 +17,8 @@ use zlayer_spec::DeploymentSpec;
 use crate::cli::{Cli, DeployMode};
 use crate::config::build_runtime_config;
 use crate::deploy_tui::{
-    DeployEvent, DeployTui, InfraPhase, LogLevel, PlainDeployLogger, ServicePlan,
+    DeployEvent, DeployTui, InfraPhase, LogLevel, PlainDeployLogger, ServiceHealth, ServicePlan,
+    ServiceStatus,
 };
 use crate::util::{discover_spec_path, parse_spec};
 
@@ -57,11 +58,10 @@ fn build_service_plan(name: &str, service: &zlayer_spec::ServiceSpec) -> Service
 fn setup_plain_channel() -> mpsc::Sender<DeployEvent> {
     let (tx, rx) = mpsc::channel::<DeployEvent>();
 
+    let is_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
     std::thread::spawn(move || {
-        let logger = PlainDeployLogger::new();
-        for event in rx {
-            logger.handle_event(&event);
-        }
+        let logger = PlainDeployLogger::with_color(is_color);
+        logger.process_events(rx);
     });
 
     tx
@@ -742,9 +742,47 @@ pub(crate) async fn deploy_services(
                 },
             );
 
-            tokio::signal::ctrl_c()
-                .await
-                .context("Failed to wait for Ctrl+C")?;
+            // Wait for Ctrl+C while emitting periodic StatusTick events
+            {
+                let mut tick_interval = tokio::time::interval(Duration::from_secs(5));
+                // The first tick fires immediately; consume it so the first
+                // real tick happens after 5 seconds.
+                tick_interval.tick().await;
+
+                loop {
+                    tokio::select! {
+                        _ = tokio::signal::ctrl_c() => {
+                            break;
+                        }
+                        _ = tick_interval.tick() => {
+                            // Build current service status from deployed_services snapshot
+                            let mut statuses = Vec::with_capacity(deployed_services.len());
+                            for (name, target) in &deployed_services {
+                                let running = manager
+                                    .service_replica_count(name)
+                                    .await
+                                    .unwrap_or(0) as u32;
+                                let health = if *target == 0 {
+                                    ServiceHealth::Unknown
+                                } else if running == *target {
+                                    ServiceHealth::Healthy
+                                } else if running == 0 {
+                                    ServiceHealth::Unhealthy
+                                } else {
+                                    ServiceHealth::Degraded
+                                };
+                                statuses.push(ServiceStatus {
+                                    name: name.clone(),
+                                    replicas_running: running,
+                                    replicas_target: *target,
+                                    health,
+                                });
+                            }
+                            emit(&event_tx, DeployEvent::StatusTick { services: statuses });
+                        }
+                    }
+                }
+            }
 
             emit(&event_tx, DeployEvent::ShutdownStarted);
             info!("Received shutdown signal");

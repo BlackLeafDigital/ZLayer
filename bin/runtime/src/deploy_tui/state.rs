@@ -33,14 +33,17 @@ pub enum PhaseStatus {
     InProgress,
     /// Successfully completed
     Complete,
-    /// Failed with an error message
+    /// Failed with an error message (reserved for future fatal infra failures)
+    #[allow(dead_code)]
     Failed(String),
-    /// Skipped with a reason
+    /// Skipped with a reason (inner String read by rendering widgets)
+    #[allow(dead_code)]
     Skipped(String),
 }
 
 impl PhaseStatus {
     /// Whether this phase has finished (complete, failed, or skipped)
+    #[allow(dead_code)]
     pub fn is_done(&self) -> bool {
         matches!(
             self,
@@ -173,10 +176,12 @@ impl DeployState {
                     if *success {
                         *entry = PhaseStatus::Complete;
                     } else {
+                        // Non-fatal infra failures are treated as "skipped" since
+                        // the deployment continues without this phase.
                         let msg = message
                             .clone()
                             .unwrap_or_else(|| "unknown error".to_string());
-                        *entry = PhaseStatus::Failed(msg);
+                        *entry = PhaseStatus::Skipped(msg);
                     }
                 }
             }
@@ -208,6 +213,10 @@ impl DeployState {
                     svc.phase = ServiceDeployPhase::Scaling;
                     svc.target_replicas = *target_replicas;
                 }
+                // Transition to Stabilizing when scaling starts during Deploying phase
+                if self.phase == DeployPhase::Deploying {
+                    self.phase = DeployPhase::Stabilizing;
+                }
             }
 
             DeployEvent::ServiceReplicaUpdate {
@@ -218,6 +227,10 @@ impl DeployState {
                 if let Some(svc) = self.find_service_mut(name) {
                     svc.current_replicas = *current;
                     svc.target_replicas = *target;
+                    // Set health to Degraded when some but not all replicas are running
+                    if *current > 0 && *current < *target {
+                        svc.health = ServiceHealth::Degraded;
+                    }
                 }
             }
 
@@ -285,6 +298,7 @@ impl DeployState {
     }
 
     /// Number of infrastructure phases that have completed (success or failure)
+    #[allow(dead_code)]
     pub fn infra_complete_count(&self) -> usize {
         self.infra_phases
             .iter()
@@ -396,7 +410,7 @@ mod tests {
         });
         assert!(matches!(state.infra_phases[0].1, PhaseStatus::Complete));
 
-        // Fail Overlay phase
+        // Non-fatal failure on Overlay phase (becomes Skipped)
         state.apply_event(&DeployEvent::InfraPhaseStarted {
             phase: InfraPhase::Overlay,
         });
@@ -407,7 +421,7 @@ mod tests {
         });
         assert!(matches!(
             state.infra_phases[1].1,
-            PhaseStatus::Failed(ref msg) if msg == "not available"
+            PhaseStatus::Skipped(ref msg) if msg == "not available"
         ));
 
         assert_eq!(state.infra_complete_count(), 2);

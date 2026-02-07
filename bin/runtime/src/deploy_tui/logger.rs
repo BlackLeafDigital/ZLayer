@@ -94,7 +94,7 @@ impl PlainDeployLogger {
                 version,
                 services,
             } => {
-                let header = format!("=== Deployment Plan ===");
+                let header = "=== Deployment Plan ===".to_string();
                 println!("\n{}", self.colorize(&header, Self::BOLD));
                 println!("Deployment: {}", self.colorize(deployment_name, Self::CYAN));
                 println!("Version: {}", version);
@@ -145,7 +145,7 @@ impl PlainDeployLogger {
 
             DeployEvent::ServiceDeployStarted { name } => {
                 println!();
-                let header = format!("=== Deploying Services ===");
+                let header = "=== Deploying Services ===".to_string();
                 // Only print the header once (on first service). We use a simple
                 // heuristic: the caller sends ServiceDeployStarted for each service,
                 // so we just print the service name with an arrow.
@@ -202,7 +202,7 @@ impl PlainDeployLogger {
 
             DeployEvent::DeploymentRunning { services } => {
                 println!();
-                let header = format!("=== Deployment Summary ===");
+                let header = "=== Deployment Summary ===".to_string();
                 println!("{}", self.colorize(&header, Self::BOLD));
                 println!();
 
