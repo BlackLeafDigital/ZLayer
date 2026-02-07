@@ -54,3 +54,7 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"

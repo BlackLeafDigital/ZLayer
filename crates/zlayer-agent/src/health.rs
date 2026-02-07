@@ -14,12 +14,19 @@ pub type HealthCallback = Arc<dyn Fn(ContainerId, bool) + Send + Sync>;
 /// Health checker for containers
 pub struct HealthChecker {
     pub check: HealthCheck,
+    /// Optional target IP address for health checks (e.g., container overlay IP).
+    /// When set, TCP and HTTP checks connect to this address instead of 127.0.0.1/localhost.
+    target_addr: Option<std::net::IpAddr>,
 }
 
 impl HealthChecker {
     /// Create a new health checker
-    pub fn new(check: HealthCheck) -> Self {
-        Self { check }
+    ///
+    /// `target_addr` is the IP address to connect to for TCP/HTTP checks.
+    /// Pass `Some(ip)` when the container has an overlay IP, or `None` to
+    /// fall back to `127.0.0.1` / localhost.
+    pub fn new(check: HealthCheck, target_addr: Option<std::net::IpAddr>) -> Self {
+        Self { check, target_addr }
     }
 
     /// Perform the health check
@@ -34,8 +41,12 @@ impl HealthChecker {
     }
 
     async fn check_tcp(&self, id: &ContainerId, port: u16, timeout_dur: Duration) -> Result<()> {
-        // Try to connect to localhost:port
-        let addr = format!("127.0.0.1:{}", port);
+        // Connect to the target address (overlay IP if set, otherwise localhost)
+        let host = self
+            .target_addr
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let addr = format!("{}:{}", host, port);
         match timeout(timeout_dur, tokio::net::TcpStream::connect(&addr)).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(AgentError::HealthCheckFailed {
@@ -55,6 +66,16 @@ impl HealthChecker {
         expect_status: u16,
         timeout_dur: Duration,
     ) -> Result<()> {
+        // If a target address is set, replace localhost / 127.0.0.1 in the URL
+        // so the health check actually reaches the container's overlay IP.
+        let url = if let Some(ip) = self.target_addr {
+            let ip_str = ip.to_string();
+            url.replace("localhost", &ip_str)
+                .replace("127.0.0.1", &ip_str)
+        } else {
+            url.to_string()
+        };
+
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(5))
             .build()
@@ -63,7 +84,7 @@ impl HealthChecker {
                 reason: format!("failed to create HTTP client: {}", e),
             })?;
 
-        match timeout(timeout_dur, client.get(url).send()).await {
+        match timeout(timeout_dur, client.get(&url).send()).await {
             Ok(Ok(resp)) => {
                 let status = resp.status().as_u16();
                 if status == expect_status {

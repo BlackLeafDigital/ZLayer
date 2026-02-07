@@ -15,6 +15,7 @@
 mod cli;
 mod commands;
 mod config;
+mod deploy_tui;
 mod util;
 
 use anyhow::{Context, Result};
@@ -30,10 +31,18 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Configure observability based on verbosity and environment
-    let log_level = match cli.verbose {
-        0 => LogLevel::Info,
-        1 => LogLevel::Debug,
-        _ => LogLevel::Trace,
+    let (log_level, filter_directives) = match cli.verbose {
+        0 => (
+            LogLevel::Warn,
+            Some(
+                "runtime=info,zlayer_agent=warn,zlayer_overlay=warn,zlayer_proxy=warn,\
+                 zlayer_init_actions=warn,zlayer_scheduler=warn,zlayer_api=warn,warn"
+                    .to_string(),
+            ),
+        ),
+        1 => (LogLevel::Info, None),  // -v: global info (old default)
+        2 => (LogLevel::Debug, None), // -vv: debug
+        _ => (LogLevel::Trace, None), // -vvv: trace
     };
 
     // Use pretty format for terminals, JSON for piped output
@@ -47,6 +56,7 @@ fn main() -> Result<()> {
         logging: LoggingConfig {
             level: log_level,
             format: log_format,
+            filter_directives,
             ..Default::default()
         },
         ..Default::default()

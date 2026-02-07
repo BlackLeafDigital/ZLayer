@@ -28,8 +28,13 @@ impl LogGuard {
 /// Returns a guard that must be held for the lifetime of the application
 /// to ensure logs are flushed properly.
 pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(level_to_string(config.level)));
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if let Some(ref directives) = config.filter_directives {
+            EnvFilter::new(directives)
+        } else {
+            EnvFilter::new(level_to_string(config.level))
+        }
+    });
 
     // Handle file logging setup
     let (file_writer, guard) = if let Some(file_config) = &config.file {

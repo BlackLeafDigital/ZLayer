@@ -74,6 +74,11 @@ pub struct LoggingConfig {
     /// Include target (module path) in logs
     #[serde(default = "default_true")]
     pub include_target: bool,
+
+    /// Per-crate tracing filter directives (e.g. "runtime=info,zlayer_agent=warn,warn")
+    /// When set, overrides the global `level` for EnvFilter construction.
+    #[serde(default)]
+    pub filter_directives: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -88,6 +93,7 @@ impl Default for LoggingConfig {
             file: None,
             include_location: true,
             include_target: true,
+            filter_directives: None,
         }
     }
 }
