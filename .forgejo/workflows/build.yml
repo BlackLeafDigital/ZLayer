@@ -318,6 +318,11 @@ jobs:
     outputs:
       package_base_url: ${{ steps.upload.outputs.package_base_url }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          sparse-checkout: scripts/upload-packages.sh
+
       - name: Download all artifacts
         uses: actions/download-artifact@v3
         with:
@@ -328,10 +333,6 @@ jobs:
           echo "=== Downloaded artifacts ==="
           find artifacts -type f -ls
 
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.sha }}
-          sparse-checkout: scripts/upload-packages.sh
       - name: Upload to temp packages
         id: upload
         shell: bash
