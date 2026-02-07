@@ -103,60 +103,33 @@ jobs:
     if: needs.detect.outputs.binary == 'true'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.ref }}
+          sparse-checkout: scripts/upload-packages.sh
       - name: Download artifacts from temp storage
+        shell: bash
         run: |
           BASE_URL="${{ inputs.artifact_base_url }}"
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
           mkdir -p artifacts
 
-          pids=()
           for name in zlayer-runtime-linux-amd64 zlayer-runtime-linux-arm64 zlayer-runtime-darwin-amd64 zlayer-runtime-darwin-arm64 zlayer-build-linux-amd64 zlayer-build-linux-arm64 zlayer-build-darwin-amd64 zlayer-build-darwin-arm64 zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64; do
-            (
-              echo "Downloading ${name}.tar.gz..."
-              curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
-                --user "$AUTH" \
-                -o "artifacts/${name}.tar.gz" \
-                "${BASE_URL}/${name}.tar.gz" \
-                && echo "OK ${name}.tar.gz" \
-                || { echo "FAIL ${name}.tar.gz"; exit 1; }
-            ) &
-            pids+=($!)
-          done
-          for pid in "${pids[@]}"; do
-            wait $pid || exit 1
+            echo "Downloading ${name}.tar.gz..."
+            curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
+              --user "$AUTH" \
+              -o "artifacts/${name}.tar.gz" \
+              "${BASE_URL}/${name}.tar.gz"
+            echo "OK ${name}.tar.gz"
           done
 
       - name: Upload to Forgejo Packages
+        shell: bash
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
-          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
           PKG_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
-
-          pids=()
-          for artifact in artifacts/*.tar.gz; do
-            filename=$(basename "$artifact")
-            (
-              local_size=$(stat -c%s "$artifact")
-              remote_size=$(curl -sI --user "$AUTH" "${PKG_URL}/${filename}" 2>/dev/null \
-                | grep -i content-length | tail -1 | tr -dc '0-9')
-              if [ -n "$remote_size" ] && [ "$remote_size" = "$local_size" ]; then
-                echo "= Skipping $filename (already uploaded)"
-              else
-                [ -n "$remote_size" ] && curl -s -X DELETE --user "$AUTH" "${PKG_URL}/${filename}" || true
-                echo "Uploading $filename..."
-                curl --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 10 \
-                  --user "$AUTH" \
-                  --upload-file "$artifact" \
-                  "${PKG_URL}/${filename}" \
-                  && echo "OK $filename" \
-                  || { echo "FAIL $filename"; exit 1; }
-              fi
-            ) &
-            pids+=($!)
-          done
-          for pid in "${pids[@]}"; do
-            wait $pid || exit 1
-          done
+          chmod +x scripts/upload-packages.sh
+          ./scripts/upload-packages.sh "$PKG_URL" "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" artifacts
 
   # ===========================================
   # Merge to main (after binaries uploaded)

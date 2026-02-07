@@ -78,14 +78,31 @@ upload_file() {
   return 1
 }
 
-# Collect all files
+# Collect all files (supports nested dirs from download-artifact or flat from curl)
 files=()
+# Nested: artifacts/zlayer-runtime-linux-amd64/zlayer-runtime-linux-amd64.tar.gz
 for artifact in "${ARTIFACTS_DIR}"/zlayer-*/*.tar.gz; do
   [ -f "$artifact" ] && files+=("$artifact")
 done
+# Flat: artifacts/binaries/zlayer-runtime-linux-amd64.tar.gz or artifacts/*.tar.gz
+for artifact in "${ARTIFACTS_DIR}"/*.tar.gz "${ARTIFACTS_DIR}"/*/*.tar.gz; do
+  [ -f "$artifact" ] && files+=("$artifact")
+done
+# Container images
 for archive in "${ARTIFACTS_DIR}"/container-images/*.tar; do
   [ -f "$archive" ] && files+=("$archive")
 done
+# Deduplicate
+declare -A seen
+unique_files=()
+for f in "${files[@]}"; do
+  fname=$(basename "$f")
+  if [ -z "${seen[$fname]+x}" ]; then
+    seen[$fname]=1
+    unique_files+=("$f")
+  fi
+done
+files=("${unique_files[@]}")
 
 echo "Found ${#files[@]} files to upload"
 

@@ -11,16 +11,56 @@ on:
         description: 'Commit SHA to build'
         required: false
         type: string
+      force:
+        description: 'Force rebuild even if artifacts exist'
+        required: false
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   # ===========================================
-  # Build Linux amd64 (native) - FIRST
-  # Required for image-build pipeline
+  # Check if artifacts already exist for this version
+  # ===========================================
+  check-existing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      need_build: ${{ steps.check.outputs.need_build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+          sparse-checkout: scripts/check-existing-packages.sh
+      - name: Check for existing release artifacts
+        id: check
+        shell: bash
+        run: |
+          VERSION=$(echo "${{ inputs.version }}" | grep -oP '\d+\.\d+\.\d+' || echo "${{ inputs.version }}")
+          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
+          chmod +x scripts/check-existing-packages.sh
+          NEED_BUILD=$(./scripts/check-existing-packages.sh "$VERSION" "$AUTH" | tail -1)
+          if [ "${{ inputs.force }}" = "true" ]; then
+            echo "Force rebuild requested"
+            NEED_BUILD="true"
+          fi
+          echo "need_build=${NEED_BUILD}" >> $GITHUB_OUTPUT
+      - name: Summary
+        if: steps.check.outputs.need_build == 'false'
+        run: |
+          echo "## Build Skipped" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "All artifacts already exist for version **${{ inputs.version }}**." >> $GITHUB_STEP_SUMMARY
+          echo "Use \`force: true\` to rebuild." >> $GITHUB_STEP_SUMMARY
+
+  # ===========================================
+  # Wave 1: Linux amd64 + macOS arm64 (2 parallel)
   # ===========================================
   build-linux-amd64:
+    needs: [check-existing]
+    if: needs.check-existing.outputs.need_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     container: node:20-bullseye
@@ -64,13 +104,65 @@ jobs:
       - name: Cleanup
         run: rm -rf $CARGO_TARGET_DIR zlayer-runtime-linux-amd64.tar.gz zlayer-build-linux-amd64.tar.gz zlayer-linux-amd64.tar.gz
 
+  build-macos-arm64:
+    needs: [check-existing]
+    if: needs.check-existing.outputs.need_build == 'true'
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        with:
+          targets: aarch64-apple-darwin
+      - name: Ensure target installed
+        run: rustup target add aarch64-apple-darwin
+      - name: Clean build state
+        run: cargo clean
+      - name: Install protobuf
+        run: brew install protobuf
+      - name: Build
+        run: cargo build --release --target aarch64-apple-darwin --package runtime --features "docker,wasm"
+      - name: Package
+        run: tar czf "zlayer-runtime-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer-runtime
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: zlayer-runtime-darwin-arm64
+          path: zlayer-runtime-darwin-arm64.tar.gz
+          retention-days: 1
+      - name: Build zlayer-build
+        run: cargo build --release --target aarch64-apple-darwin --package zlayer-build
+      - name: Package zlayer-build
+        run: tar czf "zlayer-build-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer-build
+      - name: Upload zlayer-build artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: zlayer-build-darwin-arm64
+          path: zlayer-build-darwin-arm64.tar.gz
+          retention-days: 1
+      - name: Build zlayer
+        run: cargo build --release --target aarch64-apple-darwin --package zlayer
+      - name: Package zlayer
+        run: tar czf "zlayer-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer
+      - name: Upload zlayer artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: zlayer-darwin-arm64
+          path: zlayer-darwin-arm64.tar.gz
+          retention-days: 1
+      - name: Cleanup
+        run: rm -rf $CARGO_TARGET_DIR zlayer-runtime-darwin-arm64.tar.gz zlayer-build-darwin-arm64.tar.gz zlayer-darwin-arm64.tar.gz
+
   # ===========================================
-  # Build container images using pipeline - EARLY
-  # Runs after linux-amd64, gates all other builds
+  # Wave 2: Image build + macOS amd64 (2 parallel)
   # ===========================================
   image-build:
     name: Image Build (Pipeline)
-    needs: [build-linux-amd64]
+    needs: [check-existing, build-linux-amd64]
+    if: needs.check-existing.outputs.need_build == 'true'
+    # Needs linux-amd64 for zlayer-build + zlayer-runtime binaries
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -119,66 +211,9 @@ jobs:
             zlayer-manager-oci.tar
           retention-days: 1
 
-  # ===========================================
-  # Build Linux arm64 (cross-compile)
-  # Runs after image-build succeeds
-  # ===========================================
-  build-linux-arm64:
-    needs: [image-build]
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      CROSS_TARGET_DIR: ${{ github.workspace }}/cross-target
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.sha }}
-      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
-      - name: Install cross
-        run: cargo install cross
-      - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
-      - name: Create target directory
-        run: mkdir -p $CROSS_TARGET_DIR
-      - name: Build
-        run: cross build --release --target aarch64-unknown-linux-gnu --package runtime --features "docker,wasm" --target-dir $CROSS_TARGET_DIR
-      - name: Package
-        run: tar czf "zlayer-runtime-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer-runtime
-      - name: Upload artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: zlayer-runtime-linux-arm64
-          path: zlayer-runtime-linux-arm64.tar.gz
-          retention-days: 1
-      - name: Build zlayer-build
-        run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer-build --target-dir $CROSS_TARGET_DIR
-      - name: Package zlayer-build
-        run: tar czf "zlayer-build-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer-build
-      - name: Upload zlayer-build artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: zlayer-build-linux-arm64
-          path: zlayer-build-linux-arm64.tar.gz
-          retention-days: 1
-      - name: Build zlayer
-        run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer --target-dir $CROSS_TARGET_DIR
-      - name: Package zlayer
-        run: tar czf "zlayer-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer
-      - name: Upload zlayer artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: zlayer-linux-arm64
-          path: zlayer-linux-arm64.tar.gz
-          retention-days: 1
-      - name: Cleanup
-        run: rm -rf $CROSS_TARGET_DIR zlayer-runtime-linux-arm64.tar.gz zlayer-build-linux-arm64.tar.gz zlayer-linux-arm64.tar.gz
-
-  # ===========================================
-  # Build macOS amd64
-  # Runs after image-build succeeds
-  # ===========================================
   build-macos-amd64:
-    needs: [image-build]
+    needs: [check-existing, build-macos-arm64]
+    if: needs.check-existing.outputs.need_build == 'true'
     runs-on: macos-latest
     timeout-minutes: 45
     steps:
@@ -240,64 +275,65 @@ jobs:
         run: rm -rf $CARGO_TARGET_DIR zlayer-runtime-darwin-amd64.tar.gz zlayer-build-darwin-amd64.tar.gz zlayer-darwin-amd64.tar.gz
 
   # ===========================================
-  # Build macOS arm64
-  # Runs after image-build succeeds
+  # Wave 3: Linux arm64 (cross-compile, slowest)
   # ===========================================
-  build-macos-arm64:
-    needs: [image-build]
-    runs-on: macos-latest
-    timeout-minutes: 45
+  build-linux-arm64:
+    needs: [check-existing, image-build, build-macos-amd64]
+    if: needs.check-existing.outputs.need_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CROSS_TARGET_DIR: ${{ github.workspace }}/cross-target
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
       - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
-        with:
-          targets: aarch64-apple-darwin
-      - name: Ensure target installed
-        run: rustup target add aarch64-apple-darwin
-      - name: Clean build state
-        run: cargo clean
-      - name: Install protobuf
-        run: brew install protobuf
+      - name: Install cross
+        run: cargo install cross
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
+      - name: Create target directory
+        run: mkdir -p $CROSS_TARGET_DIR
       - name: Build
-        run: cargo build --release --target aarch64-apple-darwin --package runtime --features "docker,wasm"
+        run: cross build --release --target aarch64-unknown-linux-gnu --package runtime --features "docker,wasm" --target-dir $CROSS_TARGET_DIR
       - name: Package
-        run: tar czf "zlayer-runtime-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer-runtime
+        run: tar czf "zlayer-runtime-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer-runtime
       - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-runtime-darwin-arm64
-          path: zlayer-runtime-darwin-arm64.tar.gz
+          name: zlayer-runtime-linux-arm64
+          path: zlayer-runtime-linux-arm64.tar.gz
           retention-days: 1
       - name: Build zlayer-build
-        run: cargo build --release --target aarch64-apple-darwin --package zlayer-build
+        run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer-build --target-dir $CROSS_TARGET_DIR
       - name: Package zlayer-build
-        run: tar czf "zlayer-build-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer-build
+        run: tar czf "zlayer-build-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer-build
       - name: Upload zlayer-build artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-build-darwin-arm64
-          path: zlayer-build-darwin-arm64.tar.gz
+          name: zlayer-build-linux-arm64
+          path: zlayer-build-linux-arm64.tar.gz
           retention-days: 1
       - name: Build zlayer
-        run: cargo build --release --target aarch64-apple-darwin --package zlayer
+        run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer --target-dir $CROSS_TARGET_DIR
       - name: Package zlayer
-        run: tar czf "zlayer-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer
+        run: tar czf "zlayer-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer
       - name: Upload zlayer artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-darwin-arm64
-          path: zlayer-darwin-arm64.tar.gz
+          name: zlayer-linux-arm64
+          path: zlayer-linux-arm64.tar.gz
           retention-days: 1
       - name: Cleanup
-        run: rm -rf $CARGO_TARGET_DIR zlayer-runtime-darwin-arm64.tar.gz zlayer-build-darwin-arm64.tar.gz zlayer-darwin-arm64.tar.gz
+        run: rm -rf $CROSS_TARGET_DIR zlayer-runtime-linux-arm64.tar.gz zlayer-build-linux-arm64.tar.gz zlayer-linux-arm64.tar.gz
 
   # ===========================================
   # Verify all builds passed
   # ===========================================
   verify:
-    needs: [build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64, image-build]
+    needs: [check-existing, build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64, image-build]
+    if: needs.check-existing.outputs.need_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
