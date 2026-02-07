@@ -96,19 +96,13 @@ impl PlainDeployLogger {
             } => {
                 let header = format!("=== Deployment Plan ===");
                 println!("\n{}", self.colorize(&header, Self::BOLD));
-                println!(
-                    "Deployment: {}",
-                    self.colorize(deployment_name, Self::CYAN)
-                );
+                println!("Deployment: {}", self.colorize(deployment_name, Self::CYAN));
                 println!("Version: {}", version);
                 println!("Services: {}", services.len());
                 println!();
 
                 for svc in services {
-                    println!(
-                        "  Service: {}",
-                        self.colorize(&svc.name, Self::BOLD)
-                    );
+                    println!("  Service: {}", self.colorize(&svc.name, Self::BOLD));
                     println!("    Image: {}", svc.image);
                     println!("    Scale: {}", svc.scale_mode);
                     if !svc.endpoints.is_empty() {
@@ -239,11 +233,7 @@ impl PlainDeployLogger {
             }
 
             DeployEvent::ServiceStopping { name } => {
-                println!(
-                    "  {} Stopping {}...",
-                    self.colorize("->", Self::DIM),
-                    name
-                );
+                println!("  {} Stopping {}...", self.colorize("->", Self::DIM), name);
             }
 
             DeployEvent::ServiceStopped { name } => {
@@ -252,10 +242,7 @@ impl PlainDeployLogger {
             }
 
             DeployEvent::ShutdownComplete => {
-                println!(
-                    "{}",
-                    self.colorize("Shutdown complete.", Self::GREEN)
-                );
+                println!("{}", self.colorize("Shutdown complete.", Self::GREEN));
             }
 
             DeployEvent::Log { level, message } => match level {
@@ -290,9 +277,7 @@ impl PlainDeployLogger {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::deploy_tui::{
-        InfraPhase, ServiceHealth, ServicePlan, ServiceStatus,
-    };
+    use crate::deploy_tui::{InfraPhase, ServiceHealth, ServicePlan, ServiceStatus};
 
     #[test]
     fn test_plain_deploy_logger_creation() {
@@ -470,8 +455,6 @@ mod tests {
     #[test]
     fn test_deployment_running_empty() {
         let logger = PlainDeployLogger::with_color(false);
-        logger.handle_event(&DeployEvent::DeploymentRunning {
-            services: vec![],
-        });
+        logger.handle_event(&DeployEvent::DeploymentRunning { services: vec![] });
     }
 }

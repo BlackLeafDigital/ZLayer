@@ -256,12 +256,7 @@ impl DeployView<'_> {
             } else {
                 name
             };
-            buf.set_string(
-                x + 2,
-                y,
-                &display_name,
-                Style::default().fg(Color::White),
-            );
+            buf.set_string(x + 2, y, &display_name, Style::default().fg(Color::White));
         }
     }
 
@@ -359,10 +354,7 @@ impl DeployView<'_> {
     /// Get display icon and style for a service deploy phase
     fn service_status_display(&self, phase: &ServiceDeployPhase) -> (String, Style) {
         match phase {
-            ServiceDeployPhase::Pending => (
-                ".".to_string(),
-                Style::default().fg(Color::DarkGray),
-            ),
+            ServiceDeployPhase::Pending => (".".to_string(), Style::default().fg(Color::DarkGray)),
             ServiceDeployPhase::Registering => {
                 let c = SPINNER[self.frame % SPINNER.len()];
                 (c.to_string(), Style::default().fg(Color::Cyan))
@@ -371,22 +363,13 @@ impl DeployView<'_> {
                 let c = SPINNER[self.frame % SPINNER.len()];
                 (c.to_string(), Style::default().fg(Color::Yellow))
             }
-            ServiceDeployPhase::Running => (
-                "v".to_string(),
-                Style::default().fg(Color::Green),
-            ),
-            ServiceDeployPhase::Failed(_) => (
-                "x".to_string(),
-                Style::default().fg(Color::Red),
-            ),
+            ServiceDeployPhase::Running => ("v".to_string(), Style::default().fg(Color::Green)),
+            ServiceDeployPhase::Failed(_) => ("x".to_string(), Style::default().fg(Color::Red)),
             ServiceDeployPhase::Stopping => {
                 let c = SPINNER[self.frame % SPINNER.len()];
                 (c.to_string(), Style::default().fg(Color::Yellow))
             }
-            ServiceDeployPhase::Stopped => (
-                "-".to_string(),
-                Style::default().fg(Color::DarkGray),
-            ),
+            ServiceDeployPhase::Stopped => ("-".to_string(), Style::default().fg(Color::DarkGray)),
         }
     }
 
@@ -617,7 +600,11 @@ mod tests {
             state.phase = phase;
             let view = DeployView::new(&state, 0);
             let (text, _style) = view.phase_display();
-            assert!(!text.is_empty(), "Phase {:?} should have display text", phase);
+            assert!(
+                !text.is_empty(),
+                "Phase {:?} should have display text",
+                phase
+            );
         }
     }
 

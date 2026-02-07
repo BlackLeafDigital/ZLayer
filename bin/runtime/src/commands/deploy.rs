@@ -435,9 +435,7 @@ pub(crate) async fn deploy_services(
     for (name, service_spec) in &spec.services {
         emit(
             &event_tx,
-            DeployEvent::ServiceDeployStarted {
-                name: name.clone(),
-            },
+            DeployEvent::ServiceDeployStarted { name: name.clone() },
         );
 
         // Register the service with ServiceManager
@@ -448,9 +446,7 @@ pub(crate) async fn deploy_services(
             Ok(()) => {
                 emit(
                     &event_tx,
-                    DeployEvent::ServiceRegistered {
-                        name: name.clone(),
-                    },
+                    DeployEvent::ServiceRegistered { name: name.clone() },
                 );
 
                 // Setup service overlay network before scaling
@@ -542,10 +538,7 @@ pub(crate) async fn deploy_services(
                 &event_tx,
                 DeployEvent::Log {
                     level: LogLevel::Info,
-                    message: format!(
-                        "  {} registered (manual scaling - 0 replicas)",
-                        name
-                    ),
+                    message: format!("  {} registered (manual scaling - 0 replicas)", name),
                 },
             );
             deployed_services.push((name.clone(), 0));
@@ -774,18 +767,14 @@ pub(crate) async fn deploy_services(
     for name in &service_names {
         emit(
             &event_tx,
-            DeployEvent::ServiceStopping {
-                name: name.clone(),
-            },
+            DeployEvent::ServiceStopping { name: name.clone() },
         );
         if let Err(e) = manager.scale_service(name, 0).await {
             warn!(service = %name, error = %e, "Failed to stop service");
         }
         emit(
             &event_tx,
-            DeployEvent::ServiceStopped {
-                name: name.clone(),
-            },
+            DeployEvent::ServiceStopped { name: name.clone() },
         );
     }
 

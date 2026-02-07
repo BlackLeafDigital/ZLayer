@@ -256,7 +256,11 @@ mod tests {
             "expected 'Multiple deployment specs found', got: {}",
             msg
         );
-        assert!(msg.contains("alpha.zlayer.yml"), "should list alpha: {}", msg);
+        assert!(
+            msg.contains("alpha.zlayer.yml"),
+            "should list alpha: {}",
+            msg
+        );
         assert!(msg.contains("beta.zlayer.yml"), "should list beta: {}", msg);
 
         cleanup(&dir);

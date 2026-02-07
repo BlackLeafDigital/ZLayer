@@ -155,16 +155,14 @@ impl DeployTui {
                             // DeploymentRunning, or foreground shutdown completed.
                             // Auto-exit the TUI.
                             if self.state.phase != DeployPhase::Complete {
-                                self.state
-                                    .apply_event(&DeployEvent::ShutdownComplete);
+                                self.state.apply_event(&DeployEvent::ShutdownComplete);
                             }
                             self.running = false;
                         }
                         DeployPhase::ShuttingDown => {
                             // Shutdown was in progress; the deploy task finished cleanup.
                             // Mark complete and auto-exit.
-                            self.state
-                                .apply_event(&DeployEvent::ShutdownComplete);
+                            self.state.apply_event(&DeployEvent::ShutdownComplete);
                             self.running = false;
                         }
                         _ => {
@@ -174,8 +172,7 @@ impl DeployTui {
                                 level: super::LogLevel::Error,
                                 message: "Deploy process ended unexpectedly".to_string(),
                             });
-                            self.state
-                                .apply_event(&DeployEvent::ShutdownComplete);
+                            self.state.apply_event(&DeployEvent::ShutdownComplete);
                             // Do NOT set self.running = false; wait for user to press q.
                         }
                     }
@@ -332,7 +329,11 @@ mod tests {
         // But should still be running - user needs to press q to acknowledge the error
         assert!(tui.running);
         // Should have an error log entry
-        assert!(tui.state.log_entries.iter().any(|e| e.message.contains("unexpectedly")));
+        assert!(tui
+            .state
+            .log_entries
+            .iter()
+            .any(|e| e.message.contains("unexpectedly")));
     }
 
     #[test]
@@ -430,7 +431,13 @@ mod tests {
 
         // Should have added a log entry about shutdown
         assert!(!tui.state.log_entries.is_empty());
-        assert!(tui.state.log_entries.last().unwrap().message.contains("Shutdown"));
+        assert!(tui
+            .state
+            .log_entries
+            .last()
+            .unwrap()
+            .message
+            .contains("Shutdown"));
         // Should still be running (waiting for completion)
         assert!(tui.running);
     }

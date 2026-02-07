@@ -1949,7 +1949,8 @@ mod tests {
 
     #[test]
     fn test_cli_detach_with_deploy() {
-        let cli = Cli::try_parse_from(["zlayer-runtime", "--detach", "deploy", "spec.yml"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "--detach", "deploy", "spec.yml"]).unwrap();
         assert!(cli.detach);
         assert!(matches!(cli.command, Commands::Deploy { .. }));
     }

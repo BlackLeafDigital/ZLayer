@@ -386,10 +386,7 @@ mod tests {
         state.apply_event(&DeployEvent::InfraPhaseStarted {
             phase: InfraPhase::Runtime,
         });
-        assert!(matches!(
-            state.infra_phases[0].1,
-            PhaseStatus::InProgress
-        ));
+        assert!(matches!(state.infra_phases[0].1, PhaseStatus::InProgress));
 
         // Complete Runtime phase
         state.apply_event(&DeployEvent::InfraPhaseComplete {
@@ -691,10 +688,7 @@ mod tests {
 
         // Running
         state.apply_event(&DeployEvent::DeploymentRunning {
-            services: vec![
-                ("postgres".to_string(), 1),
-                ("api".to_string(), 3),
-            ],
+            services: vec![("postgres".to_string(), 1), ("api".to_string(), 3)],
         });
         assert_eq!(state.phase, DeployPhase::Running);
 

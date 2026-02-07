@@ -10,9 +10,7 @@
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table};
 
-use super::state::{
-    DeployState, LogEntry, PhaseStatus, ServiceDeployPhase, ServiceState,
-};
+use super::state::{DeployState, LogEntry, PhaseStatus, ServiceDeployPhase, ServiceState};
 use super::{InfraPhase, LogLevel, ServiceHealth};
 
 /// Spinner frames for in-progress indicators
@@ -97,15 +95,19 @@ impl Widget for InfraProgress<'_> {
                         '\\' => "\\",
                         _ => ">",
                     };
-                    (s, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    (
+                        s,
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
                 }
-                PhaseStatus::Pending => (
-                    "..",
-                    Style::default().fg(Color::DarkGray),
-                ),
+                PhaseStatus::Pending => ("..", Style::default().fg(Color::DarkGray)),
                 PhaseStatus::Skipped(_) => (
                     "~",
-                    Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
                 ),
             };
 
@@ -127,7 +129,9 @@ impl Widget for InfraProgress<'_> {
                 PhaseStatus::InProgress => Style::default().fg(Color::Yellow),
                 PhaseStatus::Complete => Style::default().fg(Color::White),
                 PhaseStatus::Failed(_) => Style::default().fg(Color::Red),
-                PhaseStatus::Skipped(_) => Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+                PhaseStatus::Skipped(_) => Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
             };
 
             buf.set_string(name_x, y, &display_name, name_style);
@@ -162,10 +166,7 @@ impl Widget for ServiceTable<'_> {
         }
 
         let total = self.services.len();
-        let title = format!(
-            " Services  {}/{} deployed ",
-            self.deployed_count, total
-        );
+        let title = format!(" Services  {}/{} deployed ", self.deployed_count, total);
 
         let block = Block::default()
             .title(title)
@@ -204,12 +205,12 @@ impl Widget for ServiceTable<'_> {
             let (health_text, health_style) = health_display(&svc.health);
 
             // Progress bar for services that are actively scaling
-            let progress_str = if svc.phase == ServiceDeployPhase::Scaling && svc.target_replicas > 0
-            {
-                render_progress_bar(svc.current_replicas, svc.target_replicas, 10)
-            } else {
-                String::new()
-            };
+            let progress_str =
+                if svc.phase == ServiceDeployPhase::Scaling && svc.target_replicas > 0 {
+                    render_progress_bar(svc.current_replicas, svc.target_replicas, 10)
+                } else {
+                    String::new()
+                };
 
             let row = Row::new(vec![
                 Cell::from(indicator).style(ind_style),
@@ -233,7 +234,9 @@ fn service_indicator(phase: &ServiceDeployPhase) -> (&'static str, Style) {
         ServiceDeployPhase::Registering => ("~", Style::default().fg(Color::Yellow)),
         ServiceDeployPhase::Scaling => (
             "\u{25B6}", // ▶
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
         ServiceDeployPhase::Running => (
             "\u{2713}", // ✓
@@ -267,18 +270,9 @@ fn service_name_style(phase: &ServiceDeployPhase) -> Style {
 /// Render a health status label with appropriate color
 fn health_display(health: &ServiceHealth) -> (String, Style) {
     match health {
-        ServiceHealth::Healthy => (
-            "[healthy]".to_string(),
-            Style::default().fg(Color::Green),
-        ),
-        ServiceHealth::Degraded => (
-            "[degraded]".to_string(),
-            Style::default().fg(Color::Yellow),
-        ),
-        ServiceHealth::Unhealthy => (
-            "[unhealthy]".to_string(),
-            Style::default().fg(Color::Red),
-        ),
+        ServiceHealth::Healthy => ("[healthy]".to_string(), Style::default().fg(Color::Green)),
+        ServiceHealth::Degraded => ("[degraded]".to_string(), Style::default().fg(Color::Yellow)),
+        ServiceHealth::Unhealthy => ("[unhealthy]".to_string(), Style::default().fg(Color::Red)),
         ServiceHealth::Unknown => (
             "[unknown]".to_string(),
             Style::default().fg(Color::DarkGray),
@@ -374,18 +368,9 @@ impl Widget for LogPane<'_> {
 
             // Level prefix and style
             let (prefix, style) = match entry.level {
-                LogLevel::Info => (
-                    "[INFO] ",
-                    Style::default().fg(Color::DarkGray),
-                ),
-                LogLevel::Warn => (
-                    "[WARN] ",
-                    Style::default().fg(Color::Yellow),
-                ),
-                LogLevel::Error => (
-                    "[ERROR] ",
-                    Style::default().fg(Color::Red),
-                ),
+                LogLevel::Info => ("[INFO] ", Style::default().fg(Color::DarkGray)),
+                LogLevel::Warn => ("[WARN] ", Style::default().fg(Color::Yellow)),
+                LogLevel::Error => ("[ERROR] ", Style::default().fg(Color::Red)),
             };
 
             // Render prefix
@@ -453,9 +438,9 @@ pub fn render_deploy_view(state: &DeployState, tick: usize, area: Rect, buf: &mu
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(infra_height + 2), // infra + border
+            Constraint::Length(infra_height + 2),  // infra + border
             Constraint::Length(service_count + 2), // services + border
-            Constraint::Min(5),                   // logs (flexible)
+            Constraint::Min(5),                    // logs (flexible)
             Constraint::Length(1),                 // footer
         ])
         .split(area);
@@ -530,7 +515,10 @@ mod tests {
 
         let phases = vec![
             (InfraPhase::Runtime, PhaseStatus::Complete),
-            (InfraPhase::Overlay, PhaseStatus::Failed("no wg".to_string())),
+            (
+                InfraPhase::Overlay,
+                PhaseStatus::Failed("no wg".to_string()),
+            ),
             (InfraPhase::Dns, PhaseStatus::InProgress),
             (InfraPhase::Proxy, PhaseStatus::Pending),
             (InfraPhase::Supervisor, PhaseStatus::Pending),

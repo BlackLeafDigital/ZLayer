@@ -251,9 +251,7 @@ impl ServiceInstance {
                         // Register backend with load balancer so proxy can route to it.
                         // This must happen before the health callback is created, because
                         // update_backend_health only updates *existing* backends.
-                        proxy
-                            .add_backend(&self.service_name, backend_addr)
-                            .await;
+                        proxy.add_backend(&self.service_name, backend_addr).await;
 
                         let health_callback: HealthCallback =
                             Arc::new(move |container_id: ContainerId, is_healthy: bool| {
