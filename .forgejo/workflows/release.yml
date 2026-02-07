@@ -110,7 +110,7 @@ jobs:
           mkdir -p artifacts
 
           pids=()
-          for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64 zlayer-build-linux-amd64 zlayer-build-linux-arm64 zlayer-build-darwin-amd64 zlayer-build-darwin-arm64 zlayer-cli-linux-amd64 zlayer-cli-linux-arm64 zlayer-cli-darwin-amd64 zlayer-cli-darwin-arm64; do
+          for name in zlayer-runtime-linux-amd64 zlayer-runtime-linux-arm64 zlayer-runtime-darwin-amd64 zlayer-runtime-darwin-arm64 zlayer-build-linux-amd64 zlayer-build-linux-arm64 zlayer-build-darwin-amd64 zlayer-build-darwin-arm64 zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64; do
             (
               echo "Downloading ${name}.tar.gz..."
               curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
@@ -545,9 +545,9 @@ jobs:
 
           | Binary | Linux | macOS |
           |--------|-------|-------|
-          | `zlayer-cli` | [amd64](${PACKAGES_URL}/zlayer-cli-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-cli-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-cli-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-cli-darwin-arm64.tar.gz) |
+          | `zlayer` (CLI) | [amd64](${PACKAGES_URL}/zlayer-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-darwin-arm64.tar.gz) |
           | `zlayer-build` | [amd64](${PACKAGES_URL}/zlayer-build-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-build-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-build-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-build-darwin-arm64.tar.gz) |
-          | `zlayer` | [amd64](${PACKAGES_URL}/zlayer-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-darwin-arm64.tar.gz) |
+          | `zlayer-runtime` | [amd64](${PACKAGES_URL}/zlayer-runtime-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-runtime-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-runtime-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-runtime-darwin-arm64.tar.gz) |
 
           ### Container Images
 

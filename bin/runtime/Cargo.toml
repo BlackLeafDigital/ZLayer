@@ -8,7 +8,7 @@ rust-version.workspace = true
 description = "ZLayer container orchestration runtime"
 
 [[bin]]
-name = "zlayer"
+name = "zlayer-runtime"
 path = "src/main.rs"
 
 [features]

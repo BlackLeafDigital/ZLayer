@@ -10598,6 +10598,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "zlayer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap 4.5.56",
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "zlayer-builder",
+ "zlayer-spec",
+]
+
+[[package]]
 name = "zlayer-agent"
 version = "0.1.0"
 dependencies = [
@@ -10717,23 +10734,6 @@ dependencies = [
  "tokio",
  "tracing",
  "zlayer-registry",
-]
-
-[[package]]
-name = "zlayer-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap 4.5.56",
- "crossterm",
- "ratatui",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "zlayer-builder",
- "zlayer-spec",
 ]
 
 [[package]]

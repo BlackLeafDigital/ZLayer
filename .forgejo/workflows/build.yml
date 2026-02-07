@@ -34,12 +34,12 @@ jobs:
       - name: Build
         run: cargo build --release --package runtime --features "docker,wasm"
       - name: Package
-        run: tar czf "zlayer-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer
+        run: tar czf "zlayer-runtime-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer-runtime
       - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-linux-amd64
-          path: zlayer-linux-amd64.tar.gz
+          name: zlayer-runtime-linux-amd64
+          path: zlayer-runtime-linux-amd64.tar.gz
           retention-days: 1
       - name: Build zlayer-build
         run: cargo build --release --package zlayer-build
@@ -51,18 +51,18 @@ jobs:
           name: zlayer-build-linux-amd64
           path: zlayer-build-linux-amd64.tar.gz
           retention-days: 1
-      - name: Build zlayer-cli
-        run: cargo build --release --package zlayer-cli
-      - name: Package zlayer-cli
-        run: tar czf "zlayer-cli-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer-cli
-      - name: Upload zlayer-cli artifact
+      - name: Build zlayer
+        run: cargo build --release --package zlayer
+      - name: Package zlayer
+        run: tar czf "zlayer-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer
+      - name: Upload zlayer artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-cli-linux-amd64
-          path: zlayer-cli-linux-amd64.tar.gz
+          name: zlayer-linux-amd64
+          path: zlayer-linux-amd64.tar.gz
           retention-days: 1
       - name: Cleanup
-        run: rm -rf $CARGO_TARGET_DIR zlayer-linux-amd64.tar.gz zlayer-build-linux-amd64.tar.gz zlayer-cli-linux-amd64.tar.gz
+        run: rm -rf $CARGO_TARGET_DIR zlayer-runtime-linux-amd64.tar.gz zlayer-build-linux-amd64.tar.gz zlayer-linux-amd64.tar.gz
 
   # ===========================================
   # Build container images using pipeline - EARLY
@@ -85,14 +85,14 @@ jobs:
           name: zlayer-build-linux-amd64
       - name: Install zlayer-build
         run: tar xzf zlayer-build-linux-amd64.tar.gz && chmod +x zlayer-build && sudo mv zlayer-build /usr/local/bin/
-      - name: Download zlayer binary (for zlayer-node image)
+      - name: Download zlayer-runtime binary (for zlayer-node image)
         uses: actions/download-artifact@v3
         with:
-          name: zlayer-linux-amd64
-      - name: Prepare zlayer binary for node image
+          name: zlayer-runtime-linux-amd64
+      - name: Prepare zlayer-runtime binary for node image
         run: |
           mkdir -p target/release
-          tar xzf zlayer-linux-amd64.tar.gz -C target/release/
+          tar xzf zlayer-runtime-linux-amd64.tar.gz -C target/release/
       - name: Build all images with pipeline
         run: |
           sudo zlayer-build pipeline \
@@ -143,12 +143,12 @@ jobs:
       - name: Build
         run: cross build --release --target aarch64-unknown-linux-gnu --package runtime --features "docker,wasm" --target-dir $CROSS_TARGET_DIR
       - name: Package
-        run: tar czf "zlayer-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer
+        run: tar czf "zlayer-runtime-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer-runtime
       - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-linux-arm64
-          path: zlayer-linux-arm64.tar.gz
+          name: zlayer-runtime-linux-arm64
+          path: zlayer-runtime-linux-arm64.tar.gz
           retention-days: 1
       - name: Build zlayer-build
         run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer-build --target-dir $CROSS_TARGET_DIR
@@ -160,18 +160,18 @@ jobs:
           name: zlayer-build-linux-arm64
           path: zlayer-build-linux-arm64.tar.gz
           retention-days: 1
-      - name: Build zlayer-cli
-        run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer-cli --target-dir $CROSS_TARGET_DIR
-      - name: Package zlayer-cli
-        run: tar czf "zlayer-cli-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer-cli
-      - name: Upload zlayer-cli artifact
+      - name: Build zlayer
+        run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer --target-dir $CROSS_TARGET_DIR
+      - name: Package zlayer
+        run: tar czf "zlayer-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer
+      - name: Upload zlayer artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-cli-linux-arm64
-          path: zlayer-cli-linux-arm64.tar.gz
+          name: zlayer-linux-arm64
+          path: zlayer-linux-arm64.tar.gz
           retention-days: 1
       - name: Cleanup
-        run: rm -rf $CROSS_TARGET_DIR zlayer-linux-arm64.tar.gz zlayer-build-linux-arm64.tar.gz zlayer-cli-linux-arm64.tar.gz
+        run: rm -rf $CROSS_TARGET_DIR zlayer-runtime-linux-arm64.tar.gz zlayer-build-linux-arm64.tar.gz zlayer-linux-arm64.tar.gz
 
   # ===========================================
   # Build macOS amd64
@@ -209,12 +209,12 @@ jobs:
       - name: Build
         run: cargo build --release --target x86_64-apple-darwin --package runtime --features "docker,wasm"
       - name: Package
-        run: tar czf "zlayer-darwin-amd64.tar.gz" -C $CARGO_TARGET_DIR/x86_64-apple-darwin/release zlayer
+        run: tar czf "zlayer-runtime-darwin-amd64.tar.gz" -C $CARGO_TARGET_DIR/x86_64-apple-darwin/release zlayer-runtime
       - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-darwin-amd64
-          path: zlayer-darwin-amd64.tar.gz
+          name: zlayer-runtime-darwin-amd64
+          path: zlayer-runtime-darwin-amd64.tar.gz
           retention-days: 1
       - name: Build zlayer-build
         run: cargo build --release --target x86_64-apple-darwin --package zlayer-build
@@ -226,18 +226,18 @@ jobs:
           name: zlayer-build-darwin-amd64
           path: zlayer-build-darwin-amd64.tar.gz
           retention-days: 1
-      - name: Build zlayer-cli
-        run: cargo build --release --target x86_64-apple-darwin --package zlayer-cli
-      - name: Package zlayer-cli
-        run: tar czf "zlayer-cli-darwin-amd64.tar.gz" -C $CARGO_TARGET_DIR/x86_64-apple-darwin/release zlayer-cli
-      - name: Upload zlayer-cli artifact
+      - name: Build zlayer
+        run: cargo build --release --target x86_64-apple-darwin --package zlayer
+      - name: Package zlayer
+        run: tar czf "zlayer-darwin-amd64.tar.gz" -C $CARGO_TARGET_DIR/x86_64-apple-darwin/release zlayer
+      - name: Upload zlayer artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-cli-darwin-amd64
-          path: zlayer-cli-darwin-amd64.tar.gz
+          name: zlayer-darwin-amd64
+          path: zlayer-darwin-amd64.tar.gz
           retention-days: 1
       - name: Cleanup
-        run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-amd64.tar.gz zlayer-build-darwin-amd64.tar.gz zlayer-cli-darwin-amd64.tar.gz
+        run: rm -rf $CARGO_TARGET_DIR zlayer-runtime-darwin-amd64.tar.gz zlayer-build-darwin-amd64.tar.gz zlayer-darwin-amd64.tar.gz
 
   # ===========================================
   # Build macOS arm64
@@ -263,12 +263,12 @@ jobs:
       - name: Build
         run: cargo build --release --target aarch64-apple-darwin --package runtime --features "docker,wasm"
       - name: Package
-        run: tar czf "zlayer-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer
+        run: tar czf "zlayer-runtime-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer-runtime
       - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-darwin-arm64
-          path: zlayer-darwin-arm64.tar.gz
+          name: zlayer-runtime-darwin-arm64
+          path: zlayer-runtime-darwin-arm64.tar.gz
           retention-days: 1
       - name: Build zlayer-build
         run: cargo build --release --target aarch64-apple-darwin --package zlayer-build
@@ -280,18 +280,18 @@ jobs:
           name: zlayer-build-darwin-arm64
           path: zlayer-build-darwin-arm64.tar.gz
           retention-days: 1
-      - name: Build zlayer-cli
-        run: cargo build --release --target aarch64-apple-darwin --package zlayer-cli
-      - name: Package zlayer-cli
-        run: tar czf "zlayer-cli-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer-cli
-      - name: Upload zlayer-cli artifact
+      - name: Build zlayer
+        run: cargo build --release --target aarch64-apple-darwin --package zlayer
+      - name: Package zlayer
+        run: tar czf "zlayer-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer
+      - name: Upload zlayer artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-cli-darwin-arm64
-          path: zlayer-cli-darwin-arm64.tar.gz
+          name: zlayer-darwin-arm64
+          path: zlayer-darwin-arm64.tar.gz
           retention-days: 1
       - name: Cleanup
-        run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-arm64.tar.gz zlayer-build-darwin-arm64.tar.gz zlayer-cli-darwin-arm64.tar.gz
+        run: rm -rf $CARGO_TARGET_DIR zlayer-runtime-darwin-arm64.tar.gz zlayer-build-darwin-arm64.tar.gz zlayer-darwin-arm64.tar.gz
 
   # ===========================================
   # Verify all builds passed

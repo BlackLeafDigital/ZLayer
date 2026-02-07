@@ -516,6 +516,37 @@ pub struct ResourcesSpec {
     #[serde(default)]
     #[validate(custom(function = "crate::validate::validate_memory_option_wrapper"))]
     pub memory: Option<String>,
+
+    /// GPU resource request
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuSpec>,
+}
+
+/// GPU resource specification
+///
+/// Supported vendors:
+/// - `nvidia` - NVIDIA GPUs via NVIDIA Container Toolkit (default)
+/// - `amd` - AMD GPUs via ROCm (/dev/kfd + /dev/dri/renderD*)
+/// - `intel` - Intel GPUs via VAAPI/i915 (/dev/dri/renderD*)
+///
+/// Unknown vendors fall back to DRI render node passthrough.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct GpuSpec {
+    /// Number of GPUs to request
+    #[serde(default = "default_gpu_count")]
+    pub count: u32,
+    /// GPU vendor (`nvidia`, `amd`, `intel`) - defaults to `nvidia`
+    #[serde(default = "default_gpu_vendor")]
+    pub vendor: String,
+}
+
+fn default_gpu_count() -> u32 {
+    1
+}
+
+fn default_gpu_vendor() -> String {
+    "nvidia".to_string()
 }
 
 /// Network configuration

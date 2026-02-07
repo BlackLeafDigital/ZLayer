@@ -951,8 +951,14 @@ mod tests {
 
     #[test]
     fn test_cli_node_init_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "init", "--advertise-addr", "10.0.0.1"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "zlayer-runtime",
+            "node",
+            "init",
+            "--advertise-addr",
+            "10.0.0.1",
+        ])
+        .unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Init {
@@ -1078,7 +1084,7 @@ mod tests {
 
     #[test]
     fn test_cli_node_list_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "list"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::List { output }) => {
@@ -1090,7 +1096,8 @@ mod tests {
 
     #[test]
     fn test_cli_node_list_command_json() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "list", "--output", "json"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "node", "list", "--output", "json"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::List { output }) => {
@@ -1102,7 +1109,7 @@ mod tests {
 
     #[test]
     fn test_cli_node_status_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "status"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Status { node_id }) => {
@@ -1114,7 +1121,8 @@ mod tests {
 
     #[test]
     fn test_cli_node_status_command_with_id() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "status", "node-abc-123"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "node", "status", "node-abc-123"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Status { node_id }) => {
@@ -1126,7 +1134,7 @@ mod tests {
 
     #[test]
     fn test_cli_node_remove_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "remove", "node-123"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "remove", "node-123"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Remove { node_id, force }) => {
@@ -1139,7 +1147,8 @@ mod tests {
 
     #[test]
     fn test_cli_node_remove_command_force() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "remove", "--force", "node-123"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "remove", "--force", "node-123"])
+            .unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Remove { node_id, force }) => {

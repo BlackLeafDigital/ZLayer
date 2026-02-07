@@ -28,4 +28,4 @@ RUN cargo build --release --package runtime
 
 # Output binaries to a known location for extraction
 RUN mkdir -p /output && \
-    cp target/release/zlayer /output/
+    cp target/release/zlayer-runtime /output/

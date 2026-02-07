@@ -7,7 +7,7 @@ use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
 use crate::runtime::{ContainerId, ContainerState, Runtime};
 use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::models::{ContainerCreateBody, HostConfig, PortBinding};
+use bollard::models::{ContainerCreateBody, DeviceMapping, DeviceRequest, HostConfig, PortBinding};
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, LogsOptions, RemoveContainerOptions,
     StartContainerOptions, StatsOptions, StopContainerOptions, WaitContainerOptions,
@@ -123,11 +123,123 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
     // Build CPU limit (Docker uses nano-CPUs: 1 CPU = 1e9 nano-CPUs)
     let nano_cpus = spec.resources.cpu.map(|c| (c * 1_000_000_000.0) as i64);
 
+    // Build device mappings from spec.devices
+    let mut devices: Vec<DeviceMapping> = spec
+        .devices
+        .iter()
+        .map(|d| {
+            let mut permissions = String::new();
+            if d.read {
+                permissions.push('r');
+            }
+            if d.write {
+                permissions.push('w');
+            }
+            if d.mknod {
+                permissions.push('m');
+            }
+            if permissions.is_empty() {
+                permissions = "rw".to_string();
+            }
+            DeviceMapping {
+                path_on_host: Some(d.path.clone()),
+                path_in_container: Some(d.path.clone()),
+                cgroup_permissions: Some(permissions),
+            }
+        })
+        .collect();
+
+    // Build GPU device requests/mappings when spec.resources.gpu is set
+    // NVIDIA uses Docker's device_requests (NVIDIA Container Toolkit),
+    // AMD/Intel use raw device passthrough since Docker has no native plugin for them.
+    let mut device_requests: Option<Vec<DeviceRequest>> = None;
+    if let Some(ref gpu) = spec.resources.gpu {
+        match gpu.vendor.as_str() {
+            "nvidia" => {
+                // NVIDIA Container Toolkit handles this via device_requests
+                device_requests = Some(vec![DeviceRequest {
+                    driver: Some("nvidia".into()),
+                    count: Some(gpu.count as i64),
+                    capabilities: Some(vec![vec!["gpu".into()]]),
+                    ..Default::default()
+                }]);
+            }
+            "amd" => {
+                // AMD ROCm - pass through devices directly
+                devices.push(DeviceMapping {
+                    path_on_host: Some("/dev/kfd".into()),
+                    path_in_container: Some("/dev/kfd".into()),
+                    cgroup_permissions: Some("rwm".into()),
+                });
+                for i in 0..gpu.count {
+                    let render_path = format!("/dev/dri/renderD{}", 128 + i);
+                    devices.push(DeviceMapping {
+                        path_on_host: Some(render_path.clone()),
+                        path_in_container: Some(render_path),
+                        cgroup_permissions: Some("rwm".into()),
+                    });
+                    let card_path = format!("/dev/dri/card{}", i);
+                    devices.push(DeviceMapping {
+                        path_on_host: Some(card_path.clone()),
+                        path_in_container: Some(card_path),
+                        cgroup_permissions: Some("rwm".into()),
+                    });
+                }
+            }
+            "intel" => {
+                // Intel GPU - pass through DRI devices
+                for i in 0..gpu.count {
+                    let render_path = format!("/dev/dri/renderD{}", 128 + i);
+                    devices.push(DeviceMapping {
+                        path_on_host: Some(render_path.clone()),
+                        path_in_container: Some(render_path),
+                        cgroup_permissions: Some("rwm".into()),
+                    });
+                    let card_path = format!("/dev/dri/card{}", i);
+                    devices.push(DeviceMapping {
+                        path_on_host: Some(card_path.clone()),
+                        path_in_container: Some(card_path),
+                        cgroup_permissions: Some("rwm".into()),
+                    });
+                }
+            }
+            other => {
+                // Unknown vendor - try DRI render nodes as default
+                tracing::warn!(
+                    vendor = %other,
+                    "Unknown GPU vendor for Docker, attempting DRI device passthrough"
+                );
+                for i in 0..gpu.count {
+                    let render_path = format!("/dev/dri/renderD{}", 128 + i);
+                    devices.push(DeviceMapping {
+                        path_on_host: Some(render_path.clone()),
+                        path_in_container: Some(render_path),
+                        cgroup_permissions: Some("rwm".into()),
+                    });
+                }
+            }
+        }
+    }
+
+    // Build Linux capabilities to add
+    let cap_add = if spec.capabilities.is_empty() {
+        None
+    } else {
+        Some(spec.capabilities.clone())
+    };
+
     HostConfig {
         port_bindings: Some(port_bindings),
         privileged: Some(spec.privileged),
         memory,
         nano_cpus,
+        devices: if devices.is_empty() {
+            None
+        } else {
+            Some(devices)
+        },
+        device_requests,
+        cap_add,
         ..Default::default()
     }
 }

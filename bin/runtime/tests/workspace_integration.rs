@@ -7,7 +7,7 @@ use std::process::Command;
 /// Test that the runtime binary has expected commands
 #[test]
 fn test_runtime_help() {
-    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer-runtime"))
         .args(["--help"])
         .output()
         .expect("Failed to run zlayer");
@@ -21,7 +21,7 @@ fn test_runtime_help() {
 /// Test that runtime has feature-gated commands when built with full features
 #[test]
 fn test_runtime_full_features_help() {
-    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer-runtime"))
         .args(["--help"])
         .output()
         .expect("Failed to run zlayer");
@@ -45,7 +45,7 @@ fn test_runtime_full_features_help() {
 /// Test that runtime status command works
 #[test]
 fn test_runtime_status() {
-    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer-runtime"))
         .args(["status"])
         .output()
         .expect("Failed to run zlayer status");
@@ -62,7 +62,7 @@ fn test_runtime_status() {
 /// Test that zlayer token info command works
 #[test]
 fn test_zlayer_token_info() {
-    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer-runtime"))
         .args(["token", "info"])
         .output()
         .expect("Failed to run zlayer token info");
@@ -76,7 +76,7 @@ fn test_zlayer_token_info() {
 /// Test that zlayer can create tokens
 #[test]
 fn test_zlayer_token_create() {
-    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer-runtime"))
         .args([
             "token",
             "create",
@@ -108,7 +108,7 @@ fn test_zlayer_token_create() {
 /// Test that zlayer can generate join tokens
 #[test]
 fn test_zlayer_generate_join_token() {
-    let output = Command::new(env!("CARGO_BIN_EXE_zlayer"))
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer-runtime"))
         .args([
             "node",
             "generate-join-token",

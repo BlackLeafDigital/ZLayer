@@ -247,7 +247,8 @@ async fn create_auto_runtime() -> Result<Arc<dyn Runtime + Send + Sync>> {
     #[cfg(all(target_os = "linux", feature = "docker"))]
     {
         Err(AgentError::Configuration(
-            "Bundled libcontainer runtime failed to initialize and Docker daemon is not available.".to_string(),
+            "Bundled libcontainer runtime failed to initialize and Docker daemon is not available."
+                .to_string(),
         ))
     }
 

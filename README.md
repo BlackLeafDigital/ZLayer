@@ -118,9 +118,9 @@ crates/
 └── zlayer-core/    # Shared types and configuration
 
 bin/
-├── runtime/        # Main zlayer binary (full orchestration runtime)
+├── runtime/        # zlayer-runtime binary (full orchestration runtime)
 ├── zlayer-build/   # Lightweight builder CLI
-└── zlayer-cli/     # Interactive TUI for image building
+└── zlayer/         # Main zlayer CLI (interactive TUI + runtime passthrough)
 ```
 
 ## Requirements
@@ -155,11 +155,11 @@ Download the latest release for your architecture:
 ```bash
 # For amd64 (latest)
 curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-linux-amd64.tar.gz | tar xz
-sudo mv zlayer /usr/local/bin/
+sudo mv zlayer zlayer-runtime /usr/local/bin/
 
 # For arm64 (latest)
 curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-linux-arm64.tar.gz | tar xz
-sudo mv zlayer /usr/local/bin/
+sudo mv zlayer zlayer-runtime /usr/local/bin/
 ```
 
 Or pin to a specific version:
@@ -193,13 +193,13 @@ See [bin/zlayer-build/README.md](./bin/zlayer-build/README.md) for full usage de
 
 ### Interactive TUI
 
-`zlayer-cli` provides the same build capabilities as `zlayer-build` but with a menu-driven terminal interface:
+The `zlayer` CLI provides the same build capabilities as `zlayer-build` but with a menu-driven terminal interface, plus runtime command passthrough to `zlayer-runtime` when available:
 
 ```bash
-python3 install.py --binary zlayer-cli
+python3 install.py --binary zlayer
 ```
 
-See [bin/zlayer-cli/README.md](./bin/zlayer-cli/README.md) for details.
+See [bin/zlayer/README.md](./bin/zlayer/README.md) for details.
 
 ### From Source
 
@@ -211,19 +211,19 @@ cd ZLayer
 # Install dependencies (Ubuntu/Debian)
 sudo apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config cmake
 
-# Build release binary (full runtime)
+# Build release binary (full runtime, produces zlayer-runtime)
 cargo build --release --package runtime
 
 # Build just the lightweight builder
 cargo build --release -p zlayer-build
 
-# Build the interactive TUI
-cargo build --release -p zlayer-cli
+# Build the main CLI (produces zlayer)
+cargo build --release -p zlayer
 
 # Install whichever binaries you need
-sudo cp target/release/zlayer /usr/local/bin/
+sudo cp target/release/zlayer-runtime /usr/local/bin/
 sudo cp target/release/zlayer-build /usr/local/bin/
-sudo cp target/release/zlayer-cli /usr/local/bin/
+sudo cp target/release/zlayer /usr/local/bin/
 ```
 
 ## Quick Start
