@@ -106,25 +106,56 @@ jobs:
       - name: Download artifacts from temp storage
         run: |
           BASE_URL="${{ inputs.artifact_base_url }}"
+          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
           mkdir -p artifacts
 
+          pids=()
           for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64 zlayer-build-linux-amd64 zlayer-build-linux-arm64 zlayer-build-darwin-amd64 zlayer-build-darwin-arm64 zlayer-cli-linux-amd64 zlayer-cli-linux-arm64 zlayer-cli-darwin-amd64 zlayer-cli-darwin-arm64; do
-            echo "Downloading ${name}.tar.gz from temp storage..."
-            curl -L --fail \
-              --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-              -o "artifacts/${name}.tar.gz" \
-              "${BASE_URL}/${name}.tar.gz"
+            (
+              echo "Downloading ${name}.tar.gz..."
+              curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
+                --user "$AUTH" \
+                -o "artifacts/${name}.tar.gz" \
+                "${BASE_URL}/${name}.tar.gz" \
+                && echo "OK ${name}.tar.gz" \
+                || { echo "FAIL ${name}.tar.gz"; exit 1; }
+            ) &
+            pids+=($!)
+          done
+          for pid in "${pids[@]}"; do
+            wait $pid || exit 1
           done
 
       - name: Upload to Forgejo Packages
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
+          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
+          PKG_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
+
+          pids=()
           for artifact in artifacts/*.tar.gz; do
             filename=$(basename "$artifact")
-            echo "Uploading $filename to final location..."
-            curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-              --upload-file "$artifact" \
-              "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${filename}"
+            (
+              local_size=$(stat -c%s "$artifact")
+              remote_size=$(curl -sI --user "$AUTH" "${PKG_URL}/${filename}" 2>/dev/null \
+                | grep -i content-length | tail -1 | tr -dc '0-9')
+              if [ -n "$remote_size" ] && [ "$remote_size" = "$local_size" ]; then
+                echo "= Skipping $filename (already uploaded)"
+              else
+                [ -n "$remote_size" ] && curl -s -X DELETE --user "$AUTH" "${PKG_URL}/${filename}" || true
+                echo "Uploading $filename..."
+                curl --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 10 \
+                  --user "$AUTH" \
+                  --upload-file "$artifact" \
+                  "${PKG_URL}/${filename}" \
+                  && echo "OK $filename" \
+                  || { echo "FAIL $filename"; exit 1; }
+              fi
+            ) &
+            pids+=($!)
+          done
+          for pid in "${pids[@]}"; do
+            wait $pid || exit 1
           done
 
   # ===========================================
@@ -382,11 +413,21 @@ jobs:
 
       - name: Download pre-built image archives
         run: |
+          pids=()
           for img in zlayer-node zlayer-web zlayer-manager; do
-            echo "Downloading ${img}-oci.tar..."
-            curl -fsSL "${{ inputs.artifact_base_url }}/${img}-oci.tar" \
-              --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-              -o ${img}-oci.tar
+            (
+              echo "Downloading ${img}-oci.tar..."
+              curl -fsSL --max-time 600 --connect-timeout 30 --retry 3 --retry-delay 5 \
+                "${{ inputs.artifact_base_url }}/${img}-oci.tar" \
+                --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
+                -o ${img}-oci.tar \
+                && echo "OK ${img}-oci.tar downloaded" \
+                || echo "FAIL ${img}-oci.tar download failed"
+            ) &
+            pids+=($!)
+          done
+          for pid in "${pids[@]}"; do
+            wait $pid || exit 1
           done
 
       - name: Login to Docker Hub
@@ -431,11 +472,41 @@ jobs:
       - name: Upload image archives to Forgejo Packages
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
+          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
+          PKG_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
+
+          upload_with_skip() {
+            local file="$1"
+            local url="$2"
+            local filename=$(basename "$file")
+            local local_size=$(stat -c%s "$file")
+
+            # Check if already fully uploaded
+            remote_size=$(curl -sI --user "$AUTH" "$url" 2>/dev/null \
+              | grep -i content-length | tail -1 | tr -dc '0-9')
+            if [ -n "$remote_size" ] && [ "$remote_size" = "$local_size" ]; then
+              echo "= Skipping $filename (already uploaded, ${local_size} bytes)"
+              return 0
+            elif [ -n "$remote_size" ]; then
+              echo "~ Size mismatch for $filename, re-uploading..."
+              curl -s -X DELETE --user "$AUTH" "$url" || true
+              sleep 1
+            fi
+
+            echo "Uploading $filename (${local_size} bytes)..."
+            curl --fail --max-time 600 --connect-timeout 30 --retry 3 --retry-delay 10 \
+              --user "$AUTH" \
+              --upload-file "$file" \
+              "$url" && echo "OK $filename uploaded"
+          }
+
+          pids=()
           for img in zlayer-node zlayer-web zlayer-manager; do
-            echo "Uploading ${img}-${VERSION}-oci.tar..."
-            curl --fail --user "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" \
-              --upload-file "${img}-${VERSION}-oci.tar" \
-              "https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}/${img}-${VERSION}-oci.tar"
+            upload_with_skip "${img}-${VERSION}-oci.tar" "${PKG_URL}/${img}-${VERSION}-oci.tar" &
+            pids+=($!)
+          done
+          for pid in "${pids[@]}"; do
+            wait $pid || exit 1
           done
 
   # ===========================================

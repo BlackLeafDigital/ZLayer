@@ -336,89 +336,102 @@ jobs:
           BASE_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-temp/${RUN_ID}"
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
 
-          # Resilient upload function with retry, timeout, and conflict handling
-          upload_with_retry() {
+          # Upload a single file with retry, skip if already fully uploaded
+          upload_file() {
             local file="$1"
             local url="$2"
+            local filename=$(basename "$file")
+            local local_size=$(stat -c%s "$file")
             local max_retries=5
             local retry=0
             local backoff=5
 
-            while [ $retry -lt $max_retries ]; do
-              echo "Uploading $(basename "$file") (attempt $((retry + 1))/$max_retries)..."
+            # Check if file already exists with same size (fully uploaded)
+            remote_size=$(curl -sI --user "$AUTH" "$url" 2>/dev/null \
+              | grep -i content-length | tail -1 | tr -dc '0-9')
+            if [ -n "$remote_size" ] && [ "$remote_size" = "$local_size" ]; then
+              echo "= Skipping $filename (already uploaded, ${local_size} bytes)"
+              return 0
+            elif [ -n "$remote_size" ]; then
+              echo "~ Size mismatch for $filename (local=${local_size}, remote=${remote_size}), re-uploading..."
+              curl -s -X DELETE --user "$AUTH" "$url" || true
+              sleep 1
+            fi
 
-              # Try upload with timeout (5 min for large files)
+            while [ $retry -lt $max_retries ]; do
+              echo "Uploading $filename (attempt $((retry + 1))/$max_retries, ${local_size} bytes)..."
               http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-                --max-time 300 \
+                --max-time 600 \
                 --connect-timeout 30 \
-                --retry 3 \
-                --retry-delay 5 \
                 --user "$AUTH" \
                 --upload-file "$file" \
                 "$url" 2>/dev/null) || http_code="000"
 
               case "$http_code" in
                 200|201)
-                  echo "✓ Successfully uploaded $(basename "$file")"
+                  echo "OK $filename uploaded"
                   return 0
                   ;;
                 409)
-                  echo "File already exists (409), attempting to delete and re-upload..."
-                  # Try to delete existing file
+                  echo "409 conflict for $filename, deleting and retrying..."
                   curl -s -X DELETE --user "$AUTH" "$url" || true
                   sleep 2
-                  # Retry upload after delete
-                  http_code=$(curl -s -o /dev/null -w "%{http_code}" \
-                    --max-time 300 \
-                    --connect-timeout 30 \
-                    --user "$AUTH" \
-                    --upload-file "$file" \
-                    "$url" 2>/dev/null) || http_code="000"
-
-                  if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
-                    echo "✓ Successfully uploaded $(basename "$file") after delete"
-                    return 0
-                  fi
                   ;;
-                000)
-                  echo "Connection failed or timed out"
-                  ;;
-                *)
-                  echo "Upload failed with HTTP $http_code"
-                  ;;
+                000) echo "Connection failed or timed out for $filename" ;;
+                *)   echo "Upload failed for $filename with HTTP $http_code" ;;
               esac
 
               retry=$((retry + 1))
               if [ $retry -lt $max_retries ]; then
-                echo "Retrying in ${backoff}s..."
+                echo "Retrying $filename in ${backoff}s..."
                 sleep $backoff
                 backoff=$((backoff * 2))
               fi
             done
 
-            echo "✗ Failed to upload $(basename "$file") after $max_retries attempts"
+            echo "FAIL: $filename after $max_retries attempts"
             return 1
           }
 
-          failed=0
-
-          # Upload binary artifacts
+          # Collect all files to upload
+          files=()
           for artifact in artifacts/zlayer-*/*.tar.gz; do
-            [ -f "$artifact" ] || continue
-            filename=$(basename "$artifact")
-            if ! upload_with_retry "$artifact" "${BASE_URL}/${filename}"; then
-              failed=1
-            fi
+            [ -f "$artifact" ] && files+=("$artifact")
+          done
+          for archive in artifacts/container-images/*.tar; do
+            [ -f "$archive" ] && files+=("$archive")
           done
 
-          # Upload container image archives
-          for archive in artifacts/container-images/*.tar; do
-            [ -f "$archive" ] || continue
-            filename=$(basename "$archive")
-            if ! upload_with_retry "$archive" "${BASE_URL}/${filename}"; then
+          # Upload all files in parallel
+          pids=()
+          results_dir=$(mktemp -d)
+          for file in "${files[@]}"; do
+            filename=$(basename "$file")
+            (
+              if upload_file "$file" "${BASE_URL}/${filename}"; then
+                touch "${results_dir}/${filename}.ok"
+              else
+                touch "${results_dir}/${filename}.fail"
+              fi
+            ) &
+            pids+=($!)
+          done
+
+          # Wait for all uploads to finish
+          for pid in "${pids[@]}"; do
+            wait $pid || true
+          done
+
+          # Check results
+          failed=0
+          for file in "${files[@]}"; do
+            filename=$(basename "$file")
+            if [ -f "${results_dir}/${filename}.fail" ]; then
+              echo "::error::Failed to upload ${filename}"
               failed=1
             fi
           done
+          rm -rf "$results_dir"
 
           if [ $failed -ne 0 ]; then
             echo "::error::Some uploads failed"
