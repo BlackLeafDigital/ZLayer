@@ -13,8 +13,8 @@ REPO="BlackLeafDigital/ZLayer"
 COMPONENT="${ZLAYER_COMPONENT:-cli}"
 
 case "$COMPONENT" in
-    cli)      BINARY="zlayer-cli" ;;
-    runtime)  BINARY="zlayer" ;;
+    cli)      BINARY="zlayer" ;;
+    runtime)  BINARY="zlayer-runtime" ;;
     build)    BINARY="zlayer-build" ;;
     *)
         echo "Error: Unknown component '$COMPONENT'. Use: cli, runtime, or build" >&2
@@ -118,7 +118,7 @@ esac
 
 echo ""
 case "$BINARY" in
-    zlayer-cli) echo "Run 'zlayer-cli' to start." ;;
-    zlayer)     echo "Run 'zlayer --help' for commands." ;;
-    zlayer-build) echo "Run 'zlayer-build --help' for commands." ;;
+    zlayer)         echo "Run 'zlayer --help' to start." ;;
+    zlayer-runtime) echo "Run 'zlayer-runtime --help' for commands." ;;
+    zlayer-build)   echo "Run 'zlayer-build --help' for commands." ;;
 esac
