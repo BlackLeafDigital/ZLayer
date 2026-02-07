@@ -10598,6 +10598,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "zlayer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap 4.5.56",
+ "crossterm",
+ "ratatui",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "zlayer-builder",
+ "zlayer-spec",
+]
+
+[[package]]
 name = "zlayer-agent"
 version = "0.1.0"
 dependencies = [
@@ -10619,6 +10636,7 @@ dependencies = [
  "oci-spec",
  "rand 0.9.2",
  "reqwest 0.13.1",
+ "serde",
  "serde_json",
  "serde_yaml 0.9.34+deprecated",
  "tempfile",
@@ -10717,23 +10735,6 @@ dependencies = [
  "tokio",
  "tracing",
  "zlayer-registry",
-]
-
-[[package]]
-name = "zlayer-cli"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap 4.5.56",
- "crossterm",
- "ratatui",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "zlayer-builder",
- "zlayer-spec",
 ]
 
 [[package]]

@@ -20,7 +20,7 @@ docker run --privileged -d --name zlayer \
 docker logs zlayer
 
 # Deploy a spec
-docker exec zlayer zlayer deploy --spec /path/to/spec.yaml
+docker exec zlayer zlayer-runtime deploy --spec /path/to/spec.yaml
 
 # Stop
 docker rm -f zlayer
@@ -86,7 +86,7 @@ By default, containers created inside ZLayer-in-Docker use the container's netwo
 # Debug build (faster, larger)
 cargo build --package runtime
 docker build -f docker/Dockerfile.zlayer-node \
-  --build-arg BINARY_PATH=target/debug/zlayer \
+  --build-arg BINARY_PATH=target/debug/zlayer-runtime \
   -t zlayer-node:dev .
 
 # Release build (slower, optimized)
@@ -304,8 +304,8 @@ zlayer-build pipeline -f ZPipeline.yaml --no-tui --set VERSION=$VERSION --push
 ### Interactive TUI
 
 ```bash
-# Use zlayer-cli for menu-driven builds
-zlayer-cli
+# Use zlayer for menu-driven builds
+zlayer
 ```
 
 ## Limitations

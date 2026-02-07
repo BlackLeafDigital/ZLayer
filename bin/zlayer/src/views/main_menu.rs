@@ -13,7 +13,7 @@ const MENU_ITEMS: &[(&str, &str)] = &[
     ("Build Image", "Interactive image build wizard"),
     ("Validate", "Validate a Dockerfile or ZImagefile"),
     ("Runtimes", "Browse available runtime templates"),
-    ("Quit", "Exit zlayer-cli"),
+    ("Quit", "Exit zlayer"),
 ];
 
 /// Render the main menu
@@ -24,7 +24,7 @@ pub fn render(frame: &mut Frame, state: &MainMenuState) {
     let outer = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray))
-        .title(" zlayer-cli ")
+        .title(" zlayer ")
         .title_alignment(Alignment::Center);
 
     let inner = outer.inner(area);

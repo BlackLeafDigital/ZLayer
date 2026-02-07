@@ -47,8 +47,8 @@ pub use placement::{
     NodeResources, NodeState, PlacementDecision, PlacementReason, PlacementState,
 };
 pub use raft::{
-    ClusterState, HealthStatus, NodeId, NodeInfo, RaftConfig, RaftCoordinator, Request, Response,
-    ScaleEvent, ServiceState, TypeConfig, ZLayerRaft,
+    ClusterState, GpuInfoSummary, HealthStatus, NodeId, NodeInfo, RaftConfig, RaftCoordinator,
+    Request, Response, ScaleEvent, ServiceState, TypeConfig, ZLayerRaft,
 };
 pub use raft_network::RaftHttpClient;
 pub use raft_service::RaftService;

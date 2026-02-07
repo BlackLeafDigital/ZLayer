@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 /// ZLayer container orchestration runtime
 #[derive(Parser)]
-#[command(name = "zlayer")]
+#[command(name = "zlayer-runtime")]
 #[command(version, about = "ZLayer container orchestration runtime")]
 #[command(propagate_version = true)]
 pub(crate) struct Cli {
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn test_cli_parsing() {
         // Test default runtime
-        let cli = Cli::try_parse_from(["zlayer", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "status"]).unwrap();
         assert!(matches!(cli.runtime, RuntimeType::Auto));
         assert!(matches!(cli.command, Commands::Status));
     }
@@ -821,7 +821,7 @@ mod tests {
 
     #[test]
     fn test_cli_deploy_command() {
-        let cli = Cli::try_parse_from(["zlayer", "deploy", "test-spec.yaml"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "deploy", "test-spec.yaml"]).unwrap();
 
         match cli.command {
             Commands::Deploy { spec_path, dry_run } => {
@@ -834,7 +834,7 @@ mod tests {
 
     #[test]
     fn test_cli_deploy_command_no_spec() {
-        let cli = Cli::try_parse_from(["zlayer", "deploy"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "deploy"]).unwrap();
 
         match cli.command {
             Commands::Deploy { spec_path, dry_run } => {
@@ -847,7 +847,8 @@ mod tests {
 
     #[test]
     fn test_cli_deploy_dry_run() {
-        let cli = Cli::try_parse_from(["zlayer", "deploy", "--dry-run", "test-spec.yaml"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "deploy", "--dry-run", "test-spec.yaml"])
+            .unwrap();
 
         match cli.command {
             Commands::Deploy { dry_run, .. } => {
@@ -859,7 +860,7 @@ mod tests {
 
     #[test]
     fn test_cli_join_command() {
-        let cli = Cli::try_parse_from(["zlayer", "join", "some-token"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "join", "some-token"]).unwrap();
 
         match cli.command {
             Commands::Join {
@@ -911,7 +912,8 @@ mod tests {
     #[test]
     fn test_cli_join_command_short_flags() {
         let cli =
-            Cli::try_parse_from(["zlayer", "join", "-s", "api", "-r", "5", "token123"]).unwrap();
+            Cli::try_parse_from(["zlayer-runtime", "join", "-s", "api", "-r", "5", "token123"])
+                .unwrap();
 
         match cli.command {
             Commands::Join {
@@ -991,7 +993,7 @@ mod tests {
 
     #[test]
     fn test_cli_validate_command() {
-        let cli = Cli::try_parse_from(["zlayer", "validate", "test-spec.yaml"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "validate", "test-spec.yaml"]).unwrap();
 
         match cli.command {
             Commands::Validate { spec_path } => {
@@ -1003,7 +1005,7 @@ mod tests {
 
     #[test]
     fn test_cli_validate_command_no_spec() {
-        let cli = Cli::try_parse_from(["zlayer", "validate"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "validate"]).unwrap();
 
         match cli.command {
             Commands::Validate { spec_path } => {
@@ -1015,19 +1017,19 @@ mod tests {
 
     #[test]
     fn test_cli_verbose_levels() {
-        let cli = Cli::try_parse_from(["zlayer", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "status"]).unwrap();
         assert_eq!(cli.verbose, 0);
 
-        let cli = Cli::try_parse_from(["zlayer", "-v", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "-v", "status"]).unwrap();
         assert_eq!(cli.verbose, 1);
 
-        let cli = Cli::try_parse_from(["zlayer", "-vv", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "-vv", "status"]).unwrap();
         assert_eq!(cli.verbose, 2);
     }
 
     #[test]
     fn test_build_runtime_config_auto() {
-        let cli = Cli::try_parse_from(["zlayer", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "status"]).unwrap();
         let config = crate::config::build_runtime_config(&cli);
         assert!(matches!(config, zlayer_agent::RuntimeConfig::Auto));
     }
@@ -1056,7 +1058,7 @@ mod tests {
 
     #[test]
     fn test_cli_serve_command_defaults() {
-        let cli = Cli::try_parse_from(["zlayer", "serve"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "serve"]).unwrap();
 
         match cli.command {
             Commands::Serve {
@@ -1074,7 +1076,8 @@ mod tests {
 
     #[test]
     fn test_cli_serve_command_custom_bind() {
-        let cli = Cli::try_parse_from(["zlayer", "serve", "--bind", "127.0.0.1:9090"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "serve", "--bind", "127.0.0.1:9090"]).unwrap();
 
         match cli.command {
             Commands::Serve { bind, .. } => {
@@ -1086,8 +1089,13 @@ mod tests {
 
     #[test]
     fn test_cli_serve_command_jwt_secret() {
-        let cli = Cli::try_parse_from(["zlayer", "serve", "--jwt-secret", "my-super-secret-key"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "zlayer-runtime",
+            "serve",
+            "--jwt-secret",
+            "my-super-secret-key",
+        ])
+        .unwrap();
 
         match cli.command {
             Commands::Serve { jwt_secret, .. } => {
@@ -1099,7 +1107,7 @@ mod tests {
 
     #[test]
     fn test_cli_serve_command_no_swagger() {
-        let cli = Cli::try_parse_from(["zlayer", "serve", "--no-swagger"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "serve", "--no-swagger"]).unwrap();
 
         match cli.command {
             Commands::Serve { no_swagger, .. } => {
@@ -1226,7 +1234,7 @@ mod tests {
 
     #[test]
     fn test_cli_stop_command_minimal() {
-        let cli = Cli::try_parse_from(["zlayer", "stop", "my-deployment"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "stop", "my-deployment"]).unwrap();
 
         match cli.command {
             Commands::Stop {
@@ -1246,8 +1254,14 @@ mod tests {
 
     #[test]
     fn test_cli_stop_command_with_service() {
-        let cli =
-            Cli::try_parse_from(["zlayer", "stop", "--service", "web", "my-deployment"]).unwrap();
+        let cli = Cli::try_parse_from([
+            "zlayer-runtime",
+            "stop",
+            "--service",
+            "web",
+            "my-deployment",
+        ])
+        .unwrap();
 
         match cli.command {
             Commands::Stop {
@@ -1264,7 +1278,8 @@ mod tests {
 
     #[test]
     fn test_cli_stop_command_force() {
-        let cli = Cli::try_parse_from(["zlayer", "stop", "--force", "my-deployment"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "stop", "--force", "my-deployment"]).unwrap();
 
         match cli.command {
             Commands::Stop { force, .. } => {
@@ -1277,7 +1292,8 @@ mod tests {
     #[test]
     fn test_cli_stop_command_timeout() {
         let cli =
-            Cli::try_parse_from(["zlayer", "stop", "--timeout", "60", "my-deployment"]).unwrap();
+            Cli::try_parse_from(["zlayer-runtime", "stop", "--timeout", "60", "my-deployment"])
+                .unwrap();
 
         match cli.command {
             Commands::Stop { timeout, .. } => {
@@ -1319,7 +1335,7 @@ mod tests {
 
     #[test]
     fn test_cli_build_command_minimal() {
-        let cli = Cli::try_parse_from(["zlayer", "build"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "build"]).unwrap();
 
         match cli.command {
             Commands::Build {
@@ -1355,7 +1371,8 @@ mod tests {
 
     #[test]
     fn test_cli_build_command_with_zimagefile() {
-        let cli = Cli::try_parse_from(["zlayer", "build", "-z", "ZImagefile.yml", "."]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "build", "-z", "ZImagefile.yml", "."]).unwrap();
 
         match cli.command {
             Commands::Build { zimagefile, .. } => {
@@ -1367,7 +1384,7 @@ mod tests {
 
     #[test]
     fn test_cli_build_command_with_context() {
-        let cli = Cli::try_parse_from(["zlayer", "build", "./my-app"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "build", "./my-app"]).unwrap();
 
         match cli.command {
             Commands::Build { context, .. } => {
@@ -1402,7 +1419,8 @@ mod tests {
 
     #[test]
     fn test_cli_build_command_with_dockerfile() {
-        let cli = Cli::try_parse_from(["zlayer", "build", "-f", "Dockerfile.prod", "."]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "build", "-f", "Dockerfile.prod", "."]).unwrap();
 
         match cli.command {
             Commands::Build { file, .. } => {
@@ -1414,7 +1432,8 @@ mod tests {
 
     #[test]
     fn test_cli_build_command_with_runtime() {
-        let cli = Cli::try_parse_from(["zlayer", "build", "--runtime", "node20", "."]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "build", "--runtime", "node20", "."]).unwrap();
 
         match cli.command {
             Commands::Build { runtime, .. } => {
@@ -1426,7 +1445,7 @@ mod tests {
 
     #[test]
     fn test_cli_build_command_with_runtime_auto() {
-        let cli = Cli::try_parse_from(["zlayer", "build", "--runtime-auto", "."]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "build", "--runtime-auto", "."]).unwrap();
 
         match cli.command {
             Commands::Build { runtime_auto, .. } => {
@@ -1461,7 +1480,8 @@ mod tests {
 
     #[test]
     fn test_cli_build_command_with_target() {
-        let cli = Cli::try_parse_from(["zlayer", "build", "--target", "builder", "."]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "build", "--target", "builder", "."]).unwrap();
 
         match cli.command {
             Commands::Build { target, .. } => {
@@ -1557,14 +1577,20 @@ mod tests {
 
     #[test]
     fn test_cli_runtimes_command() {
-        let cli = Cli::try_parse_from(["zlayer", "runtimes"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "runtimes"]).unwrap();
         assert!(matches!(cli.command, Commands::Runtimes));
     }
 
     #[test]
     fn test_cli_node_init_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "init", "--advertise-addr", "10.0.0.1"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "zlayer-runtime",
+            "node",
+            "init",
+            "--advertise-addr",
+            "10.0.0.1",
+        ])
+        .unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Init {
@@ -1690,7 +1716,7 @@ mod tests {
 
     #[test]
     fn test_cli_node_list_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "list"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::List { output }) => {
@@ -1702,7 +1728,8 @@ mod tests {
 
     #[test]
     fn test_cli_node_list_command_json() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "list", "--output", "json"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "node", "list", "--output", "json"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::List { output }) => {
@@ -1714,7 +1741,7 @@ mod tests {
 
     #[test]
     fn test_cli_node_status_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "status"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Status { node_id }) => {
@@ -1726,7 +1753,8 @@ mod tests {
 
     #[test]
     fn test_cli_node_status_command_with_id() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "status", "node-abc-123"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "node", "status", "node-abc-123"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Status { node_id }) => {
@@ -1738,7 +1766,7 @@ mod tests {
 
     #[test]
     fn test_cli_node_remove_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "remove", "node-123"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "remove", "node-123"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Remove { node_id, force }) => {
@@ -1751,7 +1779,8 @@ mod tests {
 
     #[test]
     fn test_cli_node_remove_command_force() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "remove", "--force", "node-123"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "remove", "--force", "node-123"])
+            .unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Remove { node_id, force }) => {
@@ -1815,7 +1844,7 @@ mod tests {
 
     #[test]
     fn test_cli_up_command_no_spec() {
-        let cli = Cli::try_parse_from(["zlayer", "up"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "up"]).unwrap();
 
         match cli.command {
             Commands::Up { spec_path } => {
@@ -1828,7 +1857,7 @@ mod tests {
 
     #[test]
     fn test_cli_up_command_with_spec() {
-        let cli = Cli::try_parse_from(["zlayer", "up", "my-spec.yml"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "up", "my-spec.yml"]).unwrap();
 
         match cli.command {
             Commands::Up { spec_path } => {
@@ -1840,7 +1869,7 @@ mod tests {
 
     #[test]
     fn test_cli_up_command_background() {
-        let cli = Cli::try_parse_from(["zlayer", "up", "-b"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "up", "-b"]).unwrap();
 
         assert!(cli.background);
         assert!(matches!(cli.command, Commands::Up { .. }));
@@ -1849,7 +1878,7 @@ mod tests {
     #[test]
     fn test_cli_up_command_background_global() {
         // Background flag before subcommand
-        let cli = Cli::try_parse_from(["zlayer", "-b", "up"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "-b", "up"]).unwrap();
 
         assert!(cli.background);
         assert!(matches!(cli.command, Commands::Up { .. }));
@@ -1857,7 +1886,7 @@ mod tests {
 
     #[test]
     fn test_cli_down_command_no_deployment() {
-        let cli = Cli::try_parse_from(["zlayer", "down"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "down"]).unwrap();
 
         match cli.command {
             Commands::Down { deployment } => {
@@ -1869,7 +1898,7 @@ mod tests {
 
     #[test]
     fn test_cli_down_command_with_deployment() {
-        let cli = Cli::try_parse_from(["zlayer", "down", "my-app"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "down", "my-app"]).unwrap();
 
         match cli.command {
             Commands::Down { deployment } => {
@@ -1881,7 +1910,7 @@ mod tests {
 
     #[test]
     fn test_cli_background_flag_default() {
-        let cli = Cli::try_parse_from(["zlayer", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "status"]).unwrap();
         assert!(!cli.background);
     }
 }

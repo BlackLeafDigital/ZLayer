@@ -10,6 +10,7 @@ pub mod cron_scheduler;
 pub mod dependency;
 pub mod env;
 pub mod error;
+pub mod gpu_detector;
 pub mod health;
 pub mod init;
 pub mod job;
@@ -33,6 +34,7 @@ pub use dependency::{
 };
 pub use env::{resolve_env_value, resolve_env_vars, EnvResolutionError, ResolvedEnv};
 pub use error::*;
+pub use gpu_detector::{detect_gpus, GpuInfo};
 pub use health::*;
 pub use init::{BackoffConfig, InitOrchestrator};
 pub use job::{
@@ -65,9 +67,9 @@ pub enum RuntimeConfig {
     /// Automatically select the best available runtime
     ///
     /// Selection logic:
-    /// - On Linux: Try youki first (if binary available), fall back to Docker
+    /// - On Linux: Uses bundled libcontainer runtime (no external binary needed), falls back to Docker
     /// - On Windows/macOS: Use Docker directly
-    /// - If neither is available, returns an error
+    /// - If no runtime can be initialized, returns an error
     Auto,
     /// Use the mock runtime for testing and development
     Mock,
@@ -86,49 +88,6 @@ impl Default for RuntimeConfig {
     fn default() -> Self {
         Self::Auto
     }
-}
-
-/// Check if the youki binary is available on the system (Linux only)
-///
-/// Youki is only available on Linux. This function checks:
-/// 1. If the youki binary exists in common locations or PATH
-///
-/// # Returns
-/// `true` if youki is available, `false` otherwise
-#[cfg(target_os = "linux")]
-pub fn is_youki_available() -> bool {
-    // Check common locations for youki binary
-    let common_paths = [
-        "/usr/local/bin/youki",
-        "/usr/bin/youki",
-        "/opt/youki/bin/youki",
-    ];
-
-    for path in common_paths {
-        if std::path::Path::new(path).exists() {
-            tracing::debug!(path = %path, "Found youki binary");
-            return true;
-        }
-    }
-
-    // Check if youki is in PATH using `which`
-    match std::process::Command::new("which").arg("youki").output() {
-        Ok(output) if output.status.success() => {
-            let path = String::from_utf8_lossy(&output.stdout);
-            tracing::debug!(path = %path.trim(), "Found youki in PATH");
-            true
-        }
-        _ => {
-            tracing::debug!("youki binary not found");
-            false
-        }
-    }
-}
-
-/// Check if the youki binary is available (stub for non-Linux platforms)
-#[cfg(not(target_os = "linux"))]
-pub fn is_youki_available() -> bool {
-    false
 }
 
 /// Check if Docker daemon is available and responsive
@@ -208,9 +167,9 @@ pub fn is_wasm_available() -> bool {
 /// # Runtime Selection for Auto Mode
 ///
 /// When `RuntimeConfig::Auto` is specified:
-/// - **Linux**: Tries youki first (if binary is available), falls back to Docker
+/// - **Linux**: Uses bundled libcontainer runtime (no external binary needed), falls back to Docker
 /// - **Windows/macOS**: Uses Docker directly
-/// - If neither runtime is available, returns an error
+/// - If no runtime can be initialized, returns an error
 ///
 /// # Example
 /// ```no_run
@@ -255,29 +214,27 @@ pub async fn create_runtime(config: RuntimeConfig) -> Result<Arc<dyn Runtime + S
 /// Automatically select and create the best available runtime
 ///
 /// Selection logic:
-/// - On Linux: Try youki first (preferred for performance), fall back to Docker
-/// - On Windows/macOS: Use Docker directly (youki is not available)
-/// - Returns an error if no runtime is available
+/// - On Linux: Uses bundled libcontainer runtime directly (no external binary needed), falls back to Docker
+/// - On Windows/macOS: Use Docker directly (libcontainer requires Linux)
+/// - Returns an error if no runtime can be initialized
 async fn create_auto_runtime() -> Result<Arc<dyn Runtime + Send + Sync>> {
     tracing::info!("Auto-selecting container runtime");
 
-    // On Linux, try youki first as it's more performant (no daemon overhead)
+    // On Linux, use bundled libcontainer runtime (no daemon overhead, no external binary needed)
     #[cfg(target_os = "linux")]
     {
-        if is_youki_available() {
-            tracing::info!("Selected youki runtime (Linux-native, no daemon)");
-            match YoukiRuntime::new(YoukiConfig::default()).await {
-                Ok(runtime) => return Ok(Arc::new(runtime)),
-                Err(e) => {
-                    tracing::warn!(error = %e, "Failed to initialize youki runtime, trying Docker");
-                }
+        match YoukiRuntime::new(YoukiConfig::default()).await {
+            Ok(runtime) => {
+                tracing::info!("Using bundled libcontainer runtime (Linux-native, no daemon)");
+                return Ok(Arc::new(runtime));
             }
-        } else {
-            tracing::debug!("youki not available on this Linux system");
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to initialize libcontainer runtime, trying Docker");
+            }
         }
     }
 
-    // On non-Linux or if youki failed, try Docker
+    // On non-Linux or if libcontainer failed, try Docker
     #[cfg(feature = "docker")]
     {
         if is_docker_available().await {
@@ -292,14 +249,15 @@ async fn create_auto_runtime() -> Result<Arc<dyn Runtime + Send + Sync>> {
     #[cfg(all(target_os = "linux", feature = "docker"))]
     {
         Err(AgentError::Configuration(
-            "No container runtime available. Install youki or start the Docker daemon.".to_string(),
+            "Bundled libcontainer runtime failed to initialize and Docker daemon is not available."
+                .to_string(),
         ))
     }
 
     #[cfg(all(target_os = "linux", not(feature = "docker")))]
     {
         Err(AgentError::Configuration(
-            "No container runtime available. Install youki or enable the 'docker' feature."
+            "Bundled libcontainer runtime failed to initialize. Enable the 'docker' feature for an alternative."
                 .to_string(),
         ))
     }

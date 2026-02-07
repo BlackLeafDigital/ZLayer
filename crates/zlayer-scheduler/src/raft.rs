@@ -144,6 +144,20 @@ pub struct NodeInfo {
     pub address: String,
     pub registered_at: u64,
     pub last_heartbeat: u64,
+    /// Detected GPUs on this node
+    #[serde(default)]
+    pub gpus: Vec<GpuInfoSummary>,
+}
+
+/// Summary of a GPU on a node, stored in Raft cluster state
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GpuInfoSummary {
+    /// Vendor: "nvidia", "amd", "intel", or "unknown"
+    pub vendor: String,
+    /// Model name (e.g., "NVIDIA A100-SXM4-80GB")
+    pub model: String,
+    /// VRAM in MB
+    pub memory_mb: u64,
 }
 
 impl ClusterState {
@@ -204,6 +218,7 @@ impl ClusterState {
                         address: address.clone(),
                         registered_at: now,
                         last_heartbeat: now,
+                        gpus: Vec::new(),
                     },
                 );
 

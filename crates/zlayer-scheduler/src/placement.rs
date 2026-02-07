@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 use zlayer_spec::{NodeMode, NodeSelector, ServiceSpec};
 
 use crate::error::{Result, SchedulerError};
@@ -51,6 +52,16 @@ pub struct NodeResources {
     pub memory_total: u64,
     /// Used memory in bytes
     pub memory_used: u64,
+    /// Total GPUs on this node
+    pub gpu_total: u32,
+    /// GPUs currently allocated to containers
+    pub gpu_used: u32,
+    /// GPU model names (e.g., ["NVIDIA A100-SXM4-80GB"])
+    pub gpu_models: Vec<String>,
+    /// Total GPU VRAM in MB across all GPUs
+    pub gpu_memory_mb: u64,
+    /// GPU vendor (e.g., "nvidia", "amd", "intel"), empty if no GPUs
+    pub gpu_vendor: String,
 }
 
 impl NodeResources {
@@ -61,6 +72,11 @@ impl NodeResources {
             cpu_used: 0.0,
             memory_total,
             memory_used: 0,
+            gpu_total: 0,
+            gpu_used: 0,
+            gpu_models: Vec::new(),
+            gpu_memory_mb: 0,
+            gpu_vendor: String::new(),
         }
     }
 
@@ -95,6 +111,11 @@ impl NodeResources {
     /// Calculate overall utilization (average of CPU and memory)
     pub fn utilization(&self) -> f64 {
         (self.cpu_utilization() + self.memory_utilization()) / 2.0
+    }
+
+    /// Get number of GPUs available for allocation
+    pub fn gpu_available(&self) -> u32 {
+        self.gpu_total.saturating_sub(self.gpu_used)
     }
 }
 
@@ -257,7 +278,7 @@ impl PlacementState {
     }
 }
 
-/// Check if a node can accept a service based on node_mode and constraints
+/// Check if a node can accept a service based on node_mode, constraints, and resource availability
 ///
 /// # Arguments
 /// * `node` - The node to check
@@ -265,6 +286,7 @@ impl PlacementState {
 /// * `node_mode` - The node allocation mode for the service
 /// * `node_selector` - Optional node selection constraints
 /// * `placements` - Current placement state
+/// * `service_spec` - Optional service spec for resource-aware checks (GPU requirements)
 ///
 /// # Returns
 /// `true` if the node can accept a replica of the service
@@ -274,6 +296,7 @@ pub fn can_place_on_node(
     node_mode: NodeMode,
     node_selector: Option<&NodeSelector>,
     placements: &PlacementState,
+    service_spec: Option<&ServiceSpec>,
 ) -> bool {
     // Node must be healthy
     if !node.healthy {
@@ -284,6 +307,35 @@ pub fn can_place_on_node(
     if let Some(selector) = node_selector {
         if !node.matches_required_labels(selector) {
             return false;
+        }
+    }
+
+    // Check GPU requirements if the service requests GPUs
+    if let Some(spec) = service_spec {
+        if let Some(ref gpu) = spec.resources.gpu {
+            let available = node.resources.gpu_available();
+            if available < gpu.count {
+                debug!(
+                    node = %node.id,
+                    gpu_requested = gpu.count,
+                    gpu_available = available,
+                    "Node rejected: insufficient GPUs"
+                );
+                return false;
+            }
+            // If vendor is specified and node has GPUs, check vendor matches
+            if !gpu.vendor.is_empty()
+                && !node.resources.gpu_vendor.is_empty()
+                && node.resources.gpu_vendor != gpu.vendor
+            {
+                debug!(
+                    node = %node.id,
+                    requested_vendor = %gpu.vendor,
+                    node_vendor = %node.resources.gpu_vendor,
+                    "Node rejected: GPU vendor mismatch"
+                );
+                return false;
+            }
         }
     }
 
@@ -321,10 +373,17 @@ pub fn place_service_replicas(
     service_name: &str,
     service_spec: &ServiceSpec,
     replicas: u32,
-    nodes: &[NodeState],
+    nodes: &mut [NodeState],
     placements: &mut PlacementState,
 ) -> Vec<PlacementDecision> {
     let mut decisions = Vec::with_capacity(replicas as usize);
+
+    let gpu_count_requested = service_spec
+        .resources
+        .gpu
+        .as_ref()
+        .map(|g| g.count)
+        .unwrap_or(0);
 
     for replica in 0..replicas {
         let container_id = ContainerId::new(service_name, replica);
@@ -339,6 +398,7 @@ pub fn place_service_replicas(
                     service_spec.node_mode,
                     service_spec.node_selector.as_ref(),
                     placements,
+                    Some(service_spec),
                 )
             })
             .collect();
@@ -361,8 +421,12 @@ pub fn place_service_replicas(
         let selected = match service_spec.node_mode {
             NodeMode::Shared => {
                 // Prefer nodes with lowest utilization (bin-packing)
-                // Also consider preferred labels if node_selector is present
-                select_for_bin_packing(&suitable_nodes, service_spec.node_selector.as_ref())
+                // Also consider preferred labels and GPU availability
+                select_for_bin_packing(
+                    &suitable_nodes,
+                    service_spec.node_selector.as_ref(),
+                    Some(service_spec),
+                )
             }
             NodeMode::Dedicated | NodeMode::Exclusive => {
                 // Prefer nodes with fewer existing containers
@@ -374,6 +438,8 @@ pub fn place_service_replicas(
             }
         };
 
+        let selected_id = selected.id;
+
         // Build the reason
         let reason = match service_spec.node_mode {
             NodeMode::Shared => PlacementReason::BinPacked {
@@ -384,11 +450,20 @@ pub fn place_service_replicas(
         };
 
         // Record the placement
-        placements.place(container_id.clone(), selected.id);
+        placements.place(container_id.clone(), selected_id);
+
+        // Track GPU usage on the selected node so subsequent placements
+        // see the reduced availability
+        if gpu_count_requested > 0 {
+            if let Some(node) = nodes.iter_mut().find(|n| n.id == selected_id) {
+                node.resources.gpu_used =
+                    node.resources.gpu_used.saturating_add(gpu_count_requested);
+            }
+        }
 
         decisions.push(PlacementDecision {
             container_id,
-            node_id: Some(selected.id),
+            node_id: Some(selected_id),
             reason,
         });
     }
@@ -397,11 +472,19 @@ pub fn place_service_replicas(
 }
 
 /// Select a node for bin-packing (shared mode)
+///
+/// When the service requests GPUs, GPU availability is factored into scoring
+/// with a 30% weight. Non-GPU workloads are scored purely on label preference
+/// and CPU/memory utilization as before.
 fn select_for_bin_packing<'a>(
     nodes: &[&'a NodeState],
     node_selector: Option<&NodeSelector>,
+    service_spec: Option<&ServiceSpec>,
 ) -> &'a NodeState {
-    // Sort by: 1) preferred label score (descending), 2) utilization (ascending)
+    let wants_gpu = service_spec
+        .and_then(|s| s.resources.gpu.as_ref())
+        .is_some();
+
     nodes
         .iter()
         .max_by(|a, b| {
@@ -411,11 +494,38 @@ fn select_for_bin_packing<'a>(
             // First compare by preferred labels (more is better)
             match a_pref.cmp(&b_pref) {
                 std::cmp::Ordering::Equal => {
-                    // Then by utilization (lower is better for bin-packing)
-                    // Note: we're using max_by, so we reverse the comparison
-                    b.utilization()
-                        .partial_cmp(&a.utilization())
-                        .unwrap_or(std::cmp::Ordering::Equal)
+                    if wants_gpu {
+                        // For GPU workloads, compute a combined score:
+                        // 70% weight for low utilization + 30% weight for GPU availability
+                        let a_util_score = 100.0 - a.utilization(); // higher is better
+                        let b_util_score = 100.0 - b.utilization();
+
+                        let a_gpu_score = if a.resources.gpu_total > 0 {
+                            (a.resources.gpu_available() as f64 / a.resources.gpu_total as f64)
+                                * 100.0
+                        } else {
+                            0.0
+                        };
+                        let b_gpu_score = if b.resources.gpu_total > 0 {
+                            (b.resources.gpu_available() as f64 / b.resources.gpu_total as f64)
+                                * 100.0
+                        } else {
+                            0.0
+                        };
+
+                        let a_combined = a_util_score * 0.7 + a_gpu_score * 0.3;
+                        let b_combined = b_util_score * 0.7 + b_gpu_score * 0.3;
+
+                        a_combined
+                            .partial_cmp(&b_combined)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    } else {
+                        // Non-GPU: by utilization (lower is better for bin-packing)
+                        // Note: we're using max_by, so we reverse the comparison
+                        b.utilization()
+                            .partial_cmp(&a.utilization())
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    }
                 }
                 other => other,
             }
@@ -657,7 +767,8 @@ mod tests {
             "api",
             NodeMode::Shared,
             None,
-            &placements
+            &placements,
+            None,
         ));
     }
 
@@ -672,7 +783,8 @@ mod tests {
             "api",
             NodeMode::Dedicated,
             None,
-            &placements
+            &placements,
+            None,
         ));
 
         // Place a container from another service - still can place
@@ -682,7 +794,8 @@ mod tests {
             "api",
             NodeMode::Dedicated,
             None,
-            &placements
+            &placements,
+            None,
         ));
 
         // Place a container from same service - cannot place another
@@ -692,7 +805,8 @@ mod tests {
             "api",
             NodeMode::Dedicated,
             None,
-            &placements
+            &placements,
+            None,
         ));
     }
 
@@ -707,7 +821,8 @@ mod tests {
             "db",
             NodeMode::Exclusive,
             None,
-            &placements
+            &placements,
+            None,
         ));
 
         // Place any container - cannot place exclusive anymore
@@ -717,20 +832,21 @@ mod tests {
             "db",
             NodeMode::Exclusive,
             None,
-            &placements
+            &placements,
+            None,
         ));
     }
 
     #[test]
     fn test_place_service_replicas_shared() {
-        let nodes = vec![
+        let mut nodes = vec![
             make_node(1, "192.168.1.1:8000"),
             make_node(2, "192.168.1.2:8000"),
         ];
         let mut placements = PlacementState::new();
         let spec = make_service_spec(NodeMode::Shared, None);
 
-        let decisions = place_service_replicas("api", &spec, 3, &nodes, &mut placements);
+        let decisions = place_service_replicas("api", &spec, 3, &mut nodes, &mut placements);
 
         assert_eq!(decisions.len(), 3);
         assert!(decisions.iter().all(|d| d.is_success()));
@@ -738,7 +854,7 @@ mod tests {
 
     #[test]
     fn test_place_service_replicas_dedicated() {
-        let nodes = vec![
+        let mut nodes = vec![
             make_node(1, "192.168.1.1:8000"),
             make_node(2, "192.168.1.2:8000"),
             make_node(3, "192.168.1.3:8000"),
@@ -746,7 +862,7 @@ mod tests {
         let mut placements = PlacementState::new();
         let spec = make_service_spec(NodeMode::Dedicated, None);
 
-        let decisions = place_service_replicas("api", &spec, 3, &nodes, &mut placements);
+        let decisions = place_service_replicas("api", &spec, 3, &mut nodes, &mut placements);
 
         assert_eq!(decisions.len(), 3);
         assert!(decisions.iter().all(|d| d.is_success()));
@@ -760,14 +876,14 @@ mod tests {
 
     #[test]
     fn test_place_service_replicas_dedicated_insufficient_nodes() {
-        let nodes = vec![
+        let mut nodes = vec![
             make_node(1, "192.168.1.1:8000"),
             make_node(2, "192.168.1.2:8000"),
         ];
         let mut placements = PlacementState::new();
         let spec = make_service_spec(NodeMode::Dedicated, None);
 
-        let decisions = place_service_replicas("api", &spec, 3, &nodes, &mut placements);
+        let decisions = place_service_replicas("api", &spec, 3, &mut nodes, &mut placements);
 
         assert_eq!(decisions.len(), 3);
         // First 2 should succeed, 3rd should fail
@@ -782,7 +898,7 @@ mod tests {
 
     #[test]
     fn test_place_service_replicas_exclusive() {
-        let nodes = vec![
+        let mut nodes = vec![
             make_node(1, "192.168.1.1:8000"),
             make_node(2, "192.168.1.2:8000"),
         ];
@@ -790,21 +906,21 @@ mod tests {
         let spec = make_service_spec(NodeMode::Exclusive, None);
 
         // Place 2 replicas - should use both nodes
-        let decisions = place_service_replicas("db", &spec, 2, &nodes, &mut placements);
+        let decisions = place_service_replicas("db", &spec, 2, &mut nodes, &mut placements);
 
         assert_eq!(decisions.len(), 2);
         assert!(decisions.iter().all(|d| d.is_success()));
 
         // Now try to place another service - should fail (nodes are exclusive)
         let spec2 = make_service_spec(NodeMode::Exclusive, None);
-        let decisions2 = place_service_replicas("cache", &spec2, 1, &nodes, &mut placements);
+        let decisions2 = place_service_replicas("cache", &spec2, 1, &mut nodes, &mut placements);
 
         assert!(!decisions2[0].is_success());
     }
 
     #[test]
     fn test_place_with_node_selector() {
-        let nodes = vec![
+        let mut nodes = vec![
             make_node(1, "192.168.1.1:8000").with_label("gpu", "true"),
             make_node(2, "192.168.1.2:8000").with_label("gpu", "false"),
             make_node(3, "192.168.1.3:8000").with_label("gpu", "true"),
@@ -819,7 +935,7 @@ mod tests {
         };
         let spec = make_service_spec(NodeMode::Shared, Some(selector));
 
-        let decisions = place_service_replicas("ml", &spec, 2, &nodes, &mut placements);
+        let decisions = place_service_replicas("ml", &spec, 2, &mut nodes, &mut placements);
 
         assert_eq!(decisions.len(), 2);
         assert!(decisions.iter().all(|d| d.is_success()));
@@ -881,7 +997,208 @@ mod tests {
             "api",
             NodeMode::Shared,
             None,
-            &placements
+            &placements,
+            None,
         ));
+    }
+
+    // ==========================================================================
+    // GPU-aware scheduling tests
+    // ==========================================================================
+
+    /// Helper to create a node with GPU resources
+    fn make_gpu_node(id: NodeId, address: &str, gpu_total: u32, vendor: &str) -> NodeState {
+        let mut resources = NodeResources::new(8.0, 32 * 1024 * 1024 * 1024);
+        resources.gpu_total = gpu_total;
+        resources.gpu_vendor = vendor.to_string();
+        resources.gpu_models = vec!["Test GPU".to_string(); gpu_total as usize];
+        resources.gpu_memory_mb = gpu_total as u64 * 16384; // 16GB per GPU
+        NodeState::new(id, address).with_resources(resources)
+    }
+
+    /// Helper to create a service spec that requests GPUs
+    fn make_gpu_service_spec(gpu_count: u32, gpu_vendor: &str, node_mode: NodeMode) -> ServiceSpec {
+        let mut spec = make_service_spec(node_mode, None);
+        spec.resources.gpu = Some(zlayer_spec::GpuSpec {
+            count: gpu_count,
+            vendor: gpu_vendor.to_string(),
+        });
+        spec
+    }
+
+    #[test]
+    fn test_gpu_service_rejected_on_node_without_gpus() {
+        let node = make_node(1, "192.168.1.1:8000"); // No GPUs
+        let placements = PlacementState::new();
+        let spec = make_gpu_service_spec(1, "nvidia", NodeMode::Shared);
+
+        assert!(!can_place_on_node(
+            &node,
+            "ml-training",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec),
+        ));
+    }
+
+    #[test]
+    fn test_gpu_service_placed_on_node_with_sufficient_gpus() {
+        let node = make_gpu_node(1, "192.168.1.1:8000", 4, "nvidia");
+        let placements = PlacementState::new();
+        let spec = make_gpu_service_spec(2, "nvidia", NodeMode::Shared);
+
+        assert!(can_place_on_node(
+            &node,
+            "ml-training",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec),
+        ));
+    }
+
+    #[test]
+    fn test_gpu_service_rejected_insufficient_available_gpus() {
+        let mut node = make_gpu_node(1, "192.168.1.1:8000", 4, "nvidia");
+        node.resources.gpu_used = 3; // Only 1 GPU available
+        let placements = PlacementState::new();
+        let spec = make_gpu_service_spec(2, "nvidia", NodeMode::Shared);
+
+        assert!(!can_place_on_node(
+            &node,
+            "ml-training",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec),
+        ));
+    }
+
+    #[test]
+    fn test_gpu_vendor_mismatch_rejected() {
+        let node = make_gpu_node(1, "192.168.1.1:8000", 4, "amd");
+        let placements = PlacementState::new();
+        let spec = make_gpu_service_spec(1, "nvidia", NodeMode::Shared);
+
+        assert!(!can_place_on_node(
+            &node,
+            "ml-training",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec),
+        ));
+    }
+
+    #[test]
+    fn test_gpu_vendor_empty_matches_any() {
+        // If the service has an empty vendor, it should match any GPU node
+        let node = make_gpu_node(1, "192.168.1.1:8000", 4, "nvidia");
+        let placements = PlacementState::new();
+        let spec = make_gpu_service_spec(1, "", NodeMode::Shared);
+
+        assert!(can_place_on_node(
+            &node,
+            "ml-training",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec),
+        ));
+    }
+
+    #[test]
+    fn test_non_gpu_service_ignores_gpu_fields() {
+        // A service without GPU requirements should be placeable on any node,
+        // regardless of the node's GPU state
+        let node_no_gpu = make_node(1, "192.168.1.1:8000");
+        let node_with_gpu = make_gpu_node(2, "192.168.1.2:8000", 4, "nvidia");
+        let placements = PlacementState::new();
+        let spec = make_service_spec(NodeMode::Shared, None); // No GPU requirement
+
+        assert!(can_place_on_node(
+            &node_no_gpu,
+            "api",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec),
+        ));
+        assert!(can_place_on_node(
+            &node_with_gpu,
+            "api",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec),
+        ));
+    }
+
+    #[test]
+    fn test_gpu_placement_tracks_usage() {
+        let mut nodes = vec![
+            make_gpu_node(1, "192.168.1.1:8000", 2, "nvidia"),
+            make_gpu_node(2, "192.168.1.2:8000", 2, "nvidia"),
+        ];
+        let mut placements = PlacementState::new();
+        let spec = make_gpu_service_spec(2, "nvidia", NodeMode::Shared);
+
+        // Place first replica -- should succeed and consume 2 GPUs on one node
+        let decisions = place_service_replicas("ml", &spec, 1, &mut nodes, &mut placements);
+        assert_eq!(decisions.len(), 1);
+        assert!(decisions[0].is_success());
+        let first_node = decisions[0].node_id.unwrap();
+
+        // The placed node should now have 2 GPUs used
+        let placed_node = nodes.iter().find(|n| n.id == first_node).unwrap();
+        assert_eq!(placed_node.resources.gpu_used, 2);
+        assert_eq!(placed_node.resources.gpu_available(), 0);
+
+        // Place second replica -- should go to the OTHER node since first is full
+        let decisions2 = place_service_replicas("ml2", &spec, 1, &mut nodes, &mut placements);
+        assert_eq!(decisions2.len(), 1);
+        assert!(decisions2[0].is_success());
+        let second_node = decisions2[0].node_id.unwrap();
+        assert_ne!(first_node, second_node);
+    }
+
+    #[test]
+    fn test_gpu_placement_exhaustion() {
+        let mut nodes = vec![make_gpu_node(1, "192.168.1.1:8000", 2, "nvidia")];
+        let mut placements = PlacementState::new();
+        let spec = make_gpu_service_spec(2, "nvidia", NodeMode::Shared);
+
+        // First placement should succeed
+        let decisions = place_service_replicas("ml1", &spec, 1, &mut nodes, &mut placements);
+        assert!(decisions[0].is_success());
+
+        // Second placement should fail - no more GPUs available
+        let decisions2 = place_service_replicas("ml2", &spec, 1, &mut nodes, &mut placements);
+        assert!(!decisions2[0].is_success());
+        assert!(matches!(
+            decisions2[0].reason,
+            PlacementReason::NoSuitableNode { .. }
+        ));
+    }
+
+    #[test]
+    fn test_gpu_scoring_prefers_more_available_gpus() {
+        // Node 1: 4 GPUs, 2 used (2 available)
+        // Node 2: 4 GPUs, 0 used (4 available)
+        // Both have equal CPU/memory utilization
+        let mut node1 = make_gpu_node(1, "192.168.1.1:8000", 4, "nvidia");
+        node1.resources.gpu_used = 2;
+        let node2 = make_gpu_node(2, "192.168.1.2:8000", 4, "nvidia");
+
+        let mut nodes = vec![node1, node2];
+        let mut placements = PlacementState::new();
+        let spec = make_gpu_service_spec(1, "nvidia", NodeMode::Shared);
+
+        let decisions = place_service_replicas("ml", &spec, 1, &mut nodes, &mut placements);
+        assert!(decisions[0].is_success());
+
+        // Should prefer node 2 (more GPUs available)
+        assert_eq!(decisions[0].node_id, Some(2));
     }
 }

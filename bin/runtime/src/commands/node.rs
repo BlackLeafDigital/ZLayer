@@ -312,7 +312,29 @@ pub(crate) async fn handle_node_init(
     };
     save_node_config(&data_dir, &node_config).await?;
 
-    // 6. Initialize Raft as leader (bootstrap single-node cluster)
+    // 6. Detect GPUs on this node
+    println!("  Detecting GPUs...");
+    let detected_gpus = zlayer_agent::detect_gpus();
+    if detected_gpus.is_empty() {
+        info!("No GPUs detected on this node");
+    } else {
+        info!(
+            gpu_count = detected_gpus.len(),
+            "Detected GPUs on this node"
+        );
+        for gpu in &detected_gpus {
+            info!(
+                pci_bus_id = %gpu.pci_bus_id,
+                vendor = %gpu.vendor,
+                model = %gpu.model,
+                memory_mb = gpu.memory_mb,
+                device_path = %gpu.device_path,
+                "Detected GPU"
+            );
+        }
+    }
+
+    // 7. Initialize Raft as leader (bootstrap single-node cluster)
     println!("  Starting Raft consensus...");
     let raft_config = zlayer_scheduler::RaftConfig {
         node_id: raft_node_id,
@@ -330,7 +352,7 @@ pub(crate) async fn handle_node_init(
         .context("Failed to bootstrap Raft cluster")?;
     info!("Raft cluster bootstrapped");
 
-    // 7. Generate join token
+    // 8. Generate join token
     let join_token = generate_join_token_data(
         &advertise_addr,
         api_port,
@@ -339,7 +361,7 @@ pub(crate) async fn handle_node_init(
         &overlay_cidr,
     )?;
 
-    // 8. Print success message
+    // 9. Print success message
     println!();
     println!("Node initialized successfully!");
     println!();
@@ -350,6 +372,17 @@ pub(crate) async fn handle_node_init(
     println!("Overlay Port:   {}", overlay_port);
     println!("Overlay CIDR:   {}", overlay_cidr);
     println!("WG Public Key:  {}", public_key);
+    if detected_gpus.is_empty() {
+        println!("GPUs:           None detected");
+    } else {
+        println!("GPUs:           {} detected", detected_gpus.len());
+        for gpu in &detected_gpus {
+            println!(
+                "  - {} ({}, {} MB VRAM) at {}",
+                gpu.model, gpu.vendor, gpu.memory_mb, gpu.pci_bus_id
+            );
+        }
+    }
     println!();
     println!("To join other nodes to this cluster, run:");
     println!();
@@ -486,7 +519,29 @@ pub(crate) async fn handle_node_join(
         );
     }
 
-    // 8. Print success message
+    // 8. Detect GPUs on this node
+    println!("  Detecting GPUs...");
+    let detected_gpus = zlayer_agent::detect_gpus();
+    if detected_gpus.is_empty() {
+        info!("No GPUs detected on this node");
+    } else {
+        info!(
+            gpu_count = detected_gpus.len(),
+            "Detected GPUs on this node"
+        );
+        for gpu in &detected_gpus {
+            info!(
+                pci_bus_id = %gpu.pci_bus_id,
+                vendor = %gpu.vendor,
+                model = %gpu.model,
+                memory_mb = gpu.memory_mb,
+                device_path = %gpu.device_path,
+                "Detected GPU"
+            );
+        }
+    }
+
+    // 9. Print success message
     println!();
     println!("Successfully joined cluster!");
     println!();
@@ -498,6 +553,17 @@ pub(crate) async fn handle_node_join(
         println!("Services:       {}", svcs.join(", "));
     }
     println!("Peers:          {}", join_response.peers.len());
+    if detected_gpus.is_empty() {
+        println!("GPUs:           None detected");
+    } else {
+        println!("GPUs:           {} detected", detected_gpus.len());
+        for gpu in &detected_gpus {
+            println!(
+                "  - {} ({}, {} MB VRAM) at {}",
+                gpu.model, gpu.vendor, gpu.memory_mb, gpu.pci_bus_id
+            );
+        }
+    }
     println!();
     println!("Run 'zlayer deploy' or 'zlayer up' with a spec file to start processing workloads.");
 
@@ -951,8 +1017,14 @@ mod tests {
 
     #[test]
     fn test_cli_node_init_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "init", "--advertise-addr", "10.0.0.1"])
-            .unwrap();
+        let cli = Cli::try_parse_from([
+            "zlayer-runtime",
+            "node",
+            "init",
+            "--advertise-addr",
+            "10.0.0.1",
+        ])
+        .unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Init {
@@ -1078,7 +1150,7 @@ mod tests {
 
     #[test]
     fn test_cli_node_list_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "list"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::List { output }) => {
@@ -1090,7 +1162,8 @@ mod tests {
 
     #[test]
     fn test_cli_node_list_command_json() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "list", "--output", "json"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "node", "list", "--output", "json"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::List { output }) => {
@@ -1102,7 +1175,7 @@ mod tests {
 
     #[test]
     fn test_cli_node_status_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "status"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Status { node_id }) => {
@@ -1114,7 +1187,8 @@ mod tests {
 
     #[test]
     fn test_cli_node_status_command_with_id() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "status", "node-abc-123"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "node", "status", "node-abc-123"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Status { node_id }) => {
@@ -1126,7 +1200,7 @@ mod tests {
 
     #[test]
     fn test_cli_node_remove_command() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "remove", "node-123"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "remove", "node-123"]).unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Remove { node_id, force }) => {
@@ -1139,7 +1213,8 @@ mod tests {
 
     #[test]
     fn test_cli_node_remove_command_force() {
-        let cli = Cli::try_parse_from(["zlayer", "node", "remove", "--force", "node-123"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "remove", "--force", "node-123"])
+            .unwrap();
 
         match cli.command {
             Commands::Node(NodeCommands::Remove { node_id, force }) => {

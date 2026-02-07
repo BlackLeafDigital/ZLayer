@@ -66,8 +66,8 @@ services:
             .with_context(|| format!("Failed to create output directory: {}", output.display()))?;
     }
 
-    // Write the spec file
-    let spec_path = output.join("zlayer-manager.yaml");
+    // Write the spec file as .zlayer.yml (auto-discovered by `zlayer deploy`)
+    let spec_path = output.join(".zlayer.yml");
     std::fs::write(&spec_path, &spec)
         .with_context(|| format!("Failed to write spec file: {}", spec_path.display()))?;
 
@@ -84,10 +84,10 @@ services:
         // For now, print instructions
         println!();
         println!("To deploy manually, run:");
-        println!("  zlayer deploy {}", spec_path.display());
+        println!("  zlayer deploy");
     } else {
         println!("To deploy, run:");
-        println!("  zlayer deploy {}", spec_path.display());
+        println!("  zlayer deploy");
         println!();
         println!("Or use --deploy flag to deploy immediately:");
         println!("  zlayer manager init --deploy");

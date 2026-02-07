@@ -20,7 +20,7 @@ members = [
   "crates/zlayer-tunnel",
   "bin/runtime",
   "bin/zlayer-build",
-  "bin/zlayer-cli",
+  "bin/zlayer",
   "crates/zlayer-manager",
 ]
 

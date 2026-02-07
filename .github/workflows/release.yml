@@ -49,11 +49,11 @@ jobs:
 
           echo "Downloading from: ${BASE_URL}"
 
-          # Download zlayer runtime
+          # Download zlayer-runtime
           for os in linux darwin; do
             for arch in amd64 arm64; do
-              artifact="zlayer-${os}-${arch}.tar.gz"
-              output="artifacts/zlayer-${VERSION}-${os}-${arch}.tar.gz"
+              artifact="zlayer-runtime-${os}-${arch}.tar.gz"
+              output="artifacts/zlayer-runtime-${VERSION}-${os}-${arch}.tar.gz"
               echo "Downloading ${artifact}..."
               curl -fsSL "${BASE_URL}/${artifact}" -o "${output}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
             done
@@ -69,11 +69,11 @@ jobs:
             done
           done
 
-          # Download zlayer-cli
+          # Download zlayer (CLI)
           for os in linux darwin; do
             for arch in amd64 arm64; do
-              artifact="zlayer-cli-${os}-${arch}.tar.gz"
-              output="artifacts/zlayer-cli-${VERSION}-${os}-${arch}.tar.gz"
+              artifact="zlayer-${os}-${arch}.tar.gz"
+              output="artifacts/zlayer-${VERSION}-${os}-${arch}.tar.gz"
               echo "Downloading ${artifact}..."
               curl -fsSL "${BASE_URL}/${artifact}" -o "${output}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
             done
@@ -125,9 +125,9 @@ jobs:
 
           | Binary | Description |
           |--------|-------------|
-          | `zlayer-cli` | Interactive TUI — install, build, and manage ZLayer |
+          | `zlayer` | Interactive TUI — install, build, and manage ZLayer |
           | `zlayer-build` | Lightweight image builder CLI (Dockerfile, ZImagefile, runtime templates) |
-          | `zlayer` | Full container orchestration runtime |
+          | `zlayer-runtime` | Full container orchestration runtime |
 
           ## Container Images
 
