@@ -573,11 +573,11 @@ jobs:
           Pull and run images directly with ZLayer:
           ```bash
           # Pull images
-          zlayer pull zachhandley/zlayer-node:${VERSION}
-          zlayer pull zachhandley/zlayer-manager:${VERSION}
+          zlayer-runtime pull zachhandley/zlayer-node:${VERSION}
+          zlayer-runtime pull zachhandley/zlayer-manager:${VERSION}
 
           # Or deploy from a spec file
-          zlayer deploy my-deployment.yaml
+          zlayer-runtime deploy my-deployment.yaml
           ```
 
           ### What's Changed
