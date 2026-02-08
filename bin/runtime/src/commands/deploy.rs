@@ -261,7 +261,7 @@ pub(crate) async fn deploy_services(
             anyhow::bail!(
                 "Overlay network required but failed to initialize: {}. \
                  Services with endpoints need overlay networking: [{}]. \
-                 Install WireGuard (apt install wireguard-tools) or use --host-network flag.",
+                 WireGuard auto-installation failed. Install manually (apt install wireguard-tools) or use --host-network flag.",
                 err_detail,
                 services_needing_network.join(", ")
             );
