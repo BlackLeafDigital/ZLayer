@@ -166,6 +166,10 @@ pub struct BundleBuilder {
     args: Option<Vec<String>>,
     /// Pre-resolved volume paths from StorageManager
     volume_paths: HashMap<String, PathBuf>,
+    /// Image configuration from the OCI registry (entrypoint, cmd, env, workdir, user)
+    image_config: Option<zlayer_registry::ImageConfig>,
+    /// Use host networking (skip Network namespace, container shares host network)
+    host_network: bool,
 }
 
 impl BundleBuilder {
@@ -187,6 +191,8 @@ impl BundleBuilder {
             cwd: None,
             args: None,
             volume_paths: HashMap::new(),
+            image_config: None,
+            host_network: false,
         }
     }
 
@@ -234,6 +240,25 @@ impl BundleBuilder {
     /// when building storage mounts in the OCI spec.
     pub fn with_volume_paths(mut self, volume_paths: HashMap<String, PathBuf>) -> Self {
         self.volume_paths = volume_paths;
+        self
+    }
+
+    /// Set the OCI image configuration (entrypoint, cmd, env, workdir, user)
+    ///
+    /// When set, the image config provides defaults for the container process
+    /// that are used when the deployment spec doesn't override them.
+    pub fn with_image_config(mut self, config: zlayer_registry::ImageConfig) -> Self {
+        self.image_config = Some(config);
+        self
+    }
+
+    /// Enable host networking mode
+    ///
+    /// When true, the container will NOT get its own network namespace and will
+    /// share the host's network stack. This is equivalent to Docker's `--network host`.
+    /// Use this when overlay networking is unavailable or not desired.
+    pub fn with_host_network(mut self, host_network: bool) -> Self {
+        self.host_network = host_network;
         self
     }
 
@@ -325,21 +350,65 @@ impl BundleBuilder {
         spec: &ServiceSpec,
         volume_paths: &std::collections::HashMap<String, PathBuf>,
     ) -> Result<Spec> {
-        // Build user (default to root)
-        let user = UserBuilder::default()
-            .uid(0u32)
-            .gid(0u32)
-            .build()
-            .map_err(|e| AgentError::InvalidSpec(format!("failed to build user: {}", e)))?;
+        // Build user: image config user > root (spec doesn't currently have user override)
+        let user = {
+            let (uid, gid) = if let Some(user_str) = self
+                .image_config
+                .as_ref()
+                .and_then(|c| c.user.as_ref())
+                .filter(|u| !u.is_empty())
+            {
+                // Parse "uid:gid" or "uid" format from image config
+                let parts: Vec<&str> = user_str.splitn(2, ':').collect();
+                let uid = parts[0].parse::<u32>().unwrap_or(0);
+                let gid = if parts.len() > 1 {
+                    parts[1].parse::<u32>().unwrap_or(0)
+                } else {
+                    uid
+                };
+                (uid, gid)
+            } else {
+                (0u32, 0u32)
+            };
+
+            UserBuilder::default()
+                .uid(uid)
+                .gid(gid)
+                .build()
+                .map_err(|e| AgentError::InvalidSpec(format!("failed to build user: {}", e)))?
+        };
 
         // Build environment variables
-        let mut env: Vec<String> =
-            vec!["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()];
+        // Layer: image config env (base) -> defaults -> spec env -> builder extra env
+        let mut env: Vec<String> = Vec::new();
+        let mut env_keys: HashSet<String> = HashSet::new();
 
-        // Add TERM for interactive compatibility
-        env.push("TERM=xterm".to_string());
+        // Seed with image config env first (lowest priority)
+        if let Some(img_env) = self.image_config.as_ref().and_then(|c| c.env.as_ref()) {
+            for entry in img_env {
+                if let Some(key) = entry.split('=').next() {
+                    env_keys.insert(key.to_string());
+                }
+                env.push(entry.clone());
+            }
+        }
+
+        // If image config didn't provide PATH, add the default
+        if !env_keys.contains("PATH") {
+            env.push(
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+            );
+            env_keys.insert("PATH".to_string());
+        }
+
+        // Add TERM for interactive compatibility (if not already set)
+        if !env_keys.contains("TERM") {
+            env.push("TERM=xterm".to_string());
+            env_keys.insert("TERM".to_string());
+        }
 
         // Add service-specific env vars, resolving $E: prefixed references
+        // These override image config env for same keys
         let resolved = crate::env::resolve_env_vars_with_warnings(&spec.env).map_err(|e| {
             AgentError::InvalidSpec(format!("environment variable resolution failed: {}", e))
         })?;
@@ -349,28 +418,49 @@ impl BundleBuilder {
             tracing::warn!(container = %container_id, "{}", warning);
         }
 
-        env.extend(resolved.vars);
+        // Merge spec env: spec values take precedence over image config for same keys
+        for var in &resolved.vars {
+            if let Some(key) = var.split('=').next() {
+                if env_keys.contains(key) {
+                    // Remove the old entry from image config
+                    env.retain(|e| e.split('=').next() != Some(key));
+                }
+                env_keys.insert(key.to_string());
+            }
+            env.push(var.clone());
+        }
 
-        // Add extra env vars from builder
+        // Add extra env vars from builder (highest priority)
         for (key, value) in &self.extra_env {
+            if env_keys.contains(key.as_str()) {
+                env.retain(|e| e.split('=').next() != Some(key.as_str()));
+            }
+            env_keys.insert(key.clone());
             env.push(format!("{}={}", key, value));
         }
 
         // Build capabilities
         let capabilities = self.build_capabilities(spec)?;
 
-        // Determine working directory: builder override > spec.command.workdir > "/"
+        // Determine working directory: builder override > spec.command.workdir > image config > "/"
         let cwd = self
             .cwd
             .clone()
             .or_else(|| spec.command.workdir.clone())
+            .or_else(|| {
+                self.image_config
+                    .as_ref()
+                    .and_then(|c| c.working_dir.as_ref())
+                    .filter(|w| !w.is_empty())
+                    .cloned()
+            })
             .unwrap_or_else(|| "/".to_string());
 
-        // Resolve process args: builder override > spec.command entrypoint/args > /bin/sh
+        // Resolve process args: builder override > spec command > image config > /bin/sh
         let process_args = if let Some(ref args) = self.args {
             args.clone()
         } else {
-            Self::resolve_command_from_spec(spec)
+            Self::resolve_command_from_spec(spec, self.image_config.as_ref())
         };
 
         // Build process
@@ -862,7 +952,7 @@ impl BundleBuilder {
     /// Build Linux-specific configuration
     fn build_linux_config(&self, spec: &ServiceSpec) -> Result<oci_spec::runtime::Linux> {
         // Build namespaces
-        let namespaces = vec![
+        let mut namespaces = vec![
             LinuxNamespaceBuilder::default()
                 .typ(LinuxNamespaceType::Pid)
                 .build()
@@ -879,13 +969,19 @@ impl BundleBuilder {
                 .typ(LinuxNamespaceType::Mount)
                 .build()
                 .unwrap(),
-            // Network namespace - will be configured separately by network manager
-            // or joined to an existing network namespace
-            LinuxNamespaceBuilder::default()
-                .typ(LinuxNamespaceType::Network)
-                .build()
-                .unwrap(),
         ];
+
+        // Only add Network namespace when NOT using host networking.
+        // In host networking mode, the container shares the host's network stack
+        // (like Docker's --network host).
+        if !self.host_network {
+            namespaces.push(
+                LinuxNamespaceBuilder::default()
+                    .typ(LinuxNamespaceType::Network)
+                    .build()
+                    .unwrap(),
+            );
+        }
 
         let mut linux_builder = LinuxBuilder::default().namespaces(namespaces);
 
@@ -1497,10 +1593,18 @@ impl BundleBuilder {
         Ok(self.bundle_dir.clone())
     }
 
-    /// Resolve command from ServiceSpec following Docker/OCI semantics
+    /// Resolve command from ServiceSpec and optional image config following Docker/OCI semantics
     ///
-    /// Priority: entrypoint + args > entrypoint only > args only > /bin/sh fallback
-    fn resolve_command_from_spec(spec: &ServiceSpec) -> Vec<String> {
+    /// Resolution order:
+    /// 1. spec entrypoint + args -> use those
+    /// 2. spec entrypoint only -> use entrypoint
+    /// 3. spec args only -> use args
+    /// 4. image_config entrypoint/cmd -> use image_config.full_command()
+    /// 5. fallback to /bin/sh
+    fn resolve_command_from_spec(
+        spec: &ServiceSpec,
+        image_config: Option<&zlayer_registry::ImageConfig>,
+    ) -> Vec<String> {
         let mut args = Vec::new();
 
         match (&spec.command.entrypoint, &spec.command.args) {
@@ -1515,7 +1619,16 @@ impl BundleBuilder {
                 args.extend_from_slice(cmd_args);
             }
             _ => {
-                args.push("/bin/sh".to_string());
+                // No spec command - try image config
+                if let Some(img_cmd) = image_config.and_then(|c| c.full_command()) {
+                    if !img_cmd.is_empty() {
+                        args.extend(img_cmd);
+                    } else {
+                        args.push("/bin/sh".to_string());
+                    }
+                } else {
+                    args.push("/bin/sh".to_string());
+                }
             }
         }
 
@@ -1550,7 +1663,8 @@ pub async fn create_bundle(
     spec: &ServiceSpec,
     rootfs_path: Option<PathBuf>,
 ) -> Result<PathBuf> {
-    let mut builder = BundleBuilder::for_container(container_id);
+    let mut builder =
+        BundleBuilder::for_container(container_id).with_host_network(spec.host_network);
 
     if let Some(rootfs) = rootfs_path {
         builder = builder.with_rootfs(rootfs);
@@ -1818,6 +1932,33 @@ services:
         assert!(namespace_types.contains(&LinuxNamespaceType::Uts));
         assert!(namespace_types.contains(&LinuxNamespaceType::Mount));
         assert!(namespace_types.contains(&LinuxNamespaceType::Network));
+    }
+
+    #[test]
+    fn test_build_namespaces_host_network() {
+        let id = ContainerId {
+            service: "test".to_string(),
+            replica: 1,
+        };
+        let spec = mock_spec();
+        let builder = BundleBuilder::new("/tmp/test-bundle".into()).with_host_network(true);
+
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .unwrap();
+        let linux = oci_spec.linux().as_ref().unwrap();
+        let namespaces = linux.namespaces().as_ref().unwrap();
+
+        // Check we have the expected namespaces (NO Network namespace)
+        let namespace_types: Vec<_> = namespaces.iter().map(|ns| ns.typ()).collect();
+        assert!(namespace_types.contains(&LinuxNamespaceType::Pid));
+        assert!(namespace_types.contains(&LinuxNamespaceType::Ipc));
+        assert!(namespace_types.contains(&LinuxNamespaceType::Uts));
+        assert!(namespace_types.contains(&LinuxNamespaceType::Mount));
+        assert!(
+            !namespace_types.contains(&LinuxNamespaceType::Network),
+            "Network namespace should NOT be present in host_network mode"
+        );
     }
 
     #[test]

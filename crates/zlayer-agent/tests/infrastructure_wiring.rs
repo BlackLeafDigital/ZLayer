@@ -367,8 +367,8 @@ services:
     let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
     assert!(spec.api.enabled, "API must be enabled by default");
     assert_eq!(
-        spec.api.bind, "0.0.0.0:8080",
-        "API bind must default to 0.0.0.0:8080"
+        spec.api.bind, "0.0.0.0:3669",
+        "API bind must default to 0.0.0.0:3669"
     );
     assert!(spec.api.swagger, "Swagger must be enabled by default");
 }

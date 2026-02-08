@@ -91,7 +91,7 @@ pub(crate) async fn handle_tunnel_list(output: &str) -> Result<()> {
     println!("===========\n");
     println!("[No tunnels configured - use the API to manage tunnels]");
     println!("\nTo list tunnels via API:");
-    println!("  curl -H 'Authorization: Bearer <token>' http://localhost:8080/api/v1/tunnels");
+    println!("  curl -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels");
 
     Ok(())
 }
@@ -103,7 +103,7 @@ pub(crate) async fn handle_tunnel_revoke(id: &str) -> Result<()> {
     println!("Revoking tunnel: {}", id);
     println!("\nTo revoke via API:");
     println!(
-        "  curl -X DELETE -H 'Authorization: Bearer <token>' http://localhost:8080/api/v1/tunnels/{}",
+        "  curl -X DELETE -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/{}",
         id
     );
 
@@ -249,7 +249,7 @@ pub(crate) async fn handle_tunnel_add(
     println!(
         r#"  curl -X POST -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
     -d '{{"name":"{}","from_node":"{}","to_node":"{}","local_port":{},"remote_port":{},"expose":"{}"}}' \
-    http://localhost:8080/api/v1/tunnels/node"#,
+    http://localhost:3669/api/v1/tunnels/node"#,
         name, from, to, local_port, remote_port, expose
     );
 
@@ -266,7 +266,7 @@ pub(crate) async fn handle_tunnel_remove(name: &str) -> Result<()> {
     println!("Removing node-to-node tunnel: {}", name);
     println!("\nTo remove via API:");
     println!(
-        "  curl -X DELETE -H 'Authorization: Bearer <token>' http://localhost:8080/api/v1/tunnels/node/{}",
+        "  curl -X DELETE -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/node/{}",
         name
     );
 
@@ -286,7 +286,7 @@ pub(crate) async fn handle_tunnel_status(id: Option<String>) -> Result<()> {
             println!("==============={}", "=".repeat(tunnel_id.len()));
             println!("\nTo get status via API:");
             println!(
-                "  curl -H 'Authorization: Bearer <token>' http://localhost:8080/api/v1/tunnels/{}/status",
+                "  curl -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/{}/status",
                 tunnel_id
             );
         }
@@ -296,7 +296,7 @@ pub(crate) async fn handle_tunnel_status(id: Option<String>) -> Result<()> {
             println!("[Use the API to list tunnel status]");
             println!("\nTo list all tunnels via API:");
             println!(
-                "  curl -H 'Authorization: Bearer <token>' http://localhost:8080/api/v1/tunnels"
+                "  curl -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels"
             );
         }
     }

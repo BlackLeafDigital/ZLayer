@@ -36,7 +36,7 @@ docker pull openapitools/openapi-generator-cli
 ./scripts/generate-clients.sh java
 
 # Use custom OpenAPI spec URL
-./scripts/generate-clients.sh all http://localhost:8080/api-docs/openapi.json
+./scripts/generate-clients.sh all http://localhost:3669/api-docs/openapi.json
 ```
 
 ## Client Usage
@@ -47,7 +47,7 @@ docker pull openapitools/openapi-generator-cli
 import { Configuration, FunctionsApi, ContainersApi } from '@zlayer/client';
 
 const config = new Configuration({
-  basePath: 'http://localhost:8080',
+  basePath: 'http://localhost:3669',
   headers: {
     'Authorization': 'Bearer YOUR_API_KEY'
   }
@@ -88,7 +88,7 @@ from zlayer_client import ApiClient, Configuration
 from zlayer_client.api import FunctionsApi, ContainersApi
 
 config = Configuration(
-    host="http://localhost:8080",
+    host="http://localhost:3669",
     api_key={"Authorization": "Bearer YOUR_API_KEY"}
 )
 
@@ -134,7 +134,7 @@ import (
 
 func main() {
     config := zlayer.NewConfiguration()
-    config.BasePath = "http://localhost:8080"
+    config.BasePath = "http://localhost:3669"
     config.AddDefaultHeader("Authorization", "Bearer YOUR_API_KEY")
 
     client := zlayer.NewAPIClient(config)
@@ -186,7 +186,7 @@ use std::collections::HashMap;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut config = Configuration::default();
-    config.base_path = "http://localhost:8080".to_string();
+    config.base_path = "http://localhost:3669".to_string();
     config.bearer_access_token = Some("YOUR_API_KEY".to_string());
 
     // Deploy a function
@@ -231,7 +231,7 @@ using ZLayer.Client.Model;
 
 var config = new Configuration
 {
-    BasePath = "http://localhost:8080",
+    BasePath = "http://localhost:3669",
     DefaultHeaders = new Dictionary<string, string>
     {
         { "Authorization", "Bearer YOUR_API_KEY" }
@@ -286,7 +286,7 @@ import java.util.HashMap;
 public class Example {
     public static void main(String[] args) throws Exception {
         ApiClient client = Configuration.getDefaultApiClient();
-        client.setBasePath("http://localhost:8080");
+        client.setBasePath("http://localhost:3669");
         client.addDefaultHeader("Authorization", "Bearer YOUR_API_KEY");
 
         FunctionsApi functionsApi = new FunctionsApi(client);

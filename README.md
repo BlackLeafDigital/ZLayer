@@ -738,7 +738,7 @@ The `zlayer` binary provides comprehensive command-line management:
 zlayer node init --advertise-addr 10.0.0.1
 
 # Join an existing cluster
-zlayer node join 10.0.0.1:8080 --token <TOKEN> --advertise-addr 10.0.0.2
+zlayer node join 10.0.0.1:3669 --token <TOKEN> --advertise-addr 10.0.0.2
 
 # List nodes in cluster
 zlayer node list
@@ -750,7 +750,7 @@ zlayer node status
 zlayer node label <node-id> gpu=true
 
 # Generate a join token for workers
-zlayer node generate-join-token -d my-deploy -a http://10.0.0.1:8080
+zlayer node generate-join-token -d my-deploy -a http://10.0.0.1:3669
 ```
 
 ### Deployment Management
@@ -822,10 +822,10 @@ zlayer runtimes
 
 ```bash
 # Start the REST API server
-zlayer serve --bind 0.0.0.0:8080
+zlayer serve --bind 0.0.0.0:3669
 
 # With JWT secret
-zlayer serve --bind 0.0.0.0:8080 --jwt-secret <secret>
+zlayer serve --bind 0.0.0.0:3669 --jwt-secret <secret>
 ```
 
 ### Management UI
@@ -834,10 +834,10 @@ ZLayer includes a web-based management dashboard (similar to [Komodo](https://ko
 
 ```bash
 # Connect to existing ZLayer API
-zlayer-manager --connect http://localhost:8080
+zlayer-manager --connect http://localhost:3669
 
 # With authentication
-zlayer-manager --connect http://localhost:8080 --token <JWT_TOKEN>
+zlayer-manager --connect http://localhost:3669 --token <JWT_TOKEN>
 
 # Custom port (default: 9120)
 zlayer-manager --port 9120
@@ -885,7 +885,7 @@ zlayer spec validate deployment.yaml
 
 # Inspect a running deployment
 zlayer spec inspect my-deployment --format table
-zlayer spec inspect my-deployment --api http://localhost:8080 --format json
+zlayer spec inspect my-deployment --api http://localhost:3669 --format json
 ```
 
 ### Local Development

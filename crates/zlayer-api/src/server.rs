@@ -82,7 +82,7 @@ mod tests {
     fn test_server_creation() {
         let config = ApiConfig::default();
         let server = ApiServer::new(config);
-        assert_eq!(server.bind_addr(), "0.0.0.0:8080".parse().unwrap());
+        assert_eq!(server.bind_addr(), "0.0.0.0:3669".parse().unwrap());
     }
 
     #[test]

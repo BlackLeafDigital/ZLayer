@@ -366,6 +366,41 @@ impl Runtime for DockerRuntime {
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
         let name = container_name(id);
 
+        // Clean up any stale container with the same name from a previous deploy
+        if self.docker.inspect_container(&name, None).await.is_ok() {
+            tracing::warn!(
+                container = %name,
+                "stale container already exists, removing before re-create"
+            );
+            // Attempt to stop — ignore errors since it may already be stopped
+            let _ = self
+                .docker
+                .stop_container(
+                    &name,
+                    Some(StopContainerOptions {
+                        t: Some(5),
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            self.docker
+                .remove_container(
+                    &name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .map_err(|e| {
+                    AgentError::Internal(format!(
+                        "failed to remove stale container {}: {}",
+                        name, e
+                    ))
+                })?;
+            tracing::info!(container = %name, "stale container removed");
+        }
+
         // Build environment variables
         let env: Vec<String> = spec
             .env
@@ -1106,6 +1141,7 @@ mod tests {
             node_selector: None,
             service_type: ServiceType::default(),
             wasm_http: None,
+            host_network: false,
         }
     }
 }

@@ -51,7 +51,7 @@ pub(crate) fn handle_token(action: &TokenCommands) -> Result<()> {
                 println!("{}", token);
                 println!("\nUsage:");
                 println!(
-                    "  curl -H 'Authorization: Bearer {}' http://localhost:8080/api/v1/deployments",
+                    "  curl -H 'Authorization: Bearer {}' http://localhost:3669/api/v1/deployments",
                     token
                 );
             }

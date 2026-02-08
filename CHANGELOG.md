@@ -18,10 +18,16 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - `zlayer manager init` now creates `manager.zlayer.yml` instead of `.zlayer.yml`
 - Deploy output uses event-driven architecture (DeployEvent channel) instead of mixed println/tracing
+- API server default port changed from 8080 to 3669
+- Overlay network failure is now fatal when services require networking (use `--host-network` to bypass)
 
 ### Fixed
 - Proxy backend registration: containers are now registered with the load balancer on startup (previously backends were never added, causing "No healthy backends" errors)
 - Health check target address: TCP and HTTP health checks now connect to the container's overlay IP instead of 127.0.0.1
+- Error reporting now includes service names and error details in deploy output
+- Youki runtime reads image CMD, ENTRYPOINT, Env, WorkingDir, and User from OCI image config
+- Docker runtime cleans up stale containers before re-deploy
+- Integration tests un-ignored in `youki_e2e.rs`
 
 - GPU inventory detection module (`zlayer-agent::gpu_detector`) that scans sysfs PCI devices for GPUs
   - Auto-detects vendor (NVIDIA, AMD, Intel) via PCI vendor IDs

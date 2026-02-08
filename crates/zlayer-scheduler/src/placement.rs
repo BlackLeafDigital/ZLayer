@@ -673,6 +673,7 @@ mod tests {
             node_selector,
             service_type: Default::default(),
             wasm_http: None,
+            host_network: false,
         }
     }
 

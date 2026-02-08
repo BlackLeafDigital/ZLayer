@@ -35,6 +35,14 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) no_tui: bool,
 
+    /// Use host networking instead of overlay (containers share host network namespace)
+    ///
+    /// When set, containers will not get their own network namespace and will share
+    /// the host's network stack. This bypasses the WireGuard overlay requirement.
+    /// Equivalent to Docker's --network host mode.
+    #[arg(long, global = true)]
+    pub(crate) host_network: bool,
+
     #[command(subcommand)]
     pub(crate) command: Commands,
 }
@@ -96,8 +104,8 @@ pub(crate) enum Commands {
 
     /// Start the API server
     Serve {
-        /// Bind address (e.g., 0.0.0.0:8080)
-        #[arg(long, default_value = "0.0.0.0:8080")]
+        /// Bind address (e.g., 0.0.0.0:3669)
+        #[arg(long, default_value = "0.0.0.0:3669")]
         bind: String,
 
         /// JWT secret for authentication (can also be set via ZLAYER_JWT_SECRET env var)
@@ -636,7 +644,7 @@ pub(crate) enum NodeCommands {
         advertise_addr: String,
 
         /// API server port
-        #[arg(long, default_value = "8080")]
+        #[arg(long, default_value = "3669")]
         api_port: u16,
 
         /// Raft consensus port
@@ -659,7 +667,7 @@ pub(crate) enum NodeCommands {
     /// Join an existing cluster as a worker node
     ///
     /// Examples:
-    ///   zlayer node join 10.0.0.1:8080 --token <TOKEN> --advertise-addr 10.0.0.2
+    ///   zlayer node join 10.0.0.1:3669 --token <TOKEN> --advertise-addr 10.0.0.2
     #[command(verbatim_doc_comment)]
     Join {
         /// Leader address (host:port)
@@ -738,7 +746,7 @@ pub(crate) enum NodeCommands {
     /// Examples:
     ///   zlayer node generate-join-token
     ///   zlayer node generate-join-token my-deploy
-    ///   zlayer node generate-join-token my-deploy -a http://10.0.0.1:8080
+    ///   zlayer node generate-join-token my-deploy -a http://10.0.0.1:3669
     #[command(verbatim_doc_comment)]
     GenerateJoinToken {
         /// Deployment name/key (auto-discovered from .zlayer.yml if not given)
@@ -957,7 +965,7 @@ mod tests {
         use base64::Engine;
 
         let info = serde_json::json!({
-            "api_endpoint": "http://localhost:8080",
+            "api_endpoint": "http://localhost:3669",
             "deployment": "my-app",
             "key": "secret-auth-key",
             "service": "api"
@@ -967,7 +975,7 @@ mod tests {
             .encode(serde_json::to_string(&info).unwrap());
 
         let parsed = crate::commands::join::parse_join_token(&token).unwrap();
-        assert_eq!(parsed.api_endpoint, "http://localhost:8080");
+        assert_eq!(parsed.api_endpoint, "http://localhost:3669");
         assert_eq!(parsed.deployment, "my-app");
         assert_eq!(parsed.key, "secret-auth-key");
         assert_eq!(parsed.service, Some("api".to_string()));
@@ -1088,7 +1096,7 @@ mod tests {
                 jwt_secret,
                 no_swagger,
             } => {
-                assert_eq!(bind, "0.0.0.0:8080");
+                assert_eq!(bind, "0.0.0.0:3669");
                 assert!(jwt_secret.is_none());
                 assert!(!no_swagger);
             }
@@ -1633,7 +1641,7 @@ mod tests {
                 overlay_cidr,
             }) => {
                 assert_eq!(advertise_addr, "10.0.0.1");
-                assert_eq!(api_port, 8080);
+                assert_eq!(api_port, 3669);
                 assert_eq!(raft_port, 9000);
                 assert_eq!(overlay_port, 51820);
                 assert_eq!(data_dir, PathBuf::from("/var/lib/zlayer"));
@@ -1690,7 +1698,7 @@ mod tests {
             "zlayer",
             "node",
             "join",
-            "10.0.0.1:8080",
+            "10.0.0.1:3669",
             "--token",
             "abc123",
             "--advertise-addr",
@@ -1706,7 +1714,7 @@ mod tests {
                 mode,
                 services,
             }) => {
-                assert_eq!(leader_addr, "10.0.0.1:8080");
+                assert_eq!(leader_addr, "10.0.0.1:3669");
                 assert_eq!(token, "abc123");
                 assert_eq!(advertise_addr, "10.0.0.2");
                 assert_eq!(mode, "full");
@@ -1722,7 +1730,7 @@ mod tests {
             "zlayer",
             "node",
             "join",
-            "10.0.0.1:8080",
+            "10.0.0.1:3669",
             "--token",
             "abc123",
             "--advertise-addr",

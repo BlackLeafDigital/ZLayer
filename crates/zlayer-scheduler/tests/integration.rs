@@ -30,7 +30,7 @@ async fn test_standalone_scheduling_workflow() {
     let scheduler = Scheduler::new_standalone(
         config,
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://localhost:3669".to_string(),
     );
 
     // Add mock metrics source
@@ -121,7 +121,7 @@ async fn test_multiple_services() {
     let scheduler = Scheduler::new_standalone(
         SchedulerConfig::default(),
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://localhost:3669".to_string(),
     );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
@@ -181,7 +181,7 @@ async fn test_fixed_scaling() {
     let scheduler = Scheduler::new_standalone(
         SchedulerConfig::default(),
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://localhost:3669".to_string(),
     );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
@@ -213,7 +213,7 @@ async fn test_manual_scaling() {
     let scheduler = Scheduler::new_standalone(
         SchedulerConfig::default(),
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://localhost:3669".to_string(),
     );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
@@ -316,7 +316,7 @@ async fn test_prometheus_metrics() {
     let scheduler = Scheduler::new_standalone(
         SchedulerConfig::default(),
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://localhost:3669".to_string(),
     );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
@@ -381,7 +381,7 @@ async fn test_single_node_raft() {
     let scheduler = match Scheduler::new_distributed(
         config,
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://localhost:3669".to_string(),
     )
     .await
     {
@@ -417,7 +417,7 @@ async fn test_service_unregistration() {
     let scheduler = Scheduler::new_standalone(
         SchedulerConfig::default(),
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://localhost:3669".to_string(),
     );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
@@ -444,7 +444,7 @@ async fn test_standalone_is_leader() {
     let scheduler = Scheduler::new_standalone(
         SchedulerConfig::default(),
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://localhost:3669".to_string(),
     );
 
     // Standalone mode should always be leader
@@ -460,7 +460,7 @@ async fn test_scale_down_low_metrics() {
     let scheduler = Scheduler::new_standalone(
         SchedulerConfig::default(),
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://localhost:3669".to_string(),
     );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
@@ -512,7 +512,7 @@ async fn test_respects_bounds() {
     let scheduler = Scheduler::new_standalone(
         SchedulerConfig::default(),
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://localhost:3669".to_string(),
     );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;
@@ -563,7 +563,7 @@ async fn test_memory_scaling() {
     let scheduler = Scheduler::new_standalone(
         SchedulerConfig::default(),
         "test-token".to_string(),
-        "http://localhost:8080".to_string(),
+        "http://localhost:3669".to_string(),
     );
     let mock = Arc::new(MockMetricsSource::new());
     scheduler.add_metrics_source(mock.clone()).await;

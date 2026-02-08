@@ -971,7 +971,6 @@ fn create_test_proxy_manager() -> Arc<ProxyManager> {
 /// 3. Proxy backend registration for load balancing
 /// 4. Cleanup on scale-down
 #[tokio::test]
-#[ignore] // Requires root for overlay networking
 async fn test_service_instance_full_integration() {
     with_timeout!(300, {
         skip_without_root!();
@@ -1088,7 +1087,6 @@ async fn test_service_instance_full_integration() {
 
 /// Test that health callbacks update proxy backend health status
 #[tokio::test]
-#[ignore] // Requires root for container operations
 async fn test_health_callback_updates_proxy() {
     with_timeout!(300, {
         skip_without_root!();
@@ -1219,7 +1217,6 @@ async fn test_dns_record_lifecycle() {
 
 /// Test DNS cleanup on scale down - verifies replica DNS records are removed
 #[tokio::test]
-#[ignore] // Requires root for container operations
 async fn test_dns_cleanup_on_scale_down() {
     with_timeout!(300, {
         skip_without_root!();
@@ -1329,7 +1326,6 @@ async fn test_proxy_backend_lifecycle() {
 
 /// Test ServiceManager with all integration components
 #[tokio::test]
-#[ignore] // Requires root for container operations
 async fn test_service_manager_full_integration() {
     with_timeout!(300, {
         skip_without_root!();
