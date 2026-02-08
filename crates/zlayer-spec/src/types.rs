@@ -161,7 +161,7 @@ impl Default for WasmHttpConfig {
 }
 
 fn default_api_bind() -> String {
-    "0.0.0.0:8080".to_string()
+    "0.0.0.0:3669".to_string()
 }
 
 /// API server configuration (embedded in deploy/up flows)
@@ -170,7 +170,7 @@ pub struct ApiSpec {
     /// Enable the API server (default: true)
     #[serde(default = "default_true")]
     pub enabled: bool,
-    /// Bind address (default: "0.0.0.0:8080")
+    /// Bind address (default: "0.0.0.0:3669")
     #[serde(default = "default_api_bind")]
     pub bind: String,
     /// JWT secret (reads ZLAYER_JWT_SECRET env var if not set)
@@ -353,6 +353,13 @@ pub struct ServiceSpec {
     /// WASM HTTP configuration (only used when service_type is WasmHttp)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wasm_http: Option<WasmHttpConfig>,
+
+    /// Use host networking (container shares host network namespace)
+    ///
+    /// When true, the container will NOT get its own network namespace.
+    /// This is set programmatically via the `--host-network` CLI flag, not in YAML specs.
+    #[serde(skip)]
+    pub host_network: bool,
 }
 
 /// Command override specification (Section 5.5)
@@ -1744,7 +1751,7 @@ services:
 "#;
         let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         assert!(spec.api.enabled);
-        assert_eq!(spec.api.bind, "0.0.0.0:8080");
+        assert_eq!(spec.api.bind, "0.0.0.0:3669");
         assert!(spec.api.jwt_secret.is_none());
         assert!(spec.api.swagger);
     }

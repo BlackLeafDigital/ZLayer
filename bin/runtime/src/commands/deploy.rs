@@ -188,43 +188,85 @@ pub(crate) async fn deploy_services(
         },
     );
 
-    let overlay_manager = match zlayer_agent::OverlayManager::new(spec.deployment.clone()).await {
-        Ok(mut om) => {
-            if let Err(e) = om.setup_global_overlay().await {
-                warn!("Failed to setup global overlay (non-fatal): {}", e);
+    let mut overlay_error: Option<String> = None;
+
+    let overlay_manager = if cli.host_network {
+        info!("Host networking mode: skipping overlay network setup");
+        emit(
+            &event_tx,
+            DeployEvent::InfraPhaseComplete {
+                phase: InfraPhase::Overlay,
+                success: true,
+                message: Some("skipped (--host-network)".to_string()),
+            },
+        );
+        None
+    } else {
+        match zlayer_agent::OverlayManager::new(spec.deployment.clone()).await {
+            Ok(mut om) => {
+                if let Err(e) = om.setup_global_overlay().await {
+                    let err_msg = format!("global overlay setup failed: {}", e);
+                    warn!("Failed to setup global overlay: {}", e);
+                    overlay_error = Some(err_msg.clone());
+                    emit(
+                        &event_tx,
+                        DeployEvent::InfraPhaseComplete {
+                            phase: InfraPhase::Overlay,
+                            success: false,
+                            message: Some(err_msg),
+                        },
+                    );
+                    None
+                } else {
+                    emit(
+                        &event_tx,
+                        DeployEvent::InfraPhaseComplete {
+                            phase: InfraPhase::Overlay,
+                            success: true,
+                            message: Some("global overlay created".to_string()),
+                        },
+                    );
+                    Some(Arc::new(tokio::sync::RwLock::new(om)))
+                }
+            }
+            Err(e) => {
+                let err_msg = format!("overlay manager creation failed: {}", e);
+                warn!("Overlay networks disabled: {}", e);
+                overlay_error = Some(err_msg.clone());
                 emit(
                     &event_tx,
                     DeployEvent::InfraPhaseComplete {
                         phase: InfraPhase::Overlay,
                         success: false,
-                        message: Some(format!("global overlay setup failed: {}", e)),
+                        message: Some(format!("disabled: {}", e)),
                     },
                 );
-            } else {
-                emit(
-                    &event_tx,
-                    DeployEvent::InfraPhaseComplete {
-                        phase: InfraPhase::Overlay,
-                        success: true,
-                        message: Some("global overlay created".to_string()),
-                    },
-                );
+                None
             }
-            Some(Arc::new(tokio::sync::RwLock::new(om)))
-        }
-        Err(e) => {
-            warn!("Overlay networks disabled: {}", e);
-            emit(
-                &event_tx,
-                DeployEvent::InfraPhaseComplete {
-                    phase: InfraPhase::Overlay,
-                    success: false,
-                    message: Some(format!("disabled: {}", e)),
-                },
-            );
-            None
         }
     };
+
+    // If overlay failed, check whether any service actually needs networking.
+    // Services with endpoints need overlay networking to function.
+    if overlay_manager.is_none() && !cli.host_network {
+        let services_needing_network: Vec<&str> = spec
+            .services
+            .iter()
+            .filter(|(_, svc)| !svc.endpoints.is_empty())
+            .map(|(name, _)| name.as_str())
+            .collect();
+
+        if !services_needing_network.is_empty() {
+            let err_detail = overlay_error.as_deref().unwrap_or("unknown error");
+            anyhow::bail!(
+                "Overlay network required but failed to initialize: {}. \
+                 Services with endpoints need overlay networking: [{}]. \
+                 Install WireGuard (apt install wireguard-tools) or use --host-network flag.",
+                err_detail,
+                services_needing_network.join(", ")
+            );
+        }
+    }
 
     // 3. DNS Server
     emit(
@@ -438,9 +480,15 @@ pub(crate) async fn deploy_services(
             DeployEvent::ServiceDeployStarted { name: name.clone() },
         );
 
+        // Propagate host_network flag from CLI to the service spec
+        let mut service_spec_with_flags = service_spec.clone();
+        if cli.host_network {
+            service_spec_with_flags.host_network = true;
+        }
+
         // Register the service with ServiceManager
         match manager
-            .upsert_service(name.clone(), service_spec.clone())
+            .upsert_service(name.clone(), service_spec_with_flags.clone())
             .await
         {
             Ok(()) => {
@@ -457,15 +505,30 @@ pub(crate) async fn deploy_services(
                             info!(service = %name, interface = %iface, "Service overlay created");
                         }
                         Err(e) => {
-                            warn!(service = %name, error = %e, "Failed to setup service overlay (non-fatal)");
+                            let error_msg = format!(
+                                "Failed to setup service overlay for '{}': {}. \
+                                 Service networking will not function. \
+                                 Use --host-network flag to bypass overlay networking.",
+                                name, e
+                            );
+                            warn!(service = %name, error = %e, "Failed to setup service overlay");
+                            emit(
+                                &event_tx,
+                                DeployEvent::ServiceDeployFailed {
+                                    name: name.clone(),
+                                    error: error_msg.clone(),
+                                },
+                            );
+                            failed_services.push((name.clone(), error_msg));
+                            continue;
                         }
                     }
                 }
 
                 // Register service with proxy manager
                 if let Some(pm) = &proxy_manager {
-                    pm.add_service(name, service_spec).await;
-                    if let Err(e) = pm.ensure_ports_for_service(service_spec).await {
+                    pm.add_service(name, &service_spec_with_flags).await;
+                    if let Err(e) = pm.ensure_ports_for_service(&service_spec_with_flags).await {
                         warn!(service = %name, error = %e, "Failed to setup proxy ports (non-fatal)");
                     }
                 }
@@ -486,7 +549,7 @@ pub(crate) async fn deploy_services(
         }
 
         // Determine initial replica count from scale spec
-        let replicas = match &service_spec.scale {
+        let replicas = match &service_spec_with_flags.scale {
             zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
             zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
             zlayer_spec::ScaleSpec::Manual => 0,
@@ -642,9 +705,14 @@ pub(crate) async fn deploy_services(
     );
 
     if !failed_services.is_empty() {
+        let details: Vec<String> = failed_services
+            .iter()
+            .map(|(name, err)| format!("  - {}: {}", name, err))
+            .collect();
         anyhow::bail!(
-            "Deployment completed with {} failed service(s)",
-            failed_services.len()
+            "Deployment completed with {} failed service(s):\n{}",
+            failed_services.len(),
+            details.join("\n")
         )
     }
 

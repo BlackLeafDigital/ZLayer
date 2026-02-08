@@ -12,6 +12,7 @@ pub mod cache;
 pub mod cache_config;
 pub mod client;
 pub mod error;
+pub mod image_config;
 pub mod unpack;
 pub mod wasm;
 
@@ -34,6 +35,7 @@ pub use cache::*;
 pub use cache_config::CacheType;
 pub use client::*;
 pub use error::*;
+pub use image_config::ImageConfig;
 pub use unpack::*;
 pub use wasm::*;
 

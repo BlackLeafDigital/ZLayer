@@ -114,7 +114,7 @@ fn test_zlayer_generate_join_token() {
             "generate-join-token",
             "test-deployment",
             "-a",
-            "http://localhost:8080",
+            "http://localhost:3669",
         ])
         .output()
         .expect("Failed to run zlayer node generate-join-token");

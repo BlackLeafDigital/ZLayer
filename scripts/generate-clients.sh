@@ -31,7 +31,7 @@ check_deps() {
 
 # Fetch OpenAPI spec from running server or use local file
 fetch_spec() {
-    local url="${1:-http://localhost:8080/api-docs/openapi.json}"
+    local url="${1:-http://localhost:3669/api-docs/openapi.json}"
 
     if [[ -f "$OPENAPI_SPEC" ]]; then
         info "Using existing OpenAPI spec: $OPENAPI_SPEC"

@@ -17,7 +17,7 @@ use crate::api_client::{ApiClientError, ZLayerClient};
 
 /// Default API URL if ZLAYER_API_URL is not set
 #[cfg(feature = "ssr")]
-const DEFAULT_API_URL: &str = "http://localhost:8080";
+const DEFAULT_API_URL: &str = "http://localhost:3669";
 
 /// Get a ZLayer API client configured from environment
 #[cfg(feature = "ssr")]

@@ -46,17 +46,17 @@ cargo leptos watch
 cargo leptos build --release
 
 # Run
-./target/release/zlayer-manager --connect http://your-zlayer-api:8080
+./target/release/zlayer-manager --connect http://your-zlayer-api:3669
 ```
 
 ## CLI Options
 
 ```bash
 # Connect to existing ZLayer API
-zlayer-manager --connect http://localhost:8080
+zlayer-manager --connect http://localhost:3669
 
 # Connect with authentication token
-zlayer-manager --connect http://localhost:8080 --token <JWT_TOKEN>
+zlayer-manager --connect http://localhost:3669 --token <JWT_TOKEN>
 
 # Custom port
 zlayer-manager --port 9120
@@ -69,7 +69,7 @@ zlayer-manager --embedded
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `ZLAYER_API_URL` | ZLayer API base URL | `http://localhost:8080` |
+| `ZLAYER_API_URL` | ZLayer API base URL | `http://localhost:3669` |
 | `ZLAYER_API_TOKEN` | JWT token for authentication | None |
 
 ## API Endpoints

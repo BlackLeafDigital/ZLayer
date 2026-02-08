@@ -2,6 +2,7 @@
 
 use crate::cache::BlobCacheBackend;
 use crate::error::{RegistryError, Result};
+use crate::image_config::{ImageConfig, OciImageConfigRoot};
 use crate::wasm::{detect_artifact_type, extract_wasm_info, ArtifactType, WasmArtifactInfo};
 use oci_client::{
     client::{ClientConfig, ClientProtocol},
@@ -245,6 +246,69 @@ impl ImagePuller {
         }
 
         Ok((manifest, digest))
+    }
+
+    /// Pull and parse the image configuration from the registry.
+    ///
+    /// This fetches the manifest, extracts the config blob digest, pulls the
+    /// config blob, and parses it to extract container runtime defaults like
+    /// `Entrypoint`, `Cmd`, `WorkingDir`, `Env`, and `User`.
+    ///
+    /// # Arguments
+    ///
+    /// * `image` - Image reference (e.g., "docker.io/library/nginx:latest")
+    /// * `auth` - Registry authentication credentials
+    ///
+    /// # Returns
+    ///
+    /// Returns the parsed `ImageConfig` containing the container runtime defaults.
+    /// If the image config blob has no `config` section, returns a default (empty)
+    /// `ImageConfig`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest or config blob cannot be fetched, or if
+    /// the config blob cannot be parsed as valid JSON.
+    pub async fn pull_image_config(&self, image: &str, auth: &RegistryAuth) -> Result<ImageConfig> {
+        let (manifest, _digest) = self.pull_manifest(image, auth).await?;
+
+        let config_digest = &manifest.config.digest;
+
+        tracing::debug!(
+            image = %image,
+            config_digest = %config_digest,
+            config_media_type = %manifest.config.media_type,
+            "fetching image config blob"
+        );
+
+        let config_blob = self.pull_blob(image, config_digest, auth).await?;
+
+        let config_root: OciImageConfigRoot =
+            serde_json::from_slice(&config_blob).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    image = %image,
+                    config_digest = %config_digest,
+                    "failed to parse image config JSON"
+                );
+                RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
+                    "failed to parse image config for {image}: {e}"
+                )))
+            })?;
+
+        let config = config_root.config.unwrap_or_default();
+
+        tracing::info!(
+            image = %image,
+            has_entrypoint = config.entrypoint.is_some(),
+            has_cmd = config.cmd.is_some(),
+            has_working_dir = config.working_dir.is_some(),
+            has_user = config.user.is_some(),
+            env_count = config.env.as_ref().map_or(0, |e| e.len()),
+            "image config parsed successfully"
+        );
+
+        Ok(config)
     }
 
     /// Detect the artifact type of an image from its manifest

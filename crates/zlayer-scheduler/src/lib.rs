@@ -121,7 +121,7 @@ impl Scheduler {
     /// # Arguments
     /// * `config` - Scheduler configuration
     /// * `internal_token` - Token for authenticating with agent internal endpoints
-    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:8080")
+    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:3669")
     pub fn new_standalone(
         config: SchedulerConfig,
         internal_token: String,
@@ -144,7 +144,7 @@ impl Scheduler {
     /// # Arguments
     /// * `config` - Scheduler configuration
     /// * `internal_token` - Token for authenticating with agent internal endpoints
-    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:8080")
+    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:3669")
     pub async fn new_distributed(
         config: SchedulerConfig,
         internal_token: String,
@@ -464,7 +464,7 @@ mod tests {
         let scheduler = Scheduler::new_standalone(
             config,
             "test-token".to_string(),
-            "http://localhost:8080".to_string(),
+            "http://localhost:3669".to_string(),
         );
 
         // Should always be leader in standalone
@@ -480,7 +480,7 @@ mod tests {
         let scheduler = Scheduler::new_standalone(
             config,
             "test-token".to_string(),
-            "http://localhost:8080".to_string(),
+            "http://localhost:3669".to_string(),
         );
 
         scheduler
@@ -497,7 +497,7 @@ mod tests {
         let scheduler = Scheduler::new_standalone(
             config,
             "test-token".to_string(),
-            "http://localhost:8080".to_string(),
+            "http://localhost:3669".to_string(),
         );
 
         // Add mock metrics source

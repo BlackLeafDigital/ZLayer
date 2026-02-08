@@ -298,7 +298,7 @@ mod tests {
         use base64::Engine;
 
         let info = serde_json::json!({
-            "api_endpoint": "http://localhost:8080",
+            "api_endpoint": "http://localhost:3669",
             "deployment": "my-app",
             "key": "secret-auth-key",
             "service": "api"
@@ -308,7 +308,7 @@ mod tests {
             .encode(serde_json::to_string(&info).unwrap());
 
         let parsed = parse_join_token(&token).unwrap();
-        assert_eq!(parsed.api_endpoint, "http://localhost:8080");
+        assert_eq!(parsed.api_endpoint, "http://localhost:3669");
         assert_eq!(parsed.deployment, "my-app");
         assert_eq!(parsed.key, "secret-auth-key");
         assert_eq!(parsed.service, Some("api".to_string()));

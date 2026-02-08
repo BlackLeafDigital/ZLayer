@@ -115,7 +115,7 @@ zlayer runtimes
 
 ```bash
 # Build from Dockerfile
-curl -X POST http://localhost:8080/api/v1/build/json \
+curl -X POST http://localhost:3669/api/v1/build/json \
   -H "Content-Type: application/json" \
   -d '{
     "context_path": "/path/to/app",
@@ -123,7 +123,7 @@ curl -X POST http://localhost:8080/api/v1/build/json \
   }'
 
 # Build with runtime template
-curl -X POST http://localhost:8080/api/v1/build/json \
+curl -X POST http://localhost:3669/api/v1/build/json \
   -H "Content-Type: application/json" \
   -d '{
     "context_path": "/path/to/app",
@@ -132,7 +132,7 @@ curl -X POST http://localhost:8080/api/v1/build/json \
   }'
 
 # Stream build progress
-curl http://localhost:8080/api/v1/build/{build_id}/stream
+curl http://localhost:3669/api/v1/build/{build_id}/stream
 ```
 
 #### Dockerfile Examples

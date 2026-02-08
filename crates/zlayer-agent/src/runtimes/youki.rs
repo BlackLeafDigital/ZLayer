@@ -121,6 +121,8 @@ pub struct YoukiRuntime {
     storage_manager: std::sync::Arc<tokio::sync::RwLock<StorageManager>>,
     /// Shared blob cache for image layers (avoids repeated opens and ensures cache persistence)
     blob_cache: std::sync::Arc<Box<dyn zlayer_registry::BlobCacheBackend>>,
+    /// Cached image configs (entrypoint, cmd, env, etc.) keyed by image reference
+    image_configs: RwLock<HashMap<String, zlayer_registry::ImageConfig>>,
 }
 
 impl std::fmt::Debug for YoukiRuntime {
@@ -199,6 +201,7 @@ impl YoukiRuntime {
             auth_resolver: zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()),
             storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
             blob_cache,
+            image_configs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -277,6 +280,7 @@ impl YoukiRuntime {
             auth_resolver: zlayer_core::AuthResolver::new(auth_config),
             storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
             blob_cache,
+            image_configs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -515,6 +519,15 @@ impl YoukiRuntime {
 
         Ok(())
     }
+
+    /// Get a cached image config by image reference
+    ///
+    /// Returns the previously pulled image configuration (entrypoint, cmd, env, etc.)
+    /// for the given image reference, if available.
+    async fn get_image_config(&self, image: &str) -> Option<zlayer_registry::ImageConfig> {
+        let configs = self.image_configs.read().await;
+        configs.get(image).cloned()
+    }
 }
 
 #[async_trait::async_trait]
@@ -582,6 +595,28 @@ impl Runtime for YoukiRuntime {
             "image layers cached"
         );
 
+        // Also pull and cache the image config (entrypoint, cmd, env, etc.)
+        match puller.pull_image_config(image, &auth).await {
+            Ok(config) => {
+                tracing::info!(
+                    image = %image,
+                    has_entrypoint = config.entrypoint.is_some(),
+                    has_cmd = config.cmd.is_some(),
+                    "image config cached"
+                );
+                let mut configs = self.image_configs.write().await;
+                configs.insert(image.to_string(), config);
+            }
+            Err(e) => {
+                // Log but don't fail - the container can still run with spec defaults
+                tracing::warn!(
+                    image = %image,
+                    error = %e,
+                    "failed to pull image config, container will use spec defaults"
+                );
+            }
+        }
+
         Ok(())
     }
 
@@ -634,13 +669,20 @@ impl Runtime for YoukiRuntime {
                 reason: format!("failed to extract rootfs: {}", e),
             })?;
 
+        // Get cached image config (entrypoint, cmd, env, workdir, user)
+        let img_config = self.get_image_config(image).await;
+
         // Prepare storage volumes
         let volume_paths = self.prepare_storage_volumes(id, spec).await?;
 
         // Generate OCI config.json via BundleBuilder (handles capabilities, devices,
         // resource limits, storage mounts, env resolution, and command resolution)
-        let bundle_builder =
-            crate::bundle::BundleBuilder::new(bundle_path.clone()).with_volume_paths(volume_paths);
+        let mut bundle_builder = crate::bundle::BundleBuilder::new(bundle_path.clone())
+            .with_volume_paths(volume_paths)
+            .with_host_network(spec.host_network);
+        if let Some(config) = img_config {
+            bundle_builder = bundle_builder.with_image_config(config);
+        }
         bundle_builder.write_config(id, spec).await?;
 
         // Create log files

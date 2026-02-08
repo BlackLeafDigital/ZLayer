@@ -506,7 +506,7 @@ pub(crate) async fn handle_node_join(
         node_id: join_response.node_id.clone(),
         raft_node_id: join_response.raft_node_id,
         advertise_addr: advertise_addr.clone(),
-        api_port: 8080, // Default for workers
+        api_port: 3669, // Default for workers
         raft_port,
         overlay_port,
         overlay_cidr: token_data.overlay_cidr.clone(),
@@ -1037,7 +1037,7 @@ pub(crate) async fn handle_node_generate_join_token(
                 Err(_) => {
                     // Node was never initialized -- auto-init with defaults.
                     let advertise_addr = detect_local_ip();
-                    let api_port: u16 = 8080;
+                    let api_port: u16 = 3669;
                     let raft_port: u16 = 9000;
                     let overlay_port: u16 = 51820;
                     let overlay_cidr = "10.200.0.0/16".to_string();
@@ -1148,7 +1148,7 @@ mod tests {
                 overlay_cidr,
             }) => {
                 assert_eq!(advertise_addr, "10.0.0.1");
-                assert_eq!(api_port, 8080);
+                assert_eq!(api_port, 3669);
                 assert_eq!(raft_port, 9000);
                 assert_eq!(overlay_port, 51820);
                 assert_eq!(data_dir, PathBuf::from("/var/lib/zlayer"));
@@ -1205,7 +1205,7 @@ mod tests {
             "zlayer",
             "node",
             "join",
-            "10.0.0.1:8080",
+            "10.0.0.1:3669",
             "--token",
             "abc123",
             "--advertise-addr",
@@ -1221,7 +1221,7 @@ mod tests {
                 mode,
                 services,
             }) => {
-                assert_eq!(leader_addr, "10.0.0.1:8080");
+                assert_eq!(leader_addr, "10.0.0.1:3669");
                 assert_eq!(token, "abc123");
                 assert_eq!(advertise_addr, "10.0.0.2");
                 assert_eq!(mode, "full");
@@ -1237,7 +1237,7 @@ mod tests {
             "zlayer",
             "node",
             "join",
-            "10.0.0.1:8080",
+            "10.0.0.1:3669",
             "--token",
             "abc123",
             "--advertise-addr",
@@ -1415,7 +1415,7 @@ mod tests {
     fn test_join_token_roundtrip() {
         let token = super::generate_join_token_data(
             "192.168.1.1",
-            8080,
+            3669,
             9000,
             "test-public-key",
             "10.200.0.0/16",
@@ -1424,7 +1424,7 @@ mod tests {
 
         let parsed = super::parse_cluster_join_token(&token).unwrap();
 
-        assert_eq!(parsed.api_endpoint, "192.168.1.1:8080");
+        assert_eq!(parsed.api_endpoint, "192.168.1.1:3669");
         assert_eq!(parsed.raft_endpoint, "192.168.1.1:9000");
         assert_eq!(parsed.leader_wg_pubkey, "test-public-key");
         assert_eq!(parsed.overlay_cidr, "10.200.0.0/16");

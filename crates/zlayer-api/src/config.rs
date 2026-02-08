@@ -32,7 +32,7 @@ pub struct ApiConfig {
 }
 
 fn default_bind() -> SocketAddr {
-    "0.0.0.0:8080".parse().unwrap()
+    "0.0.0.0:3669".parse().unwrap()
 }
 
 fn default_token_expiry() -> Duration {

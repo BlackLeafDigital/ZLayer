@@ -81,11 +81,11 @@ mod tests {
 
     #[test]
     fn test_connect_mode() {
-        let args = Args::parse_from(["zlayer-manager", "--connect", "http://localhost:8080"]);
-        assert_eq!(args.connect_url.as_deref(), Some("http://localhost:8080"));
+        let args = Args::parse_from(["zlayer-manager", "--connect", "http://localhost:3669"]);
+        assert_eq!(args.connect_url.as_deref(), Some("http://localhost:3669"));
         match args.connection_mode() {
             ConnectionMode::Remote { url, token } => {
-                assert_eq!(url, "http://localhost:8080");
+                assert_eq!(url, "http://localhost:3669");
                 assert!(token.is_none());
             }
             _ => panic!("Expected Remote mode"),
@@ -97,13 +97,13 @@ mod tests {
         let args = Args::parse_from([
             "zlayer-manager",
             "--connect",
-            "http://localhost:8080",
+            "http://localhost:3669",
             "--token",
             "secret123",
         ]);
         match args.connection_mode() {
             ConnectionMode::Remote { url, token } => {
-                assert_eq!(url, "http://localhost:8080");
+                assert_eq!(url, "http://localhost:3669");
                 assert_eq!(token.as_deref(), Some("secret123"));
             }
             _ => panic!("Expected Remote mode"),

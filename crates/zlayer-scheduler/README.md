@@ -37,7 +37,7 @@ use zlayer_scheduler::{Scheduler, SchedulerConfig};
 let scheduler = Scheduler::new_standalone(
     SchedulerConfig::default(),
     "internal-token".to_string(),
-    "http://localhost:8080".to_string(),
+    "http://localhost:3669".to_string(),
 );
 
 // Register a service for autoscaling
@@ -64,7 +64,7 @@ use zlayer_scheduler::{Scheduler, SchedulerConfig, RaftConfig};
 
 let raft_config = RaftConfig {
     node_id: 1,
-    cluster_nodes: vec!["10.0.0.1:8080", "10.0.0.2:8080", "10.0.0.3:8080"],
+    cluster_nodes: vec!["10.0.0.1:3669", "10.0.0.2:3669", "10.0.0.3:3669"],
     data_dir: "/var/lib/zlayer/raft".into(),
 };
 
@@ -72,7 +72,7 @@ let scheduler = Scheduler::new_distributed(
     SchedulerConfig::default(),
     raft_config,
     "internal-token".to_string(),
-    "http://localhost:8080".to_string(),
+    "http://localhost:3669".to_string(),
 ).await?;
 ```
 
