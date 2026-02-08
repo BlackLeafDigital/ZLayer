@@ -278,14 +278,14 @@ services:
 
 ### 3. Deploy
 
-`.zlayer.yml` is the canonical deployment spec filename. When present in the current directory, `zlayer deploy` and `zlayer up` auto-discover it:
+Deployment specs use the `<name>.zlayer.yml` naming convention (e.g. `nginx.zlayer.yml`, `myapp.zlayer.yml`). When a single `*.zlayer.yml` file is present in the current directory, `zlayer deploy` and `zlayer up` auto-discover it:
 
 ```bash
-# Auto-discovers .zlayer.yml in current directory
+# Auto-discovers *.zlayer.yml in current directory
 zlayer deploy
 
 # Or specify explicitly
-zlayer deploy deployment.yaml
+zlayer deploy nginx.zlayer.yml
 ```
 
 ### 4. Check status

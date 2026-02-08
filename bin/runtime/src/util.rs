@@ -40,8 +40,8 @@ fn discover_spec_path_in_dir(explicit: Option<&Path>, dir: &Path) -> Result<Path
         1 => Ok(glob_matches.into_iter().next().unwrap()),
         0 => {
             anyhow::bail!(
-                "No deployment spec found. Create a .zlayer.yml (or <name>.zlayer.yml) file, \
-                 or specify a path explicitly."
+                "No deployment spec found. Create a <name>.zlayer.yml file \
+                 (e.g. myapp.zlayer.yml), or specify a path explicitly."
             );
         }
         _ => {

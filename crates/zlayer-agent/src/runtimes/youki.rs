@@ -1400,6 +1400,12 @@ impl Runtime for YoukiRuntime {
 
         Ok(pid)
     }
+
+    async fn get_container_ip(&self, _id: &ContainerId) -> Result<Option<std::net::IpAddr>> {
+        // Youki containers use OCI network namespaces — IP assignment comes
+        // from the overlay manager, not the runtime itself.
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
