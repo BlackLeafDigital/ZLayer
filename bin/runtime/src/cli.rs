@@ -28,7 +28,7 @@ pub(crate) struct Cli {
     /// Shows full deployment progress, waits for services to stabilize,
     /// then automatically exits without waiting for Ctrl+C.
     /// Unlike -b/--background, this waits for services to be confirmed running.
-    #[arg(long = "detach", global = true)]
+    #[arg(short = 'd', long = "detach", global = true)]
     pub(crate) detach: bool,
 
     /// Disable interactive TUI (use plain text output)
@@ -68,7 +68,7 @@ pub(crate) enum DeployMode {
 pub(crate) enum Commands {
     /// Deploy services from a spec file
     Deploy {
-        /// Path to the deployment spec YAML file (auto-discovers .zlayer.yml if not given)
+        /// Path to deployment spec (auto-discovers *.zlayer.yml in current directory)
         spec_path: Option<PathBuf>,
 
         /// Dry run - parse and validate but don't actually deploy
@@ -114,14 +114,14 @@ pub(crate) enum Commands {
 
     /// Validate a spec file without deploying
     Validate {
-        /// Path to the deployment spec YAML file (auto-discovers .zlayer.yml if not given)
+        /// Path to deployment spec (auto-discovers *.zlayer.yml in current directory)
         spec_path: Option<PathBuf>,
     },
 
     /// Stream logs from a service
     Logs {
         /// Deployment name
-        #[arg(short, long)]
+        #[arg(long)]
         deployment: String,
 
         /// Service name
@@ -160,30 +160,30 @@ pub(crate) enum Commands {
 
     /// Deploy and start services (like docker compose up)
     ///
-    /// Auto-discovers .zlayer.yml in current directory if no spec path given.
+    /// Auto-discovers *.zlayer.yml in current directory if no spec path given.
     /// Runs in foreground by default, streaming logs and waiting for Ctrl+C.
     /// Use -b/--background to deploy and return immediately.
     ///
     /// Examples:
     ///   zlayer up
-    ///   zlayer up my-spec.yml
+    ///   zlayer up myapp.zlayer.yml
     ///   zlayer up -b
     #[command(verbatim_doc_comment)]
     Up {
-        /// Path to deployment spec (auto-discovers .zlayer.yml if not given)
+        /// Path to deployment spec (auto-discovers *.zlayer.yml if not given)
         spec_path: Option<PathBuf>,
     },
 
     /// Stop all services in a deployment (like docker compose down)
     ///
-    /// Auto-discovers deployment name from .zlayer.yml if not given.
+    /// Auto-discovers deployment name from *.zlayer.yml if not given.
     ///
     /// Examples:
     ///   zlayer down
     ///   zlayer down my-deployment
     #[command(verbatim_doc_comment)]
     Down {
-        /// Deployment name (auto-discovers from .zlayer.yml if not given)
+        /// Deployment name (auto-discovers from *.zlayer.yml if not given)
         deployment: Option<String>,
     },
 
@@ -731,22 +731,30 @@ pub(crate) enum NodeCommands {
     /// Generate a join token for worker nodes
     ///
     /// Creates a base64-encoded token that workers can use to join this cluster.
+    /// If no API endpoint is provided, reads it from the node config.
+    /// If the node hasn't been initialized, auto-initializes with defaults.
+    /// If no deployment name is provided, tries to discover it from .zlayer.yml.
     ///
     /// Examples:
-    ///   zlayer node generate-join-token -d my-deploy -a http://10.0.0.1:8080
+    ///   zlayer node generate-join-token
+    ///   zlayer node generate-join-token my-deploy
+    ///   zlayer node generate-join-token my-deploy -a http://10.0.0.1:8080
     #[command(verbatim_doc_comment)]
     GenerateJoinToken {
-        /// Deployment name/key
-        #[arg(short, long)]
-        deployment: String,
+        /// Deployment name/key (auto-discovered from .zlayer.yml if not given)
+        deployment: Option<String>,
 
-        /// API endpoint URL
+        /// API endpoint URL (inferred from node config if not given)
         #[arg(short, long)]
-        api: String,
+        api: Option<String>,
 
         /// Service name (optional)
         #[arg(short, long)]
         service: Option<String>,
+
+        /// Data directory (where node_config.json lives)
+        #[arg(long, default_value = "/var/lib/zlayer")]
+        data_dir: PathBuf,
     },
 }
 
@@ -1224,7 +1232,16 @@ mod tests {
     #[test]
     fn test_cli_logs_command_short_flags() {
         let cli = Cli::try_parse_from([
-            "zlayer", "logs", "-d", "staging", "-n", "25", "-f", "-i", "inst-456", "api",
+            "zlayer",
+            "logs",
+            "--deployment",
+            "staging",
+            "-n",
+            "25",
+            "-f",
+            "-i",
+            "inst-456",
+            "api",
         ])
         .unwrap();
 
@@ -1960,5 +1977,31 @@ mod tests {
         assert_ne!(DeployMode::Foreground, DeployMode::Background);
         assert_ne!(DeployMode::Foreground, DeployMode::Detach);
         assert_ne!(DeployMode::Background, DeployMode::Detach);
+    }
+
+    #[test]
+    fn test_cli_detach_short_flag() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "-d", "deploy", "spec.yml"]).unwrap();
+        assert!(cli.detach);
+        assert!(matches!(cli.command, Commands::Deploy { .. }));
+    }
+
+    #[test]
+    fn test_cli_detach_short_flag_after_subcommand() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "deploy", "-d", "spec.yml"]).unwrap();
+        assert!(cli.detach);
+        match cli.command {
+            Commands::Deploy { spec_path, .. } => {
+                assert_eq!(spec_path, Some(PathBuf::from("spec.yml")));
+            }
+            _ => panic!("Expected Deploy command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_detach_short_flag_with_up() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "up", "-d"]).unwrap();
+        assert!(cli.detach);
+        assert!(matches!(cli.command, Commands::Up { .. }));
     }
 }

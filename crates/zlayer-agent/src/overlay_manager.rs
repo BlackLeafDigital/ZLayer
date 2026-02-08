@@ -58,13 +58,50 @@ impl OverlayManager {
         let service_prefix = &service_name[..8.min(service_name.len())];
         let interface_name = format!("zl-{}-{}", deployment_prefix, service_prefix);
 
+        // Attempt WireGuard overlay (for inter-node communication)
+        // This is non-fatal: single-node deployments work fine without it
+        match self
+            .try_create_wireguard_overlay(&interface_name, service_name)
+            .await
+        {
+            Ok(()) => {
+                tracing::info!(
+                    service = %service_name,
+                    interface = %interface_name,
+                    "WireGuard service overlay created"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    service = %service_name,
+                    error = %e,
+                    "WireGuard overlay unavailable, using direct networking"
+                );
+            }
+        }
+
+        // Always register service so attach_container can proceed
+        // (veth pair creation doesn't require the WireGuard interface)
+        self.service_interfaces
+            .write()
+            .await
+            .insert(service_name.to_string(), interface_name.clone());
+        Ok(interface_name)
+    }
+
+    /// Attempt to create a WireGuard overlay interface for inter-node traffic
+    async fn try_create_wireguard_overlay(
+        &self,
+        interface_name: &str,
+        service_name: &str,
+    ) -> Result<(), AgentError> {
         let (private_key, public_key) = WireGuardManager::generate_keys()
             .await
             .map_err(|e| AgentError::Network(format!("Failed to generate keys: {}", e)))?;
 
         let service_ip = self.ip_allocator.allocate_for_service(service_name)?;
         let config = self.build_config(private_key, public_key, service_ip, 24, 0);
-        let manager = WireGuardManager::new(config, interface_name.clone());
+        let manager = WireGuardManager::new(config, interface_name.to_string());
 
         manager
             .create_interface()
@@ -74,11 +111,7 @@ impl OverlayManager {
             AgentError::Network(format!("Failed to configure service overlay: {}", e))
         })?;
 
-        self.service_interfaces
-            .write()
-            .await
-            .insert(service_name.to_string(), interface_name.clone());
-        Ok(interface_name)
+        Ok(())
     }
 
     /// Add a container to the appropriate overlay networks
@@ -172,6 +205,17 @@ impl OverlayManager {
                 veth_container,
                 "up",
             ],
+        )
+        .await?;
+
+        // Bring up host-side veth so traffic can flow
+        self.run_command("ip", &["link", "set", &veth_host, "up"])
+            .await?;
+
+        // Add route so host can reach the container's IP via the veth
+        self.run_command(
+            "ip",
+            &["route", "add", &format!("{}/32", ip), "dev", &veth_host],
         )
         .await?;
 

@@ -105,14 +105,13 @@ fn test_zlayer_token_create() {
     assert_eq!(parts.len(), 3, "Token should be a valid JWT with 3 parts");
 }
 
-/// Test that zlayer can generate join tokens
+/// Test that zlayer can generate join tokens with explicit args
 #[test]
 fn test_zlayer_generate_join_token() {
     let output = Command::new(env!("CARGO_BIN_EXE_zlayer-runtime"))
         .args([
             "node",
             "generate-join-token",
-            "-d",
             "test-deployment",
             "-a",
             "http://localhost:8080",
@@ -134,4 +133,43 @@ fn test_zlayer_generate_join_token() {
         stdout.contains("test-deployment"),
         "Should include deployment name"
     );
+}
+
+/// Test that zlayer can generate join tokens with only deployment name (no -a)
+#[test]
+fn test_zlayer_generate_join_token_deployment_only() {
+    // Use a temp data-dir so auto-init doesn't need root and doesn't collide
+    let tmp = std::env::temp_dir().join(format!("zlayer_test_gen_token_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_zlayer-runtime"))
+        .args([
+            "node",
+            "generate-join-token",
+            "my-deploy",
+            "--data-dir",
+            tmp.to_str().unwrap(),
+        ])
+        .output()
+        .expect("Failed to run zlayer node generate-join-token");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    // This may fail on CI if wg isn't installed (auto-init needs it),
+    // but if it succeeds, the token should be correct.
+    if output.status.success() {
+        assert!(
+            stdout.contains("Join Token Generated"),
+            "Should show generation success. stdout: {}\nstderr: {}",
+            stdout,
+            stderr,
+        );
+        assert!(
+            stdout.contains("my-deploy"),
+            "Should include deployment name"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }

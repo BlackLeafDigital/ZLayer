@@ -101,9 +101,9 @@ struct ValidateArgs {
 
 #[derive(Parser)]
 struct PipelineArgs {
-    /// Path to pipeline file
-    #[arg(short = 'f', long = "file", default_value = "ZPipeline.yaml")]
-    file: PathBuf,
+    /// Path to pipeline file (defaults to ZPipeline.yaml or zlayer-pipeline.yaml)
+    #[arg(short = 'f', long = "file")]
+    file: Option<PathBuf>,
 
     /// Set pipeline variables (KEY=VALUE, repeatable)
     #[arg(long = "set")]
@@ -299,14 +299,34 @@ fn print_build_result(result: &zlayer_builder::BuiltImage) {
 // pipeline subcommand
 // ---------------------------------------------------------------------------
 
+/// Discover pipeline file from explicit path or well-known defaults.
+fn discover_pipeline_file(explicit: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    let candidates = ["ZPipeline.yaml", "ZPipeline.yml", "zlayer-pipeline.yaml", "zlayer-pipeline.yml"];
+    for candidate in &candidates {
+        let path = Path::new(candidate);
+        if path.exists() {
+            return Ok(path.to_path_buf());
+        }
+    }
+    bail!(
+        "No pipeline file found. Create a ZPipeline.yaml (or zlayer-pipeline.yaml), \
+         or specify a path with -f."
+    );
+}
+
 async fn cmd_pipeline(args: PipelineArgs) -> Result<()> {
     use std::collections::HashSet;
     use zlayer_builder::{parse_pipeline, BuildahExecutor, PipelineExecutor};
 
+    let file = discover_pipeline_file(args.file)?;
+
     // 1. Read and parse pipeline file
-    let content = tokio::fs::read_to_string(&args.file)
+    let content = tokio::fs::read_to_string(&file)
         .await
-        .with_context(|| format!("Failed to read pipeline file: {}", args.file.display()))?;
+        .with_context(|| format!("Failed to read pipeline file: {}", file.display()))?;
 
     let mut pipeline = parse_pipeline(&content).context("Failed to parse pipeline")?;
 
@@ -332,8 +352,7 @@ async fn cmd_pipeline(args: PipelineArgs) -> Result<()> {
         .await
         .context("Failed to initialize buildah")?;
 
-    let base_dir = args
-        .file
+    let base_dir = file
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."))
@@ -344,7 +363,7 @@ async fn cmd_pipeline(args: PipelineArgs) -> Result<()> {
     info!(
         "Building {} images from {}",
         pipeline.images.len(),
-        args.file.display()
+        file.display()
     );
 
     let executor = PipelineExecutor::new(pipeline, base_dir, buildah)

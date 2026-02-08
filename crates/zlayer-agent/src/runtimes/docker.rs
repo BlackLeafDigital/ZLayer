@@ -875,6 +875,40 @@ impl Runtime for DockerRuntime {
         tracing::debug!(container = %name, pid = ?pid, "got container PID");
         Ok(pid)
     }
+
+    /// Get the IP address of a running container from Docker's bridge network
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.get_ip",
+            container.id = %container_name(id),
+            service.name = %id.service,
+        )
+    )]
+    async fn get_container_ip(&self, id: &ContainerId) -> Result<Option<std::net::IpAddr>> {
+        let name = container_name(id);
+
+        let inspect = self
+            .docker
+            .inspect_container(&name, None)
+            .await
+            .map_err(|e| AgentError::NotFound {
+                container: name.clone(),
+                reason: format!("failed to inspect container: {}", e),
+            })?;
+
+        // Extract bridge IP from network settings
+        let ip = inspect
+            .network_settings
+            .and_then(|ns| ns.networks)
+            .and_then(|nets| nets.get("bridge").cloned())
+            .and_then(|bridge| bridge.ip_address)
+            .filter(|ip| !ip.is_empty())
+            .and_then(|ip| ip.parse::<std::net::IpAddr>().ok());
+
+        tracing::debug!(container = %name, ip = ?ip, "got container IP from Docker inspect");
+        Ok(ip)
+    }
 }
 
 #[cfg(test)]

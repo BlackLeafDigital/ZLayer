@@ -218,18 +218,49 @@ impl ServiceInstance {
                     None
                 };
 
+                // If overlay failed, try the container runtime's own IP as fallback
+                let effective_ip = if overlay_ip.is_none() {
+                    match self.runtime.get_container_ip(&id).await {
+                        Ok(Some(ip)) => {
+                            tracing::info!(
+                                container = %id,
+                                ip = %ip,
+                                "using runtime container IP for proxy (overlay unavailable)"
+                            );
+                            Some(ip)
+                        }
+                        Ok(None) => {
+                            tracing::warn!(
+                                container = %id,
+                                "no container IP available from runtime, proxy routing will be unavailable"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                container = %id,
+                                error = %e,
+                                "failed to get container IP from runtime"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    overlay_ip
+                };
+
                 // Start health monitoring and store handle (no lock needed during start)
                 let health_monitor_handle = {
                     let check = self.spec.health.check.clone();
                     let interval = self.spec.health.interval.unwrap_or(Duration::from_secs(10));
                     let retries = self.spec.health.retries;
 
-                    let checker = HealthChecker::new(check, overlay_ip);
+                    let checker = HealthChecker::new(check, effective_ip);
                     let mut monitor = HealthMonitor::new(id.clone(), checker, interval, retries);
 
                     // Create health callback to update proxy backend health if proxy is configured
                     // and we have an overlay IP for this container
-                    if let (Some(proxy), Some(ip)) = (&self.proxy_manager, overlay_ip) {
+                    if let (Some(proxy), Some(ip)) = (&self.proxy_manager, effective_ip) {
                         let proxy = Arc::clone(proxy);
                         let service_name = self.service_name.clone();
                         // Get the primary endpoint port for constructing the backend address
@@ -292,7 +323,7 @@ impl ServiceInstance {
                             state: ContainerState::Running,
                             pid: None,
                             task: None,
-                            overlay_ip,
+                            overlay_ip: effective_ip,
                             health_monitor: Some(health_monitor_handle),
                         },
                     );

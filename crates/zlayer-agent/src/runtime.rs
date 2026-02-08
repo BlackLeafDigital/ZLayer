@@ -111,6 +111,16 @@ pub trait Runtime: Send + Sync {
     ///
     /// Used for overlay network attachment and process management.
     async fn get_container_pid(&self, id: &ContainerId) -> Result<Option<u32>>;
+
+    /// Get the IP address of a container
+    ///
+    /// Returns:
+    /// - `Ok(Some(ip))` if the container has a known IP address
+    /// - `Ok(None)` if the container exists but has no IP assigned yet
+    /// - `Err` if the container doesn't exist or there's an error
+    ///
+    /// Used for proxy backend registration when overlay networking is unavailable.
+    async fn get_container_ip(&self, id: &ContainerId) -> Result<Option<IpAddr>>;
 }
 
 /// In-memory mock runtime for testing and development
@@ -264,6 +274,25 @@ impl Runtime for MockRuntime {
         let containers = self.containers.read().await;
         if let Some(container) = containers.get(id) {
             Ok(container.pid)
+        } else {
+            Err(AgentError::NotFound {
+                container: id.to_string(),
+                reason: "container not found".to_string(),
+            })
+        }
+    }
+
+    async fn get_container_ip(&self, id: &ContainerId) -> Result<Option<IpAddr>> {
+        let containers = self.containers.read().await;
+        if containers.contains_key(id) {
+            // Mock: deterministic IP based on replica number (172.17.0.{replica+2})
+            let last_octet = id.replica + 2;
+            Ok(Some(IpAddr::V4(std::net::Ipv4Addr::new(
+                172,
+                17,
+                0,
+                last_octet as u8,
+            ))))
         } else {
             Err(AgentError::NotFound {
                 container: id.to_string(),

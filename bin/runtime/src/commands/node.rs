@@ -248,7 +248,16 @@ pub(crate) async fn handle_node(node_cmd: &NodeCommands) -> Result<()> {
             deployment,
             api,
             service,
-        } => handle_node_generate_join_token(deployment.clone(), api.clone(), service.clone()),
+            data_dir,
+        } => {
+            handle_node_generate_join_token(
+                deployment.clone(),
+                api.clone(),
+                service.clone(),
+                data_dir.clone(),
+            )
+            .await
+        }
     }
 }
 
@@ -973,17 +982,120 @@ pub(crate) async fn handle_node_label(node_id: String, label: String) -> Result<
     Ok(())
 }
 
+/// Detect the local machine's outbound IP address.
+///
+/// Uses the UDP-connect trick: connect a UDP socket to an external address
+/// (no traffic is actually sent) and read back the local address the OS chose.
+/// Falls back to `0.0.0.0` if detection fails.
+fn detect_local_ip() -> String {
+    use std::net::UdpSocket;
+    match UdpSocket::bind("0.0.0.0:0") {
+        Ok(socket) => {
+            // Connect to a well-known public address (Google DNS).
+            // No actual traffic is sent over UDP until data is written.
+            if socket.connect("8.8.8.8:80").is_ok() {
+                if let Ok(addr) = socket.local_addr() {
+                    return addr.ip().to_string();
+                }
+            }
+            "0.0.0.0".to_string()
+        }
+        Err(_) => "0.0.0.0".to_string(),
+    }
+}
+
+/// Try to discover the deployment name from a `.zlayer.yml` / `*.zlayer.yml` spec
+/// in the current working directory.  Returns `None` if nothing is found.
+fn try_discover_deployment_name() -> Option<String> {
+    let spec_path = crate::util::discover_spec_path(None).ok()?;
+    let spec = crate::util::parse_spec(&spec_path).ok()?;
+    Some(spec.deployment)
+}
+
 /// Handle node generate-join-token command
-pub(crate) fn handle_node_generate_join_token(
-    deployment: String,
-    api: String,
+///
+/// When `api` or `deployment` are `None`, the function attempts to infer them:
+///   - `api`: read from the node config at `data_dir/node_config.json`.
+///     If no config exists, auto-initialize the node with sensible defaults.
+///   - `deployment`: discover from `*.zlayer.yml` / `.zlayer.yml` in the cwd.
+///     Falls back to `"default"` if nothing is found.
+pub(crate) async fn handle_node_generate_join_token(
+    deployment: Option<String>,
+    api: Option<String>,
     service: Option<String>,
+    data_dir: PathBuf,
 ) -> Result<()> {
     use base64::Engine;
 
+    // --- Resolve the API endpoint ---
+    let api_endpoint = match api {
+        Some(a) => a,
+        None => {
+            // Try to load from node config; auto-init if it doesn't exist.
+            let node_config = match load_node_config(&data_dir).await {
+                Ok(cfg) => cfg,
+                Err(_) => {
+                    // Node was never initialized -- auto-init with defaults.
+                    let advertise_addr = detect_local_ip();
+                    let api_port: u16 = 8080;
+                    let raft_port: u16 = 9000;
+                    let overlay_port: u16 = 51820;
+                    let overlay_cidr = "10.200.0.0/16".to_string();
+
+                    info!(
+                        advertise_addr = %advertise_addr,
+                        "Node not initialized -- auto-initializing with detected IP"
+                    );
+                    println!(
+                        "Node not yet initialized. Auto-initializing with advertise address {}...",
+                        advertise_addr
+                    );
+
+                    handle_node_init(
+                        advertise_addr,
+                        api_port,
+                        raft_port,
+                        overlay_port,
+                        data_dir.clone(),
+                        overlay_cidr,
+                    )
+                    .await?;
+
+                    // Now load the freshly-written config
+                    load_node_config(&data_dir)
+                        .await
+                        .context("Failed to load node config after auto-initialization")?
+                }
+            };
+
+            format!(
+                "http://{}:{}",
+                node_config.advertise_addr, node_config.api_port
+            )
+        }
+    };
+
+    // --- Resolve the deployment name ---
+    let deployment_name = match deployment {
+        Some(d) => d,
+        None => {
+            // Try to discover from spec files in the current directory
+            match try_discover_deployment_name() {
+                Some(name) => {
+                    info!(deployment = %name, "Auto-discovered deployment name from spec");
+                    name
+                }
+                None => {
+                    warn!("No deployment spec found in current directory, using 'default'");
+                    "default".to_string()
+                }
+            }
+        }
+    };
+
     let token_data = serde_json::json!({
-        "deployment": deployment,
-        "api_endpoint": api,
+        "deployment": deployment_name,
+        "api_endpoint": api_endpoint,
         "service": service,
     });
 
@@ -992,8 +1104,8 @@ pub(crate) fn handle_node_generate_join_token(
 
     println!("Join Token Generated");
     println!("====================\n");
-    println!("Deployment: {}", deployment);
-    println!("API: {}", api);
+    println!("Deployment: {}", deployment_name);
+    println!("API: {}", api_endpoint);
     if let Some(svc) = &service {
         println!("Service: {}", svc);
     }

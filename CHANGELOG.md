@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
   - Scrollable log pane capturing warnings and errors
   - `--no-tui` flag for CI/non-interactive environments with clean PlainDeployLogger fallback
 - Glob-based spec file discovery: `zlayer deploy` now finds `*.zlayer.yml` and `*.zlayer.yaml` files
+- Pipeline file auto-discovery: accepts `ZPipeline.yaml` or `zlayer-pipeline.yaml` (no longer requires `-f` flag)
 - Per-crate log filtering: default verbosity reduced to WARN for internal crates, use `-v` for old behavior
 
 ### Changed

@@ -1370,6 +1370,12 @@ impl Runtime for WasmRuntime {
         // Return None to indicate no separate process exists
         Ok(None)
     }
+
+    async fn get_container_ip(&self, _id: &ContainerId) -> Result<Option<std::net::IpAddr>> {
+        // WASM modules run in-process and bind directly to host ports via WASI sockets.
+        // They're reachable at localhost but don't have a separate container IP.
+        Ok(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
+    }
 }
 
 #[cfg(test)]
