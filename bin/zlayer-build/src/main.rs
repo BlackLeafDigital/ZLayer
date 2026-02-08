@@ -304,7 +304,12 @@ fn discover_pipeline_file(explicit: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path);
     }
-    let candidates = ["ZPipeline.yaml", "ZPipeline.yml", "zlayer-pipeline.yaml", "zlayer-pipeline.yml"];
+    let candidates = [
+        "ZPipeline.yaml",
+        "ZPipeline.yml",
+        "zlayer-pipeline.yaml",
+        "zlayer-pipeline.yml",
+    ];
     for candidate in &candidates {
         let path = Path::new(candidate);
         if path.exists() {
