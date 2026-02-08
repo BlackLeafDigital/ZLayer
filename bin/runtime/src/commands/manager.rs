@@ -66,8 +66,8 @@ services:
             .with_context(|| format!("Failed to create output directory: {}", output.display()))?;
     }
 
-    // Write the spec file as .zlayer.yml (auto-discovered by `zlayer deploy`)
-    let spec_path = output.join(".zlayer.yml");
+    // Write the spec file as manager.zlayer.yml (auto-discovered by `zlayer deploy`)
+    let spec_path = output.join("manager.zlayer.yml");
     std::fs::write(&spec_path, &spec)
         .with_context(|| format!("Failed to write spec file: {}", spec_path.display()))?;
 

@@ -478,7 +478,7 @@ async fn test_health_checks_tcp() {
 
         // Create TCP health checker
         let health_check = HealthCheck::Tcp { port: 80 };
-        let checker = HealthChecker::new(health_check);
+        let checker = HealthChecker::new(health_check, None);
 
         // Perform health check (this connects to localhost:80, which won't work in network namespace)
         // In a real E2E test with proper networking, this would pass

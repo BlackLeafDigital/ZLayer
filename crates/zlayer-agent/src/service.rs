@@ -224,7 +224,7 @@ impl ServiceInstance {
                     let interval = self.spec.health.interval.unwrap_or(Duration::from_secs(10));
                     let retries = self.spec.health.retries;
 
-                    let checker = HealthChecker::new(check);
+                    let checker = HealthChecker::new(check, overlay_ip);
                     let mut monitor = HealthMonitor::new(id.clone(), checker, interval, retries);
 
                     // Create health callback to update proxy backend health if proxy is configured
@@ -247,6 +247,11 @@ impl ServiceInstance {
                             .unwrap_or(8080);
 
                         let backend_addr = SocketAddr::new(ip, port);
+
+                        // Register backend with load balancer so proxy can route to it.
+                        // This must happen before the health callback is created, because
+                        // update_backend_health only updates *existing* backends.
+                        proxy.add_backend(&self.service_name, backend_addr).await;
 
                         let health_callback: HealthCallback =
                             Arc::new(move |container_id: ContainerId, is_healthy: bool| {

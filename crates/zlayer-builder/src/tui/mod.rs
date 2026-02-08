@@ -45,9 +45,10 @@ mod build_view;
 mod logger;
 mod widgets;
 
-pub use app::{BuildState, BuildTui, InstructionState, OutputLine, StageState};
+pub use app::{BuildState, BuildTui, InstructionState, StageState};
 pub use build_view::BuildView;
 pub use logger::PlainLogger;
+pub use zlayer_tui::widgets::scrollable_pane::OutputLine;
 
 /// Build event for TUI updates
 ///

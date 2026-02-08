@@ -6664,7 +6664,9 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap 4.5.56",
+ "crossterm",
  "rand 0.8.5",
+ "ratatui",
  "reqwest 0.13.1",
  "serde",
  "serde_json",
@@ -6682,6 +6684,7 @@ dependencies = [
  "zlayer-registry",
  "zlayer-scheduler",
  "zlayer-spec",
+ "zlayer-tui",
  "zlayer-tunnel",
 ]
 
@@ -10612,6 +10615,7 @@ dependencies = [
  "tracing-subscriber",
  "zlayer-builder",
  "zlayer-spec",
+ "zlayer-tui",
 ]
 
 [[package]]
@@ -10735,6 +10739,7 @@ dependencies = [
  "tokio",
  "tracing",
  "zlayer-registry",
+ "zlayer-tui",
 ]
 
 [[package]]
@@ -11005,6 +11010,14 @@ dependencies = [
  "tokio",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "zlayer-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "ratatui",
 ]
 
 [[package]]

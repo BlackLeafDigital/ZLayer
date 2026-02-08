@@ -23,6 +23,18 @@ pub(crate) struct Cli {
     #[arg(short = 'b', long = "background", global = true)]
     pub(crate) background: bool,
 
+    /// Detach after services are running (used with 'up' and 'deploy' commands)
+    ///
+    /// Shows full deployment progress, waits for services to stabilize,
+    /// then automatically exits without waiting for Ctrl+C.
+    /// Unlike -b/--background, this waits for services to be confirmed running.
+    #[arg(long = "detach", global = true)]
+    pub(crate) detach: bool,
+
+    /// Disable interactive TUI (use plain text output)
+    #[arg(long, global = true)]
+    pub(crate) no_tui: bool,
+
     #[command(subcommand)]
     pub(crate) command: Commands,
 }
@@ -47,6 +59,8 @@ pub(crate) enum DeployMode {
     Foreground,
     /// Deploy and return immediately
     Background,
+    /// Wait for services to stabilize, then automatically exit
+    Detach,
 }
 
 /// CLI subcommands
@@ -1912,5 +1926,39 @@ mod tests {
     fn test_cli_background_flag_default() {
         let cli = Cli::try_parse_from(["zlayer-runtime", "status"]).unwrap();
         assert!(!cli.background);
+    }
+
+    #[test]
+    fn test_cli_detach_flag_default() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "status"]).unwrap();
+        assert!(!cli.detach);
+    }
+
+    #[test]
+    fn test_cli_detach_flag_long() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "--detach", "up"]).unwrap();
+        assert!(cli.detach);
+        assert!(!cli.background);
+    }
+
+    #[test]
+    fn test_cli_detach_flag_after_subcommand() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "up", "--detach"]).unwrap();
+        assert!(cli.detach);
+    }
+
+    #[test]
+    fn test_cli_detach_with_deploy() {
+        let cli =
+            Cli::try_parse_from(["zlayer-runtime", "--detach", "deploy", "spec.yml"]).unwrap();
+        assert!(cli.detach);
+        assert!(matches!(cli.command, Commands::Deploy { .. }));
+    }
+
+    #[test]
+    fn test_deploy_mode_variants() {
+        assert_ne!(DeployMode::Foreground, DeployMode::Background);
+        assert_ne!(DeployMode::Foreground, DeployMode::Detach);
+        assert_ne!(DeployMode::Background, DeployMode::Detach);
     }
 }

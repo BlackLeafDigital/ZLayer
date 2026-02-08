@@ -39,6 +39,7 @@ dirs = "5"
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
+zlayer-tui = { path = "../zlayer-tui" }
 
 # Cache backend (optional)
 zlayer-registry = { path = "../zlayer-registry", optional = true }

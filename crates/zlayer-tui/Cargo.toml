@@ -1,0 +1,13 @@
+[package]
+name = "zlayer-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+description = "Shared TUI widgets, color palette, and terminal utilities for ZLayer"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"

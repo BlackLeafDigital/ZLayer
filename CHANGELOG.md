@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Deploy TUI with ratatui-based interactive progress display for `zlayer deploy` and `zlayer up`
+  - Phase-aware layout: deploying, running dashboard, and shutdown views
+  - Infrastructure phase progress indicators (spinners, checkmarks)
+  - Per-service deployment status with replica counts and health indicators
+  - Scrollable log pane capturing warnings and errors
+  - `--no-tui` flag for CI/non-interactive environments with clean PlainDeployLogger fallback
+- Glob-based spec file discovery: `zlayer deploy` now finds `*.zlayer.yml` and `*.zlayer.yaml` files
+- Per-crate log filtering: default verbosity reduced to WARN for internal crates, use `-v` for old behavior
+
+### Changed
+- `zlayer manager init` now creates `manager.zlayer.yml` instead of `.zlayer.yml`
+- Deploy output uses event-driven architecture (DeployEvent channel) instead of mixed println/tracing
+
+### Fixed
+- Proxy backend registration: containers are now registered with the load balancer on startup (previously backends were never added, causing "No healthy backends" errors)
+- Health check target address: TCP and HTTP health checks now connect to the container's overlay IP instead of 127.0.0.1
+
 - GPU inventory detection module (`zlayer-agent::gpu_detector`) that scans sysfs PCI devices for GPUs
   - Auto-detects vendor (NVIDIA, AMD, Intel) via PCI vendor IDs
   - Reads VRAM from PCI BAR regions, AMD `mem_info_vram_total`, or nvidia-smi
