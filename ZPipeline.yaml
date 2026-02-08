@@ -29,7 +29,6 @@ images:
     tags:
       - "${REGISTRY}/zlayer-web:${VERSION}"
       - "${REGISTRY}/zlayer-web:latest"
-    depends_on: [zlayer-node]
 
   zlayer-manager:
     file: docker/ZImagefile.zlayer-manager
@@ -37,7 +36,6 @@ images:
     tags:
       - "${REGISTRY}/zlayer-manager:${VERSION}"
       - "${REGISTRY}/zlayer-manager:latest"
-    depends_on: [zlayer-web]
 
 push:
   after_all: false
