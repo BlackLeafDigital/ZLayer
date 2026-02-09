@@ -1,8 +1,56 @@
 use crate::error::AgentError;
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::sync::RwLock;
 use zlayer_overlay::{OverlayConfig, OverlayTransport};
+
+/// Maximum length for Linux network interface names (IFNAMSIZ - 1 for null terminator).
+const MAX_IFNAME_LEN: usize = 15;
+
+/// Generate a Linux-safe interface name guaranteed to be <= 15 chars.
+///
+/// Joins the `parts` with `-` after a `"zl-"` prefix and appends `-{suffix}` if non-empty.
+/// When the result exceeds 15 characters, a deterministic hash of all parts is used instead
+/// to keep the name unique and within the kernel limit.
+fn make_interface_name(parts: &[&str], suffix: &str) -> String {
+    let base = format!("zl-{}", parts.join("-"));
+    let candidate = if suffix.is_empty() {
+        base
+    } else {
+        format!("{}-{}", base, suffix)
+    };
+
+    if candidate.len() <= MAX_IFNAME_LEN {
+        return candidate;
+    }
+
+    // Name is too long -- produce a deterministic hash-based name.
+    let mut hasher = DefaultHasher::new();
+    for part in parts {
+        part.hash(&mut hasher);
+    }
+    suffix.hash(&mut hasher);
+    let hash = format!("{:x}", hasher.finish());
+
+    if suffix.is_empty() {
+        // "zl-" (3) + up to 12 hex chars = 15
+        let budget = MAX_IFNAME_LEN - 3;
+        format!("zl-{}", &hash[..budget.min(hash.len())])
+    } else {
+        // "zl-" (3) + hash + "-" (1) + suffix
+        let suffix_cost = 1 + suffix.len(); // "-" + suffix
+        let hash_budget = MAX_IFNAME_LEN.saturating_sub(3 + suffix_cost);
+        if hash_budget == 0 {
+            // Suffix itself is extremely long -- just hash everything
+            let budget = MAX_IFNAME_LEN - 3;
+            format!("zl-{}", &hash[..budget.min(hash.len())])
+        } else {
+            format!("zl-{}-{}", &hash[..hash_budget.min(hash.len())], suffix)
+        }
+    }
+}
 
 /// Manages overlay networks for a deployment
 pub struct OverlayManager {
@@ -35,8 +83,7 @@ impl OverlayManager {
 
     /// Setup the global overlay network for the deployment
     pub async fn setup_global_overlay(&mut self) -> Result<(), AgentError> {
-        let prefix = &self.deployment[..8.min(self.deployment.len())];
-        let interface_name = format!("zl-{}-global", prefix);
+        let interface_name = make_interface_name(&[&self.deployment], "g");
 
         let (private_key, public_key) = OverlayTransport::generate_keys()
             .await
@@ -61,9 +108,7 @@ impl OverlayManager {
 
     /// Setup a service-scoped overlay network
     pub async fn setup_service_overlay(&self, service_name: &str) -> Result<String, AgentError> {
-        let deployment_prefix = &self.deployment[..4.min(self.deployment.len())];
-        let service_prefix = &service_name[..8.min(service_name.len())];
-        let interface_name = format!("zl-{}-{}", deployment_prefix, service_prefix);
+        let interface_name = make_interface_name(&[&self.deployment, service_name], "s");
 
         // Attempt overlay creation (for inter-node communication)
         // This is non-fatal: single-node deployments work fine without it
@@ -318,5 +363,172 @@ impl IpAllocator {
 
     fn allocate_for_service(&self, _service: &str) -> Result<Ipv4Addr, AgentError> {
         self.allocate()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// No generated name may ever exceed 15 characters.
+    #[test]
+    fn interface_name_never_exceeds_limit() {
+        let cases: Vec<(&[&str], &str)> = vec![
+            (&["a"], "g"),
+            (&["zlayer-manager"], "g"),
+            (&["my-very-long-deployment-name-that-goes-on-and-on"], "g"),
+            (&["zlayer", "manager"], "s"),
+            (&["zlayer-manager", "frontend-service"], "s"),
+            (&["a", "b"], "s"),
+            (
+                &["abcdefghijklmnopqrstuvwxyz", "abcdefghijklmnopqrstuvwxyz"],
+                "s",
+            ),
+            (&["x"], ""),
+            (&["deployment"], ""),
+            (&["a-really-long-name-exceeding-everything"], "suffix"),
+        ];
+
+        for (parts, suffix) in &cases {
+            let name = make_interface_name(parts, suffix);
+            assert!(
+                name.len() <= MAX_IFNAME_LEN,
+                "Name '{}' is {} chars (parts={:?}, suffix='{}')",
+                name,
+                name.len(),
+                parts,
+                suffix,
+            );
+        }
+    }
+
+    /// Very long and varied inputs must still respect the limit.
+    #[test]
+    fn interface_name_with_extreme_lengths() {
+        let long = "a".repeat(200);
+        let long_ref = long.as_str();
+
+        let name = make_interface_name(&[long_ref], "g");
+        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{}' too long", name);
+
+        let name = make_interface_name(&[long_ref, long_ref, long_ref], "s");
+        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{}' too long", name);
+
+        let name = make_interface_name(&[long_ref], "");
+        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{}' too long", name);
+    }
+
+    /// Empty parts and suffix must still produce a valid name.
+    #[test]
+    fn interface_name_with_empty_inputs() {
+        let name = make_interface_name(&[""], "");
+        assert!(name.len() <= MAX_IFNAME_LEN);
+        assert!(name.starts_with("zl-"));
+
+        let name = make_interface_name(&["", ""], "s");
+        assert!(name.len() <= MAX_IFNAME_LEN);
+        assert!(name.starts_with("zl-"));
+
+        let name = make_interface_name(&[], "g");
+        assert!(name.len() <= MAX_IFNAME_LEN);
+        assert!(name.starts_with("zl-"));
+    }
+
+    /// Same inputs must always produce the same output.
+    #[test]
+    fn interface_name_is_deterministic() {
+        let a = make_interface_name(&["zlayer-manager"], "g");
+        let b = make_interface_name(&["zlayer-manager"], "g");
+        assert_eq!(a, b);
+
+        let a = make_interface_name(&["deploy", "frontend"], "s");
+        let b = make_interface_name(&["deploy", "frontend"], "s");
+        assert_eq!(a, b);
+    }
+
+    /// Different inputs must produce different outputs.
+    #[test]
+    fn interface_name_uniqueness() {
+        let a = make_interface_name(&["deploy-a"], "g");
+        let b = make_interface_name(&["deploy-b"], "g");
+        assert_ne!(a, b, "Different deployments should yield different names");
+
+        let a = make_interface_name(&["deploy", "svc-a"], "s");
+        let b = make_interface_name(&["deploy", "svc-b"], "s");
+        assert_ne!(a, b, "Different services should yield different names");
+
+        let a = make_interface_name(&["deploy"], "g");
+        let b = make_interface_name(&["deploy"], "s");
+        assert_ne!(a, b, "Different suffixes should yield different names");
+    }
+
+    /// Short names that fit should be returned as-is (human readable).
+    #[test]
+    fn interface_name_short_inputs_are_readable() {
+        // "zl-" (3) + "app" (3) + "-" (1) + "g" (1) = 8 chars
+        let name = make_interface_name(&["app"], "g");
+        assert_eq!(name, "zl-app-g");
+
+        // "zl-" (3) + "my" (2) + "-" (1) + "web" (3) + "-" (1) + "s" (1) = 11
+        let name = make_interface_name(&["my", "web"], "s");
+        assert_eq!(name, "zl-my-web-s");
+    }
+
+    /// Global overlay names for realistic deployment names.
+    #[test]
+    fn global_overlay_realistic_names() {
+        let deployments = [
+            "zlayer-manager",
+            "my-very-long-deployment-name",
+            "a",
+            "production",
+            "zlayer",
+        ];
+
+        for deployment in &deployments {
+            let name = make_interface_name(&[deployment], "g");
+            assert!(
+                name.len() <= MAX_IFNAME_LEN,
+                "Global overlay '{}' for deployment '{}' exceeds limit",
+                name,
+                deployment,
+            );
+            assert!(name.starts_with("zl-"));
+        }
+    }
+
+    /// Service overlay names for realistic deployment + service combos.
+    #[test]
+    fn service_overlay_realistic_names() {
+        let cases = [
+            ("zlayer-manager", "frontend"),
+            ("zlayer-manager", "backend-api"),
+            ("zlayer", "manager"),
+            ("a", "b"),
+            ("production", "auth-service-primary"),
+            ("my-long-deploy", "my-long-service"),
+        ];
+
+        for (deployment, service) in &cases {
+            let name = make_interface_name(&[deployment, service], "s");
+            assert!(
+                name.len() <= MAX_IFNAME_LEN,
+                "Service overlay '{}' for ({}, {}) exceeds limit",
+                name,
+                deployment,
+                service,
+            );
+            assert!(name.starts_with("zl-"));
+        }
+    }
+
+    /// Unicode inputs must not cause panics and must respect the byte limit.
+    #[test]
+    fn interface_name_with_unicode() {
+        let name = make_interface_name(&["\u{1F600}\u{1F600}\u{1F600}"], "g");
+        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{}' too long", name);
+
+        let name = make_interface_name(&["\u{00E9}\u{00E9}\u{00E9}", "\u{00FC}\u{00FC}"], "s");
+        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{}' too long", name);
     }
 }
