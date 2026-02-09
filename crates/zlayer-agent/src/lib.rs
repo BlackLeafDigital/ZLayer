@@ -41,7 +41,7 @@ pub use job::{
     JobExecution, JobExecutionId, JobExecutor, JobExecutorConfig, JobStatus, JobTrigger,
 };
 pub use metrics_providers::{RuntimeStatsProvider, ServiceManagerContainerProvider};
-pub use overlay_manager::OverlayManager;
+pub use overlay_manager::{make_interface_name, OverlayManager};
 pub use proxy_manager::{ProxyManager, ProxyManagerConfig};
 pub use runtime::*;
 pub use runtimes::{create_runtime_for_image, detect_image_artifact_type};

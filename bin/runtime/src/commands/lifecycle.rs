@@ -121,14 +121,18 @@ pub(crate) async fn logs(
     Ok(())
 }
 
-/// Stop a deployment or service
+/// Stop a deployment or specific service
+///
+/// Directly stops and removes containers via the runtime, rather than going through
+/// ServiceManager (which has no knowledge of already-running containers).
+/// If a spec is found matching the deployment, it iterates over services and replicas.
+/// Also scans the state directory for any extra containers beyond the spec's replica count.
 pub(crate) async fn stop(
     deployment: &str,
     service: Option<String>,
     force: bool,
     timeout: u64,
 ) -> Result<()> {
-    use std::sync::Arc;
     use std::time::Duration;
 
     let target = match &service {
@@ -164,12 +168,10 @@ pub(crate) async fn stop(
         Duration::from_secs(timeout)
     };
 
-    // If we have a spec, use the ServiceManager for clean shutdown
+    // If we have a spec matching this deployment, use it to enumerate containers
     if let Some(spec) = &spec {
         if spec.deployment == deployment {
-            let manager = Arc::new(zlayer_agent::ServiceManager::new(runtime.clone()));
-
-            // Register services so we can scale them down
+            // Filter to targeted services
             let target_services: Vec<_> = if let Some(svc) = &service {
                 spec.services
                     .iter()
@@ -179,43 +181,66 @@ pub(crate) async fn stop(
                 spec.services.iter().collect()
             };
 
+            let mut stopped_count: u32 = 0;
+
             for (name, service_spec) in &target_services {
-                if let Err(e) = manager
-                    .upsert_service((*name).clone(), (*service_spec).clone())
-                    .await
-                {
-                    warn!(service = %name, error = %e, "Failed to register service for shutdown");
-                    continue;
+                let replicas = match &service_spec.scale {
+                    zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+                    zlayer_spec::ScaleSpec::Adaptive { max, .. } => *max,
+                    zlayer_spec::ScaleSpec::Manual => 1,
+                };
+
+                println!("  Stopping service: {} (up to {} replicas)", name, replicas);
+
+                for replica in 1..=replicas {
+                    let id = zlayer_agent::ContainerId {
+                        service: (*name).clone(),
+                        replica,
+                    };
+                    if let Err(e) = runtime.stop_container(&id, timeout_duration).await {
+                        warn!(container = %id, error = %e, "Failed to stop container (may not exist)");
+                    } else {
+                        stopped_count += 1;
+                    }
+                    if let Err(e) = runtime.remove_container(&id).await {
+                        warn!(container = %id, error = %e, "Failed to remove container (may not exist)");
+                    }
                 }
 
-                info!(service = %name, "Scaling service to 0");
-                println!("  Stopping service: {}", name);
-                if let Err(e) = manager.scale_service(name, 0).await {
-                    warn!(service = %name, error = %e, "Failed to scale down service");
-                }
-            }
-
-            // Wait for containers to stop
-            if !force && timeout > 0 {
-                let start = std::time::Instant::now();
-                while start.elapsed() < timeout_duration {
-                    let mut all_stopped = true;
-                    for (name, _) in &target_services {
-                        if let Ok(count) = manager.service_replica_count(name).await {
-                            if count > 0 {
-                                all_stopped = false;
-                                break;
+                // Scan state dir for any extra containers beyond the spec replica count
+                let state_dir = std::path::Path::new("/var/lib/zlayer/containers");
+                let prefix = format!("{}-", name);
+                if let Ok(mut entries) = tokio::fs::read_dir(state_dir).await {
+                    while let Ok(Some(entry)) = entries.next_entry().await {
+                        let entry_name = entry.file_name().to_string_lossy().to_string();
+                        if entry_name.starts_with(&prefix) {
+                            if let Some(rep_str) = entry_name.strip_prefix(&prefix) {
+                                if let Ok(rep_num) = rep_str.parse::<u32>() {
+                                    if rep_num > replicas {
+                                        let id = zlayer_agent::ContainerId {
+                                            service: (*name).clone(),
+                                            replica: rep_num,
+                                        };
+                                        info!(container = %id, "Found extra container beyond spec");
+                                        if let Err(e) =
+                                            runtime.stop_container(&id, timeout_duration).await
+                                        {
+                                            warn!(container = %id, error = %e, "Failed to stop extra container");
+                                        } else {
+                                            stopped_count += 1;
+                                        }
+                                        if let Err(e) = runtime.remove_container(&id).await {
+                                            warn!(container = %id, error = %e, "Failed to remove extra container");
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                    if all_stopped {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
 
-            println!("Stopped.");
+            println!("Stopped {} container(s).", stopped_count);
             return Ok(());
         }
     }
