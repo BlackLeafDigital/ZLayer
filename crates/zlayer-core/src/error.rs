@@ -80,13 +80,13 @@ pub enum ContainerError {
 /// Network-related errors
 #[derive(Debug, Error)]
 pub enum NetworkError {
-    /// Failed to create WireGuard interface
-    #[error("failed to create WireGuard interface {name}: {reason}")]
-    WireGuardCreateFailed { name: String, reason: String },
+    /// Failed to create overlay interface
+    #[error("failed to create overlay interface {name}: {reason}")]
+    OverlayCreateFailed { name: String, reason: String },
 
-    /// Failed to configure WireGuard peer
-    #[error("failed to configure WireGuard peer: {0}")]
-    WireGuardPeerFailed(String),
+    /// Failed to configure overlay peer
+    #[error("failed to configure overlay peer: {0}")]
+    OverlayPeerFailed(String),
 
     /// DNS resolution failed
     #[error("DNS resolution failed for {name}: {reason}")]

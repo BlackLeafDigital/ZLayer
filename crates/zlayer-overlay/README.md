@@ -1,10 +1,10 @@
 # zlayer-overlay
 
-WireGuard-based encrypted overlay networking for ZLayer with built-in DNS service discovery.
+Encrypted overlay networking for ZLayer using boringtun (userspace WireGuard) with built-in DNS service discovery.
 
 ## Features
 
-- **WireGuard Mesh** - Encrypted peer-to-peer networking via kernel WireGuard
+- **Encrypted Mesh** - Peer-to-peer networking via boringtun (no kernel WireGuard module required)
 - **IP Allocation** - Automatic CIDR-based IP management for overlay nodes
 - **DNS Service Discovery** - Auto-register peers with DNS names for easy discovery
 - **Health Checking** - Monitor peer connectivity via handshake times and ping
@@ -30,7 +30,7 @@ use std::path::Path;
 // Initialize as cluster leader
 let mut bootstrap = OverlayBootstrap::init_leader(
     "10.200.0.0/16",              // Overlay CIDR
-    51820,                         // WireGuard port
+    51820,                         // Overlay port
     Path::new("/var/lib/zlayer"),  // State directory
 ).await?;
 
@@ -38,7 +38,7 @@ let mut bootstrap = OverlayBootstrap::init_leader(
 bootstrap.start().await?;
 
 println!("Overlay IP: {}", bootstrap.node_ip());      // 10.200.0.1
-println!("Public key: {}", bootstrap.public_key());   // WireGuard pubkey
+println!("Public key: {}", bootstrap.public_key());   // Overlay pubkey
 ```
 
 ### Join an Existing Overlay
@@ -115,7 +115,7 @@ Monitor peer connectivity:
 use zlayer_overlay::OverlayHealthChecker;
 use std::time::Duration;
 
-let checker = OverlayHealthChecker::new("wg-zlayer0", Duration::from_secs(30));
+let checker = OverlayHealthChecker::new("zl-overlay0", Duration::from_secs(30));
 
 // Single check
 let health = checker.check_all().await?;
@@ -145,10 +145,10 @@ checker.run(|public_key, healthy| {
 
 | Constant | Value | Description |
 |----------|-------|-------------|
-| `DEFAULT_WG_PORT` | 51820 | Default WireGuard listen port |
+| `DEFAULT_WG_PORT` | 51820 | Default overlay listen port |
 | `DEFAULT_DNS_PORT` | 15353 | Default DNS server port |
 | `DEFAULT_OVERLAY_CIDR` | 10.200.0.0/16 | Default overlay network |
-| `DEFAULT_INTERFACE_NAME` | wg-zlayer0 | Default WireGuard interface |
+| `DEFAULT_INTERFACE_NAME` | zl-overlay0 | Default overlay interface |
 
 ## License
 

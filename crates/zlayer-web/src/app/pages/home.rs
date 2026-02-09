@@ -116,7 +116,7 @@ spec:
                             <FeatureCard
                                 icon=|| icons::network_icon("24").into_any()
                                 title="Overlay Networks"
-                                description="WireGuard-based overlay networking with automatic peer discovery. Secure communication across hosts out of the box."
+                                description="Encrypted overlay networking with automatic peer discovery. Secure communication across hosts out of the box."
                             />
                             <FeatureCard
                                 icon=|| icons::shield_icon("24").into_any()

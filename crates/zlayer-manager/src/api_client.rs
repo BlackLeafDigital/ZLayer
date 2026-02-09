@@ -288,7 +288,7 @@ pub struct CronStatusResponse {
 /// Overlay network status response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayStatusResponse {
-    /// WireGuard interface name
+    /// Overlay interface name
     pub interface: String,
     /// Whether this node is the overlay leader
     pub is_leader: bool,
@@ -296,7 +296,7 @@ pub struct OverlayStatusResponse {
     pub node_ip: String,
     /// CIDR of the overlay network
     pub cidr: String,
-    /// WireGuard listen port
+    /// Overlay listen port (WireGuard protocol)
     pub port: u16,
     /// Total number of peers
     pub total_peers: usize,
@@ -311,13 +311,13 @@ pub struct OverlayStatusResponse {
 /// Peer information from the overlay network
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayPeerInfo {
-    /// WireGuard public key
+    /// Overlay public key
     pub public_key: String,
     /// Peer's IP in the overlay network
     pub overlay_ip: Option<String>,
     /// Whether the peer is healthy
     pub healthy: bool,
-    /// Seconds since last WireGuard handshake
+    /// Seconds since last handshake
     pub last_handshake_secs: Option<u64>,
     /// Last ping latency in milliseconds
     pub last_ping_ms: Option<u64>,

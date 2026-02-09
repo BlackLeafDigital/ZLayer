@@ -73,7 +73,7 @@ spec:
 
                     <h3>"Overlay Networks"</h3>
                     <p>
-                        "ZLayer provides built-in overlay networking using WireGuard. This allows "
+                        "ZLayer provides built-in encrypted overlay networking. This allows "
                         "containers on different hosts to communicate securely without complex "
                         "network configuration."
                     </p>
@@ -189,7 +189,7 @@ spec:
                         </li>
                         <li>
                             <strong>"Network unreachable"</strong>" - Verify overlay network "
-                            "configuration and WireGuard peer connectivity"
+                            "configuration and overlay peer connectivity"
                         </li>
                     </ul>
 

@@ -9,7 +9,7 @@ use crate::error::{ApiError, Result};
 /// Overlay network status response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct OverlayStatusResponse {
-    /// WireGuard interface name
+    /// Overlay interface name
     pub interface: String,
     /// Whether this node is the cluster leader
     pub is_leader: bool,
@@ -17,7 +17,7 @@ pub struct OverlayStatusResponse {
     pub node_ip: String,
     /// Overlay network CIDR
     pub cidr: String,
-    /// WireGuard listen port
+    /// Overlay listen port (WireGuard protocol)
     pub port: u16,
     /// Total number of peers
     pub total_peers: usize,
@@ -32,14 +32,14 @@ pub struct OverlayStatusResponse {
 /// Peer information
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct PeerInfo {
-    /// Peer's WireGuard public key
+    /// Peer's public key
     pub public_key: String,
     /// Peer's overlay IP address
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overlay_ip: Option<String>,
     /// Whether the peer is healthy
     pub healthy: bool,
-    /// Seconds since last WireGuard handshake
+    /// Seconds since last handshake
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_handshake_secs: Option<u64>,
     /// Last ping latency in milliseconds

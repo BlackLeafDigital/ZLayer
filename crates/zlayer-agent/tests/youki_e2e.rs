@@ -918,7 +918,7 @@ async fn test_cleanup_state_directory() {
 
 /// Create a test OverlayManager
 ///
-/// Note: This requires root privileges for WireGuard key generation
+/// Note: This requires root privileges for overlay key generation
 /// and network interface operations.
 async fn create_test_overlay_manager() -> Option<Arc<tokio::sync::RwLock<OverlayManager>>> {
     if !has_root_privileges() {
@@ -1034,7 +1034,7 @@ async fn test_service_instance_full_integration() {
                 println!("Container {}: overlay_ip = {:?}", id, container.overlay_ip);
                 if overlay.is_some() {
                     // Overlay manager was available; check if IP was assigned
-                    // Note: IP assignment may fail if overlay setup failed (e.g., missing WireGuard)
+                    // Note: IP assignment may fail if overlay setup failed (e.g., missing CAP_NET_ADMIN)
                     if container.overlay_ip.is_some() {
                         println!(
                             "Container {} has overlay IP: {}",

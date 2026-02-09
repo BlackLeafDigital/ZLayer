@@ -99,6 +99,15 @@ pub struct PipelineDefaults {
     /// Whether to skip cache by default
     #[serde(default, skip_serializing_if = "is_false")]
     pub no_cache: bool,
+
+    /// Default cache mounts applied to all RUN steps in all images.
+    /// Individual ZImagefile step-level cache mounts are additive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_mounts: Vec<crate::zimage::types::ZCacheMount>,
+
+    /// Default retry count for failed RUN steps (0 = no retries)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retries: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +167,14 @@ pub struct PipelineImage {
     /// If None, inherits from defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
+
+    /// Cache mounts for this image's RUN steps, merged with defaults
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cache_mounts: Vec<crate::zimage::types::ZCacheMount>,
+
+    /// Override retry count for this image
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retries: Option<u32>,
 }
 
 // ---------------------------------------------------------------------------
@@ -210,6 +227,8 @@ file: Dockerfile
         assert!(img.depends_on.is_empty());
         assert!(img.no_cache.is_none());
         assert!(img.format.is_none());
+        assert!(img.cache_mounts.is_empty());
+        assert!(img.retries.is_none());
     }
 
     #[test]
@@ -219,6 +238,8 @@ file: Dockerfile
         assert!(defaults.format.is_none());
         assert!(defaults.build_args.is_empty());
         assert!(!defaults.no_cache);
+        assert!(defaults.cache_mounts.is_empty());
+        assert!(defaults.retries.is_none());
     }
 
     #[test]
@@ -273,6 +294,47 @@ bogus: "nope"
     }
 
     #[test]
+    fn test_cache_mounts_and_retries_deserialize_defaults() {
+        let yaml = r#"
+format: oci
+no_cache: true
+cache_mounts:
+  - target: /root/.cargo/registry
+    id: cargo-registry
+    sharing: shared
+  - target: /root/.cache/pip
+retries: 3
+"#;
+        let defaults: PipelineDefaults = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(defaults.cache_mounts.len(), 2);
+        assert_eq!(defaults.cache_mounts[0].target, "/root/.cargo/registry");
+        assert_eq!(
+            defaults.cache_mounts[0].id,
+            Some("cargo-registry".to_string())
+        );
+        assert_eq!(defaults.cache_mounts[0].sharing, Some("shared".to_string()));
+        assert_eq!(defaults.cache_mounts[1].target, "/root/.cache/pip");
+        assert!(defaults.cache_mounts[1].id.is_none());
+        assert_eq!(defaults.retries, Some(3));
+    }
+
+    #[test]
+    fn test_cache_mounts_and_retries_deserialize_image() {
+        let yaml = r#"
+file: Dockerfile
+cache_mounts:
+  - target: /tmp/build-cache
+    readonly: true
+retries: 5
+"#;
+        let img: PipelineImage = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(img.cache_mounts.len(), 1);
+        assert_eq!(img.cache_mounts[0].target, "/tmp/build-cache");
+        assert!(img.cache_mounts[0].readonly);
+        assert_eq!(img.retries, Some(5));
+    }
+
+    #[test]
     fn test_deny_unknown_fields_push_config() {
         let yaml = r#"
 after_all: true
@@ -292,6 +354,8 @@ extra: "bad"
             depends_on: vec![],
             no_cache: None,
             format: None,
+            cache_mounts: vec![],
+            retries: None,
         };
         let serialized = serde_yaml::to_string(&img).unwrap();
         // Should only contain "file" since everything else is default/empty
@@ -302,6 +366,8 @@ extra: "bad"
         assert!(!serialized.contains("depends_on:"));
         assert!(!serialized.contains("no_cache:"));
         assert!(!serialized.contains("format:"));
+        assert!(!serialized.contains("cache_mounts:"));
+        assert!(!serialized.contains("retries:"));
     }
 
     #[test]
@@ -314,6 +380,13 @@ extra: "bad"
             depends_on: vec!["base".to_string()],
             no_cache: Some(true),
             format: Some("docker".to_string()),
+            cache_mounts: vec![crate::zimage::types::ZCacheMount {
+                target: "/root/.cache".to_string(),
+                id: Some("mycache".to_string()),
+                sharing: None,
+                readonly: false,
+            }],
+            retries: Some(3),
         };
         let serialized = serde_yaml::to_string(&img).unwrap();
         assert!(serialized.contains("context:"));
@@ -322,5 +395,7 @@ extra: "bad"
         assert!(serialized.contains("depends_on:"));
         assert!(serialized.contains("no_cache:"));
         assert!(serialized.contains("format:"));
+        assert!(serialized.contains("cache_mounts:"));
+        assert!(serialized.contains("retries:"));
     }
 }

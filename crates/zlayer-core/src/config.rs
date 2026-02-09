@@ -109,13 +109,13 @@ fn default_heartbeat_interval() -> u64 {
 /// Overlay network configuration for agents
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OverlayAgentConfig {
-    /// WireGuard private key (x25519)
+    /// Overlay private key (x25519)
     pub private_key: String,
 
-    /// WireGuard public key (derived from private key)
+    /// Overlay public key (derived from private key)
     pub public_key: Option<String>,
 
-    /// Listen port for WireGuard
+    /// Listen port for overlay network (WireGuard protocol)
     #[serde(default = "default_wg_port")]
     pub wg_port: u16,
 

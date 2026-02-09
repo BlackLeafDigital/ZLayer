@@ -7,10 +7,10 @@ use std::time::Duration;
 /// Overlay network configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OverlayConfig {
-    /// Local WireGuard endpoint
+    /// Local overlay endpoint (WireGuard protocol)
     pub local_endpoint: SocketAddr,
 
-    /// WireGuard private key (x25519)
+    /// Private key (x25519)
     pub private_key: String,
 
     /// Public key (derived from private key)
@@ -84,8 +84,8 @@ impl PeerInfo {
         }
     }
 
-    /// Create a WireGuard config line
-    pub fn to_wg_config(&self) -> String {
+    /// Create a peer config block (WireGuard protocol format)
+    pub fn to_peer_config(&self) -> String {
         format!(
             "[Peer]\n\
              PublicKey = {}\n\
@@ -105,7 +105,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_peer_info_to_wg_config() {
+    fn test_peer_info_to_peer_config() {
         let peer = PeerInfo::new(
             "public_key_here".to_string(),
             SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 51820),
@@ -113,7 +113,7 @@ mod tests {
             Duration::from_secs(25),
         );
 
-        let config = peer.to_wg_config();
+        let config = peer.to_peer_config();
         assert!(config.contains("PublicKey = public_key_here"));
         assert!(config.contains("Endpoint = 192.168.1.1:51820"));
     }

@@ -24,7 +24,7 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 - **WebAssembly Support** - First-class WASM runtime with WASIp1 & WASIp2 support via wasmtime
 - **Multi-Language WASM SDKs** - Build WASM workloads from Rust, Go, Python, TypeScript, C, Zig, and more
 - **Built-in Image Builder** - Dockerfile parser with buildah integration and runtime templates
-- **Encrypted Overlay Networks** - WireGuard-based mesh networking with IP allocation, DNS service discovery, and health checking
+- **Encrypted Overlay Networks** - Mesh networking via boringtun (userspace WireGuard) with IP allocation, DNS service discovery, and health checking
 - **Smart Scheduler** - Node placement with Shared/Dedicated/Exclusive allocation modes
 - **Built-in Proxy** - L7 (HTTP/HTTPS/WebSocket) and L4 (TCP/UDP) with TLS termination, load balancing on every node
 - **Adaptive Autoscaling** - Scale based on CPU, memory, or requests per second
@@ -77,7 +77,7 @@ graph TB
     subgraph Overlay[Overlay Networking]
         IP[IP Allocator]
         Boot[Bootstrap]
-        WG[WireGuard Mesh]
+        WG[Overlay Mesh]
         DNS[DNS Discovery]
         TUN[Tunneling]
         IP --> Boot --> WG
@@ -109,7 +109,7 @@ crates/
 ├── layer-storage/  # S3-backed layer persistence with crash-tolerant uploads
 ├── manager/        # Web-based management UI (Leptos SSR + WASM)
 ├── observability/  # Metrics, logging, OpenTelemetry tracing
-├── overlay/        # WireGuard overlay networking, IP allocation, DNS discovery, health checks
+├── overlay/        # Encrypted overlay networking (boringtun), IP allocation, DNS discovery, health checks
 ├── proxy/          # L4/L7 proxy with TLS
 ├── registry/       # OCI image pulling and caching (with optional S3 backend)
 ├── scheduler/      # Raft-based distributed scheduler with placement logic
@@ -850,7 +850,7 @@ Features include:
 - **Deployments** - Manage deployments and services
 - **Builds** - View build history and logs
 - **Nodes** - Monitor cluster nodes
-- **Overlay** - WireGuard mesh status, peer health, DNS discovery
+- **Overlay** - Overlay mesh status, peer health, DNS discovery
 - **Settings** - Secrets management, cluster configuration
 
 See [crates/zlayer-manager/README.md](./crates/zlayer-manager/README.md) for development details.

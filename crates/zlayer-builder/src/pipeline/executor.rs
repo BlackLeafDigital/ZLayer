@@ -385,6 +385,26 @@ async fn build_single_image(
         builder = builder.no_cache();
     }
 
+    // Merge cache mounts: defaults + per-image (per-image are additive)
+    let mut cache_mounts = pipeline.defaults.cache_mounts.clone();
+    cache_mounts.extend(image_config.cache_mounts.clone());
+    if !cache_mounts.is_empty() {
+        let run_mounts: Vec<_> = cache_mounts
+            .iter()
+            .map(crate::zimage::convert_cache_mount)
+            .collect();
+        builder = builder.default_cache_mounts(run_mounts);
+    }
+
+    // Apply retries (per-image overrides default)
+    let retries = image_config
+        .retries
+        .or(pipeline.defaults.retries)
+        .unwrap_or(0);
+    if retries > 0 {
+        builder = builder.retries(retries);
+    }
+
     builder.build().await
 }
 

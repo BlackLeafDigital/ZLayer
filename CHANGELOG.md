@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Replaced kernel WireGuard with boringtun (Cloudflare's Rust userspace WireGuard implementation) for overlay networking
+  - No longer requires WireGuard kernel module (`modprobe wireguard` / kernel 5.6+)
+  - No longer requires `wireguard-tools` package (`wg` binary)
+  - Uses TUN device via `/dev/net/tun` (universally available on Linux)
+  - Still requires CAP_NET_ADMIN or root for TUN device creation
+  - Renamed `WireGuardManager` to `OverlayTransport`
+  - All configuration now done via UAPI protocol (no external binary dependencies)
+
 ### Added
 - Deploy TUI with ratatui-based interactive progress display for `zlayer deploy` and `zlayer up`
   - Phase-aware layout: deploying, running dashboard, and shutdown views

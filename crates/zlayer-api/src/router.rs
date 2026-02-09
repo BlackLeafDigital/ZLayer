@@ -565,7 +565,7 @@ pub fn build_node_routes(node_state: NodeApiState) -> Router<()> {
 /// Build routes for overlay network status
 ///
 /// Creates the routes for querying overlay network status.
-/// These endpoints provide information about the WireGuard overlay,
+/// These endpoints provide information about the encrypted overlay network,
 /// peer health, IP allocation, and DNS service.
 ///
 /// # Arguments

@@ -1,7 +1,11 @@
-//! ZLayer Overlay - WireGuard-based encrypted networking
+//! ZLayer Overlay - Encrypted overlay networking via boringtun
 //!
-//! Provides kernel WireGuard overlay networks with DNS service discovery,
-//! automatic bootstrap on node init/join, IP allocation, and health checking.
+//! Provides encrypted overlay networks using boringtun (Cloudflare's Rust userspace
+//! WireGuard implementation) with DNS service discovery, automatic bootstrap on
+//! node init/join, IP allocation, and health checking.
+//!
+//! No kernel WireGuard module or wireguard-tools required -- uses TUN devices
+//! via `/dev/net/tun` and configures peers via the UAPI protocol.
 //!
 //! # Modules
 //!
@@ -11,7 +15,7 @@
 //! - [`dns`] - DNS server for service discovery
 //! - [`error`] - Error types for overlay operations
 //! - [`health`] - Health checking for peer connectivity
-//! - [`wireguard`] - WireGuard interface management
+//! - [`transport`] - Overlay transport (boringtun device management via UAPI)
 //!
 //! # Example
 //!
@@ -27,7 +31,7 @@
 //!     Path::new("/var/lib/zlayer"),
 //! ).await?;
 //!
-//! // Start the overlay network
+//! // Start the overlay network (creates boringtun TUN device)
 //! bootstrap.start().await?;
 //!
 //! println!("Overlay IP: {}", bootstrap.node_ip());
@@ -43,7 +47,7 @@
 //! let bootstrap = OverlayBootstrap::join(
 //!     "10.200.0.0/16",           // Leader's CIDR
 //!     "192.168.1.100:51820",     // Leader's endpoint
-//!     "leader_public_key",       // Leader's WG public key
+//!     "leader_public_key",       // Leader's public key
 //!     "10.200.0.1".parse()?,     // Leader's overlay IP
 //!     "10.200.0.5".parse()?,     // Our allocated IP
 //!     51820,                      // Our listen port
@@ -84,7 +88,7 @@
 //! use zlayer_overlay::health::OverlayHealthChecker;
 //! use std::time::Duration;
 //!
-//! let checker = OverlayHealthChecker::new("wg-zlayer0", Duration::from_secs(30));
+//! let checker = OverlayHealthChecker::new("zl-overlay0", Duration::from_secs(30));
 //!
 //! // Check all peers
 //! let health = checker.check_all().await?;
@@ -102,7 +106,7 @@ pub mod config;
 pub mod dns;
 pub mod error;
 pub mod health;
-pub mod wireguard;
+pub mod transport;
 
 // Re-export commonly used types
 pub use allocator::IpAllocator;
@@ -114,4 +118,4 @@ pub use config::*;
 pub use dns::*;
 pub use error::{OverlayError, Result};
 pub use health::{OverlayHealth, OverlayHealthChecker, PeerStatus};
-pub use wireguard::*;
+pub use transport::*;

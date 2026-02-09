@@ -167,10 +167,10 @@ pub fn Overlay() -> impl IntoView {
         <div class="p-6">
             <h1 class="text-3xl font-bold mb-6">"Overlay Network"</h1>
 
-            // WireGuard Mesh Status Card
+            // Overlay Mesh Status Card
             <div class="card bg-base-200 shadow-md mb-6">
                 <div class="card-body">
-                    <h2 class="card-title">"WireGuard Mesh Status"</h2>
+                    <h2 class="card-title">"Overlay Mesh Status"</h2>
                     <Suspense fallback=move || view! { <span class="loading loading-spinner"></span> }>
                         {move || status.get().map(|result| match result {
                             Ok(s) => view! {

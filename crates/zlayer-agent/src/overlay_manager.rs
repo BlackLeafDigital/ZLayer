@@ -2,7 +2,7 @@ use crate::error::AgentError;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use tokio::sync::RwLock;
-use zlayer_overlay::{OverlayConfig, WireGuardManager};
+use zlayer_overlay::{OverlayConfig, OverlayTransport};
 
 /// Manages overlay networks for a deployment
 pub struct OverlayManager {
@@ -10,8 +10,12 @@ pub struct OverlayManager {
     deployment: String,
     /// Global overlay interface name
     global_interface: Option<String>,
+    /// Global overlay transport (must be kept alive for the TUN device lifetime)
+    global_transport: Option<OverlayTransport>,
     /// Service-specific overlay interfaces (service_name -> interface_name)
     service_interfaces: RwLock<HashMap<String, String>>,
+    /// Service-specific overlay transports (must be kept alive for TUN device lifetimes)
+    service_transports: RwLock<HashMap<String, OverlayTransport>>,
     /// IP allocator for overlay networks
     ip_allocator: IpAllocator,
 }
@@ -22,7 +26,9 @@ impl OverlayManager {
         Ok(Self {
             deployment,
             global_interface: None,
+            global_transport: None,
             service_interfaces: RwLock::new(HashMap::new()),
+            service_transports: RwLock::new(HashMap::new()),
             ip_allocator: IpAllocator::new("10.200.0.0/16".parse().unwrap()),
         })
     }
@@ -32,23 +38,24 @@ impl OverlayManager {
         let prefix = &self.deployment[..8.min(self.deployment.len())];
         let interface_name = format!("zl-{}-global", prefix);
 
-        let (private_key, public_key) = WireGuardManager::generate_keys()
+        let (private_key, public_key) = OverlayTransport::generate_keys()
             .await
             .map_err(|e| AgentError::Network(format!("Failed to generate keys: {}", e)))?;
 
         let node_ip = self.ip_allocator.allocate()?;
         let config = self.build_config(private_key, public_key, node_ip, 16, 51820);
-        let manager = WireGuardManager::new(config, interface_name.clone());
+        let mut transport = OverlayTransport::new(config, interface_name.clone());
 
-        manager
+        transport
             .create_interface()
             .await
             .map_err(|e| AgentError::Network(format!("Failed to create global overlay: {}", e)))?;
-        manager.configure_interface(&[]).await.map_err(|e| {
+        transport.configure(&[]).await.map_err(|e| {
             AgentError::Network(format!("Failed to configure global overlay: {}", e))
         })?;
 
         self.global_interface = Some(interface_name);
+        self.global_transport = Some(transport);
         Ok(())
     }
 
@@ -58,30 +65,27 @@ impl OverlayManager {
         let service_prefix = &service_name[..8.min(service_name.len())];
         let interface_name = format!("zl-{}-{}", deployment_prefix, service_prefix);
 
-        // Attempt WireGuard overlay (for inter-node communication)
+        // Attempt overlay creation (for inter-node communication)
         // This is non-fatal: single-node deployments work fine without it
-        match self
-            .try_create_wireguard_overlay(&interface_name, service_name)
-            .await
-        {
+        match self.try_create_overlay(&interface_name, service_name).await {
             Ok(()) => {
                 tracing::info!(
                     service = %service_name,
                     interface = %interface_name,
-                    "WireGuard service overlay created"
+                    "Service overlay created"
                 );
             }
             Err(e) => {
                 tracing::warn!(
                     service = %service_name,
                     error = %e,
-                    "WireGuard overlay unavailable, using direct networking"
+                    "Overlay unavailable, using direct networking"
                 );
             }
         }
 
         // Always register service so attach_container can proceed
-        // (veth pair creation doesn't require the WireGuard interface)
+        // (veth pair creation doesn't require the overlay interface)
         self.service_interfaces
             .write()
             .await
@@ -89,28 +93,32 @@ impl OverlayManager {
         Ok(interface_name)
     }
 
-    /// Attempt to create a WireGuard overlay interface for inter-node traffic
-    async fn try_create_wireguard_overlay(
+    /// Attempt to create an overlay interface for inter-node traffic
+    async fn try_create_overlay(
         &self,
         interface_name: &str,
         service_name: &str,
     ) -> Result<(), AgentError> {
-        let (private_key, public_key) = WireGuardManager::generate_keys()
+        let (private_key, public_key) = OverlayTransport::generate_keys()
             .await
             .map_err(|e| AgentError::Network(format!("Failed to generate keys: {}", e)))?;
 
         let service_ip = self.ip_allocator.allocate_for_service(service_name)?;
         let config = self.build_config(private_key, public_key, service_ip, 24, 0);
-        let manager = WireGuardManager::new(config, interface_name.to_string());
+        let mut transport = OverlayTransport::new(config, interface_name.to_string());
 
-        manager
+        transport
             .create_interface()
             .await
             .map_err(|e| AgentError::Network(format!("Failed to create service overlay: {}", e)))?;
-        manager.configure_interface(&[]).await.map_err(|e| {
+        transport.configure(&[]).await.map_err(|e| {
             AgentError::Network(format!("Failed to configure service overlay: {}", e))
         })?;
 
+        self.service_transports
+            .write()
+            .await
+            .insert(service_name.to_string(), transport);
         Ok(())
     }
 
@@ -224,14 +232,23 @@ impl OverlayManager {
 
     /// Cleanup all overlay networks
     pub async fn cleanup(&mut self) -> Result<(), AgentError> {
-        let interfaces = self.service_interfaces.read().await;
-        for iface in interfaces.values() {
-            let _ = self.run_command("ip", &["link", "del", iface]).await;
+        // Drop service transports (destroys TUN devices)
+        let mut transports = self.service_transports.write().await;
+        for (name, mut transport) in transports.drain() {
+            tracing::info!(service = %name, "Shutting down service overlay");
+            transport.shutdown();
+        }
+        drop(transports);
+
+        // Drop global transport
+        if let Some(mut transport) = self.global_transport.take() {
+            tracing::info!("Shutting down global overlay");
+            transport.shutdown();
         }
 
-        if let Some(iface) = &self.global_interface {
-            let _ = self.run_command("ip", &["link", "del", iface]).await;
-        }
+        // Clear interface name tracking
+        self.service_interfaces.write().await.clear();
+        self.global_interface = None;
 
         Ok(())
     }

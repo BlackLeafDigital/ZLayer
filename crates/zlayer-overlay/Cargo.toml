@@ -5,8 +5,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "WireGuard-based encrypted overlay networking for containers"
-keywords = ["container", "networking", "wireguard", "overlay", "mesh"]
+description = "Encrypted overlay networking for containers using boringtun userspace WireGuard"
+keywords = ["container", "networking", "boringtun", "overlay", "userspace"]
 categories = ["network-programming"]
 readme = "README.md"
 
@@ -25,3 +25,5 @@ x25519-dalek.workspace = true
 zlayer-core = { version = "0.1.0", path = "../zlayer-core" }
 base64.workspace = true
 rand.workspace = true
+hex.workspace = true
+boringtun = { version = "0.7.0", features = ["device"] }
