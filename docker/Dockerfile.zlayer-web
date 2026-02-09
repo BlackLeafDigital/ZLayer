@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y \
     pkg-config \
     cmake \
     libssl-dev \
+    binaryen \
     && rm -rf /var/lib/apt/lists/*
 
 # Install wasm target and cargo-leptos
