@@ -115,7 +115,7 @@ use tokio::fs;
 use tracing::{debug, info, instrument};
 
 use crate::buildah::{BuildahCommand, BuildahExecutor};
-use crate::dockerfile::{Dockerfile, ImageRef, Instruction, Stage};
+use crate::dockerfile::{Dockerfile, ImageRef, Instruction, RunMount, Stage};
 use crate::error::{BuildError, Result};
 use crate::templates::{get_template, Runtime};
 use crate::tui::BuildEvent;
@@ -443,6 +443,11 @@ pub struct BuildOptions {
     /// `"git.example.com:5000"` and the ZImagefile uses `base: "myapp:latest"`,
     /// the builder will check `git.example.com:5000/myapp:latest` first.
     pub default_registry: Option<String>,
+    /// Default cache mounts injected into all RUN instructions.
+    /// These are merged with any step-level cache mounts (deduped by target path).
+    pub default_cache_mounts: Vec<RunMount>,
+    /// Number of retries for failed RUN steps (0 = no retries, default)
+    pub retries: u32,
 }
 
 impl Default for BuildOptions {
@@ -466,6 +471,8 @@ impl Default for BuildOptions {
             #[cfg(feature = "cache")]
             cache_backend_config: None,
             default_registry: None,
+            default_cache_mounts: Vec::new(),
+            retries: 0,
         }
     }
 }
@@ -949,6 +956,18 @@ impl ImageBuilder {
         self
     }
 
+    /// Set default cache mounts to inject into all RUN instructions
+    pub fn default_cache_mounts(mut self, mounts: Vec<RunMount>) -> Self {
+        self.options.default_cache_mounts = mounts;
+        self
+    }
+
+    /// Set the number of retries for failed RUN steps
+    pub fn retries(mut self, retries: u32) -> Self {
+        self.options.retries = retries;
+        self
+    }
+
     /// Set an event sender for TUI progress updates
     ///
     /// Events will be sent as the build progresses, allowing you to
@@ -1333,23 +1352,85 @@ impl ImageBuilder {
                     instruction
                 };
 
+                // Inject default cache mounts into RUN instructions
+                let instruction_with_defaults;
+                let instruction_ref = if !self.options.default_cache_mounts.is_empty() {
+                    if let Instruction::Run(run) = instruction_ref {
+                        let mut merged = run.clone();
+                        for default_mount in &self.options.default_cache_mounts {
+                            // Deduplicate by target path
+                            let target = match default_mount {
+                                RunMount::Cache { target, .. } => target,
+                                _ => continue,
+                            };
+                            let already_has = merged.mounts.iter().any(
+                                |m| matches!(m, RunMount::Cache { target: t, .. } if t == target),
+                            );
+                            if !already_has {
+                                merged.mounts.push(default_mount.clone());
+                            }
+                        }
+                        instruction_with_defaults = Instruction::Run(merged);
+                        &instruction_with_defaults
+                    } else {
+                        instruction_ref
+                    }
+                } else {
+                    instruction_ref
+                };
+
+                let is_run_instruction = matches!(instruction_ref, Instruction::Run(_));
+                let max_attempts = if is_run_instruction {
+                    self.options.retries + 1
+                } else {
+                    1
+                };
+
                 let commands = BuildahCommand::from_instruction(&container_id, instruction_ref);
 
                 let mut combined_output = String::new();
                 for cmd in commands {
-                    let output = self
-                        .executor
-                        .execute_streaming(&cmd, |is_stdout, line| {
+                    let mut last_output = None;
+
+                    for attempt in 1..=max_attempts {
+                        if attempt > 1 {
+                            tracing::warn!(
+                                "Retrying step (attempt {}/{})...",
+                                attempt,
+                                max_attempts
+                            );
                             self.send_event(BuildEvent::Output {
-                                line: line.to_string(),
-                                is_stderr: !is_stdout,
+                                line: format!(
+                                    "⟳ Retrying step (attempt {}/{})...",
+                                    attempt, max_attempts
+                                ),
+                                is_stderr: false,
                             });
-                        })
-                        .await?;
+                            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                        }
 
-                    combined_output.push_str(&output.stdout);
-                    combined_output.push_str(&output.stderr);
+                        let output = self
+                            .executor
+                            .execute_streaming(&cmd, |is_stdout, line| {
+                                self.send_event(BuildEvent::Output {
+                                    line: line.to_string(),
+                                    is_stderr: !is_stdout,
+                                });
+                            })
+                            .await?;
 
+                        combined_output.push_str(&output.stdout);
+                        combined_output.push_str(&output.stderr);
+
+                        if output.success() {
+                            last_output = Some(output);
+                            break;
+                        }
+
+                        last_output = Some(output);
+                    }
+
+                    let output = last_output.unwrap();
                     if !output.success() {
                         self.send_event(BuildEvent::BuildFailed {
                             error: output.stderr.clone(),

@@ -16,7 +16,7 @@ stages:
     workdir: "/build"
     steps:
       # Install system dependencies
-      - run: "apt-get update && apt-get install -y protobuf-compiler libseccomp-dev pkg-config cmake libssl-dev binaryen nodejs npm && rm -rf /var/lib/apt/lists/*"
+      - run: "apt-get update && apt-get install -y protobuf-compiler libseccomp-dev pkg-config cmake libssl-dev nodejs npm && rm -rf /var/lib/apt/lists/*"
 
       # Install wasm target and cargo-leptos
       - run: "rustup target add wasm32-unknown-unknown && cargo install cargo-leptos"

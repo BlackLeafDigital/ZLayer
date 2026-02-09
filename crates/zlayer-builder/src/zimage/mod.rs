@@ -7,6 +7,6 @@ mod converter;
 mod parser;
 pub mod types;
 
-pub use converter::zimage_to_dockerfile;
+pub use converter::{convert_cache_mount, zimage_to_dockerfile};
 pub use parser::parse_zimagefile;
 pub use types::*;

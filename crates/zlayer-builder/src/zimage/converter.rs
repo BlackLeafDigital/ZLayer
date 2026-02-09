@@ -503,7 +503,7 @@ fn parse_optional_duration(
 // Cache mount
 // ---------------------------------------------------------------------------
 
-fn convert_cache_mount(cm: &ZCacheMount) -> RunMount {
+pub fn convert_cache_mount(cm: &ZCacheMount) -> RunMount {
     let sharing = match cm.sharing.as_deref() {
         Some("shared") => CacheSharing::Shared,
         Some("private") => CacheSharing::Private,
