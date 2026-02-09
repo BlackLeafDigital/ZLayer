@@ -23,3 +23,5 @@ trust-dns-client.workspace = true
 trust-dns-server.workspace = true
 x25519-dalek.workspace = true
 zlayer-core = { version = "0.1.0", path = "../zlayer-core" }
+base64.workspace = true
+rand.workspace = true

@@ -283,6 +283,10 @@ impl OverlayHealthChecker {
 
     /// Get raw WireGuard peer statistics
     async fn get_wg_stats(&self) -> Result<Vec<WgPeerStats>> {
+        crate::wireguard::ensure_wireguard_tools()
+            .await
+            .map_err(|e| OverlayError::WireGuardNotFound(e.to_string()))?;
+
         let output = Command::new("wg")
             .args(["show", &self.interface, "dump"])
             .output()

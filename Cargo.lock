@@ -10827,8 +10827,10 @@ dependencies = [
 name = "zlayer-overlay"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "blake2",
  "ipnet",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

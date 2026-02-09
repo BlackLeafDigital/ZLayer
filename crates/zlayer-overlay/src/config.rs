@@ -91,7 +91,7 @@ impl PeerInfo {
              PublicKey = {}\n\
              Endpoint = {}\n\
              AllowedIPs = {}\n\
-             PersistentKeepalive = {}s\n",
+             PersistentKeepalive = {}\n",
             self.public_key,
             self.endpoint,
             self.allowed_ips,
