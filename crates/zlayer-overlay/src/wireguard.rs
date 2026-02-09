@@ -122,6 +122,44 @@ pub(crate) async fn ensure_wireguard_tools() -> Result<(), Box<dyn std::error::E
     }
 }
 
+/// Static flag to track whether the WireGuard kernel module has been verified/loaded.
+static WG_MODULE_CHECKED: OnceLock<bool> = OnceLock::new();
+
+/// Ensure the WireGuard kernel module is loaded, attempting `modprobe` if not found.
+///
+/// Uses a `OnceLock` to only check/load once per process lifetime.
+pub(crate) async fn ensure_wireguard_kernel_module() -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(&loaded) = WG_MODULE_CHECKED.get() {
+        if loaded {
+            return Ok(());
+        }
+        return Err("WireGuard kernel module not available".into());
+    }
+
+    // Check if module is already loaded
+    if tokio::fs::metadata("/sys/module/wireguard").await.is_ok() {
+        let _ = WG_MODULE_CHECKED.set(true);
+        return Ok(());
+    }
+
+    // Try to load it
+    tracing::info!("Loading WireGuard kernel module...");
+    let output = Command::new("modprobe").arg("wireguard").output().await?;
+
+    if output.status.success() {
+        tracing::info!("WireGuard kernel module loaded");
+        let _ = WG_MODULE_CHECKED.set(true);
+        Ok(())
+    } else {
+        let _ = WG_MODULE_CHECKED.set(false);
+        Err(
+            "WireGuard kernel module not available. Your kernel may not support WireGuard. \
+             Use --host-network flag to skip overlay networking."
+                .into(),
+        )
+    }
+}
+
 /// WireGuard interface manager
 pub struct WireGuardManager {
     config: OverlayConfig,
@@ -139,6 +177,10 @@ impl WireGuardManager {
 
     /// Create WireGuard interface
     pub async fn create_interface(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Ensure prerequisites before attempting interface creation
+        ensure_wireguard_tools().await?;
+        ensure_wireguard_kernel_module().await?;
+
         let output = Command::new("ip")
             .args([
                 "link",
@@ -367,5 +409,68 @@ mod tests {
             key1, key2,
             "Sequential key generation should produce unique keys"
         );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_wireguard_kernel_module_checks_sysfs() {
+        // This test verifies the function runs and returns a result.
+        // On systems with WireGuard module loaded, it returns Ok.
+        // On systems without it (e.g., CI), it returns Err with a clear message.
+        let result = ensure_wireguard_kernel_module().await;
+        match result {
+            Ok(()) => {
+                // Module is available - valid outcome
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("WireGuard kernel module")
+                        || msg.contains("modprobe")
+                        || msg.contains("not available"),
+                    "Error should mention kernel module issue, got: {}",
+                    msg
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_interface_calls_prerequisites() {
+        // Verify that create_interface propagates ensure function failures correctly.
+        // On systems without WireGuard, the error should mention the kernel module
+        // or wireguard-tools, NOT "Attribute failed policy validation".
+        let config = OverlayConfig {
+            overlay_cidr: "10.42.0.1/24".to_string(),
+            private_key: "test_key".to_string(),
+            public_key: "test_pub".to_string(),
+            local_endpoint: std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                51820,
+            ),
+            peer_discovery_interval: Duration::from_secs(30),
+        };
+        let manager = WireGuardManager::new(config, "wg-test-prereq".to_string());
+        let result = manager.create_interface().await;
+
+        match result {
+            Ok(()) => {
+                // WireGuard fully available - clean up the interface
+                let _ = Command::new("ip")
+                    .args(["link", "delete", "dev", "wg-test-prereq"])
+                    .output()
+                    .await;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // The error must come from prerequisites (tools or module),
+                // not from the ip link add command failing with a cryptic message.
+                assert!(
+                    !msg.contains("Attribute failed policy validation"),
+                    "create_interface should fail at prerequisite check, \
+                     not at 'ip link add'. Got: {}",
+                    msg
+                );
+            }
+        }
     }
 }

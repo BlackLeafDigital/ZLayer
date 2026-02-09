@@ -259,9 +259,9 @@ pub(crate) async fn deploy_services(
         if !services_needing_network.is_empty() {
             let err_detail = overlay_error.as_deref().unwrap_or("unknown error");
             anyhow::bail!(
-                "Overlay network required but failed to initialize: {}. \
-                 Services with endpoints need overlay networking: [{}]. \
-                 WireGuard auto-installation failed. Install manually (apt install wireguard-tools) or use --host-network flag.",
+                "Overlay network failed: {}. Services needing overlay: [{}]. \
+                 Try: 'modprobe wireguard' (load kernel module), 'apt install wireguard-tools' (install tools), \
+                 or use --host-network flag to skip overlay.",
                 err_detail,
                 services_needing_network.join(", ")
             );
