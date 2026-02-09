@@ -159,7 +159,7 @@ pub struct ServicePlan {
 pub enum InfraPhase {
     /// Container runtime initialization
     Runtime,
-    /// WireGuard overlay network
+    /// Encrypted overlay network
     Overlay,
     /// DNS server
     Dns,

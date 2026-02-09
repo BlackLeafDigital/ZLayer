@@ -1,13 +1,15 @@
 //! Health checking for overlay network peers
 //!
-//! Monitors WireGuard peer connectivity through handshake times
-//! and optional ping tests.
+//! Monitors overlay peer connectivity through handshake times
+//! and optional ping tests. Uses UAPI to query the boringtun
+//! device directly -- no external `wg` binary required.
 
 use crate::error::{OverlayError, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -33,7 +35,7 @@ pub struct PeerStatus {
     /// Whether the peer is considered healthy
     pub healthy: bool,
 
-    /// Time since last WireGuard handshake (seconds)
+    /// Time since last overlay handshake (seconds)
     pub last_handshake_secs: Option<u64>,
 
     /// Last ping RTT in milliseconds
@@ -49,7 +51,7 @@ pub struct PeerStatus {
 /// Aggregated health status for the overlay network
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayHealth {
-    /// WireGuard interface name
+    /// Overlay interface name
     pub interface: String,
 
     /// Total number of configured peers
@@ -68,7 +70,7 @@ pub struct OverlayHealth {
     pub last_check: u64,
 }
 
-/// Raw peer statistics from WireGuard
+/// Raw peer statistics from the overlay transport (via UAPI)
 #[derive(Debug, Clone)]
 pub struct WgPeerStats {
     pub public_key: String,
@@ -81,10 +83,10 @@ pub struct WgPeerStats {
 
 /// Overlay health checker
 ///
-/// Monitors peer connectivity through WireGuard handshake times
-/// and optional ping tests.
+/// Monitors peer connectivity through overlay handshake times
+/// and optional ping tests. Queries the boringtun device via UAPI.
 pub struct OverlayHealthChecker {
-    /// WireGuard interface name
+    /// Overlay interface name
     interface: String,
 
     /// Health check interval
@@ -281,61 +283,32 @@ impl OverlayHealthChecker {
         }
     }
 
-    /// Get raw WireGuard peer statistics
+    /// Get raw overlay peer statistics via UAPI.
+    ///
+    /// Connects to the boringtun UAPI Unix socket and sends a `get=1`
+    /// query. Parses the key=value response into [`WgPeerStats`] entries.
+    /// No external `wg` binary is required.
     async fn get_wg_stats(&self) -> Result<Vec<WgPeerStats>> {
-        crate::wireguard::ensure_wireguard_tools()
-            .await
-            .map_err(|e| OverlayError::WireGuardNotFound(e.to_string()))?;
+        let sock_path = format!("/var/run/wireguard/{}.sock", self.interface);
 
-        let output = Command::new("wg")
-            .args(["show", &self.interface, "dump"])
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Check if interface just doesn't exist
-            if stderr.contains("No such device") || stderr.contains("Unable to access interface") {
-                return Ok(Vec::new());
+        let response = match uapi_get_raw(&sock_path).await {
+            Ok(resp) => resp,
+            Err(e) => {
+                let msg = e.to_string();
+                // If the socket doesn't exist, the interface isn't running
+                if msg.contains("No such file")
+                    || msg.contains("Connection refused")
+                    || msg.contains("not found")
+                {
+                    return Ok(Vec::new());
+                }
+                return Err(OverlayError::TransportCommand(msg));
             }
-            return Err(OverlayError::WireGuardCommand(stderr.to_string()));
-        }
+        };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let mut peers = Vec::new();
+        let peers = parse_uapi_get_response(&response);
 
-        // Parse `wg show <iface> dump` output
-        // Format: public_key  preshared_key  endpoint  allowed_ips  last_handshake  transfer_rx  transfer_tx  keepalive
-        // First line is the interface's own info, skip it
-        for line in stdout.lines().skip(1) {
-            let parts: Vec<&str> = line.split('\t').collect();
-            if parts.len() < 8 {
-                continue;
-            }
-
-            let public_key = parts[0].to_string();
-            let endpoint = if parts[2] == "(none)" {
-                None
-            } else {
-                Some(parts[2].to_string())
-            };
-            let allowed_ips: Vec<String> =
-                parts[3].split(',').map(|s| s.trim().to_string()).collect();
-            let last_handshake = parts[4].parse::<u64>().ok().filter(|&t| t > 0);
-            let transfer_rx = parts[5].parse().unwrap_or(0);
-            let transfer_tx = parts[6].parse().unwrap_or(0);
-
-            peers.push(WgPeerStats {
-                public_key,
-                endpoint,
-                allowed_ips,
-                last_handshake_time: last_handshake,
-                transfer_rx,
-                transfer_tx,
-            });
-        }
-
-        debug!(interface = %self.interface, peer_count = peers.len(), "Retrieved WireGuard stats");
+        debug!(interface = %self.interface, peer_count = peers.len(), "Retrieved overlay peer stats via UAPI");
         Ok(peers)
     }
 
@@ -364,6 +337,107 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Send a UAPI `get=1` query to the boringtun socket and return the raw response.
+async fn uapi_get_raw(sock_path: &str) -> std::result::Result<String, Box<dyn std::error::Error>> {
+    let mut stream = tokio::net::UnixStream::connect(sock_path).await?;
+    stream.write_all(b"get=1\n\n").await?;
+    stream.shutdown().await?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response).await?;
+    Ok(response)
+}
+
+/// Convert a hex-encoded key (from UAPI) to base64 (standard WireGuard format).
+fn hex_key_to_base64(hex_key: &str) -> String {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    match hex::decode(hex_key) {
+        Ok(bytes) => STANDARD.encode(bytes),
+        Err(_) => hex_key.to_string(), // fallback: return as-is
+    }
+}
+
+/// Parse a UAPI `get=1` response into a list of [`WgPeerStats`].
+///
+/// The UAPI response is newline-delimited `key=value` pairs. Interface-level
+/// fields come first (private_key, listen_port, fwmark). Each `public_key=`
+/// line starts a new peer block. Peer fields include endpoint,
+/// last_handshake_time_sec, last_handshake_time_nsec, rx_bytes, tx_bytes,
+/// persistent_keepalive_interval, and allowed_ip.
+fn parse_uapi_get_response(response: &str) -> Vec<WgPeerStats> {
+    let mut peers = Vec::new();
+    let mut current_peer: Option<WgPeerStats> = None;
+    let mut in_peer = false;
+
+    for line in response.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("errno=") {
+            continue;
+        }
+
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+
+        match key {
+            "public_key" => {
+                // Flush previous peer if any
+                if let Some(peer) = current_peer.take() {
+                    peers.push(peer);
+                }
+                in_peer = true;
+                current_peer = Some(WgPeerStats {
+                    public_key: hex_key_to_base64(value),
+                    endpoint: None,
+                    allowed_ips: Vec::new(),
+                    last_handshake_time: None,
+                    transfer_rx: 0,
+                    transfer_tx: 0,
+                });
+            }
+            "endpoint" if in_peer => {
+                if let Some(ref mut peer) = current_peer {
+                    if value != "(none)" {
+                        peer.endpoint = Some(value.to_string());
+                    }
+                }
+            }
+            "allowed_ip" if in_peer => {
+                if let Some(ref mut peer) = current_peer {
+                    peer.allowed_ips.push(value.to_string());
+                }
+            }
+            "last_handshake_time_sec" if in_peer => {
+                if let Some(ref mut peer) = current_peer {
+                    if let Ok(t) = value.parse::<u64>() {
+                        if t > 0 {
+                            peer.last_handshake_time = Some(t);
+                        }
+                    }
+                }
+            }
+            "rx_bytes" if in_peer => {
+                if let Some(ref mut peer) = current_peer {
+                    peer.transfer_rx = value.parse().unwrap_or(0);
+                }
+            }
+            "tx_bytes" if in_peer => {
+                if let Some(ref mut peer) = current_peer {
+                    peer.transfer_tx = value.parse().unwrap_or(0);
+                }
+            }
+            // Skip interface-level fields and other peer fields we don't need
+            _ => {}
+        }
+    }
+
+    // Flush the last peer
+    if let Some(peer) = current_peer {
+        peers.push(peer);
+    }
+
+    peers
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,7 +464,7 @@ mod tests {
     #[test]
     fn test_overlay_health_serialization() {
         let health = OverlayHealth {
-            interface: "wg-zlayer0".to_string(),
+            interface: "zl-overlay0".to_string(),
             total_peers: 2,
             healthy_peers: 1,
             unhealthy_peers: 1,
@@ -399,7 +473,7 @@ mod tests {
         };
 
         let json = serde_json::to_string_pretty(&health).unwrap();
-        assert!(json.contains("wg-zlayer0"));
+        assert!(json.contains("zl-overlay0"));
     }
 
     #[test]
@@ -460,5 +534,87 @@ mod tests {
 
         // Should be unhealthy (no handshake ever)
         assert!(!checker.is_peer_healthy(&stats));
+    }
+
+    #[test]
+    fn test_parse_uapi_get_response() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        // Simulate a hex-encoded 32-byte key for testing
+        let key_bytes = [0xABu8; 32];
+        let hex_key = hex::encode(key_bytes);
+        let expected_b64 = STANDARD.encode(key_bytes);
+
+        let response = format!(
+            "private_key=0000000000000000000000000000000000000000000000000000000000000000\n\
+             listen_port=51820\n\
+             public_key={hex_key}\n\
+             endpoint=192.168.1.5:51820\n\
+             allowed_ip=10.200.0.2/32\n\
+             last_handshake_time_sec=1700000000\n\
+             last_handshake_time_nsec=0\n\
+             rx_bytes=12345\n\
+             tx_bytes=67890\n\
+             persistent_keepalive_interval=25\n\
+             errno=0\n"
+        );
+
+        let peers = parse_uapi_get_response(&response);
+        assert_eq!(peers.len(), 1);
+
+        let peer = &peers[0];
+        assert_eq!(peer.public_key, expected_b64);
+        assert_eq!(peer.endpoint, Some("192.168.1.5:51820".to_string()));
+        assert_eq!(peer.allowed_ips, vec!["10.200.0.2/32".to_string()]);
+        assert_eq!(peer.last_handshake_time, Some(1700000000));
+        assert_eq!(peer.transfer_rx, 12345);
+        assert_eq!(peer.transfer_tx, 67890);
+    }
+
+    #[test]
+    fn test_parse_uapi_get_response_multiple_peers() {
+        let key1 = hex::encode([0x01u8; 32]);
+        let key2 = hex::encode([0x02u8; 32]);
+
+        let response = format!(
+            "private_key=0000000000000000000000000000000000000000000000000000000000000000\n\
+             listen_port=51820\n\
+             public_key={key1}\n\
+             endpoint=10.0.0.1:51820\n\
+             allowed_ip=10.200.0.2/32\n\
+             rx_bytes=100\n\
+             tx_bytes=200\n\
+             public_key={key2}\n\
+             endpoint=10.0.0.2:51821\n\
+             allowed_ip=10.200.0.3/32\n\
+             allowed_ip=10.200.1.0/24\n\
+             rx_bytes=300\n\
+             tx_bytes=400\n\
+             errno=0\n"
+        );
+
+        let peers = parse_uapi_get_response(&response);
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].transfer_rx, 100);
+        assert_eq!(peers[1].transfer_rx, 300);
+        assert_eq!(peers[1].allowed_ips.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_uapi_get_response_empty() {
+        let response = "private_key=0000\nlisten_port=51820\nerrno=0\n";
+        let peers = parse_uapi_get_response(response);
+        assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn test_hex_key_to_base64_roundtrip() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+
+        let key_bytes = [0xCDu8; 32];
+        let hex_key = hex::encode(key_bytes);
+        let b64 = hex_key_to_base64(&hex_key);
+        let expected = STANDARD.encode(key_bytes);
+        assert_eq!(b64, expected);
     }
 }

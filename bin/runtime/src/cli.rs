@@ -38,7 +38,7 @@ pub(crate) struct Cli {
     /// Use host networking instead of overlay (containers share host network namespace)
     ///
     /// When set, containers will not get their own network namespace and will share
-    /// the host's network stack. This bypasses the WireGuard overlay requirement.
+    /// the host's network stack. This bypasses the overlay networking requirement.
     /// Equivalent to Docker's --network host mode.
     #[arg(long, global = true)]
     pub(crate) host_network: bool,
@@ -651,7 +651,7 @@ pub(crate) enum NodeCommands {
         #[arg(long, default_value = "9000")]
         raft_port: u16,
 
-        /// WireGuard overlay port
+        /// Overlay network port (WireGuard protocol)
         #[arg(long, default_value = "51820")]
         overlay_port: u16,
 

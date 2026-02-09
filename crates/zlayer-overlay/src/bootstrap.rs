@@ -1,23 +1,23 @@
 //! Overlay network bootstrap functionality
 //!
 //! Provides initialization and joining capabilities for overlay networks,
-//! including WireGuard keypair generation, interface creation, and peer management.
+//! including keypair generation, interface creation, and peer management.
 
 use crate::allocator::IpAllocator;
 use crate::config::PeerInfo;
 use crate::dns::{peer_hostname, DnsConfig, DnsHandle, DnsServer, DEFAULT_DNS_PORT};
 use crate::error::{OverlayError, Result};
-use crate::wireguard::WireGuardManager;
+use crate::transport::OverlayTransport;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-/// Default WireGuard interface name for ZLayer overlay
-pub const DEFAULT_INTERFACE_NAME: &str = "wg-zlayer0";
+/// Default overlay interface name for ZLayer
+pub const DEFAULT_INTERFACE_NAME: &str = "zl-overlay0";
 
-/// Default WireGuard listen port
+/// Default overlay listen port
 pub const DEFAULT_WG_PORT: u16 = 51820;
 
 /// Default overlay network CIDR
@@ -38,16 +38,16 @@ pub struct BootstrapConfig {
     /// This node's overlay IP address
     pub node_ip: Ipv4Addr,
 
-    /// WireGuard interface name
+    /// Overlay interface name
     pub interface: String,
 
-    /// WireGuard listen port
+    /// Overlay listen port
     pub port: u16,
 
-    /// This node's WireGuard private key
+    /// This node's overlay private key
     pub private_key: String,
 
-    /// This node's WireGuard public key
+    /// This node's overlay public key
     pub public_key: String,
 
     /// Whether this node is the cluster leader
@@ -70,7 +70,7 @@ pub struct PeerConfig {
     /// Peer's node ID (for identification)
     pub node_id: String,
 
-    /// Peer's WireGuard public key
+    /// Peer's overlay public key
     pub public_key: String,
 
     /// Peer's public endpoint (host:port)
@@ -114,7 +114,7 @@ impl PeerConfig {
         self
     }
 
-    /// Convert to PeerInfo for WireGuard configuration
+    /// Convert to PeerInfo for overlay transport configuration
     pub fn to_peer_info(&self) -> std::result::Result<PeerInfo, Box<dyn std::error::Error>> {
         let endpoint: SocketAddr = self.endpoint.parse()?;
         let keepalive =
@@ -146,7 +146,7 @@ pub struct BootstrapState {
 /// Bootstrap manager for overlay network
 ///
 /// Handles overlay network initialization, peer management,
-/// and WireGuard interface configuration.
+/// and overlay transport interface configuration.
 pub struct OverlayBootstrap {
     /// Bootstrap configuration
     config: BootstrapConfig,
@@ -165,17 +165,23 @@ pub struct OverlayBootstrap {
 
     /// DNS handle for managing records (available after start() if DNS enabled)
     dns_handle: Option<DnsHandle>,
+
+    /// Overlay transport (boringtun device handle).
+    ///
+    /// Must be kept alive for the overlay network lifetime; dropping the
+    /// transport destroys the TUN device.
+    transport: Option<OverlayTransport>,
 }
 
 impl OverlayBootstrap {
     /// Initialize as cluster leader (first node in the overlay)
     ///
-    /// This generates a new WireGuard keypair, allocates the first IP
+    /// This generates a new overlay keypair, allocates the first IP
     /// in the CIDR range, and prepares the node as the overlay leader.
     ///
     /// # Arguments
     /// * `cidr` - Overlay network CIDR (e.g., "10.200.0.0/16")
-    /// * `port` - WireGuard listen port
+    /// * `port` - Overlay listen port
     /// * `data_dir` - Directory for persistent state
     ///
     /// # Example
@@ -198,11 +204,11 @@ impl OverlayBootstrap {
         // Ensure data directory exists
         tokio::fs::create_dir_all(data_dir).await?;
 
-        // Generate WireGuard keypair
-        info!("Generating WireGuard keypair for leader");
-        let (private_key, public_key) = WireGuardManager::generate_keys()
+        // Generate overlay keypair
+        info!("Generating overlay keypair for leader");
+        let (private_key, public_key) = OverlayTransport::generate_keys()
             .await
-            .map_err(|e| OverlayError::WireGuardCommand(e.to_string()))?;
+            .map_err(|e| OverlayError::TransportCommand(e.to_string()))?;
 
         // Initialize IP allocator and allocate first IP for leader
         let mut allocator = IpAllocator::new(cidr)?;
@@ -229,6 +235,7 @@ impl OverlayBootstrap {
             allocator: Some(allocator),
             dns_config: None,
             dns_handle: None,
+            transport: None,
         };
 
         // Persist state
@@ -239,16 +246,16 @@ impl OverlayBootstrap {
 
     /// Join an existing overlay network
     ///
-    /// Generates a new WireGuard keypair and configures this node
+    /// Generates a new overlay keypair and configures this node
     /// to connect to an existing overlay network.
     ///
     /// # Arguments
     /// * `leader_cidr` - Leader's overlay network CIDR
     /// * `leader_endpoint` - Leader's public endpoint (host:port)
-    /// * `leader_public_key` - Leader's WireGuard public key
+    /// * `leader_public_key` - Leader's overlay public key
     /// * `leader_overlay_ip` - Leader's overlay IP address
     /// * `allocated_ip` - IP address allocated for this node by the leader
-    /// * `port` - WireGuard listen port for this node
+    /// * `port` - Overlay listen port for this node
     /// * `data_dir` - Directory for persistent state
     pub async fn join(
         leader_cidr: &str,
@@ -270,11 +277,11 @@ impl OverlayBootstrap {
         // Ensure data directory exists
         tokio::fs::create_dir_all(data_dir).await?;
 
-        // Generate WireGuard keypair for this node
-        info!("Generating WireGuard keypair for joining node");
-        let (private_key, public_key) = WireGuardManager::generate_keys()
+        // Generate overlay keypair for this node
+        info!("Generating overlay keypair for joining node");
+        let (private_key, public_key) = OverlayTransport::generate_keys()
             .await
-            .map_err(|e| OverlayError::WireGuardCommand(e.to_string()))?;
+            .map_err(|e| OverlayError::TransportCommand(e.to_string()))?;
 
         // Create config
         let config = BootstrapConfig {
@@ -311,6 +318,7 @@ impl OverlayBootstrap {
             allocator: None, // Workers don't manage IP allocation
             dns_config: None,
             dns_handle: None,
+            transport: None,
         };
 
         // Persist state
@@ -343,6 +351,7 @@ impl OverlayBootstrap {
             allocator,
             dns_config: None, // DNS config must be re-enabled after load
             dns_handle: None,
+            transport: None,
         })
     }
 
@@ -408,9 +417,9 @@ impl OverlayBootstrap {
         self.dns_config.is_some()
     }
 
-    /// Start the overlay network (create and configure WireGuard interface)
+    /// Start the overlay network (create and configure overlay transport)
     ///
-    /// This creates the WireGuard interface, assigns the overlay IP,
+    /// This creates the boringtun TUN interface, assigns the overlay IP,
     /// configures all known peers, and starts the DNS server if enabled.
     pub async fn start(&mut self) -> Result<()> {
         info!(
@@ -433,14 +442,14 @@ impl OverlayBootstrap {
             peer_discovery_interval: Duration::from_secs(30),
         };
 
-        // Create WireGuard manager
-        let wg_manager = WireGuardManager::new(overlay_config, self.config.interface.clone());
+        // Create overlay transport
+        let mut transport = OverlayTransport::new(overlay_config, self.config.interface.clone());
 
         // Create the interface
-        wg_manager
+        transport
             .create_interface()
             .await
-            .map_err(|e| OverlayError::WireGuardCommand(e.to_string()))?;
+            .map_err(|e| OverlayError::TransportCommand(e.to_string()))?;
 
         // Convert peers to PeerInfo
         let peer_infos: Vec<PeerInfo> = self
@@ -455,11 +464,15 @@ impl OverlayBootstrap {
             })
             .collect();
 
-        // Configure interface with peers
-        wg_manager
-            .configure_interface(&peer_infos)
+        // Configure transport with peers
+        transport
+            .configure(&peer_infos)
             .await
-            .map_err(|e| OverlayError::WireGuardCommand(e.to_string()))?;
+            .map_err(|e| OverlayError::TransportCommand(e.to_string()))?;
+
+        // Store the transport so the TUN device stays alive for the overlay
+        // lifetime. Dropping the OverlayTransport destroys the boringtun device.
+        self.transport = Some(transport);
 
         // Start DNS server if configured
         if let Some(dns_config) = &self.dns_config {
@@ -525,21 +538,12 @@ impl OverlayBootstrap {
         Ok(())
     }
 
-    /// Stop the overlay network (remove WireGuard interface)
-    pub async fn stop(&self) -> Result<()> {
+    /// Stop the overlay network (shut down the boringtun transport)
+    pub async fn stop(&mut self) -> Result<()> {
         info!(interface = %self.config.interface, "Stopping overlay network");
 
-        let output = tokio::process::Command::new("ip")
-            .args(["link", "delete", "dev", &self.config.interface])
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Ignore "not found" errors
-            if !stderr.contains("Cannot find device") {
-                return Err(OverlayError::WireGuardCommand(stderr.to_string()));
-            }
+        if let Some(mut transport) = self.transport.take() {
+            transport.shutdown();
         }
 
         Ok(())
@@ -558,25 +562,33 @@ impl OverlayBootstrap {
             peer.overlay_ip
         };
 
-        // Add to WireGuard if interface is up
-        let overlay_config = crate::config::OverlayConfig {
-            local_endpoint: SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
-                self.config.port,
-            ),
-            private_key: self.config.private_key.clone(),
-            public_key: self.config.public_key.clone(),
-            overlay_cidr: self.config.allowed_ip(),
-            peer_discovery_interval: Duration::from_secs(30),
-        };
-
-        let wg_manager = WireGuardManager::new(overlay_config, self.config.interface.clone());
-
+        // Add peer to overlay transport via UAPI
         if let Ok(peer_info) = peer.to_peer_info() {
-            match wg_manager.add_peer(&peer_info).await {
-                Ok(_) => debug!(peer = %peer.node_id, "Added peer to WireGuard"),
+            // Prefer the stored transport; fall back to a temporary instance
+            // (UAPI calls work via the Unix socket regardless of DeviceHandle)
+            let transport_ref: Option<&OverlayTransport> = self.transport.as_ref();
+
+            let result = if let Some(t) = transport_ref {
+                t.add_peer(&peer_info).await
+            } else {
+                let overlay_config = crate::config::OverlayConfig {
+                    local_endpoint: SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+                        self.config.port,
+                    ),
+                    private_key: self.config.private_key.clone(),
+                    public_key: self.config.public_key.clone(),
+                    overlay_cidr: self.config.allowed_ip(),
+                    peer_discovery_interval: Duration::from_secs(30),
+                };
+                let tmp = OverlayTransport::new(overlay_config, self.config.interface.clone());
+                tmp.add_peer(&peer_info).await
+            };
+
+            match result {
+                Ok(_) => debug!(peer = %peer.node_id, "Added peer to overlay"),
                 Err(e) => {
-                    warn!(peer = %peer.node_id, error = %e, "Failed to add peer to WireGuard (interface may not be up)")
+                    warn!(peer = %peer.node_id, error = %e, "Failed to add peer to overlay (interface may not be up)")
                 }
             }
         }
@@ -651,24 +663,30 @@ impl OverlayBootstrap {
             }
         }
 
-        // Remove from WireGuard
-        let overlay_config = crate::config::OverlayConfig {
-            local_endpoint: SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
-                self.config.port,
-            ),
-            private_key: self.config.private_key.clone(),
-            public_key: self.config.public_key.clone(),
-            overlay_cidr: self.config.allowed_ip(),
-            peer_discovery_interval: Duration::from_secs(30),
+        // Remove peer from overlay transport via UAPI
+        let transport_ref: Option<&OverlayTransport> = self.transport.as_ref();
+
+        let result = if let Some(t) = transport_ref {
+            t.remove_peer(public_key).await
+        } else {
+            let overlay_config = crate::config::OverlayConfig {
+                local_endpoint: SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+                    self.config.port,
+                ),
+                private_key: self.config.private_key.clone(),
+                public_key: self.config.public_key.clone(),
+                overlay_cidr: self.config.allowed_ip(),
+                peer_discovery_interval: Duration::from_secs(30),
+            };
+            let tmp = OverlayTransport::new(overlay_config, self.config.interface.clone());
+            tmp.remove_peer(public_key).await
         };
 
-        let wg_manager = WireGuardManager::new(overlay_config, self.config.interface.clone());
-
-        match wg_manager.remove_peer(public_key).await {
-            Ok(_) => debug!(public_key = public_key, "Removed peer from WireGuard"),
+        match result {
+            Ok(_) => debug!(public_key = public_key, "Removed peer from overlay"),
             Err(e) => {
-                warn!(public_key = public_key, error = %e, "Failed to remove peer from WireGuard")
+                warn!(public_key = public_key, error = %e, "Failed to remove peer from overlay")
             }
         }
 
@@ -697,12 +715,12 @@ impl OverlayBootstrap {
         &self.config.cidr
     }
 
-    /// Get the WireGuard interface name
+    /// Get the overlay interface name
     pub fn interface(&self) -> &str {
         &self.config.interface
     }
 
-    /// Get the WireGuard listen port
+    /// Get the overlay listen port
     pub fn port(&self) -> u16 {
         self.config.port
     }

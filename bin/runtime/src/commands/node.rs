@@ -20,13 +20,13 @@ struct NodeConfig {
     api_port: u16,
     /// Raft consensus port
     raft_port: u16,
-    /// WireGuard overlay port
+    /// Overlay network port (WireGuard protocol)
     overlay_port: u16,
     /// Overlay network CIDR
     overlay_cidr: String,
-    /// WireGuard private key
+    /// Overlay private key (x25519)
     wireguard_private_key: String,
-    /// WireGuard public key
+    /// Overlay public key (x25519)
     wireguard_public_key: String,
     /// Whether this node is the cluster leader/bootstrap node
     is_leader: bool,
@@ -41,7 +41,7 @@ struct ClusterJoinToken {
     api_endpoint: String,
     /// Leader's Raft endpoint
     raft_endpoint: String,
-    /// Leader's WireGuard public key
+    /// Leader's overlay public key
     leader_wg_pubkey: String,
     /// Overlay network CIDR
     overlay_cidr: String,
@@ -62,7 +62,7 @@ struct NodeJoinRequest {
     overlay_port: u16,
     /// Joining node's Raft port
     raft_port: u16,
-    /// Joining node's WireGuard public key
+    /// Joining node's overlay public key
     wg_public_key: String,
     /// Node mode (full, replicate)
     mode: String,
@@ -270,7 +270,7 @@ pub(crate) async fn handle_node_init(
     data_dir: PathBuf,
     overlay_cidr: String,
 ) -> Result<()> {
-    use zlayer_overlay::WireGuardManager;
+    use zlayer_overlay::OverlayTransport;
 
     println!("Initializing ZLayer node as cluster leader...");
 
@@ -295,15 +295,12 @@ pub(crate) async fn handle_node_init(
     let raft_node_id: u64 = 1; // First node is always ID 1
     info!(node_id = %node_id, raft_node_id = raft_node_id, "Generated node ID");
 
-    // 4. Generate WireGuard keypair
-    println!("  Generating WireGuard keypair...");
-    let (private_key, public_key) = WireGuardManager::generate_keys().await.map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to generate WireGuard keys: {}. Ensure 'wg' command is installed.",
-            e
-        )
-    })?;
-    info!("Generated WireGuard keypair");
+    // 4. Generate overlay keypair
+    println!("  Generating overlay keypair...");
+    let (private_key, public_key) = OverlayTransport::generate_keys()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to generate overlay keys: {}", e))?;
+    info!("Generated overlay keypair");
 
     // 5. Save node config
     let node_config = NodeConfig {
@@ -414,7 +411,7 @@ pub(crate) async fn handle_node_join(
     services: Option<Vec<String>>,
 ) -> Result<()> {
     use std::time::Duration;
-    use zlayer_overlay::WireGuardManager;
+    use zlayer_overlay::OverlayTransport;
 
     println!("Joining ZLayer cluster at {}...", leader_addr);
 
@@ -427,14 +424,11 @@ pub(crate) async fn handle_node_join(
         "Parsed join token"
     );
 
-    // 2. Generate WireGuard keypair for this node
-    println!("  Generating WireGuard keypair...");
-    let (private_key, public_key) = WireGuardManager::generate_keys().await.map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to generate WireGuard keys: {}. Ensure 'wg' command is installed.",
-            e
-        )
-    })?;
+    // 2. Generate overlay keypair for this node
+    println!("  Generating overlay keypair...");
+    let (private_key, public_key) = OverlayTransport::generate_keys()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to generate overlay keys: {}", e))?;
 
     // 3. Determine data directory
     let data_dir = PathBuf::from("/var/lib/zlayer");
@@ -517,9 +511,9 @@ pub(crate) async fn handle_node_join(
     };
     save_node_config(&data_dir, &node_config).await?;
 
-    // 7. Configure WireGuard with peers
+    // 7. Configure overlay with peers
     println!("  Configuring overlay network...");
-    // TODO: Actually configure WireGuard interface with peers
+    // TODO: Actually configure overlay interface with peers
     for peer in &join_response.peers {
         info!(
             peer_id = %peer.node_id,
@@ -714,7 +708,7 @@ pub(crate) async fn handle_node_status(node_id: Option<String>) -> Result<()> {
         println!("  Overlay Port:      {}", node_config.overlay_port);
         println!("  Overlay CIDR:      {}", node_config.overlay_cidr);
         println!();
-        println!("WireGuard:");
+        println!("Overlay:");
         println!("  Public Key:        {}", node_config.wireguard_public_key);
         println!();
         println!("Endpoints:");

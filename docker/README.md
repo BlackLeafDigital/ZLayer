@@ -76,7 +76,7 @@ By default, containers created inside ZLayer-in-Docker use the container's netwo
 
 - Map ports with `-p 80:80 -p 443:443`
 - Use host networking with `--network host` (simplest, but shares host network)
-- Configure WireGuard overlay for multi-node setups
+- Configure overlay networking for multi-node setups
 
 ## Development
 

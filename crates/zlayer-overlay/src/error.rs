@@ -6,13 +6,17 @@ use thiserror::Error;
 /// Errors that can occur during overlay network operations
 #[derive(Debug, Error)]
 pub enum OverlayError {
-    /// WireGuard binary not found or not executable
-    #[error("WireGuard binary not found: {0}. Ensure 'wg' is installed and in PATH")]
-    WireGuardNotFound(String),
+    /// Overlay transport not available
+    #[error("Overlay transport not available: {0}")]
+    TransportNotAvailable(String),
 
-    /// WireGuard command execution failed
-    #[error("WireGuard command failed: {0}")]
-    WireGuardCommand(String),
+    /// Transport command execution failed
+    #[error("Transport command failed: {0}")]
+    TransportCommand(String),
+
+    /// Boringtun device error
+    #[error("Boringtun device error: {0}")]
+    BoringtunDevice(String),
 
     /// Invalid CIDR notation
     #[error("Invalid CIDR notation: {0}")]
@@ -31,11 +35,11 @@ pub enum OverlayError {
     IpNotInRange(Ipv4Addr, String),
 
     /// Interface already exists
-    #[error("WireGuard interface '{0}' already exists")]
+    #[error("Overlay interface '{0}' already exists")]
     InterfaceExists(String),
 
     /// Interface not found
-    #[error("WireGuard interface '{0}' not found")]
+    #[error("Overlay interface '{0}' not found")]
     InterfaceNotFound(String),
 
     /// Peer not found
@@ -75,7 +79,7 @@ pub enum OverlayError {
     Timeout(String),
 
     /// Invalid key format
-    #[error("Invalid WireGuard key format: {0}")]
+    #[error("Invalid key format: {0}")]
     InvalidKey(String),
 
     /// Network configuration error

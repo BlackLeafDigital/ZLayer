@@ -12,7 +12,7 @@ A Komodo-like management UI for ZLayer built with Rust Leptos (SSR + WASM hydrat
 - **Deployments** - List, create, and manage deployments
 - **Builds** - View build history, logs, and trigger new builds
 - **Nodes** - Monitor cluster nodes and resource usage
-- **Overlay Network** - WireGuard mesh status, peer health, IP allocation, DNS discovery
+- **Overlay Network** - Overlay mesh status, peer health, IP allocation, DNS discovery
 - **Settings** - Secrets management, cluster configuration
 
 ## Tech Stack

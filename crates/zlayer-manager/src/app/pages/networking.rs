@@ -46,7 +46,7 @@ pub fn Networking() -> impl IntoView {
                 <div class="card bg-base-100 shadow-xl">
                     <div class="card-body">
                         <h2 class="card-title">"Overlay Network"</h2>
-                        <p>"Manage the WireGuard-based overlay network, peer connections, and routing."</p>
+                        <p>"Manage the encrypted overlay network, peer connections, and routing."</p>
                         <div class="card-actions justify-end">
                             <A href="/overlay" attr:class="btn btn-primary">
                                 "Manage Overlay"

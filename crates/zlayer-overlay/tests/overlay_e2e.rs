@@ -1,7 +1,7 @@
 //! End-to-end integration tests for ZLayer overlay networking.
 //!
-//! Tests marked with `#[ignore]` require root privileges and the WireGuard
-//! kernel module loaded. Run them with:
+//! Tests marked with `#[ignore]` require root or CAP_NET_ADMIN capability.
+//! Run them with:
 //!
 //! ```sh
 //! cargo test -p zlayer-overlay --test overlay_e2e -- --ignored
@@ -13,19 +13,19 @@ use std::time::Duration;
 use tokio::process::Command;
 use x25519_dalek::{PublicKey, StaticSecret};
 use zlayer_overlay::config::{OverlayConfig, PeerInfo};
-use zlayer_overlay::wireguard::WireGuardManager;
+use zlayer_overlay::transport::OverlayTransport;
 
 // ---------------------------------------------------------------------------
 // 1. Key generation test
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_native_key_generation_produces_valid_wireguard_keys() {
-    let (private_key, public_key) = WireGuardManager::generate_keys()
+async fn test_native_key_generation_produces_valid_keys() {
+    let (private_key, public_key) = OverlayTransport::generate_keys()
         .await
         .expect("generate_keys should succeed");
 
-    // WireGuard keys are 32 bytes encoded as standard base64 => 44 characters
+    // Overlay keys are 32 bytes encoded as standard base64 => 44 characters
     assert_eq!(
         private_key.len(),
         44,
@@ -69,7 +69,7 @@ async fn test_native_key_generation_produces_valid_wireguard_keys() {
     );
 
     // Verify successive calls produce unique keys
-    let (private_key_2, _) = WireGuardManager::generate_keys()
+    let (private_key_2, _) = OverlayTransport::generate_keys()
         .await
         .expect("second generate_keys should succeed");
     assert_ne!(
@@ -79,12 +79,13 @@ async fn test_native_key_generation_produces_valid_wireguard_keys() {
 }
 
 // ---------------------------------------------------------------------------
-// 2. Key compatibility test (requires `wg` binary)
+// 2. Key compatibility test (optional: requires `wg` binary)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn test_native_keys_compatible_with_wg_tool() {
-    // Skip if `wg` is not available
+    // Skip if `wg` is not available -- the wg binary is no longer required
+    // at runtime, so this test is purely for validating key format compatibility.
     let wg_available = Command::new("which")
         .arg("wg")
         .output()
@@ -93,12 +94,12 @@ async fn test_native_keys_compatible_with_wg_tool() {
         .unwrap_or(false);
 
     if !wg_available {
-        eprintln!("SKIP: `wg` binary not found; skipping key compatibility test");
+        eprintln!("SKIP: `wg` binary not found; skipping key compatibility test (wg is optional)");
         return;
     }
 
     // Generate keys via native Rust implementation
-    let (native_priv, native_pub) = WireGuardManager::generate_keys()
+    let (native_priv, native_pub) = OverlayTransport::generate_keys()
         .await
         .expect("native generate_keys should succeed");
 
@@ -194,8 +195,8 @@ async fn test_native_keys_compatible_with_wg_tool() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_overlay_config_and_peer_wg_config_format() {
-    let (private_key, public_key) = WireGuardManager::generate_keys()
+async fn test_overlay_config_and_peer_config_format() {
+    let (private_key, public_key) = OverlayTransport::generate_keys()
         .await
         .expect("key generation should succeed");
 
@@ -213,7 +214,7 @@ async fn test_overlay_config_and_peer_wg_config_format() {
     assert_eq!(config.private_key, private_key);
     assert_eq!(config.public_key, public_key);
 
-    // Build a PeerInfo and verify its WireGuard config block format
+    // Build a PeerInfo and verify its peer config block format
     let peer = PeerInfo::new(
         public_key.clone(),
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)), 51820),
@@ -221,36 +222,36 @@ async fn test_overlay_config_and_peer_wg_config_format() {
         Duration::from_secs(25),
     );
 
-    let wg_config = peer.to_wg_config();
+    let peer_config = peer.to_peer_config();
 
     assert!(
-        wg_config.contains("[Peer]"),
-        "WireGuard config must contain [Peer] section header"
+        peer_config.contains("[Peer]"),
+        "Peer config must contain [Peer] section header"
     );
     assert!(
-        wg_config.contains(&format!("PublicKey = {}", public_key)),
-        "WireGuard config must contain the correct public key"
+        peer_config.contains(&format!("PublicKey = {}", public_key)),
+        "Peer config must contain the correct public key"
     );
     assert!(
-        wg_config.contains("Endpoint = 192.168.1.20:51820"),
-        "WireGuard config must contain the correct endpoint"
+        peer_config.contains("Endpoint = 192.168.1.20:51820"),
+        "Peer config must contain the correct endpoint"
     );
     assert!(
-        wg_config.contains("AllowedIPs = 10.200.0.2/32"),
-        "WireGuard config must contain the correct allowed IPs"
+        peer_config.contains("AllowedIPs = 10.200.0.2/32"),
+        "Peer config must contain the correct allowed IPs"
     );
     assert!(
-        wg_config.contains("PersistentKeepalive = 25"),
-        "WireGuard config must contain the correct keepalive interval"
+        peer_config.contains("PersistentKeepalive = 25"),
+        "Peer config must contain the correct keepalive interval"
     );
 
-    // Verify the full config that WireGuardManager.configure_interface would write.
+    // Verify the full config block format.
     // It concatenates [Interface] + [Peer] blocks.
     let full_config = format!(
         "[Interface]\nPrivateKey = {}\nListenPort = {}\n{}",
         config.private_key,
         config.local_endpoint.port(),
-        wg_config,
+        peer_config,
     );
     assert!(
         full_config.starts_with("[Interface]"),
@@ -271,17 +272,17 @@ async fn test_overlay_config_and_peer_wg_config_format() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. Interface lifecycle test (requires root + wireguard kernel module)
+// 4. Interface lifecycle test (requires root or CAP_NET_ADMIN)
 // ---------------------------------------------------------------------------
 // Run with: cargo test -p zlayer-overlay --test overlay_e2e -- --ignored
 
 #[tokio::test]
-#[ignore]
-async fn test_wireguard_interface_lifecycle() {
+#[ignore = "requires root or CAP_NET_ADMIN"]
+async fn test_overlay_interface_lifecycle() {
     let iface_name = "wg-test-life";
 
     // Generate keys for the interface
-    let (private_key, public_key) = WireGuardManager::generate_keys()
+    let (private_key, public_key) = OverlayTransport::generate_keys()
         .await
         .expect("key generation should succeed");
 
@@ -293,7 +294,7 @@ async fn test_wireguard_interface_lifecycle() {
         peer_discovery_interval: Duration::from_secs(30),
     };
 
-    let manager = WireGuardManager::new(config, iface_name.to_string());
+    let mut manager = OverlayTransport::new(config, iface_name.to_string());
 
     // Cleanup any leftover interface from a previous failed run
     let _ = Command::new("ip")
@@ -301,7 +302,7 @@ async fn test_wireguard_interface_lifecycle() {
         .output()
         .await;
 
-    // Create the WireGuard interface
+    // Create the overlay interface
     manager
         .create_interface()
         .await
@@ -327,7 +328,7 @@ async fn test_wireguard_interface_lifecycle() {
 
     // Configure the interface (assign IP, bring up)
     manager
-        .configure_interface(&[])
+        .configure(&[])
         .await
         .expect("configure_interface should succeed with no peers");
 
@@ -357,17 +358,11 @@ async fn test_wireguard_interface_lifecycle() {
         addr_stdout
     );
 
-    // Tear down the interface
-    let del_output = Command::new("ip")
-        .args(["link", "del", "dev", iface_name])
-        .output()
-        .await
-        .expect("ip link del should execute");
-    assert!(
-        del_output.status.success(),
-        "Deleting interface should succeed, stderr: {}",
-        String::from_utf8_lossy(&del_output.stderr)
-    );
+    // Tear down the interface via transport shutdown
+    manager.shutdown();
+
+    // Allow a brief moment for cleanup to complete
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Verify the interface is gone
     let link_output = Command::new("ip")
@@ -377,19 +372,19 @@ async fn test_wireguard_interface_lifecycle() {
         .expect("ip link show should execute");
     assert!(
         !link_output.status.success(),
-        "Interface {} should no longer exist after deletion",
+        "Interface {} should no longer exist after shutdown",
         iface_name
     );
 }
 
 // ---------------------------------------------------------------------------
-// 5. Dual-interface connectivity test (requires root + wireguard)
+// 5. Dual-interface connectivity test (requires root or CAP_NET_ADMIN)
 // ---------------------------------------------------------------------------
 // Run with: cargo test -p zlayer-overlay --test overlay_e2e -- --ignored
 
 #[tokio::test]
-#[ignore]
-async fn test_dual_interface_overlay_connectivity() {
+#[ignore = "requires root or CAP_NET_ADMIN"]
+async fn test_dual_overlay_connectivity() {
     let iface_a = "wg-test-a";
     let iface_b = "wg-test-b";
     let port_a: u16 = 51840;
@@ -399,10 +394,10 @@ async fn test_dual_interface_overlay_connectivity() {
     let subnet = "/24";
 
     // Generate keys for both interfaces
-    let (priv_a, pub_a) = WireGuardManager::generate_keys()
+    let (priv_a, pub_a) = OverlayTransport::generate_keys()
         .await
         .expect("key generation for A should succeed");
-    let (priv_b, pub_b) = WireGuardManager::generate_keys()
+    let (priv_b, pub_b) = OverlayTransport::generate_keys()
         .await
         .expect("key generation for B should succeed");
 
@@ -422,8 +417,8 @@ async fn test_dual_interface_overlay_connectivity() {
         peer_discovery_interval: Duration::from_secs(30),
     };
 
-    let manager_a = WireGuardManager::new(config_a, iface_a.to_string());
-    let manager_b = WireGuardManager::new(config_b, iface_b.to_string());
+    let mut manager_a = OverlayTransport::new(config_a, iface_a.to_string());
+    let mut manager_b = OverlayTransport::new(config_b, iface_b.to_string());
 
     // Cleanup any leftover interfaces
     let _ = Command::new("ip")
@@ -463,18 +458,18 @@ async fn test_dual_interface_overlay_connectivity() {
 
     // Configure both interfaces with their respective peers
     manager_a
-        .configure_interface(&[peer_b_for_a])
+        .configure(&[peer_b_for_a])
         .await
         .expect("configure_interface A with peer B should succeed");
     manager_b
-        .configure_interface(&[peer_a_for_b])
+        .configure(&[peer_a_for_b])
         .await
         .expect("configure_interface B with peer A should succeed");
 
     // Allow a brief moment for the tunnel to establish
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Ping from A's overlay IP to B's overlay IP through the WireGuard tunnel
+    // Ping from A's overlay IP to B's overlay IP through the overlay tunnel
     let ping_output = Command::new("ping")
         .args([
             "-c", "3", // 3 packets
@@ -525,15 +520,12 @@ async fn test_dual_interface_overlay_connectivity() {
         String::from_utf8_lossy(&ping_reverse.stderr),
     );
 
-    // Cleanup: remove both interfaces
-    let _ = Command::new("ip")
-        .args(["link", "del", "dev", iface_a])
-        .output()
-        .await;
-    let _ = Command::new("ip")
-        .args(["link", "del", "dev", iface_b])
-        .output()
-        .await;
+    // Cleanup: shut down both transports
+    manager_a.shutdown();
+    manager_b.shutdown();
+
+    // Allow a brief moment for cleanup to complete
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Verify both are gone
     let check_a = Command::new("ip")
@@ -543,7 +535,7 @@ async fn test_dual_interface_overlay_connectivity() {
         .expect("ip link show should execute");
     assert!(
         !check_a.status.success(),
-        "Interface {} should be removed after cleanup",
+        "Interface {} should be removed after shutdown",
         iface_a
     );
 
@@ -554,7 +546,7 @@ async fn test_dual_interface_overlay_connectivity() {
         .expect("ip link show should execute");
     assert!(
         !check_b.status.success(),
-        "Interface {} should be removed after cleanup",
+        "Interface {} should be removed after shutdown",
         iface_b
     );
 }

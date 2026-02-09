@@ -260,8 +260,7 @@ pub(crate) async fn deploy_services(
             let err_detail = overlay_error.as_deref().unwrap_or("unknown error");
             anyhow::bail!(
                 "Overlay network failed: {}. Services needing overlay: [{}]. \
-                 Try: 'modprobe wireguard' (load kernel module), 'apt install wireguard-tools' (install tools), \
-                 or use --host-network flag to skip overlay.",
+                 Ensure CAP_NET_ADMIN capability or use --host-network flag to skip overlay.",
                 err_detail,
                 services_needing_network.join(", ")
             );
