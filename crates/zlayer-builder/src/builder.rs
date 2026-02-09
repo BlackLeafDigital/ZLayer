@@ -1216,8 +1216,13 @@ impl ImageBuilder {
     #[instrument(skip(self), fields(context = %self.context.display()))]
     pub async fn build(self) -> Result<BuiltImage> {
         let start_time = std::time::Instant::now();
+        let build_id = generate_build_id();
 
-        info!("Starting build in context: {}", self.context.display());
+        info!(
+            "Starting build in context: {} (build_id: {})",
+            self.context.display(),
+            build_id
+        );
 
         // 1. Get parsed Dockerfile (from template, ZImagefile, or Dockerfile)
         let dockerfile = self.get_dockerfile().await?;
@@ -1410,7 +1415,10 @@ impl ImageBuilder {
             // Handle stage completion
             if let Some(name) = &stage.name {
                 // Named stage - commit and save for COPY --from
-                let image_name = format!("zlayer-build-stage-{}", name);
+                // Include the build_id to prevent collisions when parallel
+                // builds share stage names (e.g., two Dockerfiles both having
+                // a stage named "builder").
+                let image_name = format!("zlayer-build-{}-stage-{}", build_id, name);
                 self.commit_container(&container_id, &image_name, false)
                     .await?;
                 stage_images.insert(name.clone(), image_name.clone());
@@ -1438,7 +1446,7 @@ impl ImageBuilder {
                 final_container = Some(container_id);
             } else {
                 // Unnamed intermediate stage - commit by index for COPY --from
-                let image_name = format!("zlayer-build-stage-{}", stage.index);
+                let image_name = format!("zlayer-build-{}-stage-{}", build_id, stage.index);
                 self.commit_container(&container_id, &image_name, false)
                     .await?;
                 stage_images.insert(stage.index.to_string(), image_name);
@@ -1929,6 +1937,38 @@ fn chrono_lite_timestamp() -> String {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     format!("{}", duration.as_secs())
+}
+
+/// Generate a short unique build ID for namespacing intermediate stage images.
+///
+/// This prevents parallel builds from clobbering each other's intermediate
+/// stage images when they share stage names (e.g., two Dockerfiles both have
+/// a stage named "builder").
+///
+/// The ID combines nanosecond-precision timestamp with the process ID, then
+/// takes 12 hex characters from a SHA-256 hash for a compact, collision-resistant
+/// identifier.
+fn generate_build_id() -> String {
+    use sha2::{Digest, Sha256};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    // Use a monotonic counter to guarantee uniqueness even within the same
+    // nanosecond on the same process (e.g. tests or very fast sequential calls).
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    let mut hasher = Sha256::new();
+    hasher.update(nanos.to_le_bytes());
+    hasher.update(pid.to_le_bytes());
+    hasher.update(count.to_le_bytes());
+    let hash = hasher.finalize();
+    // 12 hex chars = 6 bytes = 48 bits of entropy, ample for build parallelism
+    hex::encode(&hash[..6])
 }
 
 #[cfg(test)]
