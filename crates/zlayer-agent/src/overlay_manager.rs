@@ -14,7 +14,7 @@ const MAX_IFNAME_LEN: usize = 15;
 /// Joins the `parts` with `-` after a `"zl-"` prefix and appends `-{suffix}` if non-empty.
 /// When the result exceeds 15 characters, a deterministic hash of all parts is used instead
 /// to keep the name unique and within the kernel limit.
-fn make_interface_name(parts: &[&str], suffix: &str) -> String {
+pub fn make_interface_name(parts: &[&str], suffix: &str) -> String {
     let base = format!("zl-{}", parts.join("-"));
     let candidate = if suffix.is_empty() {
         base

@@ -102,6 +102,34 @@ impl OverlayTransport {
         // Ensure the UAPI socket directory exists
         tokio::fs::create_dir_all("/var/run/wireguard").await?;
 
+        // Clean up any stale interface from a previous crashed deploy.
+        // If the process was SIGKILLed, the TUN device persists in the kernel
+        // and DeviceHandle::new() will fail on re-create. Best-effort cleanup:
+        // if `ip link delete` fails, we still attempt to create the device.
+        let check_output = Command::new("ip")
+            .args(["link", "show", &self.interface_name])
+            .output()
+            .await;
+        if let Ok(output) = check_output {
+            if output.status.success() {
+                tracing::warn!(
+                    interface = %self.interface_name,
+                    "stale network interface found, cleaning up before re-create"
+                );
+                let _ = Command::new("ip")
+                    .args(["link", "delete", &self.interface_name])
+                    .output()
+                    .await;
+            }
+        }
+
+        // Clean up stale UAPI socket left behind by a crashed process.
+        let sock_path = format!("/var/run/wireguard/{}.sock", self.interface_name);
+        if tokio::fs::try_exists(&sock_path).await.unwrap_or(false) {
+            tracing::warn!(path = %sock_path, "removing stale UAPI socket");
+            let _ = tokio::fs::remove_file(&sock_path).await;
+        }
+
         let name = self.interface_name.clone();
         let cfg = DeviceConfig {
             n_threads: 2,

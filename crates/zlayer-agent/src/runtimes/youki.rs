@@ -637,6 +637,49 @@ impl Runtime for YoukiRuntime {
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
         let container_id = self.container_id_str(id);
         let image = &spec.image.name;
+
+        // Clean up any stale container from a previous deploy (mirrors Docker runtime behavior)
+        // See docker.rs:370-402 for the equivalent pattern
+        let container_root = self.container_root(id);
+        if container_root.exists() {
+            tracing::warn!(
+                container = %container_id,
+                "stale container state found from previous deploy, cleaning up before re-create"
+            );
+            // Try to stop — process may already be dead, ignore errors
+            if let Err(e) = self.stop_container(id, Duration::from_secs(5)).await {
+                tracing::debug!(
+                    container = %container_id,
+                    error = %e,
+                    "stop_container during stale cleanup (expected if process already dead)"
+                );
+            }
+            // Remove container — does full cleanup: libcontainer delete + state dir + bundle + volumes
+            if let Err(e) = self.remove_container(id).await {
+                tracing::warn!(
+                    container = %container_id,
+                    error = %e,
+                    "remove_container failed during stale cleanup, attempting manual cleanup"
+                );
+                // Fall back to manual cleanup if remove_container fails
+                if container_root.exists() {
+                    let _ = tokio::fs::remove_dir_all(&container_root).await;
+                }
+                let stale_bundle = self.bundle_path(id);
+                if stale_bundle.exists() {
+                    let _ = tokio::fs::remove_dir_all(&stale_bundle).await;
+                }
+            }
+            tracing::info!(container = %container_id, "stale container cleaned up");
+        }
+
+        // Also clean up stale bundle directory if it exists but state dir didn't
+        let bundle_path = self.bundle_path(id);
+        if bundle_path.exists() {
+            tracing::warn!(container = %container_id, "stale bundle directory found, removing");
+            let _ = tokio::fs::remove_dir_all(&bundle_path).await;
+        }
+
         let bundle_path = self.bundle_path(id);
         let rootfs_path = bundle_path.join("rootfs");
 

@@ -941,31 +941,130 @@ pub(crate) async fn up(cli: &Cli, spec_path: &Path) -> Result<()> {
     }
 }
 
-/// Stop all services in a deployment (like docker compose down)
+/// Stop all services and tear down all resources in a deployment (like docker compose down)
 ///
 /// Auto-discovers deployment name from .zlayer.yml if not given.
+/// Performs a full teardown: stops and removes all containers, cleans up overlay
+/// interfaces, and removes WireGuard UAPI sockets.
 pub(crate) async fn down(deployment: Option<String>) -> Result<()> {
-    let deployment_name = match deployment {
-        Some(name) => name,
-        None => {
-            // Try to discover spec and extract deployment name
-            let spec_path = discover_spec_path(None)?;
-            let spec = parse_spec(&spec_path)?;
-            spec.deployment.clone()
+    use std::time::Duration;
+
+    // Always parse the spec so we know the full service list
+    let spec_path = discover_spec_path(None)?;
+    let spec = parse_spec(&spec_path)?;
+
+    let deployment_name = deployment.unwrap_or_else(|| spec.deployment.clone());
+
+    info!(deployment = %deployment_name, "Tearing down deployment");
+    println!("Tearing down deployment: {}...", deployment_name);
+
+    let timeout = Duration::from_secs(30);
+
+    // Create runtime to interact with containers
+    let runtime = zlayer_agent::create_runtime(zlayer_agent::RuntimeConfig::Auto)
+        .await
+        .context("Failed to create container runtime")?;
+
+    let mut containers_stopped: u32 = 0;
+    let mut containers_removed: u32 = 0;
+    let mut interfaces_cleaned: u32 = 0;
+
+    // Stop and remove all containers for every service in the spec
+    for (name, service_spec) in &spec.services {
+        let replicas = match &service_spec.scale {
+            zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+            zlayer_spec::ScaleSpec::Adaptive { max, .. } => *max,
+            zlayer_spec::ScaleSpec::Manual => 1,
+        };
+
+        println!("  Stopping service: {} (up to {} replicas)", name, replicas);
+
+        for replica in 1..=replicas {
+            let id = zlayer_agent::ContainerId {
+                service: name.clone(),
+                replica,
+            };
+            if let Err(e) = runtime.stop_container(&id, timeout).await {
+                warn!(container = %id, error = %e, "Failed to stop container (may not exist)");
+            } else {
+                containers_stopped += 1;
+            }
+            if let Err(e) = runtime.remove_container(&id).await {
+                warn!(container = %id, error = %e, "Failed to remove container (may not exist)");
+            } else {
+                containers_removed += 1;
+            }
         }
-    };
 
-    info!(deployment = %deployment_name, "Stopping deployment");
+        // Also scan the state directory for any extra containers beyond the spec's replica count
+        let state_dir = std::path::Path::new("/var/lib/zlayer/containers");
+        let prefix = format!("{}-", name);
+        if let Ok(mut entries) = tokio::fs::read_dir(state_dir).await {
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let entry_name = entry.file_name().to_string_lossy().to_string();
+                if entry_name.starts_with(&prefix) {
+                    // Parse the replica number from the directory name
+                    if let Some(rep_str) = entry_name.strip_prefix(&prefix) {
+                        if let Ok(rep_num) = rep_str.parse::<u32>() {
+                            if rep_num > replicas {
+                                let id = zlayer_agent::ContainerId {
+                                    service: name.clone(),
+                                    replica: rep_num,
+                                };
+                                info!(container = %id, "Found extra container beyond spec replica count");
+                                if let Err(e) = runtime.stop_container(&id, timeout).await {
+                                    warn!(container = %id, error = %e, "Failed to stop extra container");
+                                } else {
+                                    containers_stopped += 1;
+                                }
+                                if let Err(e) = runtime.remove_container(&id).await {
+                                    warn!(container = %id, error = %e, "Failed to remove extra container");
+                                } else {
+                                    containers_removed += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
-    let tx = setup_plain_channel();
-    emit(
-        &tx,
-        DeployEvent::Log {
-            level: LogLevel::Info,
-            message: format!("Stopping deployment: {}...", deployment_name),
-        },
+    // Clean up overlay network interfaces
+    // Global interface
+    let global_iface = zlayer_agent::make_interface_name(&[&deployment_name], "g");
+    let output = tokio::process::Command::new("ip")
+        .args(["link", "delete", &global_iface])
+        .output()
+        .await;
+    if let Ok(o) = output {
+        if o.status.success() {
+            info!(interface = %global_iface, "Deleted global overlay interface");
+            interfaces_cleaned += 1;
+        }
+    }
+    let _ = tokio::fs::remove_file(format!("/var/run/wireguard/{}.sock", global_iface)).await;
+
+    // Per-service interfaces
+    for name in spec.services.keys() {
+        let svc_iface = zlayer_agent::make_interface_name(&[&deployment_name, name.as_str()], "s");
+        let output = tokio::process::Command::new("ip")
+            .args(["link", "delete", &svc_iface])
+            .output()
+            .await;
+        if let Ok(o) = output {
+            if o.status.success() {
+                info!(interface = %svc_iface, "Deleted service overlay interface");
+                interfaces_cleaned += 1;
+            }
+        }
+        let _ = tokio::fs::remove_file(format!("/var/run/wireguard/{}.sock", svc_iface)).await;
+    }
+
+    println!(
+        "Teardown complete: {} containers stopped, {} removed, {} overlay interfaces cleaned",
+        containers_stopped, containers_removed, interfaces_cleaned
     );
 
-    // Delegate to the existing stop logic with no specific service, graceful, 30s timeout
-    crate::commands::lifecycle::stop(&deployment_name, None, false, 30).await
+    Ok(())
 }
