@@ -38,6 +38,12 @@ zlayer-tunnel = { path = "../../crates/zlayer-tunnel" }
 # API server
 zlayer-api = { path = "../../crates/zlayer-api" }
 
+# Proxy (L4/L7 registries for daemon)
+zlayer-proxy = { path = "../../crates/zlayer-proxy" }
+
+# Secrets management
+zlayer-secrets = { path = "../../crates/zlayer-secrets" }
+
 # Registry for export/import commands
 zlayer-registry = { path = "../../crates/zlayer-registry", features = ["local"] }
 
@@ -54,6 +60,18 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 chrono = { workspace = true }
 uuid = { workspace = true }
+
+# HTTP-over-Unix-socket client (daemon_client)
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = "0.1"
+bytes = { workspace = true }
+tower = { workspace = true }
+tokio-stream = { workspace = true }
+
+# Daemonization
+nix = { workspace = true }
+libc = { workspace = true }
 
 # TUI
 ratatui = "0.29"

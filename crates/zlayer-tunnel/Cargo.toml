@@ -40,5 +40,8 @@ futures-util.workspace = true
 sha2.workspace = true
 hex.workspace = true
 
+# Internal crates
+zlayer-spec = { path = "../zlayer-spec" }
+
 [dev-dependencies]
 tokio-test = "0.4"

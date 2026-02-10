@@ -1382,6 +1382,93 @@ impl ServiceManager {
         self.services.read().await.keys().cloned().collect()
     }
 
+    /// Get logs for a service, aggregated from all container replicas.
+    ///
+    /// # Arguments
+    /// * `service_name` - Name of the service to fetch logs for
+    /// * `tail` - Number of lines to return (0 = all)
+    /// * `instance` - Optional specific instance (container ID suffix like "1", "2")
+    ///
+    /// # Returns
+    /// Combined log output from all (or specific) container replicas as a string.
+    pub async fn get_service_logs(
+        &self,
+        service_name: &str,
+        tail: usize,
+        instance: Option<&str>,
+    ) -> Result<String> {
+        let container_ids = self.get_service_containers(service_name).await;
+
+        if container_ids.is_empty() {
+            return Err(AgentError::NotFound {
+                container: service_name.to_string(),
+                reason: "no containers found for service".to_string(),
+            });
+        }
+
+        // If a specific instance is requested, filter to just that one
+        let target_ids: Vec<&ContainerId> = if let Some(inst) = instance {
+            if let Ok(replica_num) = inst.parse::<u32>() {
+                container_ids
+                    .iter()
+                    .filter(|id| id.replica == replica_num)
+                    .collect()
+            } else {
+                // Try matching by full container ID string suffix
+                container_ids
+                    .iter()
+                    .filter(|id| id.to_string().contains(inst))
+                    .collect()
+            }
+        } else {
+            container_ids.iter().collect()
+        };
+
+        if target_ids.is_empty() {
+            return Err(AgentError::NotFound {
+                container: format!("{}/{}", service_name, instance.unwrap_or("?")),
+                reason: "instance not found".to_string(),
+            });
+        }
+
+        let mut combined = String::new();
+
+        for id in &target_ids {
+            let header = if target_ids.len() > 1 {
+                format!("==> {} <==\n", id)
+            } else {
+                String::new()
+            };
+
+            match self.runtime.container_logs(id, tail).await {
+                Ok(logs) => {
+                    if !logs.is_empty() {
+                        combined.push_str(&header);
+                        combined.push_str(&logs);
+                        if !combined.ends_with('\n') {
+                            combined.push('\n');
+                        }
+                    }
+                }
+                Err(e) => {
+                    combined.push_str(&header);
+                    combined.push_str(&format!("[error reading logs: {}]\n", e));
+                }
+            }
+        }
+
+        // If tail is requested and we have multiple containers, apply tail to combined output
+        if tail > 0 && target_ids.len() > 1 {
+            let lines: Vec<&str> = combined.lines().collect();
+            if lines.len() > tail {
+                combined = lines[lines.len() - tail..].join("\n");
+                combined.push('\n');
+            }
+        }
+
+        Ok(combined)
+    }
+
     /// Get all container IDs for a specific service
     ///
     /// Returns an empty vector if the service doesn't exist.
@@ -1398,6 +1485,49 @@ impl ServiceManager {
         } else {
             Vec::new()
         }
+    }
+
+    /// Execute a command inside a running container for a service
+    ///
+    /// Picks a specific replica if provided, otherwise uses the first available container.
+    ///
+    /// # Arguments
+    /// * `service_name` - Name of the service
+    /// * `replica` - Optional replica number to target
+    /// * `cmd` - Command and arguments to execute
+    ///
+    /// # Returns
+    /// Tuple of (exit_code, stdout, stderr)
+    pub async fn exec_in_container(
+        &self,
+        service_name: &str,
+        replica: Option<u32>,
+        cmd: &[String],
+    ) -> Result<(i32, String, String)> {
+        let container_ids = self.get_service_containers(service_name).await;
+
+        if container_ids.is_empty() {
+            return Err(AgentError::NotFound {
+                container: service_name.to_string(),
+                reason: "no containers found for service".to_string(),
+            });
+        }
+
+        // Pick the target container
+        let target = if let Some(rep) = replica {
+            container_ids
+                .into_iter()
+                .find(|cid| cid.replica == rep)
+                .ok_or_else(|| AgentError::NotFound {
+                    container: format!("{}-rep-{}", service_name, rep),
+                    reason: format!("replica {} not found for service", rep),
+                })?
+        } else {
+            // Use the first container (lowest replica number)
+            container_ids.into_iter().next().unwrap()
+        };
+
+        self.runtime.exec(&target, cmd).await
     }
 
     // ==================== Job Management ====================

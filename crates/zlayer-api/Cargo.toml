@@ -14,6 +14,7 @@ readme = "README.md"
 # Internal crates
 zlayer-agent = { path = "../zlayer-agent" }
 zlayer-builder = { path = "../zlayer-builder" }
+zlayer-overlay = { path = "../zlayer-overlay" }
 zlayer-spec = { path = "../zlayer-spec" }
 zlayer-scheduler = { path = "../zlayer-scheduler" }
 zlayer-observability = { path = "../zlayer-observability" }
@@ -58,6 +59,9 @@ chrono.workspace = true
 
 # UUID
 uuid.workspace = true
+
+# Base64 encoding/decoding (for join tokens)
+base64.workspace = true
 
 # Cryptography (for token hashing)
 sha2.workspace = true

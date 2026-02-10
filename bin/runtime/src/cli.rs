@@ -60,17 +60,6 @@ pub(crate) enum RuntimeType {
     Youki,
 }
 
-/// Deploy mode controls whether the runtime stays in foreground or returns after deploying
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum DeployMode {
-    /// Stay running in foreground, wait for Ctrl+C
-    Foreground,
-    /// Deploy and return immediately
-    Background,
-    /// Wait for services to stabilize, then automatically exit
-    Detach,
-}
-
 /// CLI subcommands
 #[derive(Subcommand)]
 pub(crate) enum Commands {
@@ -115,6 +104,14 @@ pub(crate) enum Commands {
         /// Disable Swagger UI
         #[arg(long)]
         no_swagger: bool,
+
+        /// Run as background daemon
+        #[arg(long)]
+        daemon: bool,
+
+        /// Unix socket path for CLI communication
+        #[arg(long, default_value = "/var/run/zlayer.sock")]
+        socket: String,
     },
 
     /// Show runtime status
@@ -343,6 +340,54 @@ pub(crate) enum Commands {
     Pull {
         /// Image reference (e.g., zachhandley/zlayer-node:latest)
         image: String,
+    },
+
+    /// Execute a command in a running service container
+    ///
+    /// Runs a command inside a container belonging to the specified service.
+    /// If only one deployment exists, the deployment flag can be omitted.
+    /// By default targets the first healthy replica; use --replica to pick one.
+    ///
+    /// Examples:
+    ///   zlayer exec web -- ls -la
+    ///   zlayer exec --deployment my-app web -- /bin/sh
+    ///   zlayer exec --replica 2 api -- cat /etc/hosts
+    #[command(verbatim_doc_comment)]
+    Exec {
+        /// Service name
+        service: String,
+        /// Deployment name (auto-detected if only one exists)
+        #[arg(long)]
+        deployment: Option<String>,
+        /// Target a specific replica number
+        #[arg(long, short = 'r')]
+        replica: Option<u32>,
+        /// Command and arguments to execute
+        #[arg(last = true)]
+        cmd: Vec<String>,
+    },
+
+    /// List running deployments, services, and containers
+    ///
+    /// Shows a summary of all deployments and their services. Use --containers
+    /// to also show individual container replicas.
+    ///
+    /// Examples:
+    ///   zlayer ps
+    ///   zlayer ps --deployment my-app
+    ///   zlayer ps --containers
+    ///   zlayer ps --format json
+    #[command(verbatim_doc_comment)]
+    Ps {
+        /// Filter by deployment name
+        #[arg(long)]
+        deployment: Option<String>,
+        /// Show individual containers
+        #[arg(long, short = 'c')]
+        containers: bool,
+        /// Output format: table, json, yaml
+        #[arg(long, default_value = "table")]
+        format: String,
     },
 }
 
@@ -824,6 +869,17 @@ pub(crate) enum SpecCommands {
 mod tests {
     use super::*;
 
+    /// Deploy mode controls whether the runtime stays in foreground or returns after deploying
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum DeployMode {
+        /// Stay running in foreground, wait for Ctrl+C
+        Foreground,
+        /// Deploy and return immediately
+        Background,
+        /// Wait for services to stabilize, then automatically exit
+        Detach,
+    }
+
     #[test]
     fn test_cli_parsing() {
         // Test default runtime
@@ -1095,10 +1151,14 @@ mod tests {
                 bind,
                 jwt_secret,
                 no_swagger,
+                daemon,
+                socket,
             } => {
                 assert_eq!(bind, "0.0.0.0:3669");
                 assert!(jwt_secret.is_none());
                 assert!(!no_swagger);
+                assert!(!daemon);
+                assert_eq!(socket, "/var/run/zlayer.sock");
             }
             _ => panic!("Expected Serve command"),
         }
@@ -1157,6 +1217,9 @@ mod tests {
             "--jwt-secret",
             "test-secret",
             "--no-swagger",
+            "--daemon",
+            "--socket",
+            "/tmp/zlayer-test.sock",
         ])
         .unwrap();
 
@@ -1165,10 +1228,67 @@ mod tests {
                 bind,
                 jwt_secret,
                 no_swagger,
+                daemon,
+                socket,
             } => {
                 assert_eq!(bind, "0.0.0.0:3000");
                 assert_eq!(jwt_secret, Some("test-secret".to_string()));
                 assert!(no_swagger);
+                assert!(daemon);
+                assert_eq!(socket, "/tmp/zlayer-test.sock");
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_command_daemon_flag() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "serve", "--daemon"]).unwrap();
+
+        match cli.command {
+            Commands::Serve { daemon, .. } => {
+                assert!(daemon);
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_command_socket_flag() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "serve", "--socket", "/tmp/custom.sock"])
+            .unwrap();
+
+        match cli.command {
+            Commands::Serve { socket, .. } => {
+                assert_eq!(socket, "/tmp/custom.sock");
+            }
+            _ => panic!("Expected Serve command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_serve_command_daemon_and_socket() {
+        let cli = Cli::try_parse_from([
+            "zlayer",
+            "serve",
+            "--daemon",
+            "--socket",
+            "/var/run/zlayer-custom.sock",
+            "--bind",
+            "127.0.0.1:3669",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Serve {
+                bind,
+                daemon,
+                socket,
+                ..
+            } => {
+                assert_eq!(bind, "127.0.0.1:3669");
+                assert!(daemon);
+                assert_eq!(socket, "/var/run/zlayer-custom.sock");
             }
             _ => panic!("Expected Serve command"),
         }
@@ -2011,5 +2131,86 @@ mod tests {
         let cli = Cli::try_parse_from(["zlayer-runtime", "up", "-d"]).unwrap();
         assert!(cli.detach);
         assert!(matches!(cli.command, Commands::Up { .. }));
+    }
+
+    #[test]
+    fn test_cli_ps_command_defaults() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "ps"]).unwrap();
+
+        match cli.command {
+            Commands::Ps {
+                deployment,
+                containers,
+                format,
+            } => {
+                assert!(deployment.is_none());
+                assert!(!containers);
+                assert_eq!(format, "table");
+            }
+            _ => panic!("Expected Ps command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_ps_command_with_deployment() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "ps", "--deployment", "my-app"]).unwrap();
+
+        match cli.command {
+            Commands::Ps { deployment, .. } => {
+                assert_eq!(deployment, Some("my-app".to_string()));
+            }
+            _ => panic!("Expected Ps command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_ps_command_with_containers() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "ps", "-c"]).unwrap();
+
+        match cli.command {
+            Commands::Ps { containers, .. } => {
+                assert!(containers);
+            }
+            _ => panic!("Expected Ps command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_ps_command_json_format() {
+        let cli = Cli::try_parse_from(["zlayer-runtime", "ps", "--format", "json"]).unwrap();
+
+        match cli.command {
+            Commands::Ps { format, .. } => {
+                assert_eq!(format, "json");
+            }
+            _ => panic!("Expected Ps command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_ps_command_all_options() {
+        let cli = Cli::try_parse_from([
+            "zlayer",
+            "ps",
+            "--deployment",
+            "prod",
+            "--containers",
+            "--format",
+            "yaml",
+        ])
+        .unwrap();
+
+        match cli.command {
+            Commands::Ps {
+                deployment,
+                containers,
+                format,
+            } => {
+                assert_eq!(deployment, Some("prod".to_string()));
+                assert!(containers);
+                assert_eq!(format, "yaml");
+            }
+            _ => panic!("Expected Ps command"),
+        }
     }
 }

@@ -15,12 +15,16 @@
 mod cli;
 mod commands;
 mod config;
+pub mod daemon;
+pub mod daemon_client;
+#[allow(dead_code)]
 mod deploy_tui;
 mod util;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use std::io::IsTerminal;
+use std::os::unix::io::AsRawFd;
 
 use cli::{Cli, Commands};
 use zlayer_observability::{
@@ -29,6 +33,56 @@ use zlayer_observability::{
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+
+    // Daemonize BEFORE any threads exist (before tokio runtime or observability init).
+    // This is critical: daemon() calls fork(), which is unsafe after threads are spawned.
+    let should_daemon = match &cli.command {
+        Commands::Serve { daemon, .. } => *daemon,
+        _ => false,
+    };
+
+    if should_daemon {
+        use std::fs::{self, OpenOptions};
+
+        // Create directories (idempotent via create_dir_all)
+        fs::create_dir_all("/var/run/zlayer").context("Failed to create /var/run/zlayer")?;
+        fs::create_dir_all("/var/log/zlayer").context("Failed to create /var/log/zlayer")?;
+
+        // Open log file BEFORE forking so errors are visible on the caller's terminal
+        let log_file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open("/var/log/zlayer/daemon.log")
+            .context("Failed to open /var/log/zlayer/daemon.log")?;
+
+        let log_fd = log_file.as_raw_fd();
+
+        // Fork + setsid + chdir to /.
+        // nochdir=false  -> chdir to /
+        // noclose=true   -> keep fds open (we redirect them ourselves below)
+        nix::unistd::daemon(false, true).context("Failed to daemonize")?;
+
+        // We are now the daemon child process.
+        // Redirect stdout (fd 1) and stderr (fd 2) to the log file,
+        // then close stdin (fd 0).
+        //
+        // Using libc::dup2/close because nix 0.31's dup2() takes AsFd + &mut OwnedFd
+        // which doesn't support targeting specific numbered fds (0, 1, 2) cleanly.
+        // SAFETY: No threads exist yet. We own these fds and the log_fd is valid.
+        unsafe {
+            libc::dup2(log_fd, libc::STDOUT_FILENO);
+            libc::dup2(log_fd, libc::STDERR_FILENO);
+            libc::close(libc::STDIN_FILENO);
+        }
+
+        // Drop the original File handle. The underlying file description stays alive
+        // because fds 1 and 2 now reference it (dup2 creates independent references).
+        drop(log_file);
+
+        // Write PID file with ONLY the numeric PID
+        fs::write("/var/run/zlayer/zlayer.pid", std::process::id().to_string())
+            .context("Failed to write PID file")?;
+    }
 
     // Configure observability based on verbosity and environment
     let (log_level, filter_directives) = match cli.verbose {
@@ -98,7 +152,18 @@ async fn run(cli: Cli) -> Result<()> {
             bind,
             jwt_secret,
             no_swagger,
-        } => commands::serve::serve(bind, jwt_secret.clone(), *no_swagger).await,
+            daemon: _, // Already handled in main() before tokio runtime
+            socket,
+        } => {
+            commands::serve::serve(
+                bind,
+                jwt_secret.clone(),
+                *no_swagger,
+                socket,
+                cli.host_network,
+            )
+            .await
+        }
         Commands::Status => commands::lifecycle::status(&cli).await,
         Commands::Validate { spec_path } => {
             let path = util::discover_spec_path(spec_path.as_deref())?;
@@ -169,6 +234,17 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Tunnel(tunnel_cmd) => commands::tunnel::handle_tunnel(&cli, tunnel_cmd).await,
         Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd).await,
         Commands::Pull { image } => commands::registry::handle_pull(image).await,
+        Commands::Exec {
+            service,
+            deployment,
+            replica,
+            cmd,
+        } => commands::exec::exec(deployment.clone(), service, *replica, cmd).await,
+        Commands::Ps {
+            deployment,
+            containers,
+            format,
+        } => commands::ps::ps(deployment.clone(), *containers, format).await,
         Commands::Node(node_cmd) => commands::node::handle_node(node_cmd).await,
     }
 }

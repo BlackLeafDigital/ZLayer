@@ -62,16 +62,37 @@ impl UdpStreamService {
         &self.registry
     }
 
-    /// Run the UDP proxy service
+    /// Run the UDP proxy service by binding its own socket.
     ///
     /// This method runs indefinitely, proxying UDP datagrams between
     /// clients and backends. Each client address gets its own session.
     pub async fn run(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Bind to listen port
         let listen_addr = format!("0.0.0.0:{}", self.listen_port);
-        let socket = Arc::new(UdpSocket::bind(&listen_addr).await?);
+        let socket = UdpSocket::bind(&listen_addr).await?;
 
         tracing::info!(port = self.listen_port, "UDP stream proxy listening");
+
+        self.serve(socket).await
+    }
+
+    /// Run the UDP proxy service on an externally-provided socket.
+    ///
+    /// This is the non-self-binding entry point, used by `ProxyManager` to serve
+    /// UDP endpoints when the caller has already bound the socket.
+    ///
+    /// Runs indefinitely, proxying UDP datagrams between clients and backends.
+    /// Each client address gets its own session with a dedicated backend socket.
+    pub async fn serve(
+        self: Arc<Self>,
+        socket: UdpSocket,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let socket = Arc::new(socket);
+
+        tracing::info!(
+            port = self.listen_port,
+            "UDP stream proxy serving (standalone)"
+        );
 
         // Session tracking: client_addr -> session
         let sessions: Arc<DashMap<SocketAddr, UdpSession>> = Arc::new(DashMap::new());

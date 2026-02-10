@@ -49,6 +49,19 @@ pub struct YoukiConfig {
     pub use_systemd: bool,
     /// Cache type configuration (if None, determined from environment)
     pub cache_type: Option<zlayer_registry::CacheType>,
+    /// Base directory for structured container logs.
+    ///
+    /// When set, container logs are written to
+    /// `{log_base_dir}/{deployment_name}/{service}/{container_id}.log`
+    /// instead of the bundle directory.  The bundle `logs/` directory will
+    /// contain symlinks back to the structured location so that existing
+    /// code paths that read from the bundle still work.
+    pub log_base_dir: Option<PathBuf>,
+    /// Deployment name used in log directory hierarchy.
+    ///
+    /// Only meaningful when `log_base_dir` is also set.  Defaults to
+    /// `"default"` if unset.
+    pub deployment_name: Option<String>,
 }
 
 impl Default for YoukiConfig {
@@ -73,6 +86,8 @@ impl Default for YoukiConfig {
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(false),
             cache_type: None,
+            log_base_dir: None,
+            deployment_name: None,
         }
     }
 }
@@ -299,16 +314,38 @@ impl YoukiRuntime {
         self.config.bundle_dir.join(self.container_id_str(id))
     }
 
-    /// Get log directory for a container (separate from state to avoid conflicts with libcontainer)
+    /// Get log directory for a container.
+    ///
+    /// When `log_base_dir` is configured, returns a structured path:
+    ///   `{log_base_dir}/{deployment}/{service}/`
+    /// Otherwise falls back to the bundle directory:
+    ///   `{bundle_dir}/{container_id}/logs/`
     fn log_dir(&self, id: &ContainerId) -> PathBuf {
-        // Put logs in bundle directory to avoid conflicting with libcontainer's state directory
-        self.bundle_path(id).join("logs")
+        if let Some(ref base) = self.config.log_base_dir {
+            let deployment = self.config.deployment_name.as_deref().unwrap_or("default");
+            base.join(deployment).join(&id.service)
+        } else {
+            // Fall back to bundle directory to avoid conflicting with libcontainer's state directory
+            self.bundle_path(id).join("logs")
+        }
     }
 
-    /// Get log file paths for a container
+    /// Get log file paths for a container.
+    ///
+    /// Returns `(stdout_path, stderr_path)`. When structured logging is
+    /// enabled via `log_base_dir`, the files are named after the container
+    /// ID (e.g. `myservice-rep-1.stdout.log`).
     fn log_paths(&self, id: &ContainerId) -> (PathBuf, PathBuf) {
         let log_dir = self.log_dir(id);
-        (log_dir.join("stdout.log"), log_dir.join("stderr.log"))
+        if self.config.log_base_dir.is_some() {
+            let container_id = self.container_id_str(id);
+            (
+                log_dir.join(format!("{}.stdout.log", container_id)),
+                log_dir.join(format!("{}.stderr.log", container_id)),
+            )
+        } else {
+            (log_dir.join("stdout.log"), log_dir.join("stderr.log"))
+        }
     }
 
     /// Map libcontainer status to our ContainerState
@@ -322,7 +359,12 @@ impl YoukiRuntime {
         }
     }
 
-    /// Create log files and return file descriptors for stdout/stderr
+    /// Create log files and return file descriptors for stdout/stderr.
+    ///
+    /// When `log_base_dir` is configured, creates the structured log
+    /// directory (`/var/log/zlayer/{deployment}/{service}/`) and places
+    /// symlinks in the bundle's `logs/` directory so that existing code
+    /// reading from the bundle still works.
     async fn create_log_files(
         &self,
         id: &ContainerId,
@@ -350,6 +392,35 @@ impl YoukiRuntime {
                 id: id.to_string(),
                 reason: format!("failed to create stderr log: {}", e),
             })?;
+
+        // When using structured logging, also create symlinks from the bundle
+        // logs directory so that code reading from bundle_path/logs/ still works.
+        if self.config.log_base_dir.is_some() {
+            let bundle_log_dir = self.bundle_path(id).join("logs");
+            let _ = fs::create_dir_all(&bundle_log_dir).await;
+
+            // Symlink bundle_log_dir/stdout.log -> structured stdout_path
+            let bundle_stdout = bundle_log_dir.join("stdout.log");
+            let _ = fs::remove_file(&bundle_stdout).await;
+            if let Err(e) = tokio::fs::symlink(&stdout_path, &bundle_stdout).await {
+                tracing::warn!(
+                    container = %id,
+                    error = %e,
+                    "Failed to create stdout symlink in bundle logs dir"
+                );
+            }
+
+            // Symlink bundle_log_dir/stderr.log -> structured stderr_path
+            let bundle_stderr = bundle_log_dir.join("stderr.log");
+            let _ = fs::remove_file(&bundle_stderr).await;
+            if let Err(e) = tokio::fs::symlink(&stderr_path, &bundle_stderr).await {
+                tracing::warn!(
+                    container = %id,
+                    error = %e,
+                    "Failed to create stderr symlink in bundle logs dir"
+                );
+            }
+        }
 
         // Convert to OwnedFd
         use std::os::unix::io::IntoRawFd;
@@ -1508,6 +1579,8 @@ mod tests {
         assert_eq!(config.volume_dir, PathBuf::from("/var/lib/zlayer/volumes"));
         assert!(!config.use_systemd);
         assert!(config.cache_type.is_none());
+        assert!(config.log_base_dir.is_none());
+        assert!(config.deployment_name.is_none());
     }
 
     #[test]
@@ -1607,6 +1680,8 @@ mod tests {
             volume_dir: PathBuf::from("/custom/volumes"),
             use_systemd: true,
             cache_type: Some(zlayer_registry::CacheType::memory()),
+            log_base_dir: Some(PathBuf::from("/var/log/zlayer")),
+            deployment_name: Some("myapp".to_string()),
         };
 
         let cloned = config.clone();
@@ -1618,6 +1693,8 @@ mod tests {
         assert_eq!(cloned.volume_dir, config.volume_dir);
         assert_eq!(cloned.use_systemd, config.use_systemd);
         assert!(cloned.cache_type.is_some());
+        assert_eq!(cloned.log_base_dir, config.log_base_dir);
+        assert_eq!(cloned.deployment_name, config.deployment_name);
     }
 
     /// Test that YoukiRuntime::new() creates directories
@@ -1634,6 +1711,8 @@ mod tests {
             volume_dir: temp_base.join("volumes"),
             use_systemd: false,
             cache_type: None,
+            log_base_dir: None,
+            deployment_name: None,
         };
 
         // Clean up any previous test run

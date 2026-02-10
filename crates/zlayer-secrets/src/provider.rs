@@ -132,6 +132,40 @@ pub trait SecretsStore: SecretsProvider {
     async fn delete_secret(&self, scope: &str, name: &str) -> Result<()>;
 }
 
+// ---------------------------------------------------------------------------
+// Blanket impls for Arc<T> - allows shared ownership of providers/stores
+// ---------------------------------------------------------------------------
+
+#[async_trait]
+impl<T: SecretsProvider + ?Sized> SecretsProvider for std::sync::Arc<T> {
+    async fn get_secret(&self, scope: &str, name: &str) -> Result<Secret> {
+        (**self).get_secret(scope, name).await
+    }
+
+    async fn get_secrets(&self, scope: &str, names: &[&str]) -> Result<HashMap<String, Secret>> {
+        (**self).get_secrets(scope, names).await
+    }
+
+    async fn list_secrets(&self, scope: &str) -> Result<Vec<SecretMetadata>> {
+        (**self).list_secrets(scope).await
+    }
+
+    async fn exists(&self, scope: &str, name: &str) -> Result<bool> {
+        (**self).exists(scope, name).await
+    }
+}
+
+#[async_trait]
+impl<T: SecretsStore + ?Sized> SecretsStore for std::sync::Arc<T> {
+    async fn set_secret(&self, scope: &str, name: &str, value: &Secret) -> Result<()> {
+        (**self).set_secret(scope, name, value).await
+    }
+
+    async fn delete_secret(&self, scope: &str, name: &str) -> Result<()> {
+        (**self).delete_secret(scope, name).await
+    }
+}
+
 /// Resolver for secret references in configuration values.
 ///
 /// The resolver parses `$S:` prefixed values and replaces them with actual

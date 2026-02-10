@@ -12,11 +12,27 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tower::Service;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+use zlayer_spec::ExposeType;
+
+/// The overlay network CIDR used for internal service communication.
+/// Source IPs outside this range are rejected for internal-only routes.
+const OVERLAY_NETWORK: (u8, u8) = (10, 200); // 10.200.0.0/16
+
+/// Check whether an IP address belongs to the overlay network (10.200.0.0/16).
+fn is_overlay_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            octets[0] == OVERLAY_NETWORK.0 && octets[1] == OVERLAY_NETWORK.1
+        }
+        IpAddr::V6(_) => false,
+    }
+}
 
 /// Body type for outgoing responses
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
@@ -108,6 +124,36 @@ impl ReverseProxyService {
         let route_match = self.router.match_route(host, path).await?;
         let route = &route_match.route;
         let lb = &route_match.load_balancer;
+
+        // Defense-in-depth: reject non-overlay sources for internal routes.
+        // The primary enforcement is the bind address (internal endpoints only
+        // bind to the overlay IP), but this check catches mis-configurations
+        // or traffic that somehow arrives via an unexpected path.
+        if route.expose == ExposeType::Internal {
+            match self.remote_addr {
+                Some(addr) if !is_overlay_ip(addr.ip()) => {
+                    warn!(
+                        source = %addr.ip(),
+                        service = %route.service,
+                        endpoint = %route.endpoint,
+                        "Rejected non-overlay source for internal endpoint"
+                    );
+                    return Err(ProxyError::Forbidden(format!(
+                        "endpoint '{}' is internal-only",
+                        route.endpoint
+                    )));
+                }
+                None => {
+                    // ConnectInfo not available -- this shouldn't happen in
+                    // production but we allow it in tests / development.
+                    debug!(
+                        service = %route.service,
+                        "No remote_addr available; skipping overlay source check"
+                    );
+                }
+                _ => {} // source is from overlay, allow through
+            }
+        }
 
         // Select backend
         let backend = lb.select().await?;
@@ -361,5 +407,36 @@ mod tests {
         assert!(parts.headers.get("x-custom").is_none());
         // x-other should remain
         assert!(parts.headers.get("x-other").is_some());
+    }
+
+    #[test]
+    fn test_is_overlay_ip_accepts_overlay_range() {
+        // 10.200.x.x should be recognized as overlay
+        assert!(is_overlay_ip("10.200.0.1".parse().unwrap()));
+        assert!(is_overlay_ip("10.200.255.254".parse().unwrap()));
+        assert!(is_overlay_ip("10.200.1.100".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_overlay_ip_rejects_non_overlay() {
+        // Non-overlay addresses
+        assert!(!is_overlay_ip("192.168.1.1".parse().unwrap()));
+        assert!(!is_overlay_ip("10.0.0.1".parse().unwrap()));
+        assert!(!is_overlay_ip("10.201.0.1".parse().unwrap()));
+        assert!(!is_overlay_ip("172.16.0.1".parse().unwrap()));
+        assert!(!is_overlay_ip("8.8.8.8".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_is_overlay_ip_rejects_ipv6() {
+        assert!(!is_overlay_ip("::1".parse().unwrap()));
+        assert!(!is_overlay_ip("fe80::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn test_forbidden_error_response() {
+        let error = ProxyError::Forbidden("endpoint 'ws' is internal-only".to_string());
+        let response = ReverseProxyService::error_response(&error);
+        assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
     }
 }

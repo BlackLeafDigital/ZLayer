@@ -20,6 +20,9 @@ mod types;
 #[cfg(feature = "persistent")]
 mod persistent;
 
+#[cfg(feature = "persistent")]
+pub mod credentials;
+
 #[cfg(feature = "vault")]
 mod vault;
 
@@ -31,6 +34,9 @@ pub use types::{Secret, SecretMetadata, SecretRef, SecretScope};
 
 #[cfg(feature = "persistent")]
 pub use persistent::PersistentSecretsStore;
+
+#[cfg(feature = "persistent")]
+pub use credentials::CredentialStore;
 
 #[cfg(feature = "vault")]
 pub use vault::VaultSecretsProvider;

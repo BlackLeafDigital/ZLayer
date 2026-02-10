@@ -66,7 +66,7 @@ pub use client::{
 };
 pub use config::{ServiceConfig, TunnelClientConfig, TunnelServerConfig};
 pub use error::{Result, TunnelError};
-pub use node::{ExposeType, NodeTunnel, NodeTunnelManager, TunnelState, TunnelStatus};
+pub use node::{NodeTunnel, NodeTunnelManager, TunnelState, TunnelStatus};
 pub use protocol::{
     Message, MessageType, ServiceProtocol, HEADER_SIZE, MAX_MESSAGE_SIZE, PROTOCOL_VERSION,
 };
@@ -74,3 +74,4 @@ pub use server::{
     accept_all_tokens, hash_token, ControlHandler, ControlMessage, ListenerManager, TokenValidator,
     Tunnel, TunnelInfo, TunnelRegistry, TunnelService,
 };
+pub use zlayer_spec::ExposeType;

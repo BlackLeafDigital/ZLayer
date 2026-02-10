@@ -64,7 +64,20 @@ pub enum Request {
         timestamp: u64,
     },
     /// Register a new node
-    RegisterNode { node_id: NodeId, address: String },
+    RegisterNode {
+        node_id: NodeId,
+        address: String,
+        #[serde(default)]
+        wg_public_key: String,
+        #[serde(default)]
+        overlay_ip: String,
+        #[serde(default)]
+        overlay_port: u16,
+        #[serde(default)]
+        advertise_addr: String,
+        #[serde(default)]
+        api_port: u16,
+    },
     /// Deregister a node
     DeregisterNode { node_id: NodeId },
     /// Update service assignment to nodes
@@ -147,6 +160,21 @@ pub struct NodeInfo {
     /// Detected GPUs on this node
     #[serde(default)]
     pub gpus: Vec<GpuInfoSummary>,
+    /// WireGuard public key for overlay networking
+    #[serde(default)]
+    pub wg_public_key: String,
+    /// Overlay network IP assigned to this node
+    #[serde(default)]
+    pub overlay_ip: String,
+    /// WireGuard overlay port
+    #[serde(default)]
+    pub overlay_port: u16,
+    /// Advertise address (public IP) for this node
+    #[serde(default)]
+    pub advertise_addr: String,
+    /// API server port
+    #[serde(default)]
+    pub api_port: u16,
 }
 
 /// Summary of a GPU on a node, stored in Raft cluster state
@@ -158,6 +186,28 @@ pub struct GpuInfoSummary {
     pub model: String,
     /// VRAM in MB
     pub memory_mb: u64,
+}
+
+/// Parameters for adding a new member to the Raft cluster.
+///
+/// Bundles the node identity, Raft address, and overlay networking metadata
+/// into a single struct to keep `add_member()` signatures clean.
+#[derive(Debug, Clone)]
+pub struct AddMemberParams {
+    /// Raft node ID for the new member
+    pub node_id: u64,
+    /// Raft RPC address (e.g., "10.0.0.2:9000")
+    pub addr: String,
+    /// WireGuard public key
+    pub wg_public_key: String,
+    /// Assigned overlay IP
+    pub overlay_ip: String,
+    /// WireGuard overlay port
+    pub overlay_port: u16,
+    /// Public advertise address (IP)
+    pub advertise_addr: String,
+    /// API server port
+    pub api_port: u16,
 }
 
 impl ClusterState {
@@ -205,7 +255,15 @@ impl ClusterState {
 
                 Response::Success { data: None }
             }
-            Request::RegisterNode { node_id, address } => {
+            Request::RegisterNode {
+                node_id,
+                address,
+                wg_public_key,
+                overlay_ip,
+                overlay_port,
+                advertise_addr,
+                api_port,
+            } => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -219,6 +277,11 @@ impl ClusterState {
                         registered_at: now,
                         last_heartbeat: now,
                         gpus: Vec::new(),
+                        wg_public_key: wg_public_key.clone(),
+                        overlay_ip: overlay_ip.clone(),
+                        overlay_port: *overlay_port,
+                        advertise_addr: advertise_addr.clone(),
+                        api_port: *api_port,
                     },
                 );
 
@@ -629,6 +692,88 @@ impl RaftCoordinator {
         self.raft.metrics().borrow().clone()
     }
 
+    /// Add a new member (voter) to the Raft cluster.
+    ///
+    /// The caller must be the current leader. This first adds the node as a
+    /// **learner** (non-voting) so it can catch up on the log, then promotes
+    /// it to a voting member via a membership change.
+    ///
+    /// # Arguments
+    /// * `node_id` - The Raft node ID for the new member.
+    /// * `addr` - The Raft RPC address (e.g., `"10.0.0.2:9000"`).
+    pub async fn add_member(&self, params: AddMemberParams) -> Result<()> {
+        use std::collections::BTreeSet;
+
+        let node = BasicNode {
+            addr: params.addr.clone(),
+        };
+
+        // Step 1: Add as learner (blocking = true waits for log sync)
+        self.raft
+            .add_learner(params.node_id, node, true)
+            .await
+            .map_err(|e| {
+                SchedulerError::Raft(format!("Failed to add learner {}: {}", params.node_id, e))
+            })?;
+
+        info!(
+            node_id = params.node_id,
+            addr = %params.addr,
+            "Added node as learner"
+        );
+
+        // Step 2: Promote to voter by including it in the membership set.
+        // We need to include ALL existing voters plus the new one.
+        let metrics = self.raft.metrics().borrow().clone();
+        let mut voter_ids: BTreeSet<u64> = BTreeSet::new();
+
+        // Collect existing voters from the current membership
+        if let Some(membership) = &metrics
+            .membership_config
+            .membership()
+            .get_joint_config()
+            .last()
+        {
+            for id in membership.iter() {
+                voter_ids.insert(*id);
+            }
+        }
+        // Also add the leader (ourselves)
+        voter_ids.insert(self.config.node_id);
+        // Add the new node
+        voter_ids.insert(params.node_id);
+
+        self.raft
+            .change_membership(voter_ids, false)
+            .await
+            .map_err(|e| {
+                SchedulerError::Raft(format!(
+                    "Failed to promote member {}: {}",
+                    params.node_id, e
+                ))
+            })?;
+
+        // Step 3: Register the node in the state machine so cluster state knows about it
+        self.propose(Request::RegisterNode {
+            node_id: params.node_id,
+            address: params.addr.clone(),
+            wg_public_key: params.wg_public_key,
+            overlay_ip: params.overlay_ip,
+            overlay_port: params.overlay_port,
+            advertise_addr: params.advertise_addr,
+            api_port: params.api_port,
+        })
+        .await?;
+
+        info!(
+            node_id = params.node_id,
+            addr = %params.addr,
+            "Added member to Raft cluster as voter"
+        );
+
+        Ok(())
+    }
+
     /// Shutdown the Raft node
     pub async fn shutdown(&self) -> Result<()> {
         self.raft
@@ -714,6 +859,11 @@ mod tests {
         state.apply(&Request::RegisterNode {
             node_id: 1,
             address: "192.168.1.1:8000".to_string(),
+            wg_public_key: String::new(),
+            overlay_ip: String::new(),
+            overlay_port: 0,
+            advertise_addr: String::new(),
+            api_port: 0,
         });
 
         let node = state.get_node(1).unwrap();

@@ -1,6 +1,8 @@
 pub mod deploy;
+pub mod exec;
 pub mod join;
 pub mod node;
+pub mod ps;
 pub mod serve;
 
 pub mod build;

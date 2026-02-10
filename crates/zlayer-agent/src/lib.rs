@@ -20,6 +20,7 @@ pub mod proxy_manager;
 pub mod runtime;
 pub mod runtimes;
 pub mod service;
+pub mod stabilization;
 pub mod storage_manager;
 
 pub use autoscale_controller::{has_adaptive_scaling, AutoscaleController};
@@ -32,7 +33,9 @@ pub use dependency::{
     DependencyConditionChecker, DependencyError, DependencyGraph, DependencyNode, DependencyWaiter,
     WaitResult,
 };
-pub use env::{resolve_env_value, resolve_env_vars, EnvResolutionError, ResolvedEnv};
+pub use env::{
+    resolve_env_value, resolve_env_vars, resolve_env_with_secrets, EnvResolutionError, ResolvedEnv,
+};
 pub use error::*;
 pub use gpu_detector::{detect_gpus, GpuInfo};
 pub use health::*;
@@ -57,6 +60,9 @@ pub use runtimes::DockerRuntime;
 pub use runtimes::{WasmConfig, WasmRuntime};
 
 pub use service::*;
+pub use stabilization::{
+    wait_for_stabilization, ServiceHealthSummary, StabilizationOutcome, StabilizationResult,
+};
 pub use storage_manager::{StorageError, StorageManager, VolumeInfo};
 
 use std::sync::Arc;

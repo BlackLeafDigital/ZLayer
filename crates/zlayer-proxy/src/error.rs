@@ -28,6 +28,10 @@ pub enum ProxyError {
     #[error("No route found for host '{host}' path '{path}'")]
     RouteNotFound { host: String, path: String },
 
+    /// Forbidden - source not allowed to access internal endpoint
+    #[error("Forbidden: {0}")]
+    Forbidden(String),
+
     /// Invalid request
     #[error("Invalid request: {0}")]
     InvalidRequest(String),
@@ -68,6 +72,7 @@ impl ProxyError {
             ProxyError::NoHealthyBackends { .. } => http::StatusCode::SERVICE_UNAVAILABLE,
             ProxyError::BackendConnectionFailed { .. } => http::StatusCode::BAD_GATEWAY,
             ProxyError::BackendRequestFailed(_) => http::StatusCode::BAD_GATEWAY,
+            ProxyError::Forbidden(_) => http::StatusCode::FORBIDDEN,
             ProxyError::InvalidRequest(_) => http::StatusCode::BAD_REQUEST,
             ProxyError::Timeout(_) => http::StatusCode::GATEWAY_TIMEOUT,
             _ => http::StatusCode::INTERNAL_SERVER_ERROR,

@@ -937,6 +937,11 @@ mod tests {
             payload: EntryPayload::Normal(Request::RegisterNode {
                 node_id: 1,
                 address: "127.0.0.1:8000".to_string(),
+                wg_public_key: String::new(),
+                overlay_ip: String::new(),
+                overlay_port: 0,
+                advertise_addr: String::new(),
+                api_port: 0,
             }),
         };
 
@@ -1028,6 +1033,11 @@ mod tests {
                 payload: EntryPayload::Normal(Request::RegisterNode {
                     node_id: 1,
                     address: "127.0.0.1:8000".to_string(),
+                    wg_public_key: String::new(),
+                    overlay_ip: String::new(),
+                    overlay_port: 0,
+                    advertise_addr: String::new(),
+                    api_port: 0,
                 }),
             };
 
@@ -1065,6 +1075,11 @@ mod tests {
                 payload: EntryPayload::Normal(Request::RegisterNode {
                     node_id: i,
                     address: format!("127.0.0.1:{}", 8000 + i),
+                    wg_public_key: String::new(),
+                    overlay_ip: String::new(),
+                    overlay_port: 0,
+                    advertise_addr: String::new(),
+                    api_port: 0,
                 }),
             })
             .collect();

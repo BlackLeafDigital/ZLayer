@@ -29,6 +29,14 @@ pub struct ApiConfig {
     /// CORS configuration
     #[serde(default)]
     pub cors: CorsConfig,
+
+    /// Credential store for API key authentication (not serialised)
+    #[serde(skip)]
+    pub credential_store: Option<
+        std::sync::Arc<
+            zlayer_secrets::CredentialStore<std::sync::Arc<zlayer_secrets::PersistentSecretsStore>>,
+        >,
+    >,
 }
 
 fn default_bind() -> SocketAddr {
@@ -52,6 +60,7 @@ impl Default for ApiConfig {
             swagger_enabled: true,
             rate_limit: RateLimitConfig::default(),
             cors: CorsConfig::default(),
+            credential_store: None,
         }
     }
 }

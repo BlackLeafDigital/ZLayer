@@ -131,6 +131,13 @@ impl AuthUser {
 #[derive(Clone)]
 pub struct AuthState {
     pub jwt_secret: String,
+    /// Credential store for validating API keys (optional; falls back to rejection
+    /// if not set).
+    pub credential_store: Option<
+        std::sync::Arc<
+            zlayer_secrets::CredentialStore<std::sync::Arc<zlayer_secrets::PersistentSecretsStore>>,
+        >,
+    >,
 }
 
 /// Axum extractor for authenticated users

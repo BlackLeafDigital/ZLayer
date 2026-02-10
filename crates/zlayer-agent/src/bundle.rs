@@ -17,7 +17,9 @@ use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
 use tokio::fs;
+use zlayer_secrets::SecretsProvider;
 use zlayer_spec::{ServiceSpec, StorageSpec, StorageTier};
 
 /// Default bundle base directory
@@ -150,7 +152,7 @@ fn get_device_type(path: &str) -> std::io::Result<LinuxDeviceType> {
 ///
 /// let bundle_path = builder.build(&container_id, &service_spec).await?;
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BundleBuilder {
     /// Base directory for the bundle
     bundle_dir: PathBuf,
@@ -170,6 +172,28 @@ pub struct BundleBuilder {
     image_config: Option<zlayer_registry::ImageConfig>,
     /// Use host networking (skip Network namespace, container shares host network)
     host_network: bool,
+    /// Secrets provider for resolving $S: prefixed env vars
+    secrets_provider: Option<Arc<dyn SecretsProvider>>,
+    /// Deployment scope for secret lookups (e.g., deployment name)
+    deployment_scope: Option<String>,
+}
+
+impl std::fmt::Debug for BundleBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BundleBuilder")
+            .field("bundle_dir", &self.bundle_dir)
+            .field("rootfs_path", &self.rootfs_path)
+            .field("hostname", &self.hostname)
+            .field("extra_env", &self.extra_env)
+            .field("cwd", &self.cwd)
+            .field("args", &self.args)
+            .field("volume_paths", &self.volume_paths)
+            .field("image_config", &self.image_config)
+            .field("host_network", &self.host_network)
+            .field("secrets_provider", &self.secrets_provider.is_some())
+            .field("deployment_scope", &self.deployment_scope)
+            .finish()
+    }
 }
 
 impl BundleBuilder {
@@ -193,6 +217,8 @@ impl BundleBuilder {
             volume_paths: HashMap::new(),
             image_config: None,
             host_network: false,
+            secrets_provider: None,
+            deployment_scope: None,
         }
     }
 
@@ -262,6 +288,24 @@ impl BundleBuilder {
         self
     }
 
+    /// Set the secrets provider for resolving `$S:` prefixed environment variables
+    ///
+    /// When set, environment variables with `$S:secret-name` syntax will be resolved
+    /// from this provider at bundle creation time.
+    pub fn with_secrets_provider(mut self, provider: Arc<dyn SecretsProvider>) -> Self {
+        self.secrets_provider = Some(provider);
+        self
+    }
+
+    /// Set the deployment scope for secret lookups
+    ///
+    /// This is typically the deployment name and is used as the scope when
+    /// resolving `$S:` prefixed environment variables.
+    pub fn with_deployment_scope(mut self, scope: String) -> Self {
+        self.deployment_scope = Some(scope);
+        self
+    }
+
     /// Get the bundle directory path
     pub fn bundle_dir(&self) -> &Path {
         &self.bundle_dir
@@ -317,7 +361,9 @@ impl BundleBuilder {
         }
 
         // Generate OCI runtime spec
-        let oci_spec = self.build_oci_spec(container_id, spec, &self.volume_paths)?;
+        let oci_spec = self
+            .build_oci_spec(container_id, spec, &self.volume_paths)
+            .await?;
 
         // Write config.json
         let config_path = self.bundle_dir.join("config.json");
@@ -344,7 +390,7 @@ impl BundleBuilder {
     }
 
     /// Build the OCI runtime spec from ServiceSpec
-    fn build_oci_spec(
+    async fn build_oci_spec(
         &self,
         container_id: &ContainerId,
         spec: &ServiceSpec,
@@ -407,27 +453,53 @@ impl BundleBuilder {
             env_keys.insert("TERM".to_string());
         }
 
-        // Add service-specific env vars, resolving $E: prefixed references
+        // Add service-specific env vars, resolving $S: and $E: prefixed references
         // These override image config env for same keys
-        let resolved = crate::env::resolve_env_vars_with_warnings(&spec.env).map_err(|e| {
-            AgentError::InvalidSpec(format!("environment variable resolution failed: {}", e))
-        })?;
+        //
+        // When a secrets provider is available, use the full secrets-aware resolver
+        // that handles both $S: (secret) and $E: (env) prefixed values.
+        // Otherwise fall back to the env-only resolver.
+        if let (Some(secrets_provider), Some(scope)) =
+            (&self.secrets_provider, &self.deployment_scope)
+        {
+            let resolved_map =
+                crate::env::resolve_env_with_secrets(&spec.env, secrets_provider.as_ref(), scope)
+                    .await
+                    .map_err(|e| {
+                        AgentError::InvalidSpec(format!(
+                            "environment variable resolution failed: {}",
+                            e
+                        ))
+                    })?;
 
-        // Log any warnings about resolved env vars
-        for warning in &resolved.warnings {
-            tracing::warn!(container = %container_id, "{}", warning);
-        }
-
-        // Merge spec env: spec values take precedence over image config for same keys
-        for var in &resolved.vars {
-            if let Some(key) = var.split('=').next() {
-                if env_keys.contains(key) {
-                    // Remove the old entry from image config
-                    env.retain(|e| e.split('=').next() != Some(key));
+            for (key, value) in &resolved_map {
+                if env_keys.contains(key.as_str()) {
+                    env.retain(|e| e.split('=').next() != Some(key.as_str()));
                 }
-                env_keys.insert(key.to_string());
+                env_keys.insert(key.clone());
+                env.push(format!("{}={}", key, value));
             }
-            env.push(var.clone());
+        } else {
+            let resolved = crate::env::resolve_env_vars_with_warnings(&spec.env).map_err(|e| {
+                AgentError::InvalidSpec(format!("environment variable resolution failed: {}", e))
+            })?;
+
+            // Log any warnings about resolved env vars
+            for warning in &resolved.warnings {
+                tracing::warn!(container = %container_id, "{}", warning);
+            }
+
+            // Merge spec env: spec values take precedence over image config for same keys
+            for var in &resolved.vars {
+                if let Some(key) = var.split('=').next() {
+                    if env_keys.contains(key) {
+                        // Remove the old entry from image config
+                        env.retain(|e| e.split('=').next() != Some(key));
+                    }
+                    env_keys.insert(key.to_string());
+                }
+                env.push(var.clone());
+            }
         }
 
         // Add extra env vars from builder (highest priority)
@@ -1567,7 +1639,9 @@ impl BundleBuilder {
         spec: &ServiceSpec,
     ) -> Result<PathBuf> {
         // Generate OCI runtime spec
-        let oci_spec = self.build_oci_spec(container_id, spec, &self.volume_paths)?;
+        let oci_spec = self
+            .build_oci_spec(container_id, spec, &self.volume_paths)
+            .await?;
 
         // Write config.json
         let config_path = self.bundle_dir.join("config.json");
@@ -1805,8 +1879,8 @@ services:
         );
     }
 
-    #[test]
-    fn test_build_oci_spec_basic() {
+    #[tokio::test]
+    async fn test_build_oci_spec_basic() {
         let id = ContainerId {
             service: "test".to_string(),
             replica: 1,
@@ -1816,6 +1890,7 @@ services:
 
         let oci_spec = builder
             .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
             .unwrap();
 
         assert_eq!(oci_spec.version(), "1.0.2");
@@ -1828,8 +1903,8 @@ services:
         assert!(oci_spec.linux().is_some());
     }
 
-    #[test]
-    fn test_build_oci_spec_with_resources() {
+    #[tokio::test]
+    async fn test_build_oci_spec_with_resources() {
         let id = ContainerId {
             service: "test".to_string(),
             replica: 1,
@@ -1839,6 +1914,7 @@ services:
 
         let oci_spec = builder
             .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
             .unwrap();
 
         // Check that resources are set
@@ -1855,8 +1931,8 @@ services:
         assert_eq!(memory.limit(), Some(512 * 1024 * 1024)); // 512Mi
     }
 
-    #[test]
-    fn test_build_oci_spec_privileged() {
+    #[tokio::test]
+    async fn test_build_oci_spec_privileged() {
         let id = ContainerId {
             service: "test".to_string(),
             replica: 1,
@@ -1866,6 +1942,7 @@ services:
 
         let oci_spec = builder
             .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
             .unwrap();
 
         // Check that all capabilities are set
@@ -1884,8 +1961,8 @@ services:
         );
     }
 
-    #[test]
-    fn test_build_oci_spec_environment() {
+    #[tokio::test]
+    async fn test_build_oci_spec_environment() {
         let id = ContainerId {
             service: "test".to_string(),
             replica: 1,
@@ -1896,6 +1973,7 @@ services:
 
         let oci_spec = builder
             .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
             .unwrap();
 
         let process = oci_spec.process().as_ref().unwrap();
@@ -1910,8 +1988,8 @@ services:
         assert!(env.iter().any(|e| e.starts_with("PATH=")));
     }
 
-    #[test]
-    fn test_build_namespaces() {
+    #[tokio::test]
+    async fn test_build_namespaces() {
         let id = ContainerId {
             service: "test".to_string(),
             replica: 1,
@@ -1921,6 +1999,7 @@ services:
 
         let oci_spec = builder
             .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
             .unwrap();
         let linux = oci_spec.linux().as_ref().unwrap();
         let namespaces = linux.namespaces().as_ref().unwrap();
@@ -1934,8 +2013,8 @@ services:
         assert!(namespace_types.contains(&LinuxNamespaceType::Network));
     }
 
-    #[test]
-    fn test_build_namespaces_host_network() {
+    #[tokio::test]
+    async fn test_build_namespaces_host_network() {
         let id = ContainerId {
             service: "test".to_string(),
             replica: 1,
@@ -1945,6 +2024,7 @@ services:
 
         let oci_spec = builder
             .build_oci_spec(&id, &spec, &std::collections::HashMap::new())
+            .await
             .unwrap();
         let linux = oci_spec.linux().as_ref().unwrap();
         let namespaces = linux.namespaces().as_ref().unwrap();
@@ -2174,8 +2254,8 @@ services:
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_oci_spec_includes_storage_mounts() {
+    #[tokio::test]
+    async fn test_oci_spec_includes_storage_mounts() {
         let id = ContainerId {
             service: "test".to_string(),
             replica: 1,
@@ -2204,7 +2284,10 @@ services:
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
         let volume_paths = std::collections::HashMap::new();
 
-        let oci_spec = builder.build_oci_spec(&id, &spec, &volume_paths).unwrap();
+        let oci_spec = builder
+            .build_oci_spec(&id, &spec, &volume_paths)
+            .await
+            .unwrap();
 
         // Verify the OCI spec includes storage mounts
         let mounts = oci_spec.mounts().as_ref().unwrap();
