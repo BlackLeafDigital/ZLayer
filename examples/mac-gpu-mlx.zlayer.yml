@@ -1,0 +1,63 @@
+# mac-gpu-mlx.zlayer.yml - MLX LLM inference on Apple Silicon
+#
+# Deploys an MLX-based LLM inference server using full Metal compute.
+# MLX compiles custom Metal shaders at runtime for optimal performance,
+# so it needs full Metal access (not just MPS).
+#
+#   zlayer deploy -f examples/mac-gpu-mlx.zlayer.yml
+
+version: v1
+deployment: mlx-llm
+
+services:
+  llm:
+    rtype: service
+    image:
+      name: mlx-llm-server:latest
+      pull_policy: if_not_present
+
+    command:
+      entrypoint: ["python3", "-m", "mlx_lm.server", "--model", "/models/llm", "--host", "0.0.0.0", "--port", "8080"]
+
+    resources:
+      cpu: 4.0
+      memory: 32Gi
+      gpu:
+        vendor: apple
+        count: 1
+        # No mode = full Metal compute (needed for MLX shader compilation)
+
+    env:
+      MLX_METAL_JIT: "1"
+
+    storage:
+      - type: named
+        name: llm-weights
+        target: /models
+        readonly: true
+        size: 50Gi
+      - type: named
+        name: mlx-cache
+        target: /root/.cache/mlx
+        tier: cached
+        size: 5Gi
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+        expose: public
+
+    scale:
+      mode: fixed
+      replicas: 1
+
+    health:
+      start_grace: 120s
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      check:
+        type: http
+        url: http://localhost:8080/health
+        expect_status: 200
