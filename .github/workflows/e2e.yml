@@ -176,12 +176,51 @@ jobs:
           RUST_LOG: debug
 
   # ===========================================
+  # macOS Unit Tests
+  # Runs unit and doc tests on macOS to catch regressions in
+  # macOS-specific code (#[cfg(target_os = "macos")]).
+  # Linux-only tests are automatically excluded.
+  # ===========================================
+  macos-unit-tests:
+    name: Unit Tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.sha || inputs.sha || github.sha }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-macos-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install system dependencies
+        run: brew install protobuf
+
+      - name: Run unit tests
+        run: cargo test --workspace --lib --bins
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug
+
+      - name: Run doc tests
+        run: cargo test --workspace --doc
+
+  # ===========================================
   # Trigger Release (if version provided)
   # ===========================================
   trigger-release:
     name: Trigger Release
     runs-on: ubuntu-latest
-    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests]
+    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, macos-unit-tests]
     if: github.event.client_payload.version != '' || inputs.version != ''
     steps:
       - name: Determine version

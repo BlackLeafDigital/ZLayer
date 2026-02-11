@@ -3,6 +3,8 @@
 //! Converts CLI arguments into the runtime configuration used by the agent.
 
 use crate::cli::{Cli, RuntimeType};
+#[cfg(target_os = "macos")]
+use zlayer_agent::MacSandboxConfig;
 use zlayer_agent::RuntimeConfig;
 #[cfg(target_os = "linux")]
 use zlayer_agent::YoukiConfig;
@@ -18,5 +20,12 @@ pub(crate) fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
             state_dir: cli.state_dir.clone(),
             ..Default::default()
         }),
+        #[cfg(target_os = "macos")]
+        RuntimeType::MacSandbox => RuntimeConfig::MacSandbox(MacSandboxConfig {
+            data_dir: cli.state_dir.clone(),
+            ..Default::default()
+        }),
+        #[cfg(target_os = "macos")]
+        RuntimeType::MacVm => RuntimeConfig::MacVm,
     }
 }

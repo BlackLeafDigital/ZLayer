@@ -4,7 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Overlay container attachment: added platform guard (`#[cfg(not(target_os = "linux"))]`) to
+  `OverlayManager::attach_container()` so non-Linux platforms skip veth/nsenter commands and
+  return the node's overlay IP directly, eliminating noisy error logs on macOS.
+- macOS sandbox networking: multiple replicas of the same service no longer conflict on ports.
+  Each sandbox container is assigned a unique dynamic port (via OS port-0 allocation), passed
+  to the process as `PORT` / `ZLAYER_PORT` environment variables. The proxy routes to each
+  replica's unique `127.0.0.1:{assigned_port}` backend address instead of all replicas sharing
+  the same port. Port guard listeners prevent TOCTOU races between `create_container()` and
+  `start_container()`.
+
 ### Added
+- `Runtime::get_container_port_override()` trait method: allows runtimes to report a
+  dynamically assigned port for containers that share the host network. Default returns
+  `None` (no override). macOS sandbox runtime returns the assigned port.
+- `Container.port_override` field: stores the runtime-assigned port for proxy backend
+  address construction.
+- Seatbelt profiles now include the dynamically assigned port in their network bind rules.
 - Stabilization and endpoint reporting (Phase 11):
   - `wait_for_stabilization()` in daemon.rs: polls ServiceManager for replica count convergence and health checks with configurable timeout
   - `ServiceHealthSummary` / `StabilizationResult` types for structured stabilization outcomes

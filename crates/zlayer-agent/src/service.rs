@@ -249,6 +249,30 @@ impl ServiceInstance {
                     overlay_ip
                 };
 
+                // Query port override from the runtime.
+                // On macOS sandbox, each container is assigned a unique port since
+                // all processes share the host network (no network namespaces).
+                // The runtime passes the port to the process via the PORT env var.
+                let port_override = match self.runtime.get_container_port_override(&id).await {
+                    Ok(Some(port)) => {
+                        tracing::info!(
+                            container = %id,
+                            port = port,
+                            "runtime assigned dynamic port override for this container"
+                        );
+                        Some(port)
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            container = %id,
+                            error = %e,
+                            "failed to query port override from runtime, using spec port"
+                        );
+                        None
+                    }
+                };
+
                 // Start health monitoring and store handle (no lock needed during start)
                 let health_monitor_handle = {
                     let check = self.spec.health.check.clone();
@@ -263,19 +287,22 @@ impl ServiceInstance {
                     if let (Some(proxy), Some(ip)) = (&self.proxy_manager, effective_ip) {
                         let proxy = Arc::clone(proxy);
                         let service_name = self.service_name.clone();
-                        // Get the primary endpoint port for constructing the backend address
-                        let port = self
-                            .spec
-                            .endpoints
-                            .iter()
-                            .find(|ep| {
-                                matches!(
-                                    ep.protocol,
-                                    Protocol::Http | Protocol::Https | Protocol::Websocket
-                                )
-                            })
-                            .map(|ep| ep.port)
-                            .unwrap_or(8080);
+                        // Get the endpoint port, using the runtime override if present.
+                        // On macOS sandbox, port_override gives each replica a unique port
+                        // so the proxy can distinguish backends sharing 127.0.0.1.
+                        let port = port_override.unwrap_or_else(|| {
+                            self.spec
+                                .endpoints
+                                .iter()
+                                .find(|ep| {
+                                    matches!(
+                                        ep.protocol,
+                                        Protocol::Http | Protocol::Https | Protocol::Websocket
+                                    )
+                                })
+                                .map(|ep| ep.port)
+                                .unwrap_or(8080)
+                        });
 
                         let backend_addr = SocketAddr::new(ip, port);
 
@@ -325,6 +352,7 @@ impl ServiceInstance {
                             task: None,
                             overlay_ip: effective_ip,
                             health_monitor: Some(health_monitor_handle),
+                            port_override,
                         },
                     );
                 } // Lock released here
@@ -1095,19 +1123,50 @@ impl ServiceManager {
     }
 
     /// Update backend addresses in the StreamRegistry for TCP/UDP endpoints after scaling
+    ///
+    /// For containers with a port override (macOS sandbox), the addresses already
+    /// carry the runtime-assigned port. In that case, the container listens on the
+    /// override port for all traffic, so we use the address port directly. For
+    /// containers without a port override (Linux, VMs), we reconstruct addresses
+    /// using the endpoint's declared port, since each container has its own IP
+    /// and can bind any port independently.
     fn update_stream_backends(&self, spec: &ServiceSpec, addrs: &[SocketAddr]) {
         let Some(stream_registry) = &self.stream_registry else {
             return;
         };
 
+        // Determine if any addresses have a port override by checking whether
+        // all addresses use the same port as the primary spec endpoint. If not,
+        // they carry per-container port overrides and should be used as-is.
+        let primary_spec_port = spec
+            .endpoints
+            .iter()
+            .find(|ep| {
+                matches!(
+                    ep.protocol,
+                    Protocol::Http | Protocol::Https | Protocol::Websocket
+                )
+            })
+            .map(|ep| ep.port)
+            .unwrap_or(8080);
+
+        let has_port_overrides = addrs.iter().any(|addr| addr.port() != primary_spec_port);
+
         for endpoint in &spec.endpoints {
             match endpoint.protocol {
                 Protocol::Tcp => {
-                    // For TCP, construct backend addresses using the endpoint's port
-                    let tcp_backends: Vec<SocketAddr> = addrs
-                        .iter()
-                        .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
-                        .collect();
+                    let tcp_backends: Vec<SocketAddr> = if has_port_overrides {
+                        // Port overrides active (macOS sandbox): the container listens
+                        // on its assigned port for all traffic. Use addresses as-is.
+                        addrs.to_vec()
+                    } else {
+                        // Normal case: each container has its own IP, construct
+                        // addresses using the TCP endpoint's declared port.
+                        addrs
+                            .iter()
+                            .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
+                            .collect()
+                    };
 
                     stream_registry.update_tcp_backends(endpoint.port, tcp_backends);
 
@@ -1119,11 +1178,14 @@ impl ServiceManager {
                     );
                 }
                 Protocol::Udp => {
-                    // For UDP, construct backend addresses using the endpoint's port
-                    let udp_backends: Vec<SocketAddr> = addrs
-                        .iter()
-                        .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
-                        .collect();
+                    let udp_backends: Vec<SocketAddr> = if has_port_overrides {
+                        addrs.to_vec()
+                    } else {
+                        addrs
+                            .iter()
+                            .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
+                            .collect()
+                    };
 
                     stream_registry.update_udp_backends(endpoint.port, udp_backends);
 
@@ -1204,6 +1266,11 @@ impl ServiceManager {
     /// This queries the service instance's containers for their overlay network
     /// IP addresses and constructs backend addresses using those IPs with the
     /// service's endpoint port.
+    ///
+    /// If a container has a `port_override` (e.g., macOS sandbox where all
+    /// containers share the host network), that port is used instead of the
+    /// spec-declared endpoint port. This allows multiple replicas on the same
+    /// IP (`127.0.0.1`) to be distinguished by port.
     async fn collect_backend_addrs(
         &self,
         instance: &ServiceInstance,
@@ -1211,8 +1278,8 @@ impl ServiceManager {
     ) -> Vec<SocketAddr> {
         let mut addrs = Vec::new();
 
-        // Get the primary endpoint port (first HTTP endpoint)
-        let port = instance
+        // Get the primary endpoint port (first HTTP endpoint) as the default
+        let spec_port = instance
             .spec
             .endpoints
             .iter()
@@ -1230,6 +1297,9 @@ impl ServiceManager {
 
         for container in containers.values() {
             if let Some(ip) = container.overlay_ip {
+                // Use the runtime-assigned port override if present (macOS sandbox),
+                // otherwise fall back to the spec-declared endpoint port.
+                let port = container.port_override.unwrap_or(spec_port);
                 addrs.push(SocketAddr::new(ip, port));
             }
         }

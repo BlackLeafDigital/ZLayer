@@ -59,13 +59,47 @@ pub use runtimes::DockerRuntime;
 #[cfg(feature = "wasm")]
 pub use runtimes::{WasmConfig, WasmRuntime};
 
+#[cfg(target_os = "macos")]
+pub use runtimes::macos_sandbox::SandboxRuntime;
+#[cfg(target_os = "macos")]
+pub use runtimes::macos_vm::VmRuntime;
+
 pub use service::*;
 pub use stabilization::{
     wait_for_stabilization, ServiceHealthSummary, StabilizationOutcome, StabilizationResult,
 };
 pub use storage_manager::{StorageError, StorageManager, VolumeInfo};
 
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::sync::Arc;
+
+/// Configuration for macOS sandbox-based container runtime
+///
+/// Uses Apple's sandbox framework (sandbox_init/sandbox-exec) to provide
+/// process isolation on macOS. This is the preferred runtime on macOS
+/// when Docker is not available or not desired.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub struct MacSandboxConfig {
+    /// Directory for container data and rootfs
+    pub data_dir: PathBuf,
+    /// Directory for container logs
+    pub log_dir: PathBuf,
+    /// Whether to enable GPU access (Metal/MPS) for containers
+    pub gpu_access: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl Default for MacSandboxConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: PathBuf::from("/var/lib/zlayer"),
+            log_dir: PathBuf::from("/var/log/zlayer"),
+            gpu_access: true,
+        }
+    }
+}
 
 /// Configuration for selecting and configuring a container runtime
 #[derive(Debug, Clone)]
@@ -74,7 +108,8 @@ pub enum RuntimeConfig {
     ///
     /// Selection logic:
     /// - On Linux: Uses bundled libcontainer runtime (no external binary needed), falls back to Docker
-    /// - On Windows/macOS: Use Docker directly
+    /// - On macOS: Uses sandbox runtime if available, falls back to Docker
+    /// - On Windows: Use Docker directly
     /// - If no runtime can be initialized, returns an error
     Auto,
     /// Use the mock runtime for testing and development
@@ -88,6 +123,12 @@ pub enum RuntimeConfig {
     /// Use WebAssembly runtime with wasmtime for WASM workloads
     #[cfg(feature = "wasm")]
     Wasm(WasmConfig),
+    /// Use macOS sandbox-based container runtime
+    #[cfg(target_os = "macos")]
+    MacSandbox(MacSandboxConfig),
+    /// Use macOS Virtualization.framework for full VM isolation
+    #[cfg(target_os = "macos")]
+    MacVm,
 }
 
 impl Default for RuntimeConfig {
@@ -214,6 +255,12 @@ pub async fn create_runtime(config: RuntimeConfig) -> Result<Arc<dyn Runtime + S
             let runtime = WasmRuntime::new(wasm_config).await?;
             Ok(Arc::new(runtime))
         }
+        #[cfg(target_os = "macos")]
+        RuntimeConfig::MacSandbox(config) => Ok(Arc::new(
+            runtimes::macos_sandbox::SandboxRuntime::new(config)?,
+        )),
+        #[cfg(target_os = "macos")]
+        RuntimeConfig::MacVm => Ok(Arc::new(runtimes::macos_vm::VmRuntime::new()?)),
     }
 }
 
@@ -221,7 +268,8 @@ pub async fn create_runtime(config: RuntimeConfig) -> Result<Arc<dyn Runtime + S
 ///
 /// Selection logic:
 /// - On Linux: Uses bundled libcontainer runtime directly (no external binary needed), falls back to Docker
-/// - On Windows/macOS: Use Docker directly (libcontainer requires Linux)
+/// - On macOS: SandboxRuntime (native Metal/MPS) → VmRuntime (libkrun Linux compat with GPU) → Docker
+/// - On Windows: Use Docker directly
 /// - Returns an error if no runtime can be initialized
 async fn create_auto_runtime() -> Result<Arc<dyn Runtime + Send + Sync>> {
     tracing::info!("Auto-selecting container runtime");
@@ -237,6 +285,21 @@ async fn create_auto_runtime() -> Result<Arc<dyn Runtime + Send + Sync>> {
             Err(e) => {
                 tracing::warn!(error = %e, "Failed to initialize libcontainer runtime, trying Docker");
             }
+        }
+    }
+
+    // On macOS, try sandbox → VM → Docker
+    #[cfg(target_os = "macos")]
+    {
+        // Try sandbox first (native Metal/MPS performance)
+        match runtimes::macos_sandbox::SandboxRuntime::new(MacSandboxConfig::default()) {
+            Ok(rt) => return Ok(Arc::new(rt)),
+            Err(e) => tracing::warn!("macOS sandbox runtime unavailable: {e}"),
+        }
+        // Fall back to VM runtime (Linux container compat with GPU forwarding)
+        match runtimes::macos_vm::VmRuntime::new() {
+            Ok(rt) => return Ok(Arc::new(rt)),
+            Err(e) => tracing::warn!("macOS VM runtime (libkrun) unavailable: {e}"),
         }
     }
 

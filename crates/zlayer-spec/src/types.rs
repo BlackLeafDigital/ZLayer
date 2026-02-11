@@ -535,17 +535,30 @@ pub struct ResourcesSpec {
 /// - `nvidia` - NVIDIA GPUs via NVIDIA Container Toolkit (default)
 /// - `amd` - AMD GPUs via ROCm (/dev/kfd + /dev/dri/renderD*)
 /// - `intel` - Intel GPUs via VAAPI/i915 (/dev/dri/renderD*)
+/// - `apple` - Apple Silicon GPUs via Metal/MPS (macOS only)
 ///
 /// Unknown vendors fall back to DRI render node passthrough.
+///
+/// ## GPU mode (macOS only)
+///
+/// When `vendor` is `"apple"`, the `mode` field controls how GPU access is provided:
+/// - `"native"` -- Seatbelt sandbox with direct Metal/MPS access (lowest overhead)
+/// - `"vm"` -- libkrun micro-VM with GPU forwarding (stronger isolation)
+/// - `None` (default) -- Auto-select based on platform and vendor
+///
+/// On Linux, `mode` is ignored; GPU passthrough always uses device node binding.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Validate)]
 #[serde(deny_unknown_fields)]
 pub struct GpuSpec {
     /// Number of GPUs to request
     #[serde(default = "default_gpu_count")]
     pub count: u32,
-    /// GPU vendor (`nvidia`, `amd`, `intel`) - defaults to `nvidia`
+    /// GPU vendor (`nvidia`, `amd`, `intel`, `apple`) - defaults to `nvidia`
     #[serde(default = "default_gpu_vendor")]
     pub vendor: String,
+    /// GPU access mode (macOS only): `"native"`, `"vm"`, or `None` for auto-select
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 fn default_gpu_count() -> u32 {

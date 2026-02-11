@@ -172,31 +172,53 @@ impl OverlayManager {
         Ok(())
     }
 
-    /// Add a container to the appropriate overlay networks
+    /// Add a container to the appropriate overlay networks.
+    ///
+    /// On non-Linux platforms this is a no-op: per-container overlay attachment
+    /// relies on Linux network namespaces (veth pairs + `nsenter`).  On macOS,
+    /// containers share the host network, so the node's overlay IP is returned
+    /// directly and the proxy differentiates traffic by port.
     pub async fn attach_container(
         &self,
         container_pid: u32,
         service_name: &str,
         join_global: bool,
     ) -> Result<Ipv4Addr, AgentError> {
-        let interfaces = self.service_interfaces.read().await;
-        let service_iface = interfaces.get(service_name).ok_or_else(|| {
-            AgentError::Network(format!("No overlay for service: {}", service_name))
-        })?;
-
-        let container_ip = self.ip_allocator.allocate()?;
-        self.attach_to_interface(container_pid, service_iface, container_ip)
-            .await?;
-
-        if join_global {
-            if let Some(global_iface) = &self.global_interface {
-                let global_ip = self.ip_allocator.allocate()?;
-                self.attach_to_interface(container_pid, global_iface, global_ip)
-                    .await?;
-            }
+        // Per-container overlay attachment uses Linux network namespaces.
+        // On non-Linux platforms, return the node's overlay IP (or loopback).
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Suppress unused-variable warnings for the Linux-only parameters.
+            let _ = (container_pid, join_global);
+            tracing::debug!(
+                service = %service_name,
+                "Skipping per-container overlay attachment (not supported on this platform). \
+                 Containers will use the node's overlay IP via host networking."
+            );
+            return Ok(self.node_ip.unwrap_or(Ipv4Addr::LOCALHOST));
         }
 
-        Ok(container_ip)
+        #[allow(unreachable_code)]
+        {
+            let interfaces = self.service_interfaces.read().await;
+            let service_iface = interfaces.get(service_name).ok_or_else(|| {
+                AgentError::Network(format!("No overlay for service: {}", service_name))
+            })?;
+
+            let container_ip = self.ip_allocator.allocate()?;
+            self.attach_to_interface(container_pid, service_iface, container_ip)
+                .await?;
+
+            if join_global {
+                if let Some(global_iface) = &self.global_interface {
+                    let global_ip = self.ip_allocator.allocate()?;
+                    self.attach_to_interface(container_pid, global_iface, global_ip)
+                        .await?;
+                }
+            }
+
+            Ok(container_ip)
+        }
     }
 
     async fn attach_to_interface(

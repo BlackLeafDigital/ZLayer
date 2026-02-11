@@ -81,6 +81,33 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
   # ===========================================
+  # Check macOS (check, clippy) — skipped for tags
+  # Runs in parallel with Linux check to catch macOS-specific
+  # compilation errors in #[cfg(target_os = "macos")] code
+  # ===========================================
+  check-macos:
+    name: Check (macOS)
+    runs-on: macos-latest
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: brew install protobuf
+
+      - name: Setup Rust
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        with:
+          components: clippy
+
+      - name: Check compilation
+        run: cargo check --workspace --all-targets
+
+      - name: Clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ===========================================
   # Test — skipped for tags
   # ===========================================
   test:
@@ -139,7 +166,33 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
   # ===========================================
-  # Build Release
+  # Test macOS — skipped for tags
+  # Runs unit and doc tests on macOS. Integration tests
+  # requiring root/containers are auto-skipped via cfg(target_os).
+  # ===========================================
+  test-macos:
+    name: Test (macOS)
+    runs-on: macos-latest
+    needs: check-macos
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: brew install protobuf
+
+      - name: Setup Rust
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+
+      - name: Run unit tests
+        run: cargo test --workspace --lib --bins
+
+      - name: Run doc tests
+        run: cargo test --workspace --doc
+
+  # ===========================================
+  # Build Release (Linux)
   # For tags: runs directly (tests already passed on the branch)
   # For branches: waits for test + feature-tests
   # ===========================================
@@ -187,6 +240,47 @@ jobs:
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: binaries
+          path: |
+            target/release/zlayer-runtime
+            target/release/zlayer-build
+            target/release/zlayer
+          retention-days: 7
+
+  # ===========================================
+  # Build Release (macOS ARM64)
+  # For tags: runs directly (tests already passed on the branch)
+  # For branches: waits for test-macos
+  # ===========================================
+  build-macos:
+    name: Build Release (macOS)
+    runs-on: macos-latest
+    needs: [test-macos]
+    if: |-
+      ${{
+        always() &&
+        (startsWith(github.ref, 'refs/tags/') ||
+         needs.test-macos.result == 'success')
+      }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: brew install protobuf
+
+      - name: Setup Rust
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+
+      - name: Build release binaries
+        run: |
+          cargo build --release --package runtime
+          cargo build --release --package zlayer-build
+          cargo build --release --package zlayer
+
+      - name: Upload artifacts
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: binaries-macos-arm64
           path: |
             target/release/zlayer-runtime
             target/release/zlayer-build
@@ -244,7 +338,7 @@ jobs:
   trigger-e2e:
     name: Trigger E2E
     runs-on: ubuntu-latest
-    needs: [build, feature-tests]
+    needs: [build, build-macos, feature-tests]
     if: |-
       ${{
         always() && needs.build.result == 'success'
@@ -275,7 +369,7 @@ jobs:
   cache-cleanup:
     name: Cleanup Old Caches
     runs-on: ubuntu-latest
-    needs: [build, feature-tests]
+    needs: [build, build-macos, feature-tests]
     if: always()
     steps:
       - name: Cleanup old caches

@@ -58,6 +58,12 @@ pub(crate) enum RuntimeType {
     /// Youki runtime for production deployments (Linux only)
     #[cfg(target_os = "linux")]
     Youki,
+    /// macOS sandbox runtime (uses Apple sandbox framework)
+    #[cfg(target_os = "macos")]
+    MacSandbox,
+    /// macOS VM runtime (uses Virtualization.framework)
+    #[cfg(target_os = "macos")]
+    MacVm,
 }
 
 /// CLI subcommands

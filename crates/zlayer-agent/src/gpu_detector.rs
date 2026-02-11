@@ -1,35 +1,40 @@
-//! GPU inventory detection via sysfs
+//! GPU inventory detection
 //!
-//! Detects GPUs on the current host by scanning `/sys/bus/pci/devices` for display
-//! controllers (VGA and 3D controllers). Identifies vendor (NVIDIA, AMD, Intel) by
-//! PCI vendor ID, reads VRAM from PCI BAR regions, and optionally uses `nvidia-smi`
-//! for NVIDIA-specific model and memory information.
+//! Platform-specific GPU detection:
+//! - **Linux**: Scans `/sys/bus/pci/devices` for display controllers (VGA and 3D controllers).
+//!   Identifies vendor (NVIDIA, AMD, Intel) by PCI vendor ID, reads VRAM from PCI BAR regions,
+//!   and optionally uses `nvidia-smi` for NVIDIA-specific model and memory information.
+//! - **macOS**: Uses `system_profiler SPDisplaysDataType -json` to detect Apple Silicon GPUs
+//!   and unified memory via `sysctl -n hw.memsize`.
+//! - **Other**: Returns an empty GPU list.
 //!
-//! No external dependencies required -- pure sysfs scanning with optional subprocess
-//! calls for enrichment.
-
-use std::path::Path;
+//! No external dependencies required -- pure sysfs/system_profiler scanning with optional
+//! subprocess calls for enrichment.
 
 use serde::{Deserialize, Serialize};
 
 /// Detected GPU information
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct GpuInfo {
-    /// PCI bus ID (e.g., "0000:01:00.0")
+    /// PCI bus ID (e.g., "0000:01:00.0" on Linux, "apple:0" on macOS)
     pub pci_bus_id: String,
-    /// Vendor: "nvidia", "amd", "intel", or "unknown"
+    /// Vendor: "nvidia", "amd", "intel", "apple", or "unknown"
     pub vendor: String,
-    /// Model name from sysfs or "Unknown GPU"
+    /// Model name (e.g., "Apple M2 Pro" or "NVIDIA A100-SXM4-80GB")
     pub model: String,
-    /// VRAM in MB (0 if unknown)
+    /// VRAM in MB (0 if unknown; on Apple Silicon, this is unified memory)
     pub memory_mb: u64,
-    /// Device path (e.g., "/dev/nvidia0" or "/dev/dri/card0")
+    /// Device path (e.g., "/dev/nvidia0", "/dev/dri/card0", "iokit://AppleGPU/0")
     pub device_path: String,
-    /// Render node path if applicable (e.g., "/dev/dri/renderD128")
+    /// Render node path if applicable (e.g., "/dev/dri/renderD128"); None on macOS
     pub render_path: Option<String>,
 }
 
-/// Scan the system for GPU devices via sysfs PCI enumeration
+// =============================================================================
+// Linux GPU detection
+// =============================================================================
+
+/// Scan the system for GPU devices via sysfs PCI enumeration (Linux only)
 ///
 /// Iterates over `/sys/bus/pci/devices` looking for PCI class codes that
 /// indicate display controllers:
@@ -37,7 +42,10 @@ pub struct GpuInfo {
 /// - `0x0302xx` -- 3D controller (e.g., NVIDIA Tesla/datacenter GPUs)
 ///
 /// For each GPU found, determines vendor, model name, VRAM, and device paths.
+#[cfg(target_os = "linux")]
 pub fn detect_gpus() -> Vec<GpuInfo> {
+    use std::path::Path;
+
     let mut gpus = Vec::new();
 
     let pci_dir = Path::new("/sys/bus/pci/devices");
@@ -109,10 +117,158 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
 }
 
 // =============================================================================
-// nvidia-smi helper
+// macOS GPU detection
+// =============================================================================
+
+/// Detect Apple Silicon GPUs via system_profiler (macOS only)
+///
+/// Runs `system_profiler SPDisplaysDataType -json` to enumerate GPUs, then
+/// queries `sysctl -n hw.memsize` for the unified memory pool size. Apple Silicon
+/// shares system memory between CPU and GPU, so the full physical memory is
+/// reported as the GPU's available memory.
+#[cfg(target_os = "macos")]
+pub fn detect_gpus() -> Vec<GpuInfo> {
+    detect_apple_gpus()
+}
+
+/// Internal macOS GPU detection implementation
+#[cfg(target_os = "macos")]
+fn detect_apple_gpus() -> Vec<GpuInfo> {
+    let output = match std::process::Command::new("system_profiler")
+        .args(["SPDisplaysDataType", "-json"])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        _ => return Vec::new(),
+    };
+
+    let json_str = String::from_utf8_lossy(&output.stdout);
+    let parsed: serde_json::Value = match serde_json::from_str(&json_str) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let unified_memory_mb = detect_unified_memory_mb();
+
+    let mut gpus = Vec::new();
+
+    // system_profiler returns { "SPDisplaysDataType": [ { ... }, ... ] }
+    let displays = match parsed.get("SPDisplaysDataType").and_then(|v| v.as_array()) {
+        Some(arr) => arr,
+        None => return gpus,
+    };
+
+    for (idx, display) in displays.iter().enumerate() {
+        let model = display
+            .get("sppci_model")
+            .and_then(|v| v.as_str())
+            .or_else(|| display.get("_name").and_then(|v| v.as_str()))
+            .unwrap_or("Apple GPU")
+            .to_string();
+
+        let chip_type = display
+            .get("sppci_chiptype")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Use chip type in model name if the model doesn't already include it
+        let model = if !chip_type.is_empty() && !model.contains(chip_type) {
+            format!("{} ({})", model, chip_type)
+        } else {
+            model
+        };
+
+        // Apple Silicon uses unified memory -- report the full system memory
+        // as GPU-accessible memory. For discrete AMD GPUs in older Macs,
+        // try to read the VRAM field from system_profiler.
+        let memory_mb = display
+            .get("sppci_vram")
+            .and_then(|v| v.as_str())
+            .and_then(|s| {
+                // Format is like "16 GB" or "8192 MB"
+                let parts: Vec<&str> = s.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    let amount: u64 = parts[0].parse().ok()?;
+                    match parts[1].to_uppercase().as_str() {
+                        "GB" => Some(amount * 1024),
+                        "MB" => Some(amount),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(unified_memory_mb);
+
+        let vendor_str = display
+            .get("sppci_vendor")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Determine vendor from vendor string or chip type
+        let vendor = if vendor_str.to_lowercase().contains("apple")
+            || chip_type.to_lowercase().starts_with("apple")
+            || model.to_lowercase().contains("apple m")
+        {
+            "apple".to_string()
+        } else if vendor_str.to_lowercase().contains("amd")
+            || vendor_str.to_lowercase().contains("ati")
+        {
+            "amd".to_string()
+        } else if vendor_str.to_lowercase().contains("intel") {
+            "intel".to_string()
+        } else {
+            // Default to "apple" on macOS when vendor is ambiguous
+            "apple".to_string()
+        };
+
+        gpus.push(GpuInfo {
+            pci_bus_id: format!("apple:{}", idx),
+            vendor,
+            model,
+            memory_mb,
+            device_path: format!("iokit://AppleGPU/{}", idx),
+            render_path: None,
+        });
+    }
+
+    gpus
+}
+
+/// Query unified memory size via sysctl on macOS
+#[cfg(target_os = "macos")]
+fn detect_unified_memory_mb() -> u64 {
+    let output = match std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+    {
+        Ok(out) if out.status.success() => out,
+        _ => return 0,
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.trim()
+        .parse::<u64>()
+        .map(|bytes| bytes / (1024 * 1024))
+        .unwrap_or(0)
+}
+
+// =============================================================================
+// Fallback for unsupported platforms
+// =============================================================================
+
+/// Returns an empty GPU list on unsupported platforms
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn detect_gpus() -> Vec<GpuInfo> {
+    Vec::new()
+}
+
+// =============================================================================
+// Linux-only helpers: nvidia-smi, sysfs scanning
 // =============================================================================
 
 /// Pre-fetched nvidia-smi data to avoid calling the subprocess multiple times
+#[cfg(target_os = "linux")]
 struct NvidiaSmiData {
     /// GPU names, one per line
     names: Vec<String>,
@@ -120,6 +276,7 @@ struct NvidiaSmiData {
     memories: Vec<u64>,
 }
 
+#[cfg(target_os = "linux")]
 impl NvidiaSmiData {
     /// Attempt to fetch GPU info from nvidia-smi. Returns empty data on failure.
     fn fetch() -> Self {
@@ -151,12 +308,13 @@ impl NvidiaSmiData {
 }
 
 // =============================================================================
-// Model detection
+// Model detection (Linux only)
 // =============================================================================
 
 /// Read GPU model name from sysfs or nvidia-smi
+#[cfg(target_os = "linux")]
 fn read_gpu_model(
-    device_dir: &Path,
+    device_dir: &std::path::Path,
     vendor: &str,
     nvidia_data: &NvidiaSmiData,
     vendor_index: usize,
@@ -185,7 +343,8 @@ fn read_gpu_model(
 /// Try to read GPU product name from the DRM subsystem
 ///
 /// Checks `/sys/bus/pci/devices/XXXX/drm/cardN/device/product_name` and similar paths.
-fn read_drm_product_name(device_dir: &Path) -> Option<String> {
+#[cfg(target_os = "linux")]
+fn read_drm_product_name(device_dir: &std::path::Path) -> Option<String> {
     // Try the product_name file under the PCI device
     let product_name_path = device_dir.join("label");
     if let Ok(name) = std::fs::read_to_string(&product_name_path) {
@@ -217,12 +376,13 @@ fn read_drm_product_name(device_dir: &Path) -> Option<String> {
 }
 
 // =============================================================================
-// VRAM detection
+// VRAM detection (Linux only)
 // =============================================================================
 
 /// Read GPU VRAM from sysfs PCI BAR regions or nvidia-smi
+#[cfg(target_os = "linux")]
 fn read_gpu_memory(
-    device_dir: &Path,
+    device_dir: &std::path::Path,
     vendor: &str,
     nvidia_data: &NvidiaSmiData,
     vendor_index: usize,
@@ -276,10 +436,11 @@ fn read_gpu_memory(
 }
 
 // =============================================================================
-// Device path resolution
+// Device path resolution (Linux only)
 // =============================================================================
 
 /// Find device paths for a GPU based on vendor and index
+#[cfg(target_os = "linux")]
 fn find_device_paths(
     _pci_bus_id: &str,
     vendor: &str,
@@ -340,6 +501,23 @@ mod tests {
     }
 
     #[test]
+    fn test_gpu_info_apple_serialization() {
+        let info = GpuInfo {
+            pci_bus_id: "apple:0".to_string(),
+            vendor: "apple".to_string(),
+            model: "Apple M2 Pro".to_string(),
+            memory_mb: 32768,
+            device_path: "iokit://AppleGPU/0".to_string(),
+            render_path: None,
+        };
+
+        let json = serde_json::to_string(&info).unwrap();
+        let deserialized: GpuInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(info, deserialized);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn test_find_device_paths_nvidia() {
         let (dev, render) = find_device_paths("0000:01:00.0", "nvidia", 0);
         assert_eq!(dev, "/dev/nvidia0");
@@ -350,6 +528,7 @@ mod tests {
         assert!(render.is_none());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_find_device_paths_amd() {
         let (dev, render) = find_device_paths("0000:03:00.0", "amd", 0);
@@ -357,6 +536,7 @@ mod tests {
         assert_eq!(render, Some("/dev/dri/renderD128".to_string()));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_find_device_paths_intel() {
         let (dev, render) = find_device_paths("0000:00:02.0", "intel", 0);
