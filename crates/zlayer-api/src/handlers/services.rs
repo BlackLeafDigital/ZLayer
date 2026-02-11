@@ -1,13 +1,21 @@
 //! Service endpoints
 
+use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::{
     extract::{Path, Query, State},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     Json,
 };
+use futures_util::{Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tracing::debug;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::AuthUser;
@@ -410,7 +418,85 @@ pub async fn scale_service(
     }))
 }
 
+/// Container summary for API responses
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ContainerSummary {
+    /// Container identifier (service-rep-N)
+    pub id: String,
+    /// Service name
+    pub service: String,
+    /// Replica number
+    pub replica: u32,
+    /// Container state
+    pub state: String,
+    /// Process ID (if running)
+    pub pid: Option<u32>,
+    /// Overlay IP (if assigned)
+    pub overlay_ip: Option<String>,
+}
+
+/// List containers for a service
+#[utoipa::path(
+    get,
+    path = "/api/v1/deployments/{deployment}/services/{service}/containers",
+    params(
+        ("deployment" = String, Path, description = "Deployment name"),
+        ("service" = String, Path, description = "Service name"),
+    ),
+    responses(
+        (status = 200, description = "List of containers", body = Vec<ContainerSummary>),
+        (status = 404, description = "Service not found"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Services"
+)]
+pub async fn list_containers(
+    _user: AuthUser,
+    State(state): State<ServiceState>,
+    Path((deployment, service)): Path<(String, String)>,
+) -> Result<Json<Vec<ContainerSummary>>> {
+    // Verify deployment and service exist in storage
+    let stored = state
+        .storage
+        .get(&deployment)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?
+        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{}' not found", deployment)))?;
+
+    if !stored.spec.services.contains_key(&service) {
+        return Err(ApiError::NotFound(format!(
+            "Service '{}/{}' not found",
+            deployment, service
+        )));
+    }
+
+    // Get container info from service manager if available
+    let mut containers = Vec::new();
+    if let Some(ref manager) = state.service_manager {
+        let manager = manager.read().await;
+        let container_ids = manager.get_service_containers(&service).await;
+        for cid in container_ids {
+            containers.push(ContainerSummary {
+                id: cid.to_string(),
+                service: cid.service.clone(),
+                replica: cid.replica,
+                state: "running".to_string(),
+                pid: None,
+                overlay_ip: None,
+            });
+        }
+    }
+
+    Ok(Json(containers))
+}
+
 /// Get service logs
+///
+/// Returns service logs as plain text when `follow=false`, or as a Server-Sent
+/// Events stream when `follow=true`.  In follow mode the server first emits the
+/// last N lines (controlled by the `lines` parameter) and then continuously
+/// polls for new output, emitting each new line as a `data:` SSE event.
 #[utoipa::path(
     get,
     path = "/api/v1/deployments/{deployment}/services/{service}/logs",
@@ -420,7 +506,7 @@ pub async fn scale_service(
         LogQuery,
     ),
     responses(
-        (status = 200, description = "Service logs", body = String),
+        (status = 200, description = "Service logs (plain text or SSE stream)", body = String),
         (status = 404, description = "Service not found"),
         (status = 401, description = "Unauthorized"),
     ),
@@ -431,8 +517,8 @@ pub async fn get_service_logs(
     _user: AuthUser,
     State(state): State<ServiceState>,
     Path((deployment, service)): Path<(String, String)>,
-    Query(_query): Query<LogQuery>,
-) -> Result<String> {
+    Query(query): Query<LogQuery>,
+) -> Result<Response> {
     // Verify deployment exists
     let stored = state
         .storage
@@ -449,12 +535,235 @@ pub async fn get_service_logs(
         )));
     }
 
-    // TODO: Get actual logs from container runtime
-    // For now, return placeholder indicating logs are not yet implemented
-    Ok(format!(
-        "# Logs for {}/{}\n# Log streaming not yet implemented\n",
-        deployment, service
-    ))
+    // Require service manager for log retrieval
+    let manager_arc = state
+        .service_manager
+        .as_ref()
+        .ok_or_else(|| {
+            ApiError::ServiceUnavailable(
+                "Log retrieval not available: no service manager configured".to_string(),
+            )
+        })?
+        .clone();
+
+    let tail = query.lines as usize;
+    let instance = query.instance.clone();
+
+    if !query.follow {
+        // ---- Non-follow mode: return plain text as before ----
+        let manager = manager_arc.read().await;
+        let logs = match manager
+            .get_service_logs(&service, tail, instance.as_deref())
+            .await
+        {
+            Ok(logs) => logs,
+            Err(zlayer_agent::AgentError::NotFound { reason, .. }) => {
+                format!(
+                    "# Logs for {}/{}\n# No running containers ({})\n",
+                    deployment, service, reason
+                )
+            }
+            Err(e) => return Err(ApiError::Internal(format!("Failed to fetch logs: {}", e))),
+        };
+        Ok(logs.into_response())
+    } else {
+        // ---- Follow mode: SSE stream ----
+        let stream = log_follow_stream(manager_arc, service, tail, instance);
+        let sse = Sse::new(stream).keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        );
+        Ok(sse.into_response())
+    }
+}
+
+/// Build an SSE stream that first emits the last `tail` lines, then polls for
+/// new log output every 500 ms and emits new lines as `data:` events.
+///
+/// The stream runs indefinitely until the client disconnects.  It works across
+/// all container runtimes (youki, docker, wasm) because it uses the
+/// `ServiceManager::get_service_logs()` abstraction rather than watching files
+/// directly.
+fn log_follow_stream(
+    manager: Arc<RwLock<ServiceManager>>,
+    service: String,
+    tail: usize,
+    instance: Option<String>,
+) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
+    // We use an `async_stream`-style approach via `tokio_stream::wrappers` and a
+    // manual async generator built on `futures_util::stream::unfold`.
+    futures_util::stream::unfold(
+        LogFollowState {
+            manager,
+            service,
+            instance,
+            tail,
+            seen_line_count: 0,
+            initial: true,
+            poll_interval: Duration::from_millis(500),
+        },
+        |mut state| async move {
+            // On the very first iteration we fetch the initial tail.
+            // On subsequent iterations we sleep first, then poll for new lines.
+            if !state.initial {
+                tokio::time::sleep(state.poll_interval).await;
+            }
+
+            // Use a large tail value when polling for updates so we see all
+            // output.  We track how many lines we have already sent and only
+            // emit genuinely new ones.
+            let fetch_tail = if state.initial { state.tail } else { 10_000 };
+
+            let mgr = state.manager.read().await;
+            let logs = mgr
+                .get_service_logs(&state.service, fetch_tail, state.instance.as_deref())
+                .await
+                .unwrap_or_default();
+            drop(mgr);
+
+            let all_lines: Vec<&str> = logs.lines().collect();
+            let total = all_lines.len();
+
+            let new_lines = if state.initial {
+                // First fetch: emit everything returned by the tail query
+                state.initial = false;
+                state.seen_line_count = total;
+                all_lines
+            } else if total > state.seen_line_count {
+                // New lines appeared since last poll
+                let new = all_lines[state.seen_line_count..].to_vec();
+                state.seen_line_count = total;
+                new
+            } else {
+                // Nothing new — yield an empty batch so the stream stays alive
+                vec![]
+            };
+
+            // Build SSE events for each new line
+            let events: Vec<std::result::Result<Event, Infallible>> = new_lines
+                .into_iter()
+                .map(|line| Ok(Event::default().data(line)))
+                .collect();
+
+            debug!(
+                service = %state.service,
+                new_events = events.len(),
+                total_seen = state.seen_line_count,
+                "log follow poll"
+            );
+
+            Some((futures_util::stream::iter(events), state))
+        },
+    )
+    .flatten()
+}
+
+/// Internal state for the log-follow polling stream.
+struct LogFollowState {
+    manager: Arc<RwLock<ServiceManager>>,
+    service: String,
+    instance: Option<String>,
+    tail: usize,
+    /// Number of log lines already sent to the client.
+    seen_line_count: usize,
+    /// Whether this is the very first poll (initial tail fetch).
+    initial: bool,
+    /// How often to poll for new log data.
+    poll_interval: Duration,
+}
+
+/// Exec request body
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ExecRequest {
+    /// Command and arguments to execute
+    pub command: Vec<String>,
+    /// Optional replica number to target
+    #[serde(default)]
+    pub replica: Option<u32>,
+}
+
+/// Exec response body
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExecResponse {
+    /// Exit code from the command
+    pub exit_code: i32,
+    /// Standard output
+    pub stdout: String,
+    /// Standard error
+    pub stderr: String,
+}
+
+/// Execute a command in a service container
+#[utoipa::path(
+    post,
+    path = "/api/v1/deployments/{deployment}/services/{service}/exec",
+    params(
+        ("deployment" = String, Path, description = "Deployment name"),
+        ("service" = String, Path, description = "Service name"),
+    ),
+    request_body = ExecRequest,
+    responses(
+        (status = 200, description = "Command executed", body = ExecResponse),
+        (status = 404, description = "Service or container not found"),
+        (status = 400, description = "Invalid exec request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 503, description = "Service manager not available"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Services"
+)]
+pub async fn exec_in_service(
+    _user: AuthUser,
+    State(state): State<ServiceState>,
+    Path((deployment, service)): Path<(String, String)>,
+    Json(request): Json<ExecRequest>,
+) -> Result<Json<ExecResponse>> {
+    // Validate command
+    if request.command.is_empty() {
+        return Err(ApiError::BadRequest("Command cannot be empty".to_string()));
+    }
+
+    // Verify deployment and service exist in storage
+    let stored = state
+        .storage
+        .get(&deployment)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?
+        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{}' not found", deployment)))?;
+
+    if !stored.spec.services.contains_key(&service) {
+        return Err(ApiError::NotFound(format!(
+            "Service '{}/{}' not found",
+            deployment, service
+        )));
+    }
+
+    // Require service manager for exec operations
+    let manager_arc = state.service_manager.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable(
+            "Exec not available: no service manager configured".to_string(),
+        )
+    })?;
+
+    let manager = manager_arc.read().await;
+
+    // Execute the command
+    let (exit_code, stdout, stderr) = manager
+        .exec_in_container(&service, request.replica, &request.command)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {}", reason))
+            }
+            other => ApiError::Internal(format!("Exec failed: {}", other)),
+        })?;
+
+    Ok(Json(ExecResponse {
+        exit_code,
+        stdout,
+        stderr,
+    }))
 }
 
 #[cfg(test)]

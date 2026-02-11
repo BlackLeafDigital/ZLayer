@@ -58,9 +58,15 @@ pub struct NodeResources {
     pub gpu_used: u32,
     /// GPU model names (e.g., ["NVIDIA A100-SXM4-80GB"])
     pub gpu_models: Vec<String>,
-    /// Total GPU VRAM in MB across all GPUs
+    /// Total GPU VRAM in MB across all GPUs.
+    ///
+    /// **Apple Silicon unified memory note**: On Apple Silicon (`gpu_vendor == "apple"`),
+    /// GPU memory is physically the same as system RAM (unified architecture). This field
+    /// will mirror a portion of `memory_total` rather than representing additional memory.
+    /// Use [`NodeResources::is_unified_memory`] to detect this case and avoid double-counting
+    /// when summing CPU + GPU memory budgets.
     pub gpu_memory_mb: u64,
-    /// GPU vendor (e.g., "nvidia", "amd", "intel"), empty if no GPUs
+    /// GPU vendor (e.g., "nvidia", "amd", "intel", "apple"), empty if no GPUs
     pub gpu_vendor: String,
 }
 
@@ -116,6 +122,31 @@ impl NodeResources {
     /// Get number of GPUs available for allocation
     pub fn gpu_available(&self) -> u32 {
         self.gpu_total.saturating_sub(self.gpu_used)
+    }
+
+    /// Returns `true` if this node uses unified memory (Apple Silicon).
+    ///
+    /// On Apple Silicon, GPU VRAM and system RAM are the same physical memory pool.
+    /// This means `gpu_memory_mb` is NOT additive with `memory_total` -- they overlap.
+    /// Callers must not double-count memory when both CPU and GPU resources are requested
+    /// on a unified-memory node.
+    pub fn is_unified_memory(&self) -> bool {
+        self.gpu_vendor.eq_ignore_ascii_case("apple")
+    }
+
+    /// Returns the total effective memory in MB, correctly handling unified memory.
+    ///
+    /// - **Discrete GPU nodes** (NVIDIA, AMD, Intel): system RAM + GPU VRAM
+    /// - **Unified memory nodes** (Apple Silicon): system RAM only (GPU VRAM is a subset)
+    pub fn total_effective_memory_mb(&self) -> u64 {
+        let system_mb = self.memory_total / (1024 * 1024);
+        if self.is_unified_memory() {
+            // Apple Silicon: GPU VRAM is carved from system RAM, don't add it
+            system_mb
+        } else {
+            // Discrete GPUs: VRAM is separate from system RAM
+            system_mb + self.gpu_memory_mb
+        }
     }
 }
 
@@ -335,6 +366,18 @@ pub fn can_place_on_node(
                     "Node rejected: GPU vendor mismatch"
                 );
                 return false;
+            }
+
+            // Apple Silicon uses unified memory -- GPU VRAM = system RAM.
+            // Don't double-count memory when both CPU and GPU resources are requested.
+            // The node's `memory_total` already includes the GPU-accessible portion,
+            // so we skip any separate GPU VRAM capacity check for Apple nodes.
+            if node.resources.is_unified_memory() {
+                debug!(
+                    node = %node.id,
+                    "Apple Silicon unified memory: GPU VRAM is part of system RAM, \
+                     no separate VRAM budget check needed"
+                );
             }
         }
     }
@@ -1023,6 +1066,7 @@ mod tests {
         spec.resources.gpu = Some(zlayer_spec::GpuSpec {
             count: gpu_count,
             vendor: gpu_vendor.to_string(),
+            mode: None,
         });
         spec
     }
@@ -1201,5 +1245,58 @@ mod tests {
 
         // Should prefer node 2 (more GPUs available)
         assert_eq!(decisions[0].node_id, Some(2));
+    }
+
+    // ==========================================================================
+    // Apple Silicon unified memory tests
+    // ==========================================================================
+
+    #[test]
+    fn test_apple_silicon_is_unified_memory() {
+        let apple_node = make_gpu_node(1, "192.168.1.1:8000", 1, "apple");
+        assert!(apple_node.resources.is_unified_memory());
+
+        let nvidia_node = make_gpu_node(2, "192.168.1.2:8000", 4, "nvidia");
+        assert!(!nvidia_node.resources.is_unified_memory());
+
+        let no_gpu_node = make_node(3, "192.168.1.3:8000");
+        assert!(!no_gpu_node.resources.is_unified_memory());
+    }
+
+    #[test]
+    fn test_unified_memory_no_double_count() {
+        // Apple Silicon: 32 GB system RAM, GPU "VRAM" is 24 GB of that same RAM
+        let mut apple_res = NodeResources::new(10.0, 32 * 1024 * 1024 * 1024);
+        apple_res.gpu_total = 1;
+        apple_res.gpu_vendor = "apple".to_string();
+        apple_res.gpu_memory_mb = 24576; // 24 GB "VRAM" (subset of system RAM)
+
+        // Effective memory should be system RAM only (32 GB = 32768 MB)
+        assert_eq!(apple_res.total_effective_memory_mb(), 32768);
+
+        // Discrete GPU: 32 GB system RAM + 16 GB discrete VRAM
+        let mut nvidia_res = NodeResources::new(8.0, 32 * 1024 * 1024 * 1024);
+        nvidia_res.gpu_total = 1;
+        nvidia_res.gpu_vendor = "nvidia".to_string();
+        nvidia_res.gpu_memory_mb = 16384; // 16 GB discrete VRAM
+
+        // Effective memory should be system RAM + VRAM (32768 + 16384 = 49152 MB)
+        assert_eq!(nvidia_res.total_effective_memory_mb(), 49152);
+    }
+
+    #[test]
+    fn test_apple_gpu_service_can_be_placed() {
+        let apple_node = make_gpu_node(1, "192.168.1.1:8000", 1, "apple");
+        let placements = PlacementState::new();
+        let spec = make_gpu_service_spec(1, "apple", NodeMode::Shared);
+
+        assert!(can_place_on_node(
+            &apple_node,
+            "ml-inference",
+            NodeMode::Shared,
+            None,
+            &placements,
+            Some(&spec),
+        ));
     }
 }

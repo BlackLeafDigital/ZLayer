@@ -43,22 +43,45 @@ pub async fn get_token(
     State(auth): State<AuthState>,
     Json(request): Json<TokenRequest>,
 ) -> Result<Json<TokenResponse>> {
-    // In production, validate against a user store
-    // For now, accept a well-known dev API key
-    if request.api_key == "dev" && request.api_secret == "dev-secret" {
-        let expiry = Duration::from_secs(3600);
-        let token = create_token(
-            &auth.jwt_secret,
-            &request.api_key,
-            expiry,
-            vec!["admin".to_string()],
-        )?;
+    // Validate against the credential store if available
+    if let Some(cred_store) = &auth.credential_store {
+        match cred_store
+            .validate(&request.api_key, &request.api_secret)
+            .await
+        {
+            Ok(Some(roles)) => {
+                let expiry = Duration::from_secs(3600);
+                let token = create_token(&auth.jwt_secret, &request.api_key, expiry, roles)?;
 
-        return Ok(Json(TokenResponse {
-            access_token: token,
-            token_type: "Bearer".to_string(),
-            expires_in: expiry.as_secs(),
-        }));
+                return Ok(Json(TokenResponse {
+                    access_token: token,
+                    token_type: "Bearer".to_string(),
+                    expires_in: expiry.as_secs(),
+                }));
+            }
+            Ok(None) => {
+                // Invalid credentials -- fall through to error
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Credential store error during authentication");
+                return Err(ApiError::Internal(
+                    "Authentication backend error".to_string(),
+                ));
+            }
+        }
+    } else {
+        // Dev fallback: accept "dev"/"dev-secret" when no credential store is configured
+        if request.api_key == "dev" && request.api_secret == "dev-secret" {
+            tracing::warn!("Using dev credentials -- NOT SAFE FOR PRODUCTION");
+            let expiry = Duration::from_secs(3600);
+            let token = create_token(&auth.jwt_secret, "dev", expiry, vec!["admin".to_string()])?;
+
+            return Ok(Json(TokenResponse {
+                access_token: token,
+                token_type: "Bearer".to_string(),
+                expires_in: expiry.as_secs(),
+            }));
+        }
     }
 
     Err(ApiError::Unauthorized("Invalid credentials".to_string()))

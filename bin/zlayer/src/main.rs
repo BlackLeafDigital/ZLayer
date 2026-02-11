@@ -50,6 +50,8 @@ fn main() -> ExitCode {
         Some(Commands::Manager { args }) => cli::exec_runtime("manager", &args),
         Some(Commands::Node { args }) => cli::exec_runtime("node", &args),
         Some(Commands::Runtimes { args }) => cli::exec_runtime("runtimes", &args),
+        Some(Commands::Exec { args }) => cli::exec_runtime("exec", &args),
+        Some(Commands::Ps { args }) => cli::exec_runtime("ps", &args),
     }
 }
 

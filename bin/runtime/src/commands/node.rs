@@ -9,29 +9,29 @@ use tracing::{info, warn};
 
 /// Node configuration stored on disk
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct NodeConfig {
+pub(crate) struct NodeConfig {
     /// Unique node identifier
-    node_id: String,
+    pub(crate) node_id: String,
     /// Raft node ID (numeric)
-    raft_node_id: u64,
+    pub(crate) raft_node_id: u64,
     /// Public IP address for this node
-    advertise_addr: String,
+    pub(crate) advertise_addr: String,
     /// API server port
-    api_port: u16,
+    pub(crate) api_port: u16,
     /// Raft consensus port
-    raft_port: u16,
+    pub(crate) raft_port: u16,
     /// Overlay network port (WireGuard protocol)
-    overlay_port: u16,
+    pub(crate) overlay_port: u16,
     /// Overlay network CIDR
-    overlay_cidr: String,
+    pub(crate) overlay_cidr: String,
     /// Overlay private key (x25519)
-    wireguard_private_key: String,
+    pub(crate) wireguard_private_key: String,
     /// Overlay public key (x25519)
-    wireguard_public_key: String,
+    pub(crate) wireguard_public_key: String,
     /// Whether this node is the cluster leader/bootstrap node
-    is_leader: bool,
+    pub(crate) is_leader: bool,
     /// Timestamp when node was created
-    created_at: String,
+    pub(crate) created_at: String,
 }
 
 /// Join token payload
@@ -119,17 +119,17 @@ fn generate_secure_token() -> String {
 }
 
 /// Generate a unique node ID
-fn generate_node_id() -> String {
+pub(crate) fn generate_node_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
 /// Get current timestamp as ISO 8601 string
-fn current_timestamp() -> String {
+pub(crate) fn current_timestamp() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
 /// Save node configuration to disk
-async fn save_node_config(data_dir: &Path, config: &NodeConfig) -> Result<()> {
+pub(crate) async fn save_node_config(data_dir: &Path, config: &NodeConfig) -> Result<()> {
     let config_path = data_dir.join("node_config.json");
     let content =
         serde_json::to_string_pretty(config).context("Failed to serialize node config")?;
@@ -141,7 +141,7 @@ async fn save_node_config(data_dir: &Path, config: &NodeConfig) -> Result<()> {
 }
 
 /// Load node configuration from disk
-async fn load_node_config(data_dir: &Path) -> Result<NodeConfig> {
+pub(crate) async fn load_node_config(data_dir: &Path) -> Result<NodeConfig> {
     let config_path = data_dir.join("node_config.json");
     let content = tokio::fs::read_to_string(&config_path)
         .await
@@ -280,14 +280,26 @@ pub(crate) async fn handle_node_init(
         .with_context(|| format!("Failed to create data directory: {}", data_dir.display()))?;
     info!(path = %data_dir.display(), "Created data directory");
 
-    // 2. Check if already initialized
+    // 2. Check if already initialized -- use load_or_init_node_config()
+    //    from daemon.rs for the load path.  If an existing config is found,
+    //    we show its details and exit early (idempotent).
     let config_path = data_dir.join("node_config.json");
     if config_path.exists() {
-        anyhow::bail!(
-            "Node already initialized. Configuration exists at {}. \
-            Use 'zlayer node status' to check the node or remove the config file to reinitialize.",
-            config_path.display()
+        let existing = crate::daemon::load_or_init_node_config(&data_dir).await?;
+        println!();
+        println!("Node already initialized.");
+        println!("Node ID:        {}", existing.node_id);
+        println!("Raft Node ID:   {}", existing.raft_node_id);
+        println!(
+            "API Server:     http://{}:{}",
+            existing.advertise_addr, existing.api_port
         );
+        println!(
+            "Raft Address:   {}:{}",
+            existing.advertise_addr, existing.raft_port
+        );
+        println!("Use 'zlayer node status' for full details.");
+        return Ok(());
     }
 
     // 3. Generate node ID
@@ -357,6 +369,20 @@ pub(crate) async fn handle_node_init(
         .await
         .context("Failed to bootstrap Raft cluster")?;
     info!("Raft cluster bootstrapped");
+
+    // Register the leader node in the Raft state machine with overlay metadata
+    let leader_overlay_ip = "10.200.0.1".to_string();
+    raft.propose(zlayer_scheduler::Request::RegisterNode {
+        node_id: raft_node_id,
+        address: format!("{}:{}", advertise_addr, raft_port),
+        wg_public_key: public_key.clone(),
+        overlay_ip: leader_overlay_ip,
+        overlay_port,
+        advertise_addr: advertise_addr.clone(),
+        api_port,
+    })
+    .await
+    .context("Failed to register leader in Raft state")?;
 
     // 8. Generate join token
     let join_token = generate_join_token_data(
@@ -513,14 +539,178 @@ pub(crate) async fn handle_node_join(
 
     // 7. Configure overlay with peers
     println!("  Configuring overlay network...");
-    // TODO: Actually configure overlay interface with peers
+
+    // Parse the overlay IP assigned by the leader
+    let our_overlay_ip: std::net::Ipv4Addr = join_response
+        .overlay_ip
+        .parse()
+        .context("Invalid overlay IP in join response")?;
+
+    // Extract the prefix length from the overlay CIDR (e.g. "10.200.0.0/16" -> 16)
+    let overlay_prefix_len = token_data
+        .overlay_cidr
+        .split('/')
+        .nth(1)
+        .and_then(|s| s.parse::<u8>().ok())
+        .unwrap_or(16);
+
+    // Build the overlay IP with the network prefix for proper routing
+    // e.g. "10.200.0.5/16" so all overlay peers are routable
+    let overlay_ip_cidr = format!("{}/{}", our_overlay_ip, overlay_prefix_len);
+
+    // Convert join response peers into zlayer_overlay PeerConfig entries
+    let mut overlay_peers: Vec<zlayer_overlay::PeerConfig> = Vec::new();
     for peer in &join_response.peers {
+        if peer.wg_public_key.is_empty() {
+            warn!(
+                peer_id = %peer.node_id,
+                "Peer has no WireGuard public key, skipping overlay setup for this peer"
+            );
+            continue;
+        }
+        let peer_overlay_ip: std::net::Ipv4Addr = match peer.overlay_ip.parse() {
+            Ok(ip) => ip,
+            Err(e) => {
+                warn!(
+                    peer_id = %peer.node_id,
+                    overlay_ip = %peer.overlay_ip,
+                    error = %e,
+                    "Failed to parse peer overlay IP, skipping"
+                );
+                continue;
+            }
+        };
+        let endpoint = format!("{}:{}", peer.advertise_addr, peer.overlay_port);
+        overlay_peers.push(zlayer_overlay::PeerConfig::new(
+            peer.node_id.clone(),
+            peer.wg_public_key.clone(),
+            endpoint,
+            peer_overlay_ip,
+        ));
         info!(
             peer_id = %peer.node_id,
             peer_addr = %peer.advertise_addr,
-            "Added peer"
+            peer_overlay_ip = %peer_overlay_ip,
+            "Configured overlay peer"
         );
     }
+
+    // Persist overlay bootstrap state so the daemon can reload it later
+    // via OverlayBootstrap::load()
+    let bootstrap_state = zlayer_overlay::BootstrapState {
+        config: zlayer_overlay::BootstrapConfig {
+            cidr: token_data.overlay_cidr.clone(),
+            node_ip: our_overlay_ip,
+            interface: zlayer_overlay::DEFAULT_INTERFACE_NAME.to_string(),
+            port: overlay_port,
+            private_key: node_config.wireguard_private_key.clone(),
+            public_key: node_config.wireguard_public_key.clone(),
+            is_leader: false,
+            created_at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        },
+        peers: overlay_peers.clone(),
+        allocator_state: None,
+    };
+    let bootstrap_path = data_dir.join("overlay_bootstrap.json");
+    let bootstrap_json = serde_json::to_string_pretty(&bootstrap_state)
+        .context("Failed to serialize overlay bootstrap state")?;
+    tokio::fs::write(&bootstrap_path, bootstrap_json)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to write overlay bootstrap state to {}",
+                bootstrap_path.display()
+            )
+        })?;
+    info!(path = %bootstrap_path.display(), "Saved overlay bootstrap state");
+
+    // Create and configure the overlay transport (boringtun TUN device)
+    // This gives the joining node immediate overlay connectivity.
+    // The TUN device will be cleaned up when this process exits; the daemon
+    // will re-create it from the persisted bootstrap state on next start.
+    let overlay_config = zlayer_overlay::OverlayConfig {
+        local_endpoint: std::net::SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+            overlay_port,
+        ),
+        private_key: node_config.wireguard_private_key.clone(),
+        public_key: node_config.wireguard_public_key.clone(),
+        overlay_cidr: overlay_ip_cidr,
+        peer_discovery_interval: Duration::from_secs(30),
+    };
+
+    // Convert PeerConfig to PeerInfo for the transport layer
+    let peer_infos: Vec<zlayer_overlay::PeerInfo> = overlay_peers
+        .iter()
+        .filter_map(|p| match p.to_peer_info() {
+            Ok(info) => Some(info),
+            Err(e) => {
+                warn!(peer = %p.node_id, error = %e, "Failed to convert peer info, skipping");
+                None
+            }
+        })
+        .collect();
+
+    let interface_name = zlayer_overlay::DEFAULT_INTERFACE_NAME.to_string();
+    let mut transport = zlayer_overlay::OverlayTransport::new(overlay_config, interface_name);
+
+    match transport.create_interface().await {
+        Ok(()) => {
+            match transport.configure(&peer_infos).await {
+                Ok(()) => {
+                    info!(
+                        overlay_ip = %our_overlay_ip,
+                        peer_count = peer_infos.len(),
+                        "Overlay network interface configured successfully"
+                    );
+                    println!(
+                        "  Overlay network up: {} with {} peer(s)",
+                        our_overlay_ip,
+                        peer_infos.len()
+                    );
+                    // Keep the transport alive until we finish printing the
+                    // success message below; it will be cleaned up on exit.
+                    // The daemon re-creates the overlay from persisted state.
+                    drop(transport);
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Failed to configure overlay transport. \
+                         The overlay bootstrap state has been saved and the daemon will \
+                         retry on next start."
+                    );
+                    println!(
+                        "  Warning: Overlay interface created but configuration failed: {}",
+                        e
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            // Non-fatal: the overlay state is persisted, the daemon will set
+            // it up when it starts. This commonly fails in unprivileged
+            // environments or CI.
+            warn!(
+                error = %e,
+                "Failed to create overlay network interface. \
+                 Requires CAP_NET_ADMIN capability. The overlay bootstrap state has \
+                 been saved and the daemon will create the interface on next start."
+            );
+            println!(
+                "  Warning: Could not create overlay interface ({}). \
+                 The daemon will set it up on next start.",
+                e
+            );
+        }
+    }
+
+    // TODO: Existing peers also need to add this new node as a peer. Currently
+    // requires periodic reconciliation from Raft state or an explicit push
+    // notification from the leader after processing the join request.
 
     // 8. Detect GPUs on this node
     println!("  Detecting GPUs...");
@@ -981,7 +1171,7 @@ pub(crate) async fn handle_node_label(node_id: String, label: String) -> Result<
 /// Uses the UDP-connect trick: connect a UDP socket to an external address
 /// (no traffic is actually sent) and read back the local address the OS chose.
 /// Falls back to `0.0.0.0` if detection fails.
-fn detect_local_ip() -> String {
+pub(crate) fn detect_local_ip() -> String {
     use std::net::UdpSocket;
     match UdpSocket::bind("0.0.0.0:0") {
         Ok(socket) => {

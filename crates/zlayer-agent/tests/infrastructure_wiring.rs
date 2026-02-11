@@ -193,7 +193,7 @@ async fn test_proxy_ensure_ports_processes_public_endpoints() {
     let proxy = ProxyManager::new(config);
 
     let spec = mock_public_http_spec();
-    let _ = proxy.ensure_ports_for_service(&spec).await;
+    let _ = proxy.ensure_ports_for_service(&spec, None).await;
 }
 
 // =============================================================================

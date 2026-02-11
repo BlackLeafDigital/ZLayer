@@ -7,6 +7,8 @@ use tracing::{info, warn};
 use crate::cli::{Cli, RuntimeType};
 use crate::util::{discover_spec_path, parse_spec};
 
+#[cfg(target_os = "macos")]
+use zlayer_agent::MacSandboxConfig;
 use zlayer_agent::RuntimeConfig;
 #[cfg(target_os = "linux")]
 use zlayer_agent::YoukiConfig;
@@ -61,6 +63,28 @@ pub(crate) async fn status(cli: &Cli) -> Result<()> {
                 }
             }
         }
+        #[cfg(target_os = "macos")]
+        RuntimeType::MacSandbox => {
+            let config = RuntimeConfig::MacSandbox(MacSandboxConfig {
+                data_dir: cli.state_dir.clone(),
+                ..Default::default()
+            });
+            match zlayer_agent::create_runtime(config).await {
+                Ok(_) => println!("Status: macOS sandbox runtime ready"),
+                Err(e) => {
+                    println!("Status: macOS sandbox runtime unavailable");
+                    println!("Error: {}", e);
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        RuntimeType::MacVm => match zlayer_agent::create_runtime(RuntimeConfig::MacVm).await {
+            Ok(_) => println!("Status: macOS VM runtime ready"),
+            Err(e) => {
+                println!("Status: macOS VM runtime unavailable");
+                println!("Error: {}", e);
+            }
+        },
     }
 
     println!();
@@ -86,7 +110,11 @@ pub(crate) async fn validate(spec_path: &Path) -> Result<()> {
     }
 }
 
-/// Stream logs from a service
+/// Stream logs from a service via the daemon API.
+///
+/// When `follow` is false, fetches the last `lines` lines and prints them.
+/// When `follow` is true, opens an SSE stream to the daemon and prints log
+/// lines as they arrive in real time (until the user presses Ctrl+C).
 pub(crate) async fn logs(
     deployment: &str,
     service: &str,
@@ -103,20 +131,31 @@ pub(crate) async fn logs(
         "Fetching logs"
     );
 
-    // TODO: Implement actual log fetching from containerd or log aggregator
-    // For now, show a helpful message
-    println!("Log streaming for {}/{}", deployment, service);
-    println!("Lines: {}, Follow: {}", lines, follow);
-    if let Some(inst) = instance {
-        println!("Instance: {}", inst);
-    }
+    // Connect to the daemon (auto-starts if needed)
+    let client = crate::daemon_client::DaemonClient::connect()
+        .await
+        .context("Failed to connect to zlayer daemon")?;
 
-    // Placeholder - in production this would:
-    // 1. Connect to the scheduler to get service instances
-    // 2. Stream logs from containerd for each instance
-    // 3. Merge and format the log streams
-    println!("\n[Log streaming not yet implemented]");
-    println!("Use 'docker logs' or 'ctr tasks logs' for container logs");
+    if follow {
+        // ---- Follow mode: SSE streaming ----
+        let mut rx = client
+            .get_logs_streaming(deployment, service, lines, instance.as_deref())
+            .await
+            .context("Failed to start log streaming from daemon")?;
+
+        // Read lines from the channel until the stream ends or Ctrl+C.
+        while let Some(line) = rx.recv().await {
+            println!("{}", line);
+        }
+    } else {
+        // ---- Non-follow mode: one-shot fetch ----
+        let log_output = client
+            .get_logs_with_instance(deployment, service, lines, false, instance.as_deref())
+            .await
+            .context("Failed to fetch logs from daemon")?;
+
+        print!("{}", log_output);
+    }
 
     Ok(())
 }

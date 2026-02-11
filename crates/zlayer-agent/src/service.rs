@@ -249,6 +249,30 @@ impl ServiceInstance {
                     overlay_ip
                 };
 
+                // Query port override from the runtime.
+                // On macOS sandbox, each container is assigned a unique port since
+                // all processes share the host network (no network namespaces).
+                // The runtime passes the port to the process via the PORT env var.
+                let port_override = match self.runtime.get_container_port_override(&id).await {
+                    Ok(Some(port)) => {
+                        tracing::info!(
+                            container = %id,
+                            port = port,
+                            "runtime assigned dynamic port override for this container"
+                        );
+                        Some(port)
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            container = %id,
+                            error = %e,
+                            "failed to query port override from runtime, using spec port"
+                        );
+                        None
+                    }
+                };
+
                 // Start health monitoring and store handle (no lock needed during start)
                 let health_monitor_handle = {
                     let check = self.spec.health.check.clone();
@@ -263,19 +287,22 @@ impl ServiceInstance {
                     if let (Some(proxy), Some(ip)) = (&self.proxy_manager, effective_ip) {
                         let proxy = Arc::clone(proxy);
                         let service_name = self.service_name.clone();
-                        // Get the primary endpoint port for constructing the backend address
-                        let port = self
-                            .spec
-                            .endpoints
-                            .iter()
-                            .find(|ep| {
-                                matches!(
-                                    ep.protocol,
-                                    Protocol::Http | Protocol::Https | Protocol::Websocket
-                                )
-                            })
-                            .map(|ep| ep.port)
-                            .unwrap_or(8080);
+                        // Get the endpoint port, using the runtime override if present.
+                        // On macOS sandbox, port_override gives each replica a unique port
+                        // so the proxy can distinguish backends sharing 127.0.0.1.
+                        let port = port_override.unwrap_or_else(|| {
+                            self.spec
+                                .endpoints
+                                .iter()
+                                .find(|ep| {
+                                    matches!(
+                                        ep.protocol,
+                                        Protocol::Http | Protocol::Https | Protocol::Websocket
+                                    )
+                                })
+                                .map(|ep| ep.port)
+                                .unwrap_or(8080)
+                        });
 
                         let backend_addr = SocketAddr::new(ip, port);
 
@@ -325,6 +352,7 @@ impl ServiceInstance {
                             task: None,
                             overlay_ip: effective_ip,
                             health_monitor: Some(health_monitor_handle),
+                            port_override,
                         },
                     );
                 } // Lock released here
@@ -1095,19 +1123,50 @@ impl ServiceManager {
     }
 
     /// Update backend addresses in the StreamRegistry for TCP/UDP endpoints after scaling
+    ///
+    /// For containers with a port override (macOS sandbox), the addresses already
+    /// carry the runtime-assigned port. In that case, the container listens on the
+    /// override port for all traffic, so we use the address port directly. For
+    /// containers without a port override (Linux, VMs), we reconstruct addresses
+    /// using the endpoint's declared port, since each container has its own IP
+    /// and can bind any port independently.
     fn update_stream_backends(&self, spec: &ServiceSpec, addrs: &[SocketAddr]) {
         let Some(stream_registry) = &self.stream_registry else {
             return;
         };
 
+        // Determine if any addresses have a port override by checking whether
+        // all addresses use the same port as the primary spec endpoint. If not,
+        // they carry per-container port overrides and should be used as-is.
+        let primary_spec_port = spec
+            .endpoints
+            .iter()
+            .find(|ep| {
+                matches!(
+                    ep.protocol,
+                    Protocol::Http | Protocol::Https | Protocol::Websocket
+                )
+            })
+            .map(|ep| ep.port)
+            .unwrap_or(8080);
+
+        let has_port_overrides = addrs.iter().any(|addr| addr.port() != primary_spec_port);
+
         for endpoint in &spec.endpoints {
             match endpoint.protocol {
                 Protocol::Tcp => {
-                    // For TCP, construct backend addresses using the endpoint's port
-                    let tcp_backends: Vec<SocketAddr> = addrs
-                        .iter()
-                        .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
-                        .collect();
+                    let tcp_backends: Vec<SocketAddr> = if has_port_overrides {
+                        // Port overrides active (macOS sandbox): the container listens
+                        // on its assigned port for all traffic. Use addresses as-is.
+                        addrs.to_vec()
+                    } else {
+                        // Normal case: each container has its own IP, construct
+                        // addresses using the TCP endpoint's declared port.
+                        addrs
+                            .iter()
+                            .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
+                            .collect()
+                    };
 
                     stream_registry.update_tcp_backends(endpoint.port, tcp_backends);
 
@@ -1119,11 +1178,14 @@ impl ServiceManager {
                     );
                 }
                 Protocol::Udp => {
-                    // For UDP, construct backend addresses using the endpoint's port
-                    let udp_backends: Vec<SocketAddr> = addrs
-                        .iter()
-                        .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
-                        .collect();
+                    let udp_backends: Vec<SocketAddr> = if has_port_overrides {
+                        addrs.to_vec()
+                    } else {
+                        addrs
+                            .iter()
+                            .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
+                            .collect()
+                    };
 
                     stream_registry.update_udp_backends(endpoint.port, udp_backends);
 
@@ -1204,6 +1266,11 @@ impl ServiceManager {
     /// This queries the service instance's containers for their overlay network
     /// IP addresses and constructs backend addresses using those IPs with the
     /// service's endpoint port.
+    ///
+    /// If a container has a `port_override` (e.g., macOS sandbox where all
+    /// containers share the host network), that port is used instead of the
+    /// spec-declared endpoint port. This allows multiple replicas on the same
+    /// IP (`127.0.0.1`) to be distinguished by port.
     async fn collect_backend_addrs(
         &self,
         instance: &ServiceInstance,
@@ -1211,8 +1278,8 @@ impl ServiceManager {
     ) -> Vec<SocketAddr> {
         let mut addrs = Vec::new();
 
-        // Get the primary endpoint port (first HTTP endpoint)
-        let port = instance
+        // Get the primary endpoint port (first HTTP endpoint) as the default
+        let spec_port = instance
             .spec
             .endpoints
             .iter()
@@ -1230,6 +1297,9 @@ impl ServiceManager {
 
         for container in containers.values() {
             if let Some(ip) = container.overlay_ip {
+                // Use the runtime-assigned port override if present (macOS sandbox),
+                // otherwise fall back to the spec-declared endpoint port.
+                let port = container.port_override.unwrap_or(spec_port);
                 addrs.push(SocketAddr::new(ip, port));
             }
         }
@@ -1382,6 +1452,93 @@ impl ServiceManager {
         self.services.read().await.keys().cloned().collect()
     }
 
+    /// Get logs for a service, aggregated from all container replicas.
+    ///
+    /// # Arguments
+    /// * `service_name` - Name of the service to fetch logs for
+    /// * `tail` - Number of lines to return (0 = all)
+    /// * `instance` - Optional specific instance (container ID suffix like "1", "2")
+    ///
+    /// # Returns
+    /// Combined log output from all (or specific) container replicas as a string.
+    pub async fn get_service_logs(
+        &self,
+        service_name: &str,
+        tail: usize,
+        instance: Option<&str>,
+    ) -> Result<String> {
+        let container_ids = self.get_service_containers(service_name).await;
+
+        if container_ids.is_empty() {
+            return Err(AgentError::NotFound {
+                container: service_name.to_string(),
+                reason: "no containers found for service".to_string(),
+            });
+        }
+
+        // If a specific instance is requested, filter to just that one
+        let target_ids: Vec<&ContainerId> = if let Some(inst) = instance {
+            if let Ok(replica_num) = inst.parse::<u32>() {
+                container_ids
+                    .iter()
+                    .filter(|id| id.replica == replica_num)
+                    .collect()
+            } else {
+                // Try matching by full container ID string suffix
+                container_ids
+                    .iter()
+                    .filter(|id| id.to_string().contains(inst))
+                    .collect()
+            }
+        } else {
+            container_ids.iter().collect()
+        };
+
+        if target_ids.is_empty() {
+            return Err(AgentError::NotFound {
+                container: format!("{}/{}", service_name, instance.unwrap_or("?")),
+                reason: "instance not found".to_string(),
+            });
+        }
+
+        let mut combined = String::new();
+
+        for id in &target_ids {
+            let header = if target_ids.len() > 1 {
+                format!("==> {} <==\n", id)
+            } else {
+                String::new()
+            };
+
+            match self.runtime.container_logs(id, tail).await {
+                Ok(logs) => {
+                    if !logs.is_empty() {
+                        combined.push_str(&header);
+                        combined.push_str(&logs);
+                        if !combined.ends_with('\n') {
+                            combined.push('\n');
+                        }
+                    }
+                }
+                Err(e) => {
+                    combined.push_str(&header);
+                    combined.push_str(&format!("[error reading logs: {}]\n", e));
+                }
+            }
+        }
+
+        // If tail is requested and we have multiple containers, apply tail to combined output
+        if tail > 0 && target_ids.len() > 1 {
+            let lines: Vec<&str> = combined.lines().collect();
+            if lines.len() > tail {
+                combined = lines[lines.len() - tail..].join("\n");
+                combined.push('\n');
+            }
+        }
+
+        Ok(combined)
+    }
+
     /// Get all container IDs for a specific service
     ///
     /// Returns an empty vector if the service doesn't exist.
@@ -1398,6 +1555,49 @@ impl ServiceManager {
         } else {
             Vec::new()
         }
+    }
+
+    /// Execute a command inside a running container for a service
+    ///
+    /// Picks a specific replica if provided, otherwise uses the first available container.
+    ///
+    /// # Arguments
+    /// * `service_name` - Name of the service
+    /// * `replica` - Optional replica number to target
+    /// * `cmd` - Command and arguments to execute
+    ///
+    /// # Returns
+    /// Tuple of (exit_code, stdout, stderr)
+    pub async fn exec_in_container(
+        &self,
+        service_name: &str,
+        replica: Option<u32>,
+        cmd: &[String],
+    ) -> Result<(i32, String, String)> {
+        let container_ids = self.get_service_containers(service_name).await;
+
+        if container_ids.is_empty() {
+            return Err(AgentError::NotFound {
+                container: service_name.to_string(),
+                reason: "no containers found for service".to_string(),
+            });
+        }
+
+        // Pick the target container
+        let target = if let Some(rep) = replica {
+            container_ids
+                .into_iter()
+                .find(|cid| cid.replica == rep)
+                .ok_or_else(|| AgentError::NotFound {
+                    container: format!("{}-rep-{}", service_name, rep),
+                    reason: format!("replica {} not found for service", rep),
+                })?
+        } else {
+            // Use the first container (lowest replica number)
+            container_ids.into_iter().next().unwrap()
+        };
+
+        self.runtime.exec(&target, cmd).await
     }
 
     // ==================== Job Management ====================

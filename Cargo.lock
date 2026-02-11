@@ -4351,6 +4351,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libloading"
+version = "0.8.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7c4b02199fee7c5d21a5ae7d8cfa79a6ef5bb2fc834d6e9058e89c825efdc55"
+dependencies = [
+ "cfg-if",
+ "windows-link",
+]
+
+[[package]]
 name = "libm"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6722,9 +6732,15 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "bytes",
  "chrono",
  "clap 4.5.56",
  "crossterm",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
+ "libc",
+ "nix 0.31.1",
  "rand 0.8.5",
  "ratatui",
  "reqwest 0.13.1",
@@ -6732,6 +6748,8 @@ dependencies = [
  "serde_json",
  "serde_yaml 0.9.34+deprecated",
  "tokio",
+ "tokio-stream",
+ "tower",
  "tracing",
  "uuid",
  "zlayer-agent",
@@ -6741,8 +6759,10 @@ dependencies = [
  "zlayer-init-actions",
  "zlayer-observability",
  "zlayer-overlay",
+ "zlayer-proxy",
  "zlayer-registry",
  "zlayer-scheduler",
+ "zlayer-secrets",
  "zlayer-spec",
  "zlayer-tui",
  "zlayer-tunnel",
@@ -10705,6 +10725,7 @@ dependencies = [
  "ipnetwork",
  "libc",
  "libcontainer",
+ "libloading",
  "nix 0.31.1",
  "num_cpus",
  "oci-spec",
@@ -10740,6 +10761,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum",
+ "base64 0.22.1",
  "chrono",
  "flate2",
  "futures-util",
@@ -10769,6 +10791,7 @@ dependencies = [
  "zlayer-agent",
  "zlayer-builder",
  "zlayer-observability",
+ "zlayer-overlay",
  "zlayer-scheduler",
  "zlayer-secrets",
  "zlayer-spec",
@@ -11112,6 +11135,7 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "uuid",
+ "zlayer-spec",
 ]
 
 [[package]]

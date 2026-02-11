@@ -176,12 +176,95 @@ jobs:
           RUST_LOG: debug
 
   # ===========================================
+  # macOS Unit Tests
+  # Runs unit and doc tests on macOS to catch regressions in
+  # macOS-specific code (#[cfg(target_os = "macos")]).
+  # Linux-only tests are automatically excluded.
+  # ===========================================
+  macos-unit-tests:
+    name: Unit Tests (macOS)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.sha || inputs.sha || github.sha }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-macos-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install system dependencies
+        run: brew install protobuf
+
+      - name: Run unit tests
+        run: cargo test --workspace --lib --bins
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug
+
+      - name: Run doc tests
+        run: cargo test --workspace --doc
+
+  # ===========================================
+  # E2E Tests (macOS Sandbox)
+  # ===========================================
+  macos-sandbox-e2e:
+    name: E2E Tests (macOS Sandbox)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.client_payload.sha || inputs.sha || github.sha }}
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-macos-sandbox-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install system dependencies
+        run: brew install protobuf
+
+      - name: Setup E2E environment
+        run: |
+          rm -rf /tmp/zlayer-macos-sandbox-e2e-test 2>/dev/null || true
+          mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/{data,logs}
+          mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/data/{containers,images}
+
+      - name: Run macOS Sandbox E2E tests
+        run: cargo test --package zlayer-agent --test macos_sandbox_e2e -- --nocapture
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf /tmp/zlayer-macos-sandbox-e2e-test 2>/dev/null || true
+
+  # ===========================================
   # Trigger Release (if version provided)
   # ===========================================
   trigger-release:
     name: Trigger Release
     runs-on: ubuntu-latest
-    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests]
+    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, macos-unit-tests, macos-sandbox-e2e]
     if: github.event.client_payload.version != '' || inputs.version != ''
     steps:
       - name: Determine version

@@ -219,7 +219,7 @@ pub fn get_secret_references(env: &HashMap<String, String>) -> Vec<&str> {
 ///     let resolved = resolve_env_with_secrets(&env, provider, "my-deployment").await.unwrap();
 /// }
 /// ```
-pub async fn resolve_env_with_secrets<P: SecretsProvider>(
+pub async fn resolve_env_with_secrets<P: SecretsProvider + ?Sized>(
     env: &HashMap<String, String>,
     secrets_provider: &P,
     scope: &str,
@@ -248,7 +248,7 @@ pub async fn resolve_env_with_secrets<P: SecretsProvider>(
 /// # Returns
 /// * `Ok(String)` - The resolved value
 /// * `Err(EnvResolutionError)` - If a $S: or $E: reference cannot be resolved
-pub async fn resolve_value_with_secrets<P: SecretsProvider>(
+pub async fn resolve_value_with_secrets<P: SecretsProvider + ?Sized>(
     value: &str,
     secrets_provider: &P,
     scope: &str,

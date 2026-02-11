@@ -1,6 +1,7 @@
 //! Node tunnel configuration
 
 use serde::{Deserialize, Serialize};
+use zlayer_spec::ExposeType;
 
 use crate::ServiceProtocol;
 
@@ -33,17 +34,6 @@ pub struct NodeTunnel {
     /// Auto-generated token for this tunnel
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-}
-
-/// Exposure type for tunneled ports
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum ExposeType {
-    /// Only accessible within the mesh network
-    #[default]
-    Internal,
-    /// Publicly accessible from internet
-    Public,
 }
 
 impl NodeTunnel {

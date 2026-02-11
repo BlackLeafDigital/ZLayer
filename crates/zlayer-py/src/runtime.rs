@@ -133,19 +133,28 @@ impl Runtime {
             let runtime: Arc<dyn AgentRuntime + Send + Sync> = if opts.mock {
                 Arc::new(MockRuntime::new())
             } else {
-                // Create youki runtime with proper initialization
-                let config = if let Some(state) = opts.state_dir.as_ref() {
-                    zlayer_agent::YoukiConfig {
-                        state_dir: PathBuf::from(state),
-                        ..Default::default()
-                    }
-                } else {
-                    zlayer_agent::YoukiConfig::default()
-                };
+                #[cfg(target_os = "linux")]
+                {
+                    // Create youki runtime with proper initialization
+                    let config = if let Some(state) = opts.state_dir.as_ref() {
+                        zlayer_agent::YoukiConfig {
+                            state_dir: PathBuf::from(state),
+                            ..Default::default()
+                        }
+                    } else {
+                        zlayer_agent::YoukiConfig::default()
+                    };
 
-                zlayer_agent::create_runtime(RuntimeConfig::Youki(config))
-                    .await
-                    .map_err(ZLayerError::from)?
+                    zlayer_agent::create_runtime(RuntimeConfig::Youki(config))
+                        .await
+                        .map_err(ZLayerError::from)?
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    zlayer_agent::create_runtime(RuntimeConfig::Auto)
+                        .await
+                        .map_err(ZLayerError::from)?
+                }
             };
 
             let service_manager = ServiceManager::new(runtime.clone());

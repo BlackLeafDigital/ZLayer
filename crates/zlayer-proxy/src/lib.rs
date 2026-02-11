@@ -94,8 +94,8 @@ pub use sni_resolver::SniCertResolver;
 
 // Re-export stream (L4) proxy types
 pub use stream::{
-    StreamRegistry, StreamService, TcpListenerConfig, TcpStreamService, UdpListenerConfig,
-    UdpStreamService, DEFAULT_UDP_SESSION_TIMEOUT,
+    BackendHealth as StreamBackendHealth, StreamRegistry, StreamService, TcpListenerConfig,
+    TcpStreamService, UdpListenerConfig, UdpStreamService, DEFAULT_UDP_SESSION_TIMEOUT,
 };
 
 // ============================================================================

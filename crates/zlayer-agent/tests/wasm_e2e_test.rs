@@ -1699,6 +1699,7 @@ mod wasm_filesystem_e2e {
             target: "/data".to_string(),
             readonly: false,
             tier: StorageTier::Local,
+            size: None,
         };
         match &spec {
             StorageSpec::Named {
@@ -1706,6 +1707,7 @@ mod wasm_filesystem_e2e {
                 target,
                 readonly,
                 tier,
+                ..
             } => {
                 assert_eq!(name, "my-volume");
                 assert_eq!(target, "/data");
@@ -1725,6 +1727,7 @@ mod wasm_filesystem_e2e {
             target: "/var/lib/db".to_string(),
             readonly: false,
             tier: StorageTier::Local,
+            size: None,
         };
         if let StorageSpec::Named { tier, .. } = &local_vol {
             assert_eq!(*tier, StorageTier::Local);
@@ -1736,6 +1739,7 @@ mod wasm_filesystem_e2e {
             target: "/var/cache".to_string(),
             readonly: false,
             tier: StorageTier::Cached,
+            size: None,
         };
         if let StorageSpec::Named { tier, .. } = &cached_vol {
             assert_eq!(*tier, StorageTier::Cached);
@@ -1747,6 +1751,7 @@ mod wasm_filesystem_e2e {
             target: "/shared".to_string(),
             readonly: true,
             tier: StorageTier::Network,
+            size: None,
         };
         if let StorageSpec::Named { tier, .. } = &network_vol {
             assert_eq!(*tier, StorageTier::Network);
@@ -1786,6 +1791,7 @@ mod wasm_filesystem_e2e {
                 target: "/app/data".to_string(),
                 readonly: false,
                 tier: StorageTier::Local,
+                size: None,
             },
             StorageSpec::Bind {
                 source: "/var/log/app".to_string(),

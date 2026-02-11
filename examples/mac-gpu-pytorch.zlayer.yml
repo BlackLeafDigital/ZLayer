@@ -1,0 +1,60 @@
+# mac-gpu-pytorch.zlayer.yml - PyTorch inference on Apple Silicon MPS
+#
+# Deploys a PyTorch model inference service using Metal Performance Shaders.
+# MPS mode uses pre-compiled GPU kernels (smaller attack surface than full
+# Metal compute). Most PyTorch inference workloads only need MPS.
+#
+#   zlayer deploy -f examples/mac-gpu-pytorch.zlayer.yml
+
+version: v1
+deployment: pytorch-mps-inference
+
+services:
+  inference:
+    rtype: service
+    image:
+      name: pytorch-inference:latest
+      pull_policy: if_not_present
+
+    command:
+      entrypoint: ["python3", "-m", "uvicorn", "app:app", "--host", "0.0.0.0"]
+
+    resources:
+      cpu: 4.0
+      memory: 8Gi
+      gpu:
+        vendor: apple
+        count: 1
+        mode: mps
+
+    env:
+      PYTORCH_MPS_HIGH_WATERMARK_RATIO: "0.7"
+      TORCH_DEVICE: mps
+      MODEL_PATH: /models/model.pt
+
+    storage:
+      - type: named
+        name: model-weights
+        target: /models
+        readonly: true
+        size: 10Gi
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8000
+        expose: public
+
+    scale:
+      mode: fixed
+      replicas: 1
+
+    health:
+      start_grace: 60s
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      check:
+        type: http
+        url: http://localhost:8000/health
+        expect_status: 200

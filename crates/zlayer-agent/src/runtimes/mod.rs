@@ -118,8 +118,20 @@ mod wasm_http_interfaces;
 #[cfg(feature = "wasm")]
 pub mod wasm_test;
 
+#[cfg(target_os = "macos")]
+pub mod macos_sandbox;
+
+#[cfg(target_os = "macos")]
+pub mod macos_vm;
+
 #[cfg(target_os = "linux")]
 pub use youki::{YoukiConfig, YoukiRuntime};
+
+#[cfg(target_os = "macos")]
+pub use macos_sandbox::SandboxRuntime;
+
+#[cfg(target_os = "macos")]
+pub use macos_vm::VmRuntime;
 
 #[cfg(feature = "docker")]
 pub use docker::DockerRuntime;

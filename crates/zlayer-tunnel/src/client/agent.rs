@@ -25,9 +25,10 @@ use crate::{Message, Result, ServiceConfig, ServiceProtocol, TunnelClientConfig,
 // =============================================================================
 
 /// Current state of the tunnel agent
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum AgentState {
     /// Not connected to the server
+    #[default]
     Disconnected,
     /// Attempting to connect
     Connecting,
@@ -43,31 +44,20 @@ pub enum AgentState {
     },
 }
 
-impl Default for AgentState {
-    fn default() -> Self {
-        Self::Disconnected
-    }
-}
-
 // =============================================================================
 // Service Status
 // =============================================================================
 
 /// Status of a registered service
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum ServiceStatus {
     /// Service registration is pending
+    #[default]
     Pending,
     /// Service is registered and active
     Registered,
     /// Service registration failed
     Failed(String),
-}
-
-impl Default for ServiceStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 // =============================================================================

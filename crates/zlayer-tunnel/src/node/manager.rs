@@ -42,9 +42,10 @@ pub struct TunnelStatus {
 }
 
 /// State of a tunnel connection
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum TunnelState {
     /// Tunnel is configured but not started
+    #[default]
     Pending,
     /// Tunnel is attempting to connect
     Connecting,
@@ -54,12 +55,6 @@ pub enum TunnelState {
     Disconnected,
     /// Tunnel connection failed
     Failed(String),
-}
-
-impl Default for TunnelState {
-    fn default() -> Self {
-        Self::Pending
-    }
 }
 
 /// Outbound tunnel tracking

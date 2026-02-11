@@ -21,7 +21,6 @@ pub mod logger;
 pub mod state;
 pub mod widgets;
 
-pub use app::DeployTui;
 pub use logger::PlainDeployLogger;
 
 /// Deployment event for TUI/logger updates

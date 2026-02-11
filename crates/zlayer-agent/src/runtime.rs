@@ -50,6 +50,11 @@ pub struct Container {
     pub overlay_ip: Option<IpAddr>,
     /// Health monitor task handle for this container
     pub health_monitor: Option<JoinHandle<()>>,
+    /// Runtime-assigned port override (used by macOS sandbox where all
+    /// containers share the host network and need unique ports).
+    /// When `Some(port)`, the proxy should use this port instead of the
+    /// spec-declared endpoint port for this specific container's backend address.
+    pub port_override: Option<u16>,
 }
 
 /// Abstract container runtime trait
@@ -121,6 +126,24 @@ pub trait Runtime: Send + Sync {
     ///
     /// Used for proxy backend registration when overlay networking is unavailable.
     async fn get_container_ip(&self, id: &ContainerId) -> Result<Option<IpAddr>>;
+
+    /// Get a runtime-assigned port override for a container.
+    ///
+    /// Returns:
+    /// - `Ok(Some(port))` if the runtime assigned a dynamic port to this container
+    /// - `Ok(None)` if the container should use the spec-declared endpoint port
+    ///
+    /// This exists for runtimes where all containers share the host network stack
+    /// (e.g., macOS sandbox). Without network namespaces, multiple replicas of
+    /// the same service would conflict on the same port. The runtime assigns
+    /// each replica a unique port and passes it via the `PORT` environment variable.
+    /// The proxy then routes to `container_ip:override_port` instead of
+    /// `container_ip:spec_port`.
+    ///
+    /// Runtimes with per-container networking (overlay, VMs, Docker) return `None`.
+    async fn get_container_port_override(&self, _id: &ContainerId) -> Result<Option<u16>> {
+        Ok(None)
+    }
 }
 
 /// In-memory mock runtime for testing and development
@@ -166,6 +189,7 @@ impl Runtime for MockRuntime {
                 task: None,
                 overlay_ip: None,
                 health_monitor: None,
+                port_override: None,
             },
         );
         Ok(())

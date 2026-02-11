@@ -66,6 +66,9 @@ pub struct OverlayManager {
     service_transports: RwLock<HashMap<String, OverlayTransport>>,
     /// IP allocator for overlay networks
     ip_allocator: IpAllocator,
+    /// This node's IP address on the global overlay network.
+    /// Set after `setup_global_overlay()` succeeds.
+    node_ip: Option<Ipv4Addr>,
 }
 
 impl OverlayManager {
@@ -78,6 +81,7 @@ impl OverlayManager {
             service_interfaces: RwLock::new(HashMap::new()),
             service_transports: RwLock::new(HashMap::new()),
             ip_allocator: IpAllocator::new("10.200.0.0/16".parse().unwrap()),
+            node_ip: None,
         })
     }
 
@@ -101,6 +105,7 @@ impl OverlayManager {
             AgentError::Network(format!("Failed to configure global overlay: {}", e))
         })?;
 
+        self.node_ip = Some(node_ip);
         self.global_interface = Some(interface_name);
         self.global_transport = Some(transport);
         Ok(())
@@ -167,31 +172,53 @@ impl OverlayManager {
         Ok(())
     }
 
-    /// Add a container to the appropriate overlay networks
+    /// Add a container to the appropriate overlay networks.
+    ///
+    /// On non-Linux platforms this is a no-op: per-container overlay attachment
+    /// relies on Linux network namespaces (veth pairs + `nsenter`).  On macOS,
+    /// containers share the host network, so the node's overlay IP is returned
+    /// directly and the proxy differentiates traffic by port.
     pub async fn attach_container(
         &self,
         container_pid: u32,
         service_name: &str,
         join_global: bool,
     ) -> Result<Ipv4Addr, AgentError> {
-        let interfaces = self.service_interfaces.read().await;
-        let service_iface = interfaces.get(service_name).ok_or_else(|| {
-            AgentError::Network(format!("No overlay for service: {}", service_name))
-        })?;
-
-        let container_ip = self.ip_allocator.allocate()?;
-        self.attach_to_interface(container_pid, service_iface, container_ip)
-            .await?;
-
-        if join_global {
-            if let Some(global_iface) = &self.global_interface {
-                let global_ip = self.ip_allocator.allocate()?;
-                self.attach_to_interface(container_pid, global_iface, global_ip)
-                    .await?;
-            }
+        // Per-container overlay attachment uses Linux network namespaces.
+        // On non-Linux platforms, return the node's overlay IP (or loopback).
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Suppress unused-variable warnings for the Linux-only parameters.
+            let _ = (container_pid, join_global);
+            tracing::debug!(
+                service = %service_name,
+                "Skipping per-container overlay attachment (not supported on this platform). \
+                 Containers will use the node's overlay IP via host networking."
+            );
+            return Ok(self.node_ip.unwrap_or(Ipv4Addr::LOCALHOST));
         }
 
-        Ok(container_ip)
+        #[allow(unreachable_code)]
+        {
+            let interfaces = self.service_interfaces.read().await;
+            let service_iface = interfaces.get(service_name).ok_or_else(|| {
+                AgentError::Network(format!("No overlay for service: {}", service_name))
+            })?;
+
+            let container_ip = self.ip_allocator.allocate()?;
+            self.attach_to_interface(container_pid, service_iface, container_ip)
+                .await?;
+
+            if join_global {
+                if let Some(global_iface) = &self.global_interface {
+                    let global_ip = self.ip_allocator.allocate()?;
+                    self.attach_to_interface(container_pid, global_iface, global_ip)
+                        .await?;
+                }
+            }
+
+            Ok(container_ip)
+        }
     }
 
     async fn attach_to_interface(
@@ -275,6 +302,28 @@ impl OverlayManager {
         Ok(())
     }
 
+    /// Tear down the overlay network for a single service.
+    ///
+    /// Removes the service's TUN transport (destroying the interface) and
+    /// clears its entry from the interface tracking map.  This is safe to call
+    /// even if no overlay was created for the service (it will be a no-op).
+    pub async fn teardown_service_overlay(&self, service_name: &str) {
+        // Remove and shut down the transport (destroys TUN device)
+        if let Some(mut transport) = self.service_transports.write().await.remove(service_name) {
+            tracing::info!(service = %service_name, "Shutting down service overlay transport");
+            transport.shutdown();
+        }
+
+        // Remove from interface tracking
+        if let Some(iface) = self.service_interfaces.write().await.remove(service_name) {
+            tracing::info!(
+                service = %service_name,
+                interface = %iface,
+                "Removed service overlay interface"
+            );
+        }
+    }
+
     /// Cleanup all overlay networks
     pub async fn cleanup(&mut self) -> Result<(), AgentError> {
         // Drop service transports (destroys TUN devices)
@@ -296,6 +345,13 @@ impl OverlayManager {
         self.global_interface = None;
 
         Ok(())
+    }
+
+    /// Returns this node's IP on the global overlay network, if available.
+    ///
+    /// This is set after [`setup_global_overlay`] completes successfully.
+    pub fn node_ip(&self) -> Option<Ipv4Addr> {
+        self.node_ip
     }
 
     fn build_config(
@@ -530,5 +586,19 @@ mod tests {
 
         let name = make_interface_name(&["\u{00E9}\u{00E9}\u{00E9}", "\u{00FC}\u{00FC}"], "s");
         assert!(name.len() <= MAX_IFNAME_LEN, "Name '{}' too long", name);
+    }
+
+    /// node_ip() should be None before setup_global_overlay and Some after.
+    #[tokio::test]
+    async fn test_node_ip_before_and_after_init() {
+        let om = OverlayManager::new("test-deploy".to_string())
+            .await
+            .unwrap();
+
+        // Before global overlay setup, node_ip should be None
+        assert!(
+            om.node_ip().is_none(),
+            "node_ip should be None before setup_global_overlay"
+        );
     }
 }

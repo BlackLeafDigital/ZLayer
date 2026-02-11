@@ -15,6 +15,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::auth::AuthState;
 use crate::config::ApiConfig;
 use crate::handlers;
+use crate::handlers::cluster::ClusterApiState;
 use crate::handlers::cron::CronState;
 use crate::handlers::deployments::DeploymentState;
 use crate::handlers::internal::InternalState;
@@ -46,6 +47,7 @@ pub fn build_router_with_storage(
     // Auth state
     let auth_state = AuthState {
         jwt_secret: config.jwt_secret.clone(),
+        credential_store: config.credential_store.clone(),
     };
 
     // Deployment state (for CRUD operations)
@@ -96,6 +98,14 @@ pub fn build_router_with_storage(
         .route(
             "/{deployment}/services/{service}/logs",
             get(handlers::services::get_service_logs),
+        )
+        .route(
+            "/{deployment}/services/{service}/containers",
+            get(handlers::services::list_containers),
+        )
+        .route(
+            "/{deployment}/services/{service}/exec",
+            post(handlers::services::exec_in_service),
         )
         .with_state(service_state);
 
@@ -265,6 +275,7 @@ pub fn build_router_with_services(
     // Auth state
     let auth_state = AuthState {
         jwt_secret: config.jwt_secret.clone(),
+        credential_store: config.credential_store.clone(),
     };
 
     // Deployment state (for deployment CRUD operations)
@@ -315,6 +326,119 @@ pub fn build_router_with_services(
         .route(
             "/{deployment}/services/{service}/logs",
             get(handlers::services::get_service_logs),
+        )
+        .route(
+            "/{deployment}/services/{service}/containers",
+            get(handlers::services::list_containers),
+        )
+        .route(
+            "/{deployment}/services/{service}/exec",
+            post(handlers::services::exec_in_service),
+        )
+        .with_state(service_state);
+
+    // API v1 routes - merge deployment and service routes
+    let api_v1 = Router::new()
+        .merge(deployment_crud_routes)
+        .merge(service_routes);
+
+    // Main router
+    let mut router = Router::new()
+        .nest("/health", health_routes)
+        .nest("/auth", auth_routes)
+        .nest("/api/v1/deployments", api_v1)
+        .layer(Extension(auth_state))
+        .layer(Extension(rate_limit_state))
+        .layer(Extension(ip_limiter))
+        .layer(middleware::from_fn(rate_limit_middleware))
+        .layer(cors)
+        .layer(TraceLayer::new_for_http());
+
+    // Add Swagger UI if enabled
+    if config.swagger_enabled {
+        router = router
+            .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()));
+    }
+
+    router
+}
+
+/// Build the API router with services, using a pre-built DeploymentState.
+///
+/// This variant allows the caller to provide a DeploymentState with orchestration
+/// handles (service manager, overlay, proxy) already wired in, enabling the
+/// create_deployment handler to perform actual container orchestration.
+///
+/// # Arguments
+/// * `config` - API configuration
+/// * `deployment_state` - Pre-built deployment state (may include orchestration handles)
+/// * `service_manager` - ServiceManager for service scaling operations
+/// * `storage` - Storage backend (for ServiceState)
+pub fn build_router_with_deployment_state(
+    config: &ApiConfig,
+    deployment_state: DeploymentState,
+    service_manager: Arc<RwLock<ServiceManager>>,
+    storage: Arc<dyn DeploymentStorage + Send + Sync>,
+) -> Router {
+    // Auth state
+    let auth_state = AuthState {
+        jwt_secret: config.jwt_secret.clone(),
+        credential_store: config.credential_store.clone(),
+    };
+
+    // Service state (for service scaling operations)
+    let service_state = ServiceState::new(service_manager, storage);
+
+    // Rate limiting
+    let rate_limit_state = RateLimitState::new(&config.rate_limit);
+    let ip_limiter = Arc::new(IpRateLimiter::new(config.rate_limit.clone()));
+
+    // CORS layer
+    let cors = build_cors_layer(config);
+
+    // Health routes (no auth required)
+    let health_routes = Router::new()
+        .route("/live", get(handlers::health::liveness))
+        .route("/ready", get(handlers::health::readiness));
+
+    // Auth routes (no auth required for token endpoint)
+    let auth_routes = Router::new()
+        .route("/token", post(handlers::auth::get_token))
+        .with_state(auth_state.clone());
+
+    // Deployment CRUD routes (use pre-built DeploymentState with orchestration)
+    let deployment_crud_routes = Router::new()
+        .route("/", get(handlers::deployments::list_deployments))
+        .route("/", post(handlers::deployments::create_deployment))
+        .route("/{name}", get(handlers::deployments::get_deployment))
+        .route("/{name}", delete(handlers::deployments::delete_deployment))
+        .with_state(deployment_state);
+
+    // Service routes (use ServiceState for scaling operations)
+    let service_routes = Router::new()
+        .route(
+            "/{deployment}/services",
+            get(handlers::services::list_services),
+        )
+        .route(
+            "/{deployment}/services/{service}",
+            get(handlers::services::get_service),
+        )
+        .route(
+            "/{deployment}/services/{service}/scale",
+            post(handlers::services::scale_service),
+        )
+        .route(
+            "/{deployment}/services/{service}/logs",
+            get(handlers::services::get_service_logs),
+        )
+        .route(
+            "/{deployment}/services/{service}/containers",
+            get(handlers::services::list_containers),
+        )
+        .route(
+            "/{deployment}/services/{service}/exec",
+            post(handlers::services::exec_in_service),
         )
         .with_state(service_state);
 
@@ -658,6 +782,23 @@ pub fn build_router_with_tunnels(
 
     // Merge tunnel routes into API v1
     base_router.nest("/api/v1/tunnels", tunnel_routes)
+}
+
+/// Build routes for cluster management (join, node listing).
+///
+/// Creates the routes for cluster join and node listing operations.
+/// The join endpoint does NOT require JWT auth (it uses token-based auth).
+///
+/// # Arguments
+/// * `cluster_state` - State containing the Raft coordinator
+///
+/// # Returns
+/// A Router with the cluster endpoints
+pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
+    Router::new()
+        .route("/join", post(handlers::cluster::cluster_join))
+        .route("/nodes", get(handlers::cluster::cluster_list_nodes))
+        .with_state(cluster_state)
 }
 
 fn build_cors_layer(config: &ApiConfig) -> CorsLayer {

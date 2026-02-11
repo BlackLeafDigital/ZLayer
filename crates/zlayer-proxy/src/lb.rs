@@ -75,20 +75,15 @@ impl Backend {
 }
 
 /// Load balancing algorithm
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LoadBalancerAlgorithm {
     /// Round-robin selection
+    #[default]
     RoundRobin,
     /// Least connections
     LeastConnections,
     /// Random selection
     Random,
-}
-
-impl Default for LoadBalancerAlgorithm {
-    fn default() -> Self {
-        Self::RoundRobin
-    }
 }
 
 /// Load balancer for distributing requests across backends
