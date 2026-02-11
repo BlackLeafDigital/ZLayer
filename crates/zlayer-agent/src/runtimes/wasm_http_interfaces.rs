@@ -123,7 +123,6 @@ pub enum HttpVersion {
     Http3 = 3,
 }
 
-
 impl std::fmt::Display for HttpVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -943,7 +942,6 @@ pub enum HttpMethod {
     Connect = 7,
     Trace = 8,
 }
-
 
 impl std::fmt::Display for HttpMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

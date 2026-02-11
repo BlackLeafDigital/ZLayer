@@ -132,7 +132,6 @@ pub enum RuntimeConfig {
     MacVm,
 }
 
-
 /// Check if Docker daemon is available and responsive
 ///
 /// This function attempts to connect to the Docker daemon using

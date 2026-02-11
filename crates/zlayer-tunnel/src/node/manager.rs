@@ -57,7 +57,6 @@ pub enum TunnelState {
     Failed(String),
 }
 
-
 /// Outbound tunnel tracking
 struct OutboundTunnel {
     /// Handle to the agent task (kept for potential future use like awaiting completion)

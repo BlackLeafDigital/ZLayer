@@ -86,7 +86,6 @@ pub enum LoadBalancerAlgorithm {
     Random,
 }
 
-
 /// Load balancer for distributing requests across backends
 #[derive(Debug)]
 pub struct LoadBalancer {
