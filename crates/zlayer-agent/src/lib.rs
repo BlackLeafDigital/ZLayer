@@ -210,24 +210,16 @@ pub fn is_wasm_available() -> bool {
 ///
 /// When `RuntimeConfig::Auto` is specified:
 /// - **Linux**: Uses bundled libcontainer runtime (no external binary needed), falls back to Docker
-/// - **Windows/macOS**: Uses Docker directly
+/// - **macOS**: Uses sandbox runtime (native Metal/MPS), falls back to VM runtime (libkrun), then Docker
+/// - **Windows**: Uses Docker directly
 /// - If no runtime can be initialized, returns an error
 ///
 /// # Example
 /// ```no_run
-/// use zlayer_agent::{RuntimeConfig, YoukiConfig, create_runtime};
+/// use zlayer_agent::{RuntimeConfig, create_runtime};
 ///
 /// # async fn example() -> Result<(), zlayer_agent::AgentError> {
-/// // Auto-select the best available runtime
-/// let auto_runtime = create_runtime(RuntimeConfig::Auto).await?;
-///
-/// // Use mock runtime for testing
-/// let mock_runtime = create_runtime(RuntimeConfig::Mock).await?;
-///
-/// // Use youki runtime explicitly
-/// let youki_runtime = create_runtime(
-///     RuntimeConfig::Youki(YoukiConfig::default())
-/// ).await?;
+/// let runtime = create_runtime(RuntimeConfig::Auto).await?;
 /// # Ok(())
 /// # }
 /// ```
