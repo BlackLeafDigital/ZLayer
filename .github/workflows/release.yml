@@ -135,12 +135,18 @@ jobs:
           ```bash
           docker pull zachhandley/zlayer-node:VERSION_PLACEHOLDER
           docker pull zachhandley/zlayer-manager:VERSION_PLACEHOLDER
+          docker pull zachhandley/zlayer-runtime:VERSION_PLACEHOLDER
+          docker pull zachhandley/zlayer-build:VERSION_PLACEHOLDER
+          docker pull zachhandley/zlayer-cli:VERSION_PLACEHOLDER
           ```
 
           **GHCR** (`ghcr.io/blackleafdigital/`):
           ```bash
           docker pull ghcr.io/blackleafdigital/zlayer-node:VERSION_PLACEHOLDER
           docker pull ghcr.io/blackleafdigital/zlayer-manager:VERSION_PLACEHOLDER
+          docker pull ghcr.io/blackleafdigital/zlayer-runtime:VERSION_PLACEHOLDER
+          docker pull ghcr.io/blackleafdigital/zlayer-build:VERSION_PLACEHOLDER
+          docker pull ghcr.io/blackleafdigital/zlayer-cli:VERSION_PLACEHOLDER
           ```
 
           ## Using with ZLayer

@@ -402,10 +402,24 @@ jobs:
       - name: Login to GHCR
         run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | sudo buildah login -u "${{ github.actor }}" --password-stdin ghcr.io
 
+      - name: Download binary archives for CLI images
+        shell: bash
+        run: |
+          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
+          for name in zlayer-runtime-linux-amd64 zlayer-build-linux-amd64 zlayer-linux-amd64; do
+            echo "Downloading ${name}.tar.gz..."
+            curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
+              --user "$AUTH" \
+              -o "${name}.tar.gz" \
+              "${{ inputs.artifact_base_url }}/${name}.tar.gz"
+          done
+
       - name: Load, tag, and push images
         run: |
           set +o pipefail  # Disable pipefail to avoid SIGPIPE issues
           VERSION="${{ needs.detect.outputs.version }}"
+
+          # --- Pre-built container images (from ZPipeline) ---
           for img in zlayer-node zlayer-web zlayer-manager; do
             echo "Processing ${img}..."
 
@@ -433,6 +447,51 @@ jobs:
             # Export versioned archives for Forgejo Packages (all images)
             sudo buildah tag ${IMAGE_ID} ${img}:${VERSION}
             sudo buildah push ${img}:${VERSION} oci-archive:${img}-${VERSION}-oci.tar
+          done
+
+          # --- Minimal CLI images (built from binary archives) ---
+          declare -A CLI_BINS=(
+            ["zlayer-runtime"]="zlayer-runtime-linux-amd64.tar.gz"
+            ["zlayer-build"]="zlayer-build-linux-amd64.tar.gz"
+            ["zlayer-cli"]="zlayer-linux-amd64.tar.gz"
+          )
+          # Map archive internal name to the binary filename inside the tar
+          declare -A BIN_NAMES=(
+            ["zlayer-runtime"]="zlayer-runtime"
+            ["zlayer-build"]="zlayer-build"
+            ["zlayer-cli"]="zlayer"
+          )
+
+          for img in zlayer-runtime zlayer-build zlayer-cli; do
+            echo "Building minimal image for ${img}..."
+            archive="${CLI_BINS[$img]}"
+            bin_name="${BIN_NAMES[$img]}"
+
+            # Extract binary
+            tar xzf "${archive}"
+
+            # Build minimal image with buildah
+            ctr=$(sudo buildah from alpine:latest)
+            sudo buildah copy $ctr "${bin_name}" "/usr/local/bin/${bin_name}"
+            sudo buildah config --entrypoint "[\"${bin_name}\"]" $ctr
+            sudo buildah config --label "org.opencontainers.image.source=https://github.com/BlackLeafDigital/ZLayer" $ctr
+            sudo buildah config --label "org.opencontainers.image.version=${VERSION}" $ctr
+            IMAGE_ID=$(sudo buildah commit $ctr ${img}:${VERSION})
+
+            # Tag and push to Docker Hub + GHCR
+            sudo buildah tag ${IMAGE_ID} zachhandley/${img}:${VERSION}
+            sudo buildah tag ${IMAGE_ID} zachhandley/${img}:latest
+            sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/${img}:${VERSION}
+            sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/${img}:latest
+
+            sudo buildah push zachhandley/${img}:${VERSION}
+            sudo buildah push zachhandley/${img}:latest
+            sudo buildah push ghcr.io/blackleafdigital/${img}:${VERSION}
+            sudo buildah push ghcr.io/blackleafdigital/${img}:latest
+
+            # Cleanup
+            rm -f "${bin_name}"
+            echo "Done: ${img}"
           done
 
       - name: Upload image archives to Forgejo Packages
@@ -512,12 +571,18 @@ jobs:
           ```bash
           docker pull zachhandley/zlayer-node:${VERSION}
           docker pull zachhandley/zlayer-manager:${VERSION}
+          docker pull zachhandley/zlayer-runtime:${VERSION}
+          docker pull zachhandley/zlayer-build:${VERSION}
+          docker pull zachhandley/zlayer-cli:${VERSION}
           ```
 
           **GHCR** (`ghcr.io/blackleafdigital/`):
           ```bash
           docker pull ghcr.io/blackleafdigital/zlayer-node:${VERSION}
           docker pull ghcr.io/blackleafdigital/zlayer-manager:${VERSION}
+          docker pull ghcr.io/blackleafdigital/zlayer-runtime:${VERSION}
+          docker pull ghcr.io/blackleafdigital/zlayer-build:${VERSION}
+          docker pull ghcr.io/blackleafdigital/zlayer-cli:${VERSION}
           ```
 
           **Forgejo Packages** (includes `zlayer-web`):
