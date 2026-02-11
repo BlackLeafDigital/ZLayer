@@ -479,6 +479,9 @@ pub enum StorageSpec {
         /// Performance tier (default: local, SQLite-safe)
         #[serde(default)]
         tier: StorageTier,
+        /// Optional size limit (e.g., "1Gi", "512Mi")
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<String>,
     },
     /// Anonymous storage (auto-named, container lifecycle)
     Anonymous {

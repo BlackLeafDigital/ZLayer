@@ -213,7 +213,7 @@ const MPS_ONLY_PROFILE_SECTION: &str = "\
   (iokit-property \"soc-generation\")
   (iokit-property \"IORegistryEntryPropertyKeys\"))
 
-; Mach services -- NO MTLCompilerService needed for MPS
+; Mach services -- NO shader compiler service needed for MPS
 (allow mach-lookup
   (global-name \"com.apple.PowerManagement.control\"))
 

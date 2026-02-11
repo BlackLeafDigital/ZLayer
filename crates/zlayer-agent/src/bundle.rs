@@ -870,6 +870,7 @@ impl BundleBuilder {
                     target,
                     readonly,
                     tier,
+                    ..
                 } => {
                     // Get the prepared volume path from StorageManager
                     let source = volume_paths.get(name).ok_or_else(|| {

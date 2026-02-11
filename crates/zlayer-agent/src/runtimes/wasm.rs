@@ -128,7 +128,7 @@ fn configure_wasi_mounts(
                 name,
                 target,
                 readonly,
-                tier: _,
+                ..
             } => {
                 // Named volumes are stored under the volumes directory
                 let volume_path = format!("{}/{}", DEFAULT_VOLUMES_DIR, name);
