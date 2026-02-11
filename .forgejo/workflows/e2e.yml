@@ -202,12 +202,62 @@ jobs:
           RUST_LOG: debug
 
   # ===========================================
+  # E2E Tests (macOS Sandbox)
+  # ===========================================
+  macos-sandbox-e2e:
+    name: E2E Tests (macOS Sandbox)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: Install system dependencies
+        run: |
+          brew install protobuf python3
+
+      - name: Setup Rust
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+
+      - name: Restore cache
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-macos-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Setup E2E environment
+        run: |
+          # Clean up any leftover state from previous runs
+          rm -rf /tmp/zlayer-macos-sandbox-e2e-test 2>/dev/null || true
+          # Create test directories (must match E2E_TEST_DIR in macos_sandbox_e2e.rs)
+          mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/{data,logs}
+          mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/data/{containers,images}
+
+      - name: Run macOS Sandbox E2E tests
+        run: cargo test --package zlayer-agent --test macos_sandbox_e2e -- --nocapture
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LOG: debug
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf /tmp/zlayer-macos-sandbox-e2e-test 2>/dev/null || true
+
+  # ===========================================
   # Trigger Build (if version provided)
   # ===========================================
   trigger-build:
     name: Trigger Build
     runs-on: ubuntu-latest
-    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests]
+    needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, macos-sandbox-e2e]
     if: inputs.version != ''
     steps:
       - name: Trigger Build workflow

@@ -94,7 +94,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install system dependencies
-        run: brew install protobuf
+        run: brew install protobuf python3
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
@@ -180,7 +180,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install system dependencies
-        run: brew install protobuf
+        run: brew install protobuf python3
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main

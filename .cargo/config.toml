@@ -10,6 +10,14 @@ incremental = true
 # linker = "clang"
 # rustflags = ["-C", "link-arg=-fuse-ld=mold"]
 
+# macOS: allow undefined Python symbols for PyO3 extension modules (zlayer-py).
+# These symbols are resolved at runtime when Python loads the .dylib.
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
+
 [alias]
 # Common build aliases for development workflow
 dev = "build --package runtime"
