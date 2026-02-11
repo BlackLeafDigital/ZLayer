@@ -548,7 +548,7 @@ async fn clone_directory_recursive(src: &Path, dst: &Path) -> std::io::Result<()
             let cloned =
                 tokio::task::spawn_blocking(move || clone_file_apfs(&src_clone, &dst_clone))
                     .await
-                    .map_err(|e| std::io::Error::other(e))??;
+                    .map_err(std::io::Error::other)??;
 
             if !cloned {
                 // Fallback: regular copy
