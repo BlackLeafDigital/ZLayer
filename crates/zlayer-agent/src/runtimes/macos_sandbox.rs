@@ -548,7 +548,7 @@ async fn clone_directory_recursive(src: &Path, dst: &Path) -> std::io::Result<()
             let cloned =
                 tokio::task::spawn_blocking(move || clone_file_apfs(&src_clone, &dst_clone))
                     .await
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))??;
+                    .map_err(|e| std::io::Error::other(e))??;
 
             if !cloned {
                 // Fallback: regular copy
@@ -890,6 +890,19 @@ fn resolve_entrypoint(spec: &ServiceSpec, rootfs: &Path) -> Result<(String, Vec<
     ))
 }
 
+/// Parameters for spawning a sandboxed process.
+struct SandboxSpawnParams {
+    program: String,
+    args: Vec<String>,
+    sbpl_profile: String,
+    rootfs_dir: PathBuf,
+    stdout_path: PathBuf,
+    stderr_path: PathBuf,
+    spec: ServiceSpec,
+    sandbox_config: SandboxConfig,
+    assigned_port: u16,
+}
+
 /// Spawn a sandboxed process using `fork()` + `sandbox_init()` + `exec()`.
 ///
 /// The sequence:
@@ -900,25 +913,16 @@ fn resolve_entrypoint(spec: &ServiceSpec, rootfs: &Path) -> Result<(String, Vec<
 ///    and resource limits.
 /// 4. Spawn the child process.
 /// 5. Return the child PID.
-fn spawn_sandboxed_process(
-    program: &str,
-    args: &[String],
-    sbpl_profile: &str,
-    rootfs_dir: &Path,
-    stdout_path: &Path,
-    stderr_path: &Path,
-    spec: &ServiceSpec,
-    sandbox_config: &SandboxConfig,
-    assigned_port: u16,
-) -> Result<u32> {
+fn spawn_sandboxed_process(params: &SandboxSpawnParams) -> Result<u32> {
     use std::os::unix::process::CommandExt;
 
-    let profile = sbpl_profile.to_string();
-    let max_files = sandbox_config.max_files;
-    let cpu_time_limit = sandbox_config.cpu_time_limit;
+    let profile = params.sbpl_profile.clone();
+    let max_files = params.sandbox_config.max_files;
+    let cpu_time_limit = params.sandbox_config.cpu_time_limit;
 
     // Build environment variables from the spec
-    let mut env_vars: Vec<(String, String)> = spec
+    let mut env_vars: Vec<(String, String)> = params
+        .spec
         .env
         .iter()
         .map(|(k, v)| (k.clone(), v.clone()))
@@ -933,29 +937,31 @@ fn spawn_sandboxed_process(
     //
     // Only set PORT if the user's spec didn't already define it (don't
     // override explicit user configuration).
-    let port_str = assigned_port.to_string();
+    let port_str = params.assigned_port.to_string();
     if !env_vars.iter().any(|(k, _)| k == "PORT") {
         env_vars.push(("PORT".to_string(), port_str.clone()));
     }
     env_vars.push(("ZLAYER_PORT".to_string(), port_str));
 
     // Open log files for stdout/stderr redirection
-    let stdout_file = std::fs::File::create(stdout_path).map_err(|e| AgentError::CreateFailed {
-        id: "sandbox-process".to_string(),
-        reason: format!("Failed to create stdout log: {}", e),
-    })?;
-    let stderr_file = std::fs::File::create(stderr_path).map_err(|e| AgentError::CreateFailed {
-        id: "sandbox-process".to_string(),
-        reason: format!("Failed to create stderr log: {}", e),
-    })?;
+    let stdout_file =
+        std::fs::File::create(&params.stdout_path).map_err(|e| AgentError::CreateFailed {
+            id: "sandbox-process".to_string(),
+            reason: format!("Failed to create stdout log: {}", e),
+        })?;
+    let stderr_file =
+        std::fs::File::create(&params.stderr_path).map_err(|e| AgentError::CreateFailed {
+            id: "sandbox-process".to_string(),
+            reason: format!("Failed to create stderr log: {}", e),
+        })?;
 
     // Spawn the child process with pre_exec hook for sandbox application.
     // SAFETY: pre_exec runs after fork() in the child process. We only call
     // async-signal-safe-compatible operations (our FFI calls and setrlimit).
     let child = unsafe {
-        std::process::Command::new(program)
-            .args(args)
-            .current_dir(rootfs_dir)
+        std::process::Command::new(&params.program)
+            .args(&params.args)
+            .current_dir(&params.rootfs_dir)
             .stdout(stdout_file)
             .stderr(stderr_file)
             .env_clear()
@@ -1584,17 +1590,17 @@ impl Runtime for SandboxRuntime {
 
         // Spawn the sandboxed process (blocking operation).
         // The assigned_port is injected as PORT and ZLAYER_PORT env vars.
-        let child_pid = spawn_sandboxed_process(
-            &program,
-            &args,
-            &profile,
-            &rootfs_dir,
-            &stdout_path,
-            &stderr_path,
-            &spec,
-            &sandbox_config,
+        let child_pid = spawn_sandboxed_process(&SandboxSpawnParams {
+            program,
+            args,
+            sbpl_profile: profile,
+            rootfs_dir,
+            stdout_path,
+            stderr_path,
+            spec,
+            sandbox_config,
             assigned_port,
-        )?;
+        })?;
 
         // Write PID file
         let pid_path = self.container_dir(id).join("pid");
@@ -1760,21 +1766,21 @@ impl Runtime for SandboxRuntime {
                 }
 
                 // Kill process if still running
-                if c.pid > 0 {
-                    if matches!(c.state, ContainerState::Running | ContainerState::Stopping) {
-                        unsafe {
-                            libc::kill(c.pid as i32, libc::SIGKILL);
-                        }
-                        // Reap the zombie (non-blocking attempt, then give up)
-                        let pid = c.pid;
-                        let _ = tokio::task::spawn_blocking(move || {
-                            let mut status: libc::c_int = 0;
-                            unsafe {
-                                libc::waitpid(pid as i32, &mut status, 0);
-                            }
-                        })
-                        .await;
+                if c.pid > 0
+                    && matches!(c.state, ContainerState::Running | ContainerState::Stopping)
+                {
+                    unsafe {
+                        libc::kill(c.pid as i32, libc::SIGKILL);
                     }
+                    // Reap the zombie (non-blocking attempt, then give up)
+                    let pid = c.pid;
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let mut status: libc::c_int = 0;
+                        unsafe {
+                            libc::waitpid(pid as i32, &mut status, 0);
+                        }
+                    })
+                    .await;
                 }
             }
         }
