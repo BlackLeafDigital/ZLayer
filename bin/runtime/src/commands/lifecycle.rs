@@ -7,6 +7,8 @@ use tracing::{info, warn};
 use crate::cli::{Cli, RuntimeType};
 use crate::util::{discover_spec_path, parse_spec};
 
+#[cfg(target_os = "macos")]
+use zlayer_agent::MacSandboxConfig;
 use zlayer_agent::RuntimeConfig;
 #[cfg(target_os = "linux")]
 use zlayer_agent::YoukiConfig;
@@ -61,6 +63,28 @@ pub(crate) async fn status(cli: &Cli) -> Result<()> {
                 }
             }
         }
+        #[cfg(target_os = "macos")]
+        RuntimeType::MacSandbox => {
+            let config = RuntimeConfig::MacSandbox(MacSandboxConfig {
+                data_dir: cli.state_dir.clone(),
+                ..Default::default()
+            });
+            match zlayer_agent::create_runtime(config).await {
+                Ok(_) => println!("Status: macOS sandbox runtime ready"),
+                Err(e) => {
+                    println!("Status: macOS sandbox runtime unavailable");
+                    println!("Error: {}", e);
+                }
+            }
+        }
+        #[cfg(target_os = "macos")]
+        RuntimeType::MacVm => match zlayer_agent::create_runtime(RuntimeConfig::MacVm).await {
+            Ok(_) => println!("Status: macOS VM runtime ready"),
+            Err(e) => {
+                println!("Status: macOS VM runtime unavailable");
+                println!("Error: {}", e);
+            }
+        },
     }
 
     println!();

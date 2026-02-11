@@ -235,8 +235,6 @@ impl LibKrun {
 
 /// Metadata for a running libkrun microVM.
 struct VmContainer {
-    /// Container identifier.
-    id: ContainerId,
     /// Current container state.
     state: ContainerState,
     /// libkrun context ID (returned by `krun_create_ctx`).
@@ -744,7 +742,6 @@ impl Runtime for VmRuntime {
 
         // Register the container as pending
         let container = VmContainer {
-            id: id.clone(),
             state: ContainerState::Pending,
             ctx_id: None,
             state_dir: vm_dir,
@@ -1148,8 +1145,8 @@ impl Runtime for VmRuntime {
             }
         }
 
-        // Remove from tracking
-        {
+        // Remove from tracking, capturing state_dir for cleanup below
+        let removed_state_dir = {
             let mut containers = self.containers.write().await;
             if let Some(c) = containers.remove(&dir_name) {
                 // Release GPU lock if needed
@@ -1163,11 +1160,14 @@ impl Runtime for VmRuntime {
                 if let (Some(api), Some(ctx)) = (&self.api, c.ctx_id) {
                     let _ = unsafe { (api.free_ctx)(ctx) };
                 }
+                Some(c.state_dir)
+            } else {
+                None
             }
-        }
+        };
 
         // Remove state directory
-        let vm_dir = self.vm_dir(id);
+        let vm_dir = removed_state_dir.unwrap_or_else(|| self.vm_dir(id));
         if vm_dir.exists() {
             tokio::fs::remove_dir_all(&vm_dir).await.map_err(|e| {
                 AgentError::Internal(format!("Failed to remove VM dir {}: {e}", vm_dir.display()))

@@ -9,10 +9,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Authentication source configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthSource {
     /// No authentication
+    #[default]
     Anonymous,
 
     /// Basic authentication with username and password
@@ -28,11 +29,6 @@ pub enum AuthSource {
     },
 }
 
-impl Default for AuthSource {
-    fn default() -> Self {
-        Self::Anonymous
-    }
-}
 
 /// Per-registry authentication configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

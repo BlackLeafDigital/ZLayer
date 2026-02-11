@@ -102,7 +102,7 @@ impl Default for MacSandboxConfig {
 }
 
 /// Configuration for selecting and configuring a container runtime
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum RuntimeConfig {
     /// Automatically select the best available runtime
     ///
@@ -111,6 +111,7 @@ pub enum RuntimeConfig {
     /// - On macOS: Uses sandbox runtime if available, falls back to Docker
     /// - On Windows: Use Docker directly
     /// - If no runtime can be initialized, returns an error
+    #[default]
     Auto,
     /// Use the mock runtime for testing and development
     Mock,
@@ -131,11 +132,6 @@ pub enum RuntimeConfig {
     MacVm,
 }
 
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
 
 /// Check if Docker daemon is available and responsive
 ///

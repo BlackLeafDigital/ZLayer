@@ -1015,8 +1015,6 @@ fn reserve_port() -> std::io::Result<(u16, std::net::TcpListener)> {
 /// Metadata for a sandboxed container process.
 #[derive(Debug)]
 struct SandboxContainer {
-    /// Container identifier.
-    id: ContainerId,
     /// Process ID of the sandboxed child (0 if not yet started).
     pid: u32,
     /// Current container state.
@@ -1479,7 +1477,6 @@ impl Runtime for SandboxRuntime {
 
         // Register the container as pending
         let container = SandboxContainer {
-            id: id.clone(),
             pid: 0,
             state: ContainerState::Pending,
             state_dir: container_dir,

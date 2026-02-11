@@ -113,20 +113,16 @@ pub fn ns_to_duration(ns: DurationNs) -> Duration {
 ///     http-3,
 /// }
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum HttpVersion {
     Http10 = 0,
+    #[default]
     Http11 = 1,
     Http2 = 2,
     Http3 = 3,
 }
 
-impl Default for HttpVersion {
-    fn default() -> Self {
-        Self::Http11
-    }
-}
 
 impl std::fmt::Display for HttpVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -933,9 +929,10 @@ impl CacheDecision {
 ///     get, post, put, delete, patch, head, options, connect, trace,
 /// }
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum HttpMethod {
+    #[default]
     Get = 0,
     Post = 1,
     Put = 2,
@@ -947,11 +944,6 @@ pub enum HttpMethod {
     Trace = 8,
 }
 
-impl Default for HttpMethod {
-    fn default() -> Self {
-        Self::Get
-    }
-}
 
 impl std::fmt::Display for HttpMethod {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
