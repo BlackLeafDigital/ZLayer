@@ -150,10 +150,11 @@ impl Cli {
 
     /// Resolve the effective socket path.
     pub(crate) fn effective_socket_path(&self) -> String {
-        if let Commands::Serve { socket, .. } = &self.command {
-            if let Some(s) = socket {
-                return s.clone();
-            }
+        if let Commands::Serve {
+            socket: Some(s), ..
+        } = &self.command
+        {
+            return s.clone();
         }
         default_socket_path(&self.effective_data_dir())
     }

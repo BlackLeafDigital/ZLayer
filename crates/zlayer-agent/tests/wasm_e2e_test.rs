@@ -1780,7 +1780,7 @@ mod wasm_filesystem_e2e {
     /// Test multiple mounts configuration
     #[test]
     fn test_multiple_mounts() {
-        let mounts = vec![
+        let mounts = [
             StorageSpec::Bind {
                 source: "/host/config".to_string(),
                 target: "/app/config".to_string(),
