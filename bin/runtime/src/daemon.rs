@@ -48,13 +48,14 @@ pub struct DaemonConfig {
     /// DNS listen port for overlay service discovery (default: 15353).
     pub dns_port: u16,
 
-    /// Root data directory (databases, state).  Default: `/var/lib/zlayer`.
+    /// Root data directory (databases, state).
+    /// Default: `~/.local/share/zlayer` on macOS, `/var/lib/zlayer` on Linux.
     pub data_dir: PathBuf,
 
-    /// Log directory.  Default: `/var/log/zlayer`.
+    /// Log directory.  Default: `{data_dir}/logs` on macOS, `/var/log/zlayer` on Linux.
     pub log_dir: PathBuf,
 
-    /// Runtime directory (sockets, PID files).  Default: `/var/run/zlayer`.
+    /// Runtime directory (sockets, PID files).  Default: `{data_dir}/run` on macOS, `/var/run/zlayer` on Linux.
     pub run_dir: PathBuf,
 }
 

@@ -197,11 +197,15 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
         ),
     ];
 
-    // Forward --data-dir if explicitly set
-    if let Some(ref dd) = cli.data_dir {
-        args.push("        <string>--data-dir</string>".to_string());
-        args.push(format!("        <string>{}</string>", dd.display()));
-    }
+    // Always forward --data-dir with the effective value so that the
+    // launchd child doesn't depend on $HOME being set (launchd services
+    // often lack it, causing default_data_dir() to fall back to /var/lib/zlayer).
+    let effective_data_dir = cli.effective_data_dir();
+    args.push("        <string>--data-dir</string>".to_string());
+    args.push(format!(
+        "        <string>{}</string>",
+        effective_data_dir.display()
+    ));
 
     if let Some(ref secret) = jwt_secret {
         args.push("        <string>--jwt-secret</string>".to_string());
@@ -226,6 +230,22 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
     let log_path = log_dir.join("daemon.log");
     let log_path_str = log_path.to_string_lossy();
 
+    // Build EnvironmentVariables section so the daemon child has HOME set.
+    // launchd services often lack HOME, which causes default_data_dir() to
+    // fall back to /var/lib/zlayer instead of ~/.local/share/zlayer.
+    let env_xml = if let Ok(home) = std::env::var("HOME") {
+        format!(
+            r#"    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>{}</string>
+    </dict>"#,
+            home
+        )
+    } else {
+        String::new()
+    };
+
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -238,6 +258,7 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
     <array>
 {}
     </array>
+{}
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -250,7 +271,7 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
     <string>/</string>
 </dict>
 </plist>"#,
-        args_xml, log_path_str, log_path_str
+        args_xml, env_xml, log_path_str, log_path_str
     );
 
     // Create log directory

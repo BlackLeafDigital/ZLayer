@@ -948,10 +948,33 @@ fn sanitize_image_name(image: &str) -> String {
 /// Checks `spec.command.entrypoint` and `spec.command.args` in order,
 /// then falls back to searching for a shell in the rootfs.
 fn resolve_entrypoint(spec: &ServiceSpec, rootfs: &Path) -> Result<(String, Vec<String>)> {
+    // Resolve a program path for the macOS sandbox runtime.
+    //
+    // If the program is an absolute path (e.g. "/usr/local/bin/app"):
+    //   1. If it exists on the host → use the host path (macOS platform binaries
+    //      must be exec'd from their original path to pass code-signing checks).
+    //   2. Else if it exists inside rootfs → use the rootfs-resolved path so
+    //      `Command::new()` can find it.
+    //   3. Otherwise return as-is and let exec() produce a clear error.
+    let resolve_program = |prog: &str| -> String {
+        if prog.starts_with('/') {
+            // Prefer the host binary (code-signing / platform binary compat)
+            if std::path::Path::new(prog).exists() {
+                return prog.to_string();
+            }
+            // Fall back to rootfs copy
+            let rootfs_path = rootfs.join(prog.trim_start_matches('/'));
+            if rootfs_path.exists() {
+                return rootfs_path.to_string_lossy().into_owned();
+            }
+        }
+        prog.to_string()
+    };
+
     // Use entrypoint if specified
     if let Some(ref entrypoint) = spec.command.entrypoint {
         if !entrypoint.is_empty() {
-            let program = entrypoint[0].clone();
+            let program = resolve_program(&entrypoint[0]);
             let mut args: Vec<String> = entrypoint[1..].to_vec();
 
             // Append args from spec.command.args if present
@@ -966,16 +989,21 @@ fn resolve_entrypoint(spec: &ServiceSpec, rootfs: &Path) -> Result<(String, Vec<
     // Use args as command if no entrypoint
     if let Some(ref cmd_args) = spec.command.args {
         if !cmd_args.is_empty() {
-            let program = cmd_args[0].clone();
+            let program = resolve_program(&cmd_args[0]);
             let args = cmd_args[1..].to_vec();
             return Ok((program, args));
         }
     }
 
-    // Fallback: try to find a shell in the rootfs
+    // Fallback: try to find a shell - prefer host path for code-signing compat,
+    // then check rootfs
     for shell in &["/bin/sh", "/bin/bash", "/usr/bin/sh"] {
-        if rootfs.join(shell.trim_start_matches('/')).exists() {
+        if std::path::Path::new(shell).exists() {
             return Ok((shell.to_string(), vec![]));
+        }
+        if rootfs.join(shell.trim_start_matches('/')).exists() {
+            let resolved = rootfs.join(shell.trim_start_matches('/'));
+            return Ok((resolved.to_string_lossy().into_owned(), vec![]));
         }
     }
 

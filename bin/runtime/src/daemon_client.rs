@@ -1,9 +1,10 @@
 //! HTTP-over-Unix-socket client for CLI-to-daemon communication.
 //!
 //! Provides a typed [`DaemonClient`] that communicates with the `zlayer-runtime serve`
-//! daemon via its Unix domain socket at `/var/run/zlayer.sock`.  If the daemon is not
-//! running, [`DaemonClient::connect`] will auto-start it and wait with exponential
-//! backoff until the socket becomes available.
+//! daemon via its Unix domain socket (platform-dependent path; see
+//! [`default_socket_path()`]).  If the daemon is not running,
+//! [`DaemonClient::connect`] will auto-start it and wait with exponential backoff
+//! until the socket becomes available.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -22,8 +23,8 @@ use tracing::{debug, info};
 
 /// Default path for the daemon Unix socket.
 ///
-/// On macOS this resolves to `~/.local/share/zlayer/run/zlayer.sock`.
-/// On Linux it stays at `/var/run/zlayer.sock`.
+/// On macOS: `~/.local/share/zlayer/run/zlayer.sock`.
+/// On Linux: `/var/run/zlayer.sock`.
 pub fn default_socket_path() -> String {
     crate::cli::default_socket_path(&crate::cli::default_data_dir())
 }
@@ -190,6 +191,17 @@ impl DaemonClient {
         debug!(binary = %runtime_bin.display(), "Spawning daemon");
 
         let mut cmd = std::process::Command::new(&runtime_bin);
+
+        // Ensure the child process knows the correct data directory.
+        // If ZLAYER_DATA_DIR is already set in the environment it will be
+        // inherited automatically (clap picks it up via `env = "ZLAYER_DATA_DIR"`).
+        // Otherwise, explicitly pass --data-dir so the child doesn't fall back
+        // to /var/lib/zlayer when $HOME is unavailable (e.g. launchd context).
+        if std::env::var_os("ZLAYER_DATA_DIR").is_none() {
+            let data_dir = crate::cli::default_data_dir();
+            cmd.arg("--data-dir").arg(&data_dir);
+        }
+
         cmd.arg("serve")
             .arg("--daemon")
             .arg("--socket")

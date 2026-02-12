@@ -16,7 +16,7 @@ use zlayer_api::router::{
 use zlayer_api::{ApiConfig, ApiServer, BuildState, TunnelApiState};
 use zlayer_overlay::IpAllocator;
 
-/// Daemon metadata written to `/var/lib/zlayer/daemon.json`.
+/// Daemon metadata written to `{data_dir}/daemon.json`.
 #[derive(Serialize)]
 struct DaemonMetadata {
     pid: u32,
