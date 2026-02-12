@@ -60,14 +60,17 @@ pub struct DaemonConfig {
 
 impl Default for DaemonConfig {
     fn default() -> Self {
+        let data_dir = crate::cli::default_data_dir();
+        let log_dir = crate::cli::default_log_dir(&data_dir);
+        let run_dir = crate::cli::default_run_dir(&data_dir);
         Self {
             host_network: false,
             deployment_name: "zlayer".to_string(),
             runtime_config: RuntimeConfig::Auto,
             dns_port: 15353,
-            data_dir: PathBuf::from("/var/lib/zlayer"),
-            log_dir: PathBuf::from("/var/log/zlayer"),
-            run_dir: PathBuf::from("/var/run/zlayer"),
+            data_dir,
+            log_dir,
+            run_dir,
         }
     }
 }
@@ -447,8 +450,9 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // Phase 12: Log rotation background task
     // -----------------------------------------------------------------------
     let log_dir_clone = config.log_dir.clone();
+    let data_dir_clone = config.data_dir.clone();
     let log_rotator_handle = Some(tokio::spawn(async move {
-        log_rotation_loop(&log_dir_clone).await;
+        log_rotation_loop(&log_dir_clone, &data_dir_clone).await;
     }));
     info!("Log rotation background task started");
 
@@ -578,8 +582,8 @@ const LOG_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 ///     (keeping the last 10% of lines to avoid losing the most recent output).
 ///  2. Cleans up log files older than [`LOG_MAX_AGE_SECS`] in the daemon's
 ///     log directory (`/var/log/zlayer/`).
-async fn log_rotation_loop(log_dir: &std::path::Path) {
-    let bundle_dir = std::path::PathBuf::from("/var/lib/zlayer/bundles");
+async fn log_rotation_loop(log_dir: &std::path::Path, data_dir: &std::path::Path) {
+    let bundle_dir = data_dir.join("bundles");
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(3600)).await;

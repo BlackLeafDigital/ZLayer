@@ -111,56 +111,122 @@ pub struct SandboxConfig {
 ///
 /// Allows IOKit GPU access, Mach shader compilation services,
 /// and all filesystem paths needed for Metal.framework.
+///
+/// IOKit user client class names were derived from:
+/// - `ioreg -l -w0` on macOS 26 / Apple M5 (AGXAcceleratorG17G, AGXDeviceUserClient)
+/// - Apple's own system sandbox profiles:
+///   - `/System/Library/Sandbox/Profiles/com.apple.intelligenceplatformd.sb`
+///   - `/System/Library/Sandbox/Profiles/safety-inference-extension-macos.sb`
+///   - `/System/Library/Sandbox/Profiles/com.apple.intelligenceplatform.IntelligencePlatformComputeService.sb`
+///
+/// Key insight: On Apple Silicon (M1+), the actual IOUserClient class opened by
+/// MTLCreateSystemDefaultDevice() is `AGXDeviceUserClient` -- NOT `AGXAccelerator`
+/// (which is the IOService/kernel driver class name, not a user client class).
+/// `AGXSharedUserClient` is needed for multi-process GPU sharing.
 const METAL_COMPUTE_PROFILE_SECTION: &str = "\
 ; --- GPU: Full Metal Compute ---
 
 ; IOKit user clients for GPU hardware access
+; Apple Silicon (M1/M2/M3/M4/M5): AGXDeviceUserClient is the actual user client
+; class opened by Metal. AGXSharedUserClient handles multi-process GPU sharing.
+; The IOAccel* classes are IOKit compatibility shims (still needed).
 (allow iokit-open
-  (iokit-user-client-class \"IOSurfaceRoot\")
+  (iokit-user-client-class \"AGXDeviceUserClient\")
+  (iokit-user-client-class \"AGXSharedUserClient\")
   (iokit-user-client-class \"IOSurfaceRootUserClient\")
+  (iokit-user-client-class \"IOSurfaceAcceleratorClient\")
+  (iokit-user-client-class \"IOAccelDevice\")
   (iokit-user-client-class \"IOAccelDevice2\")
+  (iokit-user-client-class \"IOAccelContext\")
   (iokit-user-client-class \"IOAccelContext2\")
+  (iokit-user-client-class \"IOAccelSharedUserClient\")
   (iokit-user-client-class \"IOAccelSharedUserClient2\")
   (iokit-user-client-class \"IOAccelSubmitter2\")
-  (iokit-user-client-class \"RootDomainUserClient\")
-  ; Apple Silicon GPU
-  (iokit-user-client-class \"AGXAccelerator\")
-  ; Intel GPU (for Intel Macs)
-  (iokit-user-client-class \"IOAccelerator\")
-  (iokit-user-client-class \"IntelAccelerator\"))
+  (iokit-user-client-class \"RootDomainUserClient\"))
 
-; GPU IOKit properties
+; IOKit service-level access (macOS 26+ fine-grained syntax)
+; AGXAcceleratorG* prefix matches all Apple Silicon GPU generations.
+(allow iokit-open-service
+  (iokit-user-client-class \"IOSurfaceRoot\")
+  (iokit-registry-entry-class-prefix \"AGXAcceleratorG\"))
+
+; IOKit user-client-level access (macOS 26+ fine-grained syntax)
+(allow iokit-open-user-client
+  (iokit-user-client-class \"AGXDeviceUserClient\")
+  (iokit-user-client-class \"AGXSharedUserClient\")
+  (iokit-user-client-class \"IOSurfaceRootUserClient\")
+  (iokit-user-client-class \"IOSurfaceAcceleratorClient\"))
+
+; GPU IOKit properties (comprehensive set from Apple's safety-inference profile)
 (allow iokit-get-properties
-  (iokit-property \"MetalPluginClassName\")
-  (iokit-property \"MetalPluginName\")
-  (iokit-property \"MetalStatisticsName\")
-  (iokit-property \"MetalStatisticsScriptName\")
-  (iokit-property \"MetalCoalesce\")
-  (iokit-property \"IOGLBundleName\")
-  (iokit-property \"IOGLESBundleName\")
-  (iokit-property \"IOGLESDefaultUseMetal\")
-  (iokit-property \"IOGLESMetalBundleName\")
+  (iokit-property \"AGCInfo\")
+  (iokit-property \"AGXCliqueTracingDefaults\")
+  (iokit-property \"AGXInternalPerfCounterResourcesPath\")
+  (iokit-property \"AGXLimitersDirName\")
+  (iokit-property \"AGXParameterBufferMaxSize\")
+  (iokit-property \"AGXParameterBufferMaxSizeEverMemless\")
+  (iokit-property \"AGXParameterBufferMaxSizeNeverMemless\")
+  (iokit-property \"AGXTraceCodeVersion\")
+  (iokit-property \"CFBundleIdentifier\")
+  (iokit-property \"CFBundleIdentifierKernel\")
+  (iokit-property \"chip-id\")
+  (iokit-property \"CommandSubmissionEnabled\")
+  (iokit-property \"CompactVRAM\")
+  (iokit-property \"EnableBlitLib\")
+  (iokit-property \"gpu-core-count\")
   (iokit-property \"GPUConfigurationVariable\")
   (iokit-property \"GPUDCCDisplayable\")
   (iokit-property \"GPUDebugNullClientMask\")
   (iokit-property \"GpuDebugPolicy\")
   (iokit-property \"GPURawCounterBundleName\")
-  (iokit-property \"CompactVRAM\")
-  (iokit-property \"EnableBlitLib\")
+  (iokit-property \"GPURawCounterPluginClassName\")
+  (iokit-property \"IOClass\")
+  (iokit-property \"IOClassNameOverride\")
+  (iokit-property \"IOGeneralInterest\")
+  (iokit-property \"IOGLBundleName\")
+  (iokit-property \"IOGLESBundleName\")
+  (iokit-property \"IOGLESDefaultUseMetal\")
+  (iokit-property \"IOGLESMetalBundleName\")
+  (iokit-property \"IOMatchCategory\")
+  (iokit-property \"IOMatchedAtBoot\")
+  (iokit-property \"IONameMatch\")
+  (iokit-property \"IONameMatched\")
   (iokit-property \"IOPCIMatch\")
+  (iokit-property \"IOPersonalityPublisher\")
+  (iokit-property \"IOPowerManagement\")
+  (iokit-property \"IOProbeScore\")
+  (iokit-property \"IOProviderClass\")
+  (iokit-property \"IORegistryEntryPropertyKeys\")
+  (iokit-property \"IOReportLegend\")
+  (iokit-property \"IOReportLegendPublic\")
+  (iokit-property \"IOSourceVersion\")
+  (iokit-property \"KDebugVersion\")
+  (iokit-property \"MetalCoalesce\")
+  (iokit-property \"MetalPluginClassName\")
+  (iokit-property \"MetalPluginName\")
+  (iokit-property \"MetalStatisticsName\")
+  (iokit-property \"MetalStatisticsScriptName\")
   (iokit-property \"model\")
+  (iokit-property \"PerformanceStatistics\")
+  (iokit-property \"Removable\")
+  (iokit-property \"SafeEjectRequested\")
+  (iokit-property \"SchedulerState\")
+  (iokit-property \"SCMBuildTime\")
+  (iokit-property \"SCMVersionNumber\")
+  (iokit-property \"soc-generation\")
+  (iokit-property \"SurfaceList\")
   (iokit-property \"vendor-id\")
   (iokit-property \"device-id\")
-  (iokit-property \"class-code\")
-  (iokit-property \"soc-generation\")
-  (iokit-property \"IORegistryEntryPropertyKeys\"))
+  (iokit-property \"class-code\"))
 
-; Mach services for Metal shader compilation
+; Mach services for Metal shader compilation and GPU memory
 (allow mach-lookup
   (global-name \"com.apple.MTLCompilerService\")
   (global-name \"com.apple.CARenderServer\")
   (global-name \"com.apple.PowerManagement.control\")
-  (global-name \"com.apple.gpu.process\"))
+  (global-name \"com.apple.gpu.process\")
+  (global-name \"com.apple.gpumemd.source\")
+  (global-name \"com.apple.cvmsServ\"))
 
 ; XPC services for shader compilation (Apple Silicon)
 (allow mach-lookup
@@ -185,37 +251,65 @@ const METAL_COMPUTE_PROFILE_SECTION: &str = "\
 
 /// MPS-only profile section (subset of Metal compute).
 ///
-/// MPS kernels are pre-compiled in the OS -- no MTLCompilerService needed.
-/// This gives a smaller attack surface than full Metal compute.
+/// MPS mode provides a smaller attack surface than full Metal compute by
+/// restricting IOKit access to a minimal set and omitting AGXCompilerService
+/// XPC services. However, MTLCompilerService is still required because
+/// MPSGraph on macOS 26+ uses JIT compilation internally for kernel fusion.
+///
+/// Uses the same corrected IOKit user client classes as the full Metal profile
+/// (`AGXDeviceUserClient` instead of the incorrect `AGXAccelerator`).
 const MPS_ONLY_PROFILE_SECTION: &str = "\
 ; --- GPU: MPS Only (pre-compiled kernels, no shader compilation) ---
 
 ; IOKit user clients for GPU hardware access (minimal set)
+; AGXDeviceUserClient is required -- MTLCreateSystemDefaultDevice() opens this class.
 (allow iokit-open
-  (iokit-user-client-class \"IOSurfaceRoot\")
+  (iokit-user-client-class \"AGXDeviceUserClient\")
+  (iokit-user-client-class \"AGXSharedUserClient\")
   (iokit-user-client-class \"IOSurfaceRootUserClient\")
   (iokit-user-client-class \"IOAccelDevice2\")
   (iokit-user-client-class \"IOAccelContext2\")
   (iokit-user-client-class \"IOAccelSharedUserClient2\")
-  (iokit-user-client-class \"RootDomainUserClient\")
-  ; Apple Silicon GPU
-  (iokit-user-client-class \"AGXAccelerator\"))
+  (iokit-user-client-class \"RootDomainUserClient\"))
+
+; IOKit service-level access (macOS 26+ fine-grained syntax)
+(allow iokit-open-service
+  (iokit-user-client-class \"IOSurfaceRoot\")
+  (iokit-registry-entry-class-prefix \"AGXAcceleratorG\"))
+
+; IOKit user-client-level access (macOS 26+ fine-grained syntax)
+(allow iokit-open-user-client
+  (iokit-user-client-class \"AGXDeviceUserClient\")
+  (iokit-user-client-class \"IOSurfaceRootUserClient\"))
 
 ; GPU IOKit properties (minimal set for MPS)
 (allow iokit-get-properties
   (iokit-property \"MetalPluginClassName\")
   (iokit-property \"MetalPluginName\")
+  (iokit-property \"IOClass\")
   (iokit-property \"IOGLESDefaultUseMetal\")
+  (iokit-property \"IORegistryEntryPropertyKeys\")
+  (iokit-property \"IOSourceVersion\")
   (iokit-property \"GPUConfigurationVariable\")
+  (iokit-property \"GPURawCounterBundleName\")
+  (iokit-property \"gpu-core-count\")
   (iokit-property \"model\")
   (iokit-property \"vendor-id\")
   (iokit-property \"device-id\")
-  (iokit-property \"soc-generation\")
-  (iokit-property \"IORegistryEntryPropertyKeys\"))
+  (iokit-property \"soc-generation\"))
 
-; Mach services -- NO shader compiler service needed for MPS
+; Mach services for MPS
+; MTLCompilerService is required because MPSGraph on macOS 26+ uses JIT
+; compilation internally for kernel fusion, even for pre-compiled MPS kernels.
+; gpumemd.source is needed for GPU memory management.
 (allow mach-lookup
-  (global-name \"com.apple.PowerManagement.control\"))
+  (global-name \"com.apple.MTLCompilerService\")
+  (global-name \"com.apple.PowerManagement.control\")
+  (global-name \"com.apple.gpumemd.source\"))
+
+; XPC service for MTLCompilerService (required by MPSGraph JIT)
+(allow mach-lookup
+  (xpc-service-name \"com.apple.MTLCompilerService\"))
 
 ; User preferences
 (allow user-preference-read

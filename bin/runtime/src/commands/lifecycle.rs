@@ -46,10 +46,11 @@ pub(crate) async fn status(cli: &Cli) -> Result<()> {
         },
         #[cfg(target_os = "linux")]
         RuntimeType::Youki => {
-            println!("State Dir: {}", cli.state_dir.display());
+            let state_dir = cli.effective_state_dir();
+            println!("State Dir: {}", state_dir.display());
 
             let config = YoukiConfig {
-                state_dir: cli.state_dir.clone(),
+                state_dir,
                 ..Default::default()
             };
 
@@ -66,8 +67,9 @@ pub(crate) async fn status(cli: &Cli) -> Result<()> {
         #[cfg(target_os = "macos")]
         RuntimeType::MacSandbox => {
             let config = RuntimeConfig::MacSandbox(MacSandboxConfig {
-                data_dir: cli.state_dir.clone(),
-                ..Default::default()
+                data_dir: cli.effective_data_dir(),
+                log_dir: cli.effective_log_dir(),
+                gpu_access: true,
             });
             match zlayer_agent::create_runtime(config).await {
                 Ok(_) => println!("Status: macOS sandbox runtime ready"),
@@ -171,6 +173,7 @@ pub(crate) async fn stop(
     service: Option<String>,
     force: bool,
     timeout: u64,
+    state_dir: &std::path::Path,
 ) -> Result<()> {
     use std::time::Duration;
 
@@ -247,7 +250,6 @@ pub(crate) async fn stop(
                 }
 
                 // Scan state dir for any extra containers beyond the spec replica count
-                let state_dir = std::path::Path::new("/var/lib/zlayer/containers");
                 let prefix = format!("{}-", name);
                 if let Ok(mut entries) = tokio::fs::read_dir(state_dir).await {
                     while let Ok(Some(entry)) = entries.next_entry().await {

@@ -90,6 +90,20 @@ test-features:
 	cargo test --package runtime --no-default-features --features deploy
 	cargo test --package runtime --features full
 
+# macOS Sandbox E2E tests
+test-macos-sandbox:
+	@echo "Setting up macOS sandbox E2E environment..."
+	rm -rf /tmp/zlayer-macos-sandbox-e2e-test 2>/dev/null || true
+	mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/{data,logs}
+	mkdir -p /tmp/zlayer-macos-sandbox-e2e-test/data/{containers,images}
+	@echo "Running macOS Sandbox E2E tests..."
+	cargo test --package zlayer-agent --test macos_sandbox_e2e -- --nocapture
+
+# MPS GPU smoke test (requires Apple Silicon + PyTorch via uv)
+test-mps-smoke:
+	@echo "Running MPS GPU smoke test..."
+	cargo test --package zlayer-agent --test macos_mps_smoke -- --nocapture
+
 # Generate documentation
 docs:
 	cargo doc --workspace --no-deps --open
@@ -161,6 +175,8 @@ help:
 	@echo "  make test-<crate> - Run tests for specific crate"
 	@echo "  make test-e2e     - Run E2E tests (requires sudo)"
 	@echo "  make test-e2e-single TEST=name - Run single E2E test"
+	@echo "  make test-macos-sandbox - Run macOS sandbox E2E tests"
+	@echo "  make test-mps-smoke - Run MPS GPU smoke test (Apple Silicon)"
 	@echo "  make test-features- Test feature flag combinations"
 	@echo ""
 	@echo "Documentation:"

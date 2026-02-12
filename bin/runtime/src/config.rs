@@ -17,13 +17,14 @@ pub(crate) fn build_runtime_config(cli: &Cli) -> RuntimeConfig {
         RuntimeType::Docker => RuntimeConfig::Docker,
         #[cfg(target_os = "linux")]
         RuntimeType::Youki => RuntimeConfig::Youki(YoukiConfig {
-            state_dir: cli.state_dir.clone(),
+            state_dir: cli.effective_state_dir(),
             ..Default::default()
         }),
         #[cfg(target_os = "macos")]
         RuntimeType::MacSandbox => RuntimeConfig::MacSandbox(MacSandboxConfig {
-            data_dir: cli.state_dir.clone(),
-            ..Default::default()
+            data_dir: cli.effective_data_dir(),
+            log_dir: cli.effective_log_dir(),
+            gpu_access: true,
         }),
         #[cfg(target_os = "macos")]
         RuntimeType::MacVm => RuntimeConfig::MacVm,

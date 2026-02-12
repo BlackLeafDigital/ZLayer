@@ -21,7 +21,12 @@ use tokio::net::UnixStream;
 use tracing::{debug, info};
 
 /// Default path for the daemon Unix socket.
-pub const DEFAULT_SOCKET_PATH: &str = "/var/run/zlayer.sock";
+///
+/// On macOS this resolves to `~/.local/share/zlayer/run/zlayer.sock`.
+/// On Linux it stays at `/var/run/zlayer.sock`.
+pub fn default_socket_path() -> String {
+    crate::cli::default_socket_path(&crate::cli::default_data_dir())
+}
 
 // ---------------------------------------------------------------------------
 // Unix socket connector (tower::Service<Uri>)
@@ -84,12 +89,12 @@ impl DaemonClient {
 
     /// Connect to the daemon, auto-starting it if it is not already running.
     ///
-    /// Checks for the Unix socket at [`DEFAULT_SOCKET_PATH`].  If the socket
+    /// Checks for the Unix socket at [`default_socket_path()`].  If the socket
     /// does not exist and no daemon PID is found, `zlayer-runtime serve --daemon`
     /// is spawned and the function polls the socket with exponential backoff
     /// (100 ms -> 200 ms -> 400 ms -> ... -> 1 s, max 20 attempts, ~10 s total).
     pub async fn connect() -> Result<Self> {
-        Self::connect_to(DEFAULT_SOCKET_PATH).await
+        Self::connect_to(&default_socket_path()).await
     }
 
     /// Like [`connect`](Self::connect) but with a custom socket path.

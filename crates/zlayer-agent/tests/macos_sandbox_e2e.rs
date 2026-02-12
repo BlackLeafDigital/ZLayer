@@ -846,7 +846,7 @@ async fn test_gpu_metal_compute_profile() {
             "Profile should allow IOKit GPU access"
         );
         assert!(
-            profile.contains("AGXAccelerator"),
+            profile.contains("AGXDeviceUserClient"),
             "Profile should allow Apple Silicon GPU access"
         );
         assert!(
@@ -860,7 +860,10 @@ async fn test_gpu_metal_compute_profile() {
 
 /// Test container creation with MPS-only GPU access.
 ///
-/// MPS-only mode is a smaller attack surface -- no shader compilation needed.
+/// MPS-only mode has a smaller attack surface than full Metal compute --
+/// it omits AGXCompilerService XPC services and cvmsServ. However,
+/// MTLCompilerService is still required because MPSGraph uses JIT
+/// compilation internally on macOS 26+.
 #[tokio::test]
 async fn test_gpu_mps_only_profile() {
     with_timeout!(30, {
@@ -895,13 +898,19 @@ async fn test_gpu_mps_only_profile() {
             profile.contains("MPS Only"),
             "Profile should contain MPS-only section"
         );
+        // MPS-only omits AGXCompilerService (Apple Silicon shader pre-compilation)
         assert!(
-            !profile.contains("MTLCompilerService"),
-            "MPS-only profile should NOT allow shader compilation"
+            !profile.contains("AGXCompilerService"),
+            "MPS-only profile should NOT allow AGXCompilerService"
         );
         assert!(
             profile.contains("MetalPerformanceShaders.framework"),
             "Profile should allow MPS framework access"
+        );
+        // AGXDeviceUserClient is required for Metal device creation
+        assert!(
+            profile.contains("AGXDeviceUserClient"),
+            "Profile should allow AGXDeviceUserClient"
         );
 
         let _ = runtime.remove_container(&id).await;

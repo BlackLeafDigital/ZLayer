@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use tracing::info;
 
 use crate::cli::Cli;
@@ -9,7 +9,7 @@ use crate::util::parse_image_reference;
 pub(crate) async fn handle_export(cli: &Cli, image: &str, output: &Path, gzip: bool) -> Result<()> {
     use zlayer_registry::{export_image, LocalRegistry};
 
-    let registry_path = cli.state_dir.join("registry");
+    let registry_path = cli.effective_data_dir().join("registry");
     let registry = LocalRegistry::new(registry_path)
         .await
         .context("Failed to open local registry")?;
@@ -41,7 +41,7 @@ pub(crate) async fn handle_export(cli: &Cli, image: &str, output: &Path, gzip: b
 pub(crate) async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) -> Result<()> {
     use zlayer_registry::{import_image, LocalRegistry};
 
-    let registry_path = cli.state_dir.join("registry");
+    let registry_path = cli.effective_data_dir().join("registry");
     let registry = LocalRegistry::new(registry_path)
         .await
         .context("Failed to open local registry")?;
@@ -64,14 +64,14 @@ pub(crate) async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) 
 }
 
 /// Handle pull command - pull an image from a remote registry to local cache
-pub(crate) async fn handle_pull(image: &str) -> Result<()> {
+pub(crate) async fn handle_pull(image: &str, cli_data_dir: &std::path::Path) -> Result<()> {
     use zlayer_registry::{BlobCache, ImagePuller, LocalRegistry, RegistryAuth};
 
     info!(image = %image, "Pulling image from registry");
     println!("Pulling {}...", image);
 
     // Set up directories
-    let data_dir = PathBuf::from("/var/lib/zlayer");
+    let data_dir = cli_data_dir.to_path_buf();
     let cache_dir = data_dir.join("cache");
     let registry_path = data_dir.join("registry");
 

@@ -47,9 +47,11 @@ fn main() -> Result<()> {
         {
             // macOS: use launchd for proper daemon management.
             // Generates a plist, installs it, and loads via launchctl.
-            install_launchd_service(&cli)?;
+            let log_dir = cli.effective_log_dir();
+            install_launchd_service(&cli, &log_dir)?;
+            let log_path = log_dir.join("daemon.log");
             println!("zlayer daemon registered with launchd and started.");
-            println!("  Logs: /var/log/zlayer/daemon.log");
+            println!("  Logs: {}", log_path.display());
             println!("  Stop: launchctl bootout system/com.zlayer.daemon");
             std::process::exit(0);
         }
@@ -58,16 +60,22 @@ fn main() -> Result<()> {
         {
             use std::fs::{self, OpenOptions};
 
+            let run_dir = cli.effective_run_dir();
+            let log_dir = cli.effective_log_dir();
+
             // Create directories (idempotent via create_dir_all)
-            fs::create_dir_all("/var/run/zlayer").context("Failed to create /var/run/zlayer")?;
-            fs::create_dir_all("/var/log/zlayer").context("Failed to create /var/log/zlayer")?;
+            fs::create_dir_all(&run_dir)
+                .with_context(|| format!("Failed to create {}", run_dir.display()))?;
+            fs::create_dir_all(&log_dir)
+                .with_context(|| format!("Failed to create {}", log_dir.display()))?;
 
             // Open log file BEFORE forking so errors are visible on the caller's terminal
+            let log_path = log_dir.join("daemon.log");
             let log_file = OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open("/var/log/zlayer/daemon.log")
-                .context("Failed to open /var/log/zlayer/daemon.log")?;
+                .open(&log_path)
+                .with_context(|| format!("Failed to open {}", log_path.display()))?;
 
             let log_fd = log_file.as_raw_fd();
 
@@ -94,8 +102,9 @@ fn main() -> Result<()> {
             drop(log_file);
 
             // Write PID file with ONLY the numeric PID
-            fs::write("/var/run/zlayer/zlayer.pid", std::process::id().to_string())
-                .context("Failed to write PID file")?;
+            let pid_path = run_dir.join("zlayer.pid");
+            fs::write(&pid_path, std::process::id().to_string())
+                .with_context(|| format!("Failed to write PID file at {}", pid_path.display()))?;
         }
     }
 
@@ -149,7 +158,7 @@ fn main() -> Result<()> {
 /// `launchctl`. The plist runs the server in foreground — launchd handles
 /// lifecycle, restart-on-crash, and log routing.
 #[cfg(target_os = "macos")]
-fn install_launchd_service(cli: &Cli) -> Result<()> {
+fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
     use std::fs;
     use std::process::Command;
 
@@ -173,15 +182,26 @@ fn install_launchd_service(cli: &Cli) -> Result<()> {
         _ => unreachable!("install_launchd_service called without Serve command"),
     };
 
+    let resolved_socket = cli.effective_socket_path();
+
     // Build the ProgramArguments array entries
     let mut args = vec![
         format!("        <string>{}</string>", exe_str),
         "        <string>serve</string>".to_string(),
-        format!("        <string>--bind</string>"),
+        "        <string>--bind</string>".to_string(),
         format!("        <string>{}</string>", bind),
-        format!("        <string>--socket</string>"),
-        format!("        <string>{}</string>", socket),
+        "        <string>--socket</string>".to_string(),
+        format!(
+            "        <string>{}</string>",
+            socket.as_deref().unwrap_or(&resolved_socket)
+        ),
     ];
+
+    // Forward --data-dir if explicitly set
+    if let Some(ref dd) = cli.data_dir {
+        args.push("        <string>--data-dir</string>".to_string());
+        args.push(format!("        <string>{}</string>", dd.display()));
+    }
 
     if let Some(ref secret) = jwt_secret {
         args.push("        <string>--jwt-secret</string>".to_string());
@@ -203,6 +223,9 @@ fn install_launchd_service(cli: &Cli) -> Result<()> {
 
     let args_xml = args.join("\n");
 
+    let log_path = log_dir.join("daemon.log");
+    let log_path_str = log_path.to_string_lossy();
+
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -220,18 +243,19 @@ fn install_launchd_service(cli: &Cli) -> Result<()> {
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>/var/log/zlayer/daemon.log</string>
+    <string>{}</string>
     <key>StandardErrorPath</key>
-    <string>/var/log/zlayer/daemon.log</string>
+    <string>{}</string>
     <key>WorkingDirectory</key>
     <string>/</string>
 </dict>
 </plist>"#,
-        args_xml
+        args_xml, log_path_str, log_path_str
     );
 
     // Create log directory
-    fs::create_dir_all("/var/log/zlayer").context("Failed to create /var/log/zlayer")?;
+    fs::create_dir_all(log_dir)
+        .with_context(|| format!("Failed to create {}", log_dir.display()))?;
 
     // Determine plist location based on privilege level
     let is_root = unsafe { libc::geteuid() } == 0;
@@ -316,14 +340,17 @@ async fn run(cli: Cli) -> Result<()> {
             jwt_secret,
             no_swagger,
             daemon: _, // Already handled in main() before tokio runtime
-            socket,
+            ..
         } => {
+            let socket_path = cli.effective_socket_path();
+            let data_dir = cli.effective_data_dir();
             commands::serve::serve(
                 bind,
                 jwt_secret.clone(),
                 *no_swagger,
-                socket,
+                &socket_path,
                 cli.host_network,
+                data_dir,
             )
             .await
         }
@@ -346,7 +373,16 @@ async fn run(cli: Cli) -> Result<()> {
             service,
             force,
             timeout,
-        } => commands::lifecycle::stop(deployment, service.clone(), *force, *timeout).await,
+        } => {
+            commands::lifecycle::stop(
+                deployment,
+                service.clone(),
+                *force,
+                *timeout,
+                &cli.effective_state_dir(),
+            )
+            .await
+        }
         Commands::Up { spec_path } => {
             let path = util::discover_spec_path(spec_path.as_deref())?;
             commands::deploy::up(&cli, &path).await
@@ -396,7 +432,9 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Wasm(wasm_cmd) => commands::wasm::handle_wasm(&cli, wasm_cmd).await,
         Commands::Tunnel(tunnel_cmd) => commands::tunnel::handle_tunnel(&cli, tunnel_cmd).await,
         Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd).await,
-        Commands::Pull { image } => commands::registry::handle_pull(image).await,
+        Commands::Pull { image } => {
+            commands::registry::handle_pull(image, &cli.effective_data_dir()).await
+        }
         Commands::Exec {
             service,
             deployment,
@@ -408,6 +446,8 @@ async fn run(cli: Cli) -> Result<()> {
             containers,
             format,
         } => commands::ps::ps(deployment.clone(), *containers, format).await,
-        Commands::Node(node_cmd) => commands::node::handle_node(node_cmd).await,
+        Commands::Node(node_cmd) => {
+            commands::node::handle_node(node_cmd, &cli.effective_data_dir()).await
+        }
     }
 }

@@ -34,6 +34,7 @@ pub(crate) async fn serve(
     no_swagger: bool,
     socket_path: &str,
     host_network: bool,
+    data_dir: std::path::PathBuf,
 ) -> Result<()> {
     let jwt_secret = jwt_secret.unwrap_or_else(|| {
         warn!("Using default JWT secret - NOT SAFE FOR PRODUCTION");
@@ -47,8 +48,13 @@ pub(crate) async fn serve(
     // -----------------------------------------------------------------------
     // 1. Create DaemonConfig
     // -----------------------------------------------------------------------
+    let log_dir = crate::cli::default_log_dir(&data_dir);
+    let run_dir = crate::cli::default_run_dir(&data_dir);
     let config = DaemonConfig {
         host_network,
+        data_dir,
+        log_dir,
+        run_dir,
         ..Default::default()
     };
 
