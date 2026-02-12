@@ -195,7 +195,10 @@ fn parse_cluster_join_token(token: &str) -> Result<ClusterJoinToken> {
 use crate::cli::NodeCommands;
 
 /// Top-level dispatcher for node subcommands
-pub(crate) async fn handle_node(node_cmd: &NodeCommands) -> Result<()> {
+pub(crate) async fn handle_node(
+    node_cmd: &NodeCommands,
+    cli_data_dir: &std::path::Path,
+) -> Result<()> {
     match node_cmd {
         NodeCommands::Init {
             advertise_addr,
@@ -205,12 +208,15 @@ pub(crate) async fn handle_node(node_cmd: &NodeCommands) -> Result<()> {
             data_dir,
             overlay_cidr,
         } => {
+            let resolved_dir = data_dir
+                .clone()
+                .unwrap_or_else(|| cli_data_dir.to_path_buf());
             handle_node_init(
                 advertise_addr.clone(),
                 *api_port,
                 *raft_port,
                 *overlay_port,
-                data_dir.clone(),
+                resolved_dir,
                 overlay_cidr.clone(),
             )
             .await
@@ -228,21 +234,30 @@ pub(crate) async fn handle_node(node_cmd: &NodeCommands) -> Result<()> {
                 advertise_addr.clone(),
                 mode.clone(),
                 services.clone(),
+                cli_data_dir.to_path_buf(),
             )
             .await
         }
-        NodeCommands::List { output } => handle_node_list(output.clone()).await,
-        NodeCommands::Status { node_id } => handle_node_status(node_id.clone()).await,
+        NodeCommands::List { output } => handle_node_list(output.clone(), cli_data_dir).await,
+        NodeCommands::Status { node_id } => handle_node_status(node_id.clone(), cli_data_dir).await,
         NodeCommands::Remove { node_id, force } => {
-            handle_node_remove(node_id.clone(), *force).await
+            handle_node_remove(node_id.clone(), *force, cli_data_dir).await
         }
         NodeCommands::SetMode {
             node_id,
             mode,
             services,
-        } => handle_node_set_mode(node_id.clone(), mode.clone(), services.clone()).await,
+        } => {
+            handle_node_set_mode(
+                node_id.clone(),
+                mode.clone(),
+                services.clone(),
+                cli_data_dir,
+            )
+            .await
+        }
         NodeCommands::Label { node_id, label } => {
-            handle_node_label(node_id.clone(), label.clone()).await
+            handle_node_label(node_id.clone(), label.clone(), cli_data_dir).await
         }
         NodeCommands::GenerateJoinToken {
             deployment,
@@ -250,11 +265,14 @@ pub(crate) async fn handle_node(node_cmd: &NodeCommands) -> Result<()> {
             service,
             data_dir,
         } => {
+            let resolved_dir = data_dir
+                .clone()
+                .unwrap_or_else(|| cli_data_dir.to_path_buf());
             handle_node_generate_join_token(
                 deployment.clone(),
                 api.clone(),
                 service.clone(),
-                data_dir.clone(),
+                resolved_dir,
             )
             .await
         }
@@ -435,6 +453,7 @@ pub(crate) async fn handle_node_join(
     advertise_addr: String,
     mode: String,
     services: Option<Vec<String>>,
+    data_dir_override: PathBuf,
 ) -> Result<()> {
     use std::time::Duration;
     use zlayer_overlay::OverlayTransport;
@@ -457,7 +476,7 @@ pub(crate) async fn handle_node_join(
         .map_err(|e| anyhow::anyhow!("Failed to generate overlay keys: {}", e))?;
 
     // 3. Determine data directory
-    let data_dir = PathBuf::from("/var/lib/zlayer");
+    let data_dir = data_dir_override;
     tokio::fs::create_dir_all(&data_dir)
         .await
         .context("Failed to create data directory")?;
@@ -764,11 +783,11 @@ pub(crate) async fn handle_node_join(
 }
 
 /// List all nodes in the cluster
-pub(crate) async fn handle_node_list(output: String) -> Result<()> {
+pub(crate) async fn handle_node_list(output: String, cli_data_dir: &std::path::Path) -> Result<()> {
     use std::time::Duration;
 
     // Try to load local node config to get API endpoint
-    let data_dir = PathBuf::from("/var/lib/zlayer");
+    let data_dir = cli_data_dir.to_path_buf();
     let node_config = match load_node_config(&data_dir).await {
         Ok(config) => config,
         Err(_) => {
@@ -860,8 +879,11 @@ pub(crate) async fn handle_node_list(output: String) -> Result<()> {
 }
 
 /// Show detailed status of a node
-pub(crate) async fn handle_node_status(node_id: Option<String>) -> Result<()> {
-    let data_dir = PathBuf::from("/var/lib/zlayer");
+pub(crate) async fn handle_node_status(
+    node_id: Option<String>,
+    cli_data_dir: &std::path::Path,
+) -> Result<()> {
+    let data_dir = cli_data_dir.to_path_buf();
     let node_config = match load_node_config(&data_dir).await {
         Ok(config) => config,
         Err(_) => {
@@ -962,10 +984,14 @@ pub(crate) async fn handle_node_status(node_id: Option<String>) -> Result<()> {
 }
 
 /// Remove a node from the cluster
-pub(crate) async fn handle_node_remove(node_id: String, force: bool) -> Result<()> {
+pub(crate) async fn handle_node_remove(
+    node_id: String,
+    force: bool,
+    cli_data_dir: &std::path::Path,
+) -> Result<()> {
     use std::time::Duration;
 
-    let data_dir = PathBuf::from("/var/lib/zlayer");
+    let data_dir = cli_data_dir.to_path_buf();
     let node_config = match load_node_config(&data_dir).await {
         Ok(config) => config,
         Err(_) => {
@@ -1024,6 +1050,7 @@ pub(crate) async fn handle_node_set_mode(
     node_id: String,
     mode: String,
     services: Option<Vec<String>>,
+    cli_data_dir: &std::path::Path,
 ) -> Result<()> {
     use std::time::Duration;
 
@@ -1042,7 +1069,7 @@ pub(crate) async fn handle_node_set_mode(
         anyhow::bail!("Mode '{}' requires --services to be specified", mode);
     }
 
-    let data_dir = PathBuf::from("/var/lib/zlayer");
+    let data_dir = cli_data_dir.to_path_buf();
     let node_config = match load_node_config(&data_dir).await {
         Ok(config) => config,
         Err(_) => {
@@ -1097,7 +1124,11 @@ pub(crate) async fn handle_node_set_mode(
 }
 
 /// Add label to a node
-pub(crate) async fn handle_node_label(node_id: String, label: String) -> Result<()> {
+pub(crate) async fn handle_node_label(
+    node_id: String,
+    label: String,
+    cli_data_dir: &std::path::Path,
+) -> Result<()> {
     use std::time::Duration;
 
     // Parse label
@@ -1115,7 +1146,7 @@ pub(crate) async fn handle_node_label(node_id: String, label: String) -> Result<
         anyhow::bail!("Label key cannot be empty");
     }
 
-    let data_dir = PathBuf::from("/var/lib/zlayer");
+    let data_dir = cli_data_dir.to_path_buf();
     let node_config = match load_node_config(&data_dir).await {
         Ok(config) => config,
         Err(_) => {
@@ -1335,7 +1366,7 @@ mod tests {
                 assert_eq!(api_port, 3669);
                 assert_eq!(raft_port, 9000);
                 assert_eq!(overlay_port, 51820);
-                assert_eq!(data_dir, PathBuf::from("/var/lib/zlayer"));
+                assert!(data_dir.is_none()); // resolved at runtime
                 assert_eq!(overlay_cidr, "10.200.0.0/16");
             }
             _ => panic!("Expected Node Init command"),
@@ -1376,7 +1407,7 @@ mod tests {
                 assert_eq!(api_port, 9090);
                 assert_eq!(raft_port, 9001);
                 assert_eq!(overlay_port, 51821);
-                assert_eq!(data_dir, PathBuf::from("/custom/data"));
+                assert_eq!(data_dir, Some(PathBuf::from("/custom/data")));
                 assert_eq!(overlay_cidr, "10.100.0.0/16");
             }
             _ => panic!("Expected Node Init command"),

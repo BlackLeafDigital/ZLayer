@@ -93,9 +93,13 @@ pub struct MacSandboxConfig {
 #[cfg(target_os = "macos")]
 impl Default for MacSandboxConfig {
     fn default() -> Self {
+        let base = std::env::var("HOME")
+            .map(|h| PathBuf::from(h).join(".local/share/zlayer"))
+            .unwrap_or_else(|_| PathBuf::from("/var/lib/zlayer"));
+        let log_dir = base.join("logs");
         Self {
-            data_dir: PathBuf::from("/var/lib/zlayer"),
-            log_dir: PathBuf::from("/var/log/zlayer"),
+            data_dir: base,
+            log_dir,
             gpu_access: true,
         }
     }

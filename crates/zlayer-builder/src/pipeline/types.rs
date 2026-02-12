@@ -10,7 +10,7 @@
 //! - **Coordinated push** - Push all images after successful builds
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
@@ -201,8 +201,8 @@ fn default_context() -> PathBuf {
 }
 
 /// Check if path is the default context.
-fn is_default_context(path: &PathBuf) -> bool {
-    *path == PathBuf::from(".")
+fn is_default_context(path: &Path) -> bool {
+    path.as_os_str() == "."
 }
 
 /// Helper for `skip_serializing_if` on boolean fields.

@@ -1,6 +1,73 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+/// Return the platform-appropriate default data directory for ZLayer.
+///
+/// - macOS: `~/.local/share/zlayer` (user-writable without root)
+/// - Linux: `/var/lib/zlayer` (traditional, typically runs as root)
+pub(crate) fn default_data_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            PathBuf::from(home).join(".local/share/zlayer")
+        } else {
+            PathBuf::from("/var/lib/zlayer")
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        PathBuf::from("/var/lib/zlayer")
+    }
+}
+
+/// Return the platform-appropriate default runtime directory.
+///
+/// - macOS: `{data_dir}/run` (under the user data dir)
+/// - Linux: `/var/run/zlayer`
+pub(crate) fn default_run_dir(data_dir: &std::path::Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        data_dir.join("run")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = data_dir;
+        PathBuf::from("/var/run/zlayer")
+    }
+}
+
+/// Return the platform-appropriate default log directory.
+///
+/// - macOS: `{data_dir}/logs` (under the user data dir)
+/// - Linux: `/var/log/zlayer`
+pub(crate) fn default_log_dir(data_dir: &std::path::Path) -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        data_dir.join("logs")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = data_dir;
+        PathBuf::from("/var/log/zlayer")
+    }
+}
+
+/// Return the platform-appropriate default socket path.
+pub(crate) fn default_socket_path(data_dir: &std::path::Path) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        default_run_dir(data_dir)
+            .join("zlayer.sock")
+            .to_string_lossy()
+            .into_owned()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = data_dir;
+        "/var/run/zlayer.sock".to_string()
+    }
+}
+
 /// ZLayer container orchestration runtime
 #[derive(Parser)]
 #[command(name = "zlayer-runtime")]
@@ -11,9 +78,19 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "auto", value_enum)]
     pub(crate) runtime: RuntimeType,
 
-    /// State directory for runtime data
-    #[arg(long, default_value = "/var/lib/zlayer/containers")]
-    pub(crate) state_dir: PathBuf,
+    /// Root data directory for all ZLayer state (databases, secrets, containers).
+    ///
+    /// On macOS defaults to ~/.local/share/zlayer (no root required).
+    /// On Linux defaults to /var/lib/zlayer.
+    /// Other directories (logs, run, containers) are derived from this unless
+    /// individually overridden.
+    #[arg(long, env = "ZLAYER_DATA_DIR")]
+    pub(crate) data_dir: Option<PathBuf>,
+
+    /// State directory for container runtime data.
+    /// Defaults to {data-dir}/containers.
+    #[arg(long)]
+    pub(crate) state_dir: Option<PathBuf>,
 
     /// Enable verbose logging
     #[arg(short, long, action = clap::ArgAction::Count)]
@@ -45,6 +122,42 @@ pub(crate) struct Cli {
 
     #[command(subcommand)]
     pub(crate) command: Commands,
+}
+
+impl Cli {
+    /// Resolve the effective root data directory.
+    pub(crate) fn effective_data_dir(&self) -> PathBuf {
+        self.data_dir.clone().unwrap_or_else(default_data_dir)
+    }
+
+    /// Resolve the effective state directory (container runtime state).
+    pub(crate) fn effective_state_dir(&self) -> PathBuf {
+        self.state_dir
+            .clone()
+            .unwrap_or_else(|| self.effective_data_dir().join("containers"))
+    }
+
+    /// Resolve the effective log directory.
+    pub(crate) fn effective_log_dir(&self) -> PathBuf {
+        default_log_dir(&self.effective_data_dir())
+    }
+
+    /// Resolve the effective runtime (run) directory.
+    #[allow(dead_code)] // used on Linux in cfg(not(target_os = "macos")) blocks
+    pub(crate) fn effective_run_dir(&self) -> PathBuf {
+        default_run_dir(&self.effective_data_dir())
+    }
+
+    /// Resolve the effective socket path.
+    pub(crate) fn effective_socket_path(&self) -> String {
+        if let Commands::Serve {
+            socket: Some(s), ..
+        } = &self.command
+        {
+            return s.clone();
+        }
+        default_socket_path(&self.effective_data_dir())
+    }
 }
 
 /// Runtime type selection
@@ -115,9 +228,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         daemon: bool,
 
-        /// Unix socket path for CLI communication
-        #[arg(long, default_value = "/var/run/zlayer.sock")]
-        socket: String,
+        /// Unix socket path for CLI communication.
+        /// Defaults to {run-dir}/zlayer.sock.
+        #[arg(long)]
+        socket: Option<String>,
     },
 
     /// Show runtime status
@@ -706,9 +820,9 @@ pub(crate) enum NodeCommands {
         #[arg(long, default_value = "51820")]
         overlay_port: u16,
 
-        /// Data directory
-        #[arg(long, default_value = "/var/lib/zlayer")]
-        data_dir: PathBuf,
+        /// Data directory (defaults to platform default, see --data-dir)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
 
         /// Overlay network CIDR
         #[arg(long, default_value = "10.200.0.0/16")]
@@ -811,9 +925,9 @@ pub(crate) enum NodeCommands {
         #[arg(short, long)]
         service: Option<String>,
 
-        /// Data directory (where node_config.json lives)
-        #[arg(long, default_value = "/var/lib/zlayer")]
-        data_dir: PathBuf,
+        /// Data directory (where node_config.json lives, defaults to platform default)
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
     },
 }
 
@@ -908,7 +1022,7 @@ mod tests {
         .unwrap();
 
         assert!(matches!(cli.runtime, RuntimeType::Youki));
-        assert_eq!(cli.state_dir, PathBuf::from("/custom/state"));
+        assert_eq!(cli.state_dir, Some(PathBuf::from("/custom/state")));
     }
 
     #[test]
@@ -1164,7 +1278,7 @@ mod tests {
                 assert!(jwt_secret.is_none());
                 assert!(!no_swagger);
                 assert!(!daemon);
-                assert_eq!(socket, "/var/run/zlayer.sock");
+                assert!(socket.is_none()); // resolved dynamically via effective_socket_path()
             }
             _ => panic!("Expected Serve command"),
         }
@@ -1241,7 +1355,7 @@ mod tests {
                 assert_eq!(jwt_secret, Some("test-secret".to_string()));
                 assert!(no_swagger);
                 assert!(daemon);
-                assert_eq!(socket, "/tmp/zlayer-test.sock");
+                assert_eq!(socket, Some("/tmp/zlayer-test.sock".to_string()));
             }
             _ => panic!("Expected Serve command"),
         }
@@ -1266,7 +1380,7 @@ mod tests {
 
         match cli.command {
             Commands::Serve { socket, .. } => {
-                assert_eq!(socket, "/tmp/custom.sock");
+                assert_eq!(socket, Some("/tmp/custom.sock".to_string()));
             }
             _ => panic!("Expected Serve command"),
         }
@@ -1294,7 +1408,7 @@ mod tests {
             } => {
                 assert_eq!(bind, "127.0.0.1:3669");
                 assert!(daemon);
-                assert_eq!(socket, "/var/run/zlayer-custom.sock");
+                assert_eq!(socket, Some("/var/run/zlayer-custom.sock".to_string()));
             }
             _ => panic!("Expected Serve command"),
         }
@@ -1770,7 +1884,7 @@ mod tests {
                 assert_eq!(api_port, 3669);
                 assert_eq!(raft_port, 9000);
                 assert_eq!(overlay_port, 51820);
-                assert_eq!(data_dir, PathBuf::from("/var/lib/zlayer"));
+                assert!(data_dir.is_none()); // defaults resolved at runtime
                 assert_eq!(overlay_cidr, "10.200.0.0/16");
             }
             _ => panic!("Expected Node Init command"),
@@ -1811,7 +1925,7 @@ mod tests {
                 assert_eq!(api_port, 9090);
                 assert_eq!(raft_port, 9001);
                 assert_eq!(overlay_port, 51821);
-                assert_eq!(data_dir, PathBuf::from("/custom/data"));
+                assert_eq!(data_dir, Some(PathBuf::from("/custom/data")));
                 assert_eq!(overlay_cidr, "10.100.0.0/16");
             }
             _ => panic!("Expected Node Init command"),

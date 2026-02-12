@@ -97,8 +97,7 @@ fn test_zlayer_token_create() {
     // Get the last non-empty line (the JWT token) - observability logs may precede it
     let token = stdout
         .lines()
-        .filter(|line| !line.is_empty() && !line.starts_with('{'))
-        .next_back()
+        .rfind(|line| !line.is_empty() && !line.starts_with('{'))
         .expect("Should have token output");
     // JWT format: header.payload.signature
     let parts: Vec<&str> = token.split('.').collect();

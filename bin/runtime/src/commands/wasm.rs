@@ -357,7 +357,7 @@ pub(crate) async fn handle_wasm_push(
     };
 
     // Create blob cache and image puller
-    let cache_dir = cli.state_dir.join("cache");
+    let cache_dir = cli.effective_data_dir().join("cache");
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .context("Failed to create cache directory")?;
