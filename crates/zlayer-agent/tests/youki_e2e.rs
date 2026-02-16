@@ -1,4 +1,5 @@
 #![cfg(target_os = "linux")]
+#![allow(deprecated)]
 //! End-to-end integration tests for ZLayer with youki/libcontainer runtime
 //!
 //! These tests verify the complete container lifecycle using the youki-based

@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! Infrastructure Wiring Integration Tests
 //!
 //! These tests verify that all critical infrastructure components (overlay network,

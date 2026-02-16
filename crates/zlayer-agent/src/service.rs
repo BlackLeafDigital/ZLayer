@@ -502,8 +502,166 @@ pub struct ServiceManager {
     container_supervisor: Option<Arc<ContainerSupervisor>>,
 }
 
+// ---------------------------------------------------------------------------
+// ServiceManagerBuilder
+// ---------------------------------------------------------------------------
+
+/// Builder for constructing a [`ServiceManager`] with optional subsystems.
+///
+/// Prefer using `ServiceManager::builder(runtime)` to start building.
+///
+/// # Example
+///
+/// ```ignore
+/// let manager = ServiceManager::builder(runtime)
+///     .overlay_manager(om)
+///     .proxy_manager(proxy)
+///     .service_registry(registry)
+///     .deployment_name("prod")
+///     .build();
+/// ```
+pub struct ServiceManagerBuilder {
+    runtime: Arc<dyn Runtime + Send + Sync>,
+    overlay_manager: Option<Arc<RwLock<OverlayManager>>>,
+    proxy_manager: Option<Arc<ProxyManager>>,
+    service_registry: Option<Arc<ServiceRegistry>>,
+    stream_registry: Option<Arc<StreamRegistry>>,
+    dns_server: Option<Arc<DnsServer>>,
+    deployment_name: Option<String>,
+    job_executor: Option<Arc<JobExecutor>>,
+    cron_scheduler: Option<Arc<CronScheduler>>,
+    container_supervisor: Option<Arc<ContainerSupervisor>>,
+}
+
+impl ServiceManagerBuilder {
+    /// Create a new builder with the required runtime.
+    pub fn new(runtime: Arc<dyn Runtime + Send + Sync>) -> Self {
+        Self {
+            runtime,
+            overlay_manager: None,
+            proxy_manager: None,
+            service_registry: None,
+            stream_registry: None,
+            dns_server: None,
+            deployment_name: None,
+            job_executor: None,
+            cron_scheduler: None,
+            container_supervisor: None,
+        }
+    }
+
+    /// Set the overlay network manager for container networking.
+    pub fn overlay_manager(mut self, om: Arc<RwLock<OverlayManager>>) -> Self {
+        self.overlay_manager = Some(om);
+        self
+    }
+
+    /// Set the proxy manager for health-aware load balancing.
+    pub fn proxy_manager(mut self, pm: Arc<ProxyManager>) -> Self {
+        self.proxy_manager = Some(pm);
+        self
+    }
+
+    /// Set the service registry for HTTP/HTTPS/WebSocket proxy route registration.
+    pub fn service_registry(mut self, sr: Arc<ServiceRegistry>) -> Self {
+        self.service_registry = Some(sr);
+        self
+    }
+
+    /// Set the stream registry for TCP/UDP L4 proxy route registration.
+    pub fn stream_registry(mut self, sr: Arc<StreamRegistry>) -> Self {
+        self.stream_registry = Some(sr);
+        self
+    }
+
+    /// Set the DNS server for service discovery.
+    pub fn dns_server(mut self, dns: Arc<DnsServer>) -> Self {
+        self.dns_server = Some(dns);
+        self
+    }
+
+    /// Set the deployment name (used for hostname generation).
+    pub fn deployment_name(mut self, name: impl Into<String>) -> Self {
+        self.deployment_name = Some(name.into());
+        self
+    }
+
+    /// Set the job executor for run-to-completion workloads.
+    pub fn job_executor(mut self, je: Arc<JobExecutor>) -> Self {
+        self.job_executor = Some(je);
+        self
+    }
+
+    /// Set the cron scheduler for time-based job triggers.
+    pub fn cron_scheduler(mut self, cs: Arc<CronScheduler>) -> Self {
+        self.cron_scheduler = Some(cs);
+        self
+    }
+
+    /// Set the container supervisor for crash/panic policy enforcement.
+    pub fn container_supervisor(mut self, cs: Arc<ContainerSupervisor>) -> Self {
+        self.container_supervisor = Some(cs);
+        self
+    }
+
+    /// Consume the builder and produce a fully-wired [`ServiceManager`].
+    ///
+    /// Logs warnings for missing recommended subsystems (proxy, service_registry,
+    /// stream_registry, container_supervisor, deployment_name).
+    pub fn build(self) -> ServiceManager {
+        if self.proxy_manager.is_none() {
+            tracing::warn!("ServiceManager built without proxy_manager");
+        }
+        if self.service_registry.is_none() {
+            tracing::warn!("ServiceManager built without service_registry");
+        }
+        if self.stream_registry.is_none() {
+            tracing::warn!("ServiceManager built without stream_registry");
+        }
+        if self.container_supervisor.is_none() {
+            tracing::warn!("ServiceManager built without container_supervisor");
+        }
+        if self.deployment_name.is_none() {
+            tracing::warn!("ServiceManager built without deployment_name");
+        }
+
+        ServiceManager {
+            runtime: self.runtime,
+            services: tokio::sync::RwLock::new(std::collections::HashMap::new()),
+            scale_semaphore: Arc::new(Semaphore::new(10)),
+            overlay_manager: self.overlay_manager,
+            service_registry: self.service_registry,
+            stream_registry: self.stream_registry,
+            proxy_manager: self.proxy_manager,
+            dns_server: self.dns_server,
+            deployment_name: self.deployment_name,
+            health_states: Arc::new(RwLock::new(HashMap::new())),
+            job_executor: self.job_executor,
+            cron_scheduler: self.cron_scheduler,
+            container_supervisor: self.container_supervisor,
+        }
+    }
+}
+
 impl ServiceManager {
+    /// Create a [`ServiceManagerBuilder`] for constructing a `ServiceManager`.
+    ///
+    /// This is the preferred way to construct a `ServiceManager` since v0.2.0.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let manager = ServiceManager::builder(runtime)
+    ///     .overlay_manager(om)
+    ///     .proxy_manager(proxy)
+    ///     .build();
+    /// ```
+    pub fn builder(runtime: Arc<dyn Runtime + Send + Sync>) -> ServiceManagerBuilder {
+        ServiceManagerBuilder::new(runtime)
+    }
+
     /// Create a new service manager
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn new(runtime: Arc<dyn Runtime + Send + Sync>) -> Self {
         Self {
             runtime,
@@ -523,6 +681,7 @@ impl ServiceManager {
     }
 
     /// Create a service manager with overlay network support
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn with_overlay(
         runtime: Arc<dyn Runtime + Send + Sync>,
         overlay_manager: Arc<RwLock<OverlayManager>>,
@@ -545,6 +704,7 @@ impl ServiceManager {
     }
 
     /// Create a service manager with Pingora proxy support
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn with_proxy(
         runtime: Arc<dyn Runtime + Send + Sync>,
         service_registry: Arc<ServiceRegistry>,
@@ -567,6 +727,7 @@ impl ServiceManager {
     }
 
     /// Create a fully-configured service manager with overlay and proxy support
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn with_full_config(
         runtime: Arc<dyn Runtime + Send + Sync>,
         overlay_manager: Arc<RwLock<OverlayManager>>,
@@ -602,21 +763,25 @@ impl ServiceManager {
     }
 
     /// Set the deployment name (used for generating hostnames)
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn set_deployment_name(&mut self, name: String) {
         self.deployment_name = Some(name);
     }
 
     /// Set the service registry for proxy integration (HTTP/HTTPS/WebSocket)
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn set_service_registry(&mut self, registry: Arc<ServiceRegistry>) {
         self.service_registry = Some(registry);
     }
 
     /// Set the stream registry for L4 proxy integration (TCP/UDP)
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn set_stream_registry(&mut self, registry: Arc<StreamRegistry>) {
         self.stream_registry = Some(registry);
     }
 
     /// Builder pattern: add stream registry for L4 proxy integration
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn with_stream_registry(mut self, registry: Arc<StreamRegistry>) -> Self {
         self.stream_registry = Some(registry);
         self
@@ -628,16 +793,19 @@ impl ServiceManager {
     }
 
     /// Set the overlay manager for container networking
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn set_overlay_manager(&mut self, manager: Arc<RwLock<OverlayManager>>) {
         self.overlay_manager = Some(manager);
     }
 
     /// Set the proxy manager for health-aware load balancing
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn set_proxy_manager(&mut self, proxy: Arc<ProxyManager>) {
         self.proxy_manager = Some(proxy);
     }
 
     /// Builder pattern: add proxy manager for health-aware load balancing
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn with_proxy_manager(mut self, proxy: Arc<ProxyManager>) -> Self {
         self.proxy_manager = Some(proxy);
         self
@@ -649,11 +817,13 @@ impl ServiceManager {
     }
 
     /// Set the DNS server for service discovery
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn set_dns_server(&mut self, dns: Arc<DnsServer>) {
         self.dns_server = Some(dns);
     }
 
     /// Builder pattern: add DNS server for service discovery
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn with_dns_server(mut self, dns: Arc<DnsServer>) -> Self {
         self.dns_server = Some(dns);
         self
@@ -665,22 +835,26 @@ impl ServiceManager {
     }
 
     /// Set the job executor for run-to-completion workloads
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn set_job_executor(&mut self, executor: Arc<JobExecutor>) {
         self.job_executor = Some(executor);
     }
 
     /// Set the cron scheduler for time-based job triggers
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn set_cron_scheduler(&mut self, scheduler: Arc<CronScheduler>) {
         self.cron_scheduler = Some(scheduler);
     }
 
     /// Builder pattern: add job executor
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn with_job_executor(mut self, executor: Arc<JobExecutor>) -> Self {
         self.job_executor = Some(executor);
         self
     }
 
     /// Builder pattern: add cron scheduler
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn with_cron_scheduler(mut self, scheduler: Arc<CronScheduler>) -> Self {
         self.cron_scheduler = Some(scheduler);
         self
@@ -697,11 +871,13 @@ impl ServiceManager {
     }
 
     /// Set the container supervisor for crash/panic policy enforcement
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn set_container_supervisor(&mut self, supervisor: Arc<ContainerSupervisor>) {
         self.container_supervisor = Some(supervisor);
     }
 
     /// Builder pattern: add container supervisor
+    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn with_container_supervisor(mut self, supervisor: Arc<ContainerSupervisor>) -> Self {
         self.container_supervisor = Some(supervisor);
         self
@@ -1766,6 +1942,7 @@ impl ServiceManager {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::runtime::MockRuntime;

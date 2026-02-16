@@ -17,7 +17,7 @@ build:
 
 # Build release
 release:
-	cargo build --release --package runtime
+	cargo build --release --package zlayer
 
 # Clean build artifacts
 clean:
@@ -84,14 +84,12 @@ test-registry:
 	cargo test --package zlayer-registry
 
 test-runtime:
-	cargo test --package runtime
+	cargo test --package zlayer
 
 # Test with specific features
 test-features:
-	cargo test --package runtime --no-default-features --features join
-	cargo test --package runtime --no-default-features --features serve
-	cargo test --package runtime --no-default-features --features deploy
-	cargo test --package runtime --features full
+	cargo test --package zlayer --no-default-features --features full
+	cargo test --package zlayer --features full
 
 # macOS Sandbox E2E tests
 test-macos-sandbox:
@@ -117,23 +115,23 @@ docs-build:
 
 # Install locally
 install:
-	cargo install --path bin/runtime
+	cargo install --path bin/zlayer
 
 # Install in development mode (faster builds)
 install-dev:
-	cargo install --path bin/runtime --debug
+	cargo install --path bin/zlayer --debug
 
 # Run the API server (for development)
 run-server:
-	cargo run --package runtime -- serve
+	cargo run --package zlayer -- serve
 
 # Run with verbose logging
 run-server-verbose:
-	cargo run --package runtime -- -vv serve
+	cargo run --package zlayer -- -vv serve
 
 # Validate example spec
 validate-example:
-	cargo run --package runtime -- validate examples/basic-deployment.yaml
+	cargo run --package zlayer -- validate examples/basic-deployment.yaml
 
 # Watch mode for development (requires cargo-watch)
 watch:
@@ -153,7 +151,7 @@ outdated:
 
 # Generate schema for spec (if schemars is used)
 schema:
-	cargo run --package runtime --features full -- spec dump examples/basic-deployment.yaml --format json
+	cargo run --package zlayer --features full -- spec dump examples/basic-deployment.yaml --format json
 
 # Help target
 help:

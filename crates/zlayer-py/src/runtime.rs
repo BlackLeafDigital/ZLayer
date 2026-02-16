@@ -100,7 +100,7 @@ impl Runtime {
             Arc::new(MockRuntime::new())
         };
 
-        let service_manager = ServiceManager::new(runtime.clone());
+        let service_manager = ServiceManager::builder(runtime.clone()).build();
 
         Ok(Self {
             inner: Arc::new(RwLock::new(RuntimeInner {
@@ -157,7 +157,7 @@ impl Runtime {
                 }
             };
 
-            let service_manager = ServiceManager::new(runtime.clone());
+            let service_manager = ServiceManager::builder(runtime.clone()).build();
 
             to_py_result(Ok(Runtime {
                 inner: Arc::new(RwLock::new(RuntimeInner {
@@ -191,6 +191,7 @@ impl Runtime {
             // Deploy with dependencies
             let mut inner = inner.write().await;
             inner.deployment_name = Some(spec.deployment.clone());
+            #[allow(deprecated)]
             inner
                 .service_manager
                 .set_deployment_name(spec.deployment.clone());
@@ -226,6 +227,7 @@ impl Runtime {
             // Deploy with dependencies
             let mut inner = inner.write().await;
             inner.deployment_name = Some(spec.deployment.clone());
+            #[allow(deprecated)]
             inner
                 .service_manager
                 .set_deployment_name(spec.deployment.clone());

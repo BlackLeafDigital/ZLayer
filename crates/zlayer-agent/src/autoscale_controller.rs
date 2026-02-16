@@ -440,6 +440,7 @@ pub fn has_adaptive_scaling(services: &HashMap<String, zlayer_spec::ServiceSpec>
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::runtime::MockRuntime;

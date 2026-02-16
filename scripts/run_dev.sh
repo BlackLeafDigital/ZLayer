@@ -131,7 +131,7 @@ cmd_build() {
     setup_rust_path
 
     info "Building runtime (release)..."
-    cargo build --release --package runtime
+    cargo build --release --package zlayer
 
     info "Building manager SSR (release)..."
     cargo build --release --package zlayer-manager --features ssr
@@ -144,7 +144,8 @@ cmd_build() {
     fi
 
     ok "Build complete"
-    info "Binaries: target/release/zlayer-runtime, target/release/zlayer-manager"
+    info "Binaries: target/release/zlayer, target/release/zlayer-manager"
+
 }
 
 # ============================================================
@@ -258,22 +259,22 @@ cmd_deploy() {
     header "Deploying manager via mac-sandbox"
 
     # Build if needed
-    if [ ! -f target/release/zlayer-runtime ] || [ ! -f target/release/zlayer-manager ]; then
+    if [ ! -f target/release/zlayer ] || [ ! -f target/release/zlayer-manager ]; then
         info "Missing binaries, running build first..."
         cmd_build
     fi
 
     # Clean up existing
     info "Stopping existing daemons..."
-    pkill -f "zlayer-runtime" 2>/dev/null || true
+    pkill -f "zlayer" 2>/dev/null || true
     sleep 1
-    pkill -9 -f "zlayer-runtime" 2>/dev/null || true
+    pkill -9 -f "zlayer" 2>/dev/null || true
     rm -f "$SOCKET"
     rm -rf "${DATA_DIR}/containers/manager-"* 2>/dev/null || true
 
     # Start daemon
     info "Starting daemon on port 3669..."
-    ./target/release/zlayer-runtime serve \
+    ./target/release/zlayer serve \
         --bind 0.0.0.0:3669 \
         --socket "$SOCKET" &
     local daemon_pid=$!
@@ -315,7 +316,7 @@ YAML
     fi
 
     info "Deploying..."
-    ./target/release/zlayer-runtime \
+    ./target/release/zlayer \
         --runtime mac-sandbox --host-network --no-tui \
         up -d "$DEPLOY_SPEC"
 
@@ -332,11 +333,11 @@ YAML
 cmd_clean() {
     header "Cleaning up"
 
-    if pgrep -f "zlayer-runtime" &>/dev/null; then
+    if pgrep -f "zlayer" &>/dev/null; then
         info "Stopping zlayer processes..."
-        pkill -f "zlayer-runtime" 2>/dev/null || true
+        pkill -f "zlayer" 2>/dev/null || true
         sleep 1
-        pkill -9 -f "zlayer-runtime" 2>/dev/null || true
+        pkill -9 -f "zlayer" 2>/dev/null || true
         ok "Processes stopped"
     else
         ok "No zlayer processes running"

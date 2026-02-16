@@ -827,6 +827,7 @@ fn build_cors_layer(config: &ApiConfig) -> CorsLayer {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use zlayer_agent::MockRuntime;

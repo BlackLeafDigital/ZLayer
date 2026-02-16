@@ -31,7 +31,7 @@ pub fn render_logo(area: Rect, buf: &mut Buffer) {
 
 /// Render a subtitle line below the logo
 pub fn render_subtitle(area: Rect, buf: &mut Buffer) {
-    let subtitle = Paragraph::new("Container Image Builder")
+    let subtitle = Paragraph::new("Container Orchestration Platform")
         .style(Style::default().fg(Color::DarkGray))
         .alignment(Alignment::Center);
 

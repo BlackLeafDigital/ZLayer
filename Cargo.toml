@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-default-members = ["bin/runtime"]
+default-members = ["bin/zlayer"]
 members = [
   "crates/zlayer-spec",
   "crates/zlayer-core",
@@ -19,8 +19,6 @@ members = [
   "crates/zlayer-web",
   "crates/zlayer-secrets",
   "crates/zlayer-tunnel",
-  "bin/runtime",
-  "bin/zlayer-build",
   "bin/zlayer",
   "crates/zlayer-manager",
 ]

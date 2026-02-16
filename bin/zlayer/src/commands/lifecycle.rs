@@ -4,94 +4,172 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use tracing::{info, warn};
 
-use crate::cli::{Cli, RuntimeType};
+use crate::cli::Cli;
 use crate::util::{discover_spec_path, parse_spec};
 
-#[cfg(target_os = "macos")]
-use zlayer_agent::MacSandboxConfig;
 use zlayer_agent::RuntimeConfig;
-#[cfg(target_os = "linux")]
-use zlayer_agent::YoukiConfig;
 use zlayer_spec::DeploymentSpec;
 
-/// Show runtime status
-pub(crate) async fn status(cli: &Cli) -> Result<()> {
-    info!("Checking runtime status");
+/// Show daemon and deployment status.
+///
+/// When the daemon is running, displays PID, API bind address, socket path,
+/// runtime type, and a summary of active deployments.  When the daemon is
+/// not running, shows helpful instructions for starting it.
+pub(crate) async fn status(_cli: &Cli) -> Result<()> {
+    info!("Checking daemon status");
 
-    println!("\n=== ZLayer Runtime Status ===");
-    println!("Runtime: {:?}", cli.runtime);
+    let data_dir = _cli.effective_data_dir();
+    let socket_path = _cli.effective_socket_path();
 
-    match cli.runtime {
-        RuntimeType::Auto => {
-            println!("Status: Auto-detect mode");
-            match zlayer_agent::create_runtime(RuntimeConfig::Auto).await {
-                Ok(_) => {
-                    println!("Status: Runtime auto-detected and ready");
+    // Try reading daemon.json for metadata (PID, bind address, etc.)
+    let metadata = read_daemon_metadata(&data_dir).await;
+
+    // Try connecting to the daemon without auto-starting it
+    let client = crate::daemon_client::DaemonClient::try_connect_to(&socket_path).await;
+
+    match client {
+        Ok(Some(client)) => {
+            // Daemon is running -- show rich status
+            println!();
+            println!("ZLayer Daemon");
+
+            // PID from daemon.json
+            if let Some(ref meta) = metadata {
+                if let Some(pid) = meta.get("pid").and_then(|v| v.as_u64()) {
+                    println!("  Status:    running (PID {})", pid);
+                } else {
+                    println!("  Status:    running");
+                }
+                if let Some(api_bind) = meta.get("api_bind").and_then(|v| v.as_str()) {
+                    println!("  API:       {}", api_bind);
+                }
+            } else {
+                println!("  Status:    running");
+            }
+
+            println!("  Socket:    {}", socket_path);
+
+            // Detect runtime from metadata or platform
+            if let Some(ref meta) = metadata {
+                if let Some(host_net) = meta.get("host_network").and_then(|v| v.as_bool()) {
+                    if host_net {
+                        println!("  Network:   host");
+                    }
+                }
+            }
+
+            println!("  Runtime:   {}", detect_runtime_name());
+
+            // Fetch deployment info
+            println!();
+            match client.list_deployments().await {
+                Ok(deployments) if deployments.is_empty() => {
+                    println!("Deployments: none");
+                }
+                Ok(deployments) => {
+                    let active_count = deployments.len();
+                    println!("Deployments: {} active", active_count);
+
+                    for dep in &deployments {
+                        let name = dep
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown");
+                        let status = dep
+                            .get("status")
+                            .and_then(|v| {
+                                v.as_str()
+                                    .map(|s| s.to_string())
+                                    .or_else(|| serde_json::to_string(v).ok())
+                            })
+                            .unwrap_or_else(|| "unknown".to_string());
+
+                        // Try to get service/replica counts from the spec
+                        let (svc_count, replica_count) = extract_deployment_counts(dep);
+
+                        if svc_count > 0 {
+                            println!(
+                                "  {}: {} services, {} replicas ({})",
+                                name, svc_count, replica_count, status
+                            );
+                        } else {
+                            println!("  {}: ({})", name, status);
+                        }
+                    }
                 }
                 Err(e) => {
-                    println!("Status: No suitable runtime found");
-                    println!("Error: {}", e);
+                    warn!(error = %e, "Failed to fetch deployments");
+                    println!("Deployments: error fetching ({})", e);
                 }
             }
-        }
-        #[cfg(feature = "docker")]
-        RuntimeType::Docker => match zlayer_agent::create_runtime(RuntimeConfig::Docker).await {
-            Ok(_) => {
-                println!("Status: Docker runtime ready");
-            }
-            Err(e) => {
-                println!("Status: Docker runtime unavailable");
-                println!("Error: {}", e);
-            }
-        },
-        #[cfg(target_os = "linux")]
-        RuntimeType::Youki => {
-            let state_dir = cli.effective_state_dir();
-            println!("State Dir: {}", state_dir.display());
 
-            let config = YoukiConfig {
-                state_dir,
-                ..Default::default()
-            };
-
-            match zlayer_agent::create_runtime(RuntimeConfig::Youki(config)).await {
-                Ok(_) => {
-                    println!("Status: Youki runtime ready");
-                }
-                Err(e) => {
-                    println!("Status: Youki runtime unavailable");
-                    println!("Error: {}", e);
-                }
-            }
+            println!();
         }
-        #[cfg(target_os = "macos")]
-        RuntimeType::MacSandbox => {
-            let config = RuntimeConfig::MacSandbox(MacSandboxConfig {
-                data_dir: cli.effective_data_dir(),
-                log_dir: cli.effective_log_dir(),
-                gpu_access: true,
-            });
-            match zlayer_agent::create_runtime(config).await {
-                Ok(_) => println!("Status: macOS sandbox runtime ready"),
-                Err(e) => {
-                    println!("Status: macOS sandbox runtime unavailable");
-                    println!("Error: {}", e);
-                }
-            }
+        Ok(None) | Err(_) => {
+            // Daemon is not running
+            println!();
+            println!("ZLayer Daemon: not running");
+            println!();
+            println!("  Start:  zlayer serve --daemon");
+            println!("  Or:     zlayer up (auto-starts daemon)");
+            println!();
         }
-        #[cfg(target_os = "macos")]
-        RuntimeType::MacVm => match zlayer_agent::create_runtime(RuntimeConfig::MacVm).await {
-            Ok(_) => println!("Status: macOS VM runtime ready"),
-            Err(e) => {
-                println!("Status: macOS VM runtime unavailable");
-                println!("Error: {}", e);
-            }
-        },
     }
 
-    println!();
-
     Ok(())
+}
+
+/// Read and parse `{data_dir}/daemon.json` if it exists.
+async fn read_daemon_metadata(data_dir: &std::path::Path) -> Option<serde_json::Value> {
+    let path = data_dir.join("daemon.json");
+    let contents = tokio::fs::read_to_string(&path).await.ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+/// Extract service count and total replica count from a deployment JSON value.
+fn extract_deployment_counts(dep: &serde_json::Value) -> (usize, u32) {
+    // The deployment response may include a nested "spec" with services
+    let services = dep
+        .get("spec")
+        .and_then(|s| s.get("services"))
+        .and_then(|s| s.as_object());
+
+    if let Some(services) = services {
+        let svc_count = services.len();
+        let mut total_replicas: u32 = 0;
+        for (_name, svc) in services {
+            if let Some(scale) = svc.get("scale") {
+                if let Some(replicas) = scale.get("replicas").and_then(|r| r.as_u64()) {
+                    total_replicas += replicas as u32;
+                } else if let Some(min) = scale.get("min").and_then(|r| r.as_u64()) {
+                    total_replicas += min as u32;
+                } else {
+                    total_replicas += 1;
+                }
+            } else {
+                total_replicas += 1;
+            }
+        }
+        (svc_count, total_replicas)
+    } else {
+        (0, 0)
+    }
+}
+
+/// Return a human-readable name for the current platform's default runtime.
+fn detect_runtime_name() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "mac-sandbox"
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "youki"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        "auto"
+    }
 }
 
 /// Validate a spec file without deploying

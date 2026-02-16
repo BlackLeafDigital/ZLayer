@@ -8,6 +8,7 @@ pub mod serve;
 pub mod build;
 pub mod lifecycle;
 pub mod manager;
+pub mod pipeline;
 pub mod registry;
 pub mod spec;
 pub mod token;

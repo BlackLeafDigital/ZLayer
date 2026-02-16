@@ -1344,24 +1344,18 @@ mod tests {
 
     #[test]
     fn test_cli_node_init_command() {
-        let cli = Cli::try_parse_from([
-            "zlayer-runtime",
-            "node",
-            "init",
-            "--advertise-addr",
-            "10.0.0.1",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "init", "--advertise-addr", "10.0.0.1"])
+            .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Init {
+            Some(Commands::Node(NodeCommands::Init {
                 advertise_addr,
                 api_port,
                 raft_port,
                 overlay_port,
                 data_dir,
                 overlay_cidr,
-            }) => {
+            })) => {
                 assert_eq!(advertise_addr, "10.0.0.1");
                 assert_eq!(api_port, 3669);
                 assert_eq!(raft_port, 9000);
@@ -1395,14 +1389,14 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Init {
+            Some(Commands::Node(NodeCommands::Init {
                 advertise_addr,
                 api_port,
                 raft_port,
                 overlay_port,
                 data_dir,
                 overlay_cidr,
-            }) => {
+            })) => {
                 assert_eq!(advertise_addr, "192.168.1.100");
                 assert_eq!(api_port, 9090);
                 assert_eq!(raft_port, 9001);
@@ -1429,13 +1423,13 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Join {
+            Some(Commands::Node(NodeCommands::Join {
                 leader_addr,
                 token,
                 advertise_addr,
                 mode,
                 services,
-            }) => {
+            })) => {
                 assert_eq!(leader_addr, "10.0.0.1:3669");
                 assert_eq!(token, "abc123");
                 assert_eq!(advertise_addr, "10.0.0.2");
@@ -1467,7 +1461,7 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Join { mode, services, .. }) => {
+            Some(Commands::Node(NodeCommands::Join { mode, services, .. })) => {
                 assert_eq!(mode, "replicate");
                 assert_eq!(services, Some(vec!["api".to_string(), "web".to_string()]));
             }
@@ -1477,10 +1471,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_list_command() {
-        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "list"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::List { output }) => {
+            Some(Commands::Node(NodeCommands::List { output })) => {
                 assert_eq!(output, "table");
             }
             _ => panic!("Expected Node List command"),
@@ -1489,11 +1483,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_list_command_json() {
-        let cli =
-            Cli::try_parse_from(["zlayer-runtime", "node", "list", "--output", "json"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "list", "--output", "json"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::List { output }) => {
+            Some(Commands::Node(NodeCommands::List { output })) => {
                 assert_eq!(output, "json");
             }
             _ => panic!("Expected Node List command"),
@@ -1502,10 +1495,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_status_command() {
-        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "status"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Status { node_id }) => {
+            Some(Commands::Node(NodeCommands::Status { node_id })) => {
                 assert!(node_id.is_none());
             }
             _ => panic!("Expected Node Status command"),
@@ -1514,11 +1507,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_status_command_with_id() {
-        let cli =
-            Cli::try_parse_from(["zlayer-runtime", "node", "status", "node-abc-123"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "status", "node-abc-123"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Status { node_id }) => {
+            Some(Commands::Node(NodeCommands::Status { node_id })) => {
                 assert_eq!(node_id, Some("node-abc-123".to_string()));
             }
             _ => panic!("Expected Node Status command"),
@@ -1527,10 +1519,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_remove_command() {
-        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "remove", "node-123"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "remove", "node-123"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Remove { node_id, force }) => {
+            Some(Commands::Node(NodeCommands::Remove { node_id, force })) => {
                 assert_eq!(node_id, "node-123");
                 assert!(!force);
             }
@@ -1540,11 +1532,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_remove_command_force() {
-        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "remove", "--force", "node-123"])
-            .unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "remove", "--force", "node-123"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Remove { node_id, force }) => {
+            Some(Commands::Node(NodeCommands::Remove { node_id, force })) => {
                 assert_eq!(node_id, "node-123");
                 assert!(force);
             }
@@ -1567,11 +1558,11 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::SetMode {
+            Some(Commands::Node(NodeCommands::SetMode {
                 node_id,
                 mode,
                 services,
-            }) => {
+            })) => {
                 assert_eq!(node_id, "node-123");
                 assert_eq!(mode, "dedicated");
                 assert_eq!(services, Some(vec!["api".to_string()]));
@@ -1592,7 +1583,7 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Label { node_id, label }) => {
+            Some(Commands::Node(NodeCommands::Label { node_id, label })) => {
                 assert_eq!(node_id, "node-123");
                 assert_eq!(label, "environment=production");
             }

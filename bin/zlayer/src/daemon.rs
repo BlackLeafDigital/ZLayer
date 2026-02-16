@@ -374,23 +374,22 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
     // Phase 8: Service manager – wired to all subsystems
     // -----------------------------------------------------------------------
-    let mut manager_builder = if let Some(om) = overlay.clone() {
-        ServiceManager::with_overlay(runtime.clone(), om)
-    } else {
-        ServiceManager::new(runtime.clone())
-    };
+    let mut builder = ServiceManager::builder(runtime.clone())
+        .deployment_name(config.deployment_name.clone())
+        .proxy_manager(Arc::clone(&proxy))
+        .stream_registry(Arc::clone(&stream_registry))
+        .service_registry(Arc::clone(&service_registry))
+        .container_supervisor(Arc::clone(&supervisor));
 
-    manager_builder.set_deployment_name(config.deployment_name.clone());
-    manager_builder.set_proxy_manager(Arc::clone(&proxy));
-    manager_builder.set_stream_registry(Arc::clone(&stream_registry));
-    manager_builder.set_service_registry(Arc::clone(&service_registry));
-    manager_builder.set_container_supervisor(Arc::clone(&supervisor));
-
-    if let Some(dns_ref) = &dns {
-        manager_builder.set_dns_server(Arc::clone(dns_ref));
+    if let Some(om) = overlay.clone() {
+        builder = builder.overlay_manager(om);
     }
 
-    let manager = Arc::new(manager_builder);
+    if let Some(dns_ref) = &dns {
+        builder = builder.dns_server(Arc::clone(dns_ref));
+    }
+
+    let manager = Arc::new(builder.build());
     info!("Service manager initialised");
 
     // -----------------------------------------------------------------------
