@@ -41,16 +41,19 @@ ci: fmt-check lint check test
 
 # Run specific crate tests
 test-scheduler:
-	cargo test --package scheduler
+	cargo test --package zlayer-scheduler
 
 test-api:
-	cargo test --package api
+	cargo test --package zlayer-api
 
 test-observability:
-	cargo test --package observability
+	cargo test --package zlayer-observability
 
 test-agent:
-	cargo test --package agent
+	cargo test --package zlayer-agent
+
+test-manager:
+	cargo test --package zlayer-manager --features ssr
 
 # E2E tests requiring root (youki/libcontainer)
 test-e2e:
@@ -58,7 +61,7 @@ test-e2e:
 	sudo rm -rf /tmp/zlayer-youki-e2e-test/state/* 2>/dev/null || true
 	@echo "Running E2E tests with root privileges..."
 	sudo -E env "PATH=$(HOME)/.cargo/bin:$(PATH)" \
-		cargo test --package agent --test youki_e2e -- --nocapture --test-threads=1
+		cargo test --package zlayer-agent --test youki_e2e -- --nocapture --test-threads=1
 
 # Run specific E2E test (usage: make test-e2e-single TEST=test_cleanup_state_directory)
 test-e2e-single:
@@ -66,19 +69,19 @@ test-e2e-single:
 	sudo rm -rf /tmp/zlayer-youki-e2e-test/state/* 2>/dev/null || true
 	@echo "Running E2E test: $(TEST)"
 	sudo -E env "PATH=$(HOME)/.cargo/bin:$(PATH)" \
-		cargo test --package agent --test youki_e2e $(TEST) -- --nocapture
+		cargo test --package zlayer-agent --test youki_e2e $(TEST) -- --nocapture
 
 test-spec:
-	cargo test --package spec
+	cargo test --package zlayer-spec
 
 test-proxy:
-	cargo test --package proxy
+	cargo test --package zlayer-proxy
 
 test-overlay:
-	cargo test --package overlay
+	cargo test --package zlayer-overlay
 
 test-registry:
-	cargo test --package registry
+	cargo test --package zlayer-registry
 
 test-runtime:
 	cargo test --package runtime

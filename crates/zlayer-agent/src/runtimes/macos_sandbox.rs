@@ -1240,7 +1240,6 @@ impl SandboxRuntime {
         std::fs::create_dir_all(config.data_dir.join("images")).map_err(|e| {
             AgentError::Configuration(format!("Failed to create images dir: {}", e))
         })?;
-
         tracing::info!(
             data_dir = %config.data_dir.display(),
             log_dir = %config.log_dir.display(),
@@ -1276,6 +1275,86 @@ impl SandboxRuntime {
     /// Get the images base directory.
     fn images_dir(&self) -> PathBuf {
         self.config.data_dir.join("images")
+    }
+
+    /// Register a local directory as a pre-built image rootfs.
+    ///
+    /// This allows using local directories (e.g., host system binaries) as
+    /// image sources without pulling from a registry. The directory is
+    /// copied/cloned to the standard image location and tracked for use
+    /// by `create_container`.
+    ///
+    /// Used by E2E tests to provide macOS-native binaries, and can be used
+    /// by the builder to register locally-built images.
+    pub async fn register_local_rootfs(&self, image: &str, source_dir: &Path) -> Result<()> {
+        let safe_name = sanitize_image_name(image);
+        let image_dir = self.images_dir().join(&safe_name);
+        let rootfs_dir = image_dir.join("rootfs");
+
+        // Fast path: already on disk
+        if rootfs_dir.exists() {
+            let mut images = self.image_rootfs.write().await;
+            images.insert(safe_name, rootfs_dir);
+            return Ok(());
+        }
+
+        // Ensure parent dir exists
+        tokio::fs::create_dir_all(&image_dir)
+            .await
+            .map_err(|e| AgentError::PullFailed {
+                image: image.to_string(),
+                reason: format!("Failed to create image dir: {}", e),
+            })?;
+
+        // Clone to a unique staging directory to avoid races when multiple
+        // runtime instances register the same image concurrently.
+        let staging_name = format!(
+            ".rootfs-staging-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let staging_dir = image_dir.join(&staging_name);
+
+        clone_directory_recursive(source_dir, &staging_dir)
+            .await
+            .map_err(|e| {
+                let _ = std::fs::remove_dir_all(&staging_dir);
+                AgentError::PullFailed {
+                    image: image.to_string(),
+                    reason: format!(
+                        "Failed to clone local rootfs from {}: {}",
+                        source_dir.display(),
+                        e
+                    ),
+                }
+            })?;
+
+        // Atomic rename — only one caller wins the race
+        if tokio::fs::rename(&staging_dir, &rootfs_dir).await.is_err() {
+            // Race loser: clean up staging, use winner's rootfs
+            let _ = tokio::fs::remove_dir_all(&staging_dir).await;
+            if !rootfs_dir.exists() {
+                return Err(AgentError::PullFailed {
+                    image: image.to_string(),
+                    reason: "Failed to finalize rootfs and no other clone succeeded".into(),
+                });
+            }
+        }
+
+        let mut images = self.image_rootfs.write().await;
+        images.insert(safe_name, rootfs_dir.clone());
+
+        tracing::info!(
+            image = %image,
+            source = %source_dir.display(),
+            rootfs = %rootfs_dir.display(),
+            "Registered local rootfs as image"
+        );
+
+        Ok(())
     }
 }
 
@@ -1710,19 +1789,28 @@ impl Runtime for SandboxRuntime {
             }
         }
 
-        // Spawn the sandboxed process (blocking operation).
-        // The assigned_port is injected as PORT and ZLAYER_PORT env vars.
-        let child_pid = spawn_sandboxed_process(&SandboxSpawnParams {
-            program,
-            args,
-            sbpl_profile: profile,
-            rootfs_dir,
-            stdout_path,
-            stderr_path,
-            spec,
-            sandbox_config,
-            assigned_port,
-        })?;
+        // Spawn the sandboxed process in a blocking task so that the fork+exec
+        // does not block the tokio reactor (which would prevent timers and other
+        // futures from making progress on a current_thread runtime).
+        let dir_name_for_err = dir_name.clone();
+        let child_pid = tokio::task::spawn_blocking(move || {
+            spawn_sandboxed_process(&SandboxSpawnParams {
+                program,
+                args,
+                sbpl_profile: profile,
+                rootfs_dir,
+                stdout_path,
+                stderr_path,
+                spec,
+                sandbox_config,
+                assigned_port,
+            })
+        })
+        .await
+        .map_err(|e| AgentError::StartFailed {
+            id: dir_name_for_err,
+            reason: format!("spawn task join error: {}", e),
+        })??;
 
         // Write PID file
         let pid_path = self.container_dir(id).join("pid");
@@ -1844,12 +1932,22 @@ impl Runtime for SandboxRuntime {
             libc::kill(pid as i32, libc::SIGKILL);
         }
 
-        // Wait for SIGKILL to take effect (blocking)
+        // Wait for SIGKILL to take effect (non-blocking poll with timeout,
+        // because the child may have already been reaped by container_state())
         let pid_for_wait = pid;
         let exit_code = tokio::task::spawn_blocking(move || {
-            let mut status: libc::c_int = 0;
-            unsafe {
-                libc::waitpid(pid_for_wait as i32, &mut status, 0);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let mut status: libc::c_int = 0;
+                let result =
+                    unsafe { libc::waitpid(pid_for_wait as i32, &mut status, libc::WNOHANG) };
+                if result > 0 || result == -1 {
+                    break; // reaped or already gone
+                }
+                if std::time::Instant::now() >= deadline {
+                    break; // give up — process already reaped elsewhere
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
             }
             -9i32
         })
@@ -1894,12 +1992,22 @@ impl Runtime for SandboxRuntime {
                     unsafe {
                         libc::kill(c.pid as i32, libc::SIGKILL);
                     }
-                    // Reap the zombie (non-blocking attempt, then give up)
+                    // Reap the zombie (non-blocking poll, child may already be reaped)
                     let pid = c.pid;
                     let _ = tokio::task::spawn_blocking(move || {
-                        let mut status: libc::c_int = 0;
-                        unsafe {
-                            libc::waitpid(pid as i32, &mut status, 0);
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(3);
+                        loop {
+                            let mut status: libc::c_int = 0;
+                            let result =
+                                unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+                            if result > 0 || result == -1 {
+                                break;
+                            }
+                            if std::time::Instant::now() >= deadline {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(50));
                         }
                     })
                     .await;

@@ -26,6 +26,8 @@ use zlayer_agent::{
 };
 use zlayer_spec::{DeploymentSpec, ServiceSpec};
 
+extern crate libc;
+
 /// Macro to run async test body with a timeout
 macro_rules! with_timeout {
     ($timeout_secs:expr, $body:expr) => {{
@@ -331,46 +333,61 @@ services:
         .expect("Missing vol-test service")
 }
 
-/// Prepare a minimal "image rootfs" for testing.
+/// Prepare a macOS-native image for testing.
 ///
-/// The sandbox runtime expects a rootfs directory under
-/// `{data_dir}/images/{sanitized_name}/rootfs/`. For testing with
-/// native macOS binaries, we create the directory structure and
-/// symlink to the real system binaries.
-async fn prepare_native_rootfs(runtime: &SandboxRuntime, image_name: &str) {
+/// Creates a temporary directory with host system binaries, then registers
+/// it with the runtime as a local image. This uses the runtime's own
+/// infrastructure (APFS clone, image tracking) instead of manually
+/// creating directories.
+///
+/// Thread-safe: uses a static guard to prepare the source directory once,
+/// then each runtime instance registers it via `register_local_rootfs`
+/// (which is also idempotent).
+static NATIVE_ROOTFS_DIR: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, PathBuf>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+async fn prepare_native_image(runtime: &SandboxRuntime, image_name: &str) {
     let safe_name = image_name.replace(['/', ':', '@'], "_");
-    let rootfs_dir = runtime
-        .config()
-        .data_dir
-        .join("images")
-        .join(&safe_name)
-        .join("rootfs");
 
-    tokio::fs::create_dir_all(rootfs_dir.join("bin"))
-        .await
-        .expect("Failed to create rootfs bin dir");
+    // Prepare the source directory once (thread-safe)
+    let source_dir = {
+        let mut cache = NATIVE_ROOTFS_DIR.lock().unwrap();
+        if let Some(dir) = cache.get(&safe_name) {
+            dir.clone()
+        } else {
+            let dir = PathBuf::from(E2E_TEST_DIR)
+                .join("native-sources")
+                .join(&safe_name);
 
-    // Copy (not symlink) system binaries so they work within the sandbox.
-    // The sandbox profile allows reading from the rootfs subpath.
-    for binary in &["echo", "sleep", "sh", "cat", "ls"] {
-        let src = format!("/bin/{}", binary);
-        let dst = rootfs_dir.join("bin").join(binary);
-        if std::path::Path::new(&src).exists() && !dst.exists() {
-            tokio::fs::copy(&src, &dst).await.ok();
+            std::fs::create_dir_all(dir.join("bin")).expect("Failed to create bin dir");
+            for binary in &["echo", "sleep", "sh", "cat", "ls"] {
+                let src = format!("/bin/{}", binary);
+                let dst = dir.join("bin").join(binary);
+                if std::path::Path::new(&src).exists() && !dst.exists() {
+                    std::fs::copy(&src, &dst).ok();
+                }
+            }
+
+            std::fs::create_dir_all(dir.join("usr/bin")).expect("Failed to create usr/bin dir");
+            for binary in &["env", "true", "false"] {
+                let src = format!("/usr/bin/{}", binary);
+                let dst = dir.join("usr/bin").join(binary);
+                if std::path::Path::new(&src).exists() && !dst.exists() {
+                    std::fs::copy(&src, &dst).ok();
+                }
+            }
+
+            cache.insert(safe_name.clone(), dir.clone());
+            dir
         }
-    }
+    };
 
-    // Also copy from /usr/bin for binaries that live there
-    tokio::fs::create_dir_all(rootfs_dir.join("usr/bin"))
+    // Register with the runtime (idempotent, uses APFS clone)
+    runtime
+        .register_local_rootfs(image_name, &source_dir)
         .await
-        .expect("Failed to create rootfs usr/bin dir");
-    for binary in &["env", "true", "false"] {
-        let src = format!("/usr/bin/{}", binary);
-        let dst = rootfs_dir.join("usr/bin").join(binary);
-        if std::path::Path::new(&src).exists() && !dst.exists() {
-            tokio::fs::copy(&src, &dst).await.ok();
-        }
-    }
+        .expect("Failed to register local rootfs");
 }
 
 /// Cleanup helper -- ensures container is removed even on test failure
@@ -387,14 +404,31 @@ impl ContainerGuard {
 
 impl Drop for ContainerGuard {
     fn drop(&mut self) {
-        let runtime = self.runtime.clone();
-        let id = self.id.clone();
+        // Synchronous cleanup: we cannot await in Drop, and tokio::spawn tasks
+        // get aborted when the test runtime shuts down, leaving orphaned processes.
+        // Use the runtime's config to resolve paths, then do direct syscalls.
+        let dir_name = format!("{}-{}", self.id.service, self.id.replica);
+        let container_dir = self
+            .runtime
+            .config()
+            .data_dir
+            .join("containers")
+            .join(&dir_name);
+        let pid_path = container_dir.join("pid");
 
-        // Spawn cleanup task -- we cannot await in Drop
-        tokio::spawn(async move {
-            let _ = runtime.stop_container(&id, Duration::from_secs(5)).await;
-            let _ = runtime.remove_container(&id).await;
-        });
+        if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+            if let Ok(pid) = pid_str.trim().parse::<i32>() {
+                if pid > 0 {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                        let mut status: libc::c_int = 0;
+                        libc::waitpid(pid, &mut status, libc::WNOHANG);
+                    }
+                }
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&container_dir);
     }
 }
 
@@ -404,7 +438,7 @@ impl Drop for ContainerGuard {
 
 /// Test that the sandbox runtime initializes successfully and creates
 /// the required directory structure.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_runtime_initialization() {
     with_timeout!(30, {
         let runtime = create_e2e_runtime(false);
@@ -445,7 +479,7 @@ async fn test_runtime_initialization() {
 }
 
 /// Test that GPU access configuration is stored correctly.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_runtime_gpu_config() {
     with_timeout!(30, {
         // GPU enabled
@@ -469,7 +503,7 @@ async fn test_runtime_gpu_config() {
 ///
 /// Uses `/bin/echo` which exits immediately after printing, allowing us to verify
 /// the full lifecycle including exit code capture.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_container_lifecycle_echo() {
     with_timeout!(60, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -482,7 +516,7 @@ async fn test_container_lifecycle_echo() {
         let spec = create_echo_spec();
 
         // Prepare a native rootfs with /bin/echo
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         // Setup cleanup guard
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
@@ -589,7 +623,7 @@ async fn test_container_lifecycle_echo() {
 }
 
 /// Test stopping a long-running process with SIGTERM and verifying graceful shutdown.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_container_stop_sigterm() {
     with_timeout!(60, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -601,7 +635,7 @@ async fn test_container_stop_sigterm() {
         };
         let spec = create_sleep_spec(300); // Sleep 5 minutes -- will be killed
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -658,7 +692,7 @@ async fn test_container_stop_sigterm() {
 }
 
 /// Test that wait_container returns the correct exit code.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_wait_container_exit_code() {
     with_timeout!(60, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -670,7 +704,7 @@ async fn test_wait_container_exit_code() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -699,13 +733,13 @@ async fn test_wait_container_exit_code() {
 /// The macOS sandbox runtime assigns each container a unique port because
 /// all sandboxed processes share the host network stack. This test creates
 /// multiple containers and verifies they get different ports.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_unique_port_allocation() {
     with_timeout!(60, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let spec = create_sleep_spec(60);
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let mut ports = Vec::new();
         let mut ids = Vec::new();
@@ -761,7 +795,7 @@ async fn test_unique_port_allocation() {
 }
 
 /// Test that container IP is always 127.0.0.1 on macOS sandbox.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_container_ip_is_localhost() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -773,7 +807,7 @@ async fn test_container_ip_is_localhost() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -801,7 +835,7 @@ async fn test_container_ip_is_localhost() {
 ///
 /// Verifies that the generated Seatbelt profile contains the Metal compute
 /// IOKit rules when GPU access is enabled and vendor is "apple".
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gpu_metal_compute_profile() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(true).expect("Failed to create runtime"));
@@ -813,7 +847,7 @@ async fn test_gpu_metal_compute_profile() {
         };
         let spec = create_gpu_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -864,7 +898,7 @@ async fn test_gpu_metal_compute_profile() {
 /// it omits AGXCompilerService XPC services and cvmsServ. However,
 /// MTLCompilerService is still required because MPSGraph uses JIT
 /// compilation internally on macOS 26+.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gpu_mps_only_profile() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(true).expect("Failed to create runtime"));
@@ -876,7 +910,7 @@ async fn test_gpu_mps_only_profile() {
         };
         let spec = create_mps_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -919,7 +953,7 @@ async fn test_gpu_mps_only_profile() {
 
 /// Test that GPU access is denied when the runtime has gpu_access=false,
 /// even if the spec requests a GPU.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gpu_denied_when_runtime_disabled() {
     with_timeout!(30, {
         // Create runtime with GPU disabled
@@ -933,7 +967,7 @@ async fn test_gpu_denied_when_runtime_disabled() {
         // Spec requests GPU, but runtime disables it
         let spec = create_gpu_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -972,7 +1006,7 @@ async fn test_gpu_denied_when_runtime_disabled() {
 ///
 /// Verifies that the profile correctly restricts network access based on
 /// the ServiceSpec's endpoints.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_network_localhost_only_profile() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -985,7 +1019,7 @@ async fn test_network_localhost_only_profile() {
         // Spec with endpoints -> localhost-only network
         let spec = create_echo_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1016,7 +1050,7 @@ async fn test_network_localhost_only_profile() {
 }
 
 /// Test Seatbelt profile for spec with no endpoints (full network access).
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_network_full_access_profile() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1029,7 +1063,7 @@ async fn test_network_full_access_profile() {
         // Spec without endpoints -> full network access
         let spec = create_no_endpoints_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1070,13 +1104,13 @@ async fn test_network_full_access_profile() {
 ///
 /// Verifies that APFS clonefile (or fallback copy) creates an isolated copy
 /// of the rootfs, allowing each container to modify its rootfs independently.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rootfs_cloning() {
     with_timeout!(60, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let spec = create_echo_spec();
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         // Create two containers from the same image
         let id1 = ContainerId {
@@ -1143,7 +1177,7 @@ async fn test_rootfs_cloning() {
 }
 
 /// Test that container removal cleans up the rootfs clone.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_rootfs_cleanup_on_removal() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1155,7 +1189,7 @@ async fn test_rootfs_cleanup_on_removal() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         runtime.create_container(&id, &spec).await.expect("create");
 
@@ -1188,7 +1222,7 @@ async fn test_rootfs_cleanup_on_removal() {
 // =============================================================================
 
 /// Test executing a command inside a container's sandbox.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_exec_in_container() {
     with_timeout!(60, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1200,7 +1234,7 @@ async fn test_exec_in_container() {
         };
         let spec = create_sleep_spec(60);
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1246,7 +1280,7 @@ async fn test_exec_in_container() {
 /// Test getting resource stats for a running container.
 ///
 /// Uses macOS `proc_pidinfo` to read CPU time and RSS for the process.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_container_stats() {
     with_timeout!(60, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1258,7 +1292,7 @@ async fn test_container_stats() {
         };
         let spec = create_sleep_spec(60);
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1300,7 +1334,7 @@ async fn test_container_stats() {
 }
 
 /// Test that stats fail for a non-started container.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_stats_fail_before_start() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1312,7 +1346,7 @@ async fn test_stats_fail_before_start() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1337,7 +1371,7 @@ async fn test_stats_fail_before_start() {
 ///
 /// We cannot easily test the actual kill behavior without allocating memory
 /// in the child, but we can verify the container configuration is correct.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_memory_limited_container() {
     with_timeout!(60, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1349,7 +1383,7 @@ async fn test_memory_limited_container() {
         };
         let spec = create_memory_limited_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1391,7 +1425,7 @@ async fn test_memory_limited_container() {
 ///
 /// Like the youki runtime, remove_container should be idempotent so that
 /// cleanup operations are resilient.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_remove_nonexistent_is_idempotent() {
     with_timeout!(30, {
         let runtime = create_e2e_runtime(false).expect("Failed to create runtime");
@@ -1416,7 +1450,7 @@ async fn test_remove_nonexistent_is_idempotent() {
 }
 
 /// Test that container_state returns NotFound for a non-existent container.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_state_nonexistent() {
     with_timeout!(30, {
         let runtime = create_e2e_runtime(false).expect("Failed to create runtime");
@@ -1444,7 +1478,7 @@ async fn test_state_nonexistent() {
 }
 
 /// Test that creating a container without a pulled image fails with a clear error.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_create_without_image_fails() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1505,7 +1539,7 @@ services:
 }
 
 /// Test that starting a non-existent container returns NotFound.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_start_nonexistent_fails() {
     with_timeout!(30, {
         let runtime = create_e2e_runtime(false).expect("Failed to create runtime");
@@ -1533,7 +1567,7 @@ async fn test_start_nonexistent_fails() {
 }
 
 /// Test that exec with an empty command returns an error.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_exec_empty_command_fails() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1545,7 +1579,7 @@ async fn test_exec_empty_command_fails() {
         };
         let spec = create_sleep_spec(60);
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1579,13 +1613,13 @@ async fn test_exec_empty_command_fails() {
 // =============================================================================
 
 /// Test that multiple containers can be created and managed concurrently.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_concurrent_containers() {
     with_timeout!(120, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
 
         let spec = create_echo_spec();
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let container_count = 5;
         let base_name = unique_name("concurrent");
@@ -1658,7 +1692,7 @@ async fn test_concurrent_containers() {
 // =============================================================================
 
 /// Test that creating a container on top of a stale directory cleans it up.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_stale_container_cleanup() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1670,7 +1704,7 @@ async fn test_stale_container_cleanup() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         // Create a stale directory manually
         let stale_dir = runtime
@@ -1712,7 +1746,7 @@ async fn test_stale_container_cleanup() {
 // =============================================================================
 
 /// Test that the Seatbelt profile includes writable directories for volumes.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_volume_writable_dirs_in_profile() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1724,7 +1758,7 @@ async fn test_volume_writable_dirs_in_profile() {
         };
         let spec = create_volume_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1760,7 +1794,7 @@ async fn test_volume_writable_dirs_in_profile() {
 // =============================================================================
 
 /// Test get_logs (vector form) for a container.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_logs_vector() {
     with_timeout!(60, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1772,7 +1806,7 @@ async fn test_get_logs_vector() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -1818,7 +1852,7 @@ async fn test_get_logs_vector() {
 ///
 /// Verifies deny-default, base process rules, system library access, and
 /// I/O essentials are always present regardless of configuration.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_seatbelt_profile_structure() {
     with_timeout!(30, {
         let runtime = Arc::new(create_e2e_runtime(false).expect("Failed to create runtime"));
@@ -1830,7 +1864,7 @@ async fn test_seatbelt_profile_structure() {
         };
         let spec = create_echo_spec();
 
-        prepare_native_rootfs(&runtime, &spec.image.name).await;
+        prepare_native_image(&runtime, &spec.image.name).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 

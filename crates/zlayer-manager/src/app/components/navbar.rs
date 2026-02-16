@@ -1,28 +1,34 @@
 //! Navbar component
 //!
-//! Top navigation bar with logo/title and theme toggle placeholder.
+//! Top navigation bar with hamburger menu (mobile) and theme info.
 
 use leptos::prelude::*;
 
 /// Navbar component for ZLayer Manager
-///
-/// Displays the application title and a theme toggle button placeholder.
 #[component]
 pub fn Navbar() -> impl IntoView {
     view! {
-        <div class="navbar bg-base-100 shadow-sm">
-            <div class="flex-1">
-                <a class="btn btn-ghost text-xl">ZLayer Manager</a>
+        <div class="navbar bg-base-200 border-b border-base-300 sticky top-0 z-30">
+            <div class="flex-none lg:hidden">
+                <label for="sidebar-drawer" class="btn btn-square btn-ghost">
+                    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" class="inline-block w-6 h-6 stroke-current">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16"></path>
+                    </svg>
+                </label>
             </div>
-            <div class="flex-none">
-                <button class="btn btn-square btn-ghost" title="Toggle theme">
+            <div class="flex-1">
+                <span class="text-lg font-semibold lg:hidden">"ZLayer"</span>
+            </div>
+            <div class="flex-none gap-2">
+                <div class="badge badge-ghost badge-sm">"mac-sandbox"</div>
+                <button class="btn btn-square btn-ghost btn-sm" title="Toggle theme">
                     <svg
                         xmlns="http://www.w3.org/2000/svg"
                         fill="none"
                         viewBox="0 0 24 24"
                         stroke-width="1.5"
                         stroke="currentColor"
-                        class="w-6 h-6"
+                        class="w-5 h-5"
                     >
                         <path
                             stroke-linecap="round"

@@ -13,6 +13,7 @@ use leptos_router::{
     path,
 };
 
+use components::{Navbar, Sidebar};
 use pages::{
     Builds, Dashboard, Deployments, Git, Networking, Nodes, Overlay, Settings, SshTunnels,
 };
@@ -21,7 +22,7 @@ use pages::{
 pub fn shell(options: LeptosOptions) -> impl IntoView {
     view! {
         <!DOCTYPE html>
-        <html lang="en">
+        <html lang="en" data-theme="dark">
             <head>
                 <meta charset="utf-8" />
                 <meta name="viewport" content="width=device-width, initial-scale=1" />
@@ -29,7 +30,7 @@ pub fn shell(options: LeptosOptions) -> impl IntoView {
                 <HydrationScripts options />
                 <MetaTags />
             </head>
-            <body>
+            <body class="min-h-screen bg-base-100">
                 <App />
             </body>
         </html>
@@ -46,19 +47,31 @@ pub fn App() -> impl IntoView {
         <Title text="ZLayer Manager" />
 
         <Router>
-            <main>
-                <Routes fallback=|| "Page not found.">
-                    <Route path=path!("/") view=Dashboard />
-                    <Route path=path!("/nodes") view=Nodes />
-                    <Route path=path!("/deployments") view=Deployments />
-                    <Route path=path!("/networking") view=Networking />
-                    <Route path=path!("/overlay") view=Overlay />
-                    <Route path=path!("/ssh-tunnels") view=SshTunnels />
-                    <Route path=path!("/git") view=Git />
-                    <Route path=path!("/builds") view=Builds />
-                    <Route path=path!("/settings") view=Settings />
-                </Routes>
-            </main>
+            <div class="drawer lg:drawer-open">
+                <input id="sidebar-drawer" type="checkbox" class="drawer-toggle" />
+
+                <div class="drawer-content flex flex-col min-h-screen">
+                    <Navbar />
+                    <main class="flex-1 p-6 bg-base-100">
+                        <Routes fallback=|| "Page not found.">
+                            <Route path=path!("/") view=Dashboard />
+                            <Route path=path!("/nodes") view=Nodes />
+                            <Route path=path!("/deployments") view=Deployments />
+                            <Route path=path!("/networking") view=Networking />
+                            <Route path=path!("/overlay") view=Overlay />
+                            <Route path=path!("/ssh-tunnels") view=SshTunnels />
+                            <Route path=path!("/git") view=Git />
+                            <Route path=path!("/builds") view=Builds />
+                            <Route path=path!("/settings") view=Settings />
+                        </Routes>
+                    </main>
+                </div>
+
+                <div class="drawer-side z-40">
+                    <label for="sidebar-drawer" aria-label="close sidebar" class="drawer-overlay"></label>
+                    <Sidebar />
+                </div>
+            </div>
         </Router>
     }
 }

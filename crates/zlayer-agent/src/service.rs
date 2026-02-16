@@ -19,7 +19,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
 use zlayer_overlay::DnsServer;
 use zlayer_proxy::{ResolvedService, ServiceRegistry, StreamRegistry, StreamService};
-use zlayer_spec::{DependsSpec, Protocol, ResourceType, ServiceSpec};
+use zlayer_spec::{DependsSpec, HealthCheck, Protocol, ResourceType, ServiceSpec};
 
 /// Service instance manages a single service's containers
 pub struct ServiceInstance {
@@ -275,7 +275,29 @@ impl ServiceInstance {
 
                 // Start health monitoring and store handle (no lock needed during start)
                 let health_monitor_handle = {
-                    let check = self.spec.health.check.clone();
+                    let mut check = self.spec.health.check.clone();
+
+                    // Resolve Tcp { port: 0 } ("use first endpoint") to the actual
+                    // port the container is listening on. With mac-sandbox, each
+                    // replica gets a unique assigned port via port_override.
+                    if let HealthCheck::Tcp { ref mut port } = check {
+                        if *port == 0 {
+                            *port = port_override.unwrap_or_else(|| {
+                                self.spec
+                                    .endpoints
+                                    .iter()
+                                    .find(|ep| {
+                                        matches!(
+                                            ep.protocol,
+                                            Protocol::Http | Protocol::Https | Protocol::Websocket
+                                        )
+                                    })
+                                    .map(|ep| ep.port)
+                                    .unwrap_or(8080)
+                            });
+                        }
+                    }
+
                     let interval = self.spec.health.interval.unwrap_or(Duration::from_secs(10));
                     let retries = self.spec.health.retries;
 
