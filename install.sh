@@ -6,21 +6,10 @@ set -eu
 #
 # Options:
 #   ZLAYER_VERSION=0.9.6     - Install specific version
-#   ZLAYER_COMPONENT=runtime - Component: cli, runtime, build
 #   ZLAYER_INSTALL_DIR=/path - Custom install directory
 
 REPO="BlackLeafDigital/ZLayer"
-COMPONENT="${ZLAYER_COMPONENT:-cli}"
-
-case "$COMPONENT" in
-    cli)      BINARY="zlayer" ;;
-    runtime)  BINARY="zlayer-runtime" ;;
-    build)    BINARY="zlayer-build" ;;
-    *)
-        echo "Error: Unknown component '$COMPONENT'. Use: cli, runtime, or build" >&2
-        exit 1
-        ;;
-esac
+BINARY="zlayer"
 
 # --- Detect OS ---
 OS="$(uname -s)"
@@ -117,8 +106,4 @@ case ":${PATH}:" in
 esac
 
 echo ""
-case "$BINARY" in
-    zlayer)         echo "Run 'zlayer --help' to start." ;;
-    zlayer-runtime) echo "Run 'zlayer-runtime --help' for commands." ;;
-    zlayer-build)   echo "Run 'zlayer-build --help' for commands." ;;
-esac
+echo "Run 'zlayer --help' to get started."

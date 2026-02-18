@@ -153,7 +153,7 @@ Output: `target/release/zlayer-manager` (arm64 binary) + `target/site/pkg/` (WAS
 
 ```bash
 # 1. Build runtime + manager
-cargo build --release --package runtime
+cargo build --release --package zlayer
 cargo build --release --package zlayer-manager --features ssr
 
 # 2. Set up native rootfs (first time only)
@@ -170,11 +170,11 @@ ln -sf zlayer-manager.*.css zlayer-manager.css
 cd -
 
 # 4. Start daemon + deploy
-./target/release/zlayer-runtime serve \
+./target/release/zlayer serve \
   --bind 0.0.0.0:3669 \
   --socket ~/.local/share/zlayer/run/zlayer.sock &
 sleep 2
-./target/release/zlayer-runtime \
+./target/release/zlayer \
   --runtime mac-sandbox --host-network --no-tui \
   up -d <your-spec>.zlayer.yml
 ```

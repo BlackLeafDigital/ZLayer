@@ -3,11 +3,11 @@
 ZLayer Interactive Installer
 
 A beautiful, interactive installer for the ZLayer container orchestration platform.
-Supports installing zlayer (runtime), zlayer-build (builder), and zlayer-cli (TUI).
+Installs the unified `zlayer` binary (TUI dashboard, CLI, runtime, and builder).
 
 Usage:
     python3 install.py
-    python3 install.py --yes --binary zlayer-build --dir /usr/local/bin
+    python3 install.py --yes --dir /usr/local/bin
     curl -sSL https://zlayer.dev/install.py | python3
 
 Requirements:
@@ -45,24 +45,14 @@ GITHUB_DOWNLOAD = (
 )
 
 BINARIES = {
-    "zlayer-build": {
-        "description": "Lightweight image builder",
-        "size_hint": "~10 MB",
-        "default": True,
-    },
-    "zlayer-cli": {
-        "description": "Interactive TUI",
-        "size_hint": "~12 MB",
-        "default": False,
-    },
     "zlayer": {
-        "description": "Full runtime with orchestration",
+        "description": "Unified binary (TUI, CLI, runtime, builder)",
         "size_hint": "~50 MB",
-        "default": False,
+        "default": True,
     },
 }
 
-BINARY_ORDER = ["zlayer-build", "zlayer-cli", "zlayer"]
+BINARY_ORDER = ["zlayer"]
 
 INSTALL_LOCATIONS = [
     ("/usr/local/bin", "System-wide (may require sudo)"),
@@ -1060,9 +1050,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         epilog=textwrap.dedent("""\
             Examples:
               python3 install.py
-              python3 install.py --yes --binary zlayer-build
-              python3 install.py --yes --binary all --dir ~/.local/bin
-              python3 install.py --version v0.9.0 --binary zlayer
+              python3 install.py --yes --dir ~/.local/bin
+              python3 install.py --version v0.9.0
               curl -sSL https://zlayer.dev/install.py | python3 - --yes
         """),
     )
@@ -1075,8 +1064,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--binary",
         type=str,
         default=None,
-        help="Binary to install: zlayer, zlayer-build, zlayer-cli, or 'all'. "
-             "Can be specified multiple times or comma-separated.",
+        help="Binary to install (default: zlayer).",
     )
     parser.add_argument(
         "--dir",
@@ -1157,8 +1145,8 @@ def _resolve_binaries(args: argparse.Namespace) -> List[str]:
         return valid
 
     if args.yes or not _is_interactive():
-        # Default: just zlayer-build
-        return ["zlayer-build"]
+        # Default: zlayer
+        return ["zlayer"]
 
     # Interactive selection
     write("  {}{}? What would you like to install?{}".format(S.bold, S.green, S.reset))
@@ -1381,14 +1369,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         except RuntimeError as e:
             error("Failed to download {}: {}".format(binary_name, e))
             write()
-            # If this is a secondary binary like zlayer-cli that might not exist yet
-            if binary_name != "zlayer-build" and binary_name != "zlayer":
-                warn("Binary '{}' may not be available in this release yet.".format(binary_name))
-                warn("Skipping...")
-                write()
-                continue
-            else:
-                fatal("Download failed. Check your internet connection and try again.")
+            fatal("Download failed. Check your internet connection and try again.")
 
         # Verify archive size (basic sanity check)
         try:
@@ -1490,29 +1471,20 @@ def main(argv: Optional[List[str]] = None) -> None:
     write()
 
     # Get started hints
-    for path in installed_paths:
-        name = os.path.basename(path)
-        if name == "zlayer":
-            info("Get started with zlayer:")
-            write("    {}zlayer --help{}".format(S.bold, S.reset))
-            write("    {}zlayer serve{}              {}# Start the API server{}".format(
-                S.bold, S.reset, S.dim, S.reset
-            ))
-            write("    {}zlayer deploy --spec app.yaml{}  {}# Deploy services{}".format(
-                S.bold, S.reset, S.dim, S.reset
-            ))
-        elif name == "zlayer-build":
-            info("Get started with zlayer-build:")
-            write("    {}zlayer-build --help{}".format(S.bold, S.reset))
-            write("    {}zlayer-build build .{}        {}# Build from ZImagefile{}".format(
-                S.bold, S.reset, S.dim, S.reset
-            ))
-        elif name == "zlayer-cli":
-            info("Get started with zlayer-cli:")
-            write("    {}zlayer-cli{}                  {}# Launch interactive TUI{}".format(
-                S.bold, S.reset, S.dim, S.reset
-            ))
-        write()
+    info("Get started:")
+    write("    {}zlayer{}                     {}# Launch interactive TUI dashboard{}".format(
+        S.bold, S.reset, S.dim, S.reset
+    ))
+    write("    {}zlayer --help{}              {}# Show all commands{}".format(
+        S.bold, S.reset, S.dim, S.reset
+    ))
+    write("    {}zlayer deploy app.zlayer.yml{}  {}# Deploy services{}".format(
+        S.bold, S.reset, S.dim, S.reset
+    ))
+    write("    {}zlayer build . -t myapp:latest{}  {}# Build an image{}".format(
+        S.bold, S.reset, S.dim, S.reset
+    ))
+    write()
 
     info("Documentation: {}https://zlayer.dev{}".format(S.underline, S.reset))
     info("Issues: {}https://github.com/{}/issues{}".format(S.underline, GITHUB_REPO, S.reset))

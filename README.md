@@ -824,17 +824,16 @@ zlayer serve --bind 0.0.0.0:3669 --jwt-secret <secret>
 ZLayer includes a web-based management dashboard (similar to [Komodo](https://komo.do)):
 
 ```bash
-# Start the management UI connected to a ZLayer API
-zlayer manager start --connect http://localhost:3669
+# Generate a zlayer-manager deployment spec and optionally deploy it
+zlayer manager init
+zlayer manager init --port 8080 --deploy
 
-# With authentication
-zlayer manager start --connect http://localhost:3669 --token <JWT_TOKEN>
+# Check manager status
+zlayer manager status
 
-# Custom port (default: 9120)
-zlayer manager start --port 9120
+# Stop the manager
+zlayer manager stop
 ```
-
-Access the dashboard at `http://localhost:9120`. 
 
 Features include:
 - **Dashboard** - System overview, node counts, uptime
@@ -1033,7 +1032,7 @@ cargo build --release --features wasm
 cargo build --release --features "docker,wasm"
 ```
 
-For detailed WASM implementation documentation, see [WASM_DONE.md](./WASM_DONE.md).
+For detailed WASM plugin documentation, see [WASM_PLUGINS.md](./docs/WASM_PLUGINS.md).
 
 ## Runtime Modes
 

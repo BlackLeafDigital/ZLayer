@@ -114,7 +114,7 @@ jobs:
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
           mkdir -p artifacts
 
-          for name in zlayer-runtime-linux-amd64 zlayer-runtime-linux-arm64 zlayer-runtime-darwin-amd64 zlayer-runtime-darwin-arm64 zlayer-build-linux-amd64 zlayer-build-linux-arm64 zlayer-build-darwin-amd64 zlayer-build-darwin-arm64 zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64; do
+          for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64; do
             echo "Downloading ${name}.tar.gz..."
             curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
               --user "$AUTH" \
@@ -402,17 +402,15 @@ jobs:
       - name: Login to GHCR
         run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | sudo buildah login -u "${{ github.actor }}" --password-stdin ghcr.io
 
-      - name: Download binary archives for CLI images
+      - name: Download binary archive for CLI image
         shell: bash
         run: |
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
-          for name in zlayer-runtime-linux-amd64 zlayer-build-linux-amd64 zlayer-linux-amd64; do
-            echo "Downloading ${name}.tar.gz..."
-            curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
-              --user "$AUTH" \
-              -o "${name}.tar.gz" \
-              "${{ inputs.artifact_base_url }}/${name}.tar.gz"
-          done
+          echo "Downloading zlayer-linux-amd64.tar.gz..."
+          curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
+            --user "$AUTH" \
+            -o "zlayer-linux-amd64.tar.gz" \
+            "${{ inputs.artifact_base_url }}/zlayer-linux-amd64.tar.gz"
 
       - name: Load, tag, and push images
         run: |
@@ -449,50 +447,29 @@ jobs:
             sudo buildah push ${img}:${VERSION} oci-archive:${img}-${VERSION}-oci.tar
           done
 
-          # --- Minimal CLI images (built from binary archives) ---
-          declare -A CLI_BINS=(
-            ["zlayer-runtime"]="zlayer-runtime-linux-amd64.tar.gz"
-            ["zlayer-build"]="zlayer-build-linux-amd64.tar.gz"
-            ["zlayer-cli"]="zlayer-linux-amd64.tar.gz"
-          )
-          # Map archive internal name to the binary filename inside the tar
-          declare -A BIN_NAMES=(
-            ["zlayer-runtime"]="zlayer-runtime"
-            ["zlayer-build"]="zlayer-build"
-            ["zlayer-cli"]="zlayer"
-          )
+          # --- Minimal CLI image (single zlayer binary) ---
+          echo "Building minimal image for zlayer..."
+          tar xzf "zlayer-linux-amd64.tar.gz"
 
-          for img in zlayer-runtime zlayer-build zlayer-cli; do
-            echo "Building minimal image for ${img}..."
-            archive="${CLI_BINS[$img]}"
-            bin_name="${BIN_NAMES[$img]}"
+          ctr=$(sudo buildah from alpine:latest)
+          sudo buildah copy $ctr "zlayer" "/usr/local/bin/zlayer"
+          sudo buildah config --entrypoint '["zlayer"]' $ctr
+          sudo buildah config --label "org.opencontainers.image.source=https://github.com/BlackLeafDigital/ZLayer" $ctr
+          sudo buildah config --label "org.opencontainers.image.version=${VERSION}" $ctr
+          IMAGE_ID=$(sudo buildah commit $ctr zlayer:${VERSION})
 
-            # Extract binary
-            tar xzf "${archive}"
+          sudo buildah tag ${IMAGE_ID} zachhandley/zlayer:${VERSION}
+          sudo buildah tag ${IMAGE_ID} zachhandley/zlayer:latest
+          sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/zlayer:${VERSION}
+          sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/zlayer:latest
 
-            # Build minimal image with buildah
-            ctr=$(sudo buildah from alpine:latest)
-            sudo buildah copy $ctr "${bin_name}" "/usr/local/bin/${bin_name}"
-            sudo buildah config --entrypoint "[\"${bin_name}\"]" $ctr
-            sudo buildah config --label "org.opencontainers.image.source=https://github.com/BlackLeafDigital/ZLayer" $ctr
-            sudo buildah config --label "org.opencontainers.image.version=${VERSION}" $ctr
-            IMAGE_ID=$(sudo buildah commit $ctr ${img}:${VERSION})
+          sudo buildah push zachhandley/zlayer:${VERSION}
+          sudo buildah push zachhandley/zlayer:latest
+          sudo buildah push ghcr.io/blackleafdigital/zlayer:${VERSION}
+          sudo buildah push ghcr.io/blackleafdigital/zlayer:latest
 
-            # Tag and push to Docker Hub + GHCR
-            sudo buildah tag ${IMAGE_ID} zachhandley/${img}:${VERSION}
-            sudo buildah tag ${IMAGE_ID} zachhandley/${img}:latest
-            sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/${img}:${VERSION}
-            sudo buildah tag ${IMAGE_ID} ghcr.io/blackleafdigital/${img}:latest
-
-            sudo buildah push zachhandley/${img}:${VERSION}
-            sudo buildah push zachhandley/${img}:latest
-            sudo buildah push ghcr.io/blackleafdigital/${img}:${VERSION}
-            sudo buildah push ghcr.io/blackleafdigital/${img}:latest
-
-            # Cleanup
-            rm -f "${bin_name}"
-            echo "Done: ${img}"
-          done
+          rm -f zlayer
+          echo "Done: zlayer"
 
       - name: Upload image archives to Forgejo Packages
         shell: bash
@@ -550,20 +527,15 @@ jobs:
           ### Install
 
           ```bash
-          # Install CLI (interactive TUI)
+          # Install zlayer (unified binary: TUI, CLI, runtime, builder)
           curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | sh
-
-          # Install runtime (for running containers)
-          curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=runtime sh
           ```
 
-          ### Binaries
+          ### Binary
 
           | Binary | Linux | macOS |
           |--------|-------|-------|
-          | `zlayer` (CLI) | [amd64](${PACKAGES_URL}/zlayer-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-darwin-arm64.tar.gz) |
-          | `zlayer-build` | [amd64](${PACKAGES_URL}/zlayer-build-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-build-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-build-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-build-darwin-arm64.tar.gz) |
-          | `zlayer-runtime` | [amd64](${PACKAGES_URL}/zlayer-runtime-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-runtime-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-runtime-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-runtime-darwin-arm64.tar.gz) |
+          | `zlayer` | [amd64](${PACKAGES_URL}/zlayer-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-darwin-arm64.tar.gz) |
 
           ### Container Images
 
@@ -571,18 +543,12 @@ jobs:
           ```bash
           docker pull zachhandley/zlayer-node:${VERSION}
           docker pull zachhandley/zlayer-manager:${VERSION}
-          docker pull zachhandley/zlayer-runtime:${VERSION}
-          docker pull zachhandley/zlayer-build:${VERSION}
-          docker pull zachhandley/zlayer-cli:${VERSION}
           ```
 
           **GHCR** (`ghcr.io/blackleafdigital/`):
           ```bash
           docker pull ghcr.io/blackleafdigital/zlayer-node:${VERSION}
           docker pull ghcr.io/blackleafdigital/zlayer-manager:${VERSION}
-          docker pull ghcr.io/blackleafdigital/zlayer-runtime:${VERSION}
-          docker pull ghcr.io/blackleafdigital/zlayer-build:${VERSION}
-          docker pull ghcr.io/blackleafdigital/zlayer-cli:${VERSION}
           ```
 
           **Forgejo Packages** (includes `zlayer-web`):
@@ -595,11 +561,11 @@ jobs:
           Pull and run images directly with ZLayer:
           ```bash
           # Pull images
-          zlayer-runtime pull zachhandley/zlayer-node:${VERSION}
-          zlayer-runtime pull zachhandley/zlayer-manager:${VERSION}
+          zlayer pull zachhandley/zlayer-node:${VERSION}
+          zlayer pull zachhandley/zlayer-manager:${VERSION}
 
           # Or deploy from a spec file
-          zlayer-runtime deploy my-deployment.yaml
+          zlayer deploy my-deployment.yaml
           ```
 
           ### What's Changed

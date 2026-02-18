@@ -20,16 +20,16 @@ rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
 
 [alias]
 # Common build aliases for development workflow
-dev = "build --package runtime"
-prod = "build --release --package runtime"
+dev = "build --package zlayer"
+prod = "build --release --package zlayer"
 check-all = "check --workspace --all-targets"
 test-all = "test --workspace"
 clippy-all = "clippy --workspace --all-targets -- -D warnings"
 
 # Feature-specific builds
-build-agent = "build --package runtime --no-default-features --features join"
-build-server = "build --package runtime --no-default-features --features serve"
-build-deploy = "build --package runtime --no-default-features --features deploy"
+build-agent = "build --package zlayer --no-default-features --features join"
+build-server = "build --package zlayer --no-default-features --features serve"
+build-deploy = "build --package zlayer --no-default-features --features deploy"
 
 [patch.crates-io]
 # You can add patches here if needed for development

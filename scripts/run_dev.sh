@@ -5,7 +5,8 @@ set -euo pipefail
 # Usage: ./run_dev.sh [command]
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_DIR"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
 
 # --- Platform detection ---
 OS="$(uname -s)"
@@ -130,11 +131,18 @@ cmd_build() {
     header "Building ZLayer ($PLATFORM / $ARCH_LABEL)"
     setup_rust_path
 
+    # Ensure cargo-leptos is installed (needed for manager WASM build)
+    if ! command -v cargo-leptos &>/dev/null; then
+        info "Installing cargo-leptos (needed for manager WASM build)..."
+        cargo install cargo-leptos
+        ok "cargo-leptos installed"
+    fi
+
     info "Building runtime (release)..."
     cargo build --release --package zlayer
 
-    info "Building manager SSR (release)..."
-    cargo build --release --package zlayer-manager --features ssr
+    info "Building manager (SSR + WASM via cargo-leptos)..."
+    (cd crates/zlayer-manager && cargo leptos build --release)
 
     # Copy to rootfs if it exists
     if [ -d "$ROOTFS/usr/local/bin" ]; then

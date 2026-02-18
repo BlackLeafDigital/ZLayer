@@ -230,19 +230,14 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
-      - name: Build release binaries
-        run: |
-          cargo build --release --package runtime
-          cargo build --release --package zlayer-build
-          cargo build --release --package zlayer
+      - name: Build release binary
+        run: cargo build --release --package zlayer
 
       - name: Upload artifacts
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: binaries
           path: |
-            target/release/zlayer-runtime
-            target/release/zlayer-build
             target/release/zlayer
           retention-days: 7
 
@@ -271,19 +266,14 @@ jobs:
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
 
-      - name: Build release binaries
-        run: |
-          cargo build --release --package runtime
-          cargo build --release --package zlayer-build
-          cargo build --release --package zlayer
+      - name: Build release binary
+        run: cargo build --release --package zlayer
 
       - name: Upload artifacts
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: binaries-macos-arm64
           path: |
-            target/release/zlayer-runtime
-            target/release/zlayer-build
             target/release/zlayer
           retention-days: 7
 
@@ -325,10 +315,10 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
       - name: Build with features
-        run: cargo build --package runtime ${{ matrix.features }}
+        run: cargo build --package zlayer ${{ matrix.features }}
 
       - name: Test with features
-        run: cargo test --package runtime ${{ matrix.features }}
+        run: cargo test --package zlayer ${{ matrix.features }}
 
   # ===========================================
   # Trigger E2E Tests

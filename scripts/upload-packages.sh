@@ -80,11 +80,11 @@ upload_file() {
 
 # Collect all files (supports nested dirs from download-artifact or flat from curl)
 files=()
-# Nested: artifacts/zlayer-runtime-linux-amd64/zlayer-runtime-linux-amd64.tar.gz
+# Nested: artifacts/zlayer-linux-amd64/zlayer-linux-amd64.tar.gz
 for artifact in "${ARTIFACTS_DIR}"/zlayer-*/*.tar.gz; do
   [ -f "$artifact" ] && files+=("$artifact")
 done
-# Flat: artifacts/binaries/zlayer-runtime-linux-amd64.tar.gz or artifacts/*.tar.gz
+# Flat: artifacts/binaries/zlayer-linux-amd64.tar.gz or artifacts/*.tar.gz
 for artifact in "${ARTIFACTS_DIR}"/*.tar.gz "${ARTIFACTS_DIR}"/*/*.tar.gz; do
   [ -f "$artifact" ] && files+=("$artifact")
 done

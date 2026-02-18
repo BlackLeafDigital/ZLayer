@@ -2,7 +2,7 @@
 set -e
 
 # ZLayer Node Entrypoint
-# Starts containerd, waits for it to be ready, then runs zlayer-runtime
+# Starts containerd, waits for it to be ready, then runs zlayer
 
 echo "ZLayer Node starting..."
 
@@ -36,7 +36,7 @@ echo "Namespace '$NAMESPACE' ready"
 cleanup() {
     echo "Shutting down ZLayer..."
 
-    # Kill zlayer-runtime if running
+    # Kill zlayer if running
     if [ -n "$ZLAYER_PID" ]; then
         kill "$ZLAYER_PID" 2>/dev/null || true
         wait "$ZLAYER_PID" 2>/dev/null || true
@@ -54,10 +54,10 @@ cleanup() {
 }
 trap cleanup EXIT TERM INT
 
-# Run zlayer-runtime with all passed arguments
+# Run zlayer with all passed arguments
 echo "Starting ZLayer..."
-/usr/local/bin/zlayer-runtime "$@" &
+/usr/local/bin/zlayer "$@" &
 ZLAYER_PID=$!
 
-# Wait for zlayer-runtime to exit
+# Wait for zlayer to exit
 wait "$ZLAYER_PID"

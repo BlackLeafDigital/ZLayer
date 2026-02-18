@@ -39,8 +39,8 @@ RUN mkdir -p \
     /var/lib/zlayer/containers \
     /var/lib/zlayer/state
 
-# Copy ZLayer runtime binary (build with: cargo build --release --package runtime)
-COPY target/release/zlayer-runtime /usr/local/bin/zlayer-runtime
+# Copy ZLayer binary (build with: cargo build --release --package zlayer)
+COPY target/release/zlayer /usr/local/bin/zlayer
 
 # Copy entrypoint script
 COPY docker/entrypoint.sh /entrypoint.sh
