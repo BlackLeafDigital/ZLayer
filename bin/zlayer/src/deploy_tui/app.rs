@@ -28,11 +28,12 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::Terminal;
 use tokio::sync::Notify;
+use zlayer_tui::palette::ansi;
 use zlayer_tui::widgets::scrollable_pane::LogLevel;
 
 use super::deploy_view::DeployView;
-use super::state::{DeployPhase, DeployState};
-use super::DeployEvent;
+use super::state::{DeployPhase, DeployState, ServiceDeployPhase};
+use super::{DeployEvent, ServiceHealth};
 
 /// Main TUI application for deployment progress visualization
 ///
@@ -74,7 +75,12 @@ impl DeployTui {
     /// Run the TUI (blocking)
     ///
     /// This takes over the terminal (raw mode + alternate screen), runs the
-    /// event/render loop, and restores the terminal on exit. Returns when:
+    /// event/render loop, and restores the terminal on exit. After leaving
+    /// the alternate screen, prints a plain-text summary of the final
+    /// deployment state so the user can see it in their terminal history
+    /// (similar to `docker compose up -d`).
+    ///
+    /// Returns when:
     /// - The deployment completes (ShutdownComplete received) and user presses q
     /// - The user presses q/Esc during the Running phase
     /// - The event channel disconnects
@@ -82,6 +88,11 @@ impl DeployTui {
         let mut terminal = zlayer_tui::terminal::setup_terminal()?;
         let result = self.run_loop(&mut terminal);
         zlayer_tui::terminal::restore_terminal(&mut terminal)?;
+
+        // Print final state to the main terminal buffer so it persists
+        // after the alternate screen is dismissed (like docker compose up -d).
+        self.print_final_summary();
+
         result
     }
 
@@ -240,6 +251,96 @@ impl DeployTui {
     fn render(&self, frame: &mut Frame) {
         let view = DeployView::new(&self.state, self.frame_counter);
         frame.render_widget(view, frame.area());
+    }
+
+    /// Print a plain-text summary of the final deployment state to stdout.
+    ///
+    /// This is called after the alternate screen is dismissed so the output
+    /// persists in the user's terminal scrollback -- the same UX pattern
+    /// used by `docker compose up -d`.
+    fn print_final_summary(&self) {
+        let is_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
+        let c = |text: &str, color: &str| -> String {
+            zlayer_tui::logger::colorize(text, color, is_color)
+        };
+
+        // Header
+        let phase_label = match self.state.phase {
+            DeployPhase::Running => c("RUNNING", ansi::GREEN),
+            DeployPhase::Complete => c("COMPLETE", ansi::GREEN),
+            DeployPhase::ShuttingDown => c("SHUTTING DOWN", ansi::YELLOW),
+            DeployPhase::Deploying => c("DEPLOYING", ansi::CYAN),
+            DeployPhase::Stabilizing => c("STABILIZING", ansi::YELLOW),
+            DeployPhase::Initializing => c("INITIALIZING", ansi::DIM),
+        };
+
+        if self.state.deployment_name.is_empty() {
+            println!("ZLayer Deploy | {}", phase_label);
+        } else if self.state.version.is_empty() {
+            println!(
+                "ZLayer Deploy: {} | {}",
+                c(&self.state.deployment_name, ansi::BOLD),
+                phase_label
+            );
+        } else {
+            println!(
+                "ZLayer Deploy: {} {} | {}",
+                c(&self.state.deployment_name, ansi::BOLD),
+                self.state.version,
+                phase_label
+            );
+        }
+
+        // Services summary
+        if !self.state.services.is_empty() {
+            let deployed = self.state.services_deployed_count();
+            let total = self.state.services.len();
+            println!("Services: {}/{} deployed", deployed, total);
+
+            for svc in &self.state.services {
+                let icon = match &svc.phase {
+                    ServiceDeployPhase::Running => c("\u{2713}", ansi::GREEN),
+                    ServiceDeployPhase::Failed(_) => c("\u{2717}", ansi::RED),
+                    ServiceDeployPhase::Scaling => c("\u{25B6}", ansi::YELLOW),
+                    ServiceDeployPhase::Stopping => c("\u{25BC}", ansi::YELLOW),
+                    ServiceDeployPhase::Stopped => c("\u{25A0}", ansi::DIM),
+                    _ => c("..", ansi::DIM),
+                };
+
+                let health_str = match svc.health {
+                    ServiceHealth::Healthy => c("[healthy]", ansi::GREEN),
+                    ServiceHealth::Degraded => c("[degraded]", ansi::YELLOW),
+                    ServiceHealth::Unhealthy => c("[unhealthy]", ansi::RED),
+                    ServiceHealth::Unknown => c("[unknown]", ansi::DIM),
+                };
+
+                println!(
+                    "  {} {} {}/{} replicas {}",
+                    icon, svc.name, svc.current_replicas, svc.target_replicas, health_str,
+                );
+            }
+        } else if !self.state.running_services.is_empty() {
+            // Fall back to the running_services summary from DeploymentRunning event
+            println!("Running services:");
+            for (name, replicas) in &self.state.running_services {
+                let check = c("\u{2713}", ansi::GREEN);
+                println!("  {} {} ({} replicas)", check, name, replicas);
+            }
+        }
+
+        // Hint for next steps
+        match self.state.phase {
+            DeployPhase::Running | DeployPhase::Complete => {
+                println!(
+                    "{}",
+                    c(
+                        "Use 'zlayer ps' for details, 'zlayer logs SERVICE' for logs",
+                        ansi::DIM
+                    )
+                );
+            }
+            _ => {}
+        }
     }
 }
 
@@ -626,5 +727,85 @@ mod tests {
 
         tui.handle_input(KeyCode::Char('q'), KeyModifiers::NONE);
         assert!(!tui.running);
+    }
+
+    #[test]
+    fn test_print_final_summary_no_panic_empty_state() {
+        let (_tx, tui) = create_tui();
+        // Should not panic even with empty state
+        tui.print_final_summary();
+    }
+
+    #[test]
+    fn test_print_final_summary_no_panic_with_services() {
+        let (_tx, mut tui) = create_tui();
+
+        tui.state.apply_event(&DeployEvent::PlanReady {
+            deployment_name: "my-app".to_string(),
+            version: "v1.0".to_string(),
+            services: vec![ServicePlan {
+                name: "web".to_string(),
+                image: "nginx:latest".to_string(),
+                scale_mode: "fixed(2)".to_string(),
+                endpoints: vec![],
+            }],
+        });
+        tui.state.apply_event(&DeployEvent::ServiceDeployStarted {
+            name: "web".to_string(),
+        });
+        tui.state.apply_event(&DeployEvent::ServiceDeployComplete {
+            name: "web".to_string(),
+            replicas: 2,
+        });
+        tui.state.apply_event(&DeployEvent::DeploymentRunning {
+            services: vec![("web".to_string(), 2)],
+        });
+
+        tui.print_final_summary();
+    }
+
+    #[test]
+    fn test_print_final_summary_no_panic_running_services_fallback() {
+        let (_tx, mut tui) = create_tui();
+
+        // Only set running_services, no service states
+        tui.state.apply_event(&DeployEvent::DeploymentRunning {
+            services: vec![("api".to_string(), 3), ("web".to_string(), 2)],
+        });
+
+        tui.print_final_summary();
+    }
+
+    #[test]
+    fn test_print_final_summary_no_panic_failed_service() {
+        let (_tx, mut tui) = create_tui();
+
+        tui.state.apply_event(&DeployEvent::ServiceDeployStarted {
+            name: "broken".to_string(),
+        });
+        tui.state.apply_event(&DeployEvent::ServiceDeployFailed {
+            name: "broken".to_string(),
+            error: "image not found".to_string(),
+        });
+        tui.state.apply_event(&DeployEvent::ShutdownComplete);
+
+        tui.print_final_summary();
+    }
+
+    #[test]
+    fn test_print_final_summary_no_panic_all_phases() {
+        let (_tx, mut tui) = create_tui();
+
+        for phase in [
+            DeployPhase::Initializing,
+            DeployPhase::Deploying,
+            DeployPhase::Stabilizing,
+            DeployPhase::Running,
+            DeployPhase::ShuttingDown,
+            DeployPhase::Complete,
+        ] {
+            tui.state.phase = phase;
+            tui.print_final_summary();
+        }
     }
 }

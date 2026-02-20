@@ -24,9 +24,27 @@ case "$ARCH" in
     *)             ARCH_LABEL="$ARCH" ;;
 esac
 
-DATA_DIR="${HOME}/.local/share/zlayer"
+# WSL2 detection (reports as Linux but runs under Windows host)
+IS_WSL=false
+if [ "$PLATFORM" = "linux" ] && [ -f /proc/version ]; then
+    if grep -qi 'microsoft\|WSL' /proc/version 2>/dev/null; then
+        IS_WSL=true
+    fi
+fi
+
+# Platform-aware paths (match Rust defaults in bin/zlayer/src/cli.rs)
+if [ "$PLATFORM" = "macos" ]; then
+    DATA_DIR="${HOME}/.local/share/zlayer"
+    SOCKET="${DATA_DIR}/run/zlayer.sock"
+    LOG_DIR="${DATA_DIR}/logs"
+    RUN_DIR="${DATA_DIR}/run"
+else
+    DATA_DIR="/var/lib/zlayer"
+    SOCKET="/var/run/zlayer.sock"
+    LOG_DIR="/var/log/zlayer"
+    RUN_DIR="/var/run/zlayer"
+fi
 ROOTFS="${DATA_DIR}/images/zlayer-manager_native/rootfs"
-SOCKET="${DATA_DIR}/run/zlayer.sock"
 DEPLOY_SPEC="/tmp/zlayer-deploy-test/manager-native.zlayer.yml"
 
 # --- Colors ---
@@ -42,6 +60,15 @@ warn() { echo -e "  ${YELLOW}!${NC} $1"; }
 fail() { echo -e "  ${RED}✗${NC} $1"; }
 info() { echo -e "  ${BLUE}→${NC} $1"; }
 header() { echo -e "\n${BOLD}$1${NC}"; }
+
+# Run with sudo on Linux (container ops need root for cgroups/namespaces)
+run_priv() {
+    if [ "$PLATFORM" = "linux" ]; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
 
 # --- Toolchain PATH fix for macOS ---
 # Homebrew Rust lacks wasm32 target. If both exist, force rustup.
@@ -105,6 +132,80 @@ cmd_check() {
         fi
         if system_profiler SPDisplaysDataType 2>/dev/null | grep -q Metal; then
             ok "Metal GPU available (MPS tests will run)"
+        fi
+    fi
+
+    # Linux-specific checks
+    if [ "$PLATFORM" = "linux" ]; then
+        # pkg-config
+        if command -v pkg-config &>/dev/null; then
+            ok "pkg-config installed"
+        else
+            fail "pkg-config not found — run: sudo apt-get install -y pkg-config"
+            errors=$((errors + 1))
+        fi
+
+        # cmake
+        if command -v cmake &>/dev/null; then
+            ok "cmake installed"
+        else
+            fail "cmake not found — run: sudo apt-get install -y cmake"
+            errors=$((errors + 1))
+        fi
+
+        # protobuf compiler
+        if command -v protoc &>/dev/null; then
+            ok "protobuf-compiler installed ($(protoc --version 2>/dev/null || echo 'unknown'))"
+        else
+            fail "protobuf-compiler not found — run: sudo apt-get install -y protobuf-compiler"
+            errors=$((errors + 1))
+        fi
+
+        # libseccomp-dev (checked via pkg-config, fallback to dpkg)
+        if command -v pkg-config &>/dev/null && pkg-config --exists libseccomp 2>/dev/null; then
+            ok "libseccomp-dev installed"
+        elif dpkg -s libseccomp-dev &>/dev/null 2>&1; then
+            ok "libseccomp-dev installed"
+        else
+            fail "libseccomp-dev not found — run: sudo apt-get install -y libseccomp-dev"
+            errors=$((errors + 1))
+        fi
+
+        # libssl-dev (checked via pkg-config, fallback to dpkg)
+        if command -v pkg-config &>/dev/null && pkg-config --exists openssl 2>/dev/null; then
+            ok "libssl-dev installed"
+        elif dpkg -s libssl-dev &>/dev/null 2>&1; then
+            ok "libssl-dev installed"
+        else
+            fail "libssl-dev not found — run: sudo apt-get install -y libssl-dev"
+            errors=$((errors + 1))
+        fi
+
+        # sudo access (needed for deploy/test commands)
+        if sudo -n true 2>/dev/null; then
+            ok "sudo access available (passwordless)"
+        elif groups 2>/dev/null | grep -qw sudo; then
+            ok "sudo access available (may prompt for password)"
+        else
+            warn "sudo may not be available (needed for deploy/test commands)"
+        fi
+
+        # Docker (optional fallback runtime)
+        if command -v docker &>/dev/null; then
+            ok "docker installed (fallback runtime)"
+        else
+            warn "docker not found (optional fallback runtime)"
+        fi
+
+        # WSL2 info
+        if [ "$IS_WSL" = true ]; then
+            info "Running under WSL2 (full Linux kernel features available)"
+        fi
+
+        # One-liner install hint
+        if [ $errors -gt 0 ]; then
+            echo ""
+            info "Install all required deps: sudo apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config cmake"
         fi
     fi
 
@@ -224,47 +325,42 @@ cmd_test() {
 }
 
 # ============================================================
-# dev — run manager locally (no sandbox)
+# dev — run manager with live reload (cargo-leptos watch)
 # ============================================================
 cmd_dev() {
-    header "Starting manager in dev mode"
+    header "Starting manager in dev mode (live reload)"
     setup_rust_path
 
-    # Build if needed
-    if [ ! -f target/release/zlayer-manager ]; then
-        info "Manager binary not found, building..."
-        cargo build --release --package zlayer-manager --features ssr
-    fi
-
-    local site_root="$ROOTFS/app/target/site"
-    if [ ! -d "$site_root" ]; then
-        warn "WASM site root not found at $site_root"
-        info "SSR will work but client-side hydration won't load"
-        info "To fix: cd crates/zlayer-manager && cargo leptos build --release"
-        site_root="crates/zlayer-manager/target/site"
+    # Ensure cargo-leptos is installed
+    if ! command -v cargo-leptos &>/dev/null; then
+        info "Installing cargo-leptos (needed for watch mode)..."
+        cargo install cargo-leptos
+        ok "cargo-leptos installed"
     fi
 
     local port="${PORT:-4321}"
 
     echo ""
     ok "Manager starting on http://localhost:${port}"
+    info "Live reload: saves to crates/zlayer-manager/ trigger rebuild"
     info "Press Ctrl+C to stop"
     echo ""
 
-    PORT="$port" LEPTOS_SITE_ROOT="$site_root" \
-        exec ./target/release/zlayer-manager
+    cd crates/zlayer-manager
+    exec cargo leptos watch --port "$port"
 }
 
 # ============================================================
-# deploy — full sandbox deploy (macOS)
+# deploy — full deploy with overlay networking
 # ============================================================
 cmd_deploy() {
-    if [ "$PLATFORM" != "macos" ]; then
-        fail "Sandbox deploy is macOS-only. On Linux, use Docker or youki runtime."
-        return 1
+    local runtime_label
+    if [ "$PLATFORM" = "linux" ]; then
+        runtime_label="youki (auto)"
+    else
+        runtime_label="mac-sandbox"
     fi
-
-    header "Deploying manager via mac-sandbox"
+    header "Deploying manager ($PLATFORM / $runtime_label)"
 
     # Build if needed
     if [ ! -f target/release/zlayer ] || [ ! -f target/release/zlayer-manager ]; then
@@ -274,15 +370,20 @@ cmd_deploy() {
 
     # Clean up existing
     info "Stopping existing daemons..."
-    pkill -f "zlayer" 2>/dev/null || true
+    run_priv pkill -f "zlayer" 2>/dev/null || true
     sleep 1
-    pkill -9 -f "zlayer" 2>/dev/null || true
-    rm -f "$SOCKET"
-    rm -rf "${DATA_DIR}/containers/manager-"* 2>/dev/null || true
+    run_priv pkill -9 -f "zlayer" 2>/dev/null || true
+    run_priv rm -f "$SOCKET"
+    run_priv rm -rf "${DATA_DIR}/containers/manager-"* 2>/dev/null || true
+
+    # Ensure directories exist (Linux uses system paths that may not exist)
+    if [ "$PLATFORM" = "linux" ]; then
+        sudo mkdir -p "$DATA_DIR" "$LOG_DIR" "$RUN_DIR" "${DATA_DIR}/containers" "${DATA_DIR}/images"
+    fi
 
     # Start daemon
     info "Starting daemon on port 3669..."
-    ./target/release/zlayer serve \
+    run_priv ./target/release/zlayer serve \
         --bind 0.0.0.0:3669 \
         --socket "$SOCKET" &
     local daemon_pid=$!
@@ -323,13 +424,20 @@ services:
 YAML
     fi
 
-    info "Deploying..."
-    ./target/release/zlayer \
-        --runtime mac-sandbox --host-network --no-tui \
-        up -d "$DEPLOY_SPEC"
+    # Deploy with platform-appropriate runtime (overlay networking enabled)
+    info "Deploying with overlay networking..."
+    if [ "$PLATFORM" = "linux" ]; then
+        sudo ./target/release/zlayer \
+            --runtime auto --no-tui \
+            up -d "$DEPLOY_SPEC"
+    else
+        ./target/release/zlayer \
+            --runtime mac-sandbox --no-tui \
+            up -d "$DEPLOY_SPEC"
+    fi
 
     echo ""
-    ok "Manager deployed via sandbox"
+    ok "Manager deployed ($runtime_label)"
     info "Proxy: http://localhost:8080"
     info "Daemon API: http://localhost:3669"
     info "Stop with: ./run_dev.sh clean"
@@ -343,22 +451,29 @@ cmd_clean() {
 
     if pgrep -f "zlayer" &>/dev/null; then
         info "Stopping zlayer processes..."
-        pkill -f "zlayer" 2>/dev/null || true
+        run_priv pkill -f "zlayer" 2>/dev/null || true
         sleep 1
-        pkill -9 -f "zlayer" 2>/dev/null || true
+        run_priv pkill -9 -f "zlayer" 2>/dev/null || true
         ok "Processes stopped"
     else
         ok "No zlayer processes running"
     fi
 
     if [ -S "$SOCKET" ]; then
-        rm -f "$SOCKET"
+        run_priv rm -f "$SOCKET"
         ok "Removed socket"
     fi
 
     if ls "${DATA_DIR}/containers/"* &>/dev/null 2>&1; then
-        rm -rf "${DATA_DIR}/containers/"*
+        run_priv rm -rf "${DATA_DIR}/containers/"*
         ok "Removed container state"
+    fi
+
+    if [ "$PLATFORM" = "linux" ] && [ -d "$LOG_DIR" ]; then
+        if ls "${LOG_DIR}/"* &>/dev/null 2>&1; then
+            sudo rm -rf "${LOG_DIR}/"*
+            ok "Removed log files"
+        fi
     fi
 
     ok "Clean"
@@ -374,12 +489,12 @@ ${BOLD}ZLayer Dev Script${NC} ($PLATFORM / $ARCH_LABEL)
 ${BOLD}Usage:${NC} ./run_dev.sh [command]
 
 ${BOLD}Commands:${NC}
-  check     Verify prerequisites (rustup, wasm32, cargo-leptos, bun)
-  build     Build runtime + manager (release, platform-aware)
+  check     Verify prerequisites (platform-aware)
+  build     Build runtime + manager (release)
   test      Run workspace + platform-specific tests
-  dev       Run manager locally on port 4321 (no sandbox)
-  deploy    Full sandbox deploy (macOS only)
-  clean     Kill daemons, remove sockets/containers
+  dev       Run manager with live reload (cargo-leptos watch)
+  deploy    Full deploy with overlay networking (macOS: sandbox, Linux: youki)
+  clean     Kill daemons, remove sockets/containers/logs
   help      Show this help
 
 ${BOLD}Default:${NC} check + build + test

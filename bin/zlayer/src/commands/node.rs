@@ -151,6 +151,32 @@ pub(crate) async fn load_node_config(data_dir: &Path) -> Result<NodeConfig> {
     Ok(config)
 }
 
+/// Load node config, or auto-initialize as single-node leader if none exists.
+pub(crate) async fn load_or_init_node_config(data_dir: &Path) -> Result<NodeConfig> {
+    match load_node_config(data_dir).await {
+        Ok(cfg) => Ok(cfg),
+        Err(_) => {
+            let advertise_addr = detect_local_ip();
+            println!(
+                "Node not yet initialized. Auto-initializing with advertise address {}...",
+                advertise_addr
+            );
+            handle_node_init(
+                advertise_addr,
+                3669,
+                9000,
+                51820,
+                data_dir.to_path_buf(),
+                "10.200.0.0/16".to_string(),
+            )
+            .await?;
+            load_node_config(data_dir)
+                .await
+                .context("Failed to load node config after auto-initialization")
+        }
+    }
+}
+
 /// Generate a join token for the cluster
 fn generate_join_token_data(
     advertise_addr: &str,
@@ -788,14 +814,7 @@ pub(crate) async fn handle_node_list(output: String, cli_data_dir: &std::path::P
 
     // Try to load local node config to get API endpoint
     let data_dir = cli_data_dir.to_path_buf();
-    let node_config = match load_node_config(&data_dir).await {
-        Ok(config) => config,
-        Err(_) => {
-            anyhow::bail!(
-                "Node not initialized. Run 'zlayer node init' or 'zlayer node join' first."
-            );
-        }
-    };
+    let node_config = load_or_init_node_config(&data_dir).await?;
 
     let api_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.api_port);
 
@@ -884,14 +903,7 @@ pub(crate) async fn handle_node_status(
     cli_data_dir: &std::path::Path,
 ) -> Result<()> {
     let data_dir = cli_data_dir.to_path_buf();
-    let node_config = match load_node_config(&data_dir).await {
-        Ok(config) => config,
-        Err(_) => {
-            anyhow::bail!(
-                "Node not initialized. Run 'zlayer node init' or 'zlayer node join' first."
-            );
-        }
-    };
+    let node_config = load_or_init_node_config(&data_dir).await?;
 
     // If no node_id specified, show this node
     let target_id = node_id.unwrap_or(node_config.node_id.clone());
@@ -992,14 +1004,7 @@ pub(crate) async fn handle_node_remove(
     use std::time::Duration;
 
     let data_dir = cli_data_dir.to_path_buf();
-    let node_config = match load_node_config(&data_dir).await {
-        Ok(config) => config,
-        Err(_) => {
-            anyhow::bail!(
-                "Node not initialized. Run 'zlayer node init' or 'zlayer node join' first."
-            );
-        }
-    };
+    let node_config = load_or_init_node_config(&data_dir).await?;
 
     // Cannot remove yourself
     if node_id == node_config.node_id {
@@ -1070,14 +1075,7 @@ pub(crate) async fn handle_node_set_mode(
     }
 
     let data_dir = cli_data_dir.to_path_buf();
-    let node_config = match load_node_config(&data_dir).await {
-        Ok(config) => config,
-        Err(_) => {
-            anyhow::bail!(
-                "Node not initialized. Run 'zlayer node init' or 'zlayer node join' first."
-            );
-        }
-    };
+    let node_config = load_or_init_node_config(&data_dir).await?;
 
     let api_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.api_port);
 
@@ -1147,14 +1145,7 @@ pub(crate) async fn handle_node_label(
     }
 
     let data_dir = cli_data_dir.to_path_buf();
-    let node_config = match load_node_config(&data_dir).await {
-        Ok(config) => config,
-        Err(_) => {
-            anyhow::bail!(
-                "Node not initialized. Run 'zlayer node init' or 'zlayer node join' first."
-            );
-        }
-    };
+    let node_config = load_or_init_node_config(&data_dir).await?;
 
     let api_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.api_port);
 
@@ -1246,43 +1237,7 @@ pub(crate) async fn handle_node_generate_join_token(
     let api_endpoint = match api {
         Some(a) => a,
         None => {
-            // Try to load from node config; auto-init if it doesn't exist.
-            let node_config = match load_node_config(&data_dir).await {
-                Ok(cfg) => cfg,
-                Err(_) => {
-                    // Node was never initialized -- auto-init with defaults.
-                    let advertise_addr = detect_local_ip();
-                    let api_port: u16 = 3669;
-                    let raft_port: u16 = 9000;
-                    let overlay_port: u16 = 51820;
-                    let overlay_cidr = "10.200.0.0/16".to_string();
-
-                    info!(
-                        advertise_addr = %advertise_addr,
-                        "Node not initialized -- auto-initializing with detected IP"
-                    );
-                    println!(
-                        "Node not yet initialized. Auto-initializing with advertise address {}...",
-                        advertise_addr
-                    );
-
-                    handle_node_init(
-                        advertise_addr,
-                        api_port,
-                        raft_port,
-                        overlay_port,
-                        data_dir.clone(),
-                        overlay_cidr,
-                    )
-                    .await?;
-
-                    // Now load the freshly-written config
-                    load_node_config(&data_dir)
-                        .await
-                        .context("Failed to load node config after auto-initialization")?
-                }
-            };
-
+            let node_config = load_or_init_node_config(&data_dir).await?;
             format!(
                 "http://{}:{}",
                 node_config.advertise_addr, node_config.api_port

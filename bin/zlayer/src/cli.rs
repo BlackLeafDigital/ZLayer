@@ -73,6 +73,16 @@ pub(crate) fn default_socket_path(data_dir: &std::path::Path) -> String {
 #[command(name = "zlayer")]
 #[command(version, about = "ZLayer container orchestration platform")]
 #[command(propagate_version = true)]
+#[command(after_help = "\
+COMMAND GROUPS:
+  Lifecycle:    up, down, deploy, join, ps, status, exec, logs, stop
+  Building:     build, pipeline, runtimes
+  Registry:     pull, export, import
+  Cluster:      node, serve, tunnel, manager
+  Inspection:   validate, token, spec, wasm
+  Interface:    tui
+
+Run 'zlayer <command> --help' for details on a specific command.")]
 pub(crate) struct Cli {
     /// Container runtime to use
     #[arg(long, default_value = "auto", value_enum)]
@@ -182,14 +192,38 @@ pub(crate) enum RuntimeType {
 /// CLI subcommands
 #[derive(Subcommand)]
 pub(crate) enum Commands {
-    /// Launch interactive TUI
-    Tui {
-        /// Build context directory
-        #[arg(short = 'c', long)]
-        context: Option<PathBuf>,
+    // ── Lifecycle ─────────────────────────────────────────────────────
+    /// Deploy and start services (like docker compose up)
+    ///
+    /// Auto-discovers *.zlayer.yml in current directory if no spec path given.
+    /// Runs in foreground by default, streaming logs and waiting for Ctrl+C.
+    /// Use -b/--background to deploy and return immediately.
+    ///
+    /// Examples:
+    ///   zlayer up
+    ///   zlayer up myapp.zlayer.yml
+    ///   zlayer up -b
+    #[command(verbatim_doc_comment, display_order = 1)]
+    Up {
+        /// Path to deployment spec (auto-discovers *.zlayer.yml if not given)
+        spec_path: Option<PathBuf>,
+    },
+
+    /// Stop all services in a deployment (like docker compose down)
+    ///
+    /// Auto-discovers deployment name from *.zlayer.yml if not given.
+    ///
+    /// Examples:
+    ///   zlayer down
+    ///   zlayer down my-deployment
+    #[command(verbatim_doc_comment, display_order = 2)]
+    Down {
+        /// Deployment name (auto-discovers from *.zlayer.yml if not given)
+        deployment: Option<String>,
     },
 
     /// Deploy services from a spec file
+    #[command(display_order = 3)]
     Deploy {
         /// Path to deployment spec (auto-discovers *.zlayer.yml in current directory)
         spec_path: Option<PathBuf>,
@@ -200,6 +234,7 @@ pub(crate) enum Commands {
     },
 
     /// Join an existing deployment
+    #[command(display_order = 4)]
     Join {
         /// Join token (contains deployment key and service info)
         token: String,
@@ -217,40 +252,60 @@ pub(crate) enum Commands {
         replicas: u32,
     },
 
-    /// Start the API server
-    Serve {
-        /// Bind address (e.g., 0.0.0.0:3669)
-        #[arg(long, default_value = "0.0.0.0:3669")]
-        bind: String,
-
-        /// JWT secret for authentication (can also be set via ZLAYER_JWT_SECRET env var)
-        #[arg(long, env = "ZLAYER_JWT_SECRET")]
-        jwt_secret: Option<String>,
-
-        /// Disable Swagger UI
+    /// List running deployments, services, and containers
+    ///
+    /// Shows a summary of all deployments and their services. Use --containers
+    /// to also show individual container replicas.
+    ///
+    /// Examples:
+    ///   zlayer ps
+    ///   zlayer ps --deployment my-app
+    ///   zlayer ps --containers
+    ///   zlayer ps --format json
+    #[command(verbatim_doc_comment, display_order = 5)]
+    Ps {
+        /// Filter by deployment name
         #[arg(long)]
-        no_swagger: bool,
-
-        /// Run as background daemon
-        #[arg(long)]
-        daemon: bool,
-
-        /// Unix socket path for CLI communication.
-        /// Defaults to {run-dir}/zlayer.sock.
-        #[arg(long)]
-        socket: Option<String>,
+        deployment: Option<String>,
+        /// Show individual containers
+        #[arg(long, short = 'c')]
+        containers: bool,
+        /// Output format: table, json, yaml
+        #[arg(long, default_value = "table")]
+        format: String,
     },
 
     /// Show runtime status
+    #[command(display_order = 6)]
     Status,
 
-    /// Validate a spec file without deploying
-    Validate {
-        /// Path to deployment spec (auto-discovers *.zlayer.yml in current directory)
-        spec_path: Option<PathBuf>,
+    /// Execute a command in a running service container
+    ///
+    /// Runs a command inside a container belonging to the specified service.
+    /// If only one deployment exists, the deployment flag can be omitted.
+    /// By default targets the first healthy replica; use --replica to pick one.
+    ///
+    /// Examples:
+    ///   zlayer exec web -- ls -la
+    ///   zlayer exec --deployment my-app web -- /bin/sh
+    ///   zlayer exec --replica 2 api -- cat /etc/hosts
+    #[command(verbatim_doc_comment, display_order = 7)]
+    Exec {
+        /// Service name
+        service: String,
+        /// Deployment name (auto-detected if only one exists)
+        #[arg(long)]
+        deployment: Option<String>,
+        /// Target a specific replica number
+        #[arg(long, short = 'r')]
+        replica: Option<u32>,
+        /// Command and arguments to execute
+        #[arg(last = true)]
+        cmd: Vec<String>,
     },
 
     /// Stream logs from a service
+    #[command(display_order = 8)]
     Logs {
         /// Deployment name
         #[arg(long)]
@@ -273,6 +328,7 @@ pub(crate) enum Commands {
     },
 
     /// Stop a deployment or service
+    #[command(display_order = 9)]
     Stop {
         /// Deployment name
         deployment: String,
@@ -290,35 +346,7 @@ pub(crate) enum Commands {
         timeout: u64,
     },
 
-    /// Deploy and start services (like docker compose up)
-    ///
-    /// Auto-discovers *.zlayer.yml in current directory if no spec path given.
-    /// Runs in foreground by default, streaming logs and waiting for Ctrl+C.
-    /// Use -b/--background to deploy and return immediately.
-    ///
-    /// Examples:
-    ///   zlayer up
-    ///   zlayer up myapp.zlayer.yml
-    ///   zlayer up -b
-    #[command(verbatim_doc_comment)]
-    Up {
-        /// Path to deployment spec (auto-discovers *.zlayer.yml if not given)
-        spec_path: Option<PathBuf>,
-    },
-
-    /// Stop all services in a deployment (like docker compose down)
-    ///
-    /// Auto-discovers deployment name from *.zlayer.yml if not given.
-    ///
-    /// Examples:
-    ///   zlayer down
-    ///   zlayer down my-deployment
-    #[command(verbatim_doc_comment)]
-    Down {
-        /// Deployment name (auto-discovers from *.zlayer.yml if not given)
-        deployment: Option<String>,
-    },
-
+    // ── Building ──────────────────────────────────────────────────────
     /// Build a container image from a Dockerfile
     ///
     /// Examples:
@@ -327,7 +355,7 @@ pub(crate) enum Commands {
     ///   zlayer build --runtime node20 -t myapp:v1 ./my-node-app
     ///   zlayer build --runtime-auto -t myapp:latest .
     ///   zlayer build -f Dockerfile.prod --target production -t myapp:prod .
-    #[command(verbatim_doc_comment)]
+    #[command(verbatim_doc_comment, display_order = 10)]
     Build {
         /// Build context directory
         #[arg(default_value = ".")]
@@ -378,145 +406,6 @@ pub(crate) enum Commands {
         verbose_build: bool,
     },
 
-    /// List available runtime templates
-    ///
-    /// Shows all pre-built Dockerfile templates for common development
-    /// environments. These can be used with `zlayer build --runtime <name>`.
-    Runtimes,
-
-    /// Token management commands
-    ///
-    /// Create, decode, and inspect JWT tokens for API authentication.
-    #[command(subcommand)]
-    Token(TokenCommands),
-
-    /// Specification inspection commands
-    ///
-    /// Validate, dump, and inspect deployment specifications.
-    #[command(subcommand)]
-    Spec(SpecCommands),
-
-    /// Manage cluster nodes
-    #[command(subcommand)]
-    Node(NodeCommands),
-
-    /// Export an image to a tar file (OCI Image Layout)
-    ///
-    /// Exports a locally stored image to an OCI Image Layout tar archive
-    /// that can be imported on another system or loaded into Docker.
-    ///
-    /// Examples:
-    ///   zlayer export myapp:latest -o myapp.tar
-    ///   zlayer export myapp:v1.0 -o myapp.tar.gz --gzip
-    ///   zlayer export myapp@sha256:abc123... -o myapp.tar
-    #[command(verbatim_doc_comment)]
-    Export {
-        /// Image reference (name:tag or name@digest)
-        image: String,
-
-        /// Output file path (.tar or .tar.gz)
-        #[arg(short, long)]
-        output: PathBuf,
-
-        /// Compress output with gzip
-        #[arg(long)]
-        gzip: bool,
-    },
-
-    /// Import an image from a tar file
-    ///
-    /// Imports an OCI Image Layout tar archive into the local registry.
-    /// The archive can be created by `zlayer export` or `docker save`.
-    ///
-    /// Examples:
-    ///   zlayer import myapp.tar
-    ///   zlayer import myapp.tar.gz -t myapp:imported
-    ///   zlayer import /path/to/image.tar --tag myapp:v1.0
-    #[command(verbatim_doc_comment)]
-    Import {
-        /// Input tar file path
-        input: PathBuf,
-
-        /// Tag to apply to imported image
-        #[arg(short, long)]
-        tag: Option<String>,
-    },
-
-    /// WASM build, export, and management commands
-    #[command(subcommand)]
-    Wasm(WasmCommands),
-
-    /// Tunnel management commands
-    ///
-    /// Create, manage, and connect tunnels for secure access to services.
-    #[command(subcommand)]
-    Tunnel(TunnelCommands),
-
-    /// ZLayer Manager commands
-    ///
-    /// Initialize, configure, and manage the ZLayer Manager web UI.
-    #[command(subcommand)]
-    Manager(ManagerCommands),
-
-    /// Pull an image from a registry
-    ///
-    /// Examples:
-    ///   zlayer pull zachhandley/zlayer-node:latest
-    ///   zlayer pull ghcr.io/blackleafdigital/zlayer-manager:0.9.6
-    #[command(verbatim_doc_comment)]
-    Pull {
-        /// Image reference (e.g., zachhandley/zlayer-node:latest)
-        image: String,
-    },
-
-    /// Execute a command in a running service container
-    ///
-    /// Runs a command inside a container belonging to the specified service.
-    /// If only one deployment exists, the deployment flag can be omitted.
-    /// By default targets the first healthy replica; use --replica to pick one.
-    ///
-    /// Examples:
-    ///   zlayer exec web -- ls -la
-    ///   zlayer exec --deployment my-app web -- /bin/sh
-    ///   zlayer exec --replica 2 api -- cat /etc/hosts
-    #[command(verbatim_doc_comment)]
-    Exec {
-        /// Service name
-        service: String,
-        /// Deployment name (auto-detected if only one exists)
-        #[arg(long)]
-        deployment: Option<String>,
-        /// Target a specific replica number
-        #[arg(long, short = 'r')]
-        replica: Option<u32>,
-        /// Command and arguments to execute
-        #[arg(last = true)]
-        cmd: Vec<String>,
-    },
-
-    /// List running deployments, services, and containers
-    ///
-    /// Shows a summary of all deployments and their services. Use --containers
-    /// to also show individual container replicas.
-    ///
-    /// Examples:
-    ///   zlayer ps
-    ///   zlayer ps --deployment my-app
-    ///   zlayer ps --containers
-    ///   zlayer ps --format json
-    #[command(verbatim_doc_comment)]
-    Ps {
-        /// Filter by deployment name
-        #[arg(long)]
-        deployment: Option<String>,
-        /// Show individual containers
-        #[arg(long, short = 'c')]
-        containers: bool,
-        /// Output format: table, json, yaml
-        #[arg(long, default_value = "table")]
-        format: String,
-    },
-
     /// Build multiple images from a pipeline manifest
     ///
     /// Reads a ZPipeline.yaml (or zlayer-pipeline.yaml) and builds all
@@ -527,7 +416,7 @@ pub(crate) enum Commands {
     ///   zlayer pipeline -f my-pipeline.yaml
     ///   zlayer pipeline --set VERSION=1.0 --push
     ///   zlayer pipeline --only web,api
-    #[command(verbatim_doc_comment)]
+    #[command(verbatim_doc_comment, display_order = 11)]
     Pipeline {
         /// Path to pipeline file (defaults to ZPipeline.yaml or zlayer-pipeline.yaml)
         #[arg(short = 'f', long = "file")]
@@ -552,6 +441,142 @@ pub(crate) enum Commands {
         /// Only build specific images (comma-separated)
         #[arg(long)]
         only: Option<String>,
+    },
+
+    /// List available runtime templates
+    ///
+    /// Shows all pre-built Dockerfile templates for common development
+    /// environments. These can be used with `zlayer build --runtime <name>`.
+    #[command(display_order = 12)]
+    Runtimes,
+
+    // ── Registry ──────────────────────────────────────────────────────
+    /// Pull an image from a registry
+    ///
+    /// Examples:
+    ///   zlayer pull zachhandley/zlayer-node:latest
+    ///   zlayer pull ghcr.io/blackleafdigital/zlayer-manager:0.9.6
+    #[command(verbatim_doc_comment, display_order = 20)]
+    Pull {
+        /// Image reference (e.g., zachhandley/zlayer-node:latest)
+        image: String,
+    },
+
+    /// Export an image to a tar file (OCI Image Layout)
+    ///
+    /// Exports a locally stored image to an OCI Image Layout tar archive
+    /// that can be imported on another system or loaded into Docker.
+    ///
+    /// Examples:
+    ///   zlayer export myapp:latest -o myapp.tar
+    ///   zlayer export myapp:v1.0 -o myapp.tar.gz --gzip
+    ///   zlayer export myapp@sha256:abc123... -o myapp.tar
+    #[command(verbatim_doc_comment, display_order = 21)]
+    Export {
+        /// Image reference (name:tag or name@digest)
+        image: String,
+
+        /// Output file path (.tar or .tar.gz)
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Compress output with gzip
+        #[arg(long)]
+        gzip: bool,
+    },
+
+    /// Import an image from a tar file
+    ///
+    /// Imports an OCI Image Layout tar archive into the local registry.
+    /// The archive can be created by `zlayer export` or `docker save`.
+    ///
+    /// Examples:
+    ///   zlayer import myapp.tar
+    ///   zlayer import myapp.tar.gz -t myapp:imported
+    ///   zlayer import /path/to/image.tar --tag myapp:v1.0
+    #[command(verbatim_doc_comment, display_order = 22)]
+    Import {
+        /// Input tar file path
+        input: PathBuf,
+
+        /// Tag to apply to imported image
+        #[arg(short, long)]
+        tag: Option<String>,
+    },
+
+    // ── Cluster & Infrastructure ──────────────────────────────────────
+    /// Manage cluster nodes
+    #[command(subcommand, display_order = 30)]
+    Node(NodeCommands),
+
+    /// Start the API server
+    #[command(display_order = 31)]
+    Serve {
+        /// Bind address (e.g., 0.0.0.0:3669)
+        #[arg(long, default_value = "0.0.0.0:3669")]
+        bind: String,
+
+        /// JWT secret for authentication (can also be set via ZLAYER_JWT_SECRET env var)
+        #[arg(long, env = "ZLAYER_JWT_SECRET")]
+        jwt_secret: Option<String>,
+
+        /// Disable Swagger UI
+        #[arg(long)]
+        no_swagger: bool,
+
+        /// Run as background daemon
+        #[arg(long)]
+        daemon: bool,
+
+        /// Unix socket path for CLI communication.
+        /// Defaults to {run-dir}/zlayer.sock.
+        #[arg(long)]
+        socket: Option<String>,
+    },
+
+    /// Tunnel management commands
+    ///
+    /// Create, manage, and connect tunnels for secure access to services.
+    #[command(subcommand, display_order = 32)]
+    Tunnel(TunnelCommands),
+
+    /// ZLayer Manager commands
+    ///
+    /// Initialize, configure, and manage the ZLayer Manager web UI.
+    #[command(subcommand, display_order = 33)]
+    Manager(ManagerCommands),
+
+    // ── Inspection & Configuration ────────────────────────────────────
+    /// Validate a spec file without deploying
+    #[command(display_order = 40)]
+    Validate {
+        /// Path to deployment spec (auto-discovers *.zlayer.yml in current directory)
+        spec_path: Option<PathBuf>,
+    },
+
+    /// Token management commands
+    ///
+    /// Create, decode, and inspect JWT tokens for API authentication.
+    #[command(subcommand, display_order = 41)]
+    Token(TokenCommands),
+
+    /// Specification inspection commands
+    ///
+    /// Validate, dump, and inspect deployment specifications.
+    #[command(subcommand, display_order = 42)]
+    Spec(SpecCommands),
+
+    /// WASM build, export, and management commands
+    #[command(subcommand, display_order = 43)]
+    Wasm(WasmCommands),
+
+    // ── Interface ─────────────────────────────────────────────────────
+    /// Launch interactive TUI
+    #[command(display_order = 50)]
+    Tui {
+        /// Build context directory
+        #[arg(short = 'c', long)]
+        context: Option<PathBuf>,
     },
 }
 
