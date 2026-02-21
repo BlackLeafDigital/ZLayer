@@ -16,12 +16,12 @@ fn execution_status_badge(status: &str) -> &'static str {
         "completed" => "badge badge-success",
         "failed" | "cancelled" => "badge badge-error",
         "running" => "badge badge-warning",
-        "initializing" | "pending" => "badge badge-ghost",
         _ => "badge badge-ghost",
     }
 }
 
 /// Format an optional duration in milliseconds for display
+#[allow(clippy::cast_precision_loss)]
 fn format_duration_ms(ms: Option<u64>) -> String {
     match ms {
         Some(d) if d < 1_000 => format!("{d}ms"),
@@ -98,7 +98,7 @@ fn render_cron_table(
                                                 }
                                             }
                                             on:click=move |_| {
-                                                on_toggle((name_toggle.clone(), is_enabled))
+                                                on_toggle((name_toggle.clone(), is_enabled));
                                             }
                                         >
                                             {move || if is_enabled { "Disable" } else { "Enable" }}
@@ -187,6 +187,7 @@ fn render_executions_table(executions: Vec<JobExecution>) -> impl IntoView {
 
 /// Jobs & Cron page component
 #[component]
+#[allow(clippy::too_many_lines)]
 pub fn Jobs() -> impl IntoView {
     let (refresh, set_refresh) = signal(0u32);
     let cron_jobs = Resource::new(move || refresh.get(), |_| get_cron_jobs());

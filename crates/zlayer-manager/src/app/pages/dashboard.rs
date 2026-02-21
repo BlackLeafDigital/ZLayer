@@ -26,6 +26,7 @@ fn format_uptime(secs: u64) -> String {
 
 /// Dashboard page component
 #[component]
+#[allow(clippy::too_many_lines)]
 pub fn Dashboard() -> impl IntoView {
     let stats = Resource::new(|| (), |()| get_system_stats());
     let deployments = Resource::new(|| (), |()| get_deployments());
@@ -149,29 +150,29 @@ pub fn Dashboard() -> impl IntoView {
                                         .get()
                                         .map(|result| {
                                             match result {
-                                                Ok(status) => {
+                                                Ok(net_status) => {
                                                     view! {
                                                         <div class="space-y-3">
                                                             <div class="flex justify-between">
                                                                 <span class="text-sm text-base-content/70">"Interface"</span>
-                                                                <span class="font-mono text-sm">{status.interface}</span>
+                                                                <span class="font-mono text-sm">{net_status.interface}</span>
                                                             </div>
                                                             <div class="flex justify-between">
                                                                 <span class="text-sm text-base-content/70">"Node IP"</span>
-                                                                <span class="font-mono text-sm">{status.node_ip}</span>
+                                                                <span class="font-mono text-sm">{net_status.node_ip}</span>
                                                             </div>
                                                             <div class="flex justify-between">
                                                                 <span class="text-sm text-base-content/70">"CIDR"</span>
-                                                                <span class="font-mono text-sm">{status.cidr}</span>
+                                                                <span class="font-mono text-sm">{net_status.cidr}</span>
                                                             </div>
                                                             <div class="divider my-1"></div>
                                                             <div class="flex justify-between items-center">
                                                                 <span class="text-sm text-base-content/70">"Peers"</span>
-                                                                <span class="font-semibold">{format!("{}/{}", status.healthy_peers, status.total_peers)}</span>
+                                                                <span class="font-semibold">{format!("{}/{}", net_status.healthy_peers, net_status.total_peers)}</span>
                                                             </div>
                                                             <div class="flex justify-between items-center">
                                                                 <span class="text-sm text-base-content/70">"Role"</span>
-                                                                {if status.is_leader {
+                                                                {if net_status.is_leader {
                                                                     view! { <span class="badge badge-primary badge-sm">"Leader"</span> }.into_any()
                                                                 } else {
                                                                     view! { <span class="badge badge-ghost badge-sm">"Follower"</span> }.into_any()
@@ -211,7 +212,9 @@ pub fn Dashboard() -> impl IntoView {
                                     .into_iter()
                                     .filter(|d| d.status == "running")
                                     .collect();
-                                if !running.is_empty() {
+                                if running.is_empty() {
+                                    view! { <div></div> }.into_any()
+                                } else {
                                     view! {
                                         <div class="card bg-base-200 shadow">
                                             <div class="card-body">
@@ -229,8 +232,6 @@ pub fn Dashboard() -> impl IntoView {
                                         </div>
                                     }
                                         .into_any()
-                                } else {
-                                    view! { <div></div> }.into_any()
                                 }
                             } else {
                                 view! { <div></div> }.into_any()
@@ -300,7 +301,7 @@ fn render_deployment_list(deployments: Vec<Deployment>) -> impl IntoView {
 #[component]
 fn DeploymentServices(name: String) -> impl IntoView {
     let dep_name = name.clone();
-    let services = Resource::new(move || dep_name.clone(), |n| get_services(n));
+    let services = Resource::new(move || dep_name.clone(), get_services);
 
     view! {
         <div>

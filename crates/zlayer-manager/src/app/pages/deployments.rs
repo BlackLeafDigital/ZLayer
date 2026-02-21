@@ -26,7 +26,6 @@ fn service_status_class(status: &str) -> &'static str {
         "running" => "badge badge-success badge-sm",
         "pending" | "deploying" => "badge badge-warning badge-sm",
         "failed" | "error" => "badge badge-error badge-sm",
-        "stopped" => "badge badge-ghost badge-sm",
         _ => "badge badge-ghost badge-sm",
     }
 }
@@ -95,6 +94,7 @@ fn render_deployments_table(
 /// Displays a table of deployments with "New Deployment" button,
 /// delete confirmation, and a view modal for deployment details.
 #[component]
+#[allow(clippy::too_many_lines)]
 pub fn Deployments() -> impl IntoView {
     let (refresh, set_refresh) = signal(0u32);
     let deployments = Resource::new(move || refresh.get(), |_| get_deployments());

@@ -314,7 +314,7 @@ fn DangerZoneCard() -> impl IntoView {
     let (reset_result, set_reset_result) = signal(Option::<Result<String, String>>::None);
     let (resetting, set_resetting) = signal(false);
 
-    let reset_action = Action::new(move |_: &()| async move {
+    let reset_action = Action::new(move |(): &()| async move {
         set_resetting.set(true);
         let result = reset_cluster().await;
         match result {

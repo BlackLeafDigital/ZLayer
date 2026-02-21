@@ -118,6 +118,7 @@ fn render_builds_table(
 }
 
 /// Builds page component
+#[allow(clippy::too_many_lines)]
 #[component]
 pub fn Builds() -> impl IntoView {
     let (refresh, set_refresh) = signal(0u32);
@@ -172,7 +173,7 @@ pub fn Builds() -> impl IntoView {
                     });
                 }
                 Err(e) => {
-                    set_logs_content.set(format!("Error fetching logs: {}", e));
+                    set_logs_content.set(format!("Error fetching logs: {e}"));
                 }
             }
             set_logs_loading.set(false);

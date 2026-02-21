@@ -74,6 +74,7 @@ fn format_timestamp(ts: i64) -> String {
 ///
 /// Displays a Coming Soon message with the option to pre-register
 /// repository URLs as secrets for future GitOps support.
+#[allow(clippy::too_many_lines)]
 #[component]
 pub fn Git() -> impl IntoView {
     let (refresh, set_refresh) = signal(0u32);
@@ -88,7 +89,7 @@ pub fn Git() -> impl IntoView {
     // Create repo secret action
     let create_action = Action::new(move |input: &(String, String)| {
         let (name, url) = input.clone();
-        let secret_name = format!("{}{}", GIT_REPO_PREFIX, name);
+        let secret_name = format!("{GIT_REPO_PREFIX}{name}");
         async move {
             let result = create_secret(secret_name, url).await;
             match result {

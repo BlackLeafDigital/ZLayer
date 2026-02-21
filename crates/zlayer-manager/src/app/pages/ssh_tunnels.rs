@@ -82,6 +82,7 @@ fn render_tunnels_table(
 
 /// SSH Tunnels page component
 #[component]
+#[allow(clippy::too_many_lines)]
 pub fn SshTunnels() -> impl IntoView {
     let (refresh, set_refresh) = signal(0u32);
     let tunnels = Resource::new(move || refresh.get(), |_| get_tunnels());
