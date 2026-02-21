@@ -387,7 +387,12 @@ async fn prepare_native_image(runtime: &SandboxRuntime, image_name: &str) {
     runtime
         .register_local_rootfs(image_name, &source_dir)
         .await
-        .expect("Failed to register local rootfs");
+        .unwrap_or_else(|e| {
+            panic!(
+                "Failed to register local rootfs for '{}': {}",
+                image_name, e
+            )
+        });
 }
 
 /// Cleanup helper -- ensures container is removed even on test failure

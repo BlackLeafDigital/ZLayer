@@ -43,6 +43,7 @@ use crate::MacSandboxConfig;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -603,7 +604,11 @@ fn clone_file_apfs(src: &Path, dst: &Path) -> std::io::Result<bool> {
         let err = std::io::Error::last_os_error();
         // ENOTSUP means the filesystem doesn't support clonefile (not APFS)
         // EXDEV means src and dst are on different volumes
-        if err.raw_os_error() == Some(libc::ENOTSUP) || err.raw_os_error() == Some(libc::EXDEV) {
+        // EEXIST means the destination already exists (concurrent writer)
+        if err.raw_os_error() == Some(libc::ENOTSUP)
+            || err.raw_os_error() == Some(libc::EXDEV)
+            || err.raw_os_error() == Some(libc::EEXIST)
+        {
             Ok(false) // Fallback needed
         } else {
             Err(err)
@@ -1192,6 +1197,11 @@ struct SandboxContainer {
 /// macOS process with mandatory access control. The rootfs is APFS-cloned
 /// from pulled OCI images for copy-on-write isolation.
 ///
+/// Monotonically increasing counter used to make staging directory names
+/// unique across concurrent calls within the same process. Combined with
+/// PID and nanosecond timestamp to prevent collisions.
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 /// GPU access (Metal/MPS) runs at 100% native performance -- no
 /// virtualization overhead. Each container gets a generated `.sb` profile
 /// that precisely whitelists the IOKit classes, Mach services, and filesystem
@@ -1309,12 +1319,13 @@ impl SandboxRuntime {
         // Clone to a unique staging directory to avoid races when multiple
         // runtime instances register the same image concurrently.
         let staging_name = format!(
-            ".rootfs-staging-{}-{}",
+            ".rootfs-staging-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            STAGING_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
         let staging_dir = image_dir.join(&staging_name);
 
