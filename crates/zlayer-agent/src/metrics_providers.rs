@@ -140,6 +140,7 @@ fn container_stats_to_raw(stats: ContainerStats) -> RawContainerStats {
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use crate::runtime::MockRuntime;

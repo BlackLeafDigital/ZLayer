@@ -170,6 +170,83 @@ pub struct BuildStatus {
     pub completed_at: Option<String>,
 }
 
+/// Request to trigger a new build
+#[derive(Debug, Serialize)]
+pub struct TriggerBuildRequest {
+    /// Path to the build context on the server
+    pub context_path: String,
+    /// Tags to apply to the built image
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// Use runtime template instead of Dockerfile
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// Disable cache
+    #[serde(default)]
+    pub no_cache: bool,
+}
+
+/// Response after triggering a build
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerBuildResponse {
+    /// The build ID for tracking
+    pub build_id: String,
+    /// Human-readable message
+    pub message: String,
+}
+
+// =========================================================================
+// Tunnel Types
+// =========================================================================
+
+/// Tunnel summary for listing
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelSummary {
+    /// Unique tunnel identifier
+    pub id: String,
+    /// Name of the tunnel
+    pub name: String,
+    /// Current status (active, disconnected, expired, pending)
+    pub status: String,
+    /// Services this tunnel can expose
+    pub services: Vec<String>,
+    /// When the tunnel was created (Unix timestamp)
+    pub created_at: u64,
+    /// When the token expires (Unix timestamp)
+    pub expires_at: u64,
+    /// Last time the tunnel connected (Unix timestamp, if ever)
+    pub last_connected: Option<u64>,
+}
+
+/// Request to create a tunnel
+#[derive(Debug, Serialize)]
+pub struct CreateTunnelRequest {
+    /// Name for this tunnel
+    pub name: String,
+    /// Services this tunnel can expose
+    #[serde(default)]
+    pub services: Vec<String>,
+    /// Time-to-live in seconds
+    pub ttl_secs: u64,
+}
+
+/// Response after creating a tunnel
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateTunnelResponse {
+    /// Unique tunnel identifier
+    pub id: String,
+    /// Name of the tunnel
+    pub name: String,
+    /// The tunnel token
+    pub token: String,
+    /// Services this tunnel can expose
+    pub services: Vec<String>,
+    /// When the token expires (Unix timestamp)
+    pub expires_at: u64,
+    /// When the tunnel was created (Unix timestamp)
+    pub created_at: u64,
+}
+
 // =========================================================================
 // Secrets Types
 // =========================================================================
@@ -570,6 +647,67 @@ impl ZLayerClient {
         self.handle_response(response).await
     }
 
+    /// Create a new deployment from a YAML spec
+    ///
+    /// Calls POST /api/v1/deployments to create a deployment from a YAML specification.
+    ///
+    /// # Arguments
+    ///
+    /// * `yaml` - The deployment YAML specification
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails, the spec is invalid,
+    /// or the response cannot be deserialized.
+    pub async fn create_deployment(&self, yaml: &str) -> Result<DeploymentDetails> {
+        let body = serde_json::json!({ "spec": yaml });
+        let response = self
+            .request(reqwest::Method::POST, "/api/v1/deployments")
+            .json(&body)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// Delete a deployment
+    ///
+    /// Calls DELETE /api/v1/deployments/{name} to remove a deployment.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The deployment name
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the deployment is not found.
+    pub async fn delete_deployment(&self, name: &str) -> Result<()> {
+        let response = self
+            .request(
+                reqwest::Method::DELETE,
+                &format!("/api/v1/deployments/{name}"),
+            )
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        if status.is_success() {
+            Ok(())
+        } else {
+            let error_text = response.text().await.unwrap_or_default();
+
+            match status {
+                StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
+                StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
+                _ => Err(ApiClientError::Api {
+                    status: status.as_u16(),
+                    message: error_text,
+                }),
+            }
+        }
+    }
+
     // =========================================================================
     // Service Endpoints
     // =========================================================================
@@ -685,6 +823,30 @@ impl ZLayerClient {
     pub async fn list_builds(&self) -> Result<Vec<BuildStatus>> {
         let response = self
             .request(reqwest::Method::GET, "/api/v1/builds")
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// Trigger a new build
+    ///
+    /// Calls POST /api/v1/build/json to start a new build with the given parameters.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The build request parameters
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
+    pub async fn trigger_build(
+        &self,
+        request: &TriggerBuildRequest,
+    ) -> Result<TriggerBuildResponse> {
+        let response = self
+            .request(reqwest::Method::POST, "/api/v1/build/json")
+            .json(request)
             .send()
             .await?;
 
@@ -1088,6 +1250,85 @@ impl ZLayerClient {
             .await?;
 
         self.handle_response(response).await
+    }
+
+    // =========================================================================
+    // Tunnel Endpoints
+    // =========================================================================
+
+    /// List all tunnels
+    ///
+    /// Calls GET /api/v1/tunnels to retrieve a list of all configured tunnels.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
+    pub async fn list_tunnels(&self) -> Result<Vec<TunnelSummary>> {
+        let response = self
+            .request(reqwest::Method::GET, "/api/v1/tunnels")
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// Create a new tunnel
+    ///
+    /// Calls POST /api/v1/tunnels to create a new tunnel token.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The tunnel creation request
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
+    pub async fn create_tunnel(
+        &self,
+        request: &CreateTunnelRequest,
+    ) -> Result<CreateTunnelResponse> {
+        let response = self
+            .request(reqwest::Method::POST, "/api/v1/tunnels")
+            .json(request)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// Delete (revoke) a tunnel
+    ///
+    /// Calls DELETE /api/v1/tunnels/{id} to revoke and remove a tunnel.
+    ///
+    /// # Arguments
+    ///
+    /// * `id` - The tunnel ID
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the tunnel is not found.
+    pub async fn delete_tunnel(&self, id: &str) -> Result<()> {
+        let response = self
+            .request(reqwest::Method::DELETE, &format!("/api/v1/tunnels/{id}"))
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        if status.is_success() {
+            Ok(())
+        } else {
+            let error_text = response.text().await.unwrap_or_default();
+
+            match status {
+                StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
+                StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
+                _ => Err(ApiClientError::Api {
+                    status: status.as_u16(),
+                    message: error_text,
+                }),
+            }
+        }
     }
 
     // =========================================================================

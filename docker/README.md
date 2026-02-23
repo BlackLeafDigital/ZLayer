@@ -6,7 +6,7 @@ Run ZLayer with embedded containerd inside a Docker container (similar to how KI
 
 ```bash
 # Build the ZLayer binary first
-cargo build --release --package runtime
+cargo build --release --package zlayer
 
 # Build the Docker image
 docker build -f docker/Dockerfile.zlayer-node -t zlayer-node .
@@ -20,7 +20,7 @@ docker run --privileged -d --name zlayer \
 docker logs zlayer
 
 # Deploy a spec
-docker exec zlayer zlayer-runtime deploy --spec /path/to/spec.yaml
+docker exec zlayer zlayer deploy /path/to/spec.yaml
 
 # Stop
 docker rm -f zlayer
@@ -84,13 +84,13 @@ By default, containers created inside ZLayer-in-Docker use the container's netwo
 
 ```bash
 # Debug build (faster, larger)
-cargo build --package runtime
+cargo build --package zlayer
 docker build -f docker/Dockerfile.zlayer-node \
-  --build-arg BINARY_PATH=target/debug/zlayer-runtime \
+  --build-arg BINARY_PATH=target/debug/zlayer \
   -t zlayer-node:dev .
 
 # Release build (slower, optimized)
-cargo build --release --package runtime
+cargo build --release --package zlayer
 docker build -f docker/Dockerfile.zlayer-node -t zlayer-node .
 ```
 
@@ -131,7 +131,7 @@ This is conceptually similar to KIND (Kubernetes IN Docker), where the outer con
 
 ## ZImagefiles
 
-ZImagefile equivalents of the Dockerfiles are available for use with `zlayer-build`:
+ZImagefile equivalents of the Dockerfiles are available for use with `zlayer build`:
 
 | File | Description |
 |------|-------------|
@@ -142,10 +142,10 @@ These use declarative YAML syntax with cache mounts instead of the `cargo-chef` 
 
 ```bash
 # Build the web frontend using ZImagefile
-zlayer-build build -f docker/ZImagefile.zlayer-web -t zlayer-web .
+zlayer build -f docker/ZImagefile.zlayer-web -t zlayer-web .
 
 # Build the manager UI using ZImagefile
-zlayer-build build -f docker/ZImagefile.zlayer-manager -t zlayer-manager .
+zlayer build -f docker/ZImagefile.zlayer-manager -t zlayer-manager .
 ```
 
 See the root [README](../README.md#zimagefile) for full ZImagefile format documentation.
@@ -282,23 +282,23 @@ Images are built in "waves" based on dependency depth:
 
 ```bash
 # Build from ZImagefile (auto-detected)
-zlayer-build build -f docker/ZImagefile.zlayer-web -t zlayer-web .
+zlayer build -f docker/ZImagefile.zlayer-web -t zlayer-web .
 
 # Build from Dockerfile
-zlayer-build build -f docker/Dockerfile.zlayer-node -t zlayer-node .
+zlayer build -f docker/Dockerfile.zlayer-node -t zlayer-node .
 ```
 
 ### Multiple Images with Pipeline
 
 ```bash
 # Build all images with default VERSION=dev
-zlayer-build pipeline -f ZPipeline.yaml
+zlayer pipeline -f ZPipeline.yaml
 
 # Build with specific version
-zlayer-build pipeline -f ZPipeline.yaml --set VERSION=0.1.0
+zlayer pipeline -f ZPipeline.yaml --set VERSION=0.1.0
 
 # Build and push (CI mode)
-zlayer-build pipeline -f ZPipeline.yaml --no-tui --set VERSION=$VERSION --push
+zlayer pipeline -f ZPipeline.yaml --no-tui --set VERSION=$VERSION --push
 ```
 
 ### Interactive TUI

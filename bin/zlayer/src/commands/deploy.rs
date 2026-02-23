@@ -3,7 +3,7 @@
 //! Contains the `deploy`, `up`, and `down` command implementations.
 //! These are thin clients that delegate to the daemon process over a Unix socket.
 //!
-//! The daemon (`zlayer-runtime serve --daemon`) owns all infrastructure: overlay
+//! The daemon (`zlayer serve --daemon`) owns all infrastructure: overlay
 //! networking, DNS, proxy, container supervisor, etc.  These commands simply send
 //! the deployment spec to the daemon API and poll for status.
 //!
@@ -396,7 +396,7 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
             level: LogLevel::Warn,
             message: format!(
                 "Timed out after {}s waiting for deployment '{}' to become ready. \
-                 The daemon is still processing -- check `zlayer-runtime status` for updates.",
+                 The daemon is still processing -- check `zlayer status` for updates.",
                 poll_timeout.as_secs(),
                 deployment_name,
             ),

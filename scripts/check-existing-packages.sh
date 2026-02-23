@@ -11,14 +11,6 @@ AUTH="$2"
 PKG_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
 
 BINARIES=(
-  zlayer-runtime-linux-amd64.tar.gz
-  zlayer-runtime-linux-arm64.tar.gz
-  zlayer-runtime-darwin-amd64.tar.gz
-  zlayer-runtime-darwin-arm64.tar.gz
-  zlayer-build-linux-amd64.tar.gz
-  zlayer-build-linux-arm64.tar.gz
-  zlayer-build-darwin-amd64.tar.gz
-  zlayer-build-darwin-arm64.tar.gz
   zlayer-linux-amd64.tar.gz
   zlayer-linux-arm64.tar.gz
   zlayer-darwin-amd64.tar.gz

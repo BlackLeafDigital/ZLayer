@@ -151,6 +151,32 @@ pub(crate) async fn load_node_config(data_dir: &Path) -> Result<NodeConfig> {
     Ok(config)
 }
 
+/// Load node config, or auto-initialize as single-node leader if none exists.
+pub(crate) async fn load_or_init_node_config(data_dir: &Path) -> Result<NodeConfig> {
+    match load_node_config(data_dir).await {
+        Ok(cfg) => Ok(cfg),
+        Err(_) => {
+            let advertise_addr = detect_local_ip();
+            println!(
+                "Node not yet initialized. Auto-initializing with advertise address {}...",
+                advertise_addr
+            );
+            handle_node_init(
+                advertise_addr,
+                3669,
+                9000,
+                51820,
+                data_dir.to_path_buf(),
+                "10.200.0.0/16".to_string(),
+            )
+            .await?;
+            load_node_config(data_dir)
+                .await
+                .context("Failed to load node config after auto-initialization")
+        }
+    }
+}
+
 /// Generate a join token for the cluster
 fn generate_join_token_data(
     advertise_addr: &str,
@@ -788,14 +814,7 @@ pub(crate) async fn handle_node_list(output: String, cli_data_dir: &std::path::P
 
     // Try to load local node config to get API endpoint
     let data_dir = cli_data_dir.to_path_buf();
-    let node_config = match load_node_config(&data_dir).await {
-        Ok(config) => config,
-        Err(_) => {
-            anyhow::bail!(
-                "Node not initialized. Run 'zlayer node init' or 'zlayer node join' first."
-            );
-        }
-    };
+    let node_config = load_or_init_node_config(&data_dir).await?;
 
     let api_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.api_port);
 
@@ -884,14 +903,7 @@ pub(crate) async fn handle_node_status(
     cli_data_dir: &std::path::Path,
 ) -> Result<()> {
     let data_dir = cli_data_dir.to_path_buf();
-    let node_config = match load_node_config(&data_dir).await {
-        Ok(config) => config,
-        Err(_) => {
-            anyhow::bail!(
-                "Node not initialized. Run 'zlayer node init' or 'zlayer node join' first."
-            );
-        }
-    };
+    let node_config = load_or_init_node_config(&data_dir).await?;
 
     // If no node_id specified, show this node
     let target_id = node_id.unwrap_or(node_config.node_id.clone());
@@ -992,14 +1004,7 @@ pub(crate) async fn handle_node_remove(
     use std::time::Duration;
 
     let data_dir = cli_data_dir.to_path_buf();
-    let node_config = match load_node_config(&data_dir).await {
-        Ok(config) => config,
-        Err(_) => {
-            anyhow::bail!(
-                "Node not initialized. Run 'zlayer node init' or 'zlayer node join' first."
-            );
-        }
-    };
+    let node_config = load_or_init_node_config(&data_dir).await?;
 
     // Cannot remove yourself
     if node_id == node_config.node_id {
@@ -1070,14 +1075,7 @@ pub(crate) async fn handle_node_set_mode(
     }
 
     let data_dir = cli_data_dir.to_path_buf();
-    let node_config = match load_node_config(&data_dir).await {
-        Ok(config) => config,
-        Err(_) => {
-            anyhow::bail!(
-                "Node not initialized. Run 'zlayer node init' or 'zlayer node join' first."
-            );
-        }
-    };
+    let node_config = load_or_init_node_config(&data_dir).await?;
 
     let api_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.api_port);
 
@@ -1147,14 +1145,7 @@ pub(crate) async fn handle_node_label(
     }
 
     let data_dir = cli_data_dir.to_path_buf();
-    let node_config = match load_node_config(&data_dir).await {
-        Ok(config) => config,
-        Err(_) => {
-            anyhow::bail!(
-                "Node not initialized. Run 'zlayer node init' or 'zlayer node join' first."
-            );
-        }
-    };
+    let node_config = load_or_init_node_config(&data_dir).await?;
 
     let api_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.api_port);
 
@@ -1246,43 +1237,7 @@ pub(crate) async fn handle_node_generate_join_token(
     let api_endpoint = match api {
         Some(a) => a,
         None => {
-            // Try to load from node config; auto-init if it doesn't exist.
-            let node_config = match load_node_config(&data_dir).await {
-                Ok(cfg) => cfg,
-                Err(_) => {
-                    // Node was never initialized -- auto-init with defaults.
-                    let advertise_addr = detect_local_ip();
-                    let api_port: u16 = 3669;
-                    let raft_port: u16 = 9000;
-                    let overlay_port: u16 = 51820;
-                    let overlay_cidr = "10.200.0.0/16".to_string();
-
-                    info!(
-                        advertise_addr = %advertise_addr,
-                        "Node not initialized -- auto-initializing with detected IP"
-                    );
-                    println!(
-                        "Node not yet initialized. Auto-initializing with advertise address {}...",
-                        advertise_addr
-                    );
-
-                    handle_node_init(
-                        advertise_addr,
-                        api_port,
-                        raft_port,
-                        overlay_port,
-                        data_dir.clone(),
-                        overlay_cidr,
-                    )
-                    .await?;
-
-                    // Now load the freshly-written config
-                    load_node_config(&data_dir)
-                        .await
-                        .context("Failed to load node config after auto-initialization")?
-                }
-            };
-
+            let node_config = load_or_init_node_config(&data_dir).await?;
             format!(
                 "http://{}:{}",
                 node_config.advertise_addr, node_config.api_port
@@ -1344,24 +1299,18 @@ mod tests {
 
     #[test]
     fn test_cli_node_init_command() {
-        let cli = Cli::try_parse_from([
-            "zlayer-runtime",
-            "node",
-            "init",
-            "--advertise-addr",
-            "10.0.0.1",
-        ])
-        .unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "init", "--advertise-addr", "10.0.0.1"])
+            .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Init {
+            Some(Commands::Node(NodeCommands::Init {
                 advertise_addr,
                 api_port,
                 raft_port,
                 overlay_port,
                 data_dir,
                 overlay_cidr,
-            }) => {
+            })) => {
                 assert_eq!(advertise_addr, "10.0.0.1");
                 assert_eq!(api_port, 3669);
                 assert_eq!(raft_port, 9000);
@@ -1395,14 +1344,14 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Init {
+            Some(Commands::Node(NodeCommands::Init {
                 advertise_addr,
                 api_port,
                 raft_port,
                 overlay_port,
                 data_dir,
                 overlay_cidr,
-            }) => {
+            })) => {
                 assert_eq!(advertise_addr, "192.168.1.100");
                 assert_eq!(api_port, 9090);
                 assert_eq!(raft_port, 9001);
@@ -1429,13 +1378,13 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Join {
+            Some(Commands::Node(NodeCommands::Join {
                 leader_addr,
                 token,
                 advertise_addr,
                 mode,
                 services,
-            }) => {
+            })) => {
                 assert_eq!(leader_addr, "10.0.0.1:3669");
                 assert_eq!(token, "abc123");
                 assert_eq!(advertise_addr, "10.0.0.2");
@@ -1467,7 +1416,7 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Join { mode, services, .. }) => {
+            Some(Commands::Node(NodeCommands::Join { mode, services, .. })) => {
                 assert_eq!(mode, "replicate");
                 assert_eq!(services, Some(vec!["api".to_string(), "web".to_string()]));
             }
@@ -1477,10 +1426,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_list_command() {
-        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "list"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "list"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::List { output }) => {
+            Some(Commands::Node(NodeCommands::List { output })) => {
                 assert_eq!(output, "table");
             }
             _ => panic!("Expected Node List command"),
@@ -1489,11 +1438,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_list_command_json() {
-        let cli =
-            Cli::try_parse_from(["zlayer-runtime", "node", "list", "--output", "json"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "list", "--output", "json"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::List { output }) => {
+            Some(Commands::Node(NodeCommands::List { output })) => {
                 assert_eq!(output, "json");
             }
             _ => panic!("Expected Node List command"),
@@ -1502,10 +1450,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_status_command() {
-        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "status"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "status"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Status { node_id }) => {
+            Some(Commands::Node(NodeCommands::Status { node_id })) => {
                 assert!(node_id.is_none());
             }
             _ => panic!("Expected Node Status command"),
@@ -1514,11 +1462,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_status_command_with_id() {
-        let cli =
-            Cli::try_parse_from(["zlayer-runtime", "node", "status", "node-abc-123"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "status", "node-abc-123"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Status { node_id }) => {
+            Some(Commands::Node(NodeCommands::Status { node_id })) => {
                 assert_eq!(node_id, Some("node-abc-123".to_string()));
             }
             _ => panic!("Expected Node Status command"),
@@ -1527,10 +1474,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_remove_command() {
-        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "remove", "node-123"]).unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "remove", "node-123"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Remove { node_id, force }) => {
+            Some(Commands::Node(NodeCommands::Remove { node_id, force })) => {
                 assert_eq!(node_id, "node-123");
                 assert!(!force);
             }
@@ -1540,11 +1487,10 @@ mod tests {
 
     #[test]
     fn test_cli_node_remove_command_force() {
-        let cli = Cli::try_parse_from(["zlayer-runtime", "node", "remove", "--force", "node-123"])
-            .unwrap();
+        let cli = Cli::try_parse_from(["zlayer", "node", "remove", "--force", "node-123"]).unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Remove { node_id, force }) => {
+            Some(Commands::Node(NodeCommands::Remove { node_id, force })) => {
                 assert_eq!(node_id, "node-123");
                 assert!(force);
             }
@@ -1567,11 +1513,11 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::SetMode {
+            Some(Commands::Node(NodeCommands::SetMode {
                 node_id,
                 mode,
                 services,
-            }) => {
+            })) => {
                 assert_eq!(node_id, "node-123");
                 assert_eq!(mode, "dedicated");
                 assert_eq!(services, Some(vec!["api".to_string()]));
@@ -1592,7 +1538,7 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Node(NodeCommands::Label { node_id, label }) => {
+            Some(Commands::Node(NodeCommands::Label { node_id, label })) => {
                 assert_eq!(node_id, "node-123");
                 assert_eq!(label, "environment=production");
             }

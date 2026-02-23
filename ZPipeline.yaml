@@ -1,10 +1,10 @@
 # ZPipeline.yaml - ZLayer container image pipeline
 #
 # Build all ZLayer images with coordinated caching:
-#   zlayer-build pipeline -f ZPipeline.yaml --set VERSION=0.1.0
+#   zlayer pipeline -f ZPipeline.yaml --set VERSION=0.1.0
 #
 # In CI:
-#   zlayer-build pipeline -f ZPipeline.yaml --no-tui --set VERSION=$VERSION --push
+#   zlayer pipeline -f ZPipeline.yaml --no-tui --set VERSION=$VERSION --push
 
 version: "1"
 

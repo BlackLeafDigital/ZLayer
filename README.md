@@ -16,7 +16,7 @@
 
 ## Overview
 
-ZLayer provides declarative container orchestration without Kubernetes complexity. It uses [libcontainer](https://github.com/youki-dev/youki) (from the youki project) for direct container management - no daemon required.
+ZLayer provides declarative container orchestration without Kubernetes complexity. It uses [libcontainer](https://github.com/youki-dev/youki) (from the youki project) for direct container management on Linux, and Seatbelt sandbox + APFS clonefile on macOS - no daemon required.
 
 ### Key Features
 
@@ -52,16 +52,22 @@ graph TB
         Obs --> Agent
 
         subgraph Runtime[Runtime Layer]
-            LC[libcontainer]
+            LC[libcontainer Linux]
+            SB[Seatbelt Sandbox macOS]
+            MV[macOS VM Runtime]
             WT[wasmtime]
             SM[Storage Manager]
             LC --> C1[Container]
             LC --> C2[Container]
+            SB --> C3[Container]
+            MV --> C4[VM Container]
             WT --> W1[WASM Module]
             WT --> W2[WASM Module]
         end
 
         Agent --> LC
+        Agent --> SB
+        Agent --> MV
         Agent --> WT
         Agent --> SM
     end
@@ -102,32 +108,34 @@ graph TB
 
 ```
 crates/
-├── agent/          # Container runtime (libcontainer integration, storage manager)
-├── api/            # REST API server with build endpoints and streaming
-├── builder/        # Dockerfile parser, buildah integration, runtime templates
-├── init_actions/   # Pre-start lifecycle actions (TCP, HTTP, S3, commands)
-├── layer-storage/  # S3-backed layer persistence with crash-tolerant uploads
-├── manager/        # Web-based management UI (Leptos SSR + WASM)
-├── observability/  # Metrics, logging, OpenTelemetry tracing
-├── overlay/        # Encrypted overlay networking (boringtun), IP allocation, DNS discovery, health checks
-├── proxy/          # L4/L7 proxy with TLS
-├── registry/       # OCI image pulling and caching (with optional S3 backend)
-├── scheduler/      # Raft-based distributed scheduler with placement logic
-├── spec/           # Deployment specification types
-├── tunnel/         # Secure tunneling for node-to-node and on-demand service access
-└── zlayer-core/    # Shared types and configuration
+├── zlayer-agent/          # Container runtime (libcontainer, Seatbelt sandbox, storage manager)
+├── zlayer-api/            # REST API server with build endpoints and streaming
+├── zlayer-builder/        # Dockerfile parser, buildah integration, runtime templates
+├── zlayer-core/           # Shared types and configuration
+├── zlayer-init-actions/   # Pre-start lifecycle actions (TCP, HTTP, S3, commands)
+├── zlayer-manager/        # Web-based management UI (Leptos SSR + WASM)
+├── zlayer-observability/  # Metrics, logging, OpenTelemetry tracing
+├── zlayer-overlay/        # Encrypted overlay networking (boringtun), IP allocation, DNS discovery, health checks
+├── zlayer-proxy/          # L4/L7 proxy with TLS
+├── zlayer-registry/       # OCI image pulling and caching (with optional S3 backend)
+├── zlayer-scheduler/      # Raft-based distributed scheduler with placement logic
+├── zlayer-secrets/        # Secrets management
+├── zlayer-spec/           # Deployment specification types
+├── zlayer-storage/        # S3-backed layer persistence with crash-tolerant uploads
+├── zlayer-tui/            # Terminal UI components
+├── zlayer-tunnel/         # Secure tunneling for node-to-node and on-demand service access
+└── zlayer-web/            # Web frontend utilities
 
 bin/
-├── runtime/        # zlayer-runtime binary (full orchestration runtime)
-├── zlayer-build/   # Lightweight builder CLI
-└── zlayer/         # Main zlayer CLI (interactive TUI + runtime passthrough)
+└── zlayer/                # Single zlayer binary (CLI, TUI dashboard, runtime, builder)
 ```
 
 ## Requirements
 
-- Linux (kernel 5.4+)
+- **Linux** (kernel 5.4+) or **macOS** (13+ Ventura with Seatbelt sandbox support)
 - Rust 1.85+
-- libseccomp-dev
+
+### Linux Dependencies
 
 ```bash
 # Ubuntu/Debian
@@ -140,6 +148,10 @@ sudo dnf install libseccomp-devel
 sudo pacman -S libseccomp
 ```
 
+### macOS
+
+No additional dependencies required. ZLayer uses the built-in Seatbelt sandbox and APFS clonefile for container isolation.
+
 ## Installation
 
 ### Quick Install (Recommended)
@@ -150,16 +162,24 @@ curl -fsSL https://zlayer.dev/install.sh | bash
 
 ### From GitHub Releases
 
-Download the latest release for your architecture:
+Download the latest release for your platform:
 
 ```bash
-# For amd64 (latest)
+# Linux amd64
 curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-linux-amd64.tar.gz | tar xz
-sudo mv zlayer zlayer-runtime /usr/local/bin/
+sudo mv zlayer /usr/local/bin/
 
-# For arm64 (latest)
+# Linux arm64
 curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-linux-arm64.tar.gz | tar xz
-sudo mv zlayer zlayer-runtime /usr/local/bin/
+sudo mv zlayer /usr/local/bin/
+
+# macOS (Apple Silicon)
+curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-darwin-arm64.tar.gz | tar xz
+sudo mv zlayer /usr/local/bin/
+
+# macOS (Intel)
+curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-darwin-amd64.tar.gz | tar xz
+sudo mv zlayer /usr/local/bin/
 ```
 
 Or pin to a specific version:
@@ -169,35 +189,9 @@ Or pin to a specific version:
 curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/download/VERSION/zlayer-linux-amd64.tar.gz | tar xz
 ```
 
-### Standalone Builder (Lightweight)
-
-If you only need image building (no runtime/orchestration), install the lightweight `zlayer-build` binary (~10MB):
-
-```bash
-# Install just the builder
-curl -sSL https://zlayer.dev/install.py | python3
-
-# Or install a specific binary
-python3 install.py --binary zlayer-build
-```
-
-`zlayer-build` depends only on `zlayer-builder` and `zlayer-spec` -- it does not pull in the agent, scheduler, overlay, or proxy crates.
-
-```
-zlayer-build build [OPTIONS] <CONTEXT>   Build an image from Dockerfile, ZImagefile, or runtime template
-zlayer-build runtimes [--json]           List available runtime templates
-zlayer-build validate <PATH>             Parse and validate a Dockerfile or ZImagefile
-```
-
-See [bin/zlayer-build/README.md](./bin/zlayer-build/README.md) for full usage details.
-
 ### Interactive TUI
 
-The `zlayer` CLI provides the same build capabilities as `zlayer-build` but with a menu-driven terminal interface, plus runtime command passthrough to `zlayer-runtime` when available:
-
-```bash
-python3 install.py --binary zlayer
-```
+Running `zlayer` with no arguments launches a full operational dashboard with menu items for Dashboard, Deploy, Build Image, Validate, Runtimes, and Quit. All build and runtime functionality is built into the single binary.
 
 See [bin/zlayer/README.md](./bin/zlayer/README.md) for details.
 
@@ -211,18 +205,12 @@ cd ZLayer
 # Install dependencies (Ubuntu/Debian)
 sudo apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config cmake
 
-# Build release binary (full runtime, produces zlayer-runtime)
-cargo build --release --package runtime
+# macOS: no extra dependencies needed (uses system Seatbelt + APFS)
 
-# Build just the lightweight builder
-cargo build --release -p zlayer-build
-
-# Build the main CLI (produces zlayer)
+# Build the single binary
 cargo build --release -p zlayer
 
-# Install whichever binaries you need
-sudo cp target/release/zlayer-runtime /usr/local/bin/
-sudo cp target/release/zlayer-build /usr/local/bin/
+# Install
 sudo cp target/release/zlayer /usr/local/bin/
 ```
 
@@ -814,6 +802,9 @@ zlayer build . --build-arg VERSION=1.0 -t myapp:1.0.0
 # Multi-stage builds with target
 zlayer build . --target production -t myapp:prod
 
+# Multi-image pipeline builds
+zlayer pipeline ./pipeline.yaml
+
 # List available runtime templates
 zlayer runtimes
 ```
@@ -833,17 +824,16 @@ zlayer serve --bind 0.0.0.0:3669 --jwt-secret <secret>
 ZLayer includes a web-based management dashboard (similar to [Komodo](https://komo.do)):
 
 ```bash
-# Connect to existing ZLayer API
-zlayer-manager --connect http://localhost:3669
+# Generate a zlayer-manager deployment spec and optionally deploy it
+zlayer manager init
+zlayer manager init --port 8080 --deploy
 
-# With authentication
-zlayer-manager --connect http://localhost:3669 --token <JWT_TOKEN>
+# Check manager status
+zlayer manager status
 
-# Custom port (default: 9120)
-zlayer-manager --port 9120
+# Stop the manager
+zlayer manager stop
 ```
-
-Access the dashboard at `http://localhost:9120`. 
 
 Features include:
 - **Dashboard** - System overview, node counts, uptime
@@ -1042,7 +1032,7 @@ cargo build --release --features wasm
 cargo build --release --features "docker,wasm"
 ```
 
-For detailed WASM implementation documentation, see [WASM_DONE.md](./WASM_DONE.md).
+For detailed WASM plugin documentation, see [WASM_PLUGINS.md](./docs/WASM_PLUGINS.md).
 
 ## Runtime Modes
 
@@ -1050,6 +1040,12 @@ ZLayer supports multiple container runtime backends:
 
 ### Youki Runtime (Default on Linux)
 Direct container management via libcontainer - no daemon required. Optimal performance with minimal overhead.
+
+### macOS Sandbox Runtime (Default on macOS)
+Uses the built-in Seatbelt sandbox (`sandbox-exec`) and APFS clonefile for container isolation. No daemon or VM required. Requires macOS 13+ (Ventura).
+
+### macOS VM Runtime
+Lightweight Linux VMs on macOS via the Virtualization framework. Useful when full Linux container compatibility is needed on macOS.
 
 ### Docker Runtime (Cross-Platform)
 Uses the Docker daemon via bollard for cross-platform support (macOS, Windows, Linux). Enable with the `docker` feature:
@@ -1064,7 +1060,7 @@ cargo build --release --features "docker,wasm"
 
 **Runtime Selection**:
 - Linux: Prefers youki, falls back to Docker if unavailable
-- macOS/Windows: Uses Docker automatically
+- macOS: Prefers Seatbelt sandbox, falls back to macOS VM, then Docker
 
 ### WASM Runtime
 WebAssembly workloads via wasmtime. See [WebAssembly Support](#webassembly-support).
@@ -1072,6 +1068,8 @@ WebAssembly workloads via wasmtime. See [WebAssembly Support](#webassembly-suppo
 | Runtime | Platform | Daemon Required | Use Case |
 |---------|----------|-----------------|----------|
 | Youki | Linux only | No | Production (optimal) |
+| Seatbelt Sandbox | macOS only | No | Native macOS containers |
+| macOS VM | macOS only | No | Full Linux compat on macOS |
 | Docker | All | Yes | Development, cross-platform |
 | WASM | All | No | Lightweight, portable workloads |
 
@@ -1157,13 +1155,13 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 
 # Run specific crate tests
-cargo test -p agent
-cargo test -p registry
-cargo test -p builder
-cargo test -p scheduler
+cargo test -p zlayer-agent
+cargo test -p zlayer-registry
+cargo test -p zlayer-builder
+cargo test -p zlayer-scheduler
 
-# Build with specific features
-cargo build --package runtime --features full
+# Build the single binary with all features
+cargo build --release -p zlayer --features full
 ```
 
 ## License

@@ -49,33 +49,13 @@ jobs:
 
           echo "Downloading from: ${BASE_URL}"
 
-          # Download zlayer-runtime
-          for os in linux darwin; do
-            for arch in amd64 arm64; do
-              artifact="zlayer-runtime-${os}-${arch}.tar.gz"
-              output="artifacts/zlayer-runtime-${VERSION}-${os}-${arch}.tar.gz"
-              echo "Downloading ${artifact}..."
-              curl -fsSL "${BASE_URL}/${artifact}" -o "${output}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
-            done
-          done
-
-          # Download zlayer-build
-          for os in linux darwin; do
-            for arch in amd64 arm64; do
-              artifact="zlayer-build-${os}-${arch}.tar.gz"
-              output="artifacts/zlayer-build-${VERSION}-${os}-${arch}.tar.gz"
-              echo "Downloading ${artifact}..."
-              curl -fsSL "${BASE_URL}/${artifact}" -o "${output}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
-            done
-          done
-
-          # Download zlayer (CLI)
+          # Download zlayer binary for all platforms
           for os in linux darwin; do
             for arch in amd64 arm64; do
               artifact="zlayer-${os}-${arch}.tar.gz"
               output="artifacts/zlayer-${VERSION}-${os}-${arch}.tar.gz"
               echo "Downloading ${artifact}..."
-              curl -fsSL "${BASE_URL}/${artifact}" -o "${output}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
+              curl -fsSL "${BASE_URL}/${artifact}" -o "${output}" && echo "  OK ${artifact}" || echo "  SKIP ${artifact} not available"
             done
           done
 
@@ -114,20 +94,15 @@ jobs:
           ## Install
 
           ```bash
-          # Install CLI (interactive TUI)
+          # Install zlayer (unified binary: TUI, CLI, runtime, builder)
           curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | sh
-
-          # Install runtime (for deploying containers)
-          curl -sSL https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.sh | ZLAYER_COMPONENT=runtime sh
           ```
 
-          ## Binaries
+          ## Binary
 
           | Binary | Description |
           |--------|-------------|
-          | `zlayer` | Interactive TUI — install, build, and manage ZLayer |
-          | `zlayer-build` | Lightweight image builder CLI (Dockerfile, ZImagefile, runtime templates) |
-          | `zlayer-runtime` | Full container orchestration runtime |
+          | `zlayer` | Unified binary — TUI dashboard, full CLI, runtime, and image builder |
 
           ## Container Images
 
@@ -135,18 +110,12 @@ jobs:
           ```bash
           docker pull zachhandley/zlayer-node:VERSION_PLACEHOLDER
           docker pull zachhandley/zlayer-manager:VERSION_PLACEHOLDER
-          docker pull zachhandley/zlayer-runtime:VERSION_PLACEHOLDER
-          docker pull zachhandley/zlayer-build:VERSION_PLACEHOLDER
-          docker pull zachhandley/zlayer-cli:VERSION_PLACEHOLDER
           ```
 
           **GHCR** (`ghcr.io/blackleafdigital/`):
           ```bash
           docker pull ghcr.io/blackleafdigital/zlayer-node:VERSION_PLACEHOLDER
           docker pull ghcr.io/blackleafdigital/zlayer-manager:VERSION_PLACEHOLDER
-          docker pull ghcr.io/blackleafdigital/zlayer-runtime:VERSION_PLACEHOLDER
-          docker pull ghcr.io/blackleafdigital/zlayer-build:VERSION_PLACEHOLDER
-          docker pull ghcr.io/blackleafdigital/zlayer-cli:VERSION_PLACEHOLDER
           ```
 
           ## Using with ZLayer

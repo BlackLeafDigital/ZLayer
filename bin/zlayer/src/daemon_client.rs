@@ -1,9 +1,10 @@
 //! HTTP-over-Unix-socket client for CLI-to-daemon communication.
 //!
-//! Provides a typed [`DaemonClient`] that communicates with the `zlayer-runtime serve`
-//! daemon via its Unix domain socket at `/var/run/zlayer.sock`.  If the daemon is not
-//! running, [`DaemonClient::connect`] will auto-start it and wait with exponential
-//! backoff until the socket becomes available.
+//! Provides a typed [`DaemonClient`] that communicates with the `zlayer serve`
+//! daemon via its Unix domain socket (platform-dependent path; see
+//! [`default_socket_path()`]).  If the daemon is not running,
+//! [`DaemonClient::connect`] will auto-start it and wait with exponential backoff
+//! until the socket becomes available.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -22,8 +23,8 @@ use tracing::{debug, info};
 
 /// Default path for the daemon Unix socket.
 ///
-/// On macOS this resolves to `~/.local/share/zlayer/run/zlayer.sock`.
-/// On Linux it stays at `/var/run/zlayer.sock`.
+/// On macOS: `~/.local/share/zlayer/run/zlayer.sock`.
+/// On Linux: `/var/run/zlayer.sock`.
 pub fn default_socket_path() -> String {
     crate::cli::default_socket_path(&crate::cli::default_data_dir())
 }
@@ -90,11 +91,33 @@ impl DaemonClient {
     /// Connect to the daemon, auto-starting it if it is not already running.
     ///
     /// Checks for the Unix socket at [`default_socket_path()`].  If the socket
-    /// does not exist and no daemon PID is found, `zlayer-runtime serve --daemon`
+    /// does not exist and no daemon PID is found, `zlayer serve --daemon`
     /// is spawned and the function polls the socket with exponential backoff
     /// (100 ms -> 200 ms -> 400 ms -> ... -> 1 s, max 20 attempts, ~10 s total).
     pub async fn connect() -> Result<Self> {
         Self::connect_to(&default_socket_path()).await
+    }
+
+    /// Try to connect to a running daemon without auto-starting.
+    ///
+    /// Returns `Ok(Some(client))` if the daemon is running and healthy,
+    /// `Ok(None)` if the daemon is not running, or `Err` on unexpected errors.
+    pub async fn try_connect() -> Result<Option<Self>> {
+        Self::try_connect_to(&default_socket_path()).await
+    }
+
+    /// Like [`try_connect`](Self::try_connect) but with a custom socket path.
+    pub async fn try_connect_to(socket_path: impl AsRef<Path>) -> Result<Option<Self>> {
+        let socket_path = socket_path.as_ref().to_path_buf();
+
+        if socket_path.exists() {
+            match Self::try_build(&socket_path).await {
+                Ok(client) => Ok(Some(client)),
+                Err(_) => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
     }
 
     /// Like [`connect`](Self::connect) but with a custom socket path.
@@ -112,11 +135,12 @@ impl DaemonClient {
 
         // No running daemon detected -- start one.
         info!("Daemon not running, auto-starting...");
+        eprintln!("ZLayer daemon not running. Starting...");
         Self::auto_start_daemon(&socket_path).await?;
 
         Self::try_build(&socket_path)
             .await
-            .context("Failed to connect to daemon after auto-start")
+            .context("Cannot connect to ZLayer daemon. Run 'zlayer status' for details.")
     }
 
     /// Build the client and verify that the daemon is reachable via a health
@@ -142,54 +166,31 @@ impl DaemonClient {
     // Auto-start
     // ------------------------------------------------------------------
 
-    /// Locate the `zlayer-runtime` binary using the same search strategy as
-    /// `bin/zlayer/src/cli.rs::which_runtime()`.
-    fn find_runtime_binary() -> Result<PathBuf> {
-        // Well-known install locations
-        for path in &["/usr/local/bin/zlayer-runtime", "/usr/bin/zlayer-runtime"] {
-            let p = PathBuf::from(path);
-            if p.exists() {
-                return Ok(p);
-            }
-        }
-
-        // Next to the current executable
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                let sibling = dir.join("zlayer-runtime");
-                if sibling.exists() {
-                    return Ok(sibling);
-                }
-            }
-        }
-
-        // Fall back to $PATH
-        if let Ok(output) = std::process::Command::new("which")
-            .arg("zlayer-runtime")
-            .output()
-        {
-            if output.status.success() {
-                let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !path.is_empty() {
-                    return Ok(PathBuf::from(path));
-                }
-            }
-        }
-
-        bail!(
-            "zlayer-runtime not found. Install it or add it to your PATH.\n\
-             The daemon requires zlayer-runtime to be available."
-        )
+    /// Resolve the path to the current executable (since zlayer is now a
+    /// single binary, we just re-invoke ourselves).
+    fn find_self_binary() -> Result<PathBuf> {
+        std::env::current_exe().context("Failed to resolve current executable path")
     }
 
-    /// Spawn `zlayer-runtime serve --daemon` and poll the socket with
+    /// Spawn `zlayer serve --daemon` and poll the socket with
     /// exponential backoff until the daemon is reachable or we give up.
     async fn auto_start_daemon(socket_path: &Path) -> Result<()> {
-        let runtime_bin = Self::find_runtime_binary()?;
+        let runtime_bin = Self::find_self_binary()?;
 
         debug!(binary = %runtime_bin.display(), "Spawning daemon");
 
         let mut cmd = std::process::Command::new(&runtime_bin);
+
+        // Ensure the child process knows the correct data directory.
+        // If ZLAYER_DATA_DIR is already set in the environment it will be
+        // inherited automatically (clap picks it up via `env = "ZLAYER_DATA_DIR"`).
+        // Otherwise, explicitly pass --data-dir so the child doesn't fall back
+        // to /var/lib/zlayer when $HOME is unavailable (e.g. launchd context).
+        if std::env::var_os("ZLAYER_DATA_DIR").is_none() {
+            let data_dir = crate::cli::default_data_dir();
+            cmd.arg("--data-dir").arg(&data_dir);
+        }
+
         cmd.arg("serve")
             .arg("--daemon")
             .arg("--socket")
@@ -246,10 +247,17 @@ impl DaemonClient {
             delay = std::cmp::min(delay * 2, max_delay);
         }
 
+        let log_dir = crate::cli::default_log_dir(&crate::cli::default_data_dir());
+        let log_path = log_dir.join("daemon.log");
+        let timeout_secs = 10;
+        eprintln!("Failed to start ZLayer daemon after {}s.", timeout_secs);
+        eprintln!("  Check logs: {}", log_path.display());
+        eprintln!("  Start manually: zlayer serve");
         bail!(
-            "Timed out waiting for daemon to start after {} attempts (~10 s). \
+            "Timed out waiting for daemon to start after {} attempts (~{} s). \
              Socket path: {}",
             max_attempts,
+            timeout_secs,
             socket_path.display()
         )
     }
@@ -355,7 +363,8 @@ impl DaemonClient {
     }
 
     /// Check that a response has a successful (2xx) status code.  If not,
-    /// extract the error message from the body and return it.
+    /// extract the error message from the body and return it with actionable
+    /// guidance.
     fn check_status(status: hyper::StatusCode, body: &[u8]) -> Result<()> {
         if status.is_success() {
             return Ok(());
@@ -371,7 +380,22 @@ impl DaemonClient {
             String::from_utf8_lossy(body).into_owned()
         };
 
-        bail!("Daemon returned {} -- {}", status, msg)
+        match status.as_u16() {
+            404 => bail!(
+                "404 Not Found: {}. Check deployment name with 'zlayer ps'.",
+                msg
+            ),
+            500 => {
+                let log_dir = crate::cli::default_log_dir(&crate::cli::default_data_dir());
+                let log_path = log_dir.join("daemon.log");
+                bail!(
+                    "500 Internal Server Error: {}. Check logs at {}",
+                    msg,
+                    log_path.display()
+                )
+            }
+            _ => bail!("Daemon returned {} -- {}", status, msg),
+        }
     }
 
     // ------------------------------------------------------------------
@@ -387,6 +411,15 @@ impl DaemonClient {
             // Connection refused / broken pipe => daemon is not up.
             Err(_) => Ok(false),
         }
+    }
+
+    /// Check if the daemon is ready (fully initialized).
+    ///
+    /// Hits `GET /health/ready` and returns the parsed response.
+    pub async fn health_ready(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get("/health/ready").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
     }
 
     /// Create a new deployment from a YAML spec string.
@@ -803,10 +836,10 @@ mod tests {
     }
 
     #[test]
-    fn test_find_runtime_binary_current_exe() {
+    fn test_find_self_binary() {
         // This test verifies the logic works without panicking.
-        // In CI the binary may or may not be present, so we just
-        // verify the function doesn't panic.
-        let _ = DaemonClient::find_runtime_binary();
+        // current_exe() should always succeed in a test runner.
+        let result = DaemonClient::find_self_binary();
+        assert!(result.is_ok());
     }
 }

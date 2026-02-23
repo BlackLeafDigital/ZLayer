@@ -279,6 +279,28 @@ pub async fn get_deployments() -> Result<Vec<Deployment>, ServerFnError> {
     Ok(deployments)
 }
 
+/// Create a new deployment from YAML spec
+#[server(CreateDeployment, prefix = "/api/manager")]
+pub async fn create_deployment(yaml: String) -> Result<(), ServerFnError> {
+    let client = get_api_client();
+    client
+        .create_deployment(&yaml)
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    Ok(())
+}
+
+/// Delete a deployment by name
+#[server(DeleteDeployment, prefix = "/api/manager")]
+pub async fn delete_deployment(name: String) -> Result<(), ServerFnError> {
+    let client = get_api_client();
+    client
+        .delete_deployment(&name)
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    Ok(())
+}
+
 /// Get services for a specific deployment
 #[server(GetServices, prefix = "/api/manager")]
 pub async fn get_services(deployment: String) -> Result<Vec<Service>, ServerFnError> {
@@ -397,6 +419,136 @@ pub async fn get_build_logs(id: String) -> Result<String, ServerFnError> {
     Ok(logs)
 }
 
+/// Trigger a new build
+#[server(TriggerBuild, prefix = "/api/manager")]
+pub async fn trigger_build(
+    context_path: String,
+    tags: String,
+    runtime: String,
+) -> Result<String, ServerFnError> {
+    let client = get_api_client();
+
+    let tag_list: Vec<String> = tags
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let runtime_opt = if runtime.trim().is_empty() {
+        None
+    } else {
+        Some(runtime.trim().to_string())
+    };
+
+    let request = crate::api_client::TriggerBuildRequest {
+        context_path,
+        tags: tag_list,
+        runtime: runtime_opt,
+        no_cache: false,
+    };
+
+    let response = client
+        .trigger_build(&request)
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    Ok(response.build_id)
+}
+
+// ============================================================================
+// Tunnel Server Functions
+// ============================================================================
+
+/// Tunnel information for UI display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TunnelInfo {
+    /// Unique tunnel identifier
+    pub id: String,
+    /// Name of the tunnel
+    pub name: String,
+    /// Current status
+    pub status: String,
+    /// Services this tunnel can expose
+    pub services: Vec<String>,
+    /// When the tunnel was created (Unix timestamp)
+    pub created_at: u64,
+    /// When the token expires (Unix timestamp)
+    pub expires_at: u64,
+    /// Last time the tunnel connected (Unix timestamp, if ever)
+    pub last_connected: Option<u64>,
+}
+
+/// List all tunnels
+#[server(GetTunnels, prefix = "/api/manager")]
+pub async fn get_tunnels() -> Result<Vec<TunnelInfo>, ServerFnError> {
+    let client = get_api_client();
+    let tunnels = client
+        .list_tunnels()
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    Ok(tunnels
+        .into_iter()
+        .map(|t| TunnelInfo {
+            id: t.id,
+            name: t.name,
+            status: t.status,
+            services: t.services,
+            created_at: t.created_at,
+            expires_at: t.expires_at,
+            last_connected: t.last_connected,
+        })
+        .collect())
+}
+
+/// Create a new tunnel
+#[server(CreateTunnel, prefix = "/api/manager")]
+pub async fn create_tunnel(
+    name: String,
+    services: String,
+    ttl_hours: u64,
+) -> Result<TunnelInfo, ServerFnError> {
+    let client = get_api_client();
+
+    let service_list: Vec<String> = services
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let request = crate::api_client::CreateTunnelRequest {
+        name,
+        services: service_list,
+        ttl_secs: ttl_hours * 3600,
+    };
+
+    let response = client
+        .create_tunnel(&request)
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    Ok(TunnelInfo {
+        id: response.id,
+        name: response.name,
+        status: "pending".to_string(),
+        services: response.services,
+        created_at: response.created_at,
+        expires_at: response.expires_at,
+        last_connected: None,
+    })
+}
+
+/// Delete a tunnel
+#[server(DeleteTunnel, prefix = "/api/manager")]
+pub async fn delete_tunnel(id: String) -> Result<(), ServerFnError> {
+    let client = get_api_client();
+    client
+        .delete_tunnel(&id)
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    Ok(())
+}
+
 // ============================================================================
 // Secrets Server Functions
 // ============================================================================
@@ -447,6 +599,63 @@ pub async fn delete_secret(name: String) -> Result<(), ServerFnError> {
         .await
         .map_err(|e| api_error_to_server_error(&e))?;
     Ok(())
+}
+
+// ============================================================================
+// Cluster Reset Server Function
+// ============================================================================
+
+/// Reset the entire cluster by deleting all deployments and secrets
+#[server(ResetCluster, prefix = "/api/manager")]
+pub async fn reset_cluster() -> Result<String, ServerFnError> {
+    let client = get_api_client();
+
+    let mut deleted_deployments = 0u32;
+    let mut deleted_secrets = 0u32;
+    let mut errors = Vec::new();
+
+    // Delete all deployments
+    let deployments = client
+        .list_deployments()
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    for dep in &deployments {
+        if let Err(e) = client.delete_deployment(&dep.name).await {
+            errors.push(format!("deployment '{}': {}", dep.name, e));
+        } else {
+            deleted_deployments += 1;
+        }
+    }
+
+    // Delete all secrets
+    let secrets = client
+        .list_secrets()
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    for secret in &secrets {
+        if let Err(e) = client.delete_secret(&secret.name).await {
+            errors.push(format!("secret '{}': {}", secret.name, e));
+        } else {
+            deleted_secrets += 1;
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(format!(
+            "Cluster reset complete. Deleted {} deployment(s) and {} secret(s).",
+            deleted_deployments, deleted_secrets
+        ))
+    } else {
+        Err(ServerFnError::new(format!(
+            "Partial reset: deleted {} deployment(s) and {} secret(s), but {} error(s) occurred: {}",
+            deleted_deployments,
+            deleted_secrets,
+            errors.len(),
+            errors.join("; ")
+        )))
+    }
 }
 
 // ============================================================================

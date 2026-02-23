@@ -18,18 +18,23 @@ rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
 
+# WASM: getrandom 0.3+ requires explicit backend selection for wasm32 targets.
+# This enables the JavaScript-based RNG backend used by ahash/hashbrown/leptos.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]
+
 [alias]
 # Common build aliases for development workflow
-dev = "build --package runtime"
-prod = "build --release --package runtime"
+dev = "build --package zlayer"
+prod = "build --release --package zlayer"
 check-all = "check --workspace --all-targets"
 test-all = "test --workspace"
 clippy-all = "clippy --workspace --all-targets -- -D warnings"
 
 # Feature-specific builds
-build-agent = "build --package runtime --no-default-features --features join"
-build-server = "build --package runtime --no-default-features --features serve"
-build-deploy = "build --package runtime --no-default-features --features deploy"
+build-agent = "build --package zlayer --no-default-features --features join"
+build-server = "build --package zlayer --no-default-features --features serve"
+build-deploy = "build --package zlayer --no-default-features --features deploy"
 
 [patch.crates-io]
 # You can add patches here if needed for development

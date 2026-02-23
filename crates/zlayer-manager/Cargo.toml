@@ -44,6 +44,10 @@ name = "zlayer-manager"
 path = "src/main.rs"
 required-features = ["ssr"]
 
+# WASM: getrandom 0.3+ needs wasm_js feature for wasm32 targets (transitive via ahash/hashbrown)
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [features]
 default = []
 

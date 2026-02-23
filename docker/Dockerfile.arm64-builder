@@ -20,12 +20,12 @@ RUN apt-get update && apt-get install -y \
 
 # Copy recipe and build dependencies only
 COPY --from=planner /workspace/recipe.json recipe.json
-RUN cargo chef cook --release --recipe-path recipe.json --package runtime
+RUN cargo chef cook --release --recipe-path recipe.json --package zlayer
 
 # Copy source and build application (only rebuilds changed code)
 COPY . .
-RUN cargo build --release --package runtime
+RUN cargo build --release --package zlayer
 
 # Output binaries to a known location for extraction
 RUN mkdir -p /output && \
-    cp target/release/zlayer-runtime /output/
+    cp target/release/zlayer /output/

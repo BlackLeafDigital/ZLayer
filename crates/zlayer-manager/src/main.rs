@@ -46,6 +46,7 @@ async fn start_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     use leptos_axum::{generate_route_list, LeptosRoutes};
     use std::net::SocketAddr;
     use tower_http::services::ServeDir;
+    use zlayer_manager::app::shell;
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
 
@@ -75,12 +76,11 @@ async fn start_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     let opts_for_ssr = leptos_options.clone();
 
     // Generate route list for SSR
-    // TODO: Replace with actual App component from app module
-    let routes = generate_route_list(move || shell(&opts_for_route_gen));
+    let routes = generate_route_list(move || shell(opts_for_route_gen.clone()));
 
     // Main app router with Leptos SSR + Hydration
     let leptos_router =
-        Router::new().leptos_routes(&leptos_options, routes, move || shell(&opts_for_ssr));
+        Router::new().leptos_routes(&leptos_options, routes, move || shell(opts_for_ssr.clone()));
 
     // Serve static files (WASM pkg directory) for client-side hydration
     let pkg_dir = format!("{site_root}/pkg");
@@ -98,31 +98,6 @@ async fn start_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, app).await?;
 
     Ok(())
-}
-
-/// Placeholder HTML shell - will be replaced with actual App component
-#[cfg(feature = "ssr")]
-fn shell(options: &leptos::config::LeptosOptions) -> impl leptos::prelude::IntoView {
-    use leptos::hydration::HydrationScripts;
-    use leptos::prelude::*;
-
-    view! {
-        <!DOCTYPE html>
-        <html lang="en">
-            <head>
-                <meta charset="UTF-8"/>
-                <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-                <title>"ZLayer Manager"</title>
-                <HydrationScripts options=options.clone()/>
-            </head>
-            <body>
-                <main>
-                    <h1>"ZLayer Manager"</h1>
-                    <p>"Server is running. App component placeholder."</p>
-                </main>
-            </body>
-        </html>
-    }
 }
 
 #[cfg(not(feature = "ssr"))]

@@ -2,7 +2,7 @@
 # Run ZLayer inside a Docker container (like KIND for Kubernetes)
 #
 # ZImagefile equivalent of Dockerfile.zlayer-node
-# Single-stage build: copies a pre-built zlayer-runtime binary into an Ubuntu image
+# Single-stage build: copies a pre-built zlayer binary into an Ubuntu image
 # with containerd, runc, and networking tools.
 #
 # Usage:
@@ -28,9 +28,9 @@ steps:
   # Create required directories
   - run: "mkdir -p /run/containerd /var/lib/containerd /var/lib/zlayer/containers /var/lib/zlayer/state"
 
-  # Copy pre-built ZLayer runtime binary
-  - copy: "target/release/zlayer-runtime"
-    to: "/usr/local/bin/zlayer-runtime"
+  # Copy pre-built ZLayer binary
+  - copy: "target/release/zlayer"
+    to: "/usr/local/bin/zlayer"
 
   # Copy entrypoint script
   - copy: "docker/entrypoint.sh"

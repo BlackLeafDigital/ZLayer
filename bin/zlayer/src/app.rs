@@ -23,6 +23,10 @@ use crate::views;
 pub enum Screen {
     /// Main menu with logo and navigation
     MainMenu(MainMenuState),
+    /// Dashboard showing daemon status and deployments
+    Dashboard(Box<DashboardState>),
+    /// Multi-step deploy flow
+    Deploy(Box<DeployState>),
     /// Multi-step build wizard
     BuildWizard(Box<BuildWizardState>),
     /// Runtime template browser
@@ -163,6 +167,79 @@ impl Default for ValidateState {
 }
 
 // ---------------------------------------------------------------------------
+// Dashboard state
+// ---------------------------------------------------------------------------
+
+/// State for the dashboard screen
+pub struct DashboardState {
+    /// Daemon connection status
+    pub daemon_status: views::dashboard::DaemonStatus,
+    /// List of deployments fetched from the daemon
+    pub deployments: Vec<views::dashboard::DeploymentInfo>,
+    /// Selected deployment index
+    pub selected: usize,
+    /// Detail view for a specific deployment (drill-down)
+    pub detail_view: Option<views::dashboard::DeploymentDetail>,
+    /// Selected service index within detail view
+    pub detail_selected: usize,
+    /// Timestamp of last data refresh
+    pub last_refresh: Option<std::time::Instant>,
+}
+
+impl Default for DashboardState {
+    fn default() -> Self {
+        Self {
+            daemon_status: views::dashboard::DaemonStatus::Connecting,
+            deployments: Vec::new(),
+            selected: 0,
+            detail_view: None,
+            detail_selected: 0,
+            last_refresh: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Deploy state
+// ---------------------------------------------------------------------------
+
+/// State for the deploy screen
+pub struct DeployState {
+    /// Current step
+    pub step: views::deploy::DeployStep,
+    /// Spec files found in CWD
+    pub spec_files: Vec<PathBuf>,
+    /// Selected file index
+    pub selected: usize,
+    /// The file that was selected for deployment
+    pub selected_file: Option<PathBuf>,
+    /// Parsed deployment spec (populated after parse)
+    pub parsed_spec: Option<zlayer_spec::DeploymentSpec>,
+    /// Raw YAML content of the spec
+    pub spec_yaml: Option<String>,
+    /// Parse error message
+    pub parse_error: Option<String>,
+    /// Deploy error message
+    pub deploy_error: Option<String>,
+}
+
+impl DeployState {
+    pub fn new() -> Self {
+        let spec_files = views::deploy::scan_spec_files();
+        Self {
+            step: views::deploy::DeployStep::SelectFile,
+            spec_files,
+            selected: 0,
+            selected_file: None,
+            parsed_spec: None,
+            spec_yaml: None,
+            parse_error: None,
+            deploy_error: None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -176,6 +253,8 @@ pub struct App {
     pub show_help: bool,
     /// Initial context directory (from CLI args or cwd)
     pub initial_context: PathBuf,
+    /// Tokio runtime for async daemon communication
+    pub tokio_rt: tokio::runtime::Runtime,
 }
 
 impl App {
@@ -185,11 +264,19 @@ impl App {
             .or_else(|| std::env::current_dir().ok())
             .unwrap_or_else(|| PathBuf::from("."));
 
+        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_name("zlayer-tui-rt")
+            .enable_all()
+            .build()
+            .expect("Failed to create tokio runtime for TUI");
+
         Self {
             screen: Screen::MainMenu(MainMenuState::default()),
             should_quit: false,
             show_help: false,
             initial_context,
+            tokio_rt,
         }
     }
 
@@ -198,6 +285,9 @@ impl App {
         while !self.should_quit {
             // If we are in the Building step, poll for build events
             self.poll_build_events();
+
+            // If we are on the Dashboard, auto-refresh every 2 seconds
+            self.poll_dashboard_refresh();
 
             // Render
             terminal.draw(|frame| self.render(frame))?;
@@ -231,6 +321,8 @@ impl App {
 
         match &self.screen {
             Screen::MainMenu(state) => views::main_menu::render(frame, state),
+            Screen::Dashboard(state) => views::dashboard::render(frame, state),
+            Screen::Deploy(state) => views::deploy::render(frame, state),
             Screen::BuildWizard(state) => views::build::render(frame, state),
             Screen::RuntimeBrowser(state) => views::runtimes::render(frame, state),
             Screen::Validate(state) => views::validate::render(frame, state),
@@ -254,6 +346,16 @@ Navigation:
   Esc / q       Back / quit
   Tab           Next field (forms)
   ?             Toggle this help
+
+Dashboard:
+  r             Refresh data
+  s             Start daemon
+  Enter         Drill into deployment
+
+Deploy:
+  Enter         Select file / confirm
+  Esc           Go back a step
+  d             Go to dashboard (result)
 
 Build Wizard:
   Enter         Confirm current step
@@ -305,6 +407,28 @@ General:
             Screen::MainMenu(state) => {
                 handle_main_menu_key(key, state, &self.initial_context, &mut self.should_quit)
             }
+            Screen::Dashboard(state) => {
+                let go_back = views::dashboard::handle_key(key, state, &self.tokio_rt);
+                if go_back {
+                    Some(Screen::MainMenu(MainMenuState::default()))
+                } else {
+                    None
+                }
+            }
+            Screen::Deploy(state) => {
+                let action = views::deploy::handle_key(key, state, &self.tokio_rt);
+                match action {
+                    views::deploy::DeployAction::MainMenu => {
+                        Some(Screen::MainMenu(MainMenuState::default()))
+                    }
+                    views::deploy::DeployAction::Dashboard => {
+                        let mut ds = DashboardState::default();
+                        views::dashboard::refresh_data(&self.tokio_rt, &mut ds);
+                        Some(Screen::Dashboard(Box::new(ds)))
+                    }
+                    views::deploy::DeployAction::None => None,
+                }
+            }
             Screen::BuildWizard(state) => {
                 views::build::handle_key(key, state);
                 if key.code == KeyCode::Esc && state.step == BuildStep::SelectSource {
@@ -333,6 +457,32 @@ General:
 
         if let Some(new_screen) = transition {
             self.screen = new_screen;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Dashboard auto-refresh
+    // ------------------------------------------------------------------
+
+    fn poll_dashboard_refresh(&mut self) {
+        if let Screen::Dashboard(ref mut state) = self.screen {
+            let should_refresh = match state.last_refresh {
+                Some(last) => last.elapsed() >= Duration::from_secs(2),
+                None => true, // First load
+            };
+
+            if should_refresh {
+                if state.detail_view.is_some() {
+                    let name = state
+                        .detail_view
+                        .as_ref()
+                        .map(|d| d.deployment_name.clone())
+                        .unwrap_or_default();
+                    views::dashboard::refresh_detail(&self.tokio_rt, state, &name);
+                } else {
+                    views::dashboard::refresh_data(&self.tokio_rt, state);
+                }
+            }
         }
     }
 
@@ -474,7 +624,8 @@ fn handle_main_menu_key(
     initial_context: &std::path::Path,
     should_quit: &mut bool,
 ) -> Option<Screen> {
-    const MENU_ITEMS: usize = 4; // Build, Validate, Runtimes, Quit
+    // Dashboard, Deploy, Build, Validate, Runtimes, Quit
+    const MENU_ITEMS: usize = 6;
 
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => {
@@ -488,12 +639,14 @@ fn handle_main_menu_key(
             None
         }
         KeyCode::Enter => match state.selected {
-            0 => Some(Screen::BuildWizard(Box::new(BuildWizardState::new(
+            0 => Some(Screen::Dashboard(Box::default())),
+            1 => Some(Screen::Deploy(Box::new(DeployState::new()))),
+            2 => Some(Screen::BuildWizard(Box::new(BuildWizardState::new(
                 initial_context.to_path_buf(),
             )))),
-            1 => Some(Screen::Validate(ValidateState::default())),
-            2 => Some(Screen::RuntimeBrowser(RuntimeBrowserState::default())),
-            3 => {
+            3 => Some(Screen::Validate(ValidateState::default())),
+            4 => Some(Screen::RuntimeBrowser(RuntimeBrowserState::default())),
+            5 => {
                 *should_quit = true;
                 None
             }

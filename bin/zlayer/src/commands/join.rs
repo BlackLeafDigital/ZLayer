@@ -176,11 +176,11 @@ pub(crate) async fn join(
     };
 
     // Step 7: Create ServiceManager with overlay support
-    let manager = if let Some(om) = overlay_manager.clone() {
-        zlayer_agent::ServiceManager::with_overlay(runtime.clone(), om)
-    } else {
-        zlayer_agent::ServiceManager::new(runtime.clone())
-    };
+    let mut builder = zlayer_agent::ServiceManager::builder(runtime.clone());
+    if let Some(om) = overlay_manager.clone() {
+        builder = builder.overlay_manager(om);
+    }
+    let manager = builder.build();
 
     println!("\n=== Starting Services ===\n");
 

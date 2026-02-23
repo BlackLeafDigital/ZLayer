@@ -5,23 +5,54 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "ZLayer CLI - container orchestration platform entry point"
+description = "ZLayer CLI - container orchestration platform"
 
 [[bin]]
 name = "zlayer"
 path = "src/main.rs"
 
-[dependencies]
-# Internal crates - builder subsystem only
-zlayer-builder = { path = "../../crates/zlayer-builder" }
-zlayer-spec = { path = "../../crates/zlayer-spec" }
-zlayer-tui = { path = "../../crates/zlayer-tui" }
+[features]
+default = ["full"]
+# Full runtime with all CLI commands and capabilities
+full = ["docker", "wasm", "s3", "persistent", "observability"]
 
-# TUI - same versions as zlayer-builder
+# Runtime capabilities (forwarded to deps)
+docker = ["zlayer-agent/docker"]
+wasm = ["zlayer-agent/wasm"]
+s3 = ["zlayer-agent/s3", "zlayer-registry/s3"]
+persistent = ["zlayer-scheduler/persistent", "zlayer-registry/persistent"]
+observability = ["zlayer-observability/axum", "zlayer-observability/propagation"]
+
+[dependencies]
+# Internal crates
+zlayer-agent = { path = "../../crates/zlayer-agent" }
+zlayer-spec = { path = "../../crates/zlayer-spec" }
+zlayer-observability = { path = "../../crates/zlayer-observability" }
+zlayer-init-actions = { path = "../../crates/zlayer-init-actions" }
+zlayer-builder = { path = "../../crates/zlayer-builder" }
+zlayer-scheduler = { path = "../../crates/zlayer-scheduler" }
+zlayer-overlay = { path = "../../crates/zlayer-overlay" }
+zlayer-core = { path = "../../crates/zlayer-core" }
+zlayer-tunnel = { path = "../../crates/zlayer-tunnel" }
+
+# API server
+zlayer-api = { path = "../../crates/zlayer-api" }
+
+# Proxy (L4/L7 registries for daemon)
+zlayer-proxy = { path = "../../crates/zlayer-proxy" }
+
+# Secrets management
+zlayer-secrets = { path = "../../crates/zlayer-secrets" }
+
+# Registry for export/import commands
+zlayer-registry = { path = "../../crates/zlayer-registry", features = ["local"] }
+
+# TUI
 ratatui = "0.29"
 crossterm = "0.28"
+zlayer-tui = { path = "../../crates/zlayer-tui" }
 
-# CLI bootstrap (for --help, --version, non-interactive mode)
+# CLI
 clap = { workspace = true, features = ["derive"] }
 
 # Async
@@ -36,4 +67,25 @@ tracing-appender = { workspace = true }
 anyhow = { workspace = true }
 
 # Serialization
+serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+# HTTP
+reqwest = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+# HTTP-over-Unix-socket client (daemon_client)
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = "0.1"
+bytes = { workspace = true }
+tower = { workspace = true }
+tokio-stream = { workspace = true }
+
+# Daemonization
+nix = { workspace = true }
+libc = { workspace = true }

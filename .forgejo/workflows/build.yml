@@ -72,37 +72,17 @@ jobs:
       - name: Install system deps
         run: apt-get update && apt-get install -y protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git
       - name: Build
-        run: cargo build --release --package runtime --features "docker,wasm"
-      - name: Package
-        run: tar czf "zlayer-runtime-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer-runtime
-      - name: Upload artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: zlayer-runtime-linux-amd64
-          path: zlayer-runtime-linux-amd64.tar.gz
-          retention-days: 1
-      - name: Build zlayer-build
-        run: cargo build --release --package zlayer-build
-      - name: Package zlayer-build
-        run: tar czf "zlayer-build-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer-build
-      - name: Upload zlayer-build artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: zlayer-build-linux-amd64
-          path: zlayer-build-linux-amd64.tar.gz
-          retention-days: 1
-      - name: Build zlayer
         run: cargo build --release --package zlayer
-      - name: Package zlayer
+      - name: Package
         run: tar czf "zlayer-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer
-      - name: Upload zlayer artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
           name: zlayer-linux-amd64
           path: zlayer-linux-amd64.tar.gz
           retention-days: 1
       - name: Cleanup
-        run: rm -rf $CARGO_TARGET_DIR zlayer-runtime-linux-amd64.tar.gz zlayer-build-linux-amd64.tar.gz zlayer-linux-amd64.tar.gz
+        run: rm -rf $CARGO_TARGET_DIR zlayer-linux-amd64.tar.gz
 
   build-macos-arm64:
     needs: [check-existing]
@@ -123,37 +103,17 @@ jobs:
       - name: Install protobuf
         run: brew install protobuf
       - name: Build
-        run: cargo build --release --target aarch64-apple-darwin --package runtime --features "docker,wasm"
-      - name: Package
-        run: tar czf "zlayer-runtime-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer-runtime
-      - name: Upload artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: zlayer-runtime-darwin-arm64
-          path: zlayer-runtime-darwin-arm64.tar.gz
-          retention-days: 1
-      - name: Build zlayer-build
-        run: cargo build --release --target aarch64-apple-darwin --package zlayer-build
-      - name: Package zlayer-build
-        run: tar czf "zlayer-build-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer-build
-      - name: Upload zlayer-build artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: zlayer-build-darwin-arm64
-          path: zlayer-build-darwin-arm64.tar.gz
-          retention-days: 1
-      - name: Build zlayer
         run: cargo build --release --target aarch64-apple-darwin --package zlayer
-      - name: Package zlayer
+      - name: Package
         run: tar czf "zlayer-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer
-      - name: Upload zlayer artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
           name: zlayer-darwin-arm64
           path: zlayer-darwin-arm64.tar.gz
           retention-days: 1
       - name: Cleanup
-        run: rm -rf $CARGO_TARGET_DIR zlayer-runtime-darwin-arm64.tar.gz zlayer-build-darwin-arm64.tar.gz zlayer-darwin-arm64.tar.gz
+        run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-arm64.tar.gz
 
   # ===========================================
   # Wave 2: Image build + macOS amd64 (2 parallel)
@@ -162,7 +122,7 @@ jobs:
     name: Image Build (Pipeline)
     needs: [check-existing, build-linux-amd64]
     if: needs.check-existing.outputs.need_build == 'true'
-    # Needs linux-amd64 for zlayer-build + zlayer-runtime binaries
+    # Needs linux-amd64 for zlayer binary
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -171,23 +131,19 @@ jobs:
           ref: ${{ inputs.sha || github.sha }}
       - name: Install buildah
         run: sudo apt-get update && sudo apt-get install -y buildah
-      - name: Download zlayer-build
+      - name: Download zlayer
         uses: actions/download-artifact@v3
         with:
-          name: zlayer-build-linux-amd64
-      - name: Install zlayer-build
-        run: tar xzf zlayer-build-linux-amd64.tar.gz && chmod +x zlayer-build && sudo mv zlayer-build /usr/local/bin/
-      - name: Download zlayer-runtime binary (for zlayer-node image)
-        uses: actions/download-artifact@v3
-        with:
-          name: zlayer-runtime-linux-amd64
-      - name: Prepare zlayer-runtime binary for node image
+          name: zlayer-linux-amd64
+      - name: Install zlayer
+        run: tar xzf zlayer-linux-amd64.tar.gz && chmod +x zlayer && sudo mv zlayer /usr/local/bin/
+      - name: Prepare zlayer binary for node image
         run: |
           mkdir -p target/release
-          tar xzf zlayer-runtime-linux-amd64.tar.gz -C target/release/
+          cp /usr/local/bin/zlayer target/release/zlayer
       - name: Build all images with pipeline
         run: |
-          sudo zlayer-build pipeline \
+          sudo zlayer pipeline \
             -f ZPipeline.yaml \
             --no-tui \
             --set VERSION=build-${{ github.run_id }} \
@@ -225,54 +181,20 @@ jobs:
           targets: x86_64-apple-darwin
       - name: Ensure target installed
         run: rustup target add x86_64-apple-darwin
-      - name: Debug - Show environment
-        run: |
-          echo "=== Rust/Cargo versions ==="
-          rustc --version
-          cargo --version
-          echo "=== Installed targets ==="
-          rustup target list --installed
-          echo "=== CARGO_HOME / RUSTUP_HOME ==="
-          echo "CARGO_HOME=$CARGO_HOME"
-          echo "RUSTUP_HOME=$RUSTUP_HOME"
-          echo "=== Feature resolution for x86_64-apple-darwin ==="
-          cargo tree -p runtime --features "docker,wasm" --target x86_64-apple-darwin 2>&1 | grep -E "(zlayer-agent|bollard|wasmtime|futures-util)" | head -30 || true
-          echo "=== Full zlayer-agent deps ==="
-          cargo tree -p zlayer-agent --features "docker,wasm" --target x86_64-apple-darwin 2>&1 | head -50 || true
       - name: Install protobuf
         run: brew install protobuf
       - name: Build
-        run: cargo build --release --target x86_64-apple-darwin --package runtime --features "docker,wasm"
-      - name: Package
-        run: tar czf "zlayer-runtime-darwin-amd64.tar.gz" -C $CARGO_TARGET_DIR/x86_64-apple-darwin/release zlayer-runtime
-      - name: Upload artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: zlayer-runtime-darwin-amd64
-          path: zlayer-runtime-darwin-amd64.tar.gz
-          retention-days: 1
-      - name: Build zlayer-build
-        run: cargo build --release --target x86_64-apple-darwin --package zlayer-build
-      - name: Package zlayer-build
-        run: tar czf "zlayer-build-darwin-amd64.tar.gz" -C $CARGO_TARGET_DIR/x86_64-apple-darwin/release zlayer-build
-      - name: Upload zlayer-build artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: zlayer-build-darwin-amd64
-          path: zlayer-build-darwin-amd64.tar.gz
-          retention-days: 1
-      - name: Build zlayer
         run: cargo build --release --target x86_64-apple-darwin --package zlayer
-      - name: Package zlayer
+      - name: Package
         run: tar czf "zlayer-darwin-amd64.tar.gz" -C $CARGO_TARGET_DIR/x86_64-apple-darwin/release zlayer
-      - name: Upload zlayer artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
           name: zlayer-darwin-amd64
           path: zlayer-darwin-amd64.tar.gz
           retention-days: 1
       - name: Cleanup
-        run: rm -rf $CARGO_TARGET_DIR zlayer-runtime-darwin-amd64.tar.gz zlayer-build-darwin-amd64.tar.gz zlayer-darwin-amd64.tar.gz
+        run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-amd64.tar.gz
 
   # ===========================================
   # Wave 3: Linux arm64 (cross-compile, slowest)
@@ -296,37 +218,17 @@ jobs:
       - name: Create target directory
         run: mkdir -p $CROSS_TARGET_DIR
       - name: Build
-        run: cross build --release --target aarch64-unknown-linux-gnu --package runtime --features "docker,wasm" --target-dir $CROSS_TARGET_DIR
-      - name: Package
-        run: tar czf "zlayer-runtime-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer-runtime
-      - name: Upload artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: zlayer-runtime-linux-arm64
-          path: zlayer-runtime-linux-arm64.tar.gz
-          retention-days: 1
-      - name: Build zlayer-build
-        run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer-build --target-dir $CROSS_TARGET_DIR
-      - name: Package zlayer-build
-        run: tar czf "zlayer-build-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer-build
-      - name: Upload zlayer-build artifact
-        uses: actions/upload-artifact@v3
-        with:
-          name: zlayer-build-linux-arm64
-          path: zlayer-build-linux-arm64.tar.gz
-          retention-days: 1
-      - name: Build zlayer
         run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer --target-dir $CROSS_TARGET_DIR
-      - name: Package zlayer
+      - name: Package
         run: tar czf "zlayer-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer
-      - name: Upload zlayer artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
           name: zlayer-linux-arm64
           path: zlayer-linux-arm64.tar.gz
           retention-days: 1
       - name: Cleanup
-        run: rm -rf $CROSS_TARGET_DIR zlayer-runtime-linux-arm64.tar.gz zlayer-build-linux-arm64.tar.gz zlayer-linux-arm64.tar.gz
+        run: rm -rf $CROSS_TARGET_DIR zlayer-linux-arm64.tar.gz
 
   # ===========================================
   # Verify all builds passed

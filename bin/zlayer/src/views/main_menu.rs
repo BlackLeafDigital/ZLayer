@@ -10,6 +10,8 @@ use crate::widgets::logo;
 
 /// Menu items displayed to the user
 const MENU_ITEMS: &[(&str, &str)] = &[
+    ("Dashboard", "View running deployments and services"),
+    ("Deploy", "Deploy from a spec file"),
     ("Build Image", "Interactive image build wizard"),
     ("Validate", "Validate a Dockerfile or ZImagefile"),
     ("Runtimes", "Browse available runtime templates"),

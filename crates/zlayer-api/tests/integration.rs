@@ -1,3 +1,4 @@
+#![allow(deprecated)]
 //! API integration tests
 
 use axum::{

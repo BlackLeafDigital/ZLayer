@@ -30,7 +30,7 @@ pub struct Args {
     pub embedded: bool,
 
     /// Port to bind the web server
-    #[arg(long, short, default_value = "9120")]
+    #[arg(long, short, default_value = "9120", env = "PORT")]
     pub port: u16,
 
     /// Path to configuration file

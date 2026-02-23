@@ -48,13 +48,14 @@ pub struct DaemonConfig {
     /// DNS listen port for overlay service discovery (default: 15353).
     pub dns_port: u16,
 
-    /// Root data directory (databases, state).  Default: `/var/lib/zlayer`.
+    /// Root data directory (databases, state).
+    /// Default: `~/.local/share/zlayer` on macOS, `/var/lib/zlayer` on Linux.
     pub data_dir: PathBuf,
 
-    /// Log directory.  Default: `/var/log/zlayer`.
+    /// Log directory.  Default: `{data_dir}/logs` on macOS, `/var/log/zlayer` on Linux.
     pub log_dir: PathBuf,
 
-    /// Runtime directory (sockets, PID files).  Default: `/var/run/zlayer`.
+    /// Runtime directory (sockets, PID files).  Default: `{data_dir}/run` on macOS, `/var/run/zlayer` on Linux.
     pub run_dir: PathBuf,
 }
 
@@ -373,23 +374,22 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
     // Phase 8: Service manager – wired to all subsystems
     // -----------------------------------------------------------------------
-    let mut manager_builder = if let Some(om) = overlay.clone() {
-        ServiceManager::with_overlay(runtime.clone(), om)
-    } else {
-        ServiceManager::new(runtime.clone())
-    };
+    let mut builder = ServiceManager::builder(runtime.clone())
+        .deployment_name(config.deployment_name.clone())
+        .proxy_manager(Arc::clone(&proxy))
+        .stream_registry(Arc::clone(&stream_registry))
+        .service_registry(Arc::clone(&service_registry))
+        .container_supervisor(Arc::clone(&supervisor));
 
-    manager_builder.set_deployment_name(config.deployment_name.clone());
-    manager_builder.set_proxy_manager(Arc::clone(&proxy));
-    manager_builder.set_stream_registry(Arc::clone(&stream_registry));
-    manager_builder.set_service_registry(Arc::clone(&service_registry));
-    manager_builder.set_container_supervisor(Arc::clone(&supervisor));
-
-    if let Some(dns_ref) = &dns {
-        manager_builder.set_dns_server(Arc::clone(dns_ref));
+    if let Some(om) = overlay.clone() {
+        builder = builder.overlay_manager(om);
     }
 
-    let manager = Arc::new(manager_builder);
+    if let Some(dns_ref) = &dns {
+        builder = builder.dns_server(Arc::clone(dns_ref));
+    }
+
+    let manager = Arc::new(builder.build());
     info!("Service manager initialised");
 
     // -----------------------------------------------------------------------
