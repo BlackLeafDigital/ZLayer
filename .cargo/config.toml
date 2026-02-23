@@ -18,6 +18,11 @@ rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
 
+# WASM: getrandom 0.3+ requires explicit backend selection for wasm32 targets.
+# This enables the JavaScript-based RNG backend used by ahash/hashbrown/leptos.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg", "getrandom_backend=\"wasm_js\""]
+
 [alias]
 # Common build aliases for development workflow
 dev = "build --package zlayer"

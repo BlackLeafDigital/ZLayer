@@ -70,6 +70,10 @@ tracing-subscriber = { workspace = true, optional = true }
 console_error_panic_hook = { version = "0.1", optional = true }
 gloo-timers = { version = "0.3", optional = true }
 
+# WASM: getrandom 0.3+ needs wasm_js feature for wasm32 targets (transitive via ahash/hashbrown)
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+
 [features]
 default = []
 

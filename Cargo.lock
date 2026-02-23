@@ -10970,6 +10970,7 @@ dependencies = [
  "axum",
  "clap 4.5.59",
  "console_error_panic_hook",
+ "getrandom 0.3.4",
  "gloo-timers",
  "leptos",
  "leptos-chartistry",
@@ -11245,6 +11246,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "console_error_panic_hook",
+ "getrandom 0.3.4",
  "gloo-timers",
  "leptos",
  "leptos_axum",
