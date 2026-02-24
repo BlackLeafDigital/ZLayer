@@ -36,6 +36,8 @@ pub struct ServiceSummary {
     pub replicas: u32,
     /// Desired replica count
     pub desired_replicas: u32,
+    /// Service endpoints
+    pub endpoints: Vec<ServiceEndpoint>,
 }
 
 /// Service details
@@ -209,6 +211,16 @@ pub async fn list_services(
             status,
             replicas,
             desired_replicas,
+            endpoints: spec
+                .endpoints
+                .iter()
+                .map(|ep| ServiceEndpoint {
+                    name: ep.name.clone(),
+                    protocol: format!("{:?}", ep.protocol).to_lowercase(),
+                    port: ep.port,
+                    url: ep.path.clone(),
+                })
+                .collect(),
         });
     }
 
@@ -778,6 +790,12 @@ mod tests {
             status: "running".to_string(),
             replicas: 3,
             desired_replicas: 3,
+            endpoints: vec![ServiceEndpoint {
+                name: "http".to_string(),
+                protocol: "http".to_string(),
+                port: 8080,
+                url: None,
+            }],
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("api"));

@@ -178,9 +178,20 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
         widths[5] = widths[5].max(r.age.len());
     }
 
+    let sep = format!(
+        "{}-+-{}-+-{}-+-{}-+-{}-+-{}",
+        "-".repeat(widths[0]),
+        "-".repeat(widths[1]),
+        "-".repeat(widths[2]),
+        "-".repeat(widths[3]),
+        "-".repeat(widths[4]),
+        "-".repeat(widths[5]),
+    );
+
     // Print header
+    println!("{}", sep);
     println!(
-        "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {:<w5$}",
+        "{:<w0$} | {:<w1$} | {:<w2$} | {:<w3$} | {:<w4$} | {:<w5$}",
         hdr[0],
         hdr[1],
         hdr[2],
@@ -194,11 +205,12 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
         w4 = widths[4],
         w5 = widths[5],
     );
+    println!("{}", sep);
 
     // Print rows
     for r in rows {
         println!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}  {:<w5$}",
+            "{:<w0$} | {:<w1$} | {:<w2$} | {:<w3$} | {:<w4$} | {:<w5$}",
             r.deployment,
             r.service,
             r.replicas,
@@ -213,6 +225,7 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
             w5 = widths[5],
         );
     }
+    println!("{}", sep);
 
     // Print containers if requested
     if show_containers && !container_rows.is_empty() {
@@ -229,8 +242,18 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
             cwidths[4] = cwidths[4].max(c.state.len());
         }
 
+        let csep = format!(
+            "{}-+-{}-+-{}-+-{}-+-{}",
+            "-".repeat(cwidths[0]),
+            "-".repeat(cwidths[1]),
+            "-".repeat(cwidths[2]),
+            "-".repeat(cwidths[3]),
+            "-".repeat(cwidths[4]),
+        );
+
+        println!("{}", csep);
         println!(
-            "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+            "{:<w0$} | {:<w1$} | {:<w2$} | {:<w3$} | {:<w4$}",
             chdr[0],
             chdr[1],
             chdr[2],
@@ -242,10 +265,11 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
             w3 = cwidths[3],
             w4 = cwidths[4],
         );
+        println!("{}", csep);
 
         for c in container_rows {
             println!(
-                "{:<w0$}  {:<w1$}  {:<w2$}  {:<w3$}  {:<w4$}",
+                "{:<w0$} | {:<w1$} | {:<w2$} | {:<w3$} | {:<w4$}",
                 c.deployment,
                 c.service,
                 c.container,
@@ -258,6 +282,7 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
                 w4 = cwidths[4],
             );
         }
+        println!("{}", csep);
     }
 }
 

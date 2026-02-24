@@ -151,7 +151,7 @@ fn main() -> ExitCode {
         0 => (
             LogLevel::Warn,
             Some(
-                "zlayer=info,zlayer_agent=warn,zlayer_overlay=warn,zlayer_proxy=warn,\
+                "zlayer=warn,zlayer_agent=warn,zlayer_overlay=warn,zlayer_proxy=warn,\
                  zlayer_init_actions=warn,zlayer_scheduler=warn,zlayer_api=warn,warn"
                     .to_string(),
             ),

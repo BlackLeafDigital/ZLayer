@@ -41,7 +41,7 @@ async fn main() {
 /// Start the Leptos SSR server on the given port.
 #[cfg(feature = "ssr")]
 async fn start_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    use axum::Router;
+    use axum::{routing::get, Router};
     use leptos::config::{Env, LeptosOptions};
     use leptos_axum::{generate_route_list, LeptosRoutes};
     use std::net::SocketAddr;
@@ -87,6 +87,7 @@ async fn start_server(port: u16) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Serving WASM package from {}", pkg_dir);
 
     let app = leptos_router
+        .route("/health", get(|| async { "ok" }))
         .nest_service("/pkg", ServeDir::new(&pkg_dir))
         .with_state(leptos_options);
 
