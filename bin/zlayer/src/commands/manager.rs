@@ -43,6 +43,8 @@ services:
     resources:
       cpu: 0.5
       memory: 256Mi
+    env:
+      PORT: "{port}"
     endpoints:
       - name: http
         protocol: http
