@@ -36,5 +36,8 @@ build-agent = "build --package zlayer --no-default-features --features join"
 build-server = "build --package zlayer --no-default-features --features serve"
 build-deploy = "build --package zlayer --no-default-features --features deploy"
 
+[registries.forgejo]
+index = "sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/"
+
 [patch.crates-io]
 # You can add patches here if needed for development
