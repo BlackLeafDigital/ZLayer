@@ -300,7 +300,7 @@ mod tests {
     fn test_server_creation() {
         let config = ApiConfig::default();
         let server = ApiServer::new(config);
-        assert_eq!(server.bind_addr(), "0.0.0.0:3669".parse().unwrap());
+        assert_eq!(server.bind_addr(), "0.0.0.0:3669".parse::<std::net::SocketAddr>().unwrap());
     }
 
     #[test]
@@ -310,7 +310,7 @@ mod tests {
             ..Default::default()
         };
         let server = ApiServer::new(config);
-        assert_eq!(server.bind_addr(), "127.0.0.1:9090".parse().unwrap());
+        assert_eq!(server.bind_addr(), "127.0.0.1:9090".parse::<std::net::SocketAddr>().unwrap());
     }
 
     #[cfg(unix)]
