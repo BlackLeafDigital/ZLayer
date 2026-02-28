@@ -76,12 +76,10 @@ impl ZqlStorage {
         let path = path.as_ref().to_path_buf();
 
         // ZQL Database::open is synchronous, run on blocking thread
-        let db = tokio::task::spawn_blocking(move || {
-            zql::Database::open(&path)
-        })
-        .await
-        .map_err(|e| StorageError::Database(format!("spawn_blocking failed: {e}")))?
-        .map_err(StorageError::from)?;
+        let db = tokio::task::spawn_blocking(move || zql::Database::open(&path))
+            .await
+            .map_err(|e| StorageError::Database(format!("spawn_blocking failed: {e}")))?
+            .map_err(StorageError::from)?;
 
         Ok(Self {
             db: tokio::sync::Mutex::new(db),

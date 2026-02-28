@@ -66,6 +66,6 @@ pub use handlers::tunnels::{
 
 // Re-export storage types
 pub use storage::{
-    DeploymentStatus, DeploymentStorage, InMemoryStorage, ZqlStorage, StorageError,
-    StoredDeployment,
+    DeploymentStatus, DeploymentStorage, InMemoryStorage, StorageError, StoredDeployment,
+    ZqlStorage,
 };

@@ -19,7 +19,7 @@ use zlayer_agent::{
     ContainerSupervisor, OverlayManager, ProxyManager, ProxyManagerConfig, Runtime, RuntimeConfig,
     ServiceManager,
 };
-use zlayer_api::{DeploymentStatus, DeploymentStorage, ZqlStorage, StoredDeployment};
+use zlayer_api::{DeploymentStatus, DeploymentStorage, StoredDeployment, ZqlStorage};
 use zlayer_overlay::{DnsHandle, DnsServer, OverlayTransport};
 use zlayer_proxy::{ServiceRegistry, StreamRegistry};
 use zlayer_scheduler::{RaftConfig, RaftCoordinator, RaftService, Request};

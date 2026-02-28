@@ -175,14 +175,13 @@ impl PersistentLogStore {
                 }
                 if let Some((_, record)) = best {
                     if let Some(data) = record.fields.get("entry_data") {
-                        let entry: Entry<TypeConfig> =
-                            serde_json::from_str(data).map_err(|e| {
-                                db_to_storage_error(
-                                    openraft::ErrorSubject::Store,
-                                    openraft::ErrorVerb::Read,
-                                    e.to_string(),
-                                )
-                            })?;
+                        let entry: Entry<TypeConfig> = serde_json::from_str(data).map_err(|e| {
+                            db_to_storage_error(
+                                openraft::ErrorSubject::Store,
+                                openraft::ErrorVerb::Read,
+                                e.to_string(),
+                            )
+                        })?;
                         return Ok(Some(entry));
                     }
                 }
@@ -953,8 +952,8 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         };
 
         if let Some((snapshot_id, meta_json)) = best_snapshot {
-            let snapshot_record: SnapshotMetadataRecord =
-                serde_json::from_str(&meta_json).map_err(|e| {
+            let snapshot_record: SnapshotMetadataRecord = serde_json::from_str(&meta_json)
+                .map_err(|e| {
                     db_to_storage_error(
                         openraft::ErrorSubject::Snapshot(None),
                         openraft::ErrorVerb::Read,

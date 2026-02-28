@@ -17,7 +17,7 @@
 
 mod deployments;
 
-pub use deployments::{DeploymentStorage, InMemoryStorage, ZqlStorage, StorageError};
+pub use deployments::{DeploymentStorage, InMemoryStorage, StorageError, ZqlStorage};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

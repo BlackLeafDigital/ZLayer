@@ -128,10 +128,7 @@ impl PersistentSecretsStore {
     }
 
     /// Query the database for a record by storage_key
-    async fn get_record(
-        &self,
-        storage_key: &str,
-    ) -> Result<Option<HashMap<String, String>>> {
+    async fn get_record(&self, storage_key: &str) -> Result<Option<HashMap<String, String>>> {
         let mut db = self.db.lock().await;
         let result = db.query(&format!(
             "SELECT * FROM secrets WHERE storage_key = '{}'",
@@ -161,11 +158,9 @@ impl SecretsProvider for PersistentSecretsStore {
 
         match record {
             Some(fields) => {
-                let encrypted_hex = fields
-                    .get("encrypted_value_hex")
-                    .ok_or_else(|| {
-                        SecretsError::Storage("Missing encrypted_value_hex field".to_string())
-                    })?;
+                let encrypted_hex = fields.get("encrypted_value_hex").ok_or_else(|| {
+                    SecretsError::Storage("Missing encrypted_value_hex field".to_string())
+                })?;
 
                 let encrypted_value = hex::decode(encrypted_hex)
                     .map_err(|e| SecretsError::Storage(format!("Invalid hex encoding: {e}")))?;
@@ -209,11 +204,7 @@ impl SecretsProvider for PersistentSecretsStore {
                 for record in &records {
                     if let Some(sk) = record.fields.get("storage_key") {
                         if sk.starts_with(&prefix) {
-                            let name = record
-                                .fields
-                                .get("name")
-                                .cloned()
-                                .unwrap_or_default();
+                            let name = record.fields.get("name").cloned().unwrap_or_default();
                             let version = record
                                 .fields
                                 .get("version")

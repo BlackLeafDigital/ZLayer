@@ -59,12 +59,10 @@ impl LayerSyncManager {
 
         // Open/create ZQL database
         let db_path = config.state_db_path.clone();
-        let db = tokio::task::spawn_blocking(move || {
-            zql::Database::open(&db_path)
-        })
-        .await
-        .map_err(|e| LayerStorageError::Database(format!("spawn_blocking failed: {e}")))?
-        .map_err(|e| LayerStorageError::Database(e.to_string()))?;
+        let db = tokio::task::spawn_blocking(move || zql::Database::open(&db_path))
+            .await
+            .map_err(|e| LayerStorageError::Database(format!("spawn_blocking failed: {e}")))?
+            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
 
         let db = tokio::sync::Mutex::new(db);
 
@@ -89,9 +87,10 @@ impl LayerSyncManager {
             Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
                 let mut states = HashMap::new();
                 for record in &records {
-                    if let (Some(key), Some(json)) =
-                        (record.fields.get("container_key"), record.fields.get("state_json"))
-                    {
+                    if let (Some(key), Some(json)) = (
+                        record.fields.get("container_key"),
+                        record.fields.get("state_json"),
+                    ) {
                         if let Ok(state) = serde_json::from_str::<SyncState>(json) {
                             states.insert(key.clone(), state);
                         }
