@@ -11277,6 +11277,8 @@ dependencies = [
 [[package]]
 name = "zql"
 version = "0.1.0"
+source = "sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/"
+checksum = "a1ffc7c39551f0a6f5b7859dce981795e5e69ef8512db24dadc62aae143bfdc0"
 dependencies = [
  "blake3",
  "chumsky",

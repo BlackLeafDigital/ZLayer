@@ -11,9 +11,6 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
-/// Default database directory name used when a directory is provided
-const DEFAULT_DB_DIRNAME: &str = "blob_cache_zql";
-
 fn current_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -46,13 +43,7 @@ impl PersistentBlobCache {
     /// it will be used directly as the database directory.
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self, CacheError> {
         let path = path.as_ref();
-
-        // If the path is an existing directory, append the default database dirname
-        let db_path = if path.is_dir() {
-            path.join(DEFAULT_DB_DIRNAME)
-        } else {
-            path.to_path_buf()
-        };
+        let db_path = path.to_path_buf();
 
         // Ensure parent directory exists
         if let Some(parent) = db_path.parent() {
