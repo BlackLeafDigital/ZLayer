@@ -83,6 +83,51 @@ if [ -z "$BIN_PATH" ]; then
     exit 1
 fi
 
+# --- Stop running zlayer before overwriting binary ---
+if [ -f "${INSTALL_DIR}/${BINARY}" ]; then
+    NEED_SUDO=false
+    if [ ! -w "$INSTALL_DIR" ] && command -v sudo >/dev/null 2>&1; then
+        NEED_SUDO=true
+    fi
+
+    case "$OS" in
+        linux)
+            if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet zlayer 2>/dev/null; then
+                echo "Stopping zlayer..."
+                if [ "$NEED_SUDO" = true ]; then
+                    sudo systemctl stop zlayer
+                else
+                    systemctl stop zlayer
+                fi
+            elif pgrep -x "$BINARY" >/dev/null 2>&1; then
+                echo "Stopping zlayer..."
+                if [ "$NEED_SUDO" = true ]; then
+                    sudo pkill -x "$BINARY" 2>/dev/null || true
+                else
+                    pkill -x "$BINARY" 2>/dev/null || true
+                fi
+                sleep 1
+            fi
+            ;;
+        darwin)
+            PLIST="com.zlayer.zlayer"
+            if launchctl list "$PLIST" >/dev/null 2>&1; then
+                echo "Stopping zlayer..."
+                if [ "$NEED_SUDO" = true ]; then
+                    sudo launchctl stop "$PLIST" 2>/dev/null || true
+                else
+                    launchctl stop "$PLIST" 2>/dev/null || true
+                fi
+                sleep 1
+            elif pgrep -x "$BINARY" >/dev/null 2>&1; then
+                echo "Stopping zlayer..."
+                pkill -x "$BINARY" 2>/dev/null || true
+                sleep 1
+            fi
+            ;;
+    esac
+fi
+
 if [ -w "$INSTALL_DIR" ]; then
     cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
     chmod +x "${INSTALL_DIR}/${BINARY}"
