@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
@@ -25,6 +25,156 @@ struct DaemonMetadata {
     socket_path: String,
     host_network: bool,
     overlay_cidr: String,
+}
+
+/// Minimal struct for reading back the PID from a previous daemon's metadata.
+#[derive(Deserialize)]
+struct StaleDaemonMeta {
+    pid: u32,
+}
+
+/// Clean up a stale daemon process and leftover network state from a previous run.
+///
+/// This is best-effort: all errors are logged as warnings but never prevent startup.
+async fn cleanup_stale_daemon(config: &DaemonConfig) {
+    let metadata_path = config.data_dir.join("daemon.json");
+
+    // -----------------------------------------------------------------------
+    // 1. Read the old daemon PID and terminate it if still alive
+    // -----------------------------------------------------------------------
+    if let Ok(contents) = tokio::fs::read_to_string(&metadata_path).await {
+        match serde_json::from_str::<StaleDaemonMeta>(&contents) {
+            Ok(meta) => {
+                let old_pid = meta.pid as i32;
+                // Do not kill ourselves (pid file left over from a clean restart).
+                if old_pid as u32 == std::process::id() {
+                    info!(
+                        pid = old_pid,
+                        "Stale daemon PID matches current process, skipping kill"
+                    );
+                } else if process_alive(old_pid) {
+                    warn!(
+                        pid = old_pid,
+                        "Stale daemon process detected, sending SIGTERM"
+                    );
+                    // SAFETY: we validated the PID is alive and is not us.
+                    unsafe { libc::kill(old_pid, libc::SIGTERM) };
+
+                    // Poll for up to 5 seconds waiting for graceful exit.
+                    let mut terminated = false;
+                    for _ in 0..50 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if !process_alive(old_pid) {
+                            terminated = true;
+                            break;
+                        }
+                    }
+
+                    if terminated {
+                        info!(pid = old_pid, "Stale daemon exited after SIGTERM");
+                    } else {
+                        warn!(
+                            pid = old_pid,
+                            "Stale daemon did not exit in time, sending SIGKILL"
+                        );
+                        unsafe { libc::kill(old_pid, libc::SIGKILL) };
+                        // Brief wait for the kernel to reap.
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        if process_alive(old_pid) {
+                            warn!(pid = old_pid, "Stale daemon still alive after SIGKILL");
+                        } else {
+                            info!(pid = old_pid, "Stale daemon killed with SIGKILL");
+                        }
+                    }
+                } else {
+                    info!(
+                        pid = old_pid,
+                        "Previous daemon is not running, cleaning up stale files"
+                    );
+                }
+            }
+            Err(e) => {
+                warn!(
+                    path = %metadata_path.display(),
+                    error = %e,
+                    "Failed to parse stale daemon.json, ignoring"
+                );
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 2. Clean up stale network interfaces (veth-* and zl-*)
+    // -----------------------------------------------------------------------
+    if let Ok(output) = tokio::process::Command::new("ip")
+        .args(["-br", "link"])
+        .output()
+        .await
+    {
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                // `ip -br link` format: "NAME  STATE  ..."
+                let iface = match line.split_whitespace().next() {
+                    Some(name) => name,
+                    None => continue,
+                };
+
+                if iface.starts_with("veth-") || iface.starts_with("zl-") {
+                    warn!(interface = %iface, "Deleting stale network interface");
+                    let _ = tokio::process::Command::new("ip")
+                        .args(["link", "delete", iface])
+                        .output()
+                        .await;
+                }
+            }
+        }
+    } else {
+        warn!("Failed to list network interfaces for stale cleanup");
+    }
+
+    // -----------------------------------------------------------------------
+    // 3. Remove stale WireGuard UAPI sockets
+    // -----------------------------------------------------------------------
+    let wg_sock_dir = std::path::Path::new("/var/run/wireguard");
+    if wg_sock_dir.is_dir() {
+        match tokio::fs::read_dir(wg_sock_dir).await {
+            Ok(mut entries) => {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let path = entry.path();
+                    if path.extension().and_then(|e| e.to_str()) == Some("sock") {
+                        warn!(path = %path.display(), "Removing stale WireGuard socket");
+                        let _ = tokio::fs::remove_file(&path).await;
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to read /var/run/wireguard for stale socket cleanup");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4. Remove stale daemon metadata and PID files
+    // -----------------------------------------------------------------------
+    if metadata_path.exists() {
+        let _ = tokio::fs::remove_file(&metadata_path).await;
+        info!(path = %metadata_path.display(), "Removed stale daemon.json");
+    }
+
+    let pid_file = config.run_dir.join("zlayer.pid");
+    if pid_file.exists() {
+        let _ = tokio::fs::remove_file(&pid_file).await;
+        info!(path = %pid_file.display(), "Removed stale zlayer.pid");
+    }
+}
+
+/// Check whether a process with the given PID is still alive.
+///
+/// Uses `kill(pid, 0)` which checks for existence without sending a signal.
+fn process_alive(pid: i32) -> bool {
+    // SAFETY: signal 0 is a null signal used purely for existence checking.
+    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 /// Start the daemon API server with full infrastructure.
@@ -57,6 +207,11 @@ pub(crate) async fn serve(
         run_dir,
         ..Default::default()
     };
+
+    // -----------------------------------------------------------------------
+    // 1b. Clean up any stale daemon from a previous run
+    // -----------------------------------------------------------------------
+    cleanup_stale_daemon(&config).await;
 
     // -----------------------------------------------------------------------
     // 2. Initialise all daemon infrastructure

@@ -230,6 +230,12 @@ impl OverlayManager {
         let veth_host = format!("veth-{}", container_pid);
         let veth_container = "eth0";
 
+        // Clean up any stale veth pair left by a previous daemon crash.
+        // This is idempotent — deleting a non-existent interface fails silently.
+        let _ = self
+            .run_command("ip", &["link", "delete", &veth_host])
+            .await;
+
         self.run_command(
             "ip",
             &[
@@ -292,10 +298,11 @@ impl OverlayManager {
         self.run_command("ip", &["link", "set", &veth_host, "up"])
             .await?;
 
-        // Add route so host can reach the container's IP via the veth
+        // Use "replace" instead of "add" so stale routes from a previous
+        // daemon run don't cause a failure (EEXIST).
         self.run_command(
             "ip",
-            &["route", "add", &format!("{}/32", ip), "dev", &veth_host],
+            &["route", "replace", &format!("{}/32", ip), "dev", &veth_host],
         )
         .await?;
 
