@@ -1,7 +1,7 @@
 //! Persistent secrets storage using ZQL.
 //!
 //! Provides encrypted local storage for secrets with a single store containing
-//! fields: storage_key, encrypted_value_hex, name, version, created_at, updated_at.
+//! fields: `storage_key`, `encrypted_value_hex`, name, version, `created_at`, `updated_at`.
 //!
 //! - `storage_key`: Primary key in `{scope}:{name}` format
 //! - `encrypted_value_hex`: XChaCha20-Poly1305 encrypted secret bytes (hex-encoded)
@@ -127,7 +127,7 @@ impl PersistentSecretsStore {
         s.replace('\'', "''")
     }
 
-    /// Query the database for a record by storage_key
+    /// Query the database for a record by `storage_key`
     async fn get_record(&self, storage_key: &str) -> Result<Option<HashMap<String, String>>> {
         let mut db = self.db.lock().await;
         let result = db.query(&format!(
@@ -143,8 +143,7 @@ impl PersistentSecretsStore {
                     Ok(Some(records[0].fields.clone()))
                 }
             }
-            Ok(_) => Ok(None),
-            Err(_) => Ok(None),
+            Ok(_) | Err(_) => Ok(None),
         }
     }
 }
@@ -213,13 +212,11 @@ impl SecretsProvider for PersistentSecretsStore {
                             let created_at = record
                                 .fields
                                 .get("created_at")
-                                .map(|s| Self::parse_timestamp(s))
-                                .unwrap_or(0);
+                                .map_or(0, |s| Self::parse_timestamp(s));
                             let updated_at = record
                                 .fields
                                 .get("updated_at")
-                                .map(|s| Self::parse_timestamp(s))
-                                .unwrap_or(0);
+                                .map_or(0, |s| Self::parse_timestamp(s));
 
                             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                             results.push(SecretMetadata {
@@ -558,8 +555,7 @@ mod tests {
         let expected_path = temp_dir.path().join(DEFAULT_DB_DIRNAME);
         assert!(
             expected_path.exists(),
-            "Database directory should be created at {:?}",
-            expected_path
+            "Database directory should be created at {expected_path:?}"
         );
     }
 
