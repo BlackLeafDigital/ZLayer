@@ -36,14 +36,14 @@ zeroize = { version = "1.7", features = ["derive"] }
 chrono.workspace = true
 
 # Storage (optional)
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"], optional = true }
+zql = { workspace = true, optional = true }
 
 # HashiCorp Vault (optional)
 vaultrs = { version = "0.7", optional = true }
 
 [features]
 default = ["persistent"]
-persistent = ["sqlx"]
+persistent = ["zql"]
 vault = ["vaultrs"]
 
 [dev-dependencies]

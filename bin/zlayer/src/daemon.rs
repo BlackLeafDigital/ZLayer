@@ -19,7 +19,7 @@ use zlayer_agent::{
     ContainerSupervisor, OverlayManager, ProxyManager, ProxyManagerConfig, Runtime, RuntimeConfig,
     ServiceManager,
 };
-use zlayer_api::{DeploymentStatus, DeploymentStorage, SqlxStorage, StoredDeployment};
+use zlayer_api::{DeploymentStatus, DeploymentStorage, ZqlStorage, StoredDeployment};
 use zlayer_overlay::{DnsHandle, DnsServer, OverlayTransport};
 use zlayer_proxy::{ServiceRegistry, StreamRegistry};
 use zlayer_scheduler::{RaftConfig, RaftCoordinator, RaftService, Request};
@@ -110,8 +110,8 @@ pub struct DaemonState {
     /// Service manager wired to all subsystems.
     pub manager: Arc<ServiceManager>,
 
-    /// Persistent deployment storage (SQLite).
-    pub storage: Arc<SqlxStorage>,
+    /// Persistent deployment storage (ZQL).
+    pub storage: Arc<ZqlStorage>,
 
     /// Persistent encrypted secrets store (SQLite + XChaCha20-Poly1305).
     pub secrets: Arc<PersistentSecretsStore>,
@@ -393,11 +393,11 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     info!("Service manager initialised");
 
     // -----------------------------------------------------------------------
-    // Phase 9: Persistent deployment storage (SQLite)
+    // Phase 9: Persistent deployment storage (ZQL)
     // -----------------------------------------------------------------------
-    let db_path = config.data_dir.join("deployments.db");
+    let db_path = config.data_dir.join("deployments_zql");
     let storage =
-        Arc::new(SqlxStorage::open(&db_path).await.with_context(|| {
+        Arc::new(ZqlStorage::open(&db_path).await.with_context(|| {
             format!("Failed to open deployment storage at {}", db_path.display())
         })?);
     info!(path = %db_path.display(), "Deployment storage opened");

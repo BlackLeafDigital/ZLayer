@@ -53,8 +53,11 @@ num_cpus = { workspace = true }
 # JSON serialization for snapshots
 serde_json.workspace = true
 
+# Hex encoding for binary data in ZQL
+hex.workspace = true
+
 # Storage (optional, for persistent feature)
-sqlx = { workspace = true, optional = true }
+zql = { workspace = true, optional = true }
 
 # Testing utilities
 [dev-dependencies]
@@ -62,5 +65,5 @@ tempfile = "3"
 wiremock = "0.6"
 
 [features]
-persistent = ["sqlx"]
+persistent = ["zql"]
 test-skip-http = []

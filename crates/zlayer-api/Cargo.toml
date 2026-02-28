@@ -79,7 +79,7 @@ tar.workspace = true
 flate2.workspace = true
 
 # Embedded database
-sqlx.workspace = true
+zql.workspace = true
 
 # Temp directories for tests
 [dev-dependencies]

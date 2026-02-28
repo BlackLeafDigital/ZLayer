@@ -1,0 +1,152 @@
+name: ZDB Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version for artifacts (e.g., 0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ===========================================
+  # Build zlayer binary (Linux amd64)
+  # ===========================================
+  build-binary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container: node:20-bullseye
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: zdb
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+      - name: Install system deps
+        run: apt-get update && apt-get install -y protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git
+      - name: Restore cache
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+      - name: Build
+        run: cargo build --release --package zlayer
+      - name: Package
+        run: tar czf "zlayer-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: zlayer-zdb-linux-amd64
+          path: zlayer-linux-amd64.tar.gz
+          retention-days: 7
+
+  # ===========================================
+  # Build zlayer-zdb-* container images
+  # ===========================================
+  build-images:
+    name: Build ZDB Images
+    needs: [build-binary]
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: zdb
+      - name: Install buildah
+        run: sudo apt-get update && sudo apt-get install -y buildah
+      - name: Download zlayer binary
+        uses: actions/download-artifact@v3
+        with:
+          name: zlayer-zdb-linux-amd64
+      - name: Install zlayer
+        run: tar xzf zlayer-linux-amd64.tar.gz && chmod +x zlayer && sudo mv zlayer /usr/local/bin/
+      - name: Prepare zlayer binary for node image
+        run: |
+          mkdir -p target/release
+          cp /usr/local/bin/zlayer target/release/zlayer
+
+      - name: Build images with pipeline (zlayer-zdb namespace)
+        run: |
+          sudo zlayer pipeline \
+            -f ZPipeline.yaml \
+            --no-tui \
+            --set VERSION=${{ inputs.version }} \
+            --set REGISTRY=zlayer-zdb
+
+      - name: Export and upload OCI archives
+        shell: bash
+        run: |
+          VERSION="${{ inputs.version }}"
+          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
+          PKG_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-zdb/${VERSION}"
+
+          for img in zlayer-node zlayer-web zlayer-manager; do
+            echo "Exporting ${img}..."
+            sudo buildah push zlayer-zdb/${img}:${VERSION} \
+              oci-archive:zlayer-zdb-${img}-oci.tar
+
+            echo "Uploading zlayer-zdb-${img}-oci.tar..."
+            curl --fail --max-time 600 --connect-timeout 30 --retry 3 --retry-delay 10 \
+              --user "$AUTH" \
+              --upload-file "zlayer-zdb-${img}-oci.tar" \
+              "${PKG_URL}/zlayer-zdb-${img}-oci.tar" && echo "OK"
+          done
+
+  # ===========================================
+  # Publish crates to Forgejo Cargo registry
+  # ===========================================
+  publish-crates:
+    name: Publish Crates (Forgejo)
+    needs: [build-binary]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: zdb
+      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
+      - name: Restore cache
+        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        with:
+          mode: restore
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
+          bucket: ${{ secrets.S3_BUCKET }}
+          endpoint: https://${{ secrets.S3_ENDPOINT }}
+          region: ${{ secrets.S3_REGION }}
+          access-key: ${{ secrets.S3_ACCESS_KEY }}
+          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
+
+      - name: Configure Forgejo Cargo registry
+        run: |
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml << 'EOF'
+          [registries.forgejo]
+          index = "sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/"
+          EOF
+
+      - name: Publish crates to Forgejo
+        env:
+          CARGO_REGISTRIES_FORGEJO_TOKEN: ${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+        run: |
+          CRATES="zlayer-spec zlayer-observability zlayer-overlay zlayer-storage zlayer-core zlayer-builder zlayer-init-actions zlayer-registry zlayer-scheduler zlayer-tunnel"
+
+          for crate in $CRATES; do
+            echo "Publishing $crate to Forgejo..."
+            if cargo publish --registry forgejo -p "$crate" --allow-dirty; then
+              echo "OK: $crate published"
+            else
+              echo "WARN: $crate may already exist or failed"
+            fi
+            sleep 30
+          done

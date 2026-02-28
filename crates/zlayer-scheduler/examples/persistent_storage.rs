@@ -14,12 +14,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     use openraft::storage::Adaptor;
 
     // Create persistent storage in /tmp for this example
-    let storage = PersistentRaftStorage::new("/tmp/zlayer-raft.db").await?;
+    let storage = PersistentRaftStorage::new("/tmp/zlayer-raft-zql").await?;
 
     // Create adaptors for OpenRaft
     let (_log_store, _state_machine) = Adaptor::new(storage);
 
-    println!("Persistent Raft storage created at /tmp/zlayer-raft.db");
+    println!("Persistent Raft storage created at /tmp/zlayer-raft-zql");
     println!("Storage will survive process restarts!");
 
     // The log_store and state_machine can now be used with OpenRaft

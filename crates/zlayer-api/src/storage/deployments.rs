@@ -1,13 +1,12 @@
 //! Deployment storage implementations
 //!
-//! Provides both persistent (SQLite via sqlx) and in-memory storage backends.
+//! Provides both persistent (ZQL) and in-memory storage backends.
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
@@ -33,15 +32,15 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
 }
 
-impl From<sqlx::Error> for StorageError {
-    fn from(err: sqlx::Error) -> Self {
-        StorageError::Database(err.to_string())
-    }
-}
-
 impl From<serde_json::Error> for StorageError {
     fn from(err: serde_json::Error) -> Self {
         StorageError::Serialization(err.to_string())
+    }
+}
+
+impl From<zql::database::DatabaseError> for StorageError {
+    fn from(err: zql::database::DatabaseError) -> Self {
+        StorageError::Database(err.to_string())
     }
 }
 
@@ -66,130 +65,148 @@ pub trait DeploymentStorage: Send + Sync {
     }
 }
 
-/// SQLite-based persistent storage for deployments using sqlx
-pub struct SqlxStorage {
-    pool: SqlitePool,
+/// ZQL-based persistent storage for deployments
+pub struct ZqlStorage {
+    db: tokio::sync::Mutex<zql::Database>,
 }
 
-impl SqlxStorage {
-    /// Open or create a SQLite database at the given path
+impl ZqlStorage {
+    /// Open or create a ZQL database at the given path
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
-        let path_str = path.as_ref().display().to_string();
-        let connection_string = format!("sqlite:{}?mode=rwc", path_str);
+        let path = path.as_ref().to_path_buf();
 
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect(&connection_string)
-            .await?;
+        // ZQL Database::open is synchronous, run on blocking thread
+        let db = tokio::task::spawn_blocking(move || {
+            zql::Database::open(&path)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("spawn_blocking failed: {e}")))?
+        .map_err(StorageError::from)?;
 
-        // Enable WAL mode for better concurrent access
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&pool)
-            .await?;
-        sqlx::query("PRAGMA busy_timeout=5000")
-            .execute(&pool)
-            .await?;
-
-        // Create the deployments table if it doesn't exist
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS deployments (
-                name TEXT PRIMARY KEY NOT NULL,
-                data_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await?;
-
-        Ok(Self { pool })
+        Ok(Self {
+            db: tokio::sync::Mutex::new(db),
+        })
     }
 
-    /// Create an in-memory SQLite database (useful for testing)
+    /// Create a ZQL database in a temporary directory (useful for testing)
+    #[cfg(test)]
     pub async fn in_memory() -> Result<Self, StorageError> {
-        let pool = SqlitePool::connect(":memory:").await?;
+        let temp_dir = tempfile::tempdir()
+            .map_err(|e| StorageError::Database(format!("failed to create temp dir: {e}")))?;
+        let path = temp_dir.path().join("deployments_zql");
 
-        // Create the deployments table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS deployments (
-                name TEXT PRIMARY KEY NOT NULL,
-                data_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await?;
+        let db = tokio::task::spawn_blocking(move || {
+            // Keep temp_dir alive by moving it into the closure (leaked)
+            let _keep = temp_dir;
+            zql::Database::open(&path)
+        })
+        .await
+        .map_err(|e| StorageError::Database(format!("spawn_blocking failed: {e}")))?
+        .map_err(StorageError::from)?;
 
-        Ok(Self { pool })
+        Ok(Self {
+            db: tokio::sync::Mutex::new(db),
+        })
     }
 }
 
 #[async_trait]
-impl DeploymentStorage for SqlxStorage {
+impl DeploymentStorage for ZqlStorage {
     async fn store(&self, deployment: &StoredDeployment) -> Result<(), StorageError> {
         let data_json = serde_json::to_string(deployment)?;
-        let created_at = deployment.created_at.to_rfc3339();
-        let updated_at = deployment.updated_at.to_rfc3339();
+        let name = deployment.name.clone();
 
-        sqlx::query(
-            r#"
-            INSERT OR REPLACE INTO deployments (name, data_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?)
-            "#,
-        )
-        .bind(&deployment.name)
-        .bind(&data_json)
-        .bind(&created_at)
-        .bind(&updated_at)
-        .execute(&self.pool)
-        .await?;
+        // Delete existing entry first (upsert semantics)
+        let mut db = self.db.lock().await;
+        let _ = db.query(&format!(
+            "DELETE FROM deployments WHERE name = '{}'",
+            name.replace('\'', "''")
+        ));
+
+        // Insert new entry
+        db.query(&format!(
+            "INSERT INTO deployments (name, data_json) VALUES ('{}', '{}')",
+            name.replace('\'', "''"),
+            data_json.replace('\'', "''")
+        ))
+        .map_err(StorageError::from)?;
 
         Ok(())
     }
 
     async fn get(&self, name: &str) -> Result<Option<StoredDeployment>, StorageError> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT data_json FROM deployments WHERE name = ?")
-                .bind(name)
-                .fetch_optional(&self.pool)
-                .await?;
+        let mut db = self.db.lock().await;
+        let result = db.query(&format!(
+            "SELECT * FROM deployments WHERE name = '{}'",
+            name.replace('\'', "''")
+        ));
 
-        match row {
-            Some((data_json,)) => {
-                let deployment: StoredDeployment = serde_json::from_str(&data_json)?;
-                Ok(Some(deployment))
+        match result {
+            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
+                if records.is_empty() {
+                    return Ok(None);
+                }
+                let record = &records[0];
+                if let Some(data_json) = record.fields.get("data_json") {
+                    let deployment: StoredDeployment = serde_json::from_str(data_json)?;
+                    Ok(Some(deployment))
+                } else {
+                    Ok(None)
+                }
             }
-            None => Ok(None),
+            Ok(_) => Ok(None),
+            Err(zql::database::DatabaseError::Exec(
+                zql::query::executor::ExecError::UnknownStore(_),
+            )) => {
+                // Store doesn't exist yet, no deployments
+                Ok(None)
+            }
+            Err(e) => Err(StorageError::from(e)),
         }
     }
 
     async fn list(&self) -> Result<Vec<StoredDeployment>, StorageError> {
-        let rows: Vec<(String,)> =
-            sqlx::query_as("SELECT data_json FROM deployments ORDER BY name")
-                .fetch_all(&self.pool)
-                .await?;
+        let mut db = self.db.lock().await;
+        let result = db.query("SELECT * FROM deployments");
 
-        let mut deployments = Vec::with_capacity(rows.len());
-        for (data_json,) in rows {
-            let deployment: StoredDeployment = serde_json::from_str(&data_json)?;
-            deployments.push(deployment);
+        match result {
+            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
+                let mut deployments = Vec::with_capacity(records.len());
+                for record in &records {
+                    if let Some(data_json) = record.fields.get("data_json") {
+                        let deployment: StoredDeployment = serde_json::from_str(data_json)?;
+                        deployments.push(deployment);
+                    }
+                }
+                deployments.sort_by(|a, b| a.name.cmp(&b.name));
+                Ok(deployments)
+            }
+            Ok(_) => Ok(Vec::new()),
+            Err(zql::database::DatabaseError::Exec(
+                zql::query::executor::ExecError::UnknownStore(_),
+            )) => {
+                // Store doesn't exist yet
+                Ok(Vec::new())
+            }
+            Err(e) => Err(StorageError::from(e)),
         }
-
-        Ok(deployments)
     }
 
     async fn delete(&self, name: &str) -> Result<bool, StorageError> {
-        let result = sqlx::query("DELETE FROM deployments WHERE name = ?")
-            .bind(name)
-            .execute(&self.pool)
-            .await?;
+        // Check existence first
+        let exists = self.get(name).await?.is_some();
+        if !exists {
+            return Ok(false);
+        }
 
-        Ok(result.rows_affected() > 0)
+        let mut db = self.db.lock().await;
+        db.query(&format!(
+            "DELETE FROM deployments WHERE name = '{}'",
+            name.replace('\'', "''")
+        ))
+        .map_err(StorageError::from)?;
+
+        Ok(true)
     }
 }
 
@@ -399,12 +416,12 @@ mod tests {
     }
 
     // =========================================================================
-    // SqlxStorage tests
+    // ZqlStorage tests
     // =========================================================================
 
     #[tokio::test]
-    async fn test_sqlx_store_and_get() {
-        let storage = SqlxStorage::in_memory().await.unwrap();
+    async fn test_zql_store_and_get() {
+        let storage = ZqlStorage::in_memory().await.unwrap();
         let deployment = create_test_deployment("test-app");
 
         storage.store(&deployment).await.unwrap();
@@ -417,16 +434,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sqlx_get_nonexistent() {
-        let storage = SqlxStorage::in_memory().await.unwrap();
+    async fn test_zql_get_nonexistent() {
+        let storage = ZqlStorage::in_memory().await.unwrap();
 
         let result = storage.get("nonexistent").await.unwrap();
         assert!(result.is_none());
     }
 
     #[tokio::test]
-    async fn test_sqlx_list() {
-        let storage = SqlxStorage::in_memory().await.unwrap();
+    async fn test_zql_list() {
+        let storage = ZqlStorage::in_memory().await.unwrap();
 
         storage
             .store(&create_test_deployment("app-c"))
@@ -450,8 +467,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sqlx_delete() {
-        let storage = SqlxStorage::in_memory().await.unwrap();
+    async fn test_zql_delete() {
+        let storage = ZqlStorage::in_memory().await.unwrap();
         let deployment = create_test_deployment("test-app");
 
         storage.store(&deployment).await.unwrap();
@@ -464,16 +481,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sqlx_delete_nonexistent() {
-        let storage = SqlxStorage::in_memory().await.unwrap();
+    async fn test_zql_delete_nonexistent() {
+        let storage = ZqlStorage::in_memory().await.unwrap();
 
         let deleted = storage.delete("nonexistent").await.unwrap();
         assert!(!deleted);
     }
 
     #[tokio::test]
-    async fn test_sqlx_exists() {
-        let storage = SqlxStorage::in_memory().await.unwrap();
+    async fn test_zql_exists() {
+        let storage = ZqlStorage::in_memory().await.unwrap();
         let deployment = create_test_deployment("test-app");
 
         assert!(!storage.exists("test-app").await.unwrap());
@@ -484,8 +501,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sqlx_update() {
-        let storage = SqlxStorage::in_memory().await.unwrap();
+    async fn test_zql_update() {
+        let storage = ZqlStorage::in_memory().await.unwrap();
         let mut deployment = create_test_deployment("test-app");
 
         storage.store(&deployment).await.unwrap();
@@ -499,13 +516,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sqlx_persistent_storage() {
+    async fn test_zql_persistent_storage() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("test.db");
+        let db_path = temp_dir.path().join("test_zql_db");
 
         // Create and populate database
         {
-            let storage = SqlxStorage::open(&db_path).await.unwrap();
+            let storage = ZqlStorage::open(&db_path).await.unwrap();
             storage
                 .store(&create_test_deployment("persistent-app"))
                 .await
@@ -514,7 +531,7 @@ mod tests {
 
         // Reopen and verify data persists
         {
-            let storage = SqlxStorage::open(&db_path).await.unwrap();
+            let storage = ZqlStorage::open(&db_path).await.unwrap();
             let deployment = storage.get("persistent-app").await.unwrap();
             assert!(deployment.is_some());
             assert_eq!(deployment.unwrap().name, "persistent-app");
@@ -522,8 +539,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sqlx_failed_status_serialization() {
-        let storage = SqlxStorage::in_memory().await.unwrap();
+    async fn test_zql_failed_status_serialization() {
+        let storage = ZqlStorage::in_memory().await.unwrap();
         let mut deployment = create_test_deployment("test-app");
         deployment.update_status(DeploymentStatus::Failed {
             message: "Container OOM killed".to_string(),

@@ -1,6 +1,7 @@
 //! Sync manager for coordinating local/remote layer state
 //!
 //! Handles crash-tolerant uploads with resume capability using S3 multipart uploads.
+//! Uses ZQL for persistent sync state storage.
 
 use crate::config::LayerStorageConfig;
 use crate::error::{LayerStorageError, Result};
@@ -9,11 +10,8 @@ use crate::types::{ContainerLayerId, LayerSnapshot, PendingUpload, SyncState};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart as S3CompletedPart};
 use aws_sdk_s3::Client as S3Client;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
@@ -24,7 +22,7 @@ use tracing::{debug, info, instrument, warn};
 pub struct LayerSyncManager {
     config: LayerStorageConfig,
     s3_client: S3Client,
-    pool: SqlitePool,
+    db: tokio::sync::Mutex<zql::Database>,
     /// In-memory cache of sync states
     states: Arc<RwLock<HashMap<String, SyncState>>>,
 }
@@ -59,79 +57,74 @@ impl LayerSyncManager {
 
         let s3_client = S3Client::from_conf(s3_config);
 
-        // Open/create SQLite database
-        let db_url = format!("sqlite:{}?mode=rwc", config.state_db_path.display());
-        let connect_options = SqliteConnectOptions::from_str(&db_url)
-            .map_err(|e| LayerStorageError::Database(e.to_string()))?
-            .create_if_missing(true);
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(connect_options)
-            .await
-            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-
-        // Enable WAL mode for better concurrent access
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&pool)
-            .await
-            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-
-        // Create sync_state table
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS sync_state (
-                container_key TEXT PRIMARY KEY NOT NULL,
-                state_json TEXT NOT NULL,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-            "#,
-        )
-        .execute(&pool)
+        // Open/create ZQL database
+        let db_path = config.state_db_path.clone();
+        let db = tokio::task::spawn_blocking(move || {
+            zql::Database::open(&db_path)
+        })
         .await
+        .map_err(|e| LayerStorageError::Database(format!("spawn_blocking failed: {e}")))?
         .map_err(|e| LayerStorageError::Database(e.to_string()))?;
 
+        let db = tokio::sync::Mutex::new(db);
+
         // Load existing states into memory
-        let states = Arc::new(RwLock::new(Self::load_all_states(&pool).await?));
+        let states = Arc::new(RwLock::new(Self::load_all_states_from_db(&db).await?));
 
         Ok(Self {
             config,
             s3_client,
-            pool,
+            db,
             states,
         })
     }
 
-    async fn load_all_states(pool: &SqlitePool) -> Result<HashMap<String, SyncState>> {
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT container_key, state_json FROM sync_state")
-                .fetch_all(pool)
-                .await
-                .map_err(|e| LayerStorageError::Database(e.to_string()))?;
+    async fn load_all_states_from_db(
+        db: &tokio::sync::Mutex<zql::Database>,
+    ) -> Result<HashMap<String, SyncState>> {
+        let mut db = db.lock().await;
+        let result = db.query("SELECT * FROM sync_state");
 
-        let mut states = HashMap::new();
-        for (key, json) in rows {
-            let state: SyncState = serde_json::from_str(&json)?;
-            states.insert(key, state);
+        match result {
+            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
+                let mut states = HashMap::new();
+                for record in &records {
+                    if let (Some(key), Some(json)) =
+                        (record.fields.get("container_key"), record.fields.get("state_json"))
+                    {
+                        if let Ok(state) = serde_json::from_str::<SyncState>(json) {
+                            states.insert(key.clone(), state);
+                        }
+                    }
+                }
+                Ok(states)
+            }
+            Ok(_) => Ok(HashMap::new()),
+            Err(_) => {
+                // Store doesn't exist yet, no states
+                Ok(HashMap::new())
+            }
         }
-
-        Ok(states)
     }
 
     async fn save_state(&self, state: &SyncState) -> Result<()> {
         let key = state.container_id.to_key();
         let value = serde_json::to_string(state)?;
 
-        sqlx::query(
-            r#"
-            INSERT OR REPLACE INTO sync_state (container_key, state_json, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            "#,
-        )
-        .bind(&key)
-        .bind(&value)
-        .execute(&self.pool)
-        .await
+        let mut db = self.db.lock().await;
+
+        // Delete existing entry first (upsert)
+        let _ = db.query(&format!(
+            "DELETE FROM sync_state WHERE container_key = '{}'",
+            key.replace('\'', "''")
+        ));
+
+        // Insert new entry
+        db.query(&format!(
+            "INSERT INTO sync_state (container_key, state_json) VALUES ('{}', '{}')",
+            key.replace('\'', "''"),
+            value.replace('\'', "''")
+        ))
         .map_err(|e| LayerStorageError::Database(e.to_string()))?;
 
         Ok(())

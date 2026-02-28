@@ -2,11 +2,11 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
+    branches: [main, dev, zdb]
     tags:
       - 'v*'
   pull_request:
-    branches: [main, dev]
+    branches: [main, dev, zdb]
   workflow_dispatch:
     inputs:
       version:

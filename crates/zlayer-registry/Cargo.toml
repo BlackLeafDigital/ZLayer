@@ -19,7 +19,7 @@ flate2 = "1.1.8"
 hex.workspace = true
 oci-client.workspace = true
 serde = { workspace = true }
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"], optional = true }
+zql = { workspace = true, optional = true }
 serde_json.workspace = true
 sha2.workspace = true
 tar = "0.4.44"
@@ -33,6 +33,6 @@ serial_test = "3"
 tempfile = "3.24.0"
 
 [features]
-persistent = ["dep:sqlx"]
+persistent = ["dep:zql"]
 s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
 local = []
