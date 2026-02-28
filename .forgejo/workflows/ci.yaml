@@ -89,6 +89,8 @@ jobs:
     name: Check (macOS)
     runs-on: macos-latest
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    env:
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -175,6 +177,8 @@ jobs:
     runs-on: macos-latest
     needs: check-macos
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    env:
+      CARGO_BUILD_JOBS: "2"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -250,6 +254,8 @@ jobs:
     name: Build Release (macOS)
     runs-on: macos-latest
     needs: [test-macos]
+    env:
+      CARGO_BUILD_JOBS: "2"
     if: |-
       ${{
         always() &&
