@@ -527,6 +527,7 @@ pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResu
             name: "http".to_string(),
             protocol: zlayer_spec::Protocol::Http,
             port: p,
+            target_port: None,
             path: None,
             expose: zlayer_spec::ExposeType::Internal,
             stream: None,

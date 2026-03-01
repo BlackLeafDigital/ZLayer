@@ -885,7 +885,7 @@ fn build_network_access(spec: &ServiceSpec) -> NetworkAccess {
 
     // Collect ports from endpoints
     for endpoint in &spec.endpoints {
-        bind_ports.push(endpoint.port);
+        bind_ports.push(endpoint.target_port());
     }
 
     // If no endpoints and no special network config, default to full access

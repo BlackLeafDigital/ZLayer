@@ -292,7 +292,7 @@ impl ServiceInstance {
                                             Protocol::Http | Protocol::Https | Protocol::Websocket
                                         )
                                     })
-                                    .map(|ep| ep.port)
+                                    .map(|ep| ep.target_port())
                                     .unwrap_or(8080)
                             });
                         }
@@ -309,7 +309,7 @@ impl ServiceInstance {
                     if let (Some(proxy), Some(ip)) = (&self.proxy_manager, effective_ip) {
                         let proxy = Arc::clone(proxy);
                         let service_name = self.service_name.clone();
-                        // Get the endpoint port, using the runtime override if present.
+                        // Get the container's target port, using the runtime override if present.
                         // On macOS sandbox, port_override gives each replica a unique port
                         // so the proxy can distinguish backends sharing 127.0.0.1.
                         let port = port_override.unwrap_or_else(|| {
@@ -322,7 +322,7 @@ impl ServiceInstance {
                                         Protocol::Http | Protocol::Https | Protocol::Websocket
                                     )
                                 })
-                                .map(|ep| ep.port)
+                                .map(|ep| ep.target_port())
                                 .unwrap_or(8080)
                         });
 
@@ -1345,7 +1345,7 @@ impl ServiceManager {
                     Protocol::Http | Protocol::Https | Protocol::Websocket
                 )
             })
-            .map(|ep| ep.port)
+            .map(|ep| ep.target_port())
             .unwrap_or(8080);
 
         let has_port_overrides = addrs.iter().any(|addr| addr.port() != primary_spec_port);
@@ -1359,10 +1359,10 @@ impl ServiceManager {
                         addrs.to_vec()
                     } else {
                         // Normal case: each container has its own IP, construct
-                        // addresses using the TCP endpoint's declared port.
+                        // addresses using the TCP endpoint's container target port.
                         addrs
                             .iter()
-                            .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
+                            .map(|addr| SocketAddr::new(addr.ip(), endpoint.target_port()))
                             .collect()
                     };
 
@@ -1381,7 +1381,7 @@ impl ServiceManager {
                     } else {
                         addrs
                             .iter()
-                            .map(|addr| SocketAddr::new(addr.ip(), endpoint.port))
+                            .map(|addr| SocketAddr::new(addr.ip(), endpoint.target_port()))
                             .collect()
                     };
 
@@ -1476,7 +1476,7 @@ impl ServiceManager {
     ) -> Vec<SocketAddr> {
         let mut addrs = Vec::new();
 
-        // Get the primary endpoint port (first HTTP endpoint) as the default
+        // Get the primary container target port (first HTTP endpoint) as the default
         let spec_port = instance
             .spec
             .endpoints
@@ -1487,7 +1487,7 @@ impl ServiceManager {
                     Protocol::Http | Protocol::Https | Protocol::Websocket
                 )
             })
-            .map(|ep| ep.port)
+            .map(|ep| ep.target_port())
             .unwrap_or(8080);
 
         // Collect backend addresses from containers with overlay IPs

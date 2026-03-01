@@ -1047,8 +1047,10 @@ async fn test_service_instance_full_integration() {
                         );
 
                         // Add backend to proxy with the overlay IP
-                        let backend_addr =
-                            SocketAddr::new(container.overlay_ip.unwrap(), spec.endpoints[0].port);
+                        let backend_addr = SocketAddr::new(
+                            container.overlay_ip.unwrap(),
+                            spec.endpoints[0].target_port(),
+                        );
                         proxy.add_backend(&service_name, backend_addr).await;
                     }
                 }

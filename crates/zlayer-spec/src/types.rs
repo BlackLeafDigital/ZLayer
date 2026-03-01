@@ -704,9 +704,14 @@ pub struct EndpointSpec {
     /// Protocol
     pub protocol: Protocol,
 
-    /// Container port
+    /// Proxy listen port (external-facing port)
     #[validate(custom(function = "crate::validate::validate_port_wrapper"))]
     pub port: u16,
+
+    /// Container port the service actually listens on.
+    /// Defaults to `port` when not specified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_port: Option<u16>,
 
     /// URL path prefix (for http/https/websocket)
     pub path: Option<String>,
@@ -723,6 +728,14 @@ pub struct EndpointSpec {
     /// Optional tunnel configuration for this endpoint
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tunnel: Option<EndpointTunnelConfig>,
+}
+
+impl EndpointSpec {
+    /// Returns the port the container actually listens on.
+    /// Falls back to `port` when `target_port` is not specified.
+    pub fn target_port(&self) -> u16 {
+        self.target_port.unwrap_or(self.port)
+    }
 }
 
 /// Tunnel configuration for an endpoint
