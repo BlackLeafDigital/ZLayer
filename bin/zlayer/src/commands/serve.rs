@@ -27,17 +27,31 @@ struct DaemonMetadata {
     overlay_cidr: String,
 }
 
-/// Minimal struct for reading back the PID from a previous daemon's metadata.
+/// Minimal struct for reading back the PID and bind address from a previous daemon's metadata.
 #[derive(Deserialize)]
 struct StaleDaemonMeta {
     pid: u32,
+    /// The API bind address (e.g. "0.0.0.0:3669") so we can verify the port is
+    /// free after killing the old process.
+    #[serde(default)]
+    api_bind: Option<String>,
 }
 
 /// Clean up a stale daemon process and leftover network state from a previous run.
 ///
 /// This is best-effort: all errors are logged as warnings but never prevent startup.
-async fn cleanup_stale_daemon(config: &DaemonConfig) {
+async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind: &str) {
     let metadata_path = config.data_dir.join("daemon.json");
+    let my_pid = std::process::id();
+
+    // Track whether the PID-based kill was conclusive (i.e. daemon.json existed
+    // and the named PID was either dead or successfully killed).
+    let mut pid_kill_conclusive = false;
+
+    // The port we need to verify is free before returning.  Default to the
+    // port extracted from the *current* bind address; override with the port
+    // from the old daemon.json if available.
+    let mut api_port: u16 = parse_port_from_bind(api_bind).unwrap_or(3669);
 
     // -----------------------------------------------------------------------
     // 1. Read the old daemon PID and terminate it if still alive
@@ -45,13 +59,23 @@ async fn cleanup_stale_daemon(config: &DaemonConfig) {
     if let Ok(contents) = tokio::fs::read_to_string(&metadata_path).await {
         match serde_json::from_str::<StaleDaemonMeta>(&contents) {
             Ok(meta) => {
+                // If the old daemon wrote an api_bind, use its port for the
+                // port-free check so we wait on the right port even when the
+                // operator changed the bind address between runs.
+                if let Some(ref old_bind) = meta.api_bind {
+                    if let Some(port) = parse_port_from_bind(old_bind) {
+                        api_port = port;
+                    }
+                }
+
                 let old_pid = meta.pid as i32;
                 // Do not kill ourselves (pid file left over from a clean restart).
-                if old_pid as u32 == std::process::id() {
+                if old_pid as u32 == my_pid {
                     info!(
                         pid = old_pid,
                         "Stale daemon PID matches current process, skipping kill"
                     );
+                    pid_kill_conclusive = true;
                 } else if process_alive(old_pid) {
                     warn!(
                         pid = old_pid,
@@ -72,6 +96,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig) {
 
                     if terminated {
                         info!(pid = old_pid, "Stale daemon exited after SIGTERM");
+                        pid_kill_conclusive = true;
                     } else {
                         warn!(
                             pid = old_pid,
@@ -84,6 +109,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig) {
                             warn!(pid = old_pid, "Stale daemon still alive after SIGKILL");
                         } else {
                             info!(pid = old_pid, "Stale daemon killed with SIGKILL");
+                            pid_kill_conclusive = true;
                         }
                     }
                 } else {
@@ -91,6 +117,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig) {
                         pid = old_pid,
                         "Previous daemon is not running, cleaning up stale files"
                     );
+                    pid_kill_conclusive = true;
                 }
             }
             Err(e) => {
@@ -100,6 +127,56 @@ async fn cleanup_stale_daemon(config: &DaemonConfig) {
                     "Failed to parse stale daemon.json, ignoring"
                 );
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 1b. pkill fallback — if daemon.json was missing or unparseable, use
+    //     pkill to find any orphaned zlayer processes.  Skip our own PID.
+    // -----------------------------------------------------------------------
+    if !pid_kill_conclusive {
+        warn!("daemon.json not found or unparseable, attempting pkill fallback");
+        match tokio::process::Command::new("pkill")
+            .args(["-x", "zlayer"])
+            .output()
+            .await
+        {
+            Ok(output) => {
+                if output.status.success() {
+                    info!("pkill sent SIGTERM to zlayer process(es), waiting for exit");
+                    // Poll for up to 5 seconds for processes to die.
+                    for _ in 0..50 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        let check = tokio::process::Command::new("pgrep")
+                            .args(["-x", "zlayer"])
+                            .output()
+                            .await;
+                        match check {
+                            Ok(out) if !out.status.success() => {
+                                info!("All zlayer processes exited after pkill");
+                                break;
+                            }
+                            _ => continue,
+                        }
+                    }
+                } else {
+                    info!("pkill found no zlayer processes to kill");
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to run pkill fallback (non-fatal)");
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 1c. Remove stale unix socket
+    // -----------------------------------------------------------------------
+    let socket = std::path::Path::new(socket_path);
+    if socket.exists() {
+        match tokio::fs::remove_file(socket).await {
+            Ok(()) => info!(path = %socket_path, "Removed stale unix socket"),
+            Err(e) => warn!(path = %socket_path, error = %e, "Failed to remove stale unix socket"),
         }
     }
 
@@ -155,7 +232,43 @@ async fn cleanup_stale_daemon(config: &DaemonConfig) {
     }
 
     // -----------------------------------------------------------------------
-    // 4. Remove stale daemon metadata and PID files
+    // 4. Wait for API port to be free
+    // -----------------------------------------------------------------------
+    {
+        let bind_addr: std::net::SocketAddr =
+            ([0, 0, 0, 0], api_port).into();
+        let mut port_free = false;
+        for attempt in 1..=50 {
+            match std::net::TcpListener::bind(bind_addr) {
+                Ok(_listener) => {
+                    // Listener is dropped immediately, port is free.
+                    if attempt > 1 {
+                        info!(port = api_port, attempts = attempt, "API port is now free");
+                    }
+                    port_free = true;
+                    break;
+                }
+                Err(_) => {
+                    if attempt == 1 {
+                        warn!(
+                            port = api_port,
+                            "API port still in use, waiting for it to be released"
+                        );
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+            }
+        }
+        if !port_free {
+            warn!(
+                port = api_port,
+                "API port still in use after 5 seconds — startup may fail with 'Address already in use'"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 5. Remove stale daemon metadata and PID files
     // -----------------------------------------------------------------------
     if metadata_path.exists() {
         let _ = tokio::fs::remove_file(&metadata_path).await;
@@ -175,6 +288,12 @@ async fn cleanup_stale_daemon(config: &DaemonConfig) {
 fn process_alive(pid: i32) -> bool {
     // SAFETY: signal 0 is a null signal used purely for existence checking.
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Extract the port number from a bind address string like `"0.0.0.0:3669"`.
+fn parse_port_from_bind(bind: &str) -> Option<u16> {
+    bind.rsplit_once(':')
+        .and_then(|(_, port_str)| port_str.parse::<u16>().ok())
 }
 
 /// Start the daemon API server with full infrastructure.
@@ -211,7 +330,7 @@ pub(crate) async fn serve(
     // -----------------------------------------------------------------------
     // 1b. Clean up any stale daemon from a previous run
     // -----------------------------------------------------------------------
-    cleanup_stale_daemon(&config).await;
+    cleanup_stale_daemon(&config, socket_path, bind).await;
 
     // -----------------------------------------------------------------------
     // 2. Initialise all daemon infrastructure
