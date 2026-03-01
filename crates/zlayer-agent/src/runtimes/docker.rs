@@ -100,7 +100,7 @@ fn parse_image_ref(image: &str) -> (&str, &str) {
 fn build_exposed_ports(spec: &ServiceSpec) -> Vec<String> {
     spec.endpoints
         .iter()
-        .map(|endpoint| format!("{}/tcp", endpoint.port))
+        .map(|endpoint| format!("{}/tcp", endpoint.target_port()))
         .collect()
 }
 
@@ -109,7 +109,7 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
     let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
 
     for endpoint in &spec.endpoints {
-        let key = format!("{}/tcp", endpoint.port);
+        let key = format!("{}/tcp", endpoint.target_port());
         let binding = PortBinding {
             host_ip: Some("0.0.0.0".to_string()),
             host_port: Some(endpoint.port.to_string()),
@@ -1103,6 +1103,7 @@ mod tests {
                 name: format!("endpoint{}", i),
                 protocol: Protocol::Http,
                 port,
+                target_port: None,
                 path: None,
                 expose: ExposeType::Internal,
                 stream: None,
