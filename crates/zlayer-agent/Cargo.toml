@@ -1,5 +1,5 @@
 [package]
-name = "zlayer-agent"
+name = "zlayer-agent-zql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -29,7 +29,7 @@ s3 = ["zlayer-init-actions/s3", "zlayer-registry/s3"]
 async-trait.workspace = true
 chrono.workspace = true
 cron.workspace = true
-zlayer-init-actions = { version = "0.1.0", path = "../zlayer-init-actions" }
+zlayer-init-actions = { workspace = true }
 libc.workspace = true
 nix.workspace = true
 oci-spec.workspace = true
@@ -37,19 +37,19 @@ reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
-zlayer-secrets = { version = "0.1.0", path = "../zlayer-secrets" }
-zlayer-spec = { version = "0.1.0", path = "../zlayer-spec" }
+zlayer-secrets = { workspace = true }
+zlayer-spec = { workspace = true }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
-zlayer-core = { version = "0.1.0", path = "../zlayer-core" }
-zlayer-proxy = { version = "0.1.0", path = "../zlayer-proxy" }
-zlayer-registry = { version = "0.1.0", path = "../zlayer-registry", features = ["persistent"] }
-zlayer-overlay = { version = "0.1.0", path = "../zlayer-overlay" }
+zlayer-core = { workspace = true }
+zlayer-proxy = { workspace = true }
+zlayer-registry = { workspace = true, features = ["persistent"] }
+zlayer-overlay = { workspace = true }
 ipnetwork = "0.21.1"
 num_cpus.workspace = true
-zlayer-scheduler = { version = "0.1.0", path = "../zlayer-scheduler" }
+zlayer-scheduler = { workspace = true }
 ulid = "1.2.1"
 
 # Streaming utilities (needed for Docker streaming)

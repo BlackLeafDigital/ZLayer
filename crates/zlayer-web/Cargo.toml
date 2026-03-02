@@ -1,5 +1,5 @@
 [package]
-name = "zlayer-web"
+name = "zlayer-web-zql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -50,10 +50,10 @@ tower-http = { version = "0.6", features = ["fs", "trace", "compression-br"], op
 leptos_axum = { version = "0.8", optional = true }
 
 # Local crates (server-only)
-zlayer-agent = { path = "../zlayer-agent", optional = true }
-zlayer-spec = { path = "../zlayer-spec", optional = true }
-zlayer-scheduler = { path = "../zlayer-scheduler", optional = true }
-zlayer-observability = { path = "../zlayer-observability", optional = true }
+zlayer-agent = { workspace = true, optional = true }
+zlayer-spec = { workspace = true, optional = true }
+zlayer-scheduler = { workspace = true, optional = true }
+zlayer-observability = { workspace = true, optional = true }
 
 # WASM execution (server-only)
 wasmtime = { version = "41", default-features = false, features = ["cranelift"], optional = true }

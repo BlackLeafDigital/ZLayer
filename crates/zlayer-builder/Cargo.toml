@@ -1,5 +1,5 @@
 [package]
-name = "zlayer-builder"
+name = "zlayer-builder-zql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -39,10 +39,10 @@ dirs = "5"
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
-zlayer-tui = { path = "../zlayer-tui" }
+zlayer-tui = { workspace = true }
 
 # Cache backend (optional)
-zlayer-registry = { path = "../zlayer-registry", optional = true }
+zlayer-registry = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

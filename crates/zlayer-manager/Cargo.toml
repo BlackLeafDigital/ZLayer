@@ -1,5 +1,5 @@
 [package]
-name = "zlayer-manager"
+name = "zlayer-manager-zql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -29,9 +29,9 @@ tracing = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, optional = true }
 wasm-bindgen = "0.2.108"
 web-sys = { version = "0.3.85", features = ["Window", "Document", "Element", "Storage", "MediaQueryList"] }
-zlayer-agent = { version = "0.1.0", path = "../zlayer-agent", optional = true }
-zlayer-api = { version = "0.1.0", path = "../zlayer-api", optional = true }
-zlayer-spec = { version = "0.1.0", path = "../zlayer-spec", optional = true }
+zlayer-agent = { workspace = true, optional = true }
+zlayer-api = { workspace = true, optional = true }
+zlayer-spec = { workspace = true, optional = true }
 
 [lints]
 workspace = true

@@ -1,5 +1,5 @@
 [package]
-name = "zlayer-tui"
+name = "zlayer-tui-zql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

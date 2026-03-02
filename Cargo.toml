@@ -178,6 +178,35 @@ num_cpus = "1.16"
 rand = "0.8"
 
 # =============================================================================
+# Internal Workspace Crates (aliased with -zql suffix for publishing)
+# =============================================================================
+# The dependency KEY stays as `zlayer-X` so all code (`use zlayer_X::...`) and
+# feature forwarding (`zlayer-X/feature`) works without changes.
+# The `package` field tells Cargo the actual crate name on the registry.
+
+# --- Publishable crates ---
+zlayer-spec = { path = "crates/zlayer-spec", version = "0.1.0", package = "zlayer-spec-zql" }
+zlayer-observability = { path = "crates/zlayer-observability", version = "0.1.0", package = "zlayer-observability-zql" }
+zlayer-overlay = { path = "crates/zlayer-overlay", version = "0.1.0", package = "zlayer-overlay-zql" }
+zlayer-storage = { path = "crates/zlayer-storage", version = "0.1.0", package = "zlayer-storage-zql" }
+zlayer-core = { path = "crates/zlayer-core", version = "0.1.0", package = "zlayer-core-zql" }
+zlayer-builder = { path = "crates/zlayer-builder", version = "0.1.0", package = "zlayer-builder-zql" }
+zlayer-init-actions = { path = "crates/zlayer-init-actions", version = "0.1.0", package = "zlayer-init-actions-zql" }
+zlayer-registry = { path = "crates/zlayer-registry", version = "0.1.0", package = "zlayer-registry-zql" }
+zlayer-scheduler = { path = "crates/zlayer-scheduler", version = "0.1.0", package = "zlayer-scheduler-zql" }
+zlayer-tunnel = { path = "crates/zlayer-tunnel", version = "0.1.0", package = "zlayer-tunnel-zql" }
+
+# --- Non-publishable workspace crates ---
+zlayer-agent = { path = "crates/zlayer-agent", version = "0.1.0", package = "zlayer-agent-zql" }
+zlayer-proxy = { path = "crates/zlayer-proxy", version = "0.1.0", package = "zlayer-proxy-zql" }
+zlayer-api = { path = "crates/zlayer-api", version = "0.1.0", package = "zlayer-api-zql" }
+zlayer-tui = { path = "crates/zlayer-tui", version = "0.1.0", package = "zlayer-tui-zql" }
+zlayer-py = { path = "crates/zlayer-py", version = "0.1.0", package = "zlayer-py-zql" }
+zlayer-web = { path = "crates/zlayer-web", version = "0.1.0", package = "zlayer-web-zql" }
+zlayer-secrets = { path = "crates/zlayer-secrets", version = "0.1.0", package = "zlayer-secrets-zql" }
+zlayer-manager = { path = "crates/zlayer-manager", version = "0.1.0", package = "zlayer-manager-zql" }
+
+# =============================================================================
 # Build Profiles
 # =============================================================================
 

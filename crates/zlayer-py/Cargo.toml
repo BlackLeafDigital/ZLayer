@@ -1,5 +1,5 @@
 [package]
-name = "zlayer-py"
+name = "zlayer-py-zql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -27,9 +27,9 @@ pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 
 # ZLayer crates
-zlayer-agent = { version = "0.1.0", path = "../zlayer-agent" }
-zlayer-spec = { version = "0.1.0", path = "../zlayer-spec" }
-zlayer-builder = { version = "0.1.0", path = "../zlayer-builder" }
+zlayer-agent = { workspace = true }
+zlayer-spec = { workspace = true }
+zlayer-builder = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["full"] }

@@ -1,5 +1,5 @@
 [package]
-name = "zlayer-storage"
+name = "zlayer-storage-zql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

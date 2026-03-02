@@ -10769,51 +10769,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zlayer"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "bytes",
- "chrono",
- "clap 4.5.59",
- "crossterm",
- "http-body-util",
- "hyper 1.8.1",
- "hyper-util",
- "libc",
- "nix 0.31.1",
- "rand 0.8.5",
- "ratatui",
- "reqwest 0.13.2",
- "serde",
- "serde_json",
- "serde_yaml 0.9.34+deprecated",
- "tokio",
- "tokio-stream",
- "tower",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
- "uuid",
- "zlayer-agent",
- "zlayer-api",
- "zlayer-builder",
- "zlayer-core",
- "zlayer-init-actions",
- "zlayer-observability",
- "zlayer-overlay",
- "zlayer-proxy",
- "zlayer-registry",
- "zlayer-scheduler",
- "zlayer-secrets",
- "zlayer-spec",
- "zlayer-tui",
- "zlayer-tunnel",
-]
-
-[[package]]
-name = "zlayer-agent"
+name = "zlayer-agent-zql"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -10848,18 +10804,18 @@ dependencies = [
  "wasmtime-wasi",
  "wasmtime-wasi-http",
  "wat",
- "zlayer-core",
- "zlayer-init-actions",
- "zlayer-overlay",
- "zlayer-proxy",
- "zlayer-registry",
- "zlayer-scheduler",
- "zlayer-secrets",
- "zlayer-spec",
+ "zlayer-core-zql",
+ "zlayer-init-actions-zql",
+ "zlayer-overlay-zql",
+ "zlayer-proxy-zql",
+ "zlayer-registry-zql",
+ "zlayer-scheduler-zql",
+ "zlayer-secrets-zql",
+ "zlayer-spec-zql",
 ]
 
 [[package]]
-name = "zlayer-api"
+name = "zlayer-api-zql"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -10891,18 +10847,18 @@ dependencies = [
  "utoipa",
  "utoipa-swagger-ui",
  "uuid",
- "zlayer-agent",
- "zlayer-builder",
- "zlayer-observability",
- "zlayer-overlay",
- "zlayer-scheduler",
- "zlayer-secrets",
- "zlayer-spec",
+ "zlayer-agent-zql",
+ "zlayer-builder-zql",
+ "zlayer-observability-zql",
+ "zlayer-overlay-zql",
+ "zlayer-scheduler-zql",
+ "zlayer-secrets-zql",
+ "zlayer-spec-zql",
  "zql",
 ]
 
 [[package]]
-name = "zlayer-builder"
+name = "zlayer-builder-zql"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -10921,12 +10877,12 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "zlayer-registry",
- "zlayer-tui",
+ "zlayer-registry-zql",
+ "zlayer-tui-zql",
 ]
 
 [[package]]
-name = "zlayer-core"
+name = "zlayer-core-zql"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
@@ -10936,11 +10892,11 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
- "zlayer-spec",
+ "zlayer-spec-zql",
 ]
 
 [[package]]
-name = "zlayer-init-actions"
+name = "zlayer-init-actions-zql"
 version = "0.1.0"
 dependencies = [
  "aws-config",
@@ -10953,7 +10909,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zlayer-manager"
+name = "zlayer-manager-zql"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -10978,13 +10934,13 @@ dependencies = [
  "tracing-subscriber",
  "wasm-bindgen",
  "web-sys",
- "zlayer-agent",
- "zlayer-api",
- "zlayer-spec",
+ "zlayer-agent-zql",
+ "zlayer-api-zql",
+ "zlayer-spec-zql",
 ]
 
 [[package]]
-name = "zlayer-observability"
+name = "zlayer-observability-zql"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -11008,7 +10964,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zlayer-overlay"
+name = "zlayer-overlay-zql"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
@@ -11025,12 +10981,12 @@ dependencies = [
  "trust-dns-client",
  "trust-dns-server",
  "x25519-dalek",
- "zlayer-core",
- "zlayer-spec",
+ "zlayer-core-zql",
+ "zlayer-spec-zql",
 ]
 
 [[package]]
-name = "zlayer-proxy"
+name = "zlayer-proxy-zql"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -11063,11 +11019,11 @@ dependencies = [
  "tower",
  "tracing",
  "x509-parser 0.18.1",
- "zlayer-spec",
+ "zlayer-spec-zql",
 ]
 
 [[package]]
-name = "zlayer-py"
+name = "zlayer-py-zql"
 version = "0.1.0"
 dependencies = [
  "indexmap 2.13.0",
@@ -11081,13 +11037,13 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "zlayer-agent",
- "zlayer-builder",
- "zlayer-spec",
+ "zlayer-agent-zql",
+ "zlayer-builder-zql",
+ "zlayer-spec-zql",
 ]
 
 [[package]]
-name = "zlayer-registry"
+name = "zlayer-registry-zql"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -11111,7 +11067,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zlayer-scheduler"
+name = "zlayer-scheduler-zql"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -11133,13 +11089,13 @@ dependencies = [
  "tracing",
  "uuid",
  "wiremock",
- "zlayer-core",
- "zlayer-spec",
+ "zlayer-core-zql",
+ "zlayer-spec-zql",
  "zql",
 ]
 
 [[package]]
-name = "zlayer-secrets"
+name = "zlayer-secrets-zql"
 version = "0.1.0"
 dependencies = [
  "argon2",
@@ -11162,7 +11118,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zlayer-spec"
+name = "zlayer-spec-zql"
 version = "0.1.0"
 dependencies = [
  "cron",
@@ -11176,7 +11132,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zlayer-storage"
+name = "zlayer-storage-zql"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -11199,7 +11155,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zlayer-tui"
+name = "zlayer-tui-zql"
 version = "0.1.0"
 dependencies = [
  "crossterm",
@@ -11207,7 +11163,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zlayer-tunnel"
+name = "zlayer-tunnel-zql"
 version = "0.1.0"
 dependencies = [
  "bytes",
@@ -11224,11 +11180,11 @@ dependencies = [
  "toml 0.8.23",
  "tracing",
  "uuid",
- "zlayer-spec",
+ "zlayer-spec-zql",
 ]
 
 [[package]]
-name = "zlayer-web"
+name = "zlayer-web-zql"
 version = "0.1.0"
 dependencies = [
  "axum",
@@ -11252,10 +11208,54 @@ dependencies = [
  "wasmtime-wasi",
  "wat",
  "web-sys",
- "zlayer-agent",
- "zlayer-observability",
- "zlayer-scheduler",
- "zlayer-spec",
+ "zlayer-agent-zql",
+ "zlayer-observability-zql",
+ "zlayer-scheduler-zql",
+ "zlayer-spec-zql",
+]
+
+[[package]]
+name = "zlayer-zql"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "bytes",
+ "chrono",
+ "clap 4.5.59",
+ "crossterm",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
+ "libc",
+ "nix 0.31.1",
+ "rand 0.8.5",
+ "ratatui",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "serde_yaml 0.9.34+deprecated",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+ "uuid",
+ "zlayer-agent-zql",
+ "zlayer-api-zql",
+ "zlayer-builder-zql",
+ "zlayer-core-zql",
+ "zlayer-init-actions-zql",
+ "zlayer-observability-zql",
+ "zlayer-overlay-zql",
+ "zlayer-proxy-zql",
+ "zlayer-registry-zql",
+ "zlayer-scheduler-zql",
+ "zlayer-secrets-zql",
+ "zlayer-spec-zql",
+ "zlayer-tui-zql",
+ "zlayer-tunnel-zql",
 ]
 
 [[package]]

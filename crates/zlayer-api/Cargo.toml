@@ -1,5 +1,5 @@
 [package]
-name = "zlayer-api"
+name = "zlayer-api-zql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,13 +12,13 @@ readme = "README.md"
 
 [dependencies]
 # Internal crates
-zlayer-agent = { path = "../zlayer-agent" }
-zlayer-builder = { path = "../zlayer-builder" }
-zlayer-overlay = { path = "../zlayer-overlay" }
-zlayer-spec = { path = "../zlayer-spec" }
-zlayer-scheduler = { path = "../zlayer-scheduler" }
-zlayer-observability = { path = "../zlayer-observability" }
-zlayer-secrets = { path = "../zlayer-secrets" }
+zlayer-agent = { workspace = true }
+zlayer-builder = { workspace = true }
+zlayer-overlay = { workspace = true }
+zlayer-spec = { workspace = true }
+zlayer-scheduler = { workspace = true }
+zlayer-observability = { workspace = true }
+zlayer-secrets = { workspace = true }
 
 # Web framework
 axum.workspace = true

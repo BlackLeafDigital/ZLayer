@@ -154,7 +154,7 @@ jobs:
           CARGO_REGISTRIES_FORGEJO_TOKEN: ${{ secrets.FORGEJO_ACTIONS_TOKEN }}
           CARGO_REGISTRIES_FORGEJO_INDEX: "sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/"
         run: |
-          CRATES="zlayer-spec zlayer-observability zlayer-overlay zlayer-storage zlayer-core zlayer-builder zlayer-init-actions zlayer-registry zlayer-scheduler zlayer-tunnel"
+          CRATES="zlayer-spec-zql zlayer-observability-zql zlayer-overlay-zql zlayer-storage-zql zlayer-core-zql zlayer-builder-zql zlayer-init-actions-zql zlayer-registry-zql zlayer-scheduler-zql zlayer-tunnel-zql"
 
           for crate in $CRATES; do
             echo "Publishing $crate to Forgejo..."
