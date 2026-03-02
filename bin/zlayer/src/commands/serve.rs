@@ -135,16 +135,32 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     //     pkill to find any orphaned zlayer processes.  Skip our own PID.
     // -----------------------------------------------------------------------
     if !pid_kill_conclusive {
-        warn!("daemon.json not found or unparseable, attempting pkill fallback");
-        match tokio::process::Command::new("pkill")
+        warn!("daemon.json not found or unparseable, attempting targeted kill fallback");
+
+        // Find all zlayer processes EXCEPT ourselves, then kill them.
+        // pkill -x zlayer would kill the parent `zlayer deploy` too, so we
+        // use pgrep to enumerate PIDs and selectively kill only foreign ones.
+        let my_pid = std::process::id();
+        if let Ok(output) = tokio::process::Command::new("pgrep")
             .args(["-x", "zlayer"])
             .output()
             .await
         {
-            Ok(output) => {
-                if output.status.success() {
-                    info!("pkill sent SIGTERM to zlayer process(es), waiting for exit");
-                    // Poll for up to 5 seconds for processes to die.
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut killed_any = false;
+                for line in stdout.lines() {
+                    if let Ok(pid) = line.trim().parse::<u32>() {
+                        if pid != my_pid {
+                            info!(pid = pid, "Sending SIGTERM to stale zlayer process");
+                            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                            killed_any = true;
+                        }
+                    }
+                }
+
+                if killed_any {
+                    // Poll for up to 5 seconds for foreign processes to die.
                     for _ in 0..50 {
                         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                         let check = tokio::process::Command::new("pgrep")
@@ -152,19 +168,29 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                             .output()
                             .await;
                         match check {
-                            Ok(out) if !out.status.success() => {
-                                info!("All zlayer processes exited after pkill");
+                            Ok(out) if out.status.success() => {
+                                // Check if the only remaining PIDs are us
+                                let remaining = String::from_utf8_lossy(&out.stdout);
+                                let foreign = remaining.lines().any(|l| {
+                                    l.trim().parse::<u32>().map_or(false, |p| p != my_pid)
+                                });
+                                if !foreign {
+                                    info!("All stale zlayer processes exited");
+                                    break;
+                                }
+                            }
+                            Ok(_) => {
+                                info!("All stale zlayer processes exited");
                                 break;
                             }
                             _ => continue,
                         }
                     }
                 } else {
-                    info!("pkill found no zlayer processes to kill");
+                    info!("No foreign zlayer processes found");
                 }
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to run pkill fallback (non-fatal)");
+            } else {
+                info!("pgrep found no zlayer processes");
             }
         }
     }
