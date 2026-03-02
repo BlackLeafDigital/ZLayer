@@ -106,8 +106,12 @@ if [ -f "${INSTALL_DIR}/${BINARY}" ]; then
                 else
                     pkill -x "$BINARY" 2>/dev/null || true
                 fi
-                sleep 1
+                for i in $(seq 1 50); do
+                    pgrep -x "$BINARY" >/dev/null 2>&1 || break
+                    sleep 0.1
+                done
             fi
+            rm -f /var/run/zlayer.sock
             ;;
         darwin)
             PLIST="com.zlayer.daemon"
