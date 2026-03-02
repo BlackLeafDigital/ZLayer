@@ -235,8 +235,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     // 4. Wait for API port to be free
     // -----------------------------------------------------------------------
     {
-        let bind_addr: std::net::SocketAddr =
-            ([0, 0, 0, 0], api_port).into();
+        let bind_addr: std::net::SocketAddr = ([0, 0, 0, 0], api_port).into();
         let mut port_free = false;
         for attempt in 1..=50 {
             match std::net::TcpListener::bind(bind_addr) {
