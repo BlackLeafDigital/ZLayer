@@ -1,9 +1,6 @@
 name: ZDB Publish
 
 on:
-  push:
-    tags:
-      - 'zdb-v*'
   workflow_dispatch:
     inputs:
       version:
@@ -130,7 +127,7 @@ jobs:
   # ===========================================
   publish-crates:
     name: Publish Crates (Forgejo)
-    needs: [build-binary]
+    needs: [build-images]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -152,17 +149,10 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
-      - name: Configure Forgejo Cargo registry
-        run: |
-          mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml << 'EOF'
-          [registries.forgejo]
-          index = "sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/"
-          EOF
-
       - name: Publish crates to Forgejo
         env:
           CARGO_REGISTRIES_FORGEJO_TOKEN: ${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+          CARGO_REGISTRIES_FORGEJO_INDEX: "sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/"
         run: |
           CRATES="zlayer-spec zlayer-observability zlayer-overlay zlayer-storage zlayer-core zlayer-builder zlayer-init-actions zlayer-registry zlayer-scheduler zlayer-tunnel"
 
