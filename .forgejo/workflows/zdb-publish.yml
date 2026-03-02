@@ -1,6 +1,9 @@
 name: ZDB Publish
 
 on:
+  push:
+    tags:
+      - 'zdb-v*'
   workflow_dispatch:
     inputs:
       version:
@@ -15,9 +18,29 @@ env:
 
 jobs:
   # ===========================================
+  # Extract version from tag or input
+  # ===========================================
+  resolve-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            # Strip zdb-v prefix from tag
+            TAG="${{ github.ref_name }}"
+            echo "version=${TAG#zdb-v}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ===========================================
   # Build zlayer binary (Linux amd64)
   # ===========================================
   build-binary:
+    needs: [resolve-version]
     runs-on: ubuntu-latest
     timeout-minutes: 45
     container: node:20-bullseye
@@ -55,7 +78,7 @@ jobs:
   # ===========================================
   build-images:
     name: Build ZDB Images
-    needs: [build-binary]
+    needs: [resolve-version, build-binary]
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -80,13 +103,13 @@ jobs:
           sudo zlayer pipeline \
             -f ZPipeline.yaml \
             --no-tui \
-            --set VERSION=${{ inputs.version }} \
+            --set VERSION=${{ needs.resolve-version.outputs.version }} \
             --set REGISTRY=zlayer-zdb
 
       - name: Export and upload OCI archives
         shell: bash
         run: |
-          VERSION="${{ inputs.version }}"
+          VERSION="${{ needs.resolve-version.outputs.version }}"
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
           PKG_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-zdb/${VERSION}"
 
