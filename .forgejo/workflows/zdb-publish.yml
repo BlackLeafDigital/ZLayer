@@ -50,7 +50,7 @@ jobs:
           ref: zdb
       - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
       - name: Install system deps
-        run: apt-get update && apt-get install -y protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git
+        run: apt-get update && apt-get install -y sudo protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
         with:
