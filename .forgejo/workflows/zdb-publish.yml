@@ -60,7 +60,7 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
       - name: Build
-        run: cargo build --release --package zlayer
+        run: cargo build --release --package zlayer-zql
       - name: Package
         run: tar czf "zlayer-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer
       - name: Upload artifact
