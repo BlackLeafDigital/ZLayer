@@ -114,23 +114,25 @@ fn detect_memory_used() -> u64 {
 // Disk detection (via nix::sys::statvfs)
 // =============================================================================
 
+#[allow(clippy::unnecessary_cast)]
 fn detect_disk_total(data_dir: &Path) -> u64 {
     match nix::sys::statvfs::statvfs(data_dir) {
         Ok(stat) => {
             // Total blocks * fragment size = total bytes
-            stat.blocks() * stat.fragment_size()
+            stat.blocks() as u64 * stat.fragment_size() as u64
         }
         Err(_) => 0,
     }
 }
 
+#[allow(clippy::unnecessary_cast)]
 fn detect_disk_used(data_dir: &Path) -> u64 {
     match nix::sys::statvfs::statvfs(data_dir) {
         Ok(stat) => {
-            let frag = stat.fragment_size();
-            let total = stat.blocks() * frag;
+            let frag = stat.fragment_size() as u64;
+            let total = stat.blocks() as u64 * frag;
             // blocks_available is free blocks available to unprivileged users
-            let avail = stat.blocks_available() * frag;
+            let avail = stat.blocks_available() as u64 * frag;
             total.saturating_sub(avail)
         }
         Err(_) => 0,
