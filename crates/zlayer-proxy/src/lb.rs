@@ -23,6 +23,9 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+/// Number of consecutive health-check failures before a backend is marked unhealthy.
+const UNHEALTHY_THRESHOLD: u64 = 3;
+
 // ---------------------------------------------------------------------------
 // LbStrategy
 // ---------------------------------------------------------------------------
@@ -307,6 +310,9 @@ impl LoadBalancer {
     pub fn add_backend(&self, service: &str, addr: SocketAddr) {
         if let Some(mut group) = self.groups.get_mut(service) {
             group.add_backend(addr);
+            debug!(service = service, backend = %addr, total = group.backends.len(), "Added backend to LB group");
+        } else {
+            warn!(service = service, backend = %addr, "Cannot add backend: LB group not registered");
         }
     }
 
@@ -409,23 +415,46 @@ impl LoadBalancer {
                                 backend.reset_failures();
                             }
                             Ok(Err(e)) => {
-                                backend.set_unhealthy();
                                 backend.record_failure();
-                                warn!(
-                                    %addr,
-                                    error = %e,
-                                    failures = backend.consecutive_failures(),
-                                    "Health check failed (connect error)"
-                                );
+                                let failures = backend.consecutive_failures();
+                                if failures >= UNHEALTHY_THRESHOLD {
+                                    if backend.is_healthy() {
+                                        warn!(
+                                            %addr,
+                                            error = %e,
+                                            failures,
+                                            "Backend marked unhealthy after consecutive failures"
+                                        );
+                                    }
+                                    backend.set_unhealthy();
+                                } else {
+                                    debug!(
+                                            %addr,
+                                            error = %e,
+                                            failures,
+                                            "Health check failed ({failures}/{UNHEALTHY_THRESHOLD} before unhealthy)"
+                                    );
+                                }
                             }
                             Err(_elapsed) => {
-                                backend.set_unhealthy();
                                 backend.record_failure();
-                                warn!(
-                                    %addr,
-                                    failures = backend.consecutive_failures(),
-                                    "Health check failed (timeout)"
-                                );
+                                let failures = backend.consecutive_failures();
+                                if failures >= UNHEALTHY_THRESHOLD {
+                                    if backend.is_healthy() {
+                                        warn!(
+                                            %addr,
+                                            failures,
+                                            "Backend marked unhealthy after consecutive timeout failures"
+                                        );
+                                    }
+                                    backend.set_unhealthy();
+                                } else {
+                                    debug!(
+                                        %addr,
+                                        failures,
+                                        "Health check timed out ({failures}/{UNHEALTHY_THRESHOLD} before unhealthy)"
+                                    );
+                                }
                             }
                         }
                     }));
