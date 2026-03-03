@@ -211,7 +211,6 @@ impl ServiceRegistry {
     pub async fn route_count(&self) -> usize {
         self.routes.read().await.len()
     }
-
 }
 
 // ---------------------------------------------------------------------------

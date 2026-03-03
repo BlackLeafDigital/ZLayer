@@ -176,12 +176,11 @@ impl ReverseProxyService {
                 }
             }
 
-            let backend = self
-                .load_balancer
-                .select(&resolved.name)
-                .ok_or_else(|| ProxyError::NoHealthyBackends {
+            let backend = self.load_balancer.select(&resolved.name).ok_or_else(|| {
+                ProxyError::NoHealthyBackends {
                     service: resolved.name.clone(),
-                })?;
+                }
+            })?;
             let _guard = backend.track_connection();
             let backend_addr = backend.addr;
 
@@ -276,7 +275,8 @@ impl ReverseProxyService {
                 let server_upgrade: OnUpgrade = hyper::upgrade::on(backend_response);
 
                 // Build 101 response to send back to the client
-                let mut resp_builder = Response::builder().status(http::StatusCode::SWITCHING_PROTOCOLS);
+                let mut resp_builder =
+                    Response::builder().status(http::StatusCode::SWITCHING_PROTOCOLS);
                 // Note: we need to construct the response manually since we consumed
                 // the backend response to get OnUpgrade. Copy relevant headers.
                 // The hyper::upgrade::on() for the response does NOT consume it —
@@ -290,13 +290,14 @@ impl ReverseProxyService {
                 }
                 resp_builder = resp_builder.header(header::CONNECTION, "upgrade");
 
-                let client_response = resp_builder
-                    .body(empty_body())
-                    .map_err(|e| ProxyError::Internal(format!("Failed to build 101 response: {}", e)))?;
+                let client_response = resp_builder.body(empty_body()).map_err(|e| {
+                    ProxyError::Internal(format!("Failed to build 101 response: {}", e))
+                })?;
 
                 // Spawn background task to bridge the upgraded connections
                 tokio::spawn(async move {
-                    if let Err(e) = crate::tunnel::proxy_upgrade(client_upgrade, server_upgrade).await
+                    if let Err(e) =
+                        crate::tunnel::proxy_upgrade(client_upgrade, server_upgrade).await
                     {
                         debug!(error = %e, "Upgrade tunnel ended");
                     }
@@ -374,12 +375,11 @@ impl ReverseProxyService {
         }
 
         // Select backend via load balancer
-        let backend = self
-            .load_balancer
-            .select(&resolved.name)
-            .ok_or_else(|| ProxyError::NoHealthyBackends {
+        let backend = self.load_balancer.select(&resolved.name).ok_or_else(|| {
+            ProxyError::NoHealthyBackends {
                 service: resolved.name.clone(),
-            })?;
+            }
+        })?;
         let _guard = backend.track_connection();
         let backend_addr = backend.addr;
 

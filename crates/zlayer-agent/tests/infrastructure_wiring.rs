@@ -262,18 +262,19 @@ async fn test_service_manager_full_infrastructure_wiring() {
     let service_registry = Arc::new(ServiceRegistry::new());
     let stream_registry = Arc::new(StreamRegistry::new());
     let proxy_config = ProxyManagerConfig::default();
-    let proxy_manager = Arc::new(ProxyManager::new(proxy_config, service_registry.clone(), None));
+    let proxy_manager = Arc::new(ProxyManager::new(
+        proxy_config,
+        service_registry.clone(),
+        None,
+    ));
     let dns_server = Arc::new(
         DnsServer::new("127.0.0.1:15353".parse().unwrap(), "service.local.")
             .expect("Failed to create DnsServer"),
     );
     let supervisor = Arc::new(ContainerSupervisor::new(runtime.clone()));
 
-    let mut manager = ServiceManager::with_full_config(
-        runtime,
-        overlay_manager,
-        "prod".to_string(),
-    );
+    let mut manager =
+        ServiceManager::with_full_config(runtime, overlay_manager, "prod".to_string());
     manager.set_stream_registry(stream_registry.clone());
     manager.set_proxy_manager(proxy_manager);
     manager.set_dns_server(dns_server);

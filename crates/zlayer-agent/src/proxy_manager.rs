@@ -125,10 +125,8 @@ impl ProxyManager {
         // Spawn the load balancer's background health checker
         let lb_clone = load_balancer.clone();
         tokio::spawn(async move {
-            let handle = lb_clone.spawn_health_checker(
-                Duration::from_secs(5),
-                Duration::from_secs(2),
-            );
+            let handle =
+                lb_clone.spawn_health_checker(Duration::from_secs(5), Duration::from_secs(2));
             handle.await.ok();
         });
 
@@ -199,8 +197,11 @@ impl ProxyManager {
         proxy_config.server.http_addr = addr;
         proxy_config.server.http2_enabled = self.config.http2_enabled;
 
-        let server =
-            ProxyServer::with_registry(proxy_config, self.registry.clone(), self.load_balancer.clone());
+        let server = ProxyServer::with_registry(
+            proxy_config,
+            self.registry.clone(),
+            self.load_balancer.clone(),
+        );
         let server = Arc::new(server);
 
         info!(port = port, bind = %addr, "Proxy listening on port");
@@ -287,7 +288,10 @@ impl ProxyManager {
         while self.active_connections.load(Ordering::Relaxed) > 0 {
             if tokio::time::Instant::now() >= deadline {
                 let remaining = self.active_connections.load(Ordering::Relaxed);
-                warn!(remaining = remaining, "Drain timeout reached, forcing shutdown");
+                warn!(
+                    remaining = remaining,
+                    "Drain timeout reached, forcing shutdown"
+                );
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -650,9 +654,7 @@ impl ProxyManager {
     /// This replaces all backends for the given service with the provided list.
     /// Each backend should be the address where the service replica is listening.
     pub async fn update_backends(&self, service: &str, addrs: Vec<SocketAddr>) {
-        self.registry
-            .update_backends(service, addrs.clone())
-            .await;
+        self.registry.update_backends(service, addrs.clone()).await;
         self.load_balancer.update_backends(service, addrs);
         debug!(service = service, "Updated backends for service");
     }

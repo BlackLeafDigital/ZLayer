@@ -540,11 +540,7 @@ async fn test_proxy_routing() {
 
         // Verify backends were added via the load balancer
         let lb = manager.load_balancer();
-        assert_eq!(
-            lb.backend_count(&service_name),
-            2,
-            "Should have 2 backends"
-        );
+        assert_eq!(lb.backend_count(&service_name), 2, "Should have 2 backends");
 
         // Update health status
         manager
@@ -1321,7 +1317,11 @@ async fn test_proxy_backend_lifecycle() {
         // Remove unhealthy backend
         proxy.remove_backend(&service_name, backend2).await;
         assert_eq!(lb.backend_count(&service_name), 1, "Should have 1 backend");
-        assert_eq!(lb.healthy_count(&service_name), 1, "Should have 1 healthy backend");
+        assert_eq!(
+            lb.healthy_count(&service_name),
+            1,
+            "Should have 1 healthy backend"
+        );
 
         // Remove service
         proxy.remove_service(&service_name).await;

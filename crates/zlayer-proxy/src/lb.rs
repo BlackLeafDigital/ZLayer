@@ -277,7 +277,10 @@ impl LoadBalancer {
     /// Register (or replace) a backend group for `service`.
     pub fn register(&self, service: &str, addrs: Vec<SocketAddr>, strategy: LbStrategy) {
         let mut group = BackendGroup::new(strategy);
-        group.backends = addrs.into_iter().map(|a| Arc::new(Backend::new(a))).collect();
+        group.backends = addrs
+            .into_iter()
+            .map(|a| Arc::new(Backend::new(a)))
+            .collect();
         self.groups.insert(service.to_string(), group);
     }
 
@@ -548,11 +551,19 @@ mod tests {
         assert_eq!(group.backends.len(), 2);
 
         // The preserved backend for 8001 should still have 1 active connection.
-        let preserved = group.backends.iter().find(|b| b.addr == addr(8001)).unwrap();
+        let preserved = group
+            .backends
+            .iter()
+            .find(|b| b.addr == addr(8001))
+            .unwrap();
         assert_eq!(preserved.active_connections(), 1);
 
         // The new backend for 8003 should start fresh.
-        let new_backend = group.backends.iter().find(|b| b.addr == addr(8003)).unwrap();
+        let new_backend = group
+            .backends
+            .iter()
+            .find(|b| b.addr == addr(8003))
+            .unwrap();
         assert_eq!(new_backend.active_connections(), 0);
         assert!(new_backend.is_healthy());
 
