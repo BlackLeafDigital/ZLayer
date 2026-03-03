@@ -1,0 +1,49 @@
+[package]
+name = "zlayer-consensus-zql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Shared Raft consensus library built on openraft 0.9 for ZLayer and ZDB"
+keywords = ["raft", "consensus", "distributed", "openraft"]
+categories = ["concurrency", "network-programming"]
+
+[dependencies]
+# Consensus
+openraft = { workspace = true, features = ["serde", "storage-v2"] }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
+bincode = "1"
+
+# Async
+tokio = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Web framework (for Raft RPC service)
+axum = { workspace = true }
+
+# HTTP client (for Raft RPC client)
+reqwest = { workspace = true }
+
+# Hex encoding for binary data in ZQL
+hex = { workspace = true }
+
+# Persistent storage (optional)
+zql = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"
+
+[features]
+default = ["mem-store"]
+mem-store = []
+zql-store = ["dep:zql", "dep:serde_json"]

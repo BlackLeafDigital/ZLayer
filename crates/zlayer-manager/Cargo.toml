@@ -37,6 +37,7 @@ zlayer-spec = { workspace = true, optional = true }
 workspace = true
 
 [lib]
+name = "zlayer_manager"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]

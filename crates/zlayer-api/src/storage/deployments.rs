@@ -32,12 +32,6 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
 }
 
-impl From<serde_json::Error> for StorageError {
-    fn from(err: serde_json::Error) -> Self {
-        StorageError::Serialization(err.to_string())
-    }
-}
-
 impl From<zql::database::DatabaseError> for StorageError {
     fn from(err: zql::database::DatabaseError) -> Self {
         StorageError::Database(err.to_string())
@@ -111,100 +105,37 @@ impl ZqlStorage {
 #[async_trait]
 impl DeploymentStorage for ZqlStorage {
     async fn store(&self, deployment: &StoredDeployment) -> Result<(), StorageError> {
-        let data_json = serde_json::to_string(deployment)?;
         let name = deployment.name.clone();
 
-        // Delete existing entry first (upsert semantics)
         let mut db = self.db.lock().await;
-        let _ = db.query(&format!(
-            "DELETE FROM deployments WHERE name = '{}'",
-            name.replace('\'', "''")
-        ));
-
-        // Insert new entry
-        db.query(&format!(
-            "INSERT INTO deployments (name, data_json) VALUES ('{}', '{}')",
-            name.replace('\'', "''"),
-            data_json.replace('\'', "''")
-        ))
-        .map_err(StorageError::from)?;
+        db.put_typed("deployments", &name, deployment)
+            .map_err(StorageError::from)?;
 
         Ok(())
     }
 
     async fn get(&self, name: &str) -> Result<Option<StoredDeployment>, StorageError> {
         let mut db = self.db.lock().await;
-        let result = db.query(&format!(
-            "SELECT * FROM deployments WHERE name = '{}'",
-            name.replace('\'', "''")
-        ));
-
-        match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
-                if records.is_empty() {
-                    return Ok(None);
-                }
-                let record = &records[0];
-                if let Some(data_json) = record.fields.get("data_json") {
-                    let deployment: StoredDeployment = serde_json::from_str(data_json)?;
-                    Ok(Some(deployment))
-                } else {
-                    Ok(None)
-                }
-            }
-            Ok(_) => Ok(None),
-            Err(zql::database::DatabaseError::Exec(
-                zql::query::executor::ExecError::UnknownStore(_),
-            )) => {
-                // Store doesn't exist yet, no deployments
-                Ok(None)
-            }
-            Err(e) => Err(StorageError::from(e)),
-        }
+        db.get_typed("deployments", name)
+            .map_err(StorageError::from)
     }
 
     async fn list(&self) -> Result<Vec<StoredDeployment>, StorageError> {
         let mut db = self.db.lock().await;
-        let result = db.query("SELECT * FROM deployments");
+        let all: Vec<(String, StoredDeployment)> = db
+            .scan_typed("deployments", "")
+            .map_err(StorageError::from)?;
 
-        match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
-                let mut deployments = Vec::with_capacity(records.len());
-                for record in &records {
-                    if let Some(data_json) = record.fields.get("data_json") {
-                        let deployment: StoredDeployment = serde_json::from_str(data_json)?;
-                        deployments.push(deployment);
-                    }
-                }
-                deployments.sort_by(|a, b| a.name.cmp(&b.name));
-                Ok(deployments)
-            }
-            Ok(_) => Ok(Vec::new()),
-            Err(zql::database::DatabaseError::Exec(
-                zql::query::executor::ExecError::UnknownStore(_),
-            )) => {
-                // Store doesn't exist yet
-                Ok(Vec::new())
-            }
-            Err(e) => Err(StorageError::from(e)),
-        }
+        let mut deployments: Vec<StoredDeployment> =
+            all.into_iter().map(|(_, d)| d).collect();
+        deployments.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(deployments)
     }
 
     async fn delete(&self, name: &str) -> Result<bool, StorageError> {
-        // Check existence first
-        let exists = self.get(name).await?.is_some();
-        if !exists {
-            return Ok(false);
-        }
-
         let mut db = self.db.lock().await;
-        db.query(&format!(
-            "DELETE FROM deployments WHERE name = '{}'",
-            name.replace('\'', "''")
-        ))
-        .map_err(StorageError::from)?;
-
-        Ok(true)
+        db.delete_typed("deployments", name)
+            .map_err(StorageError::from)
     }
 }
 

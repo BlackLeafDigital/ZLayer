@@ -8,6 +8,7 @@ description = "ZLayer web UI with Leptos SSR + Hydration"
 rust-version.workspace = true
 
 [lib]
+name = "zlayer_web"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]

@@ -21,6 +21,7 @@ members = [
   "crates/zlayer-tunnel",
   "bin/zlayer",
   "crates/zlayer-manager",
+  "crates/zlayer-consensus",
 ]
 
 [workspace.package]
@@ -119,7 +120,7 @@ trust-dns-client = "0.23"
 # Storage
 redb = "2.2"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
-zql = { version = "0.2.29", registry = "forgejo", default-features = false, features = ["sql-compat", "native-storage"] }
+zql = { version = "0.3.0", registry = "forgejo", default-features = false, features = ["sql-compat", "native-storage"] }
 
 # Config
 config = "0.15"
@@ -205,6 +206,7 @@ zlayer-py = { path = "crates/zlayer-py", version = "0.1.0", package = "zlayer-py
 zlayer-web = { path = "crates/zlayer-web", version = "0.1.0", package = "zlayer-web-zql" }
 zlayer-secrets = { path = "crates/zlayer-secrets", version = "0.1.0", package = "zlayer-secrets-zql" }
 zlayer-manager = { path = "crates/zlayer-manager", version = "0.1.0", package = "zlayer-manager-zql" }
+zlayer-consensus = { path = "crates/zlayer-consensus", version = "0.1.0", package = "zlayer-consensus-zql" }
 
 # =============================================================================
 # Build Profiles

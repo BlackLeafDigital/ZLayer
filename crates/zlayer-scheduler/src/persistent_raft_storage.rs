@@ -1,19 +1,19 @@
 //! Persistent storage implementation for OpenRaft using ZQL
 //!
 //! Provides durable log storage and state machine for the scheduler's Raft consensus.
-//! Uses the RaftStorage v1 API which combines log and state machine storage.
+//! Uses the v2 API with separate `RaftLogStorage` and `RaftStateMachine` traits.
 //!
 //! # Usage
 //!
 //! ```no_run
-//! use zlayer_scheduler::persistent_raft_storage::PersistentRaftStorage;
-//! use openraft::storage::RaftStorage;
+//! use zlayer_scheduler_zql::persistent_raft_storage::PersistentRaftStorage;
+//! use openraft::storage::RaftLogStorage;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Create or open persistent storage
 //! let storage = PersistentRaftStorage::new("/var/lib/zlayer/raft_zql").await?;
 //!
-//! // Storage implements RaftStorage and can be used with OpenRaft
+//! // Storage implements RaftLogStorage + RaftStateMachine and can be used with OpenRaft
 //! // Storage automatically recovers state on restart
 //! # Ok(())
 //! # }
@@ -35,7 +35,7 @@ use std::ops::RangeBounds;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use openraft::storage::{LogState, RaftStorage, Snapshot};
+use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
     Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder, SnapshotMeta,
     StorageError, StoredMembership, Vote,
@@ -73,6 +73,12 @@ struct AppliedState {
     state: ClusterState,
 }
 
+/// Snapshot data wrapper for typed storage
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SnapshotDataRecord {
+    data: Vec<u8>,
+}
+
 // =============================================================================
 // Error Helpers
 // =============================================================================
@@ -84,11 +90,6 @@ fn db_to_storage_error(
     msg: String,
 ) -> StorageError<NodeId> {
     StorageError::from_io_error(subject, verb, std::io::Error::other(msg))
-}
-
-/// Escape a string for safe ZQL query embedding
-fn escape_str(s: &str) -> String {
-    s.replace('\'', "''")
 }
 
 // =============================================================================
@@ -123,72 +124,51 @@ impl PersistentLogStore {
     /// Get last purged log ID
     async fn get_last_purged(&self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
         let mut db = self.db.lock().await;
-        let result = db.query("SELECT * FROM log_metadata WHERE key = 'last_purged'");
+        let result: Result<Option<LogMetadata>, _> =
+            db.get_typed("log_metadata", "last_purged");
 
         match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
-                if records.is_empty() {
-                    return Ok(None);
-                }
-                if let Some(data) = records[0].fields.get("value_data") {
-                    let meta: LogMetadata = serde_json::from_str(data).map_err(|e| {
-                        db_to_storage_error(
-                            openraft::ErrorSubject::Store,
-                            openraft::ErrorVerb::Read,
-                            e.to_string(),
-                        )
-                    })?;
-                    Ok(meta.last_purged_log_id)
-                } else {
-                    Ok(None)
-                }
-            }
-            _ => Ok(None),
+            Ok(Some(meta)) => Ok(meta.last_purged_log_id),
+            Ok(None) => Ok(None),
+            Err(e) => Err(db_to_storage_error(
+                openraft::ErrorSubject::Store,
+                openraft::ErrorVerb::Read,
+                e.to_string(),
+            )),
         }
     }
 
     /// Get last log entry
     async fn get_last_log(&self) -> Result<Option<Entry<TypeConfig>>, StorageError<NodeId>> {
-        // We need to scan all log entries and find the one with the highest index
         let mut db = self.db.lock().await;
-        let result = db.query("SELECT * FROM log_entries");
+        let all: Vec<(String, Entry<TypeConfig>)> =
+            db.scan_typed("log_entries", "").map_err(|e| {
+                db_to_storage_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Read,
+                    e.to_string(),
+                )
+            })?;
 
-        match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
-                if records.is_empty() {
-                    return Ok(None);
-                }
-                // Find max index entry
-                let mut best: Option<(u64, &zql::query::executor::RetrievedRecord)> = None;
-                for record in &records {
-                    if let Some(idx_str) = record.fields.get("log_index") {
-                        if let Ok(idx) = idx_str.parse::<u64>() {
-                            match best {
-                                None => best = Some((idx, record)),
-                                Some((cur_max, _)) if idx > cur_max => {
-                                    best = Some((idx, record));
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-                if let Some((_, record)) = best {
-                    if let Some(data) = record.fields.get("entry_data") {
-                        let entry: Entry<TypeConfig> = serde_json::from_str(data).map_err(|e| {
-                            db_to_storage_error(
-                                openraft::ErrorSubject::Store,
-                                openraft::ErrorVerb::Read,
-                                e.to_string(),
-                            )
-                        })?;
-                        return Ok(Some(entry));
-                    }
-                }
-                Ok(None)
-            }
-            _ => Ok(None),
+        if all.is_empty() {
+            return Ok(None);
         }
+
+        // Find entry with the highest index
+        let mut best: Option<(u64, Entry<TypeConfig>)> = None;
+        for (key, entry) in all {
+            if let Ok(idx) = key.parse::<u64>() {
+                match best {
+                    None => best = Some((idx, entry)),
+                    Some((cur_max, _)) if idx > cur_max => {
+                        best = Some((idx, entry));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        Ok(best.map(|(_, entry)| entry))
     }
 }
 
@@ -224,35 +204,17 @@ impl PersistentStateMachine {
     /// Get the current applied state
     async fn get_applied_state(&self) -> Result<AppliedState, StorageError<NodeId>> {
         let mut db = self.db.lock().await;
-        let result = db.query("SELECT * FROM sm_applied_state WHERE key = 'current'");
+        let result: Result<Option<AppliedState>, _> =
+            db.get_typed("sm_applied_state", "current");
 
         match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
-                if records.is_empty() {
-                    return Ok(AppliedState {
-                        last_applied_log: None,
-                        last_membership: StoredMembership::default(),
-                        state: ClusterState::default(),
-                    });
-                }
-                if let Some(data) = records[0].fields.get("value_data") {
-                    let state: AppliedState = serde_json::from_str(data).map_err(|e| {
-                        db_to_storage_error(
-                            openraft::ErrorSubject::StateMachine,
-                            openraft::ErrorVerb::Read,
-                            e.to_string(),
-                        )
-                    })?;
-                    Ok(state)
-                } else {
-                    Ok(AppliedState {
-                        last_applied_log: None,
-                        last_membership: StoredMembership::default(),
-                        state: ClusterState::default(),
-                    })
-                }
-            }
-            _ => Ok(AppliedState {
+            Ok(Some(state)) => Ok(state),
+            Ok(None) => Ok(AppliedState {
+                last_applied_log: None,
+                last_membership: StoredMembership::default(),
+                state: ClusterState::default(),
+            }),
+            Err(_) => Ok(AppliedState {
                 last_applied_log: None,
                 last_membership: StoredMembership::default(),
                 state: ClusterState::default(),
@@ -262,31 +224,16 @@ impl PersistentStateMachine {
 
     /// Set the current applied state
     async fn set_applied_state(&self, state: &AppliedState) -> Result<(), StorageError<NodeId>> {
-        let json = serde_json::to_string(state).map_err(|e| {
-            db_to_storage_error(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Write,
-                e.to_string(),
-            )
-        })?;
-
         let mut db = self.db.lock().await;
 
-        // Delete existing
-        let _ = db.query("DELETE FROM sm_applied_state WHERE key = 'current'");
-
-        // Insert new
-        db.query(&format!(
-            "INSERT INTO sm_applied_state (key, value_data) VALUES ('current', '{}')",
-            escape_str(&json)
-        ))
-        .map_err(|e| {
-            db_to_storage_error(
-                openraft::ErrorSubject::StateMachine,
-                openraft::ErrorVerb::Write,
-                e.to_string(),
-            )
-        })?;
+        db.put_typed("sm_applied_state", "current", state)
+            .map_err(|e| {
+                db_to_storage_error(
+                    openraft::ErrorSubject::StateMachine,
+                    openraft::ErrorVerb::Write,
+                    e.to_string(),
+                )
+            })?;
 
         // Flush for durability (ACID requirement for Raft)
         db.flush().map_err(|e| {
@@ -311,10 +258,10 @@ impl PersistentStateMachine {
 // Combined Persistent Storage
 // =============================================================================
 
-/// Combined persistent storage for OpenRaft (v1 API)
+/// Persistent storage for OpenRaft (v2 API)
 ///
-/// This implements the unified `RaftStorage` trait which combines
-/// log storage and state machine operations, backed by ZQL.
+/// Implements both `RaftLogStorage` and `RaftStateMachine` traits directly,
+/// backed by ZQL for durability.
 pub struct PersistentRaftStorage {
     log_store: Arc<PersistentLogStore>,
     state_machine: Arc<RwLock<PersistentStateMachine>>,
@@ -425,44 +372,33 @@ impl RaftLogReader<TypeConfig> for PersistentRaftStorage {
 
         // Fetch all log entries and filter in memory
         let mut db = self.db.lock().await;
-        let result = db.query("SELECT * FROM log_entries");
+        let all: Vec<(String, Entry<TypeConfig>)> =
+            db.scan_typed("log_entries", "").map_err(|e| {
+                db_to_storage_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Read,
+                    e.to_string(),
+                )
+            })?;
 
-        match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
-                let mut entries: Vec<(u64, Entry<TypeConfig>)> = Vec::new();
+        let mut entries: Vec<(u64, Entry<TypeConfig>)> = Vec::new();
 
-                for record in &records {
-                    if let (Some(idx_str), Some(data)) = (
-                        record.fields.get("log_index"),
-                        record.fields.get("entry_data"),
-                    ) {
-                        if let Ok(idx) = idx_str.parse::<u64>() {
-                            let in_range = idx >= start
-                                && match end {
-                                    Some(e) => idx <= e,
-                                    None => true,
-                                };
-                            if in_range {
-                                let entry: Entry<TypeConfig> =
-                                    serde_json::from_str(data).map_err(|e| {
-                                        db_to_storage_error(
-                                            openraft::ErrorSubject::Logs,
-                                            openraft::ErrorVerb::Read,
-                                            e.to_string(),
-                                        )
-                                    })?;
-                                entries.push((idx, entry));
-                            }
-                        }
-                    }
+        for (key, entry) in all {
+            if let Ok(idx) = key.parse::<u64>() {
+                let in_range = idx >= start
+                    && match end {
+                        Some(e) => idx <= e,
+                        None => true,
+                    };
+                if in_range {
+                    entries.push((idx, entry));
                 }
-
-                // Sort by index
-                entries.sort_by_key(|(idx, _)| *idx);
-                Ok(entries.into_iter().map(|(_, e)| e).collect())
             }
-            _ => Ok(Vec::new()),
         }
+
+        // Sort by index
+        entries.sort_by_key(|(idx, _)| *idx);
+        Ok(entries.into_iter().map(|(_, e)| e).collect())
     }
 }
 
@@ -500,57 +436,30 @@ impl RaftSnapshotBuilder<TypeConfig> for PersistentRaftStorage {
             size: data.len() as u64,
         };
 
-        let meta_json = serde_json::to_string(&snapshot_record).map_err(|e| {
-            db_to_storage_error(
-                openraft::ErrorSubject::Snapshot(None),
-                openraft::ErrorVerb::Write,
-                e.to_string(),
-            )
-        })?;
-
-        let data_hex = hex::encode(&data);
+        let snapshot_data = SnapshotDataRecord {
+            data: data.clone(),
+        };
 
         // Save snapshot atomically
         let mut db = self.db.lock().await;
 
-        // Delete old snapshot entries with same ID
-        let _ = db.query(&format!(
-            "DELETE FROM snapshot_metadata WHERE snapshot_id = '{}'",
-            escape_str(&snapshot_id)
-        ));
-        let _ = db.query(&format!(
-            "DELETE FROM snapshot_data WHERE snapshot_id = '{}'",
-            escape_str(&snapshot_id)
-        ));
+        db.put_typed("snapshot_metadata", &snapshot_id, &snapshot_record)
+            .map_err(|e| {
+                db_to_storage_error(
+                    openraft::ErrorSubject::Snapshot(None),
+                    openraft::ErrorVerb::Write,
+                    e.to_string(),
+                )
+            })?;
 
-        // Insert metadata
-        db.query(&format!(
-            "INSERT INTO snapshot_metadata (snapshot_id, metadata, created_at) VALUES ('{}', '{}', '{}')",
-            escape_str(&snapshot_id),
-            escape_str(&meta_json),
-            now
-        ))
-        .map_err(|e| {
-            db_to_storage_error(
-                openraft::ErrorSubject::Snapshot(None),
-                openraft::ErrorVerb::Write,
-                e.to_string(),
-            )
-        })?;
-
-        // Insert data
-        db.query(&format!(
-            "INSERT INTO snapshot_data (snapshot_id, data_hex) VALUES ('{}', '{}')",
-            escape_str(&snapshot_id),
-            escape_str(&data_hex)
-        ))
-        .map_err(|e| {
-            db_to_storage_error(
-                openraft::ErrorSubject::Snapshot(None),
-                openraft::ErrorVerb::Write,
-                e.to_string(),
-            )
-        })?;
+        db.put_typed("snapshot_data", &snapshot_id, &snapshot_data)
+            .map_err(|e| {
+                db_to_storage_error(
+                    openraft::ErrorSubject::Snapshot(None),
+                    openraft::ErrorVerb::Write,
+                    e.to_string(),
+                )
+            })?;
 
         // Flush for durability
         db.flush().map_err(|e| {
@@ -576,32 +485,16 @@ impl RaftSnapshotBuilder<TypeConfig> for PersistentRaftStorage {
     }
 }
 
-// Implement the unified RaftStorage trait (v1 API)
-#[allow(deprecated)]
-impl RaftStorage<TypeConfig> for PersistentRaftStorage {
+// Implement RaftLogStorage (v2 API) for log and vote operations
+impl RaftLogStorage<TypeConfig> for PersistentRaftStorage {
     type LogReader = Self;
-    type SnapshotBuilder = Self;
 
     // === Vote operations ===
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let json = serde_json::to_string(vote).map_err(|e| {
-            db_to_storage_error(
-                openraft::ErrorSubject::Vote,
-                openraft::ErrorVerb::Write,
-                e.to_string(),
-            )
-        })?;
-
         let mut db = self.db.lock().await;
 
-        // Upsert
-        let _ = db.query("DELETE FROM raft_vote WHERE key = 'current'");
-        db.query(&format!(
-            "INSERT INTO raft_vote (key, value_data) VALUES ('current', '{}')",
-            escape_str(&json)
-        ))
-        .map_err(|e| {
+        db.put_typed("raft_vote", "current", vote).map_err(|e| {
             db_to_storage_error(
                 openraft::ErrorSubject::Vote,
                 openraft::ErrorVerb::Write,
@@ -624,28 +517,13 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
 
     async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
         let mut db = self.db.lock().await;
-        let result = db.query("SELECT * FROM raft_vote WHERE key = 'current'");
-
-        match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
-                if records.is_empty() {
-                    return Ok(None);
-                }
-                if let Some(data) = records[0].fields.get("value_data") {
-                    let vote: Vote<NodeId> = serde_json::from_str(data).map_err(|e| {
-                        db_to_storage_error(
-                            openraft::ErrorSubject::Vote,
-                            openraft::ErrorVerb::Read,
-                            e.to_string(),
-                        )
-                    })?;
-                    Ok(Some(vote))
-                } else {
-                    Ok(None)
-                }
-            }
-            _ => Ok(None),
-        }
+        db.get_typed("raft_vote", "current").map_err(|e| {
+            db_to_storage_error(
+                openraft::ErrorSubject::Vote,
+                openraft::ErrorVerb::Read,
+                e.to_string(),
+            )
+        })
     }
 
     // === Log operations ===
@@ -664,38 +542,26 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         self.clone()
     }
 
-    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<NodeId>>
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: LogFlushed<TypeConfig>,
+    ) -> Result<(), StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
     {
         let entries: Vec<_> = entries.into_iter().collect();
         if entries.is_empty() {
+            callback.log_io_completed(Ok(()));
             return Ok(());
         }
 
         let mut db = self.db.lock().await;
 
         for entry in &entries {
-            let json = serde_json::to_string(entry).map_err(|e| {
-                db_to_storage_error(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    e.to_string(),
-                )
-            })?;
-
-            // Upsert by index
-            let _ = db.query(&format!(
-                "DELETE FROM log_entries WHERE log_index = '{}'",
-                entry.log_id.index
-            ));
-
-            db.query(&format!(
-                "INSERT INTO log_entries (log_index, entry_data) VALUES ('{}', '{}')",
-                entry.log_id.index,
-                escape_str(&json)
-            ))
-            .map_err(|e| {
+            let key = format!("{}", entry.log_id.index);
+            db.put_typed("log_entries", &key, entry).map_err(|e| {
                 db_to_storage_error(
                     openraft::ErrorSubject::Logs,
                     openraft::ErrorVerb::Write,
@@ -714,38 +580,40 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         })?;
 
         debug!("Appended {} log entries", entries.len());
+
+        // Signal that IO is complete (data is persisted)
+        callback.log_io_completed(Ok(()));
         Ok(())
     }
 
-    async fn delete_conflict_logs_since(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> Result<(), StorageError<NodeId>> {
-        // We need to find and delete all entries with index >= log_id.index
+    async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut db = self.db.lock().await;
-        let result = db.query("SELECT * FROM log_entries");
 
-        let indices_to_delete: Vec<u64> = match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => records
-                .iter()
-                .filter_map(|r| {
-                    r.fields
-                        .get("log_index")
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .filter(|&idx| idx >= log_id.index)
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
+        // Scan all log entries and find ones with index >= log_id.index
+        let all: Vec<(String, Entry<TypeConfig>)> =
+            db.scan_typed("log_entries", "").map_err(|e| {
+                db_to_storage_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Read,
+                    e.to_string(),
+                )
+            })?;
 
-        for idx in &indices_to_delete {
-            let _ = db.query(&format!(
-                "DELETE FROM log_entries WHERE log_index = '{}'",
-                idx
-            ));
+        let keys_to_delete: Vec<String> = all
+            .into_iter()
+            .filter_map(|(key, _)| {
+                key.parse::<u64>()
+                    .ok()
+                    .filter(|&idx| idx >= log_id.index)
+                    .map(|_| key)
+            })
+            .collect();
+
+        for key in &keys_to_delete {
+            let _ = db.delete_typed("log_entries", key);
         }
 
-        if !indices_to_delete.is_empty() {
+        if !keys_to_delete.is_empty() {
             db.flush().map_err(|e| {
                 db_to_storage_error(
                     openraft::ErrorSubject::Logs,
@@ -757,62 +625,52 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
 
         debug!(
             "Deleted {} conflict logs since index {}",
-            indices_to_delete.len(),
+            keys_to_delete.len(),
             log_id.index
         );
         Ok(())
     }
 
-    async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+    async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut db = self.db.lock().await;
 
-        // Find and delete entries with index <= log_id.index
-        let result = db.query("SELECT * FROM log_entries");
+        // Scan all log entries and find ones with index <= log_id.index
+        let all: Vec<(String, Entry<TypeConfig>)> =
+            db.scan_typed("log_entries", "").map_err(|e| {
+                db_to_storage_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Read,
+                    e.to_string(),
+                )
+            })?;
 
-        let indices_to_delete: Vec<u64> = match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => records
-                .iter()
-                .filter_map(|r| {
-                    r.fields
-                        .get("log_index")
-                        .and_then(|s| s.parse::<u64>().ok())
-                        .filter(|&idx| idx <= log_id.index)
-                })
-                .collect(),
-            _ => Vec::new(),
-        };
+        let keys_to_delete: Vec<String> = all
+            .into_iter()
+            .filter_map(|(key, _)| {
+                key.parse::<u64>()
+                    .ok()
+                    .filter(|&idx| idx <= log_id.index)
+                    .map(|_| key)
+            })
+            .collect();
 
-        for idx in &indices_to_delete {
-            let _ = db.query(&format!(
-                "DELETE FROM log_entries WHERE log_index = '{}'",
-                idx
-            ));
+        for key in &keys_to_delete {
+            let _ = db.delete_typed("log_entries", key);
         }
 
         // Update last purged log ID
         let meta = LogMetadata {
             last_purged_log_id: Some(log_id),
         };
-        let meta_json = serde_json::to_string(&meta).map_err(|e| {
-            db_to_storage_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                e.to_string(),
-            )
-        })?;
 
-        let _ = db.query("DELETE FROM log_metadata WHERE key = 'last_purged'");
-        db.query(&format!(
-            "INSERT INTO log_metadata (key, value_data) VALUES ('last_purged', '{}')",
-            escape_str(&meta_json)
-        ))
-        .map_err(|e| {
-            db_to_storage_error(
-                openraft::ErrorSubject::Logs,
-                openraft::ErrorVerb::Write,
-                e.to_string(),
-            )
-        })?;
+        db.put_typed("log_metadata", "last_purged", &meta)
+            .map_err(|e| {
+                db_to_storage_error(
+                    openraft::ErrorSubject::Logs,
+                    openraft::ErrorVerb::Write,
+                    e.to_string(),
+                )
+            })?;
 
         // Flush for durability
         db.flush().map_err(|e| {
@@ -825,15 +683,18 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
 
         debug!(
             "Purged {} logs up to index {}",
-            indices_to_delete.len(),
+            keys_to_delete.len(),
             log_id.index
         );
         Ok(())
     }
+}
 
-    // === State machine operations ===
+// Implement RaftStateMachine (v2 API) for state machine and snapshot operations
+impl RaftStateMachine<TypeConfig> for PersistentRaftStorage {
+    type SnapshotBuilder = Self;
 
-    async fn last_applied_state(
+    async fn applied_state(
         &mut self,
     ) -> Result<
         (
@@ -847,10 +708,14 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         Ok((applied.last_applied_log, applied.last_membership))
     }
 
-    async fn apply_to_state_machine(
+    async fn apply<I>(
         &mut self,
-        entries: &[Entry<TypeConfig>],
-    ) -> Result<Vec<Response>, StorageError<NodeId>> {
+        entries: I,
+    ) -> Result<Vec<Response>, StorageError<NodeId>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
         let sm = self.state_machine.read().await;
         let mut applied = sm.get_applied_state().await?;
         let mut responses = Vec::new();
@@ -877,11 +742,9 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
         // Persist the updated state
         sm.set_applied_state(&applied).await?;
 
-        debug!("Applied {} entries to state machine", entries.len());
+        debug!("Applied {} entries to state machine", responses.len());
         Ok(responses)
     }
-
-    // === Snapshot operations ===
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
@@ -923,83 +786,61 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
     async fn get_current_snapshot(
         &mut self,
     ) -> Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        // Get the latest snapshot by created_at timestamp
         let mut db = self.db.lock().await;
-        let result = db.query("SELECT * FROM snapshot_metadata");
 
-        let best_snapshot: Option<(String, String)> = match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
-                let mut best: Option<(u64, String, String)> = None;
-                for record in &records {
-                    if let (Some(sid), Some(meta), Some(ts_str)) = (
-                        record.fields.get("snapshot_id"),
-                        record.fields.get("metadata"),
-                        record.fields.get("created_at"),
-                    ) {
-                        let ts = ts_str.parse::<u64>().unwrap_or(0);
-                        match best {
-                            None => best = Some((ts, sid.clone(), meta.clone())),
-                            Some((cur_ts, _, _)) if ts > cur_ts => {
-                                best = Some((ts, sid.clone(), meta.clone()));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                best.map(|(_, sid, meta)| (sid, meta))
-            }
-            _ => None,
-        };
+        // Scan all snapshot metadata and find the latest by created_at
+        let all_meta: Vec<(String, SnapshotMetadataRecord)> =
+            db.scan_typed("snapshot_metadata", "").map_err(|e| {
+                db_to_storage_error(
+                    openraft::ErrorSubject::Snapshot(None),
+                    openraft::ErrorVerb::Read,
+                    e.to_string(),
+                )
+            })?;
 
-        if let Some((snapshot_id, meta_json)) = best_snapshot {
-            let snapshot_record: SnapshotMetadataRecord = serde_json::from_str(&meta_json)
-                .map_err(|e| {
-                    db_to_storage_error(
-                        openraft::ErrorSubject::Snapshot(None),
-                        openraft::ErrorVerb::Read,
-                        e.to_string(),
-                    )
-                })?;
-
-            // Load snapshot data
-            let data_result = db.query(&format!(
-                "SELECT * FROM snapshot_data WHERE snapshot_id = '{}'",
-                escape_str(&snapshot_id)
-            ));
-
-            if let Ok(zql::query::executor::ExecResult::Retrieved(records)) = data_result {
-                if let Some(record) = records.first() {
-                    if let Some(data_hex) = record.fields.get("data_hex") {
-                        let data = hex::decode(data_hex).map_err(|e| {
-                            db_to_storage_error(
-                                openraft::ErrorSubject::Snapshot(None),
-                                openraft::ErrorVerb::Read,
-                                format!("hex decode failed: {e}"),
-                            )
-                        })?;
-
-                        let meta = SnapshotMeta {
-                            last_log_id: snapshot_record.last_log_id,
-                            last_membership: snapshot_record.last_membership,
-                            snapshot_id: snapshot_record.snapshot_id,
-                        };
-
-                        debug!(
-                            "Loaded snapshot {} ({} bytes)",
-                            meta.snapshot_id,
-                            data.len()
-                        );
-
-                        return Ok(Some(Snapshot {
-                            meta,
-                            snapshot: Box::new(Cursor::new(data)),
-                        }));
-                    }
-                }
-            }
+        if all_meta.is_empty() {
+            return Ok(None);
         }
 
-        Ok(None)
+        // Find the one with the highest created_at
+        let best = all_meta
+            .into_iter()
+            .max_by_key(|(_, record)| record.created_at);
+
+        let Some((snapshot_id, snapshot_record)) = best else {
+            return Ok(None);
+        };
+
+        // Load snapshot data
+        let snapshot_data: Option<SnapshotDataRecord> =
+            db.get_typed("snapshot_data", &snapshot_id).map_err(|e| {
+                db_to_storage_error(
+                    openraft::ErrorSubject::Snapshot(None),
+                    openraft::ErrorVerb::Read,
+                    e.to_string(),
+                )
+            })?;
+
+        let Some(snapshot_data) = snapshot_data else {
+            return Ok(None);
+        };
+
+        let meta = SnapshotMeta {
+            last_log_id: snapshot_record.last_log_id,
+            last_membership: snapshot_record.last_membership,
+            snapshot_id: snapshot_record.snapshot_id,
+        };
+
+        debug!(
+            "Loaded snapshot {} ({} bytes)",
+            meta.snapshot_id,
+            snapshot_data.data.len()
+        );
+
+        Ok(Some(Snapshot {
+            meta,
+            snapshot: Box::new(Cursor::new(snapshot_data.data)),
+        }))
     }
 }
 
@@ -1007,6 +848,7 @@ impl RaftStorage<TypeConfig> for PersistentRaftStorage {
 mod tests {
     use super::*;
     use crate::raft::{Request, ServiceState};
+    use openraft::storage::RaftLogStorageExt;
     use openraft::CommittedLeaderId;
     use tempfile::TempDir;
 
@@ -1017,7 +859,7 @@ mod tests {
         let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
 
         // Check initial state
-        let log_state = RaftStorage::get_log_state(&mut store).await.unwrap();
+        let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
         assert!(log_state.last_log_id.is_none());
         assert!(log_state.last_purged_log_id.is_none());
     }
@@ -1029,15 +871,17 @@ mod tests {
         let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
 
         // Initially no vote
-        let vote = RaftStorage::read_vote(&mut store).await.unwrap();
+        let vote = RaftLogStorage::read_vote(&mut store).await.unwrap();
         assert!(vote.is_none());
 
         // Save a vote
         let new_vote = Vote::new(1, 1);
-        RaftStorage::save_vote(&mut store, &new_vote).await.unwrap();
+        RaftLogStorage::save_vote(&mut store, &new_vote)
+            .await
+            .unwrap();
 
         // Read it back
-        let vote = RaftStorage::read_vote(&mut store).await.unwrap();
+        let vote = RaftLogStorage::read_vote(&mut store).await.unwrap();
         assert_eq!(vote, Some(new_vote));
     }
 
@@ -1063,13 +907,11 @@ mod tests {
             }),
         };
 
-        // Append it
-        RaftStorage::append_to_log(&mut store, vec![entry.clone()])
-            .await
-            .unwrap();
+        // Append using blocking convenience method
+        store.blocking_append(vec![entry.clone()]).await.unwrap();
 
         // Read it back
-        let mut reader = RaftStorage::get_log_reader(&mut store).await;
+        let mut reader = RaftLogStorage::get_log_reader(&mut store).await;
         let entries = reader.try_get_log_entries(0..2).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].log_id.index, 1);
@@ -1095,8 +937,8 @@ mod tests {
             }),
         };
 
-        // Apply entry
-        let responses = RaftStorage::apply_to_state_machine(&mut store, &[entry])
+        // Apply entry using the v2 API
+        let responses = RaftStateMachine::apply(&mut store, vec![entry])
             .await
             .unwrap();
 
@@ -1125,7 +967,9 @@ mod tests {
         assert_eq!(snapshot.meta.snapshot_id, "0-0");
 
         // Verify snapshot was saved
-        let current = RaftStorage::get_current_snapshot(&mut store).await.unwrap();
+        let current = RaftStateMachine::get_current_snapshot(&mut store)
+            .await
+            .unwrap();
         assert!(current.is_some());
         let current = current.unwrap();
         assert_eq!(current.meta.snapshot_id, "0-0");
@@ -1141,7 +985,9 @@ mod tests {
             let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
 
             let new_vote = Vote::new(1, 1);
-            RaftStorage::save_vote(&mut store, &new_vote).await.unwrap();
+            RaftLogStorage::save_vote(&mut store, &new_vote)
+                .await
+                .unwrap();
 
             let leader_id = CommittedLeaderId::new(1, 1);
             let log_id = LogId::new(leader_id, 1);
@@ -1159,19 +1005,17 @@ mod tests {
                 }),
             };
 
-            RaftStorage::append_to_log(&mut store, vec![entry])
-                .await
-                .unwrap();
+            store.blocking_append(vec![entry]).await.unwrap();
         }
 
         // Reopen and verify data persisted
         {
             let mut store = PersistentRaftStorage::new(&db_path).await.unwrap();
 
-            let vote = RaftStorage::read_vote(&mut store).await.unwrap();
+            let vote = RaftLogStorage::read_vote(&mut store).await.unwrap();
             assert_eq!(vote, Some(Vote::new(1, 1)));
 
-            let mut reader = RaftStorage::get_log_reader(&mut store).await;
+            let mut reader = RaftLogStorage::get_log_reader(&mut store).await;
             let entries = reader.try_get_log_entries(0..2).await.unwrap();
             assert_eq!(entries.len(), 1);
             assert_eq!(entries[0].log_id.index, 1);
@@ -1202,30 +1046,28 @@ mod tests {
             })
             .collect();
 
-        RaftStorage::append_to_log(&mut store, entries)
-            .await
-            .unwrap();
+        store.blocking_append(entries).await.unwrap();
 
         // Verify all entries exist
-        let mut reader = RaftStorage::get_log_reader(&mut store).await;
+        let mut reader = RaftLogStorage::get_log_reader(&mut store).await;
         let all_entries = reader.try_get_log_entries(0..10).await.unwrap();
         assert_eq!(all_entries.len(), 5);
 
         // Purge up to index 3
         let purge_log_id = LogId::new(leader_id, 3);
-        RaftStorage::purge_logs_upto(&mut store, purge_log_id)
+        RaftLogStorage::purge(&mut store, purge_log_id)
             .await
             .unwrap();
 
         // Verify only entries 4 and 5 remain
-        let mut reader = RaftStorage::get_log_reader(&mut store).await;
+        let mut reader = RaftLogStorage::get_log_reader(&mut store).await;
         let remaining = reader.try_get_log_entries(0..10).await.unwrap();
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].log_id.index, 4);
         assert_eq!(remaining[1].log_id.index, 5);
 
         // Verify last_purged is updated
-        let log_state = RaftStorage::get_log_state(&mut store).await.unwrap();
+        let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
         assert_eq!(log_state.last_purged_log_id, Some(purge_log_id));
     }
 
@@ -1245,18 +1087,16 @@ mod tests {
             })
             .collect();
 
-        RaftStorage::append_to_log(&mut store, entries)
-            .await
-            .unwrap();
+        store.blocking_append(entries).await.unwrap();
 
-        // Delete conflict logs since index 3
+        // Delete conflict logs since index 3 (truncate)
         let conflict_log_id = LogId::new(leader_id, 3);
-        RaftStorage::delete_conflict_logs_since(&mut store, conflict_log_id)
+        RaftLogStorage::truncate(&mut store, conflict_log_id)
             .await
             .unwrap();
 
         // Verify only entries 1 and 2 remain
-        let mut reader = RaftStorage::get_log_reader(&mut store).await;
+        let mut reader = RaftLogStorage::get_log_reader(&mut store).await;
         let remaining = reader.try_get_log_entries(0..10).await.unwrap();
         assert_eq!(remaining.len(), 2);
         assert_eq!(remaining[0].log_id.index, 1);

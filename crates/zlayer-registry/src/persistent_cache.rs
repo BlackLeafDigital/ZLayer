@@ -1,8 +1,8 @@
 //! Persistent blob cache for OCI images using ZQL
 //!
 //! This module provides a persistent blob cache backed by ZQL for durability.
-//! Blobs are stored with metadata for LRU eviction. Binary data is base64-encoded
-//! for storage in ZQL's string-based fields.
+//! Blobs are stored as typed structs using ZQL's typed KV API with postcard
+//! serialization for efficient binary storage.
 
 use crate::cache::{compute_digest, validate_digest, BlobCacheBackend};
 use crate::error::{CacheError, Result};
@@ -18,15 +18,17 @@ fn current_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
-/// Encode binary data as hex for ZQL storage
-fn encode_blob(data: &[u8]) -> String {
-    hex::encode(data)
-}
-
-/// Decode hex-encoded data back to bytes
-fn decode_blob(encoded: &str) -> std::result::Result<Vec<u8>, CacheError> {
-    hex::decode(encoded)
-        .map_err(|e| CacheError::Database(format!("failed to decode blob data: {}", e)))
+/// A cached blob record stored in ZQL
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedBlob {
+    /// The raw blob data
+    data: Vec<u8>,
+    /// Size in bytes
+    size_bytes: u64,
+    /// Creation timestamp (Unix seconds)
+    created_at: i64,
+    /// Last access timestamp (Unix seconds)
+    last_accessed: i64,
 }
 
 /// Persistent blob cache for OCI images backed by ZQL
@@ -75,47 +77,19 @@ impl PersistentBlobCache {
         validate_digest(digest)?;
 
         let mut db = self.db.lock().await;
-        let result = db.query(&format!(
-            "SELECT * FROM blobs WHERE digest = '{}'",
-            digest.replace('\'', "''")
-        ));
+        let result: std::result::Result<Option<CachedBlob>, _> =
+            db.get_typed("blobs", digest);
 
         match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
-                if records.is_empty() {
-                    return Ok(None);
-                }
-                let record = &records[0];
-                if let Some(encoded_data) = record.fields.get("data_hex") {
-                    let data = decode_blob(encoded_data)?;
+            Ok(Some(mut cached)) => {
+                // Update last_accessed timestamp
+                let now = current_timestamp();
+                cached.last_accessed = now;
+                let _ = db.put_typed("blobs", digest, &cached);
 
-                    // Update last_accessed timestamp (best effort)
-                    let now = current_timestamp();
-                    let _ = db.query(&format!(
-                        "DELETE FROM blobs WHERE digest = '{}'",
-                        digest.replace('\'', "''")
-                    ));
-                    let size_bytes = data.len();
-                    let created_at = record
-                        .fields
-                        .get("created_at")
-                        .map(|s| s.as_str())
-                        .unwrap_or("0");
-                    let _ = db.query(&format!(
-                        "INSERT INTO blobs (digest, data_hex, size_bytes, created_at, last_accessed) VALUES ('{}', '{}', '{}', '{}', '{}')",
-                        digest.replace('\'', "''"),
-                        encoded_data.replace('\'', "''"),
-                        size_bytes,
-                        created_at,
-                        now
-                    ));
-
-                    Ok(Some(data))
-                } else {
-                    Ok(None)
-                }
+                Ok(Some(cached.data))
             }
-            Ok(_) => Ok(None),
+            Ok(None) => Ok(None),
             Err(_) => Ok(None),
         }
     }
@@ -136,27 +110,17 @@ impl PersistentBlobCache {
         }
 
         let now = current_timestamp();
-        let size_bytes = data.len();
-        let encoded_data = encode_blob(data);
+
+        let cached = CachedBlob {
+            data: data.to_vec(),
+            size_bytes: data.len() as u64,
+            created_at: now,
+            last_accessed: now,
+        };
 
         let mut db = self.db.lock().await;
-
-        // Delete existing entry (upsert)
-        let _ = db.query(&format!(
-            "DELETE FROM blobs WHERE digest = '{}'",
-            digest.replace('\'', "''")
-        ));
-
-        // Insert
-        db.query(&format!(
-            "INSERT INTO blobs (digest, data_hex, size_bytes, created_at, last_accessed) VALUES ('{}', '{}', '{}', '{}', '{}')",
-            digest.replace('\'', "''"),
-            encoded_data.replace('\'', "''"),
-            size_bytes,
-            now,
-            now
-        ))
-        .map_err(|e| CacheError::Database(format!("failed to insert blob: {}", e)))?;
+        db.put_typed("blobs", digest, &cached)
+            .map_err(|e| CacheError::Database(format!("failed to insert blob: {}", e)))?;
 
         debug!("Stored blob {} ({} bytes)", digest, data.len());
 
@@ -174,13 +138,11 @@ impl PersistentBlobCache {
         validate_digest(digest)?;
 
         let mut db = self.db.lock().await;
-        let result = db.query(&format!(
-            "SELECT * FROM blobs WHERE digest = '{}'",
-            digest.replace('\'', "''")
-        ));
+        let result: std::result::Result<Option<CachedBlob>, _> =
+            db.get_typed("blobs", digest);
 
         match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => Ok(!records.is_empty()),
+            Ok(Some(_)) => Ok(true),
             _ => Ok(false),
         }
     }
@@ -190,11 +152,8 @@ impl PersistentBlobCache {
         validate_digest(digest)?;
 
         let mut db = self.db.lock().await;
-        db.query(&format!(
-            "DELETE FROM blobs WHERE digest = '{}'",
-            digest.replace('\'', "''")
-        ))
-        .map_err(|e| CacheError::Database(format!("failed to delete blob: {}", e)))?;
+        db.delete_typed("blobs", digest)
+            .map_err(|e| CacheError::Database(format!("failed to delete blob: {}", e)))?;
 
         debug!("Deleted blob {}", digest);
 
@@ -204,18 +163,12 @@ impl PersistentBlobCache {
     /// Get current cache size in bytes
     pub async fn size(&self) -> Result<u64, CacheError> {
         let mut db = self.db.lock().await;
-        let result = db.query("SELECT * FROM blobs");
+        let result: std::result::Result<Vec<(String, CachedBlob)>, _> =
+            db.scan_typed("blobs", "");
 
         match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
-                let mut total: u64 = 0;
-                for record in &records {
-                    if let Some(size_str) = record.fields.get("size_bytes") {
-                        if let Ok(size) = size_str.parse::<u64>() {
-                            total += size;
-                        }
-                    }
-                }
+            Ok(entries) => {
+                let total: u64 = entries.iter().map(|(_, b)| b.size_bytes).sum();
                 Ok(total)
             }
             _ => Ok(0),
@@ -225,10 +178,11 @@ impl PersistentBlobCache {
     /// Get number of blobs in the cache
     pub async fn blob_count(&self) -> Result<u64, CacheError> {
         let mut db = self.db.lock().await;
-        let result = db.query("SELECT * FROM blobs");
+        let result: std::result::Result<Vec<(String, CachedBlob)>, _> =
+            db.scan_typed("blobs", "");
 
         match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => Ok(records.len() as u64),
+            Ok(entries) => Ok(entries.len() as u64),
             _ => Ok(0),
         }
     }
@@ -238,22 +192,17 @@ impl PersistentBlobCache {
         // Get all digests then delete each one
         let digests: Vec<String> = {
             let mut db = self.db.lock().await;
-            let result = db.query("SELECT * FROM blobs");
+            let result: std::result::Result<Vec<(String, CachedBlob)>, _> =
+                db.scan_typed("blobs", "");
             match result {
-                Ok(zql::query::executor::ExecResult::Retrieved(records)) => records
-                    .iter()
-                    .filter_map(|r| r.fields.get("digest").cloned())
-                    .collect(),
+                Ok(entries) => entries.into_iter().map(|(key, _)| key).collect(),
                 _ => Vec::new(),
             }
         };
 
         let mut db = self.db.lock().await;
         for digest in &digests {
-            let _ = db.query(&format!(
-                "DELETE FROM blobs WHERE digest = '{}'",
-                digest.replace('\'', "''")
-            ));
+            let _ = db.delete_typed("blobs", digest);
         }
 
         info!("Cleared all blobs from cache");
@@ -280,23 +229,12 @@ impl PersistentBlobCache {
         // Get all entries with their timestamps for sorting
         let mut entries: Vec<(String, u64, i64)> = {
             let mut db = self.db.lock().await;
-            let result = db.query("SELECT * FROM blobs");
+            let result: std::result::Result<Vec<(String, CachedBlob)>, _> =
+                db.scan_typed("blobs", "");
             match result {
-                Ok(zql::query::executor::ExecResult::Retrieved(records)) => records
-                    .iter()
-                    .filter_map(|r| {
-                        let digest = r.fields.get("digest")?.clone();
-                        let size = r
-                            .fields
-                            .get("size_bytes")
-                            .and_then(|s| s.parse::<u64>().ok())?;
-                        let last_accessed = r
-                            .fields
-                            .get("last_accessed")
-                            .and_then(|s| s.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        Some((digest, size, last_accessed))
-                    })
+                Ok(all) => all
+                    .into_iter()
+                    .map(|(key, blob)| (key, blob.size_bytes, blob.last_accessed))
                     .collect(),
                 _ => Vec::new(),
             }
@@ -323,10 +261,7 @@ impl PersistentBlobCache {
         // Delete in batch
         let mut db = self.db.lock().await;
         for digest in &digests_to_delete {
-            let _ = db.query(&format!(
-                "DELETE FROM blobs WHERE digest = '{}'",
-                digest.replace('\'', "''")
-            ));
+            let _ = db.delete_typed("blobs", digest);
         }
 
         info!(

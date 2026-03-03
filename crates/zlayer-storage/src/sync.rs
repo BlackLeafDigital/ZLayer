@@ -81,24 +81,17 @@ impl LayerSyncManager {
         db: &tokio::sync::Mutex<zql::Database>,
     ) -> Result<HashMap<String, SyncState>> {
         let mut db = db.lock().await;
-        let result = db.query("SELECT * FROM sync_state");
+        let result: std::result::Result<Vec<(String, SyncState)>, _> =
+            db.scan_typed("sync_state", "");
 
         match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
+            Ok(entries) => {
                 let mut states = HashMap::new();
-                for record in &records {
-                    if let (Some(key), Some(json)) = (
-                        record.fields.get("container_key"),
-                        record.fields.get("state_json"),
-                    ) {
-                        if let Ok(state) = serde_json::from_str::<SyncState>(json) {
-                            states.insert(key.clone(), state);
-                        }
-                    }
+                for (key, state) in entries {
+                    states.insert(key, state);
                 }
                 Ok(states)
             }
-            Ok(_) => Ok(HashMap::new()),
             Err(_) => {
                 // Store doesn't exist yet, no states
                 Ok(HashMap::new())
@@ -108,23 +101,11 @@ impl LayerSyncManager {
 
     async fn save_state(&self, state: &SyncState) -> Result<()> {
         let key = state.container_id.to_key();
-        let value = serde_json::to_string(state)?;
 
         let mut db = self.db.lock().await;
 
-        // Delete existing entry first (upsert)
-        let _ = db.query(&format!(
-            "DELETE FROM sync_state WHERE container_key = '{}'",
-            key.replace('\'', "''")
-        ));
-
-        // Insert new entry
-        db.query(&format!(
-            "INSERT INTO sync_state (container_key, state_json) VALUES ('{}', '{}')",
-            key.replace('\'', "''"),
-            value.replace('\'', "''")
-        ))
-        .map_err(|e| LayerStorageError::Database(e.to_string()))?;
+        db.put_typed("sync_state", &key, state)
+            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
 
         Ok(())
     }

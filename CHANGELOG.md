@@ -2,9 +2,49 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.9.990]
+
+### Added
+- Resource-aware node join: `NodeInfo` now tracks CPU cores, memory, disk, GPU resources, and
+  node status (ready/draining/dead). Join flow (`POST /api/v1/cluster/join`) includes hardware
+  resource information from the joining node.
+- Cross-platform system resource detection (`bin/zlayer/src/resources.rs`): detects CPU, memory,
+  disk, and GPU resources using Linux `/proc/meminfo`, macOS `sysctl`, and disk via `statvfs`.
+- Leader self-registration: the leader node registers itself with real hardware specs on bootstrap
+  instead of placeholder values.
+- Worker heartbeat endpoint (`POST /api/v1/cluster/heartbeat`): worker nodes report resource
+  usage every 5 seconds. Dead-node detection loop marks stale nodes as "dead" after 30 seconds
+  of missed heartbeats.
+- Distributed scheduling: `Scheduler::build_node_states()` converts Raft cluster state into a
+  placement-ready node list. `Scheduler::compute_placement()` feeds it through the existing
+  bin-packing/dedicated/exclusive placement algorithms.
+- Remote container dispatch: `Scheduler::execute_distributed_scaling()` dispatches container
+  creation to remote nodes via internal API calls. `apply_scaling()` now chooses distributed
+  multi-node or local-only scheduling based on cluster size.
+- Service assignment tracking: service-to-node assignments are replicated through Raft via
+  `UpdateServiceAssignment` entries.
+- Container rescheduling on node death: when the dead-node detection loop marks a node as "dead",
+  the scheduler's `handle_node_death()` method automatically reschedules affected services to
+  remaining live nodes using the placement algorithm.
+- `Scheduler::with_raft()` constructor: accepts a pre-existing `Arc<RaftCoordinator>` so the
+  daemon can share its Raft coordinator with the scheduler.
+- `PlacementState::remove_node()` and `PlacementState::remove_service_from_node()`: cleanup
+  methods for clearing stale container placements when a node dies.
+- Node recovery: when a previously "dead" node resumes sending heartbeats, the heartbeat handler
+  automatically proposes `UpdateNodeStatus { status: "ready" }` to recover it.
+- Internal authentication token is now generated during daemon init and shared between the
+  scheduler and API InternalState, ensuring consistent auth across the system.
+
+### Changed
+- zlayer-consensus: replaced serde_json round-trip in state machine apply with direct
+  `EntryPayload` matching (~10x faster apply). Switched to consistent bincode serialization
+  for snapshots. Removed unnecessary serde_json dependency.
 
 ### Fixed
+- zlayer-consensus: `handle_full_snapshot` was a no-op (snapshot data was received but never
+  installed into the state machine). Now correctly deserializes and installs snapshot state.
+- zlayer-consensus: `snapshot_logs_since_last` and `enable_prevote` config settings were silently
+  ignored during Raft node initialization. Both are now applied to the openraft `Config`.
 - Overlay container attachment: added platform guard (`#[cfg(not(target_os = "linux"))]`) to
   `OverlayManager::attach_container()` so non-Linux platforms skip veth/nsenter commands and
   return the node's overlay IP directly, eliminating noisy error logs on macOS.

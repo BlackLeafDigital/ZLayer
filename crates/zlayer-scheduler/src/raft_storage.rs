@@ -1,7 +1,7 @@
 //! In-memory storage implementation for OpenRaft
 //!
 //! Provides log storage and state machine for the scheduler's Raft consensus.
-//! Uses the RaftStorage v1 API which combines log and state machine storage.
+//! Uses the v2 API with separate `RaftLogStorage` and `RaftStateMachine` traits.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -9,7 +9,7 @@ use std::io::Cursor;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 
-use openraft::storage::{LogState, RaftStorage, Snapshot};
+use openraft::storage::{LogFlushed, LogState, RaftLogStorage, RaftStateMachine, Snapshot};
 use openraft::{
     Entry, EntryPayload, LogId, OptionalSend, RaftLogReader, RaftSnapshotBuilder, SnapshotMeta,
     StorageError, StoredMembership, Vote,
@@ -27,6 +27,8 @@ pub struct LogStore {
     log: BTreeMap<u64, Entry<TypeConfig>>,
     /// Current vote
     vote: Option<Vote<NodeId>>,
+    /// Last committed log ID
+    committed: Option<LogId<NodeId>>,
 }
 
 /// In-memory state machine
@@ -40,10 +42,9 @@ pub struct StateMachine {
     pub state: ClusterState,
 }
 
-/// Combined in-memory storage for OpenRaft (v1 API)
+/// In-memory storage for OpenRaft (v2 API)
 ///
-/// This implements the unified `RaftStorage` trait which combines
-/// log storage and state machine operations.
+/// Implements both `RaftLogStorage` and `RaftStateMachine` traits directly.
 pub struct MemStore {
     log: Arc<RwLock<LogStore>>,
     sm: Arc<RwLock<StateMachine>>,
@@ -141,26 +142,9 @@ impl RaftSnapshotBuilder<TypeConfig> for MemStore {
     }
 }
 
-// Implement the unified RaftStorage trait (v1 API)
-#[allow(deprecated)]
-impl RaftStorage<TypeConfig> for MemStore {
+// Implement RaftLogStorage (v2 API) for log and vote operations
+impl RaftLogStorage<TypeConfig> for MemStore {
     type LogReader = Self;
-    type SnapshotBuilder = Self;
-
-    // === Vote operations ===
-
-    async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let mut log = self.log.write().await;
-        log.vote = Some(*vote);
-        Ok(())
-    }
-
-    async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        let log = self.log.read().await;
-        Ok(log.vote)
-    }
-
-    // === Log operations ===
 
     async fn get_log_state(&mut self) -> Result<LogState<TypeConfig>, StorageError<NodeId>> {
         let log = self.log.read().await;
@@ -173,25 +157,56 @@ impl RaftStorage<TypeConfig> for MemStore {
         })
     }
 
+    async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
+        let mut log = self.log.write().await;
+        log.vote = Some(*vote);
+        Ok(())
+    }
+
+    async fn read_vote(&mut self) -> Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
+        let log = self.log.read().await;
+        Ok(log.vote)
+    }
+
+    async fn save_committed(
+        &mut self,
+        committed: Option<LogId<NodeId>>,
+    ) -> Result<(), StorageError<NodeId>> {
+        let mut log = self.log.write().await;
+        log.committed = committed;
+        Ok(())
+    }
+
+    async fn read_committed(
+        &mut self,
+    ) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+        let log = self.log.read().await;
+        Ok(log.committed)
+    }
+
     async fn get_log_reader(&mut self) -> Self::LogReader {
         self.clone()
     }
 
-    async fn append_to_log<I>(&mut self, entries: I) -> Result<(), StorageError<NodeId>>
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: LogFlushed<TypeConfig>,
+    ) -> Result<(), StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
     {
         let mut log = self.log.write().await;
         for entry in entries {
             log.log.insert(entry.log_id.index, entry);
         }
+        // In-memory storage: data is immediately "flushed"
+        callback.log_io_completed(Ok(()));
         Ok(())
     }
 
-    async fn delete_conflict_logs_since(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> Result<(), StorageError<NodeId>> {
+    async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut log = self.log.write().await;
         let keys: Vec<u64> = log.log.range(log_id.index..).map(|(k, _)| *k).collect();
         for key in keys {
@@ -200,7 +215,7 @@ impl RaftStorage<TypeConfig> for MemStore {
         Ok(())
     }
 
-    async fn purge_logs_upto(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
+    async fn purge(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut log = self.log.write().await;
 
         let keys: Vec<u64> = log.log.range(..=log_id.index).map(|(k, _)| *k).collect();
@@ -211,10 +226,13 @@ impl RaftStorage<TypeConfig> for MemStore {
         log.last_purged_log_id = Some(log_id);
         Ok(())
     }
+}
 
-    // === State machine operations ===
+// Implement RaftStateMachine (v2 API) for state machine and snapshot operations
+impl RaftStateMachine<TypeConfig> for MemStore {
+    type SnapshotBuilder = Self;
 
-    async fn last_applied_state(
+    async fn applied_state(
         &mut self,
     ) -> Result<
         (
@@ -227,10 +245,14 @@ impl RaftStorage<TypeConfig> for MemStore {
         Ok((sm.last_applied_log, sm.last_membership.clone()))
     }
 
-    async fn apply_to_state_machine(
+    async fn apply<I>(
         &mut self,
-        entries: &[Entry<TypeConfig>],
-    ) -> Result<Vec<Response>, StorageError<NodeId>> {
+        entries: I,
+    ) -> Result<Vec<Response>, StorageError<NodeId>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
         let mut sm = self.sm.write().await;
         let mut responses = Vec::new();
 
@@ -254,8 +276,6 @@ impl RaftStorage<TypeConfig> for MemStore {
 
         Ok(responses)
     }
-
-    // === Snapshot operations ===
 
     async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
         self.clone()
@@ -308,7 +328,7 @@ mod tests {
         let mut store = MemStore::new();
 
         // Check initial state
-        let log_state = RaftStorage::get_log_state(&mut store).await.unwrap();
+        let log_state = RaftLogStorage::get_log_state(&mut store).await.unwrap();
         assert!(log_state.last_log_id.is_none());
         assert!(log_state.last_purged_log_id.is_none());
     }
@@ -318,15 +338,17 @@ mod tests {
         let mut store = MemStore::new();
 
         // Initially no vote
-        let vote = RaftStorage::read_vote(&mut store).await.unwrap();
+        let vote = RaftLogStorage::read_vote(&mut store).await.unwrap();
         assert!(vote.is_none());
 
         // Save a vote
         let new_vote = Vote::new(1, 1);
-        RaftStorage::save_vote(&mut store, &new_vote).await.unwrap();
+        RaftLogStorage::save_vote(&mut store, &new_vote)
+            .await
+            .unwrap();
 
         // Read it back
-        let vote = RaftStorage::read_vote(&mut store).await.unwrap();
+        let vote = RaftLogStorage::read_vote(&mut store).await.unwrap();
         assert_eq!(vote, Some(new_vote));
     }
 
@@ -358,6 +380,7 @@ mod tests {
     #[tokio::test]
     async fn test_log_append_and_read() {
         use openraft::CommittedLeaderId;
+        use openraft::storage::RaftLogStorageExt;
 
         let mut store = MemStore::new();
 
@@ -379,13 +402,11 @@ mod tests {
             }),
         };
 
-        // Append it
-        RaftStorage::append_to_log(&mut store, vec![entry.clone()])
-            .await
-            .unwrap();
+        // Append it using the blocking convenience method
+        store.blocking_append(vec![entry.clone()]).await.unwrap();
 
         // Read it back
-        let mut reader = RaftStorage::get_log_reader(&mut store).await;
+        let mut reader = RaftLogStorage::get_log_reader(&mut store).await;
         let entries = reader.try_get_log_entries(0..2).await.unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].log_id.index, 1);

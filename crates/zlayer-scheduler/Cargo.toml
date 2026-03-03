@@ -43,7 +43,7 @@ tower.workspace = true
 tower-http.workspace = true
 
 # Consensus
-openraft.workspace = true
+openraft = { workspace = true, features = ["storage-v2"] }
 
 # Metrics
 metrics.workspace = true

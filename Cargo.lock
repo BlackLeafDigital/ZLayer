@@ -1009,6 +1009,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2af50177e190e07a26ab74f8b1efbfe2ef87da2116221318cb1c2e82baf7de06"
 
 [[package]]
+name = "bincode"
+version = "1.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bitflags"
 version = "1.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10882,6 +10891,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "zlayer-consensus-zql"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bincode",
+ "hex",
+ "openraft",
+ "reqwest 0.13.2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "zql",
+]
+
+[[package]]
 name = "zlayer-core-zql"
 version = "0.1.0"
 dependencies = [
@@ -11284,9 +11311,9 @@ dependencies = [
 
 [[package]]
 name = "zql"
-version = "0.2.29"
+version = "0.3.0"
 source = "sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/"
-checksum = "1f7ec67fb195c6102bcabcc3883bc8763d5842d0c823ea5891d5bd5bce8d9d6a"
+checksum = "9d8b7099a89f2c891d3ff7926c7303163dd8553eb8cb2ae3433f577b368ac877"
 dependencies = [
  "blake3",
  "cbindgen",

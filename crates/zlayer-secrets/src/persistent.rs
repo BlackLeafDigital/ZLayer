@@ -1,11 +1,14 @@
 //! Persistent secrets storage using ZQL.
 //!
-//! Provides encrypted local storage for secrets with a single store containing
-//! fields: `storage_key`, `encrypted_value_hex`, name, version, `created_at`, `updated_at`.
+//! Provides encrypted local storage for secrets using ZQL's typed KV API.
+//! Secrets are encrypted with XChaCha20-Poly1305 before storage.
 //!
-//! - `storage_key`: Primary key in `{scope}:{name}` format
-//! - `encrypted_value_hex`: XChaCha20-Poly1305 encrypted secret bytes (hex-encoded)
-//! - `name`, `version`, `created_at`, `updated_at`: Metadata fields
+//! Each secret is stored as a `StoredSecret` struct containing:
+//! - `encrypted_value`: The encrypted secret bytes
+//! - `name`: The secret name
+//! - `version`: Version number (incremented on each update)
+//! - `created_at`: ISO 8601 creation timestamp
+//! - `updated_at`: ISO 8601 last-update timestamp
 //!
 //! # Example
 //!
@@ -39,6 +42,21 @@ use crate::{
 
 /// Default database directory name when a directory is provided.
 const DEFAULT_DB_DIRNAME: &str = "secrets_zql";
+
+/// Internal struct stored in ZQL for each secret.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredSecret {
+    /// Encrypted secret value bytes
+    encrypted_value: Vec<u8>,
+    /// Secret name
+    name: String,
+    /// Version number
+    version: u32,
+    /// ISO 8601 creation timestamp
+    created_at: String,
+    /// ISO 8601 last-update timestamp
+    updated_at: String,
+}
 
 /// Persistent secrets store backed by ZQL with encryption.
 ///
@@ -122,28 +140,15 @@ impl PersistentSecretsStore {
             .unwrap_or(0)
     }
 
-    /// Escape a string for safe ZQL query embedding
-    fn escape_str(s: &str) -> String {
-        s.replace('\'', "''")
-    }
-
-    /// Query the database for a record by `storage_key`
-    async fn get_record(&self, storage_key: &str) -> Result<Option<HashMap<String, String>>> {
+    /// Get a stored secret record by storage key
+    async fn get_record(&self, storage_key: &str) -> Result<Option<StoredSecret>> {
         let mut db = self.db.lock().await;
-        let result = db.query(&format!(
-            "SELECT * FROM secrets WHERE storage_key = '{}'",
-            Self::escape_str(storage_key)
-        ));
+        let result: std::result::Result<Option<StoredSecret>, _> =
+            db.get_typed("secrets", storage_key);
 
         match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
-                if records.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(records[0].fields.clone()))
-                }
-            }
-            Ok(_) | Err(_) => Ok(None),
+            Ok(record) => Ok(record),
+            Err(_) => Ok(None),
         }
     }
 }
@@ -156,15 +161,8 @@ impl SecretsProvider for PersistentSecretsStore {
         let record = self.get_record(&storage_key).await?;
 
         match record {
-            Some(fields) => {
-                let encrypted_hex = fields.get("encrypted_value_hex").ok_or_else(|| {
-                    SecretsError::Storage("Missing encrypted_value_hex field".to_string())
-                })?;
-
-                let encrypted_value = hex::decode(encrypted_hex)
-                    .map_err(|e| SecretsError::Storage(format!("Invalid hex encoding: {e}")))?;
-
-                let decrypted = self.key.decrypt(&encrypted_value)?;
+            Some(stored) => {
+                let decrypted = self.key.decrypt(&stored.encrypted_value)?;
 
                 let value = String::from_utf8(decrypted)
                     .map_err(|e| SecretsError::Decryption(format!("Invalid UTF-8: {e}")))?;
@@ -194,39 +192,21 @@ impl SecretsProvider for PersistentSecretsStore {
         let prefix = format!("{scope}:");
 
         let mut db = self.db.lock().await;
-        let result = db.query("SELECT * FROM secrets");
+        let result: std::result::Result<Vec<(String, StoredSecret)>, _> =
+            db.scan_typed("secrets", &prefix);
 
         match result {
-            Ok(zql::query::executor::ExecResult::Retrieved(records)) => {
+            Ok(entries) => {
                 let mut results = Vec::new();
 
-                for record in &records {
-                    if let Some(sk) = record.fields.get("storage_key") {
-                        if sk.starts_with(&prefix) {
-                            let name = record.fields.get("name").cloned().unwrap_or_default();
-                            let version = record
-                                .fields
-                                .get("version")
-                                .and_then(|v| v.parse::<i64>().ok())
-                                .unwrap_or(1);
-                            let created_at = record
-                                .fields
-                                .get("created_at")
-                                .map_or(0, |s| Self::parse_timestamp(s));
-                            let updated_at = record
-                                .fields
-                                .get("updated_at")
-                                .map_or(0, |s| Self::parse_timestamp(s));
-
-                            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                            results.push(SecretMetadata {
-                                name,
-                                version: version as u32,
-                                created_at,
-                                updated_at,
-                            });
-                        }
-                    }
+                for (_key, stored) in entries {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    results.push(SecretMetadata {
+                        name: stored.name,
+                        version: stored.version,
+                        created_at: Self::parse_timestamp(&stored.created_at),
+                        updated_at: Self::parse_timestamp(&stored.updated_at),
+                    });
                 }
 
                 results.sort_by(|a, b| a.name.cmp(&b.name));
@@ -252,81 +232,51 @@ impl SecretsStore for PersistentSecretsStore {
 
         // Encrypt the secret value
         let encrypted = self.key.encrypt(value.expose().as_bytes())?;
-        let encrypted_hex = hex::encode(&encrypted);
 
         let now = Self::now_iso8601();
 
         // Check if secret exists to determine version
         let existing = self.get_record(&storage_key).await?;
 
-        let mut db = self.db.lock().await;
-
-        if let Some(existing_fields) = existing {
-            // Update existing secret
-            let version: i64 = existing_fields
-                .get("version")
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(1);
-            let new_version = version + 1;
-            let created_at = existing_fields
-                .get("created_at")
-                .cloned()
-                .unwrap_or_else(|| now.clone());
-
-            // Delete old entry
-            let _ = db.query(&format!(
-                "DELETE FROM secrets WHERE storage_key = '{}'",
-                Self::escape_str(&storage_key)
-            ));
-
-            // Insert updated entry
-            db.query(&format!(
-                "INSERT INTO secrets (storage_key, encrypted_value_hex, name, version, created_at, updated_at) VALUES ('{}', '{}', '{}', '{}', '{}', '{}')",
-                Self::escape_str(&storage_key),
-                Self::escape_str(&encrypted_hex),
-                Self::escape_str(name),
-                new_version,
-                Self::escape_str(&created_at),
-                Self::escape_str(&now)
-            ))
-            .map_err(|e| SecretsError::Storage(format!("Failed to update secret: {e}")))?;
-
-            debug!("Updated secret: {} (version {})", storage_key, new_version);
+        let stored = if let Some(existing_record) = existing {
+            StoredSecret {
+                encrypted_value: encrypted,
+                name: name.to_string(),
+                version: existing_record.version + 1,
+                created_at: existing_record.created_at,
+                updated_at: now,
+            }
         } else {
-            // Insert new secret
-            db.query(&format!(
-                "INSERT INTO secrets (storage_key, encrypted_value_hex, name, version, created_at, updated_at) VALUES ('{}', '{}', '{}', '1', '{}', '{}')",
-                Self::escape_str(&storage_key),
-                Self::escape_str(&encrypted_hex),
-                Self::escape_str(name),
-                Self::escape_str(&now),
-                Self::escape_str(&now)
-            ))
-            .map_err(|e| SecretsError::Storage(format!("Failed to insert secret: {e}")))?;
+            StoredSecret {
+                encrypted_value: encrypted,
+                name: name.to_string(),
+                version: 1,
+                created_at: now.clone(),
+                updated_at: now,
+            }
+        };
 
-            debug!("Stored secret: {} (version 1)", storage_key);
-        }
+        let mut db = self.db.lock().await;
+        db.put_typed("secrets", &storage_key, &stored)
+            .map_err(|e| SecretsError::Storage(format!("Failed to store secret: {e}")))?;
 
+        debug!("Stored secret: {} (version {})", storage_key, stored.version);
         Ok(())
     }
 
     async fn delete_secret(&self, scope: &str, name: &str) -> Result<()> {
         let storage_key = Self::make_key(scope, name);
 
-        // Check existence first
-        let exists = self.get_record(&storage_key).await?.is_some();
-        if !exists {
+        let mut db = self.db.lock().await;
+        let deleted = db
+            .delete_typed("secrets", &storage_key)
+            .map_err(|e| SecretsError::Storage(format!("Failed to delete secret: {e}")))?;
+
+        if !deleted {
             return Err(SecretsError::NotFound {
                 name: name.to_string(),
             });
         }
-
-        let mut db = self.db.lock().await;
-        db.query(&format!(
-            "DELETE FROM secrets WHERE storage_key = '{}'",
-            Self::escape_str(&storage_key)
-        ))
-        .map_err(|e| SecretsError::Storage(format!("Failed to delete secret: {e}")))?;
 
         debug!("Deleted secret: {}", storage_key);
         Ok(())

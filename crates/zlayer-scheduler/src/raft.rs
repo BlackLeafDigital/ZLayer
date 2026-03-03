@@ -16,10 +16,10 @@ use openraft::raft::{
     AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
     SnapshotResponse, VoteRequest, VoteResponse,
 };
-use openraft::storage::Adaptor;
+use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine as RaftStateMachineTrait};
 use openraft::{
-    BasicNode, Config, Entry, LogId, OptionalSend, Raft, RaftTypeConfig, Snapshot,
-    StoredMembership, Vote,
+    BasicNode, Config, Entry, LogId, OptionalSend, Raft, RaftLogReader, RaftTypeConfig, Snapshot,
+    SnapshotMeta, StorageError, StoredMembership, Vote,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
@@ -529,11 +529,225 @@ impl RaftNetwork<TypeConfig> for ZLayerNetworkConnection {
 // Raft Coordinator
 // =============================================================================
 
-/// Type alias for the log store adaptor (wraps MemStore for v2 API)
-pub type RaftLogStore = Adaptor<TypeConfig, MemStore>;
+// =============================================================================
+// Storage Adaptor (wraps MemStore behind Arc<RwLock> for shared access)
+// =============================================================================
 
-/// Type alias for the state machine adaptor (wraps MemStore for v2 API)
-pub type RaftStateMachine = Adaptor<TypeConfig, MemStore>;
+/// Adaptor that wraps `MemStore` behind an `Arc<RwLock>` and delegates to its
+/// `RaftLogStorage` and `RaftStateMachine` implementations.
+///
+/// Both `StorageAdaptor` instances (log store and state machine) share the same
+/// underlying `MemStore`.
+#[derive(Debug, Clone)]
+pub struct StorageAdaptor {
+    storage: Arc<RwLock<MemStore>>,
+}
+
+impl StorageAdaptor {
+    /// Create a pair of (log_store, state_machine) adaptors over a single `MemStore`.
+    pub fn new(store: MemStore) -> (Self, Self) {
+        let s = Arc::new(RwLock::new(store));
+        (
+            Self { storage: s.clone() },
+            Self { storage: s },
+        )
+    }
+
+    /// Get read access to the underlying storage.
+    pub async fn storage(&self) -> tokio::sync::RwLockReadGuard<'_, MemStore> {
+        self.storage.read().await
+    }
+}
+
+impl RaftLogReader<TypeConfig> for StorageAdaptor {
+    async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend>(
+        &mut self,
+        range: RB,
+    ) -> std::result::Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
+        <MemStore as RaftLogReader<TypeConfig>>::try_get_log_entries(
+            self.storage.write().await.deref_mut(),
+            range,
+        )
+        .await
+    }
+}
+
+impl RaftLogStorage<TypeConfig> for StorageAdaptor {
+    type LogReader = <MemStore as RaftLogStorage<TypeConfig>>::LogReader;
+
+    async fn get_log_state(
+        &mut self,
+    ) -> std::result::Result<openraft::storage::LogState<TypeConfig>, StorageError<NodeId>> {
+        <MemStore as RaftLogStorage<TypeConfig>>::get_log_state(
+            self.storage.write().await.deref_mut(),
+        )
+        .await
+    }
+
+    async fn save_vote(
+        &mut self,
+        vote: &Vote<NodeId>,
+    ) -> std::result::Result<(), StorageError<NodeId>> {
+        <MemStore as RaftLogStorage<TypeConfig>>::save_vote(
+            self.storage.write().await.deref_mut(),
+            vote,
+        )
+        .await
+    }
+
+    async fn read_vote(
+        &mut self,
+    ) -> std::result::Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
+        <MemStore as RaftLogStorage<TypeConfig>>::read_vote(
+            self.storage.write().await.deref_mut(),
+        )
+        .await
+    }
+
+    async fn save_committed(
+        &mut self,
+        committed: Option<LogId<NodeId>>,
+    ) -> std::result::Result<(), StorageError<NodeId>> {
+        <MemStore as RaftLogStorage<TypeConfig>>::save_committed(
+            self.storage.write().await.deref_mut(),
+            committed,
+        )
+        .await
+    }
+
+    async fn read_committed(
+        &mut self,
+    ) -> std::result::Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+        <MemStore as RaftLogStorage<TypeConfig>>::read_committed(
+            self.storage.write().await.deref_mut(),
+        )
+        .await
+    }
+
+    async fn get_log_reader(&mut self) -> Self::LogReader {
+        <MemStore as RaftLogStorage<TypeConfig>>::get_log_reader(
+            self.storage.write().await.deref_mut(),
+        )
+        .await
+    }
+
+    async fn append<I>(
+        &mut self,
+        entries: I,
+        callback: LogFlushed<TypeConfig>,
+    ) -> std::result::Result<(), StorageError<NodeId>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        <MemStore as RaftLogStorage<TypeConfig>>::append(
+            self.storage.write().await.deref_mut(),
+            entries,
+            callback,
+        )
+        .await
+    }
+
+    async fn truncate(
+        &mut self,
+        log_id: LogId<NodeId>,
+    ) -> std::result::Result<(), StorageError<NodeId>> {
+        <MemStore as RaftLogStorage<TypeConfig>>::truncate(
+            self.storage.write().await.deref_mut(),
+            log_id,
+        )
+        .await
+    }
+
+    async fn purge(
+        &mut self,
+        log_id: LogId<NodeId>,
+    ) -> std::result::Result<(), StorageError<NodeId>> {
+        <MemStore as RaftLogStorage<TypeConfig>>::purge(
+            self.storage.write().await.deref_mut(),
+            log_id,
+        )
+        .await
+    }
+}
+
+impl RaftStateMachineTrait<TypeConfig> for StorageAdaptor {
+    type SnapshotBuilder = <MemStore as RaftStateMachineTrait<TypeConfig>>::SnapshotBuilder;
+
+    async fn applied_state(
+        &mut self,
+    ) -> std::result::Result<
+        (
+            Option<LogId<NodeId>>,
+            StoredMembership<NodeId, BasicNode>,
+        ),
+        StorageError<NodeId>,
+    > {
+        <MemStore as RaftStateMachineTrait<TypeConfig>>::applied_state(
+            self.storage.write().await.deref_mut(),
+        )
+        .await
+    }
+
+    async fn apply<I>(
+        &mut self,
+        entries: I,
+    ) -> std::result::Result<Vec<Response>, StorageError<NodeId>>
+    where
+        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
+        I::IntoIter: OptionalSend,
+    {
+        <MemStore as RaftStateMachineTrait<TypeConfig>>::apply(
+            self.storage.write().await.deref_mut(),
+            entries,
+        )
+        .await
+    }
+
+    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
+        <MemStore as RaftStateMachineTrait<TypeConfig>>::get_snapshot_builder(
+            self.storage.write().await.deref_mut(),
+        )
+        .await
+    }
+
+    async fn begin_receiving_snapshot(
+        &mut self,
+    ) -> std::result::Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<NodeId>> {
+        <MemStore as RaftStateMachineTrait<TypeConfig>>::begin_receiving_snapshot(
+            self.storage.write().await.deref_mut(),
+        )
+        .await
+    }
+
+    async fn install_snapshot(
+        &mut self,
+        meta: &SnapshotMeta<NodeId, BasicNode>,
+        snapshot: Box<std::io::Cursor<Vec<u8>>>,
+    ) -> std::result::Result<(), StorageError<NodeId>> {
+        <MemStore as RaftStateMachineTrait<TypeConfig>>::install_snapshot(
+            self.storage.write().await.deref_mut(),
+            meta,
+            snapshot,
+        )
+        .await
+    }
+
+    async fn get_current_snapshot(
+        &mut self,
+    ) -> std::result::Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
+        <MemStore as RaftStateMachineTrait<TypeConfig>>::get_current_snapshot(
+            self.storage.write().await.deref_mut(),
+        )
+        .await
+    }
+}
+
+use std::ops::DerefMut;
+
+// =============================================================================
+// Raft Coordinator
+// =============================================================================
 
 /// High-level coordinator for Raft consensus
 ///
@@ -546,7 +760,7 @@ pub struct RaftCoordinator {
     /// OpenRaft instance
     raft: ZLayerRaft,
     /// Log store (adaptor over MemStore)
-    log_store: RaftLogStore,
+    log_store: StorageAdaptor,
     /// Configuration
     config: RaftConfig,
 }
@@ -571,7 +785,7 @@ impl RaftCoordinator {
         let network = ZLayerNetwork::with_timeout(config.rpc_timeout_ms);
 
         // Create adaptors for log storage and state machine from the combined storage
-        let (log_store, state_machine) = Adaptor::new(storage);
+        let (log_store, state_machine) = StorageAdaptor::new(storage);
 
         let raft = Raft::new(
             config.node_id,
