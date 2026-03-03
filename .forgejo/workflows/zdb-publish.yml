@@ -63,7 +63,9 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
       - name: Set release version
         run: |
-          VERSION="${{ needs.resolve-version.outputs.version }}"
+          VERSION="${{ needs.resolve-version.outputs.version || inputs.version }}"
+          if [ -z "$VERSION" ]; then echo "ERROR: No version!"; exit 1; fi
+          echo "Setting version to: ${VERSION}"
           sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" Cargo.toml
           find crates bin -name Cargo.toml -exec sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" {} +
           sed -i "s/version = \"0.0.0-dev\", package/version = \"${VERSION}\", package/" Cargo.toml
@@ -101,7 +103,9 @@ jobs:
         run: tar xzf zlayer-linux-amd64.tar.gz && chmod +x zlayer && sudo mv zlayer /usr/local/bin/
       - name: Set release version
         run: |
-          VERSION="${{ needs.resolve-version.outputs.version }}"
+          VERSION="${{ needs.resolve-version.outputs.version || inputs.version }}"
+          if [ -z "$VERSION" ]; then echo "ERROR: No version!"; exit 1; fi
+          echo "Setting version to: ${VERSION}"
           sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" Cargo.toml
           find crates bin -name Cargo.toml -exec sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" {} +
           sed -i "s/version = \"0.0.0-dev\", package/version = \"${VERSION}\", package/" Cargo.toml
@@ -168,7 +172,9 @@ jobs:
 
       - name: Set release version
         run: |
-          VERSION="${{ needs.resolve-version.outputs.version }}"
+          VERSION="${{ needs.resolve-version.outputs.version || inputs.version }}"
+          if [ -z "$VERSION" ]; then echo "ERROR: No version!"; exit 1; fi
+          echo "Setting version to: ${VERSION}"
           sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" Cargo.toml
           find crates bin -name Cargo.toml -exec sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" {} +
           sed -i "s/version = \"0.0.0-dev\", package/version = \"${VERSION}\", package/" Cargo.toml
