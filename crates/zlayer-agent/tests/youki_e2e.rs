@@ -27,6 +27,7 @@ use zlayer_agent_zql::{
     ProxyManagerConfig, Runtime, ServiceInstance, ServiceManager, YoukiConfig, YoukiRuntime,
 };
 use zlayer_overlay::DnsServer;
+use zlayer_proxy::ServiceRegistry;
 use zlayer_spec::{DeploymentSpec, HealthCheck, ServiceSpec};
 
 /// Macro to run async test body with a timeout
@@ -516,7 +517,8 @@ async fn test_proxy_routing() {
         let port: u16 = 30000 + (rand::random::<u16>() % 10000);
         let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
         let config = ProxyManagerConfig::new(addr);
-        let manager = ProxyManager::new(config);
+        let service_registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, service_registry, None);
 
         // Add service routes
         manager.add_service(&service_name, &spec).await;
@@ -536,23 +538,17 @@ async fn test_proxy_routing() {
         manager.add_backend(&service_name, backend_addr1).await;
         manager.add_backend(&service_name, backend_addr2).await;
 
-        // Verify backends were added via the router
-        let lb = manager.router().get_lb(&service_name).await;
-        assert!(lb.is_some(), "Load balancer should exist");
-        assert_eq!(
-            lb.unwrap().backend_count().await,
-            2,
-            "Should have 2 backends"
-        );
+        // Verify backends were added via the load balancer
+        let lb = manager.load_balancer();
+        assert_eq!(lb.backend_count(&service_name), 2, "Should have 2 backends");
 
         // Update health status
         manager
             .update_backend_health(&service_name, backend_addr1, false)
             .await;
 
-        let lb = manager.router().get_lb(&service_name).await.unwrap();
         assert_eq!(
-            lb.healthy_count().await,
+            lb.healthy_count(&service_name),
             1,
             "One backend should be unhealthy"
         );
@@ -560,7 +556,7 @@ async fn test_proxy_routing() {
         // Remove backend
         manager.remove_backend(&service_name, backend_addr1).await;
         assert_eq!(
-            lb.backend_count().await,
+            lb.backend_count(&service_name),
             1,
             "Should have 1 backend after removal"
         );
@@ -964,7 +960,8 @@ fn create_test_proxy_manager() -> Arc<ProxyManager> {
     let port: u16 = 30000 + (rand::random::<u16>() % 10000);
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let config = ProxyManagerConfig::new(addr);
-    Arc::new(ProxyManager::new(config))
+    let service_registry = Arc::new(ServiceRegistry::new());
+    Arc::new(ProxyManager::new(config, service_registry, None))
 }
 
 /// Test ServiceInstance with full integration: overlay, DNS, and proxy
@@ -1125,13 +1122,11 @@ async fn test_health_callback_updates_proxy() {
         proxy.add_backend(&service_name, test_backend).await;
 
         // Verify backend was added
-        let lb = proxy.router().get_lb(&service_name).await;
-        assert!(lb.is_some(), "Load balancer should exist");
-        let lb = lb.unwrap();
-        assert_eq!(lb.backend_count().await, 1, "Should have 1 backend");
+        let lb = proxy.load_balancer();
+        assert_eq!(lb.backend_count(&service_name), 1, "Should have 1 backend");
 
         // Initially healthy (backends start in Unknown/Healthy state)
-        let initial_healthy = lb.healthy_count().await;
+        let initial_healthy = lb.healthy_count(&service_name);
         println!("Initial healthy count: {}", initial_healthy);
 
         // Simulate health callback marking backend as unhealthy
@@ -1140,7 +1135,7 @@ async fn test_health_callback_updates_proxy() {
             .await;
 
         // Verify backend is now unhealthy
-        let unhealthy_count = lb.healthy_count().await;
+        let unhealthy_count = lb.healthy_count(&service_name);
         println!("Healthy count after marking unhealthy: {}", unhealthy_count);
         assert_eq!(unhealthy_count, 0, "Backend should be marked as unhealthy");
 
@@ -1150,7 +1145,7 @@ async fn test_health_callback_updates_proxy() {
             .await;
 
         // Verify backend is healthy again
-        let healthy_count = lb.healthy_count().await;
+        let healthy_count = lb.healthy_count(&service_name);
         println!("Healthy count after marking healthy: {}", healthy_count);
         assert_eq!(healthy_count, 1, "Backend should be marked as healthy");
 
@@ -1298,15 +1293,15 @@ async fn test_proxy_backend_lifecycle() {
         proxy.add_backend(&service_name, backend2).await;
         proxy.add_backend(&service_name, backend3).await;
 
-        let lb = proxy.router().get_lb(&service_name).await.unwrap();
-        assert_eq!(lb.backend_count().await, 3, "Should have 3 backends");
+        let lb = proxy.load_balancer();
+        assert_eq!(lb.backend_count(&service_name), 3, "Should have 3 backends");
 
         // Mark one backend as unhealthy
         proxy
             .update_backend_health(&service_name, backend2, false)
             .await;
         assert_eq!(
-            lb.healthy_count().await,
+            lb.healthy_count(&service_name),
             2,
             "Should have 2 healthy backends"
         );
@@ -1314,15 +1309,19 @@ async fn test_proxy_backend_lifecycle() {
         // Remove one backend (simulating scale down)
         proxy.remove_backend(&service_name, backend1).await;
         assert_eq!(
-            lb.backend_count().await,
+            lb.backend_count(&service_name),
             2,
             "Should have 2 backends after removal"
         );
 
         // Remove unhealthy backend
         proxy.remove_backend(&service_name, backend2).await;
-        assert_eq!(lb.backend_count().await, 1, "Should have 1 backend");
-        assert_eq!(lb.healthy_count().await, 1, "Should have 1 healthy backend");
+        assert_eq!(lb.backend_count(&service_name), 1, "Should have 1 backend");
+        assert_eq!(
+            lb.healthy_count(&service_name),
+            1,
+            "Should have 1 healthy backend"
+        );
 
         // Remove service
         proxy.remove_service(&service_name).await;

@@ -10,12 +10,15 @@
 use crate::error::Result;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use zlayer_proxy::{
-    Backend, HealthStatus, ProxyConfig, ProxyServer, Route, Router, StreamRegistry,
-    TcpStreamService, UdpStreamService,
+    load_existing_certs_into_resolver, CertManager, LbStrategy, LoadBalancer, ProxyConfig,
+    ProxyServer, RouteEntry, ServiceRegistry, SniCertResolver, StreamRegistry, TcpStreamService,
+    UdpStreamService,
 };
 use zlayer_spec::{ExposeType, Protocol, ServiceSpec};
 
@@ -83,43 +86,82 @@ struct ServiceTracking {
 /// the proxy crate's routing/load balancing infrastructure. It supports:
 ///
 /// - **HTTP/HTTPS/WebSocket (L7)**: Multiple port listeners sharing the same
-///   `Router` for request matching and load balancing.
+///   `ServiceRegistry` for request matching and load balancing.
 /// - **TCP/UDP (L4)**: Standalone stream proxy listeners that forward raw
 ///   connections/datagrams to backends via the `StreamRegistry`.
 pub struct ProxyManager {
     /// Configuration
     config: ProxyManagerConfig,
-    /// Shared router for HTTP request matching
-    router: Arc<Router>,
+    /// Shared service registry for HTTP request matching and backend management
+    registry: Arc<ServiceRegistry>,
+    /// Load balancer for health-aware backend selection
+    load_balancer: Arc<LoadBalancer>,
     /// Per-port HTTP proxy server handles
     servers: RwLock<HashMap<u16, Arc<ProxyServer>>>,
     /// Tracked services and their endpoints (includes port ownership for cleanup)
     services: RwLock<HashMap<String, ServiceTracking>>,
     /// Stream registry for L4 TCP/UDP proxy routing
     stream_registry: Option<Arc<StreamRegistry>>,
+    /// Certificate manager for TLS
+    cert_manager: Option<Arc<CertManager>>,
     /// Ports with active TCP stream listeners (to avoid double-binding)
     tcp_listeners: RwLock<HashSet<u16>>,
     /// Ports with active UDP stream listeners (to avoid double-binding)
     udp_listeners: RwLock<HashSet<u16>>,
+    /// Number of active proxy connections (for graceful drain on shutdown)
+    active_connections: Arc<AtomicU64>,
 }
 
 impl ProxyManager {
-    /// Create a new ProxyManager with the given configuration
-    pub fn new(config: ProxyManagerConfig) -> Self {
+    /// Create a new ProxyManager with the given configuration, service registry,
+    /// and optional certificate manager.
+    pub fn new(
+        config: ProxyManagerConfig,
+        registry: Arc<ServiceRegistry>,
+        cert_manager: Option<Arc<CertManager>>,
+    ) -> Self {
+        let load_balancer = Arc::new(LoadBalancer::new());
+
+        // Spawn the load balancer's background health checker
+        let lb_clone = load_balancer.clone();
+        tokio::spawn(async move {
+            let handle =
+                lb_clone.spawn_health_checker(Duration::from_secs(5), Duration::from_secs(2));
+            handle.await.ok();
+        });
+
         Self {
             config,
-            router: Arc::new(Router::new()),
+            registry,
+            load_balancer,
             servers: RwLock::new(HashMap::new()),
             services: RwLock::new(HashMap::new()),
             stream_registry: None,
+            cert_manager,
             tcp_listeners: RwLock::new(HashSet::new()),
             udp_listeners: RwLock::new(HashSet::new()),
+            active_connections: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Get a reference to the router
-    pub fn router(&self) -> Arc<Router> {
-        self.router.clone()
+    /// Get a reference to the service registry
+    pub fn registry(&self) -> Arc<ServiceRegistry> {
+        self.registry.clone()
+    }
+
+    /// Get a reference to the load balancer
+    pub fn load_balancer(&self) -> Arc<LoadBalancer> {
+        self.load_balancer.clone()
+    }
+
+    /// Get the number of currently active proxy connections.
+    pub fn active_connections(&self) -> u64 {
+        self.active_connections.load(Ordering::Relaxed)
+    }
+
+    /// Get a reference to the certificate manager (if configured)
+    pub fn cert_manager(&self) -> Option<&Arc<CertManager>> {
+        self.cert_manager.as_ref()
     }
 
     /// Set the stream registry for L4 proxy integration (TCP/UDP)
@@ -141,7 +183,7 @@ impl ProxyManager {
     /// Start listening on a specific port bound to the given address.
     ///
     /// If already listening on this port, skip.
-    /// All port listeners share the same Router for request matching.
+    /// All port listeners share the same ServiceRegistry for request matching.
     pub async fn listen_on(&self, port: u16, bind_ip: IpAddr) -> Result<()> {
         let mut servers = self.servers.write().await;
 
@@ -155,7 +197,11 @@ impl ProxyManager {
         proxy_config.server.http_addr = addr;
         proxy_config.server.http2_enabled = self.config.http2_enabled;
 
-        let server = ProxyServer::with_router(proxy_config, self.router.clone());
+        let server = ProxyServer::with_registry(
+            proxy_config,
+            self.registry.clone(),
+            self.load_balancer.clone(),
+        );
         let server = Arc::new(server);
 
         info!(port = port, bind = %addr, "Proxy listening on port");
@@ -171,11 +217,94 @@ impl ProxyManager {
         Ok(())
     }
 
-    /// Stop all proxy servers on all ports
+    /// Start an HTTPS listener on the given port using SniCertResolver for dynamic cert selection.
+    ///
+    /// If already listening on this port, skip.
+    /// Requires a `CertManager` to be configured; logs a warning and returns `Ok(())` if not.
+    pub async fn listen_on_tls(&self, port: u16, bind_ip: IpAddr) -> Result<()> {
+        let mut servers = self.servers.write().await;
+
+        if servers.contains_key(&port) {
+            debug!(port = port, "Already listening on port (TLS)");
+            return Ok(());
+        }
+
+        let cert_manager = match &self.cert_manager {
+            Some(cm) => cm,
+            None => {
+                warn!(
+                    port = port,
+                    "Cannot start TLS listener: no CertManager configured"
+                );
+                return Ok(());
+            }
+        };
+
+        // Create SniCertResolver and load existing certs
+        let sni_resolver = Arc::new(SniCertResolver::new());
+
+        // Load existing certificates (best-effort; log warnings on failure)
+        let _ = load_existing_certs_into_resolver(cert_manager, &sni_resolver).await;
+
+        let addr = SocketAddr::new(bind_ip, port);
+        let mut proxy_config = ProxyConfig::default();
+        proxy_config.server.https_addr = addr;
+
+        let server = ProxyServer::with_tls_resolver(
+            proxy_config,
+            self.registry.clone(),
+            self.load_balancer.clone(),
+            sni_resolver,
+        )
+        .with_cert_manager(Arc::clone(cert_manager));
+        let server = Arc::new(server);
+
+        info!(port = port, bind = %addr, "HTTPS proxy listening on port");
+
+        let server_clone = server.clone();
+        tokio::spawn(async move {
+            if let Err(e) = server_clone.run_https().await {
+                tracing::error!(port = port, error = %e, "HTTPS proxy server error");
+            }
+        });
+
+        servers.insert(port, server);
+        Ok(())
+    }
+
+    /// Stop all proxy servers on all ports.
+    ///
+    /// After signalling each server to shut down, waits up to 30 seconds for
+    /// active connections to drain before returning.
     pub async fn stop(&self) {
         let mut servers = self.servers.write().await;
         for (port, server) in servers.drain() {
             info!(port = port, "Stopping proxy on port");
+            server.shutdown();
+        }
+
+        // Wait up to 30s for active connections to drain
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while self.active_connections.load(Ordering::Relaxed) > 0 {
+            if tokio::time::Instant::now() >= deadline {
+                let remaining = self.active_connections.load(Ordering::Relaxed);
+                warn!(
+                    remaining = remaining,
+                    "Drain timeout reached, forcing shutdown"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        info!("All proxy servers stopped");
+    }
+
+    /// Remove and shut down the listener on a specific port.
+    pub async fn unbind(&self, port: u16) {
+        let mut servers = self.servers.write().await;
+        if let Some(server) = servers.remove(&port) {
+            info!(port = port, "Unbinding proxy from port");
             server.shutdown();
         }
     }
@@ -215,7 +344,11 @@ impl ProxyManager {
             };
 
             match endpoint.protocol {
-                Protocol::Http | Protocol::Https | Protocol::Websocket => {
+                Protocol::Https => {
+                    // L7 TLS: start HTTPS proxy listener with SNI cert resolution
+                    self.listen_on_tls(endpoint.port, bind_ip).await?;
+                }
+                Protocol::Http | Protocol::Websocket => {
                     // L7: start HTTP proxy listener
                     self.listen_on(endpoint.port, bind_ip).await?;
                 }
@@ -347,7 +480,7 @@ impl ProxyManager {
     /// Add routes for a service based on its specification
     ///
     /// This creates proxy routes for each endpoint defined in the ServiceSpec.
-    /// HTTP/HTTPS/WebSocket endpoints get L7 routes via the Router.
+    /// HTTP/HTTPS/WebSocket endpoints get L7 routes via the ServiceRegistry.
     /// TCP/UDP endpoints are tracked but their L4 registration is handled
     /// by the `ServiceManager::register_service_routes()` method.
     pub async fn add_service(&self, name: &str, spec: &ServiceSpec) {
@@ -362,9 +495,9 @@ impl ProxyManager {
         for endpoint in &spec.endpoints {
             match endpoint.protocol {
                 Protocol::Http | Protocol::Https | Protocol::Websocket => {
-                    // L7: add HTTP route to the Router
-                    let route = Route::from_endpoint(name, endpoint);
-                    self.router.add_route(route).await;
+                    // L7: register route in the ServiceRegistry
+                    let entry = RouteEntry::from_endpoint(name, endpoint);
+                    self.registry.register(entry).await;
                     http_ports.push(endpoint.port);
 
                     info!(
@@ -403,14 +536,9 @@ impl ProxyManager {
             endpoint_names.push(endpoint.name.clone());
         }
 
-        // Ensure load balancer exists for HTTP services
-        let has_http = spec
-            .endpoints
-            .iter()
-            .any(|e| is_http_compatible(e.protocol));
-        if has_http {
-            let _ = self.router.get_or_create_lb(name).await;
-        }
+        // Register the service in the load balancer (starts with no backends)
+        self.load_balancer
+            .register(name, vec![], LbStrategy::RoundRobin);
 
         services.insert(
             name.to_string(),
@@ -427,7 +555,7 @@ impl ProxyManager {
     ///
     /// This performs a full cleanup of all proxy resources associated with the
     /// service:
-    /// - Removes L7 (HTTP/HTTPS/WebSocket) routes from the Router
+    /// - Removes L7 (HTTP/HTTPS/WebSocket) routes from the ServiceRegistry
     /// - Unregisters TCP/UDP stream services from the StreamRegistry
     /// - Removes port tracking for TCP/UDP listeners
     /// - Shuts down HTTP proxy server handles that were exclusively owned by
@@ -436,8 +564,11 @@ impl ProxyManager {
         let mut services = self.services.write().await;
 
         if let Some(tracking) = services.remove(name) {
-            // 1. Remove L7 routes from the Router
-            self.router.remove_service_routes(name).await;
+            // 1. Remove L7 routes from the ServiceRegistry
+            self.registry.unregister_service(name).await;
+
+            // 1b. Remove from the load balancer
+            self.load_balancer.unregister(name);
 
             // 2. Unregister TCP stream services and clear port tracking
             if !tracking.tcp_ports.is_empty() {
@@ -490,72 +621,47 @@ impl ProxyManager {
         }
     }
 
-    /// Update the backends for a service
-    ///
-    /// This replaces all backends for the given service with the provided list.
-    /// Each backend should be the address where the service replica is listening.
-    pub async fn update_backends(&self, service: &str, backends: Vec<Backend>) {
-        let lb = self.router.get_or_create_lb(service).await;
-
-        debug!(
-            service = service,
-            count = backends.len(),
-            "Updating backends for service"
-        );
-
-        lb.set_backends(backends).await;
-    }
-
     /// Add a single backend to a service
     pub async fn add_backend(&self, service: &str, addr: SocketAddr) {
-        let lb = self.router.get_or_create_lb(service).await;
-
-        let backend = Backend::new(addr);
-        lb.add_backend(backend).await;
-
-        debug!(
-            service = service,
-            backend = %addr,
-            "Added backend to service"
-        );
+        self.registry.add_backend(service, addr).await;
+        self.load_balancer.add_backend(service, addr);
+        debug!(service = service, backend = %addr, "Added backend to service");
     }
 
     /// Remove a backend from a service
     pub async fn remove_backend(&self, service: &str, addr: SocketAddr) {
-        if let Some(lb) = self.router.get_lb(service).await {
-            lb.remove_backend(addr).await;
-
-            debug!(
-                service = service,
-                backend = %addr,
-                "Removed backend from service"
-            );
-        }
+        self.registry.remove_backend(service, addr).await;
+        self.load_balancer.remove_backend(service, &addr);
+        debug!(service = service, backend = %addr, "Removed backend from service");
     }
 
-    /// Update the health status of a backend
+    /// Update the health status of a backend in the load balancer.
+    ///
+    /// Delegates to [`LoadBalancer::mark_health`] so that unhealthy backends
+    /// are skipped during selection.
     pub async fn update_backend_health(&self, service: &str, addr: SocketAddr, healthy: bool) {
-        if let Some(lb) = self.router.get_lb(service).await {
-            let status = if healthy {
-                HealthStatus::Healthy
-            } else {
-                HealthStatus::Unhealthy
-            };
+        self.load_balancer.mark_health(service, &addr, healthy);
+        debug!(
+            service = service,
+            backend = %addr,
+            healthy = healthy,
+            "Updated backend health in load balancer"
+        );
+    }
 
-            lb.update_health(addr, status).await;
-
-            debug!(
-                service = service,
-                backend = %addr,
-                healthy = healthy,
-                "Updated backend health"
-            );
-        }
+    /// Update the backends for a service
+    ///
+    /// This replaces all backends for the given service with the provided list.
+    /// Each backend should be the address where the service replica is listening.
+    pub async fn update_backends(&self, service: &str, addrs: Vec<SocketAddr>) {
+        self.registry.update_backends(service, addrs.clone()).await;
+        self.load_balancer.update_backends(service, addrs);
+        debug!(service = service, "Updated backends for service");
     }
 
     /// Get the number of registered routes
     pub async fn route_count(&self) -> usize {
-        self.router.route_count().await
+        self.registry.route_count().await
     }
 
     /// Get the list of registered service names
@@ -567,14 +673,6 @@ impl ProxyManager {
     pub async fn has_service(&self, name: &str) -> bool {
         self.services.read().await.contains_key(name)
     }
-}
-
-/// Check if a protocol is HTTP-compatible (can be proxied over HTTP)
-fn is_http_compatible(protocol: Protocol) -> bool {
-    matches!(
-        protocol,
-        Protocol::Http | Protocol::Https | Protocol::Websocket
-    )
 }
 
 #[cfg(test)]
@@ -637,7 +735,8 @@ services:
     #[tokio::test]
     async fn test_proxy_manager_new() {
         let config = ProxyManagerConfig::default();
-        let manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, registry, None);
 
         assert_eq!(manager.route_count().await, 0);
         assert!(manager.list_services().await.is_empty());
@@ -646,7 +745,8 @@ services:
     #[tokio::test]
     async fn test_add_service_with_http_endpoints() {
         let config = ProxyManagerConfig::default();
-        let manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, registry, None);
 
         let spec = mock_service_spec_with_endpoints();
         manager.add_service("api", &spec).await;
@@ -659,7 +759,8 @@ services:
     #[tokio::test]
     async fn test_tcp_endpoints_tracked_not_routed() {
         let config = ProxyManagerConfig::default();
-        let manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, registry, None);
 
         let spec = mock_service_spec_tcp_only();
         manager.add_service("grpc-service", &spec).await;
@@ -673,7 +774,8 @@ services:
     #[tokio::test]
     async fn test_remove_service() {
         let config = ProxyManagerConfig::default();
-        let manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, registry, None);
 
         let spec = mock_service_spec_with_endpoints();
         manager.add_service("api", &spec).await;
@@ -687,7 +789,8 @@ services:
     #[tokio::test]
     async fn test_backend_management() {
         let config = ProxyManagerConfig::default();
-        let manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, registry.clone(), None);
 
         let spec = mock_service_spec_with_endpoints();
         manager.add_service("api", &spec).await;
@@ -699,18 +802,21 @@ services:
         manager.add_backend("api", addr1).await;
         manager.add_backend("api", addr2).await;
 
-        let lb = manager.router.get_lb("api").await.unwrap();
-        assert_eq!(lb.backend_count().await, 2);
+        // Verify backends via the registry's resolve
+        let resolved = registry.resolve(None, "/api").await.unwrap();
+        assert_eq!(resolved.backends.len(), 2);
 
         // Remove a backend
         manager.remove_backend("api", addr1).await;
-        assert_eq!(lb.backend_count().await, 1);
+        let resolved = registry.resolve(None, "/api").await.unwrap();
+        assert_eq!(resolved.backends.len(), 1);
     }
 
     #[tokio::test]
     async fn test_update_backends_replaces_all() {
         let config = ProxyManagerConfig::default();
-        let manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, registry.clone(), None);
 
         let spec = mock_service_spec_with_endpoints();
         manager.add_service("api", &spec).await;
@@ -720,39 +826,15 @@ services:
         manager.add_backend("api", addr1).await;
 
         // Update with new backends (replaces)
-        let new_backends = vec![
-            Backend::new("127.0.0.1:9000".parse().unwrap()),
-            Backend::new("127.0.0.1:9001".parse().unwrap()),
-            Backend::new("127.0.0.1:9002".parse().unwrap()),
+        let new_backends: Vec<SocketAddr> = vec![
+            "127.0.0.1:9000".parse().unwrap(),
+            "127.0.0.1:9001".parse().unwrap(),
+            "127.0.0.1:9002".parse().unwrap(),
         ];
         manager.update_backends("api", new_backends).await;
 
-        let lb = manager.router.get_lb("api").await.unwrap();
-        assert_eq!(lb.backend_count().await, 3);
-    }
-
-    #[tokio::test]
-    async fn test_health_update() {
-        let config = ProxyManagerConfig::default();
-        let manager = ProxyManager::new(config);
-
-        let spec = mock_service_spec_with_endpoints();
-        manager.add_service("api", &spec).await;
-
-        let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
-        manager.add_backend("api", addr).await;
-
-        // Mark as unhealthy
-        manager.update_backend_health("api", addr, false).await;
-
-        let lb = manager.router.get_lb("api").await.unwrap();
-        // healthy_count only returns backends with Healthy or Unknown status
-        // After setting unhealthy, it should be 0
-        assert_eq!(lb.healthy_count().await, 0);
-
-        // Mark as healthy
-        manager.update_backend_health("api", addr, true).await;
-        assert_eq!(lb.healthy_count().await, 1);
+        let resolved = registry.resolve(None, "/api").await.unwrap();
+        assert_eq!(resolved.backends.len(), 3);
     }
 
     #[tokio::test]
@@ -779,7 +861,8 @@ services:
     #[tokio::test]
     async fn test_ensure_ports_differentiates_public_and_internal() {
         let config = ProxyManagerConfig::default();
-        let manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, registry, None);
 
         let spec = mock_service_spec_with_endpoints();
         // Passing None for overlay_ip: internal endpoints should fall back to 127.0.0.1
@@ -792,7 +875,8 @@ services:
     #[tokio::test]
     async fn test_ensure_ports_with_overlay_ip() {
         let config = ProxyManagerConfig::default();
-        let manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, registry, None);
 
         let spec = mock_service_spec_with_endpoints();
         // Pass an overlay IP -- internal endpoints should bind there
@@ -839,7 +923,8 @@ services:
     #[tokio::test]
     async fn test_add_mixed_service_tracks_all_endpoints() {
         let config = ProxyManagerConfig::default();
-        let manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, registry, None);
 
         let spec = mock_mixed_service_spec();
         manager.add_service("mixed", &spec).await;
@@ -854,7 +939,8 @@ services:
     async fn test_ensure_ports_tcp_with_stream_registry() {
         let stream_registry = Arc::new(StreamRegistry::new());
         let config = ProxyManagerConfig::default();
-        let mut manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let mut manager = ProxyManager::new(config, registry, None);
         manager.set_stream_registry(stream_registry.clone());
 
         let spec = mock_service_spec_tcp_only();
@@ -875,7 +961,8 @@ services:
     #[tokio::test]
     async fn test_ensure_ports_tcp_without_stream_registry() {
         let config = ProxyManagerConfig::default();
-        let manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, registry, None);
 
         let spec = mock_service_spec_tcp_only();
 
@@ -892,10 +979,21 @@ services:
     async fn test_stream_registry_setter() {
         let stream_registry = Arc::new(StreamRegistry::new());
         let config = ProxyManagerConfig::default();
-        let mut manager = ProxyManager::new(config);
+        let registry = Arc::new(ServiceRegistry::new());
+        let mut manager = ProxyManager::new(config, registry, None);
 
         assert!(manager.stream_registry().is_none());
         manager.set_stream_registry(stream_registry.clone());
         assert!(manager.stream_registry().is_some());
+    }
+
+    #[tokio::test]
+    async fn test_registry_accessor() {
+        let config = ProxyManagerConfig::default();
+        let registry = Arc::new(ServiceRegistry::new());
+        let manager = ProxyManager::new(config, registry.clone(), None);
+
+        // registry() should return the same Arc
+        assert_eq!(Arc::as_ptr(&manager.registry()), Arc::as_ptr(&registry));
     }
 }

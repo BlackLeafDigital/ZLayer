@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
 use zlayer_overlay::DnsServer;
-use zlayer_proxy::{ResolvedService, ServiceRegistry, StreamRegistry, StreamService};
+use zlayer_proxy::{StreamRegistry, StreamService};
 use zlayer_spec::{DependsSpec, HealthCheck, Protocol, ResourceType, ServiceSpec};
 
 /// Service instance manages a single service's containers
@@ -141,10 +141,34 @@ impl ServiceInstance {
                         reason: e.to_string(),
                     })?;
 
+                // Get container PID with retries (may not be immediately available)
+                let mut container_pid = None;
+                for attempt in 1..=5u32 {
+                    match self.runtime.get_container_pid(&id).await {
+                        Ok(Some(pid)) => {
+                            container_pid = Some(pid);
+                            break;
+                        }
+                        Ok(None) if attempt < 5 => {
+                            tracing::debug!(container = %id, attempt, "PID not available yet, retrying");
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                        Ok(None) => {
+                            tracing::warn!(container = %id, "Container PID unavailable after 5 attempts");
+                        }
+                        Err(e) => {
+                            tracing::warn!(container = %id, attempt, error = %e, "Failed to get PID");
+                            if attempt < 5 {
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            }
+                        }
+                    }
+                }
+
                 // Attach to overlay network if manager is available
                 let overlay_ip = if let Some(overlay) = &self.overlay_manager {
                     // Get container PID for network namespace attachment
-                    if let Ok(Some(pid)) = self.runtime.get_container_pid(&id).await {
+                    if let Some(pid) = container_pid {
                         let overlay_guard = overlay.read().await;
                         match overlay_guard
                             .attach_container(pid, &self.service_name, true)
@@ -482,8 +506,6 @@ pub struct ServiceManager {
     scale_semaphore: Arc<Semaphore>,
     /// Overlay network manager for container networking
     overlay_manager: Option<Arc<RwLock<OverlayManager>>>,
-    /// Service registry for Pingora proxy route registration (HTTP/HTTPS/WebSocket)
-    service_registry: Option<Arc<ServiceRegistry>>,
     /// Stream registry for L4 proxy route registration (TCP/UDP)
     stream_registry: Option<Arc<StreamRegistry>>,
     /// Proxy manager for health-aware load balancing (hyper-based proxy)
@@ -516,7 +538,6 @@ pub struct ServiceManager {
 /// let manager = ServiceManager::builder(runtime)
 ///     .overlay_manager(om)
 ///     .proxy_manager(proxy)
-///     .service_registry(registry)
 ///     .deployment_name("prod")
 ///     .build();
 /// ```
@@ -524,7 +545,6 @@ pub struct ServiceManagerBuilder {
     runtime: Arc<dyn Runtime + Send + Sync>,
     overlay_manager: Option<Arc<RwLock<OverlayManager>>>,
     proxy_manager: Option<Arc<ProxyManager>>,
-    service_registry: Option<Arc<ServiceRegistry>>,
     stream_registry: Option<Arc<StreamRegistry>>,
     dns_server: Option<Arc<DnsServer>>,
     deployment_name: Option<String>,
@@ -540,7 +560,6 @@ impl ServiceManagerBuilder {
             runtime,
             overlay_manager: None,
             proxy_manager: None,
-            service_registry: None,
             stream_registry: None,
             dns_server: None,
             deployment_name: None,
@@ -559,12 +578,6 @@ impl ServiceManagerBuilder {
     /// Set the proxy manager for health-aware load balancing.
     pub fn proxy_manager(mut self, pm: Arc<ProxyManager>) -> Self {
         self.proxy_manager = Some(pm);
-        self
-    }
-
-    /// Set the service registry for HTTP/HTTPS/WebSocket proxy route registration.
-    pub fn service_registry(mut self, sr: Arc<ServiceRegistry>) -> Self {
-        self.service_registry = Some(sr);
         self
     }
 
@@ -606,14 +619,11 @@ impl ServiceManagerBuilder {
 
     /// Consume the builder and produce a fully-wired [`ServiceManager`].
     ///
-    /// Logs warnings for missing recommended subsystems (proxy, service_registry,
+    /// Logs warnings for missing recommended subsystems (proxy,
     /// stream_registry, container_supervisor, deployment_name).
     pub fn build(self) -> ServiceManager {
         if self.proxy_manager.is_none() {
             tracing::warn!("ServiceManager built without proxy_manager");
-        }
-        if self.service_registry.is_none() {
-            tracing::warn!("ServiceManager built without service_registry");
         }
         if self.stream_registry.is_none() {
             tracing::warn!("ServiceManager built without stream_registry");
@@ -630,7 +640,6 @@ impl ServiceManagerBuilder {
             services: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             scale_semaphore: Arc::new(Semaphore::new(10)),
             overlay_manager: self.overlay_manager,
-            service_registry: self.service_registry,
             stream_registry: self.stream_registry,
             proxy_manager: self.proxy_manager,
             dns_server: self.dns_server,
@@ -668,7 +677,6 @@ impl ServiceManager {
             services: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             scale_semaphore: Arc::new(Semaphore::new(10)), // Max 10 concurrent scaling operations
             overlay_manager: None,
-            service_registry: None,
             stream_registry: None,
             proxy_manager: None,
             dns_server: None,
@@ -691,30 +699,6 @@ impl ServiceManager {
             services: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             scale_semaphore: Arc::new(Semaphore::new(10)),
             overlay_manager: Some(overlay_manager),
-            service_registry: None,
-            stream_registry: None,
-            proxy_manager: None,
-            dns_server: None,
-            deployment_name: None,
-            health_states: Arc::new(RwLock::new(HashMap::new())),
-            job_executor: None,
-            cron_scheduler: None,
-            container_supervisor: None,
-        }
-    }
-
-    /// Create a service manager with Pingora proxy support
-    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
-    pub fn with_proxy(
-        runtime: Arc<dyn Runtime + Send + Sync>,
-        service_registry: Arc<ServiceRegistry>,
-    ) -> Self {
-        Self {
-            runtime,
-            services: tokio::sync::RwLock::new(std::collections::HashMap::new()),
-            scale_semaphore: Arc::new(Semaphore::new(10)),
-            overlay_manager: None,
-            service_registry: Some(service_registry),
             stream_registry: None,
             proxy_manager: None,
             dns_server: None,
@@ -731,7 +715,6 @@ impl ServiceManager {
     pub fn with_full_config(
         runtime: Arc<dyn Runtime + Send + Sync>,
         overlay_manager: Arc<RwLock<OverlayManager>>,
-        service_registry: Arc<ServiceRegistry>,
         deployment_name: String,
     ) -> Self {
         Self {
@@ -739,7 +722,6 @@ impl ServiceManager {
             services: tokio::sync::RwLock::new(std::collections::HashMap::new()),
             scale_semaphore: Arc::new(Semaphore::new(10)),
             overlay_manager: Some(overlay_manager),
-            service_registry: Some(service_registry),
             stream_registry: None,
             proxy_manager: None,
             dns_server: None,
@@ -766,12 +748,6 @@ impl ServiceManager {
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
     pub fn set_deployment_name(&mut self, name: String) {
         self.deployment_name = Some(name);
-    }
-
-    /// Set the service registry for proxy integration (HTTP/HTTPS/WebSocket)
-    #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
-    pub fn set_service_registry(&mut self, registry: Arc<ServiceRegistry>) {
-        self.service_registry = Some(registry);
     }
 
     /// Set the stream registry for L4 proxy integration (TCP/UDP)
@@ -1032,7 +1008,7 @@ impl ServiceManager {
         let condition_checker = DependencyConditionChecker::new(
             Arc::clone(&self.runtime),
             Arc::clone(&self.health_states),
-            self.service_registry.clone(),
+            None,
         );
 
         let waiter = DependencyWaiter::new(condition_checker);
@@ -1083,7 +1059,7 @@ impl ServiceManager {
         let condition_checker = DependencyConditionChecker::new(
             Arc::clone(&self.runtime),
             Arc::clone(&self.health_states),
-            self.service_registry.clone(),
+            None,
         );
 
         for dep in deps {
@@ -1104,11 +1080,7 @@ impl ServiceManager {
     pub async fn upsert_service(&self, name: String, spec: ServiceSpec) -> Result<()> {
         match spec.rtype {
             ResourceType::Service => {
-                // Long-running service: register routes and create/update instance
-                if let Some(registry) = &self.service_registry {
-                    self.register_service_routes(registry, &name, &spec);
-                }
-
+                // Long-running service: create/update instance
                 let mut services = self.services.write().await;
 
                 if let Some(instance) = services.get_mut(&name) {
@@ -1135,6 +1107,38 @@ impl ServiceManager {
                     // Set DNS server if configured
                     if let Some(dns) = &self.dns_server {
                         instance.set_dns_server(Arc::clone(dns));
+                    }
+                    // Register HTTP routes via proxy manager
+                    if let Some(proxy) = &self.proxy_manager {
+                        proxy.add_service(&name, &instance.spec).await;
+                    }
+                    // Register TCP/UDP endpoints in stream registry
+                    if let Some(stream_registry) = &self.stream_registry {
+                        for endpoint in &instance.spec.endpoints {
+                            let svc = StreamService::new(
+                                name.clone(),
+                                Vec::new(), // No backends yet; added on scale-up
+                            );
+                            match endpoint.protocol {
+                                Protocol::Tcp => {
+                                    stream_registry.register_tcp(endpoint.port, svc);
+                                    tracing::debug!(
+                                        service = %name,
+                                        port = endpoint.port,
+                                        "Registered TCP stream route"
+                                    );
+                                }
+                                Protocol::Udp => {
+                                    stream_registry.register_udp(endpoint.port, svc);
+                                    tracing::debug!(
+                                        service = %name,
+                                        port = endpoint.port,
+                                        "Registered UDP stream route"
+                                    );
+                                }
+                                _ => {} // HTTP routes handled by proxy manager
+                            }
+                        }
                     }
                     services.insert(name, instance);
                 }
@@ -1188,135 +1192,14 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// Register service routes with the Pingora proxy ServiceRegistry and StreamRegistry
-    fn register_service_routes(
-        &self,
-        registry: &ServiceRegistry,
-        service_name: &str,
-        spec: &ServiceSpec,
-    ) {
-        let deployment = self.deployment_name.as_deref().unwrap_or("default");
-
-        for endpoint in &spec.endpoints {
-            match endpoint.protocol {
-                Protocol::Http | Protocol::Websocket => {
-                    // HTTP/WebSocket: register with ServiceRegistry (L7 proxy)
-                    let resolved = ResolvedService {
-                        name: service_name.to_string(),
-                        backends: vec![], // Backends are populated on scale operations
-                        use_tls: false,
-                        sni_hostname: format!("{}.{}.service", endpoint.name, service_name),
-                    };
-
-                    // Generate the host pattern for this endpoint
-                    // Format: {endpoint_name}.{service_name}.{deployment}
-                    let host = format!("{}.{}.{}", endpoint.name, service_name, deployment);
-
-                    // Register with optional path prefix
-                    registry.register(&host, endpoint.path.as_deref(), resolved.clone());
-
-                    // Also register a simpler host pattern for convenience
-                    // Format: {service_name}.{deployment} (matches first endpoint)
-                    if endpoint.name == "http" || endpoint.name == "main" || endpoint.name == "web"
-                    {
-                        let simple_host = format!("{}.{}", service_name, deployment);
-                        registry.register(&simple_host, endpoint.path.as_deref(), resolved);
-                    }
-
-                    tracing::debug!(
-                        service = %service_name,
-                        endpoint = %endpoint.name,
-                        host = %host,
-                        path = ?endpoint.path,
-                        "Registered HTTP proxy route"
-                    );
-                }
-                Protocol::Https => {
-                    // HTTPS: register with ServiceRegistry (L7 proxy with TLS)
-                    let resolved = ResolvedService {
-                        name: service_name.to_string(),
-                        backends: vec![], // Backends are populated on scale operations
-                        use_tls: true,
-                        sni_hostname: format!("{}.{}.service", endpoint.name, service_name),
-                    };
-
-                    let host = format!("{}.{}.{}", endpoint.name, service_name, deployment);
-                    registry.register(&host, endpoint.path.as_deref(), resolved.clone());
-
-                    if endpoint.name == "https" || endpoint.name == "main" || endpoint.name == "web"
-                    {
-                        let simple_host = format!("{}.{}", service_name, deployment);
-                        registry.register(&simple_host, endpoint.path.as_deref(), resolved);
-                    }
-
-                    tracing::debug!(
-                        service = %service_name,
-                        endpoint = %endpoint.name,
-                        host = %host,
-                        path = ?endpoint.path,
-                        "Registered HTTPS proxy route"
-                    );
-                }
-                Protocol::Tcp => {
-                    // TCP: register with StreamRegistry (L4 proxy)
-                    if let Some(stream_registry) = &self.stream_registry {
-                        let stream_service = StreamService::new(
-                            service_name.to_string(),
-                            vec![], // Backends populated when containers start
-                        );
-                        stream_registry.register_tcp(endpoint.port, stream_service);
-
-                        tracing::debug!(
-                            service = %service_name,
-                            endpoint = %endpoint.name,
-                            port = endpoint.port,
-                            "Registered TCP stream route"
-                        );
-                    } else {
-                        tracing::warn!(
-                            service = %service_name,
-                            endpoint = %endpoint.name,
-                            port = endpoint.port,
-                            "TCP endpoint defined but StreamRegistry not configured - skipping"
-                        );
-                    }
-                }
-                Protocol::Udp => {
-                    // UDP: register with StreamRegistry (L4 proxy)
-                    if let Some(stream_registry) = &self.stream_registry {
-                        let stream_service = StreamService::new(
-                            service_name.to_string(),
-                            vec![], // Backends populated when containers start
-                        );
-                        stream_registry.register_udp(endpoint.port, stream_service);
-
-                        tracing::debug!(
-                            service = %service_name,
-                            endpoint = %endpoint.name,
-                            port = endpoint.port,
-                            "Registered UDP stream route"
-                        );
-                    } else {
-                        tracing::warn!(
-                            service = %service_name,
-                            endpoint = %endpoint.name,
-                            port = endpoint.port,
-                            "UDP endpoint defined but StreamRegistry not configured - skipping"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Update backend addresses in the proxy ServiceRegistry after scaling
+    /// Update backend addresses via ProxyManager after scaling
     fn update_proxy_backends(&self, service_name: &str, addrs: Vec<SocketAddr>) {
-        if let Some(registry) = &self.service_registry {
-            registry.update_backends(service_name, addrs);
-            tracing::debug!(
-                service = %service_name,
-                "Updated HTTP proxy backends"
-            );
+        if let Some(proxy) = &self.proxy_manager {
+            let proxy = Arc::clone(proxy);
+            let name = service_name.to_string();
+            tokio::spawn(async move {
+                proxy.update_backends(&name, addrs).await;
+            });
         }
     }
 
@@ -1422,8 +1305,8 @@ impl ServiceManager {
         // TODO: Get actual container addresses from overlay_manager or runtime
         let addrs = self.collect_backend_addrs(instance, replicas).await;
 
-        // Update HTTP backends in ServiceRegistry
-        if self.service_registry.is_some() {
+        // Update HTTP backends via ProxyManager
+        if self.proxy_manager.is_some() {
             self.update_proxy_backends(name, addrs.clone());
         }
 
@@ -1541,12 +1424,6 @@ impl ServiceManager {
         // Try to unregister from job executor
         if let Some(executor) = &self.job_executor {
             executor.unregister_job(name).await;
-        }
-
-        // Unregister routes from the proxy service registry (HTTP/HTTPS/WebSocket)
-        if let Some(registry) = &self.service_registry {
-            registry.unregister_service(name);
-            tracing::debug!(service = %name, "Unregistered HTTP proxy routes");
         }
 
         // Unregister stream routes (TCP/UDP) from the stream registry
@@ -1972,11 +1849,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_service_manager_with_proxy() {
+    async fn test_service_manager_basic_lifecycle() {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
-        let registry = Arc::new(ServiceRegistry::new());
-        let mut manager = ServiceManager::with_proxy(runtime, registry.clone());
-        manager.set_deployment_name("mydeployment".to_string());
+        let manager = ServiceManager::new(runtime);
 
         // Add service with HTTP endpoint
         let spec = mock_spec();
@@ -1985,23 +1860,19 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify routes were registered
-        assert_eq!(registry.route_count(), 2); // http.api.mydeployment + api.mydeployment
-
         // Scale up
         manager.scale_service("api", 2).await.unwrap();
 
-        // Verify we can resolve the route
-        let resolved = registry.resolve("http.api.mydeployment", "/").unwrap();
-        assert_eq!(resolved.name, "api");
-        // Note: backends.len() is 0 because MockRuntime doesn't provide overlay IPs.
-        // Backend population requires containers to have overlay_ip set, which requires
-        // a real overlay_manager or mock with IPs. Testing backend count would require
-        // integration with the overlay network.
+        // Check count
+        let count = manager.service_replica_count("api").await.unwrap();
+        assert_eq!(count, 2);
 
-        // Remove service and verify routes are unregistered
+        // Remove service
         manager.remove_service("api").await.unwrap();
-        assert_eq!(registry.route_count(), 0);
+
+        // Verify service is gone
+        let services = manager.list_services().await;
+        assert!(!services.contains(&"api".to_string()));
     }
 
     #[tokio::test]
@@ -2009,7 +1880,6 @@ mod tests {
         use tokio::sync::RwLock;
 
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
-        let registry = Arc::new(ServiceRegistry::new());
 
         // Create a mock overlay manager (skip actual network setup)
         let overlay_manager = Arc::new(RwLock::new(
@@ -2018,12 +1888,8 @@ mod tests {
                 .unwrap(),
         ));
 
-        let manager = ServiceManager::with_full_config(
-            runtime,
-            overlay_manager,
-            registry.clone(),
-            "prod".to_string(),
-        );
+        let manager =
+            ServiceManager::with_full_config(runtime, overlay_manager, "prod".to_string());
 
         // Add service
         let spec = mock_spec();
@@ -2032,13 +1898,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify routes were registered with correct deployment name
-        let resolved = registry.resolve("http.web.prod", "/").unwrap();
-        assert_eq!(resolved.name, "web");
-
-        // Also verify simple host pattern
-        let resolved_simple = registry.resolve("web.prod", "/").unwrap();
-        assert_eq!(resolved_simple.name, "web");
+        // Verify service is registered
+        let services = manager.list_services().await;
+        assert!(services.contains(&"web".to_string()));
     }
 
     fn mock_spec() -> ServiceSpec {
@@ -2745,10 +2607,9 @@ services:
     #[tokio::test]
     async fn test_service_manager_with_stream_registry_tcp() {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
-        let service_registry = Arc::new(ServiceRegistry::new());
         let stream_registry = Arc::new(StreamRegistry::new());
 
-        let mut manager = ServiceManager::with_proxy(runtime, service_registry);
+        let mut manager = ServiceManager::new(runtime);
         manager.set_stream_registry(stream_registry.clone());
         manager.set_deployment_name("test".to_string());
 
@@ -2771,10 +2632,9 @@ services:
     #[tokio::test]
     async fn test_service_manager_with_stream_registry_udp() {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
-        let service_registry = Arc::new(ServiceRegistry::new());
         let stream_registry = Arc::new(StreamRegistry::new());
 
-        let mut manager = ServiceManager::with_proxy(runtime, service_registry);
+        let mut manager = ServiceManager::new(runtime);
         manager.set_stream_registry(stream_registry.clone());
         manager.set_deployment_name("test".to_string());
 
@@ -2797,10 +2657,9 @@ services:
     #[tokio::test]
     async fn test_service_manager_with_stream_registry_mixed() {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
-        let service_registry = Arc::new(ServiceRegistry::new());
         let stream_registry = Arc::new(StreamRegistry::new());
 
-        let mut manager = ServiceManager::with_proxy(runtime, service_registry.clone());
+        let mut manager = ServiceManager::new(runtime);
         manager.set_stream_registry(stream_registry.clone());
         manager.set_deployment_name("test".to_string());
 
@@ -2811,17 +2670,15 @@ services:
             .await
             .unwrap();
 
-        // Verify all routes were registered
-        assert!(service_registry.route_count() > 0); // HTTP routes
+        // Verify stream routes were registered
         assert_eq!(stream_registry.tcp_count(), 1); // TCP: 9000
         assert_eq!(stream_registry.udp_count(), 1); // UDP: 8125
 
         assert!(stream_registry.tcp_ports().contains(&9000));
         assert!(stream_registry.udp_ports().contains(&8125));
 
-        // Remove service and verify all cleanup
+        // Remove service and verify stream cleanup
         manager.remove_service("mixed").await.unwrap();
-        assert_eq!(service_registry.route_count(), 0);
         assert_eq!(stream_registry.tcp_count(), 0);
         assert_eq!(stream_registry.udp_count(), 0);
     }
@@ -2841,10 +2698,9 @@ services:
     #[tokio::test]
     async fn test_tcp_service_without_stream_registry() {
         let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
-        let service_registry = Arc::new(ServiceRegistry::new());
 
         // Manager without stream registry
-        let mut manager = ServiceManager::with_proxy(runtime, service_registry);
+        let mut manager = ServiceManager::new(runtime);
         manager.set_deployment_name("test".to_string());
 
         // Add TCP service - should log warning but not fail

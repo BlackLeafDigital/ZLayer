@@ -438,7 +438,7 @@ impl DependencyConditionChecker {
             Some(registry) => {
                 // Check if service has registered routes with healthy backends
                 // We need to check if the service is registered and has backends
-                let services = registry.list_services();
+                let services = registry.list_services().await;
                 if !services.contains(&service.to_string()) {
                     return Ok(false);
                 }
@@ -446,12 +446,12 @@ impl DependencyConditionChecker {
                 // Try to resolve a route for this service
                 // Use a generic host pattern that should match
                 let host = format!("{}.default", service);
-                match registry.resolve(&host, "/") {
-                    Ok(resolved) => {
+                match registry.resolve(Some(&host), "/").await {
+                    Some(resolved) => {
                         // Service is registered, check if it has backends
                         Ok(!resolved.backends.is_empty())
                     }
-                    Err(_) => {
+                    None => {
                         // Service not found in routes, not ready
                         Ok(false)
                     }
@@ -1108,19 +1108,34 @@ services:
     #[tokio::test]
     async fn test_check_ready_with_registry() {
         use std::net::SocketAddr;
+        use zlayer_proxy::RouteEntry;
 
         let runtime = Arc::new(MockRuntime::new());
         let health_states = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(ServiceRegistry::new());
 
-        // Register service with backends
-        let resolved = zlayer_proxy::ResolvedService {
-            name: "test".to_string(),
-            backends: vec!["127.0.0.1:8080".parse::<SocketAddr>().unwrap()],
-            use_tls: false,
-            sni_hostname: "test.local".to_string(),
+        // Register service with backends.
+        // check_ready("test") resolves via host "test.default" and checks
+        // list_services() for "test", so service_name must be "test" and
+        // the host must be "test.default" to match the resolution pattern.
+        let entry = RouteEntry {
+            service_name: "test".to_string(),
+            endpoint_name: "http".to_string(),
+            host: Some("test.default".to_string()),
+            path_prefix: "/".to_string(),
+            resolved: zlayer_proxy::ResolvedService {
+                name: "test".to_string(),
+                backends: vec!["127.0.0.1:8080".parse::<SocketAddr>().unwrap()],
+                use_tls: false,
+                sni_hostname: "test.local".to_string(),
+                expose: zlayer_spec::ExposeType::Public,
+                protocol: zlayer_spec::Protocol::Http,
+                strip_prefix: false,
+                path_prefix: "/".to_string(),
+                target_port: 8080,
+            },
         };
-        registry.register("test.default", None, resolved);
+        registry.register(entry).await;
 
         let checker = DependencyConditionChecker::new(runtime, health_states, Some(registry));
 
@@ -1129,18 +1144,31 @@ services:
 
     #[tokio::test]
     async fn test_check_ready_no_backends() {
+        use zlayer_proxy::RouteEntry;
+
         let runtime = Arc::new(MockRuntime::new());
         let health_states = Arc::new(RwLock::new(HashMap::new()));
         let registry = Arc::new(ServiceRegistry::new());
 
         // Register service without backends
-        let resolved = zlayer_proxy::ResolvedService {
-            name: "test".to_string(),
-            backends: vec![], // No backends
-            use_tls: false,
-            sni_hostname: "test.local".to_string(),
+        let entry = RouteEntry {
+            service_name: "test".to_string(),
+            endpoint_name: "http".to_string(),
+            host: Some("test.default".to_string()),
+            path_prefix: "/".to_string(),
+            resolved: zlayer_proxy::ResolvedService {
+                name: "test".to_string(),
+                backends: vec![], // No backends
+                use_tls: false,
+                sni_hostname: "test.local".to_string(),
+                expose: zlayer_spec::ExposeType::Public,
+                protocol: zlayer_spec::Protocol::Http,
+                strip_prefix: false,
+                path_prefix: "/".to_string(),
+                target_port: 8080,
+            },
         };
-        registry.register("test.default", None, resolved);
+        registry.register(entry).await;
 
         let checker = DependencyConditionChecker::new(runtime, health_states, Some(registry));
 
