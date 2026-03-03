@@ -75,15 +75,15 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
-          name: zlayer-zdb-linux-amd64
+          name: zlayer-zql-linux-amd64
           path: zlayer-linux-amd64.tar.gz
           retention-days: 7
 
   # ===========================================
-  # Build zlayer-zdb-* container images
+  # Build zlayer-zql-* container images
   # ===========================================
   build-images:
-    name: Build ZDB Images
+    name: Build ZQL Images
     needs: [resolve-version, build-binary]
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -96,7 +96,7 @@ jobs:
       - name: Download zlayer binary
         uses: actions/download-artifact@v3
         with:
-          name: zlayer-zdb-linux-amd64
+          name: zlayer-zql-linux-amd64
       - name: Install zlayer
         run: tar xzf zlayer-linux-amd64.tar.gz && chmod +x zlayer && sudo mv zlayer /usr/local/bin/
       - name: Set release version
@@ -110,31 +110,31 @@ jobs:
           mkdir -p target/release
           cp /usr/local/bin/zlayer target/release/zlayer
 
-      - name: Build images with pipeline (zlayer-zdb namespace)
+      - name: Build images with pipeline (zlayer-zql namespace)
         run: |
           sudo zlayer pipeline \
             -f ZPipeline.yaml \
             --no-tui \
             --set VERSION=${{ needs.resolve-version.outputs.version }} \
-            --set REGISTRY=zlayer-zdb
+            --set REGISTRY=zlayer-zql
 
       - name: Export and upload OCI archives
         shell: bash
         run: |
           VERSION="${{ needs.resolve-version.outputs.version }}"
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
-          PKG_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-zdb/${VERSION}"
+          PKG_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-zql/${VERSION}"
 
           for img in zlayer-node zlayer-web zlayer-manager; do
             echo "Exporting ${img}..."
-            sudo buildah push zlayer-zdb/${img}:${VERSION} \
-              oci-archive:zlayer-zdb-${img}-oci.tar
+            sudo buildah push zlayer-zql/${img}:${VERSION} \
+              oci-archive:zlayer-zql-${img}-oci.tar
 
-            echo "Uploading zlayer-zdb-${img}-oci.tar..."
+            echo "Uploading zlayer-zql-${img}-oci.tar..."
             curl --fail --max-time 600 --connect-timeout 30 --retry 3 --retry-delay 10 \
               --user "$AUTH" \
-              --upload-file "zlayer-zdb-${img}-oci.tar" \
-              "${PKG_URL}/zlayer-zdb-${img}-oci.tar" && echo "OK"
+              --upload-file "zlayer-zql-${img}-oci.tar" \
+              "${PKG_URL}/zlayer-zql-${img}-oci.tar" && echo "OK"
           done
 
   # ===========================================
