@@ -1,5 +1,6 @@
 [package]
 name = "zlayer-secrets-zql"
+publish = false
 description = "Secure secrets management for ZLayer container workloads"
 version.workspace = true
 edition.workspace = true

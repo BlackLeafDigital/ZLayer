@@ -23,7 +23,7 @@ env:
   CARGO_BUILD_JOBS: "2"
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: "0"
-  CARGO_REGISTRIES_FORGEJO_TOKEN: ${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+  FORGEJO_REGISTRIES: '[{"name":"forgejo","index":"sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/","token":"${{ secrets.FORGEJO_ACTIONS_TOKEN }}"}]'
 
 jobs:
   # ===========================================
@@ -42,12 +42,13 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
         with:
           components: rustfmt, clippy
+          registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
@@ -100,10 +101,12 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        with:
+          registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
@@ -163,10 +166,12 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        with:
+          registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
@@ -210,10 +215,12 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        with:
+          registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
