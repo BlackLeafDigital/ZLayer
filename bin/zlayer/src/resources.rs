@@ -118,7 +118,7 @@ fn detect_disk_total(data_dir: &Path) -> u64 {
     match nix::sys::statvfs::statvfs(data_dir) {
         Ok(stat) => {
             // Total blocks * fragment size = total bytes
-            stat.blocks() as u64 * stat.fragment_size() as u64
+            stat.blocks() * stat.fragment_size()
         }
         Err(_) => 0,
     }
@@ -127,10 +127,10 @@ fn detect_disk_total(data_dir: &Path) -> u64 {
 fn detect_disk_used(data_dir: &Path) -> u64 {
     match nix::sys::statvfs::statvfs(data_dir) {
         Ok(stat) => {
-            let frag = stat.fragment_size() as u64;
-            let total = stat.blocks() as u64 * frag;
+            let frag = stat.fragment_size();
+            let total = stat.blocks() * frag;
             // blocks_available is free blocks available to unprivileged users
-            let avail = stat.blocks_available() as u64 * frag;
+            let avail = stat.blocks_available() * frag;
             total.saturating_sub(avail)
         }
         Err(_) => 0,

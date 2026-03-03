@@ -137,10 +137,14 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     if !pid_kill_conclusive {
         warn!("daemon.json not found or unparseable, attempting targeted kill fallback");
 
-        // Find all zlayer processes EXCEPT ourselves, then kill them.
-        // pkill -x zlayer would kill the parent `zlayer deploy` too, so we
-        // use pgrep to enumerate PIDs and selectively kill only foreign ones.
+        // Find all zlayer processes EXCEPT ourselves and the process that
+        // spawned us (the `zlayer up` / `zlayer deploy` CLI), then kill them.
         let my_pid = std::process::id();
+        let spawner_pid: Option<u32> = std::env::var("ZLAYER_SPAWNER_PID")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let is_protected = |pid: u32| pid == my_pid || Some(pid) == spawner_pid;
+
         if let Ok(output) = tokio::process::Command::new("pgrep")
             .args(["-x", "zlayer"])
             .output()
@@ -151,7 +155,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                 let mut killed_any = false;
                 for line in stdout.lines() {
                     if let Ok(pid) = line.trim().parse::<u32>() {
-                        if pid != my_pid {
+                        if !is_protected(pid) {
                             info!(pid = pid, "Sending SIGTERM to stale zlayer process");
                             unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                             killed_any = true;
@@ -169,10 +173,9 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                             .await;
                         match check {
                             Ok(out) if out.status.success() => {
-                                // Check if the only remaining PIDs are us
                                 let remaining = String::from_utf8_lossy(&out.stdout);
                                 let foreign = remaining.lines().any(|l| {
-                                    l.trim().parse::<u32>().map_or(false, |p| p != my_pid)
+                                    l.trim().parse::<u32>().is_ok_and(|p| !is_protected(p))
                                 });
                                 if !foreign {
                                     info!("All stale zlayer processes exited");
