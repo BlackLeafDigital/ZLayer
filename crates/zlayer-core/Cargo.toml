@@ -18,4 +18,4 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
-zlayer-spec = { path = "../zlayer-spec" }
+zlayer-spec.workspace = true
