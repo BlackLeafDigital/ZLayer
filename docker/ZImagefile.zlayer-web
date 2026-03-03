@@ -38,7 +38,7 @@ stages:
             sharing: shared
 
       # Copy binary out of cached target dir
-      - run: "cp target/release/zlayer-web /build/zlayer-web"
+      - run: "cp target/release/zlayer-web-zql /build/zlayer-web-zql"
         cache:
           - target: /build/target
             id: cargo-target-web
@@ -60,7 +60,7 @@ stages:
       - run: "apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*"
 
       # Copy the binary (relative to builder's workdir /build)
-      - copy: "zlayer-web"
+      - copy: "zlayer-web-zql"
         from: builder
         to: "/app/zlayer-web"
         chmod: "755"
