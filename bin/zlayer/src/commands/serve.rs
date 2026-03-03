@@ -388,7 +388,7 @@ pub(crate) async fn serve(
         secrets,
         credential_store,
         stream_registry: _stream_registry,
-        service_registry: _service_registry,
+        cert_manager: _cert_manager,
         log_rotator_handle,
         health_checker_handle,
         node_config,

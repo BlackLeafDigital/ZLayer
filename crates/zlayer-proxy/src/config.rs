@@ -215,10 +215,26 @@ pub struct HeaderConfig {
     /// Server name for Via header
     #[serde(default = "default_server_name")]
     pub server_name: String,
+
+    /// Enable HSTS (HTTP Strict Transport Security)
+    #[serde(default = "default_true")]
+    pub hsts: bool,
+
+    /// HSTS max-age in seconds (default: 1 year)
+    #[serde(default = "default_hsts_max_age")]
+    pub hsts_max_age: u64,
+
+    /// Include subdomains in HSTS
+    #[serde(default = "default_true")]
+    pub hsts_subdomains: bool,
 }
 
 fn default_server_name() -> String {
     "zlayer-proxy".to_string()
+}
+
+fn default_hsts_max_age() -> u64 {
+    31536000 // 1 year
 }
 
 impl Default for HeaderConfig {
@@ -230,6 +246,9 @@ impl Default for HeaderConfig {
             x_real_ip: true,
             via: true,
             server_name: default_server_name(),
+            hsts: true,
+            hsts_max_age: default_hsts_max_age(),
+            hsts_subdomains: true,
         }
     }
 }

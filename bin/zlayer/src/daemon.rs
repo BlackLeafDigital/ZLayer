@@ -21,7 +21,7 @@ use zlayer_agent::{
 };
 use zlayer_api::{DeploymentStatus, DeploymentStorage, SqlxStorage, StoredDeployment};
 use zlayer_overlay::{DnsHandle, DnsServer, OverlayTransport};
-use zlayer_proxy::{ServiceRegistry, StreamRegistry};
+use zlayer_proxy::{CertManager, ServiceRegistry, StreamRegistry};
 use zlayer_scheduler::{
     RaftConfig, RaftCoordinator, RaftService, Request, Scheduler, SchedulerConfig,
 };
@@ -124,8 +124,8 @@ pub struct DaemonState {
     /// L4 stream registry for TCP/UDP proxy routing.
     pub stream_registry: Arc<StreamRegistry>,
 
-    /// HTTP service registry for Pingora proxy routing.
-    pub service_registry: Arc<ServiceRegistry>,
+    /// TLS certificate manager (ACME / self-signed).
+    pub cert_manager: Arc<CertManager>,
 
     /// Background task for log rotation (hourly).
     pub log_rotator_handle: Option<tokio::task::JoinHandle<()>>,
@@ -357,7 +357,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     };
 
     // -----------------------------------------------------------------------
-    // Phase 5: Stream registry + service registry (L4/L7)
+    // Phase 5: Stream registry + service registry + cert manager (L4/L7)
     // -----------------------------------------------------------------------
     let stream_registry = Arc::new(StreamRegistry::new());
     let service_registry = Arc::new(ServiceRegistry::new());
@@ -367,15 +367,31 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         std::time::Duration::from_secs(5),
         std::time::Duration::from_secs(2),
     );
+
+    // Certificate manager for TLS termination (ACME / self-signed)
+    let cert_manager = Arc::new(
+        CertManager::new(
+            config.data_dir.join("certs").to_string_lossy().to_string(),
+            None, // ACME email - can be configured later
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!(e))
+        .context("Failed to create certificate manager")?,
+    );
+
     info!("Stream and service registries initialised (with health checker)");
 
     // -----------------------------------------------------------------------
-    // Phase 6: Proxy manager (wired with stream registry for TCP/UDP)
+    // Phase 6: Proxy manager (wired with registries + cert manager)
     // -----------------------------------------------------------------------
-    let mut proxy_builder = ProxyManager::new(ProxyManagerConfig::default());
+    let mut proxy_builder = ProxyManager::new(
+        ProxyManagerConfig::default(),
+        Arc::clone(&service_registry),
+        Some(Arc::clone(&cert_manager)),
+    );
     proxy_builder.set_stream_registry(Arc::clone(&stream_registry));
     let proxy = Arc::new(proxy_builder);
-    info!("Proxy manager initialised (with L4 stream support)");
+    info!("Proxy manager initialised (with L4 stream + TLS support)");
 
     // -----------------------------------------------------------------------
     // Phase 7: Container supervisor
@@ -394,7 +410,6 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         .deployment_name(config.deployment_name.clone())
         .proxy_manager(Arc::clone(&proxy))
         .stream_registry(Arc::clone(&stream_registry))
-        .service_registry(Arc::clone(&service_registry))
         .container_supervisor(Arc::clone(&supervisor));
 
     if let Some(om) = overlay.clone() {
@@ -643,7 +658,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         secrets,
         credential_store,
         stream_registry,
-        service_registry,
+        cert_manager,
         log_rotator_handle,
         health_checker_handle: Some(health_checker_handle),
         node_config,

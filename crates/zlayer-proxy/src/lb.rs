@@ -1,325 +1,689 @@
-//! Load balancing implementation
+//! Load balancer for backend selection
 //!
-//! This module provides load balancing for distributing requests across backends.
+//! This module handles **backend selection** (service -> specific backend addr).
+//! The [`ServiceRegistry`](crate::routes::ServiceRegistry) handles **routing**
+//! (host+path -> service). These are separate concerns.
+//!
+//! # Strategies
+//!
+//! - [`LbStrategy::RoundRobin`] — Cycles through healthy backends in order.
+//! - [`LbStrategy::LeastConnections`] — Picks the healthy backend with the
+//!   fewest active connections (tracked via atomic counters).
+//!
+//! # Health checking
+//!
+//! [`LoadBalancer::spawn_health_checker`] launches a background task that
+//! periodically TCP-connects to every backend across all groups, updating
+//! health status atomically. Concurrency is bounded by a semaphore.
 
-use crate::error::{ProxyError, Result};
+use dashmap::DashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::Duration;
+use tracing::{debug, warn};
 
-/// Health status of a backend
+// ---------------------------------------------------------------------------
+// LbStrategy
+// ---------------------------------------------------------------------------
+
+/// Load-balancing strategy for a backend group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HealthStatus {
-    /// Backend is healthy and can receive traffic
-    Healthy,
-    /// Backend is unhealthy and should not receive traffic
-    Unhealthy,
-    /// Backend health is unknown (not yet checked)
-    Unknown,
+pub enum LbStrategy {
+    /// Cycle through healthy backends in registration order.
+    RoundRobin,
+    /// Pick the healthy backend with the fewest active connections.
+    LeastConnections,
 }
 
-/// A backend server
-#[derive(Debug, Clone)]
+// ---------------------------------------------------------------------------
+// HealthStatus
+// ---------------------------------------------------------------------------
+
+/// Whether a backend is considered reachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HealthStatus {
+    Healthy,
+    Unhealthy,
+}
+
+// ---------------------------------------------------------------------------
+// Backend
+// ---------------------------------------------------------------------------
+
+/// Per-backend state with atomic connection counting and health tracking.
 pub struct Backend {
-    /// Backend address
+    /// The network address of this backend.
     pub addr: SocketAddr,
-    /// Current health status
-    pub health: HealthStatus,
-    /// Weight for weighted load balancing (higher = more traffic)
-    pub weight: u32,
-    /// Active connections count
-    pub active_connections: Arc<AtomicUsize>,
+    /// Number of in-flight connections (incremented/decremented atomically).
+    active_connections: AtomicU64,
+    /// Current health status (behind a std RwLock for interior mutability).
+    health: std::sync::RwLock<HealthStatus>,
+    /// Number of consecutive health-check failures.
+    consecutive_failures: AtomicU64,
+}
+
+impl std::fmt::Debug for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Backend")
+            .field("addr", &self.addr)
+            .field(
+                "active_connections",
+                &self.active_connections.load(Ordering::Relaxed),
+            )
+            .field("health", &*self.health.read().unwrap())
+            .field(
+                "consecutive_failures",
+                &self.consecutive_failures.load(Ordering::Relaxed),
+            )
+            .finish()
+    }
 }
 
 impl Backend {
-    /// Create a new backend with default settings
+    /// Create a new backend that starts healthy with zero active connections.
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
-            health: HealthStatus::Unknown,
-            weight: 1,
-            active_connections: Arc::new(AtomicUsize::new(0)),
+            active_connections: AtomicU64::new(0),
+            health: std::sync::RwLock::new(HealthStatus::Healthy),
+            consecutive_failures: AtomicU64::new(0),
         }
     }
 
-    /// Create a new backend with a specific weight
-    pub fn with_weight(addr: SocketAddr, weight: u32) -> Self {
-        Self {
-            addr,
-            health: HealthStatus::Unknown,
-            weight,
-            active_connections: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    /// Check if the backend is available for traffic
-    pub fn is_available(&self) -> bool {
-        matches!(self.health, HealthStatus::Healthy | HealthStatus::Unknown)
-    }
-
-    /// Increment active connection count
-    pub fn inc_connections(&self) {
+    /// Increment the active connection count and return an RAII guard that
+    /// decrements it on drop.
+    pub fn track_connection(self: &Arc<Self>) -> ConnectionGuard {
         self.active_connections.fetch_add(1, Ordering::Relaxed);
+        ConnectionGuard {
+            backend: Arc::clone(self),
+        }
     }
 
-    /// Decrement active connection count
-    pub fn dec_connections(&self) {
-        self.active_connections.fetch_sub(1, Ordering::Relaxed);
-    }
-
-    /// Get current active connection count
-    pub fn connection_count(&self) -> usize {
+    /// Current number of in-flight connections.
+    pub fn active_connections(&self) -> u64 {
         self.active_connections.load(Ordering::Relaxed)
     }
-}
 
-/// Load balancing algorithm
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum LoadBalancerAlgorithm {
-    /// Round-robin selection
-    #[default]
-    RoundRobin,
-    /// Least connections
-    LeastConnections,
-    /// Random selection
-    Random,
-}
-
-/// Load balancer for distributing requests across backends
-#[derive(Debug)]
-pub struct LoadBalancer {
-    /// Service name (for error messages)
-    service: String,
-    /// Available backends
-    backends: RwLock<Vec<Backend>>,
-    /// Current index for round-robin
-    current_index: AtomicUsize,
-    /// Load balancing algorithm
-    algorithm: LoadBalancerAlgorithm,
-}
-
-impl LoadBalancer {
-    /// Create a new load balancer
-    pub fn new(service: impl Into<String>) -> Self {
-        Self {
-            service: service.into(),
-            backends: RwLock::new(Vec::new()),
-            current_index: AtomicUsize::new(0),
-            algorithm: LoadBalancerAlgorithm::default(),
-        }
+    /// Returns `true` if the backend is currently marked healthy.
+    pub fn is_healthy(&self) -> bool {
+        *self.health.read().unwrap() == HealthStatus::Healthy
     }
 
-    /// Create a new load balancer with a specific algorithm
-    pub fn with_algorithm(service: impl Into<String>, algorithm: LoadBalancerAlgorithm) -> Self {
-        Self {
-            service: service.into(),
-            backends: RwLock::new(Vec::new()),
-            current_index: AtomicUsize::new(0),
-            algorithm,
-        }
+    /// Mark this backend as healthy.
+    pub fn set_healthy(&self) {
+        *self.health.write().unwrap() = HealthStatus::Healthy;
     }
 
-    /// Add a backend to the load balancer
-    pub async fn add_backend(&self, backend: Backend) {
-        let mut backends = self.backends.write().await;
-        // Check if backend already exists
-        if !backends.iter().any(|b| b.addr == backend.addr) {
-            backends.push(backend);
-        }
+    /// Mark this backend as unhealthy.
+    pub fn set_unhealthy(&self) {
+        *self.health.write().unwrap() = HealthStatus::Unhealthy;
     }
 
-    /// Remove a backend from the load balancer
-    pub async fn remove_backend(&self, addr: SocketAddr) {
-        let mut backends = self.backends.write().await;
-        backends.retain(|b| b.addr != addr);
+    /// Record one consecutive health-check failure.
+    pub fn record_failure(&self) {
+        self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Update the health status of a backend
-    pub async fn update_health(&self, addr: SocketAddr, health: HealthStatus) {
-        let mut backends = self.backends.write().await;
-        if let Some(backend) = backends.iter_mut().find(|b| b.addr == addr) {
-            backend.health = health;
-        }
+    /// Reset the consecutive failure counter to zero.
+    pub fn reset_failures(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
     }
 
-    /// Set all backends at once (replaces existing)
-    pub async fn set_backends(&self, backends: Vec<Backend>) {
-        let mut current = self.backends.write().await;
-        *current = backends;
-    }
-
-    /// Get the number of backends
-    pub async fn backend_count(&self) -> usize {
-        self.backends.read().await.len()
-    }
-
-    /// Get the number of healthy backends
-    pub async fn healthy_count(&self) -> usize {
-        self.backends
-            .read()
-            .await
-            .iter()
-            .filter(|b| b.is_available())
-            .count()
-    }
-
-    /// Select the next backend for a request
-    pub async fn select(&self) -> Result<Backend> {
-        let backends = self.backends.read().await;
-        let available: Vec<_> = backends.iter().filter(|b| b.is_available()).collect();
-
-        if available.is_empty() {
-            return Err(ProxyError::NoHealthyBackends {
-                service: self.service.clone(),
-            });
-        }
-
-        let selected = match self.algorithm {
-            LoadBalancerAlgorithm::RoundRobin => self.select_round_robin(&available),
-            LoadBalancerAlgorithm::LeastConnections => self.select_least_connections(&available),
-            LoadBalancerAlgorithm::Random => self.select_random(&available),
-        };
-
-        Ok(selected.clone())
-    }
-
-    fn select_round_robin<'a>(&self, available: &[&'a Backend]) -> &'a Backend {
-        let index = self.current_index.fetch_add(1, Ordering::Relaxed) % available.len();
-        available[index]
-    }
-
-    fn select_least_connections<'a>(&self, available: &[&'a Backend]) -> &'a Backend {
-        available
-            .iter()
-            .min_by_key(|b| b.connection_count())
-            .unwrap()
-    }
-
-    fn select_random<'a>(&self, available: &[&'a Backend]) -> &'a Backend {
-        // Simple random using current time nanos
-        let index = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.subsec_nanos() as usize)
-            .unwrap_or(0)
-            % available.len();
-        available[index]
+    /// Number of consecutive health-check failures.
+    pub fn consecutive_failures(&self) -> u64 {
+        self.consecutive_failures.load(Ordering::Relaxed)
     }
 }
 
-/// RAII guard for tracking backend connections
+// ---------------------------------------------------------------------------
+// ConnectionGuard
+// ---------------------------------------------------------------------------
+
+/// RAII guard that decrements a backend's active connection count on drop.
 pub struct ConnectionGuard {
-    backend: Backend,
-}
-
-impl ConnectionGuard {
-    /// Create a new connection guard
-    pub fn new(backend: Backend) -> Self {
-        backend.inc_connections();
-        Self { backend }
-    }
-
-    /// Get the backend address
-    pub fn addr(&self) -> SocketAddr {
-        self.backend.addr
-    }
+    backend: Arc<Backend>,
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.backend.dec_connections();
+        self.backend
+            .active_connections
+            .fetch_sub(1, Ordering::Relaxed);
     }
 }
+
+// ---------------------------------------------------------------------------
+// BackendGroup
+// ---------------------------------------------------------------------------
+
+/// A set of backends for a single service, with a configured selection strategy.
+pub struct BackendGroup {
+    /// The backends in this group.
+    pub backends: Vec<Arc<Backend>>,
+    /// The strategy used by [`select`](Self::select).
+    pub strategy: LbStrategy,
+    /// Monotonically-increasing counter for round-robin.
+    rr_counter: AtomicUsize,
+}
+
+impl BackendGroup {
+    /// Create an empty group with the given strategy.
+    pub fn new(strategy: LbStrategy) -> Self {
+        Self {
+            backends: Vec::new(),
+            strategy,
+            rr_counter: AtomicUsize::new(0),
+        }
+    }
+
+    /// Select a healthy backend using the configured strategy.
+    ///
+    /// Returns `None` if every backend is unhealthy (or the group is empty).
+    pub fn select(&self) -> Option<Arc<Backend>> {
+        if self.backends.is_empty() {
+            return None;
+        }
+
+        match self.strategy {
+            LbStrategy::RoundRobin => self.select_round_robin(),
+            LbStrategy::LeastConnections => self.select_least_connections(),
+        }
+    }
+
+    /// Round-robin: start from the current counter position, try each backend
+    /// once, skip unhealthy ones.
+    fn select_round_robin(&self) -> Option<Arc<Backend>> {
+        let len = self.backends.len();
+        let start = self.rr_counter.fetch_add(1, Ordering::Relaxed) % len;
+
+        for i in 0..len {
+            let idx = (start + i) % len;
+            let backend = &self.backends[idx];
+            if backend.is_healthy() {
+                return Some(Arc::clone(backend));
+            }
+        }
+
+        None
+    }
+
+    /// Least-connections: find the healthy backend with the fewest active
+    /// connections. Ties are broken by position (first wins).
+    fn select_least_connections(&self) -> Option<Arc<Backend>> {
+        self.backends
+            .iter()
+            .filter(|b| b.is_healthy())
+            .min_by_key(|b| b.active_connections())
+            .cloned()
+    }
+
+    /// Replace the backend list while preserving state for addresses that
+    /// remain unchanged.
+    ///
+    /// Backends whose address appears in `addrs` keep their existing
+    /// connection counts, health status, and failure counters. New addresses
+    /// get a fresh `Backend`. Addresses no longer in `addrs` are dropped.
+    pub fn update_backends(&mut self, addrs: Vec<SocketAddr>) {
+        let mut new_backends = Vec::with_capacity(addrs.len());
+
+        for addr in addrs {
+            if let Some(existing) = self.backends.iter().find(|b| b.addr == addr) {
+                new_backends.push(Arc::clone(existing));
+            } else {
+                new_backends.push(Arc::new(Backend::new(addr)));
+            }
+        }
+
+        self.backends = new_backends;
+    }
+
+    /// Add a backend if its address is not already present.
+    pub fn add_backend(&mut self, addr: SocketAddr) {
+        if !self.backends.iter().any(|b| b.addr == addr) {
+            self.backends.push(Arc::new(Backend::new(addr)));
+        }
+    }
+
+    /// Remove the backend with the given address, if present.
+    pub fn remove_backend(&mut self, addr: &SocketAddr) {
+        self.backends.retain(|b| b.addr != *addr);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LoadBalancer
+// ---------------------------------------------------------------------------
+
+/// Top-level load balancer that manages backend groups keyed by service name.
+pub struct LoadBalancer {
+    groups: DashMap<String, BackendGroup>,
+}
+
+impl Default for LoadBalancer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LoadBalancer {
+    /// Create an empty load balancer.
+    pub fn new() -> Self {
+        Self {
+            groups: DashMap::new(),
+        }
+    }
+
+    /// Register (or replace) a backend group for `service`.
+    pub fn register(&self, service: &str, addrs: Vec<SocketAddr>, strategy: LbStrategy) {
+        let mut group = BackendGroup::new(strategy);
+        group.backends = addrs
+            .into_iter()
+            .map(|a| Arc::new(Backend::new(a)))
+            .collect();
+        self.groups.insert(service.to_string(), group);
+    }
+
+    /// Select a healthy backend for `service`, delegating to the group's
+    /// configured strategy.
+    pub fn select(&self, service: &str) -> Option<Arc<Backend>> {
+        self.groups.get(service).and_then(|g| g.select())
+    }
+
+    /// Update the backend list for `service`, preserving state for unchanged
+    /// addresses.
+    pub fn update_backends(&self, service: &str, addrs: Vec<SocketAddr>) {
+        if let Some(mut group) = self.groups.get_mut(service) {
+            group.update_backends(addrs);
+        }
+    }
+
+    /// Remove the backend group for `service`.
+    pub fn unregister(&self, service: &str) {
+        self.groups.remove(service);
+    }
+
+    /// Add a single backend to an existing group.
+    pub fn add_backend(&self, service: &str, addr: SocketAddr) {
+        if let Some(mut group) = self.groups.get_mut(service) {
+            group.add_backend(addr);
+        }
+    }
+
+    /// Remove a single backend from an existing group.
+    pub fn remove_backend(&self, service: &str, addr: &SocketAddr) {
+        if let Some(mut group) = self.groups.get_mut(service) {
+            group.remove_backend(addr);
+        }
+    }
+
+    /// Return the number of backends registered for `service`, or 0 if
+    /// the service is not registered.
+    pub fn backend_count(&self, service: &str) -> usize {
+        self.groups
+            .get(service)
+            .map(|g| g.backends.len())
+            .unwrap_or(0)
+    }
+
+    /// Return the number of *healthy* backends for `service`, or 0 if the
+    /// service is not registered.
+    pub fn healthy_count(&self, service: &str) -> usize {
+        self.groups
+            .get(service)
+            .map(|g| g.backends.iter().filter(|b| b.is_healthy()).count())
+            .unwrap_or(0)
+    }
+
+    /// Update the health status of a specific backend in a service group.
+    ///
+    /// If `healthy` is `true`, marks the backend healthy and resets its failure
+    /// counter. Otherwise marks it unhealthy and records a failure.
+    pub fn mark_health(&self, service: &str, addr: &SocketAddr, healthy: bool) {
+        if let Some(group) = self.groups.get(service) {
+            if let Some(backend) = group.backends.iter().find(|b| b.addr == *addr) {
+                if healthy {
+                    backend.set_healthy();
+                    backend.reset_failures();
+                } else {
+                    backend.set_unhealthy();
+                    backend.record_failure();
+                }
+            }
+        }
+    }
+
+    /// Spawn a background health-check task.
+    ///
+    /// Every `interval` the task TCP-connects to every backend across all
+    /// groups with a per-probe `timeout`. Concurrency is bounded to at most
+    /// 64 simultaneous probes via a semaphore.
+    ///
+    /// On success the backend is marked healthy and its failure counter is
+    /// reset. On failure it is marked unhealthy and the failure counter is
+    /// incremented.
+    pub fn spawn_health_checker(
+        self: &Arc<Self>,
+        interval: Duration,
+        timeout: Duration,
+    ) -> tokio::task::JoinHandle<()> {
+        let lb = Arc::clone(self);
+
+        tokio::spawn(async move {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(64));
+
+            loop {
+                // Collect all backends across all groups.
+                let backends: Vec<Arc<Backend>> = lb
+                    .groups
+                    .iter()
+                    .flat_map(|entry| entry.value().backends.clone())
+                    .collect();
+
+                debug!(
+                    backend_count = backends.len(),
+                    "Starting health check sweep"
+                );
+
+                let mut handles = Vec::with_capacity(backends.len());
+
+                for backend in backends {
+                    let sem = Arc::clone(&semaphore);
+                    let probe_timeout = timeout;
+
+                    handles.push(tokio::spawn(async move {
+                        let _permit = sem.acquire().await.expect("semaphore closed");
+                        let addr = backend.addr;
+
+                        match tokio::time::timeout(
+                            probe_timeout,
+                            tokio::net::TcpStream::connect(addr),
+                        )
+                        .await
+                        {
+                            Ok(Ok(_stream)) => {
+                                if !backend.is_healthy() {
+                                    debug!(%addr, "Backend recovered");
+                                }
+                                backend.set_healthy();
+                                backend.reset_failures();
+                            }
+                            Ok(Err(e)) => {
+                                backend.set_unhealthy();
+                                backend.record_failure();
+                                warn!(
+                                    %addr,
+                                    error = %e,
+                                    failures = backend.consecutive_failures(),
+                                    "Health check failed (connect error)"
+                                );
+                            }
+                            Err(_elapsed) => {
+                                backend.set_unhealthy();
+                                backend.record_failure();
+                                warn!(
+                                    %addr,
+                                    failures = backend.consecutive_failures(),
+                                    "Health check failed (timeout)"
+                                );
+                            }
+                        }
+                    }));
+                }
+
+                // Wait for all probes to finish before sleeping.
+                for handle in handles {
+                    let _ = handle.await;
+                }
+
+                tokio::time::sleep(interval).await;
+            }
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn test_load_balancer_round_robin() {
-        let lb = LoadBalancer::new("test-service");
-
-        lb.add_backend(Backend::new("127.0.0.1:8081".parse().unwrap()))
-            .await;
-        lb.add_backend(Backend::new("127.0.0.1:8082".parse().unwrap()))
-            .await;
-        lb.add_backend(Backend::new("127.0.0.1:8083".parse().unwrap()))
-            .await;
-
-        // Mark all as healthy
-        lb.update_health("127.0.0.1:8081".parse().unwrap(), HealthStatus::Healthy)
-            .await;
-        lb.update_health("127.0.0.1:8082".parse().unwrap(), HealthStatus::Healthy)
-            .await;
-        lb.update_health("127.0.0.1:8083".parse().unwrap(), HealthStatus::Healthy)
-            .await;
-
-        let b1 = lb.select().await.unwrap();
-        let b2 = lb.select().await.unwrap();
-        let b3 = lb.select().await.unwrap();
-        let b4 = lb.select().await.unwrap();
-
-        // Should cycle through backends
-        assert_ne!(b1.addr, b2.addr);
-        assert_ne!(b2.addr, b3.addr);
-        assert_eq!(b1.addr, b4.addr); // Wraps around
+    fn addr(port: u16) -> SocketAddr {
+        format!("127.0.0.1:{}", port).parse().unwrap()
     }
 
-    #[tokio::test]
-    async fn test_load_balancer_no_healthy_backends() {
-        let lb = LoadBalancer::new("test-service");
+    #[test]
+    fn test_round_robin_selection() {
+        let mut group = BackendGroup::new(LbStrategy::RoundRobin);
+        group.backends = vec![
+            Arc::new(Backend::new(addr(8001))),
+            Arc::new(Backend::new(addr(8002))),
+            Arc::new(Backend::new(addr(8003))),
+        ];
 
-        lb.add_backend(Backend::new("127.0.0.1:8081".parse().unwrap()))
-            .await;
-        lb.update_health("127.0.0.1:8081".parse().unwrap(), HealthStatus::Unhealthy)
-            .await;
+        let a = group.select().unwrap();
+        let b = group.select().unwrap();
+        let c = group.select().unwrap();
+        let d = group.select().unwrap();
 
-        let result = lb.select().await;
-        assert!(matches!(result, Err(ProxyError::NoHealthyBackends { .. })));
+        assert_eq!(a.addr, addr(8001));
+        assert_eq!(b.addr, addr(8002));
+        assert_eq!(c.addr, addr(8003));
+        assert_eq!(d.addr, addr(8001)); // wraps around
     }
 
-    #[tokio::test]
-    async fn test_connection_guard() {
-        let backend = Backend::new("127.0.0.1:8080".parse().unwrap());
-        assert_eq!(backend.connection_count(), 0);
+    #[test]
+    fn test_least_connections_selection() {
+        let mut group = BackendGroup::new(LbStrategy::LeastConnections);
+        let b1 = Arc::new(Backend::new(addr(8001)));
+        let b2 = Arc::new(Backend::new(addr(8002)));
+        let b3 = Arc::new(Backend::new(addr(8003)));
+
+        // Give b1 a tracked connection so it has 1 active.
+        let _guard = b1.track_connection();
+
+        group.backends = vec![b1, Arc::clone(&b2), b3];
+
+        // Should pick b2 or b3 (both have 0 connections); first one wins.
+        let selected = group.select().unwrap();
+        assert_ne!(selected.addr, addr(8001));
+        assert!(selected.addr == addr(8002) || selected.addr == addr(8003));
+
+        // With b2 having a connection too, only b3 has 0.
+        let _guard2 = b2.track_connection();
+        let selected = group.select().unwrap();
+        assert_eq!(selected.addr, addr(8003));
+    }
+
+    #[test]
+    fn test_unhealthy_backends_skipped() {
+        let mut group = BackendGroup::new(LbStrategy::RoundRobin);
+        let b1 = Arc::new(Backend::new(addr(8001)));
+        let b2 = Arc::new(Backend::new(addr(8002)));
+        let b3 = Arc::new(Backend::new(addr(8003)));
+
+        b2.set_unhealthy();
+
+        group.backends = vec![b1, b2, Arc::clone(&b3)];
+
+        // Should cycle between b1 and b3, never returning b2.
+        for _ in 0..10 {
+            let selected = group.select().unwrap();
+            assert_ne!(selected.addr, addr(8002), "Unhealthy backend was selected");
+        }
+    }
+
+    #[test]
+    fn test_connection_guard_decrement() {
+        let backend = Arc::new(Backend::new(addr(9000)));
+        assert_eq!(backend.active_connections(), 0);
+
+        let guard1 = backend.track_connection();
+        assert_eq!(backend.active_connections(), 1);
+
+        let guard2 = backend.track_connection();
+        assert_eq!(backend.active_connections(), 2);
+
+        drop(guard1);
+        assert_eq!(backend.active_connections(), 1);
+
+        drop(guard2);
+        assert_eq!(backend.active_connections(), 0);
+    }
+
+    #[test]
+    fn test_update_backends_preserves_state() {
+        let mut group = BackendGroup::new(LbStrategy::RoundRobin);
+        let b1 = Arc::new(Backend::new(addr(8001)));
+        let b2 = Arc::new(Backend::new(addr(8002)));
+
+        // Give b1 a tracked connection to create observable state.
+        let _guard = b1.track_connection();
+        b2.set_unhealthy();
+
+        group.backends = vec![Arc::clone(&b1), Arc::clone(&b2)];
+
+        // Update: keep 8001, drop 8002, add 8003.
+        group.update_backends(vec![addr(8001), addr(8003)]);
+
+        assert_eq!(group.backends.len(), 2);
+
+        // The preserved backend for 8001 should still have 1 active connection.
+        let preserved = group
+            .backends
+            .iter()
+            .find(|b| b.addr == addr(8001))
+            .unwrap();
+        assert_eq!(preserved.active_connections(), 1);
+
+        // The new backend for 8003 should start fresh.
+        let new_backend = group
+            .backends
+            .iter()
+            .find(|b| b.addr == addr(8003))
+            .unwrap();
+        assert_eq!(new_backend.active_connections(), 0);
+        assert!(new_backend.is_healthy());
+
+        // 8002 should be gone.
+        assert!(group.backends.iter().all(|b| b.addr != addr(8002)));
+    }
+
+    #[test]
+    fn test_all_unhealthy_returns_none() {
+        let mut group = BackendGroup::new(LbStrategy::RoundRobin);
+        let b1 = Arc::new(Backend::new(addr(8001)));
+        let b2 = Arc::new(Backend::new(addr(8002)));
+
+        b1.set_unhealthy();
+        b2.set_unhealthy();
+
+        group.backends = vec![b1, b2];
+
+        assert!(group.select().is_none());
+
+        // Same for LeastConnections.
+        group.strategy = LbStrategy::LeastConnections;
+        assert!(group.select().is_none());
+    }
+
+    #[test]
+    fn test_register_and_select() {
+        let lb = LoadBalancer::new();
+        lb.register("web", vec![addr(8080), addr(8081)], LbStrategy::RoundRobin);
+
+        let backend = lb.select("web").unwrap();
+        assert!(backend.addr == addr(8080) || backend.addr == addr(8081));
+
+        // Unknown service returns None.
+        assert!(lb.select("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_add_remove_backend() {
+        let lb = LoadBalancer::new();
+        lb.register("api", vec![addr(9001)], LbStrategy::RoundRobin);
+
+        // Add a second backend.
+        lb.add_backend("api", addr(9002));
 
         {
-            let _guard = ConnectionGuard::new(backend.clone());
-            assert_eq!(backend.connection_count(), 1);
-
-            let _guard2 = ConnectionGuard::new(backend.clone());
-            assert_eq!(backend.connection_count(), 2);
+            let group = lb.groups.get("api").unwrap();
+            assert_eq!(group.backends.len(), 2);
         }
 
-        // Guards dropped
-        assert_eq!(backend.connection_count(), 0);
+        // Adding the same address again should be a no-op.
+        lb.add_backend("api", addr(9002));
+        {
+            let group = lb.groups.get("api").unwrap();
+            assert_eq!(group.backends.len(), 2);
+        }
+
+        // Remove the first backend.
+        lb.remove_backend("api", &addr(9001));
+        {
+            let group = lb.groups.get("api").unwrap();
+            assert_eq!(group.backends.len(), 1);
+            assert_eq!(group.backends[0].addr, addr(9002));
+        }
     }
 
-    #[tokio::test]
-    async fn test_least_connections() {
-        let lb =
-            LoadBalancer::with_algorithm("test-service", LoadBalancerAlgorithm::LeastConnections);
+    #[test]
+    fn test_unregister() {
+        let lb = LoadBalancer::new();
+        lb.register("svc", vec![addr(5000)], LbStrategy::RoundRobin);
+        assert!(lb.select("svc").is_some());
 
-        let b1 = Backend::new("127.0.0.1:8081".parse().unwrap());
-        let b2 = Backend::new("127.0.0.1:8082".parse().unwrap());
+        lb.unregister("svc");
+        assert!(lb.select("svc").is_none());
+    }
 
-        // Simulate b1 having more connections
-        b1.inc_connections();
-        b1.inc_connections();
+    #[test]
+    fn test_update_backends_via_lb() {
+        let lb = LoadBalancer::new();
+        lb.register("svc", vec![addr(3000)], LbStrategy::RoundRobin);
 
-        lb.add_backend(b1).await;
-        lb.add_backend(b2).await;
+        lb.update_backends("svc", vec![addr(3001), addr(3002)]);
 
-        lb.update_health("127.0.0.1:8081".parse().unwrap(), HealthStatus::Healthy)
-            .await;
-        lb.update_health("127.0.0.1:8082".parse().unwrap(), HealthStatus::Healthy)
-            .await;
+        let group = lb.groups.get("svc").unwrap();
+        assert_eq!(group.backends.len(), 2);
+        assert!(group.backends.iter().any(|b| b.addr == addr(3001)));
+        assert!(group.backends.iter().any(|b| b.addr == addr(3002)));
+    }
 
-        // Should select b2 (fewer connections)
-        let selected = lb.select().await.unwrap();
-        assert_eq!(
-            selected.addr,
-            "127.0.0.1:8082".parse::<SocketAddr>().unwrap()
-        );
+    #[test]
+    fn test_empty_group_returns_none() {
+        let group = BackendGroup::new(LbStrategy::RoundRobin);
+        assert!(group.select().is_none());
+
+        let group_lc = BackendGroup::new(LbStrategy::LeastConnections);
+        assert!(group_lc.select().is_none());
+    }
+
+    #[test]
+    fn test_failure_tracking() {
+        let backend = Backend::new(addr(7000));
+        assert_eq!(backend.consecutive_failures(), 0);
+
+        backend.record_failure();
+        backend.record_failure();
+        assert_eq!(backend.consecutive_failures(), 2);
+
+        backend.reset_failures();
+        assert_eq!(backend.consecutive_failures(), 0);
+    }
+
+    #[test]
+    fn test_health_transitions() {
+        let backend = Backend::new(addr(7001));
+        assert!(backend.is_healthy());
+
+        backend.set_unhealthy();
+        assert!(!backend.is_healthy());
+
+        backend.set_healthy();
+        assert!(backend.is_healthy());
     }
 }

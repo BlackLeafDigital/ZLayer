@@ -1,12 +1,15 @@
 //! HTTP server implementation
 //!
 //! This module provides the HTTP/HTTPS server for the proxy.
+//! Uses `ServiceRegistry` for route resolution instead of the legacy `Router`.
 
+use crate::acme::CertManager;
 use crate::config::ProxyConfig;
 use crate::error::{ProxyError, Result};
-use crate::routing::Router;
+use crate::lb::LoadBalancer;
+use crate::routes::ServiceRegistry;
 use crate::service::ReverseProxyService;
-use crate::tls::{create_tls_acceptor, TlsServerConfig};
+use crate::sni_resolver::SniCertResolver;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -23,54 +26,77 @@ use tracing::{debug, error, info, warn};
 pub struct ProxyServer {
     /// Server configuration
     config: Arc<ProxyConfig>,
-    /// Router for request matching
-    router: Arc<Router>,
+    /// Service registry for route resolution
+    registry: Arc<ServiceRegistry>,
+    /// Load balancer for backend selection
+    load_balancer: Arc<LoadBalancer>,
     /// Shutdown signal sender
     shutdown_tx: watch::Sender<bool>,
     /// Shutdown signal receiver
     shutdown_rx: watch::Receiver<bool>,
     /// TLS acceptor for HTTPS connections
     tls_acceptor: Option<TlsAcceptor>,
+    /// Certificate manager for ACME challenge responses
+    cert_manager: Option<Arc<CertManager>>,
 }
 
 impl ProxyServer {
     /// Create a new proxy server
-    pub fn new(config: ProxyConfig, router: Router) -> Self {
+    pub fn new(
+        config: ProxyConfig,
+        registry: Arc<ServiceRegistry>,
+        load_balancer: Arc<LoadBalancer>,
+    ) -> Self {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Self {
             config: Arc::new(config),
-            router: Arc::new(router),
+            registry,
+            load_balancer,
             shutdown_tx,
             shutdown_rx,
             tls_acceptor: None,
+            cert_manager: None,
         }
     }
 
-    /// Create a proxy server with an existing router
-    pub fn with_router(config: ProxyConfig, router: Arc<Router>) -> Self {
+    /// Create a proxy server with an existing registry (alias for `new`)
+    pub fn with_registry(
+        config: ProxyConfig,
+        registry: Arc<ServiceRegistry>,
+        load_balancer: Arc<LoadBalancer>,
+    ) -> Self {
+        Self::new(config, registry, load_balancer)
+    }
+
+    /// Create a proxy server with TLS via SNI resolver
+    pub fn with_tls_resolver(
+        config: ProxyConfig,
+        registry: Arc<ServiceRegistry>,
+        load_balancer: Arc<LoadBalancer>,
+        resolver: Arc<SniCertResolver>,
+    ) -> Self {
+        let tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_cert_resolver(resolver);
+        let acceptor = TlsAcceptor::from(Arc::new(tls_config));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         Self {
             config: Arc::new(config),
-            router,
+            registry,
+            load_balancer,
             shutdown_tx,
             shutdown_rx,
-            tls_acceptor: None,
+            tls_acceptor: Some(acceptor),
+            cert_manager: None,
         }
     }
 
-    /// Create a proxy server with TLS support
-    pub fn with_tls(config: ProxyConfig, router: Router, tls_acceptor: TlsAcceptor) -> Self {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        Self {
-            config: Arc::new(config),
-            router: Arc::new(router),
-            shutdown_tx,
-            shutdown_rx,
-            tls_acceptor: Some(tls_acceptor),
-        }
+    /// Set the certificate manager for ACME challenge interception
+    pub fn with_cert_manager(mut self, cm: Arc<CertManager>) -> Self {
+        self.cert_manager = Some(cm);
+        self
     }
 
     /// Check if TLS is enabled
@@ -83,9 +109,9 @@ impl ProxyServer {
         self.tls_acceptor.as_ref()
     }
 
-    /// Get the router
-    pub fn router(&self) -> Arc<Router> {
-        self.router.clone()
+    /// Get the service registry
+    pub fn registry(&self) -> Arc<ServiceRegistry> {
+        self.registry.clone()
     }
 
     /// Get the configuration
@@ -144,15 +170,19 @@ impl ProxyServer {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, remote_addr)) => {
-                            let router = self.router.clone();
+                            let registry = self.registry.clone();
+                            let load_balancer = self.load_balancer.clone();
                             let config = self.config.clone();
+                            let cert_manager = self.cert_manager.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = Self::handle_connection(
                                     stream,
                                     remote_addr,
-                                    router,
+                                    registry,
+                                    load_balancer,
                                     config,
+                                    cert_manager,
                                 ).await {
                                     debug!(
                                         error = %e,
@@ -176,12 +206,18 @@ impl ProxyServer {
     async fn handle_connection(
         stream: tokio::net::TcpStream,
         remote_addr: SocketAddr,
-        router: Arc<Router>,
+        registry: Arc<ServiceRegistry>,
+        load_balancer: Arc<LoadBalancer>,
         config: Arc<ProxyConfig>,
+        cert_manager: Option<Arc<CertManager>>,
     ) -> Result<()> {
         let io = TokioIo::new(stream);
 
-        let service = ReverseProxyService::new(router, config).with_remote_addr(remote_addr);
+        let mut service =
+            ReverseProxyService::new(registry, load_balancer, config).with_remote_addr(remote_addr);
+        if let Some(cm) = cert_manager {
+            service = service.with_cert_manager(cm);
+        }
 
         let service = service_fn(move |req: Request<Incoming>| {
             let svc = service.clone();
@@ -305,17 +341,21 @@ impl ProxyServer {
                 result = listener.accept() => {
                     match result {
                         Ok((stream, remote_addr)) => {
-                            let router = self.router.clone();
+                            let registry = self.registry.clone();
+                            let load_balancer = self.load_balancer.clone();
                             let config = self.config.clone();
                             let acceptor = acceptor.clone();
+                            let cert_manager = self.cert_manager.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = Self::handle_tls_connection(
                                     stream,
                                     remote_addr,
-                                    router,
+                                    registry,
+                                    load_balancer,
                                     config,
                                     acceptor,
+                                    cert_manager,
                                 ).await {
                                     debug!(
                                         error = %e,
@@ -339,9 +379,11 @@ impl ProxyServer {
     async fn handle_tls_connection(
         stream: tokio::net::TcpStream,
         remote_addr: SocketAddr,
-        router: Arc<Router>,
+        registry: Arc<ServiceRegistry>,
+        load_balancer: Arc<LoadBalancer>,
         config: Arc<ProxyConfig>,
         acceptor: TlsAcceptor,
+        cert_manager: Option<Arc<CertManager>>,
     ) -> Result<()> {
         // Perform TLS handshake
         let tls_stream = acceptor
@@ -351,9 +393,12 @@ impl ProxyServer {
 
         let io = TokioIo::new(tls_stream);
 
-        let service = ReverseProxyService::new(router, config)
+        let mut service = ReverseProxyService::new(registry, load_balancer, config)
             .with_remote_addr(remote_addr)
             .with_tls(true);
+        if let Some(cm) = cert_manager {
+            service = service.with_cert_manager(cm);
+        }
 
         let service = service_fn(move |req: Request<Incoming>| {
             let svc = service.clone();
@@ -380,130 +425,44 @@ impl ProxyServer {
     }
 }
 
-/// Builder for ProxyServer
-pub struct ProxyServerBuilder {
-    config: ProxyConfig,
-    router: Option<Router>,
-    tls_config: Option<TlsServerConfig>,
-}
-
-impl ProxyServerBuilder {
-    /// Create a new builder with default configuration
-    pub fn new() -> Self {
-        Self {
-            config: ProxyConfig::default(),
-            router: None,
-            tls_config: None,
-        }
-    }
-
-    /// Set the configuration
-    pub fn config(mut self, config: ProxyConfig) -> Self {
-        self.config = config;
-        self
-    }
-
-    /// Set the router
-    pub fn router(mut self, router: Router) -> Self {
-        self.router = Some(router);
-        self
-    }
-
-    /// Set the HTTP bind address
-    pub fn http_addr(mut self, addr: SocketAddr) -> Self {
-        self.config.server.http_addr = addr;
-        self
-    }
-
-    /// Set the HTTPS bind address
-    pub fn https_addr(mut self, addr: SocketAddr) -> Self {
-        self.config.server.https_addr = addr;
-        self
-    }
-
-    /// Enable or disable HTTP/2
-    pub fn http2_enabled(mut self, enabled: bool) -> Self {
-        self.config.server.http2_enabled = enabled;
-        self
-    }
-
-    /// Set TLS configuration
-    pub fn tls(mut self, config: TlsServerConfig) -> Self {
-        self.tls_config = Some(config);
-        self
-    }
-
-    /// Set TLS configuration from certificate and key paths
-    pub fn tls_files(mut self, cert_path: impl Into<String>, key_path: impl Into<String>) -> Self {
-        self.tls_config = Some(TlsServerConfig::new(cert_path, key_path));
-        self
-    }
-
-    /// Build the ProxyServer
-    pub fn build(self) -> ProxyServer {
-        let router = self.router.unwrap_or_default();
-        ProxyServer::new(self.config, router)
-    }
-
-    /// Build the ProxyServer with TLS
-    ///
-    /// Returns an error if TLS configuration is invalid.
-    pub fn build_with_tls(self) -> Result<ProxyServer> {
-        let router = self.router.unwrap_or_default();
-
-        let tls_acceptor = if let Some(tls_config) = self.tls_config {
-            Some(create_tls_acceptor(&tls_config)?)
-        } else if let Some(ref tls) = self.config.tls {
-            let tls_config = TlsServerConfig::from_config(tls);
-            Some(create_tls_acceptor(&tls_config)?)
-        } else {
-            return Err(ProxyError::Config("TLS configuration required".to_string()));
-        };
-
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-
-        Ok(ProxyServer {
-            config: Arc::new(self.config),
-            router: Arc::new(router),
-            shutdown_tx,
-            shutdown_rx,
-            tls_acceptor,
-        })
-    }
-}
-
-impl Default for ProxyServerBuilder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lb::{Backend, HealthStatus};
-    use crate::routing::Route;
+    use crate::lb::LoadBalancer;
+    use crate::routes::{ResolvedService, RouteEntry};
     use zlayer_spec::{ExposeType, Protocol};
 
-    #[tokio::test]
-    async fn test_server_builder() {
-        let server = ProxyServerBuilder::new()
-            .http_addr("127.0.0.1:8080".parse().unwrap())
-            .http2_enabled(true)
-            .build();
-
-        assert_eq!(
-            server.config.server.http_addr,
-            "127.0.0.1:8080".parse::<SocketAddr>().unwrap()
-        );
-        assert!(server.config.server.http2_enabled);
+    /// Helper to build a minimal `RouteEntry` for tests.
+    fn make_entry(
+        service: &str,
+        host: Option<&str>,
+        path: &str,
+        backends: Vec<SocketAddr>,
+    ) -> RouteEntry {
+        RouteEntry {
+            service_name: service.to_string(),
+            endpoint_name: "http".to_string(),
+            host: host.map(|s| s.to_string()),
+            path_prefix: path.to_string(),
+            resolved: ResolvedService {
+                name: service.to_string(),
+                backends,
+                use_tls: false,
+                sni_hostname: String::new(),
+                expose: ExposeType::Public,
+                protocol: Protocol::Http,
+                strip_prefix: false,
+                path_prefix: path.to_string(),
+                target_port: 8080,
+            },
+        }
     }
 
     #[tokio::test]
     async fn test_server_shutdown() {
-        let server = ProxyServerBuilder::new()
-            .http_addr("127.0.0.1:0".parse().unwrap())
-            .build();
+        let registry = Arc::new(ServiceRegistry::new());
+        let lb = Arc::new(LoadBalancer::new());
+        let server = ProxyServer::new(ProxyConfig::default(), registry, lb);
 
         // Create a separate handle for shutdown
         let shutdown_tx = server.shutdown_tx.clone();
@@ -516,33 +475,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_router_integration() {
-        let router = Router::new();
+    async fn test_registry_integration() {
+        let registry = Arc::new(ServiceRegistry::new());
 
         // Add a route
-        router
-            .add_route(Route {
-                service: "test-service".to_string(),
-                endpoint: "http".to_string(),
-                host: None,
-                path_prefix: "/api".to_string(),
-                protocol: Protocol::Http,
-                expose: ExposeType::Public,
-                strip_prefix: false,
-            })
+        registry
+            .register(make_entry(
+                "test-service",
+                None,
+                "/api",
+                vec!["127.0.0.1:8081".parse().unwrap()],
+            ))
             .await;
 
-        // Add a backend
-        let lb = router.get_or_create_lb("test-service").await;
-        lb.add_backend(Backend::new("127.0.0.1:8081".parse().unwrap()))
-            .await;
-        lb.update_health("127.0.0.1:8081".parse().unwrap(), HealthStatus::Healthy)
-            .await;
+        let lb = Arc::new(LoadBalancer::new());
+        let server = ProxyServer::new(ProxyConfig::default(), registry, lb);
 
-        let server = ProxyServerBuilder::new().router(router).build();
-
-        // Verify router is accessible
-        let router = server.router();
-        assert_eq!(router.route_count().await, 1);
+        // Verify registry is accessible
+        let reg = server.registry();
+        assert_eq!(reg.route_count().await, 1);
     }
 }
