@@ -52,6 +52,7 @@ async fn test_standalone_scheduling_workflow() {
                 },
             },
             2,
+            None,
         )
         .await
         .unwrap();
@@ -90,6 +91,7 @@ async fn test_standalone_scheduling_workflow() {
                 },
             },
             2,
+            None,
         )
         .await
         .unwrap();
@@ -142,6 +144,7 @@ async fn test_multiple_services() {
                     },
                 },
                 2,
+                None,
             )
             .await
             .unwrap();
@@ -192,6 +195,7 @@ async fn test_fixed_scaling() {
             "static",
             ScaleSpec::Fixed { replicas: 5 },
             2, // Start at 2
+            None,
         )
         .await
         .unwrap();
@@ -219,7 +223,7 @@ async fn test_manual_scaling() {
     scheduler.add_metrics_source(mock.clone()).await;
 
     scheduler
-        .register_service("manual", ScaleSpec::Manual, 3)
+        .register_service("manual", ScaleSpec::Manual, 3, None)
         .await
         .unwrap();
 
@@ -277,6 +281,7 @@ async fn test_apply_scaling() {
                 },
             },
             2,
+            None,
         )
         .await
         .unwrap();
@@ -331,6 +336,7 @@ async fn test_prometheus_metrics() {
                 targets: ScaleTargets::default(),
             },
             2,
+            None,
         )
         .await
         .unwrap();
@@ -424,7 +430,7 @@ async fn test_service_unregistration() {
 
     // Register a service
     scheduler
-        .register_service("temp-service", ScaleSpec::Fixed { replicas: 3 }, 3)
+        .register_service("temp-service", ScaleSpec::Fixed { replicas: 3 }, 3, None)
         .await
         .unwrap();
 
@@ -480,6 +486,7 @@ async fn test_scale_down_low_metrics() {
                 },
             },
             5, // Start high
+            None,
         )
         .await
         .unwrap();
@@ -532,6 +539,7 @@ async fn test_respects_bounds() {
                 },
             },
             3,
+            None,
         )
         .await
         .unwrap();
@@ -583,6 +591,7 @@ async fn test_memory_scaling() {
                 },
             },
             2,
+            None,
         )
         .await
         .unwrap();
