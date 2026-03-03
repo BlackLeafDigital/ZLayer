@@ -21,6 +21,7 @@ members = [
   "crates/zlayer-tunnel",
   "bin/zlayer",
   "crates/zlayer-manager",
+  "crates/zlayer-consensus",
 ]
 
 [workspace.package]

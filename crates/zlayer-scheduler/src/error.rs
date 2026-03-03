@@ -48,30 +48,14 @@ pub enum SchedulerError {
     /// Agent communication failed
     #[error("Agent communication error: {0}")]
     AgentCommunication(String),
-}
 
-/// Errors specific to Raft network operations
-#[derive(Debug, Error)]
-pub enum RaftNetworkError {
-    /// Request timeout
-    #[error("Network request timed out")]
-    Timeout,
+    /// Not the Raft leader, cannot execute distributed operations
+    #[error("Not the Raft leader")]
+    NotLeader,
 
-    /// Target node unreachable
-    #[error("Target node unreachable: {0}")]
-    Unreachable(String),
-
-    /// Serialization/deserialization failed
-    #[error("Serialization error: {0}")]
-    Serialization(String),
-
-    /// Invalid or unexpected response
-    #[error("Invalid response: {0}")]
-    InvalidResponse(String),
-
-    /// HTTP client error
-    #[error("HTTP error: {0}")]
-    Http(#[from] reqwest::Error),
+    /// Placement failed (no suitable nodes for some replicas)
+    #[error("Placement failed: {0}")]
+    PlacementFailed(String),
 }
 
 /// Result type alias for scheduler operations

@@ -307,6 +307,48 @@ impl PlacementState {
     pub fn container_count(&self, node_id: NodeId) -> usize {
         self.containers_on_node(node_id).len()
     }
+
+    /// Remove all container placements from a specific node.
+    ///
+    /// Returns the list of containers that were removed. This is used during
+    /// node death handling to clear stale placements before rescheduling.
+    pub fn remove_node(&mut self, node_id: NodeId) -> Vec<ContainerId> {
+        let removed = self.node_containers.remove(&node_id).unwrap_or_default();
+        for container in &removed {
+            self.container_nodes.remove(container);
+        }
+        removed
+    }
+
+    /// Remove all containers for a specific service from a specific node.
+    ///
+    /// Returns the containers that were removed.
+    pub fn remove_service_from_node(
+        &mut self,
+        node_id: NodeId,
+        service_name: &str,
+    ) -> Vec<ContainerId> {
+        let mut removed = Vec::new();
+
+        if let Some(containers) = self.node_containers.get_mut(&node_id) {
+            let mut i = 0;
+            while i < containers.len() {
+                if containers[i].service == service_name {
+                    let c = containers.swap_remove(i);
+                    self.container_nodes.remove(&c);
+                    removed.push(c);
+                } else {
+                    i += 1;
+                }
+            }
+            // Clean up the node entry if no containers remain
+            if containers.is_empty() {
+                self.node_containers.remove(&node_id);
+            }
+        }
+
+        removed
+    }
 }
 
 /// Check if a node can accept a service based on node_mode, constraints, and resource availability
@@ -794,6 +836,53 @@ mod tests {
         assert!(!state.has_service_on_node(2, "api"));
         assert_eq!(state.node_for_container(&container), Some(1));
         assert_eq!(state.container_count(1), 1);
+    }
+
+    #[test]
+    fn test_placement_state_remove_node() {
+        let mut state = PlacementState::new();
+
+        state.place(ContainerId::new("api", 0), 1);
+        state.place(ContainerId::new("api", 1), 1);
+        state.place(ContainerId::new("web", 0), 1);
+        state.place(ContainerId::new("web", 1), 2);
+
+        assert_eq!(state.container_count(1), 3);
+        assert_eq!(state.container_count(2), 1);
+
+        let removed = state.remove_node(1);
+        assert_eq!(removed.len(), 3);
+        assert_eq!(state.container_count(1), 0);
+        assert!(!state.has_service_on_node(1, "api"));
+        assert!(!state.has_service_on_node(1, "web"));
+        // Node 2 should be unaffected
+        assert_eq!(state.container_count(2), 1);
+        assert!(state.has_service_on_node(2, "web"));
+    }
+
+    #[test]
+    fn test_placement_state_remove_service_from_node() {
+        let mut state = PlacementState::new();
+
+        state.place(ContainerId::new("api", 0), 1);
+        state.place(ContainerId::new("api", 1), 1);
+        state.place(ContainerId::new("web", 0), 1);
+
+        assert_eq!(state.container_count(1), 3);
+
+        let removed = state.remove_service_from_node(1, "api");
+        assert_eq!(removed.len(), 2);
+        assert!(!state.has_service_on_node(1, "api"));
+        // web should still be on node 1
+        assert!(state.has_service_on_node(1, "web"));
+        assert_eq!(state.container_count(1), 1);
+    }
+
+    #[test]
+    fn test_placement_state_remove_service_from_empty_node() {
+        let mut state = PlacementState::new();
+        let removed = state.remove_service_from_node(99, "api");
+        assert!(removed.is_empty());
     }
 
     #[test]

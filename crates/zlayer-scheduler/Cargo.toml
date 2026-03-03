@@ -14,6 +14,7 @@ readme = "README.md"
 # Internal crates
 zlayer-spec.path = "../zlayer-spec"
 zlayer-core.path = "../zlayer-core"
+zlayer-consensus.path = "../zlayer-consensus"
 
 # Serialization
 serde.workspace = true
@@ -32,17 +33,17 @@ tracing.workspace = true
 # UUID
 uuid.workspace = true
 
-# Web framework (for raft network layer)
+# Web framework (for raft service router)
 axum.workspace = true
 
-# HTTP client for raft network
+# HTTP client (used by Scheduler for agent communication)
 reqwest.workspace = true
 
 # Tower middleware
 tower.workspace = true
 tower-http.workspace = true
 
-# Consensus
+# Consensus (re-exported via zlayer-consensus, but needed for declare_raft_types! macro)
 openraft.workspace = true
 
 # Metrics
@@ -53,8 +54,8 @@ num_cpus = { workspace = true }
 # JSON serialization for snapshots
 serde_json.workspace = true
 
-# Storage (optional, for persistent feature)
-sqlx = { workspace = true, optional = true }
+# OpenAPI schema generation
+utoipa.workspace = true
 
 # Testing utilities
 [dev-dependencies]
@@ -62,5 +63,7 @@ tempfile = "3"
 wiremock = "0.6"
 
 [features]
-persistent = ["sqlx"]
 test-skip-http = []
+# Persistent storage is now provided by zlayer-consensus's redb-store feature.
+# This feature flag is kept for backward compatibility with dependents.
+persistent = ["zlayer-consensus/redb-store"]

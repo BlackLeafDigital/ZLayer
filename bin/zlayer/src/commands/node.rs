@@ -424,6 +424,10 @@ pub(crate) async fn handle_node_init(
         overlay_port,
         advertise_addr: advertise_addr.clone(),
         api_port,
+        cpu_total: 0.0,
+        memory_total: 0,
+        disk_total: 0,
+        gpus: vec![],
     })
     .await
     .context("Failed to register leader in Raft state")?;

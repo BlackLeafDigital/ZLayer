@@ -1,24 +1,23 @@
 //! Axum-based HTTP server for receiving Raft RPCs
 //!
-//! Provides an HTTP server that listens for Raft RPC requests from
-//! other nodes and forwards them to the local Raft instance.
+//! Delegates to `zlayer_consensus::network::http_service::raft_service_router()`
+//! for the actual endpoint handlers.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use axum::{routing::post, Router};
+use axum::Router;
 use tower_http::trace::TraceLayer;
 use tracing::info;
 
 use crate::error::Result;
-use crate::handlers::raft::{
-    handle_append_entries, handle_full_snapshot, handle_install_snapshot, handle_vote,
-};
 use crate::raft::RaftCoordinator;
+use zlayer_consensus::network::http_service::raft_service_router;
 
 /// Raft RPC service
 ///
 /// Provides an HTTP server for receiving Raft RPCs from peer nodes.
+/// Delegates to `zlayer-consensus` for the actual RPC handling.
 pub struct RaftService {
     raft: Arc<RaftCoordinator>,
 }
@@ -34,20 +33,14 @@ impl RaftService {
 
     /// Create the Axum router with Raft RPC endpoints
     ///
-    /// # Returns
-    /// An Axum router configured with the following endpoints:
-    /// - POST /raft/append-entries
-    /// - POST /raft/install-snapshot
+    /// Uses `zlayer_consensus::network::http_service::raft_service_router()` which
+    /// provides endpoints for:
     /// - POST /raft/vote
+    /// - POST /raft/append
+    /// - POST /raft/snapshot
     /// - POST /raft/full-snapshot
     pub fn router(&self) -> Router {
-        Router::new()
-            .route("/raft/append-entries", post(handle_append_entries))
-            .route("/raft/install-snapshot", post(handle_install_snapshot))
-            .route("/raft/vote", post(handle_vote))
-            .route("/raft/full-snapshot", post(handle_full_snapshot))
-            .layer(TraceLayer::new_for_http())
-            .with_state(Arc::clone(&self.raft))
+        raft_service_router(self.raft.raft_clone()).layer(TraceLayer::new_for_http())
     }
 
     /// Run the Raft service on the specified address
@@ -99,7 +92,6 @@ mod tests {
     #[test]
     fn test_router_endpoints() {
         // Verify that the router has the expected structure
-        // This is a basic test - in production you'd test actual routing
         let config = RaftConfig::default();
         let rt = tokio::runtime::Runtime::new().unwrap();
 

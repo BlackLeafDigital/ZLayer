@@ -21,6 +21,7 @@ pub mod daemon;
 pub mod daemon_client;
 #[allow(dead_code)]
 mod deploy_tui;
+pub mod resources;
 mod util;
 mod views;
 mod widgets;

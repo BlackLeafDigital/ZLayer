@@ -191,6 +191,8 @@ impl DaemonClient {
             cmd.arg("--data-dir").arg(&data_dir);
         }
 
+        cmd.env("ZLAYER_SPAWNER_PID", std::process::id().to_string());
+
         cmd.arg("serve")
             .arg("--daemon")
             .arg("--socket")

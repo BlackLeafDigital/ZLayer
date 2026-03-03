@@ -16,7 +16,7 @@
 
 ## Overview
 
-ZLayer provides declarative container orchestration without Kubernetes complexity. It uses [libcontainer](https://github.com/youki-dev/youki) (from the youki project) for direct container management on Linux, and Seatbelt sandbox + APFS clonefile on macOS - no daemon required.
+ZLayer provides declarative container orchestration without Kubernetes complexity. It uses [libcontainer](https://github.com/youki-dev/youki) (from the youki project) for direct container management on Linux, and Seatbelt sandbox + APFS clonefile on macOS - no daemon required. Nodes form a Raft-based cluster with resource-aware scheduling, automatic failover, and distributed container placement.
 
 ### Key Features
 
@@ -26,6 +26,7 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 - **Built-in Image Builder** - Dockerfile parser with buildah integration and runtime templates
 - **Encrypted Overlay Networks** - Mesh networking via boringtun (userspace WireGuard) with IP allocation, DNS service discovery, and health checking
 - **Smart Scheduler** - Node placement with Shared/Dedicated/Exclusive allocation modes
+- **Multi-Node Clustering** - Raft consensus, resource-aware node join with CPU/memory/disk/GPU detection, heartbeat-based health monitoring, automatic failover and rescheduling
 - **Built-in Proxy** - L7 (HTTP/HTTPS/WebSocket) and L4 (TCP/UDP) with TLS termination, load balancing on every node
 - **Adaptive Autoscaling** - Scale based on CPU, memory, or requests per second
 - **Init Actions** - Pre-start lifecycle hooks (wait for TCP, HTTP, S3 pull/push, run commands)
@@ -39,37 +40,56 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 
 ```mermaid
 graph TB
-    subgraph Node[ZLayer Node]
-        API[REST API]
-        Proxy[Proxy TLS/HTTP2/LB]
-        Agent[Agent Runtime]
-        Scheduler[Scheduler Raft]
-        Obs[Observability]
+    subgraph Cluster[ZLayer Cluster]
+        subgraph Leader[Leader Node]
+            API1[REST API]
+            Proxy1[Proxy TLS/HTTP2/LB]
+            Agent1[Agent Runtime]
+            Sched[Scheduler]
+            Raft1[Raft Consensus]
+            Res1[Resource Detection]
 
-        API --> Agent
-        Proxy --> Agent
-        Scheduler --> Agent
-        Obs --> Agent
-
-        subgraph Runtime[Runtime Layer]
-            LC[libcontainer Linux]
-            SB[Seatbelt Sandbox macOS]
-            MV[macOS VM Runtime]
-            WT[wasmtime]
-            SM[Storage Manager]
-            LC --> C1[Container]
-            LC --> C2[Container]
-            SB --> C3[Container]
-            MV --> C4[VM Container]
-            WT --> W1[WASM Module]
-            WT --> W2[WASM Module]
+            API1 --> Agent1
+            Proxy1 --> Agent1
+            Sched --> Agent1
+            Sched --> Raft1
+            Res1 --> Raft1
         end
 
-        Agent --> LC
-        Agent --> SB
-        Agent --> MV
-        Agent --> WT
-        Agent --> SM
+        subgraph Worker1[Worker Node]
+            API2[REST API]
+            Agent2[Agent Runtime]
+            Raft2[Raft Follower]
+            Res2[Resource Detection]
+            Res2 --> Raft2
+        end
+
+        subgraph Worker2[Worker Node]
+            API3[REST API]
+            Agent3[Agent Runtime]
+            Raft3[Raft Follower]
+            Res3[Resource Detection]
+            Res3 --> Raft3
+        end
+
+        Raft1 <-->|Raft RPC + Heartbeat| Raft2
+        Raft1 <-->|Raft RPC + Heartbeat| Raft3
+        Sched -->|Dispatch Containers| API2
+        Sched -->|Dispatch Containers| API3
+    end
+
+    subgraph Runtime[Runtime Layer per Node]
+        LC[libcontainer Linux]
+        SB[Seatbelt Sandbox macOS]
+        MV[macOS VM Runtime]
+        WT[wasmtime]
+        SM[Storage Manager]
+        LC --> C1[Container]
+        LC --> C2[Container]
+        SB --> C3[Container]
+        MV --> C4[VM Container]
+        WT --> W1[WASM Module]
+        WT --> W2[WASM Module]
     end
 
     subgraph Builder[Builder Subsystem]
@@ -100,8 +120,9 @@ graph TB
         LS --> SM
     end
 
-    Agent --> Builder
-    Agent --> Overlay
+    Agent1 --> Runtime
+    Agent1 --> Builder
+    Agent1 --> Overlay
 ```
 
 ## Project Structure
@@ -111,6 +132,7 @@ crates/
 ├── zlayer-agent/          # Container runtime (libcontainer, Seatbelt sandbox, storage manager)
 ├── zlayer-api/            # REST API server with build endpoints and streaming
 ├── zlayer-builder/        # Dockerfile parser, buildah integration, runtime templates
+├── zlayer-consensus/      # Raft consensus (openraft), snapshot management, cluster state machine
 ├── zlayer-core/           # Shared types and configuration
 ├── zlayer-init-actions/   # Pre-start lifecycle actions (TCP, HTTP, S3, commands)
 ├── zlayer-manager/        # Web-based management UI (Leptos SSR + WASM)
@@ -280,6 +302,71 @@ zlayer deploy nginx.zlayer.yml
 
 ```bash
 zlayer status my-app
+```
+
+## Multi-Node Clustering
+
+ZLayer nodes form a Raft-based cluster for distributed container scheduling, automatic failover, and resource pooling. A single-node deployment works out of the box; adding nodes scales capacity without configuration changes.
+
+### How It Works
+
+1. **Bootstrap** -- The first node initializes the cluster and becomes the Raft leader. It detects local CPU, memory, disk, and GPU resources and registers itself in the cluster state.
+2. **Join** -- Additional nodes join via `zlayer node join`, providing a join token for authentication. Each joining node reports its hardware resources (CPU cores, memory, disk, GPUs) which are stored in the Raft-replicated cluster state.
+3. **Heartbeat** -- Worker nodes send resource usage heartbeats to the leader every 5 seconds. If a node misses heartbeats for 30 seconds, the leader marks it as "dead".
+4. **Scheduling** -- When a deployment is created or scaled, the scheduler builds a placement plan across all live nodes using bin-packing, dedicated, or exclusive allocation modes (depending on the service spec). Containers are dispatched to remote nodes via internal API calls.
+5. **Failover** -- When a node dies, the scheduler automatically reschedules its containers to remaining live nodes. If a dead node later resumes heartbeating, it is automatically recovered to "ready" status.
+
+### Bootstrapping a Cluster
+
+```bash
+# Node 1: Initialize the cluster (becomes leader)
+zlayer node init --advertise-addr 10.0.0.1
+
+# Generate a join token for workers
+zlayer node generate-join-token -d my-deploy -a http://10.0.0.1:3669
+```
+
+### Adding Worker Nodes
+
+```bash
+# Node 2: Join the cluster
+zlayer node join 10.0.0.1:3669 --token <TOKEN> --advertise-addr 10.0.0.2
+
+# Node 3: Join the cluster
+zlayer node join 10.0.0.1:3669 --token <TOKEN> --advertise-addr 10.0.0.3
+```
+
+Each joining node automatically detects its hardware resources (CPU, memory, disk, GPUs) and reports them to the leader. The scheduler uses these resources for placement decisions.
+
+### Resource Detection
+
+ZLayer detects the following resources on each node at init and join time:
+
+| Resource | Linux | macOS |
+|----------|-------|-------|
+| CPU cores | `/proc/cpuinfo` | `sysctl hw.ncpu` |
+| Memory | `/proc/meminfo` | `sysctl hw.memsize` |
+| Disk | `statvfs` | `statvfs` |
+| GPUs | sysfs PCI scan + `nvidia-smi` | `system_profiler` |
+
+GPU detection identifies vendor (NVIDIA, AMD, Intel), VRAM, model name, and device paths. GPU-aware placement is available through node labels and the scheduler's resource accounting.
+
+### Node Status
+
+Nodes transition between three states:
+
+| Status | Meaning |
+|--------|---------|
+| `ready` | Node is healthy, accepting new containers |
+| `draining` | Node is being evacuated, no new containers scheduled |
+| `dead` | Node missed heartbeats for 30s, containers rescheduled |
+
+```bash
+# View cluster nodes and their status
+zlayer node list
+
+# Check individual node status
+zlayer node status
 ```
 
 ## Deployment Spec

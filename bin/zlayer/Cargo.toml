@@ -86,6 +86,9 @@ bytes = { workspace = true }
 tower = { workspace = true }
 tokio-stream = { workspace = true }
 
+# System resource detection
+num_cpus = { workspace = true }
+
 # Daemonization
 nix = { workspace = true }
 libc = { workspace = true }

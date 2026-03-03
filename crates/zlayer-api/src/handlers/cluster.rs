@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use axum::{extract::State, Json};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -42,6 +42,18 @@ pub struct ClusterJoinRequest {
     pub mode: String,
     /// Services to replicate (only if mode == "replicate")
     pub services: Option<Vec<String>>,
+    /// Total CPU cores on the joining node
+    #[serde(default)]
+    pub cpu_total: f64,
+    /// Total memory in bytes
+    #[serde(default)]
+    pub memory_total: u64,
+    /// Total disk in bytes
+    #[serde(default)]
+    pub disk_total: u64,
+    /// Detected GPUs
+    #[serde(default)]
+    pub gpus: Vec<zlayer_scheduler::raft::GpuInfoSummary>,
 }
 
 fn default_mode() -> String {
@@ -230,6 +242,10 @@ pub async fn cluster_join(
         overlay_port: req.overlay_port,
         advertise_addr: req.advertise_addr.clone(),
         api_port: req.api_port,
+        cpu_total: req.cpu_total,
+        memory_total: req.memory_total,
+        disk_total: req.disk_total,
+        gpus: req.gpus.clone(),
     })
     .await
     .map_err(|e| ApiError::Internal(format!("Failed to add member to Raft: {e}")))?;
@@ -312,6 +328,78 @@ pub async fn cluster_list_nodes(
         .collect();
 
     Ok(Json(nodes))
+}
+
+/// Heartbeat request from a worker node.
+#[derive(Debug, Deserialize)]
+pub struct HeartbeatRequest {
+    pub node_id: u64,
+    pub cpu_used: f64,
+    pub memory_used: u64,
+    pub disk_used: u64,
+}
+
+/// Handle node heartbeat.
+///
+/// `POST /api/v1/cluster/heartbeat`
+///
+/// Accepts resource usage data from worker nodes and proposes an
+/// `UpdateNodeHeartbeat` to the Raft state machine.
+pub async fn cluster_heartbeat(
+    State(state): State<ClusterApiState>,
+    Json(req): Json<HeartbeatRequest>,
+) -> impl IntoResponse {
+    let Some(ref raft) = state.raft else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": "no raft coordinator"})),
+        )
+            .into_response();
+    };
+
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+
+    // Check if the node was previously marked "dead" -- if so, recover it
+    // by proposing a status update back to "ready" before processing the
+    // heartbeat. This handles the case where a node comes back online after
+    // a transient failure.
+    {
+        let cluster_state = raft.read_state().await;
+        if let Some(node_info) = cluster_state.nodes.get(&req.node_id) {
+            if node_info.status == "dead" {
+                tracing::info!(
+                    node_id = req.node_id,
+                    "Node previously marked dead is sending heartbeats again, recovering"
+                );
+                let _ = raft
+                    .propose(zlayer_scheduler::raft::Request::UpdateNodeStatus {
+                        node_id: req.node_id,
+                        status: "ready".to_string(),
+                    })
+                    .await;
+            }
+        }
+    }
+
+    let request = zlayer_scheduler::raft::Request::UpdateNodeHeartbeat {
+        node_id: req.node_id,
+        timestamp,
+        cpu_used: req.cpu_used,
+        memory_used: req.memory_used,
+        disk_used: req.disk_used,
+    };
+
+    match raft.propose(request).await {
+        Ok(_) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 // =============================================================================
@@ -422,6 +510,50 @@ mod tests {
         assert_eq!(req.advertise_addr, "10.0.0.2");
         assert_eq!(req.mode, "full"); // default
         assert!(req.services.is_none());
+        // Resource fields default to zero/empty
+        assert_eq!(req.cpu_total, 0.0);
+        assert_eq!(req.memory_total, 0);
+        assert_eq!(req.disk_total, 0);
+        assert!(req.gpus.is_empty());
+    }
+
+    #[test]
+    fn test_cluster_join_request_with_resources() {
+        let json = r#"{
+            "token": "abc123",
+            "advertise_addr": "10.0.0.2",
+            "overlay_port": 51820,
+            "raft_port": 9000,
+            "wg_public_key": "pubkey123",
+            "cpu_total": 16.0,
+            "memory_total": 68719476736,
+            "disk_total": 1099511627776,
+            "gpus": [
+                {"vendor": "nvidia", "model": "NVIDIA A100-SXM4-80GB", "memory_mb": 81920}
+            ]
+        }"#;
+        let req: ClusterJoinRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.cpu_total, 16.0);
+        assert_eq!(req.memory_total, 68719476736);
+        assert_eq!(req.disk_total, 1099511627776);
+        assert_eq!(req.gpus.len(), 1);
+        assert_eq!(req.gpus[0].vendor, "nvidia");
+        assert_eq!(req.gpus[0].memory_mb, 81920);
+    }
+
+    #[test]
+    fn test_heartbeat_request_deserialize() {
+        let json = r#"{
+            "node_id": 2,
+            "cpu_used": 4.5,
+            "memory_used": 8589934592,
+            "disk_used": 107374182400
+        }"#;
+        let req: HeartbeatRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.node_id, 2);
+        assert_eq!(req.cpu_used, 4.5);
+        assert_eq!(req.memory_used, 8589934592);
+        assert_eq!(req.disk_used, 107374182400);
     }
 
     #[test]

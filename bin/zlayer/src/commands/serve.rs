@@ -137,10 +137,14 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     if !pid_kill_conclusive {
         warn!("daemon.json not found or unparseable, attempting targeted kill fallback");
 
-        // Find all zlayer processes EXCEPT ourselves, then kill them.
-        // pkill -x zlayer would kill the parent `zlayer deploy` too, so we
-        // use pgrep to enumerate PIDs and selectively kill only foreign ones.
+        // Find all zlayer processes EXCEPT ourselves and the process that
+        // spawned us (the `zlayer up` / `zlayer deploy` CLI), then kill them.
         let my_pid = std::process::id();
+        let spawner_pid: Option<u32> = std::env::var("ZLAYER_SPAWNER_PID")
+            .ok()
+            .and_then(|s| s.parse().ok());
+        let is_protected = |pid: u32| pid == my_pid || Some(pid) == spawner_pid;
+
         if let Ok(output) = tokio::process::Command::new("pgrep")
             .args(["-x", "zlayer"])
             .output()
@@ -151,7 +155,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                 let mut killed_any = false;
                 for line in stdout.lines() {
                     if let Ok(pid) = line.trim().parse::<u32>() {
-                        if pid != my_pid {
+                        if !is_protected(pid) {
                             info!(pid = pid, "Sending SIGTERM to stale zlayer process");
                             unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                             killed_any = true;
@@ -169,10 +173,9 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                             .await;
                         match check {
                             Ok(out) if out.status.success() => {
-                                // Check if the only remaining PIDs are us
                                 let remaining = String::from_utf8_lossy(&out.stdout);
                                 let foreign = remaining.lines().any(|l| {
-                                    l.trim().parse::<u32>().map_or(false, |p| p != my_pid)
+                                    l.trim().parse::<u32>().is_ok_and(|p| !is_protected(p))
                                 });
                                 if !foreign {
                                     info!("All stale zlayer processes exited");
@@ -391,6 +394,10 @@ pub(crate) async fn serve(
         node_config,
         raft: _raft,
         raft_server_handle,
+        heartbeat_handle,
+        dead_node_detection_handle,
+        scheduler: _scheduler,
+        internal_token: daemon_internal_token,
     } = state;
 
     // -----------------------------------------------------------------------
@@ -453,8 +460,9 @@ pub(crate) async fn serve(
         dns_handle.clone(),
     );
 
-    // Generate an internal token for scheduler-to-agent communication
-    let internal_token = generate_internal_token();
+    // Use the internal token generated during daemon init so the scheduler
+    // (which already has a copy) and the API InternalState share the same secret.
+    let internal_token = daemon_internal_token;
 
     // Build the core router using the orchestration-wired deployment state.
     // This ensures create_deployment actually orchestrates containers.
@@ -600,6 +608,17 @@ pub(crate) async fn serve(
     // -----------------------------------------------------------------------
     info!("API server stopped, shutting down daemon infrastructure");
 
+    // Stop heartbeat / dead-node detection background tasks
+    if let Some(handle) = heartbeat_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = dead_node_detection_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    info!("Heartbeat / dead-node detection stopped");
+
     // Stop Raft RPC server
     if let Some(handle) = raft_server_handle {
         handle.abort();
@@ -664,15 +683,4 @@ pub(crate) async fn serve(
 
     info!("Daemon shutdown complete");
     Ok(())
-}
-
-/// Generate a random internal token for scheduler-to-agent communication.
-fn generate_internal_token() -> String {
-    use std::fmt::Write;
-    let mut buf = String::with_capacity(64);
-    for _ in 0..32 {
-        let byte: u8 = rand::random();
-        let _ = write!(buf, "{:02x}", byte);
-    }
-    buf
 }
