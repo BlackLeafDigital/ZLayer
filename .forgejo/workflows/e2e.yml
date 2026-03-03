@@ -42,10 +42,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
 
       - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -104,10 +104,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler
 
       - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
 
       - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -142,10 +142,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
 
       - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -183,10 +183,10 @@ jobs:
           sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
 
       - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -220,10 +220,10 @@ jobs:
           brew install protobuf python3
 
       - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
 
       - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
           key: cargo-registry-macos-${{ hashFiles('**/Cargo.lock') }}

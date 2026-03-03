@@ -45,13 +45,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: zdb
-      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           registries: ${{ env.FORGEJO_REGISTRIES }}
       - name: Install system deps
         run: apt-get update && apt-get install -y sudo protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git jq
       - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -149,13 +149,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: zdb
-      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           registries: ${{ env.FORGEJO_REGISTRIES }}
       - name: Install system deps
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev jq
       - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}

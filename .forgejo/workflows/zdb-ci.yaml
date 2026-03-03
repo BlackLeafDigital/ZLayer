@@ -45,13 +45,13 @@ jobs:
           sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           components: rustfmt, clippy
           registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -73,7 +73,7 @@ jobs:
 
       - name: Save cache
         if: always()
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: save
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -104,12 +104,12 @@ jobs:
           sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -133,7 +133,7 @@ jobs:
 
       - name: Save cache
         if: always()
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: save
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -169,12 +169,12 @@ jobs:
           sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -218,12 +218,12 @@ jobs:
           sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Restore cache
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
@@ -278,7 +278,7 @@ jobs:
     if: always()
     steps:
       - name: Cleanup old caches
-        uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/s3-cache@main
+        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: cleanup
           max-age-days: '30'

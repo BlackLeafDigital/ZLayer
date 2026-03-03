@@ -70,7 +70,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
-      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
       - name: Install system deps
         run: apt-get update && apt-get install -y protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git
       - name: Build
@@ -95,7 +95,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
-      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           targets: aarch64-apple-darwin
       - name: Ensure target installed
@@ -178,7 +178,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
-      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           targets: x86_64-apple-darwin
       - name: Ensure target installed
@@ -212,7 +212,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
-      - uses: https://forge.blackleafdigital.com/BlackLeafDigital/actions/setup-rust@main
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
       - name: Install cross
         run: cargo install cross
       - name: Install system deps
