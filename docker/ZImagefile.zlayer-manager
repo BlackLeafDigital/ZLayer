@@ -43,7 +43,7 @@ stages:
             sharing: shared
 
       # Copy binary out of cached target dir
-      - run: "cp target/release/zlayer-manager /build/zlayer-manager"
+      - run: "cp target/release/zlayer-manager-zql /build/zlayer-manager-zql"
         cache:
           - target: /build/target
             id: cargo-target-manager
@@ -65,7 +65,7 @@ stages:
       - run: "apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*"
 
       # Copy the binary (relative to builder's workdir /build)
-      - copy: "zlayer-manager"
+      - copy: "zlayer-manager-zql"
         from: builder
         to: "/app/zlayer-manager"
         chmod: "755"

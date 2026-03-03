@@ -41,7 +41,7 @@ name = "zlayer_manager"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "zlayer-manager"
+name = "zlayer-manager-zql"
 path = "src/main.rs"
 required-features = ["ssr"]
 
@@ -93,7 +93,7 @@ tailwind-input-file = "./tailwind.css"
 bin-features = ["ssr"]
 lib-features = ["hydrate"]
 # Targets
-bin-target = "zlayer-manager"
+bin-target = "zlayer-manager-zql"
 # Environment
 env = "DEV"
 # Hash files for cache busting

@@ -248,12 +248,12 @@ cmd_build() {
     # Copy to rootfs if it exists
     if [ -d "$ROOTFS/usr/local/bin" ]; then
         info "Copying manager binary to rootfs..."
-        cp target/release/zlayer-manager "$ROOTFS/usr/local/bin/"
+        cp target/release/zlayer-manager-zql "$ROOTFS/usr/local/bin/zlayer-manager"
         ok "Manager binary updated in rootfs"
     fi
 
     ok "Build complete"
-    info "Binaries: target/release/zlayer, target/release/zlayer-manager"
+    info "Binaries: target/release/zlayer, target/release/zlayer-manager-zql"
 
 }
 
@@ -363,7 +363,7 @@ cmd_deploy() {
     header "Deploying manager ($PLATFORM / $runtime_label)"
 
     # Build if needed
-    if [ ! -f target/release/zlayer ] || [ ! -f target/release/zlayer-manager ]; then
+    if [ ! -f target/release/zlayer ] || [ ! -f target/release/zlayer-manager-zql ]; then
         info "Missing binaries, running build first..."
         cmd_build
     fi
