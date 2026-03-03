@@ -166,8 +166,9 @@ async fn test_upsert_without_overlay_gives_none_to_instance() {
 async fn test_upsert_passes_proxy_manager_to_service_instance() {
     // BUG THIS CATCHES: ProxyManager was never started/wired in deploy flow
     let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockRuntime::new());
+    let service_registry = Arc::new(ServiceRegistry::new());
     let proxy_config = ProxyManagerConfig::default();
-    let proxy_manager = Arc::new(ProxyManager::new(proxy_config));
+    let proxy_manager = Arc::new(ProxyManager::new(proxy_config, service_registry, None));
 
     let mut manager = ServiceManager::new(runtime);
     manager.set_proxy_manager(proxy_manager);
@@ -191,7 +192,8 @@ async fn test_proxy_ensure_ports_processes_public_endpoints() {
     // BUG THIS CATCHES: expose: public had zero effect because ProxyManager
     // was never started and ensure_ports_for_service was never called
     let config = ProxyManagerConfig::new("0.0.0.0:80".parse().unwrap());
-    let proxy = ProxyManager::new(config);
+    let service_registry = Arc::new(ServiceRegistry::new());
+    let proxy = ProxyManager::new(config, service_registry, None);
 
     let spec = mock_public_http_spec();
     let _ = proxy.ensure_ports_for_service(&spec, None).await;
@@ -260,7 +262,7 @@ async fn test_service_manager_full_infrastructure_wiring() {
     let service_registry = Arc::new(ServiceRegistry::new());
     let stream_registry = Arc::new(StreamRegistry::new());
     let proxy_config = ProxyManagerConfig::default();
-    let proxy_manager = Arc::new(ProxyManager::new(proxy_config));
+    let proxy_manager = Arc::new(ProxyManager::new(proxy_config, service_registry.clone(), None));
     let dns_server = Arc::new(
         DnsServer::new("127.0.0.1:15353".parse().unwrap(), "service.local.")
             .expect("Failed to create DnsServer"),
@@ -270,7 +272,6 @@ async fn test_service_manager_full_infrastructure_wiring() {
     let mut manager = ServiceManager::with_full_config(
         runtime,
         overlay_manager,
-        service_registry.clone(),
         "prod".to_string(),
     );
     manager.set_stream_registry(stream_registry.clone());
@@ -301,7 +302,7 @@ async fn test_service_manager_full_infrastructure_wiring() {
     assert!(infra.2, "ServiceInstance must have dns_server");
 
     assert!(
-        service_registry.route_count() > 0,
+        service_registry.route_count().await > 0,
         "HTTP routes must be registered"
     );
     assert_eq!(
