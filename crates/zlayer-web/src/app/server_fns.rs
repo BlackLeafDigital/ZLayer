@@ -86,7 +86,6 @@ pub struct WasmExecutionResult {
 
 /// Get system statistics
 #[server(prefix = "/api/leptos")]
-#[allow(clippy::similar_names)]
 pub async fn get_system_stats() -> Result<SystemStats, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
@@ -95,7 +94,7 @@ pub async fn get_system_stats() -> Result<SystemStats, ServerFnError> {
         use crate::server::state::WebState;
 
         // Try to get WebState from Leptos context
-        let state: Option<Arc<WebState>> = leptos::prelude::use_context();
+        let web_state: Option<Arc<WebState>> = leptos::prelude::use_context();
 
         let mut stats = SystemStats {
             version: env!("CARGO_PKG_VERSION").to_string(),
@@ -110,7 +109,7 @@ pub async fn get_system_stats() -> Result<SystemStats, ServerFnError> {
             uptime_seconds: 0,
         };
 
-        if let Some(web_state) = state {
+        if let Some(web_state) = web_state {
             // Always set uptime
             stats.uptime_seconds = web_state.uptime().as_secs();
 
@@ -129,10 +128,10 @@ pub async fn get_system_stats() -> Result<SystemStats, ServerFnError> {
                 }
                 stats.running_containers = total_containers;
 
-                // Count healthy services from health states
-                let health_states = manager.health_states();
-                let states = health_states.read().await;
-                stats.healthy_services = states
+                // Count healthy services from health map
+                let svc_health = manager.health_states();
+                let health_map = svc_health.read().await;
+                stats.healthy_services = health_map
                     .values()
                     .filter(|s| matches!(s, zlayer_agent::health::HealthState::Healthy))
                     .count() as u64;
@@ -188,7 +187,6 @@ pub async fn get_system_stats() -> Result<SystemStats, ServerFnError> {
 /// Returns a vector of `ServiceStats` containing metrics for each registered service.
 /// If no services are registered or WebState is not available, returns an empty vector.
 #[server(prefix = "/api/leptos")]
-#[allow(clippy::similar_names, clippy::cast_possible_truncation)]
 pub async fn get_all_service_stats() -> Result<Vec<ServiceStats>, ServerFnError> {
     #[cfg(feature = "ssr")]
     {
@@ -197,9 +195,9 @@ pub async fn get_all_service_stats() -> Result<Vec<ServiceStats>, ServerFnError>
         use crate::server::state::WebState;
 
         // Try to get WebState from Leptos context
-        let state: Option<Arc<WebState>> = leptos::prelude::use_context();
+        let web_state: Option<Arc<WebState>> = leptos::prelude::use_context();
 
-        let Some(web_state) = state else {
+        let Some(web_state) = web_state else {
             return Ok(Vec::new());
         };
 
@@ -214,20 +212,22 @@ pub async fn get_all_service_stats() -> Result<Vec<ServiceStats>, ServerFnError>
             return Ok(Vec::new());
         }
 
-        // Get health states
-        let health_states = manager.health_states();
-        let health_map = health_states.read().await;
+        // Get health state map for all services
+        let svc_health = manager.health_states();
+        let health_map = svc_health.read().await;
 
         let mut result = Vec::with_capacity(services.len());
 
         for service_name in services {
-            // Get replica count
+            // Get replica count (capped to u32::MAX which is far beyond
+            // any realistic replica count)
+            #[allow(clippy::cast_possible_truncation)]
             let replicas = manager
                 .service_replica_count(&service_name)
                 .await
                 .unwrap_or(0) as u32;
 
-            // Get health status
+            // Get health status string
             let health_status = health_map
                 .get(&service_name)
                 .map_or("unknown", |s| match s {

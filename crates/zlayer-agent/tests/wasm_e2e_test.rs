@@ -23,7 +23,7 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 // Import the public API from zlayer-agent
-use zlayer_agent::runtimes::{
+use zlayer_agent_zql::runtimes::{
     DefaultHost, HttpRequest, HttpResponse, KvError, LogLevel, PoolStats, WasmHttpRuntime,
     ZLayerHost,
 };
@@ -1894,7 +1894,8 @@ mod wasm_stdio_capture_e2e {
 
 mod wasm_http_interfaces_e2e {
     use super::*;
-    use zlayer_agent::runtimes::{
+    use std::str::FromStr;
+    use zlayer_agent_zql::runtimes::{
         duration_to_ns, ns_to_duration, CacheDecision, CacheEntry, HttpMethod, HttpVersion,
         ImmediateResponse, KeyValue, MessageType, MiddlewareAction, PluginRequest, RedirectInfo,
         RequestMetadata, RoutingDecision, UpgradeDecision, Upstream, WebSocketMessage,
@@ -2173,8 +2174,6 @@ mod wasm_http_interfaces_e2e {
     /// Test HttpMethod FromStr implementation
     #[test]
     fn test_http_method_from_str() {
-        use std::str::FromStr;
-
         assert_eq!(HttpMethod::from_str("GET").unwrap(), HttpMethod::Get);
         assert_eq!(HttpMethod::from_str("post").unwrap(), HttpMethod::Post);
         assert_eq!(HttpMethod::from_str("PUT").unwrap(), HttpMethod::Put);

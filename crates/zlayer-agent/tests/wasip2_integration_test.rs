@@ -28,8 +28,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use zlayer_agent::runtimes::{WasmConfig, WasmRuntime};
-use zlayer_agent::{ContainerId, ContainerState, Runtime};
+use zlayer_agent_zql::runtimes::{WasmConfig, WasmRuntime};
+use zlayer_agent_zql::{ContainerId, ContainerState, Runtime};
 use zlayer_registry::{detect_wasm_version_from_binary, WasiVersion};
 use zlayer_spec::{
     CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NetworkSpec, NodeMode,
@@ -1311,7 +1311,7 @@ mod concurrent_tests {
                 let exit_code = runtime.wait_container(&id).await?;
                 runtime.remove_container(&id).await?;
 
-                Ok::<i32, zlayer_agent::error::AgentError>(exit_code)
+                Ok::<i32, zlayer_agent_zql::error::AgentError>(exit_code)
             }));
         }
 

@@ -51,11 +51,7 @@ where
         range: RB,
     ) -> Result<Vec<C::Entry>, StorageError<NodeId>> {
         let log = self.log.read().await;
-        let entries = log
-            .entries
-            .range(range)
-            .map(|(_, e)| e.clone())
-            .collect();
+        let entries = log.entries.range(range).map(|(_, e)| e.clone()).collect();
         Ok(entries)
     }
 }
@@ -168,11 +164,7 @@ where
         range: RB,
     ) -> Result<Vec<C::Entry>, StorageError<NodeId>> {
         let log = self.log.read().await;
-        let entries = log
-            .entries
-            .range(range)
-            .map(|(_, e)| e.clone())
-            .collect();
+        let entries = log.entries.range(range).map(|(_, e)| e.clone()).collect();
         Ok(entries)
     }
 }
@@ -250,11 +242,7 @@ where
 
     async fn truncate(&mut self, log_id: LogId<NodeId>) -> Result<(), StorageError<NodeId>> {
         let mut log = self.log.write().await;
-        let keys: Vec<u64> = log
-            .entries
-            .range(log_id.index..)
-            .map(|(k, _)| *k)
-            .collect();
+        let keys: Vec<u64> = log.entries.range(log_id.index..).map(|(k, _)| *k).collect();
         for key in keys {
             log.entries.remove(&key);
         }
@@ -401,13 +389,8 @@ where
 
     async fn applied_state(
         &mut self,
-    ) -> Result<
-        (
-            Option<LogId<NodeId>>,
-            StoredMembership<NodeId, C::Node>,
-        ),
-        StorageError<NodeId>,
-    > {
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, C::Node>), StorageError<NodeId>>
+    {
         let sm = self.sm.read().await;
         Ok((sm.last_applied_log, sm.last_membership.clone()))
     }
@@ -429,8 +412,7 @@ where
                     responses.push(resp);
                 }
                 EntryPayload::Membership(ref mem) => {
-                    sm.last_membership =
-                        StoredMembership::new(Some(entry.log_id), mem.clone());
+                    sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
                     responses.push(C::R::default());
                 }
                 EntryPayload::Blank => {
@@ -495,9 +477,7 @@ where
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<Snapshot<C>>, StorageError<NodeId>> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<C>>, StorageError<NodeId>> {
         let sm = self.sm.read().await;
         match &sm.current_snapshot {
             Some(stored) => Ok(Some(Snapshot {

@@ -62,10 +62,7 @@ where
 // Handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_vote<C>(
-    State(state): State<Arc<RaftState<C>>>,
-    body: Bytes,
-) -> impl IntoResponse
+async fn handle_vote<C>(State(state): State<Arc<RaftState<C>>>, body: Bytes) -> impl IntoResponse
 where
     C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode, SnapshotData = Cursor<Vec<u8>>>,
     C::D: serde::Serialize + serde::de::DeserializeOwned,
@@ -97,10 +94,7 @@ where
     }
 }
 
-async fn handle_append<C>(
-    State(state): State<Arc<RaftState<C>>>,
-    body: Bytes,
-) -> impl IntoResponse
+async fn handle_append<C>(State(state): State<Arc<RaftState<C>>>, body: Bytes) -> impl IntoResponse
 where
     C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode, SnapshotData = Cursor<Vec<u8>>>,
     C::D: serde::Serialize + serde::de::DeserializeOwned,

@@ -18,7 +18,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use zlayer_agent::{AgentError, ContainerId, MacSandboxConfig, Runtime, SandboxRuntime};
+use zlayer_agent_zql::{AgentError, ContainerId, MacSandboxConfig, Runtime, SandboxRuntime};
 use zlayer_spec::DeploymentSpec;
 
 /// Macro to run async test body with a timeout

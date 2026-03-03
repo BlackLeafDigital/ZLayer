@@ -22,7 +22,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use zlayer_agent::{
+use zlayer_agent_zql::{
     AgentError, ContainerId, ContainerState, HealthChecker, OverlayManager, ProxyManager,
     ProxyManagerConfig, Runtime, ServiceInstance, ServiceManager, YoukiConfig, YoukiRuntime,
 };

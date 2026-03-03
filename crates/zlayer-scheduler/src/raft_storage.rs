@@ -177,9 +177,7 @@ impl RaftLogStorage<TypeConfig> for MemStore {
         Ok(())
     }
 
-    async fn read_committed(
-        &mut self,
-    ) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
+    async fn read_committed(&mut self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
         let log = self.log.read().await;
         Ok(log.committed)
     }
@@ -245,10 +243,7 @@ impl RaftStateMachine<TypeConfig> for MemStore {
         Ok((sm.last_applied_log, sm.last_membership.clone()))
     }
 
-    async fn apply<I>(
-        &mut self,
-        entries: I,
-    ) -> Result<Vec<Response>, StorageError<NodeId>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Response>, StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,
@@ -379,8 +374,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_log_append_and_read() {
-        use openraft::CommittedLeaderId;
         use openraft::storage::RaftLogStorageExt;
+        use openraft::CommittedLeaderId;
 
         let mut store = MemStore::new();
 

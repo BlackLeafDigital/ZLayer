@@ -260,7 +260,10 @@ impl SecretsStore for PersistentSecretsStore {
         db.put_typed("secrets", &storage_key, &stored)
             .map_err(|e| SecretsError::Storage(format!("Failed to store secret: {e}")))?;
 
-        debug!("Stored secret: {} (version {})", storage_key, stored.version);
+        debug!(
+            "Stored secret: {} (version {})",
+            storage_key, stored.version
+        );
         Ok(())
     }
 

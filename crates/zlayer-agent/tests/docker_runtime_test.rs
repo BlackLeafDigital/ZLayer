@@ -17,8 +17,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use zlayer_agent::runtimes::DockerRuntime;
-use zlayer_agent::{ContainerId, ContainerState, Runtime};
+use zlayer_agent_zql::runtimes::DockerRuntime;
+use zlayer_agent_zql::{ContainerId, ContainerState, Runtime};
 use zlayer_spec::{
     CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NetworkSpec, NodeMode,
     PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceSpec, ServiceType,

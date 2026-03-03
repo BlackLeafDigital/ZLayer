@@ -126,8 +126,7 @@ impl DeploymentStorage for ZqlStorage {
             .scan_typed("deployments", "")
             .map_err(StorageError::from)?;
 
-        let mut deployments: Vec<StoredDeployment> =
-            all.into_iter().map(|(_, d)| d).collect();
+        let mut deployments: Vec<StoredDeployment> = all.into_iter().map(|(_, d)| d).collect();
         deployments.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(deployments)
     }

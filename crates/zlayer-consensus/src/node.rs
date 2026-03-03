@@ -161,11 +161,7 @@ where
     ///
     /// If `retain` is true, nodes not in `voter_ids` are kept as learners
     /// rather than removed entirely.
-    pub async fn change_membership(
-        &self,
-        voter_ids: BTreeSet<NodeId>,
-        retain: bool,
-    ) -> Result<()> {
+    pub async fn change_membership(&self, voter_ids: BTreeSet<NodeId>, retain: bool) -> Result<()> {
         self.raft
             .change_membership(voter_ids, retain)
             .await

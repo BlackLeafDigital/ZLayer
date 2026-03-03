@@ -75,8 +75,8 @@ impl RaftHttpClient {
         Req: serde::Serialize,
         Resp: serde::de::DeserializeOwned,
     {
-        let body = bincode::serialize(request)
-            .map_err(|e| format!("bincode serialize error: {e}"))?;
+        let body =
+            bincode::serialize(request).map_err(|e| format!("bincode serialize error: {e}"))?;
 
         let response = client
             .post(url)
@@ -100,7 +100,10 @@ impl RaftHttpClient {
             return Err(format!("HTTP {status}: {text}"));
         }
 
-        let bytes = response.bytes().await.map_err(|e| format!("read body error: {e}"))?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| format!("read body error: {e}"))?;
         bincode::deserialize(&bytes).map_err(|e| format!("bincode deserialize error: {e}"))
     }
 }

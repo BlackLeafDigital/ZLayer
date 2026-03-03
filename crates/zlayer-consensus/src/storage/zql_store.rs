@@ -89,10 +89,7 @@ impl<C: RaftTypeConfig<NodeId = NodeId>> ZqlLogStore<C> {
         }
 
         let db = zql::Database::open(path).map_err(|e| {
-            crate::error::ConsensusError::Zql(format!(
-                "Failed to open ZQL at {:?}: {e}",
-                path
-            ))
+            crate::error::ConsensusError::Zql(format!("Failed to open ZQL at {:?}: {e}", path))
         })?;
 
         Ok(Self {
@@ -174,17 +171,15 @@ where
                     record.fields.get("entry_data"),
                 ) {
                     if let Ok(idx) = idx_str.parse::<u64>() {
-                        let in_range =
-                            idx >= start && end.is_none_or(|e| idx <= e);
+                        let in_range = idx >= start && end.is_none_or(|e| idx <= e);
                         if in_range {
-                            let entry: C::Entry =
-                                serde_json::from_str(data).map_err(|e| {
-                                    zql_to_storage_err(
-                                        openraft::ErrorSubject::Logs,
-                                        openraft::ErrorVerb::Read,
-                                        e,
-                                    )
-                                })?;
+                            let entry: C::Entry = serde_json::from_str(data).map_err(|e| {
+                                zql_to_storage_err(
+                                    openraft::ErrorSubject::Logs,
+                                    openraft::ErrorVerb::Read,
+                                    e,
+                                )
+                            })?;
                             entries.push((idx, entry));
                         }
                     }
@@ -242,11 +237,7 @@ async fn read_meta<T: serde::de::DeserializeOwned>(
             }
             if let Some(data) = records[0].fields.get("value_data") {
                 let val: T = serde_json::from_str(data).map_err(|e| {
-                    zql_to_storage_err(
-                        openraft::ErrorSubject::Store,
-                        openraft::ErrorVerb::Read,
-                        e,
-                    )
+                    zql_to_storage_err(openraft::ErrorSubject::Store, openraft::ErrorVerb::Read, e)
                 })?;
                 Ok(Some(val))
             } else {
@@ -264,11 +255,7 @@ fn write_meta<T: serde::Serialize>(
     value: &T,
 ) -> Result<(), StorageError<NodeId>> {
     let json = serde_json::to_string(value).map_err(|e| {
-        zql_to_storage_err(
-            openraft::ErrorSubject::Store,
-            openraft::ErrorVerb::Write,
-            e,
-        )
+        zql_to_storage_err(openraft::ErrorSubject::Store, openraft::ErrorVerb::Write, e)
     })?;
 
     // Upsert: delete then insert
@@ -326,9 +313,7 @@ where
                         if let Ok(idx) = idx_str.parse::<u64>() {
                             let dominated = best.as_ref().is_none_or(|(cur, _)| idx > *cur);
                             if dominated {
-                                if let Ok(entry) =
-                                    serde_json::from_str::<C::Entry>(data)
-                                {
+                                if let Ok(entry) = serde_json::from_str::<C::Entry>(data) {
                                     best = Some((idx, *entry.get_log_id()));
                                 }
                             }
@@ -401,11 +386,7 @@ where
         for entry in entries {
             let idx = entry.get_log_id().index;
             let json = serde_json::to_string(&entry).map_err(|e| {
-                zql_to_storage_err(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    e,
-                )
+                zql_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
             })?;
 
             // Upsert by index
@@ -459,11 +440,7 @@ where
 
         if !indices_to_delete.is_empty() {
             db.flush().map_err(|e| {
-                zql_to_storage_err(
-                    openraft::ErrorSubject::Logs,
-                    openraft::ErrorVerb::Write,
-                    e,
-                )
+                zql_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
             })?;
         }
 
@@ -553,10 +530,7 @@ where
     F: Fn(&mut S, &C::D) -> C::R + Send + Sync + 'static,
 {
     /// Open or create a state machine store at the given path.
-    pub fn new(
-        path: impl AsRef<Path>,
-        apply_fn: F,
-    ) -> Result<Self, crate::error::ConsensusError> {
+    pub fn new(path: impl AsRef<Path>, apply_fn: F) -> Result<Self, crate::error::ConsensusError> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
@@ -568,10 +542,7 @@ where
         }
 
         let db = zql::Database::open(path).map_err(|e| {
-            crate::error::ConsensusError::Zql(format!(
-                "Failed to open ZQL SM at {:?}: {e}",
-                path
-            ))
+            crate::error::ConsensusError::Zql(format!("Failed to open ZQL SM at {:?}: {e}", path))
         })?;
 
         let db = Arc::new(Mutex::new(db));
@@ -617,13 +588,12 @@ where
         };
 
         let state = Self::read_sm_field::<S>(&mut db, SM_STATE).unwrap_or_default();
-        let last_applied_log =
-            Self::read_sm_field::<LogId<NodeId>>(&mut db, META_LAST_APPLIED).ok().flatten();
-        let last_membership = Self::read_sm_field::<StoredMembership<NodeId, C::Node>>(
-            &mut db,
-            META_LAST_MEMBERSHIP,
-        )
-        .unwrap_or_default();
+        let last_applied_log = Self::read_sm_field::<LogId<NodeId>>(&mut db, META_LAST_APPLIED)
+            .ok()
+            .flatten();
+        let last_membership =
+            Self::read_sm_field::<StoredMembership<NodeId, C::Node>>(&mut db, META_LAST_MEMBERSHIP)
+                .unwrap_or_default();
 
         ZqlSmCache {
             last_applied_log,
@@ -648,8 +618,7 @@ where
                     return Ok(None);
                 }
                 if let Some(data) = records[0].fields.get("value_data") {
-                    let val: T =
-                        serde_json::from_str(data).map_err(|e| e.to_string())?;
+                    let val: T = serde_json::from_str(data).map_err(|e| e.to_string())?;
                     Ok(Some(val))
                 } else {
                     Ok(None)
@@ -665,8 +634,7 @@ where
         key: &str,
         value: &T,
     ) -> std::result::Result<(), String> {
-        let json =
-            serde_json::to_string(value).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string(value).map_err(|e| e.to_string())?;
 
         let _ = db.query(&format!(
             "DELETE FROM raft_sm_state WHERE key = '{}'",
@@ -758,13 +726,8 @@ where
 
     async fn applied_state(
         &mut self,
-    ) -> Result<
-        (
-            Option<LogId<NodeId>>,
-            StoredMembership<NodeId, C::Node>,
-        ),
-        StorageError<NodeId>,
-    > {
+    ) -> Result<(Option<LogId<NodeId>>, StoredMembership<NodeId, C::Node>), StorageError<NodeId>>
+    {
         let sm = self.sm.read().await;
         Ok((sm.last_applied_log, sm.last_membership.clone()))
     }
@@ -786,8 +749,7 @@ where
                     responses.push(resp);
                 }
                 EntryPayload::Membership(ref mem) => {
-                    sm.last_membership =
-                        StoredMembership::new(Some(entry.log_id), mem.clone());
+                    sm.last_membership = StoredMembership::new(Some(entry.log_id), mem.clone());
                     responses.push(C::R::default());
                 }
                 EntryPayload::Blank => {
@@ -817,15 +779,13 @@ where
             })?;
         }
 
-        Self::write_sm_field(&mut db, META_LAST_MEMBERSHIP, &sm.last_membership).map_err(
-            |e| {
-                zql_to_storage_err(
-                    openraft::ErrorSubject::StateMachine,
-                    openraft::ErrorVerb::Write,
-                    e,
-                )
-            },
-        )?;
+        Self::write_sm_field(&mut db, META_LAST_MEMBERSHIP, &sm.last_membership).map_err(|e| {
+            zql_to_storage_err(
+                openraft::ErrorSubject::StateMachine,
+                openraft::ErrorVerb::Write,
+                e,
+            )
+        })?;
 
         db.flush().map_err(|e| {
             zql_to_storage_err(
@@ -938,15 +898,13 @@ where
             })?;
         }
 
-        Self::write_sm_field(&mut db, META_LAST_MEMBERSHIP, &sm.last_membership).map_err(
-            |e| {
-                zql_to_storage_err(
-                    openraft::ErrorSubject::Snapshot(None),
-                    openraft::ErrorVerb::Write,
-                    e,
-                )
-            },
-        )?;
+        Self::write_sm_field(&mut db, META_LAST_MEMBERSHIP, &sm.last_membership).map_err(|e| {
+            zql_to_storage_err(
+                openraft::ErrorSubject::Snapshot(None),
+                openraft::ErrorVerb::Write,
+                e,
+            )
+        })?;
 
         db.flush().map_err(|e| {
             zql_to_storage_err(
@@ -964,9 +922,7 @@ where
         Ok(())
     }
 
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> Result<Option<Snapshot<C>>, StorageError<NodeId>> {
+    async fn get_current_snapshot(&mut self) -> Result<Option<Snapshot<C>>, StorageError<NodeId>> {
         let mut db = self.db.lock().await;
 
         // Read snapshot data

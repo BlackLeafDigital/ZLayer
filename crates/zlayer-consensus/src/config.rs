@@ -111,7 +111,10 @@ mod tests {
     fn default_config_validates() {
         let config = ConsensusConfig::default();
         let raft_config = config.to_openraft_config();
-        assert!(raft_config.is_ok(), "Default config should validate: {raft_config:?}");
+        assert!(
+            raft_config.is_ok(),
+            "Default config should validate: {raft_config:?}"
+        );
     }
 
     #[test]

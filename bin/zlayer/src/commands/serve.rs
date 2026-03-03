@@ -132,15 +132,25 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 
     // -----------------------------------------------------------------------
     // 1b. pkill fallback — if daemon.json was missing or unparseable, use
-    //     pkill to find any orphaned zlayer processes.  Skip our own PID.
+    //     pgrep to find any orphaned zlayer processes.  Skip our own PID
+    //     and the spawner PID (parent process that launched us, e.g.
+    //     `zlayer deploy`).
     // -----------------------------------------------------------------------
     if !pid_kill_conclusive {
         warn!("daemon.json not found or unparseable, attempting targeted kill fallback");
 
-        // Find all zlayer processes EXCEPT ourselves, then kill them.
-        // pkill -x zlayer would kill the parent `zlayer deploy` too, so we
-        // use pgrep to enumerate PIDs and selectively kill only foreign ones.
+        // Find all zlayer processes EXCEPT ourselves and our spawner, then
+        // kill them.  The spawner PID is passed via ZLAYER_SPAWNER_PID so
+        // that `zlayer deploy` (or any parent CLI command) is never
+        // accidentally killed by the daemon cleanup.
         let my_pid = std::process::id();
+        let spawner_pid: Option<u32> = std::env::var("ZLAYER_SPAWNER_PID")
+            .ok()
+            .and_then(|v| v.parse().ok());
+
+        let is_protected_pid =
+            |pid: u32| -> bool { pid == my_pid || spawner_pid.is_some_and(|sp| sp == pid) };
+
         if let Ok(output) = tokio::process::Command::new("pgrep")
             .args(["-x", "zlayer"])
             .output()
@@ -151,7 +161,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                 let mut killed_any = false;
                 for line in stdout.lines() {
                     if let Ok(pid) = line.trim().parse::<u32>() {
-                        if pid != my_pid {
+                        if !is_protected_pid(pid) {
                             info!(pid = pid, "Sending SIGTERM to stale zlayer process");
                             unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                             killed_any = true;
@@ -169,10 +179,10 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                             .await;
                         match check {
                             Ok(out) if out.status.success() => {
-                                // Check if the only remaining PIDs are us
+                                // Check if the only remaining PIDs are protected
                                 let remaining = String::from_utf8_lossy(&out.stdout);
                                 let foreign = remaining.lines().any(|l| {
-                                    l.trim().parse::<u32>().map_or(false, |p| p != my_pid)
+                                    l.trim().parse::<u32>().is_ok_and(|p| !is_protected_pid(p))
                                 });
                                 if !foreign {
                                     info!("All stale zlayer processes exited");

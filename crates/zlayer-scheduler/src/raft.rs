@@ -547,10 +547,7 @@ impl StorageAdaptor {
     /// Create a pair of (log_store, state_machine) adaptors over a single `MemStore`.
     pub fn new(store: MemStore) -> (Self, Self) {
         let s = Arc::new(RwLock::new(store));
-        (
-            Self { storage: s.clone() },
-            Self { storage: s },
-        )
+        (Self { storage: s.clone() }, Self { storage: s })
     }
 
     /// Get read access to the underlying storage.
@@ -560,7 +557,9 @@ impl StorageAdaptor {
 }
 
 impl RaftLogReader<TypeConfig> for StorageAdaptor {
-    async fn try_get_log_entries<RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend>(
+    async fn try_get_log_entries<
+        RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend,
+    >(
         &mut self,
         range: RB,
     ) -> std::result::Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
@@ -598,10 +597,8 @@ impl RaftLogStorage<TypeConfig> for StorageAdaptor {
     async fn read_vote(
         &mut self,
     ) -> std::result::Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        <MemStore as RaftLogStorage<TypeConfig>>::read_vote(
-            self.storage.write().await.deref_mut(),
-        )
-        .await
+        <MemStore as RaftLogStorage<TypeConfig>>::read_vote(self.storage.write().await.deref_mut())
+            .await
     }
 
     async fn save_committed(
@@ -677,10 +674,7 @@ impl RaftStateMachineTrait<TypeConfig> for StorageAdaptor {
     async fn applied_state(
         &mut self,
     ) -> std::result::Result<
-        (
-            Option<LogId<NodeId>>,
-            StoredMembership<NodeId, BasicNode>,
-        ),
+        (Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>),
         StorageError<NodeId>,
     > {
         <MemStore as RaftStateMachineTrait<TypeConfig>>::applied_state(

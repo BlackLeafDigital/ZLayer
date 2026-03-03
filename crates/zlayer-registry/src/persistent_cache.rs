@@ -77,8 +77,7 @@ impl PersistentBlobCache {
         validate_digest(digest)?;
 
         let mut db = self.db.lock().await;
-        let result: std::result::Result<Option<CachedBlob>, _> =
-            db.get_typed("blobs", digest);
+        let result: std::result::Result<Option<CachedBlob>, _> = db.get_typed("blobs", digest);
 
         match result {
             Ok(Some(mut cached)) => {
@@ -138,8 +137,7 @@ impl PersistentBlobCache {
         validate_digest(digest)?;
 
         let mut db = self.db.lock().await;
-        let result: std::result::Result<Option<CachedBlob>, _> =
-            db.get_typed("blobs", digest);
+        let result: std::result::Result<Option<CachedBlob>, _> = db.get_typed("blobs", digest);
 
         match result {
             Ok(Some(_)) => Ok(true),
@@ -163,8 +161,7 @@ impl PersistentBlobCache {
     /// Get current cache size in bytes
     pub async fn size(&self) -> Result<u64, CacheError> {
         let mut db = self.db.lock().await;
-        let result: std::result::Result<Vec<(String, CachedBlob)>, _> =
-            db.scan_typed("blobs", "");
+        let result: std::result::Result<Vec<(String, CachedBlob)>, _> = db.scan_typed("blobs", "");
 
         match result {
             Ok(entries) => {
@@ -178,8 +175,7 @@ impl PersistentBlobCache {
     /// Get number of blobs in the cache
     pub async fn blob_count(&self) -> Result<u64, CacheError> {
         let mut db = self.db.lock().await;
-        let result: std::result::Result<Vec<(String, CachedBlob)>, _> =
-            db.scan_typed("blobs", "");
+        let result: std::result::Result<Vec<(String, CachedBlob)>, _> = db.scan_typed("blobs", "");
 
         match result {
             Ok(entries) => Ok(entries.len() as u64),

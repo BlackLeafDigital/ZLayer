@@ -88,7 +88,7 @@ mod tests {
                 assert_eq!(url, "http://localhost:3669");
                 assert!(token.is_none());
             }
-            _ => panic!("Expected Remote mode"),
+            ConnectionMode::Embedded { .. } => panic!("Expected Remote mode"),
         }
     }
 
@@ -106,7 +106,7 @@ mod tests {
                 assert_eq!(url, "http://localhost:3669");
                 assert_eq!(token.as_deref(), Some("secret123"));
             }
-            _ => panic!("Expected Remote mode"),
+            ConnectionMode::Embedded { .. } => panic!("Expected Remote mode"),
         }
     }
 

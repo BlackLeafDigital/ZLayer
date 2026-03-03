@@ -191,6 +191,10 @@ impl DaemonClient {
             cmd.arg("--data-dir").arg(&data_dir);
         }
 
+        // Tell the child daemon our PID so cleanup_stale_daemon() never
+        // kills the parent CLI process that spawned it (e.g. `zlayer deploy`).
+        cmd.env("ZLAYER_SPAWNER_PID", std::process::id().to_string());
+
         cmd.arg("serve")
             .arg("--daemon")
             .arg("--socket")

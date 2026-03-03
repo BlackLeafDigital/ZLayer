@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 
-use zlayer_api::{
+use zlayer_api_zql::{
     build_router_with_storage, create_token, storage::InMemoryStorage, ApiConfig,
     DeploymentStorage, StoredDeployment,
 };

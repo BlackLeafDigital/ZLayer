@@ -124,8 +124,7 @@ impl PersistentLogStore {
     /// Get last purged log ID
     async fn get_last_purged(&self) -> Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
         let mut db = self.db.lock().await;
-        let result: Result<Option<LogMetadata>, _> =
-            db.get_typed("log_metadata", "last_purged");
+        let result: Result<Option<LogMetadata>, _> = db.get_typed("log_metadata", "last_purged");
 
         match result {
             Ok(Some(meta)) => Ok(meta.last_purged_log_id),
@@ -204,8 +203,7 @@ impl PersistentStateMachine {
     /// Get the current applied state
     async fn get_applied_state(&self) -> Result<AppliedState, StorageError<NodeId>> {
         let mut db = self.db.lock().await;
-        let result: Result<Option<AppliedState>, _> =
-            db.get_typed("sm_applied_state", "current");
+        let result: Result<Option<AppliedState>, _> = db.get_typed("sm_applied_state", "current");
 
         match result {
             Ok(Some(state)) => Ok(state),
@@ -436,9 +434,7 @@ impl RaftSnapshotBuilder<TypeConfig> for PersistentRaftStorage {
             size: data.len() as u64,
         };
 
-        let snapshot_data = SnapshotDataRecord {
-            data: data.clone(),
-        };
+        let snapshot_data = SnapshotDataRecord { data: data.clone() };
 
         // Save snapshot atomically
         let mut db = self.db.lock().await;
@@ -708,10 +704,7 @@ impl RaftStateMachine<TypeConfig> for PersistentRaftStorage {
         Ok((applied.last_applied_log, applied.last_membership))
     }
 
-    async fn apply<I>(
-        &mut self,
-        entries: I,
-    ) -> Result<Vec<Response>, StorageError<NodeId>>
+    async fn apply<I>(&mut self, entries: I) -> Result<Vec<Response>, StorageError<NodeId>>
     where
         I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
         I::IntoIter: OptionalSend,

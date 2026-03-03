@@ -19,8 +19,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tempfile::TempDir;
-use zlayer_agent::runtimes::{WasmConfig, WasmRuntime};
-use zlayer_agent::{ContainerId, ContainerState, Runtime};
+use zlayer_agent_zql::runtimes::{WasmConfig, WasmRuntime};
+use zlayer_agent_zql::{ContainerId, ContainerState, Runtime};
 use zlayer_spec::{
     CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NetworkSpec, NodeMode,
     PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceSpec,
