@@ -1,51 +1,35 @@
 //! OpenRaft distributed coordination for ZLayer scheduler
 //!
 //! Provides consensus-based service state management across nodes.
+//! Uses `zlayer-consensus` for storage, network, and Raft RPC plumbing.
 
-use std::collections::{BTreeMap, HashMap};
-use std::future::Future;
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
+use std::time::Duration;
 
-use openraft::error::{
-    Fatal, InstallSnapshotError, RPCError, RaftError, ReplicationClosed, StreamingError,
-    Unreachable,
-};
-use openraft::network::{RPCOption, RaftNetwork, RaftNetworkFactory};
-use openraft::raft::{
-    AppendEntriesRequest, AppendEntriesResponse, InstallSnapshotRequest, InstallSnapshotResponse,
-    SnapshotResponse, VoteRequest, VoteResponse,
-};
-use openraft::storage::{LogFlushed, RaftLogStorage, RaftStateMachine as RaftStateMachineTrait};
-use openraft::{
-    BasicNode, Config, Entry, LogId, OptionalSend, Raft, RaftLogReader, RaftTypeConfig, Snapshot,
-    SnapshotMeta, StorageError, StoredMembership, Vote,
-};
+use openraft::{BasicNode, Raft};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{debug, info};
+use tracing::info;
+use utoipa::ToSchema;
+use zlayer_consensus::network::http_client::HttpNetwork;
+use zlayer_consensus::storage::mem_store::{MemLogStore, MemStateMachine, SmData};
+use zlayer_consensus::{ConsensusConfig, ConsensusNode, ConsensusNodeBuilder};
 
 use crate::error::{Result, SchedulerError};
-use crate::raft_network::RaftHttpClient;
-use crate::raft_storage::MemStore;
 
 /// Node ID type (u64 for simplicity)
 pub type NodeId = u64;
 
-/// OpenRaft type configuration for ZLayer
-#[derive(Debug, Clone, Copy, Default, Eq, PartialEq, Ord, PartialOrd)]
-pub struct TypeConfig;
-
-impl RaftTypeConfig for TypeConfig {
-    type D = Request;
-    type R = Response;
-    type NodeId = NodeId;
-    type Node = BasicNode;
-    type Entry = Entry<TypeConfig>;
-    type SnapshotData = Cursor<Vec<u8>>;
-    type Responder = openraft::impls::OneshotResponder<TypeConfig>;
-    type AsyncRuntime = openraft::TokioRuntime;
-}
+// OpenRaft type configuration for ZLayer scheduler.
+// Uses `declare_raft_types!` which automatically provides v2-compatible
+// Entry, SnapshotData, Responder, and AsyncRuntime.
+openraft::declare_raft_types!(
+    pub TypeConfig:
+        D = Request,
+        R = Response,
+);
 
 /// Raft request types (state machine commands)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,7 +61,25 @@ pub enum Request {
         advertise_addr: String,
         #[serde(default)]
         api_port: u16,
+        #[serde(default)]
+        cpu_total: f64,
+        #[serde(default)]
+        memory_total: u64,
+        #[serde(default)]
+        disk_total: u64,
+        #[serde(default)]
+        gpus: Vec<GpuInfoSummary>,
     },
+    /// Update node heartbeat with current resource usage
+    UpdateNodeHeartbeat {
+        node_id: NodeId,
+        timestamp: u64,
+        cpu_used: f64,
+        memory_used: u64,
+        disk_used: u64,
+    },
+    /// Update node status (ready/draining/dead)
+    UpdateNodeStatus { node_id: NodeId, status: String },
     /// Deregister a node
     DeregisterNode { node_id: NodeId },
     /// Update service assignment to nodes
@@ -94,6 +96,12 @@ pub enum Response {
     Success { data: Option<String> },
     /// Error response
     Error { message: String },
+}
+
+impl Default for Response {
+    fn default() -> Self {
+        Response::Success { data: None }
+    }
 }
 
 /// Service state tracked in Raft
@@ -135,13 +143,14 @@ pub struct ScaleEvent {
     pub timestamp: u64,
 }
 
-/// Cluster state (the state machine)
+/// Cluster state (the Raft state machine application state).
+///
+/// This is the `S` generic parameter to `MemStateMachine<TypeConfig, S, F>`.
+/// It only contains application-level fields -- the Raft bookkeeping
+/// (`last_applied_log`, `last_membership`) is managed by `SmData` inside the
+/// consensus crate.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClusterState {
-    /// Last applied log index
-    pub last_applied_log: Option<LogId<NodeId>>,
-    /// Last membership config
-    pub last_membership: StoredMembership<NodeId, BasicNode>,
     /// Service states
     pub services: HashMap<String, ServiceState>,
     /// Node registry
@@ -175,10 +184,35 @@ pub struct NodeInfo {
     /// API server port
     #[serde(default)]
     pub api_port: u16,
+    /// Total CPU cores on this node
+    #[serde(default)]
+    pub cpu_total: f64,
+    /// Total memory in bytes
+    #[serde(default)]
+    pub memory_total: u64,
+    /// Total disk in bytes
+    #[serde(default)]
+    pub disk_total: u64,
+    /// Current CPU usage (cores)
+    #[serde(default)]
+    pub cpu_used: f64,
+    /// Current memory usage in bytes
+    #[serde(default)]
+    pub memory_used: u64,
+    /// Current disk usage in bytes
+    #[serde(default)]
+    pub disk_used: u64,
+    /// Node status: "ready", "draining", or "dead"
+    #[serde(default = "default_node_status")]
+    pub status: String,
+}
+
+fn default_node_status() -> String {
+    "ready".to_string()
 }
 
 /// Summary of a GPU on a node, stored in Raft cluster state
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct GpuInfoSummary {
     /// Vendor: "nvidia", "amd", "intel", or "unknown"
     pub vendor: String,
@@ -208,6 +242,14 @@ pub struct AddMemberParams {
     pub advertise_addr: String,
     /// API server port
     pub api_port: u16,
+    /// Total CPU cores on this node
+    pub cpu_total: f64,
+    /// Total memory in bytes
+    pub memory_total: u64,
+    /// Total disk in bytes
+    pub disk_total: u64,
+    /// Detected GPUs on this node
+    pub gpus: Vec<GpuInfoSummary>,
 }
 
 impl ClusterState {
@@ -263,6 +305,10 @@ impl ClusterState {
                 overlay_port,
                 advertise_addr,
                 api_port,
+                cpu_total,
+                memory_total,
+                disk_total,
+                gpus,
             } => {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -276,15 +322,43 @@ impl ClusterState {
                         address: address.clone(),
                         registered_at: now,
                         last_heartbeat: now,
-                        gpus: Vec::new(),
+                        gpus: gpus.clone(),
                         wg_public_key: wg_public_key.clone(),
                         overlay_ip: overlay_ip.clone(),
                         overlay_port: *overlay_port,
                         advertise_addr: advertise_addr.clone(),
                         api_port: *api_port,
+                        cpu_total: *cpu_total,
+                        memory_total: *memory_total,
+                        disk_total: *disk_total,
+                        cpu_used: 0.0,
+                        memory_used: 0,
+                        disk_used: 0,
+                        status: "ready".to_string(),
                     },
                 );
 
+                Response::Success { data: None }
+            }
+            Request::UpdateNodeHeartbeat {
+                node_id,
+                timestamp,
+                cpu_used,
+                memory_used,
+                disk_used,
+            } => {
+                if let Some(node) = self.nodes.get_mut(node_id) {
+                    node.last_heartbeat = *timestamp;
+                    node.cpu_used = *cpu_used;
+                    node.memory_used = *memory_used;
+                    node.disk_used = *disk_used;
+                }
+                Response::Success { data: None }
+            }
+            Request::UpdateNodeStatus { node_id, status } => {
+                if let Some(node) = self.nodes.get_mut(node_id) {
+                    node.status = status.clone();
+                }
                 Response::Success { data: None }
             }
             Request::DeregisterNode { node_id } => {
@@ -338,6 +412,10 @@ impl ClusterState {
 /// Type alias for the configured Raft instance
 pub type ZLayerRaft = Raft<TypeConfig>;
 
+/// The state machine type, parameterized with our ClusterState and apply fn
+pub type SchedulerStateMachine =
+    MemStateMachine<TypeConfig, ClusterState, fn(&mut ClusterState, &Request) -> Response>;
+
 // =============================================================================
 // Raft Configuration
 // =============================================================================
@@ -373,429 +451,63 @@ impl Default for RaftConfig {
 }
 
 // =============================================================================
-// Network Layer
-// =============================================================================
-
-/// Network implementation for Raft RPCs
-///
-/// Uses HTTP-based RPC client to communicate between nodes.
-pub struct ZLayerNetwork {
-    /// Known peer addresses
-    peers: Arc<RwLock<HashMap<NodeId, String>>>,
-    /// Shared HTTP client for making RPC calls
-    client: Arc<RaftHttpClient>,
-}
-
-impl ZLayerNetwork {
-    /// Create a new network layer with default timeout (5 seconds)
-    pub fn new() -> Self {
-        Self::with_timeout(5000)
-    }
-
-    /// Create a new network layer with specified timeout in milliseconds
-    pub fn with_timeout(timeout_ms: u64) -> Self {
-        Self {
-            peers: Arc::new(RwLock::new(HashMap::new())),
-            client: Arc::new(RaftHttpClient::new(timeout_ms)),
-        }
-    }
-
-    /// Add a peer
-    pub async fn add_peer(&self, node_id: NodeId, address: String) {
-        let mut peers = self.peers.write().await;
-        peers.insert(node_id, address);
-    }
-
-    /// Remove a peer
-    pub async fn remove_peer(&self, node_id: NodeId) {
-        let mut peers = self.peers.write().await;
-        peers.remove(&node_id);
-    }
-
-    /// Get all known peers
-    pub async fn peers(&self) -> HashMap<NodeId, String> {
-        self.peers.read().await.clone()
-    }
-}
-
-impl Default for ZLayerNetwork {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Clone for ZLayerNetwork {
-    fn clone(&self) -> Self {
-        Self {
-            peers: Arc::clone(&self.peers),
-            client: Arc::clone(&self.client),
-        }
-    }
-}
-
-// OpenRaft network factory trait implementation
-impl RaftNetworkFactory<TypeConfig> for ZLayerNetwork {
-    type Network = ZLayerNetworkConnection;
-
-    async fn new_client(&mut self, _target: NodeId, node: &BasicNode) -> Self::Network {
-        ZLayerNetworkConnection {
-            target_addr: node.addr.clone(),
-            client: Arc::clone(&self.client),
-        }
-    }
-}
-
-/// A connection to a single Raft peer
-pub struct ZLayerNetworkConnection {
-    target_addr: String,
-    client: Arc<RaftHttpClient>,
-}
-
-impl RaftNetwork<TypeConfig> for ZLayerNetworkConnection {
-    async fn append_entries(
-        &mut self,
-        rpc: AppendEntriesRequest<TypeConfig>,
-        _option: RPCOption,
-    ) -> std::result::Result<
-        AppendEntriesResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId>>,
-    > {
-        debug!(target = %self.target_addr, "Sending append_entries RPC");
-        self.client
-            .append_entries(&self.target_addr, rpc)
-            .await
-            .map_err(|e| {
-                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
-            })
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        rpc: InstallSnapshotRequest<TypeConfig>,
-        _option: RPCOption,
-    ) -> std::result::Result<
-        InstallSnapshotResponse<NodeId>,
-        RPCError<NodeId, BasicNode, RaftError<NodeId, InstallSnapshotError>>,
-    > {
-        debug!(target = %self.target_addr, "Sending install_snapshot RPC");
-        self.client
-            .install_snapshot(&self.target_addr, rpc)
-            .await
-            .map_err(|e| {
-                RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
-            })
-    }
-
-    async fn vote(
-        &mut self,
-        rpc: VoteRequest<NodeId>,
-        _option: RPCOption,
-    ) -> std::result::Result<VoteResponse<NodeId>, RPCError<NodeId, BasicNode, RaftError<NodeId>>>
-    {
-        debug!(target = %self.target_addr, "Sending vote RPC");
-        self.client.vote(&self.target_addr, rpc).await.map_err(|e| {
-            RPCError::Unreachable(Unreachable::new(&std::io::Error::other(e.to_string())))
-        })
-    }
-
-    async fn full_snapshot(
-        &mut self,
-        vote: Vote<NodeId>,
-        snapshot: Snapshot<TypeConfig>,
-        _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
-        _option: RPCOption,
-    ) -> std::result::Result<SnapshotResponse<NodeId>, StreamingError<TypeConfig, Fatal<NodeId>>>
-    {
-        debug!(target = %self.target_addr, "Sending full_snapshot RPC");
-
-        // Read snapshot data into a buffer
-        let mut snapshot_data = Vec::new();
-        let mut snapshot_reader = snapshot.snapshot;
-        std::io::Read::read_to_end(&mut snapshot_reader, &mut snapshot_data).map_err(|e| {
-            StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(format!(
-                "Failed to read snapshot: {}",
-                e
-            ))))
-        })?;
-
-        self.client
-            .full_snapshot(&self.target_addr, vote, snapshot_data)
-            .await
-            .map_err(|e| StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(e))))
-    }
-}
-
-// =============================================================================
-// Raft Coordinator
-// =============================================================================
-
-// =============================================================================
-// Storage Adaptor (wraps MemStore behind Arc<RwLock> for shared access)
-// =============================================================================
-
-/// Adaptor that wraps `MemStore` behind an `Arc<RwLock>` and delegates to its
-/// `RaftLogStorage` and `RaftStateMachine` implementations.
-///
-/// Both `StorageAdaptor` instances (log store and state machine) share the same
-/// underlying `MemStore`.
-#[derive(Debug, Clone)]
-pub struct StorageAdaptor {
-    storage: Arc<RwLock<MemStore>>,
-}
-
-impl StorageAdaptor {
-    /// Create a pair of (log_store, state_machine) adaptors over a single `MemStore`.
-    pub fn new(store: MemStore) -> (Self, Self) {
-        let s = Arc::new(RwLock::new(store));
-        (Self { storage: s.clone() }, Self { storage: s })
-    }
-
-    /// Get read access to the underlying storage.
-    pub async fn storage(&self) -> tokio::sync::RwLockReadGuard<'_, MemStore> {
-        self.storage.read().await
-    }
-}
-
-impl RaftLogReader<TypeConfig> for StorageAdaptor {
-    async fn try_get_log_entries<
-        RB: std::ops::RangeBounds<u64> + Clone + std::fmt::Debug + OptionalSend,
-    >(
-        &mut self,
-        range: RB,
-    ) -> std::result::Result<Vec<Entry<TypeConfig>>, StorageError<NodeId>> {
-        <MemStore as RaftLogReader<TypeConfig>>::try_get_log_entries(
-            self.storage.write().await.deref_mut(),
-            range,
-        )
-        .await
-    }
-}
-
-impl RaftLogStorage<TypeConfig> for StorageAdaptor {
-    type LogReader = <MemStore as RaftLogStorage<TypeConfig>>::LogReader;
-
-    async fn get_log_state(
-        &mut self,
-    ) -> std::result::Result<openraft::storage::LogState<TypeConfig>, StorageError<NodeId>> {
-        <MemStore as RaftLogStorage<TypeConfig>>::get_log_state(
-            self.storage.write().await.deref_mut(),
-        )
-        .await
-    }
-
-    async fn save_vote(
-        &mut self,
-        vote: &Vote<NodeId>,
-    ) -> std::result::Result<(), StorageError<NodeId>> {
-        <MemStore as RaftLogStorage<TypeConfig>>::save_vote(
-            self.storage.write().await.deref_mut(),
-            vote,
-        )
-        .await
-    }
-
-    async fn read_vote(
-        &mut self,
-    ) -> std::result::Result<Option<Vote<NodeId>>, StorageError<NodeId>> {
-        <MemStore as RaftLogStorage<TypeConfig>>::read_vote(self.storage.write().await.deref_mut())
-            .await
-    }
-
-    async fn save_committed(
-        &mut self,
-        committed: Option<LogId<NodeId>>,
-    ) -> std::result::Result<(), StorageError<NodeId>> {
-        <MemStore as RaftLogStorage<TypeConfig>>::save_committed(
-            self.storage.write().await.deref_mut(),
-            committed,
-        )
-        .await
-    }
-
-    async fn read_committed(
-        &mut self,
-    ) -> std::result::Result<Option<LogId<NodeId>>, StorageError<NodeId>> {
-        <MemStore as RaftLogStorage<TypeConfig>>::read_committed(
-            self.storage.write().await.deref_mut(),
-        )
-        .await
-    }
-
-    async fn get_log_reader(&mut self) -> Self::LogReader {
-        <MemStore as RaftLogStorage<TypeConfig>>::get_log_reader(
-            self.storage.write().await.deref_mut(),
-        )
-        .await
-    }
-
-    async fn append<I>(
-        &mut self,
-        entries: I,
-        callback: LogFlushed<TypeConfig>,
-    ) -> std::result::Result<(), StorageError<NodeId>>
-    where
-        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
-        I::IntoIter: OptionalSend,
-    {
-        <MemStore as RaftLogStorage<TypeConfig>>::append(
-            self.storage.write().await.deref_mut(),
-            entries,
-            callback,
-        )
-        .await
-    }
-
-    async fn truncate(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> std::result::Result<(), StorageError<NodeId>> {
-        <MemStore as RaftLogStorage<TypeConfig>>::truncate(
-            self.storage.write().await.deref_mut(),
-            log_id,
-        )
-        .await
-    }
-
-    async fn purge(
-        &mut self,
-        log_id: LogId<NodeId>,
-    ) -> std::result::Result<(), StorageError<NodeId>> {
-        <MemStore as RaftLogStorage<TypeConfig>>::purge(
-            self.storage.write().await.deref_mut(),
-            log_id,
-        )
-        .await
-    }
-}
-
-impl RaftStateMachineTrait<TypeConfig> for StorageAdaptor {
-    type SnapshotBuilder = <MemStore as RaftStateMachineTrait<TypeConfig>>::SnapshotBuilder;
-
-    async fn applied_state(
-        &mut self,
-    ) -> std::result::Result<
-        (Option<LogId<NodeId>>, StoredMembership<NodeId, BasicNode>),
-        StorageError<NodeId>,
-    > {
-        <MemStore as RaftStateMachineTrait<TypeConfig>>::applied_state(
-            self.storage.write().await.deref_mut(),
-        )
-        .await
-    }
-
-    async fn apply<I>(
-        &mut self,
-        entries: I,
-    ) -> std::result::Result<Vec<Response>, StorageError<NodeId>>
-    where
-        I: IntoIterator<Item = Entry<TypeConfig>> + OptionalSend,
-        I::IntoIter: OptionalSend,
-    {
-        <MemStore as RaftStateMachineTrait<TypeConfig>>::apply(
-            self.storage.write().await.deref_mut(),
-            entries,
-        )
-        .await
-    }
-
-    async fn get_snapshot_builder(&mut self) -> Self::SnapshotBuilder {
-        <MemStore as RaftStateMachineTrait<TypeConfig>>::get_snapshot_builder(
-            self.storage.write().await.deref_mut(),
-        )
-        .await
-    }
-
-    async fn begin_receiving_snapshot(
-        &mut self,
-    ) -> std::result::Result<Box<std::io::Cursor<Vec<u8>>>, StorageError<NodeId>> {
-        <MemStore as RaftStateMachineTrait<TypeConfig>>::begin_receiving_snapshot(
-            self.storage.write().await.deref_mut(),
-        )
-        .await
-    }
-
-    async fn install_snapshot(
-        &mut self,
-        meta: &SnapshotMeta<NodeId, BasicNode>,
-        snapshot: Box<std::io::Cursor<Vec<u8>>>,
-    ) -> std::result::Result<(), StorageError<NodeId>> {
-        <MemStore as RaftStateMachineTrait<TypeConfig>>::install_snapshot(
-            self.storage.write().await.deref_mut(),
-            meta,
-            snapshot,
-        )
-        .await
-    }
-
-    async fn get_current_snapshot(
-        &mut self,
-    ) -> std::result::Result<Option<Snapshot<TypeConfig>>, StorageError<NodeId>> {
-        <MemStore as RaftStateMachineTrait<TypeConfig>>::get_current_snapshot(
-            self.storage.write().await.deref_mut(),
-        )
-        .await
-    }
-}
-
-use std::ops::DerefMut;
-
-// =============================================================================
 // Raft Coordinator
 // =============================================================================
 
 /// High-level coordinator for Raft consensus
 ///
-/// Wraps the OpenRaft instance and provides a simpler API for:
+/// Wraps `zlayer_consensus::ConsensusNode` and provides a simpler API for:
 /// - Bootstrapping a new cluster
 /// - Joining an existing cluster
 /// - Proposing state changes
 /// - Reading cluster state
 pub struct RaftCoordinator {
-    /// OpenRaft instance
-    raft: ZLayerRaft,
-    /// Log store (adaptor over MemStore)
-    log_store: StorageAdaptor,
-    /// Configuration
+    /// ConsensusNode from zlayer-consensus
+    node: ConsensusNode<TypeConfig>,
+    /// Shared state machine data (for reading cluster state)
+    sm_data: Arc<RwLock<SmData<TypeConfig, ClusterState>>>,
+    /// Configuration (retained for callers that need `raft_port`, etc.)
+    #[allow(dead_code)]
     config: RaftConfig,
 }
 
 impl RaftCoordinator {
     /// Create a new Raft coordinator
     pub async fn new(config: RaftConfig) -> Result<Self> {
-        let raft_config = Config {
+        let consensus_config = ConsensusConfig {
             cluster_name: "zlayer".to_string(),
-            heartbeat_interval: config.heartbeat_interval_ms,
-            election_timeout_min: config.election_timeout_ms.0,
-            election_timeout_max: config.election_timeout_ms.1,
-            ..Default::default()
+            heartbeat_interval_ms: config.heartbeat_interval_ms,
+            election_timeout_min_ms: config.election_timeout_ms.0,
+            election_timeout_max_ms: config.election_timeout_ms.1,
+            rpc_timeout: Duration::from_millis(config.rpc_timeout_ms),
+            ..ConsensusConfig::default()
         };
 
-        let raft_config =
-            Arc::new(raft_config.validate().map_err(|e| {
-                SchedulerError::InvalidConfig(format!("Invalid Raft config: {}", e))
-            })?);
+        // Create storage using zlayer-consensus's MemLogStore + MemStateMachine
+        let log_store = MemLogStore::<TypeConfig>::new();
+        let state_machine = MemStateMachine::<TypeConfig, ClusterState, _>::new(
+            ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
+        );
+        let sm_data = state_machine.data();
 
-        let storage = MemStore::new();
-        let network = ZLayerNetwork::with_timeout(config.rpc_timeout_ms);
+        // Create network using zlayer-consensus's HttpNetwork
+        let network = HttpNetwork::<TypeConfig>::with_timeouts(
+            Duration::from_millis(config.rpc_timeout_ms),
+            Duration::from_secs(60),
+        );
 
-        // Create adaptors for log storage and state machine from the combined storage
-        let (log_store, state_machine) = StorageAdaptor::new(storage);
-
-        let raft = Raft::new(
-            config.node_id,
-            raft_config,
-            network,
-            log_store.clone(),
-            state_machine,
-        )
-        .await
-        .map_err(|e| SchedulerError::Raft(e.to_string()))?;
+        // Build the consensus node
+        let node = ConsensusNodeBuilder::new(config.node_id, config.address.clone())
+            .with_config(consensus_config)
+            .build_with(log_store, state_machine, network)
+            .await
+            .map_err(|e| SchedulerError::Raft(e.to_string()))?;
 
         info!(node_id = config.node_id, "Created Raft coordinator");
 
         Ok(Self {
-            raft,
-            log_store,
+            node,
+            sm_data,
             config,
         })
     }
@@ -804,54 +516,34 @@ impl RaftCoordinator {
     ///
     /// This should only be called once when creating a new cluster.
     pub async fn bootstrap(&self) -> Result<()> {
-        let mut members = BTreeMap::new();
-        members.insert(
-            self.config.node_id,
-            BasicNode {
-                addr: self.config.address.clone(),
-            },
-        );
-
-        self.raft
-            .initialize(members)
+        self.node
+            .bootstrap()
             .await
             .map_err(|e| SchedulerError::Raft(format!("Bootstrap failed: {}", e)))?;
-
-        info!(
-            node_id = self.config.node_id,
-            "Bootstrapped single-node cluster"
-        );
         Ok(())
     }
 
     /// Check if this node is the current leader
     pub fn is_leader(&self) -> bool {
-        let metrics = self.raft.metrics().borrow().clone();
-        metrics.current_leader == Some(self.config.node_id)
+        self.node.is_leader()
     }
 
     /// Get the current leader's node ID
     pub fn leader_id(&self) -> Option<NodeId> {
-        self.raft.metrics().borrow().current_leader
+        self.node.leader_id()
     }
 
     /// Propose a state change (must be leader)
     pub async fn propose(&self, request: Request) -> Result<Response> {
-        let result = self
-            .raft
-            .client_write(request)
+        self.node
+            .propose(request)
             .await
-            .map_err(|e| SchedulerError::Raft(format!("Failed to propose: {}", e)))?;
-
-        Ok(result.data)
+            .map_err(|e| SchedulerError::Raft(format!("Failed to propose: {}", e)))
     }
 
     /// Read current cluster state
     pub async fn read_state(&self) -> ClusterState {
-        // Access the underlying storage through the adaptor
-        let storage = self.log_store.storage().await;
-        let sm = storage.state_machine();
-        let sm = sm.read().await;
+        let sm = self.sm_data.read().await;
         sm.state.clone()
     }
 
@@ -897,7 +589,7 @@ impl RaftCoordinator {
 
     /// Get Raft metrics
     pub fn metrics(&self) -> openraft::RaftMetrics<NodeId, BasicNode> {
-        self.raft.metrics().borrow().clone()
+        self.node.metrics()
     }
 
     /// Add a new member (voter) to the Raft cluster.
@@ -905,63 +597,16 @@ impl RaftCoordinator {
     /// The caller must be the current leader. This first adds the node as a
     /// **learner** (non-voting) so it can catch up on the log, then promotes
     /// it to a voting member via a membership change.
-    ///
-    /// # Arguments
-    /// * `node_id` - The Raft node ID for the new member.
-    /// * `addr` - The Raft RPC address (e.g., `"10.0.0.2:9000"`).
     pub async fn add_member(&self, params: AddMemberParams) -> Result<()> {
-        use std::collections::BTreeSet;
-
-        let node = BasicNode {
-            addr: params.addr.clone(),
-        };
-
-        // Step 1: Add as learner (blocking = true waits for log sync)
-        self.raft
-            .add_learner(params.node_id, node, true)
+        // Use ConsensusNode's add_voter (learner + promote in one call)
+        self.node
+            .add_voter(params.node_id, params.addr.clone())
             .await
             .map_err(|e| {
-                SchedulerError::Raft(format!("Failed to add learner {}: {}", params.node_id, e))
+                SchedulerError::Raft(format!("Failed to add member {}: {}", params.node_id, e))
             })?;
 
-        info!(
-            node_id = params.node_id,
-            addr = %params.addr,
-            "Added node as learner"
-        );
-
-        // Step 2: Promote to voter by including it in the membership set.
-        // We need to include ALL existing voters plus the new one.
-        let metrics = self.raft.metrics().borrow().clone();
-        let mut voter_ids: BTreeSet<u64> = BTreeSet::new();
-
-        // Collect existing voters from the current membership
-        if let Some(membership) = &metrics
-            .membership_config
-            .membership()
-            .get_joint_config()
-            .last()
-        {
-            for id in membership.iter() {
-                voter_ids.insert(*id);
-            }
-        }
-        // Also add the leader (ourselves)
-        voter_ids.insert(self.config.node_id);
-        // Add the new node
-        voter_ids.insert(params.node_id);
-
-        self.raft
-            .change_membership(voter_ids, false)
-            .await
-            .map_err(|e| {
-                SchedulerError::Raft(format!(
-                    "Failed to promote member {}: {}",
-                    params.node_id, e
-                ))
-            })?;
-
-        // Step 3: Register the node in the state machine so cluster state knows about it
+        // Register the node in the state machine so cluster state knows about it
         self.propose(Request::RegisterNode {
             node_id: params.node_id,
             address: params.addr.clone(),
@@ -970,6 +615,10 @@ impl RaftCoordinator {
             overlay_port: params.overlay_port,
             advertise_addr: params.advertise_addr,
             api_port: params.api_port,
+            cpu_total: params.cpu_total,
+            memory_total: params.memory_total,
+            disk_total: params.disk_total,
+            gpus: params.gpus,
         })
         .await?;
 
@@ -982,21 +631,32 @@ impl RaftCoordinator {
         Ok(())
     }
 
+    /// Get this node's Raft node ID.
+    pub fn node_id(&self) -> NodeId {
+        self.config.node_id
+    }
+
     /// Shutdown the Raft node
     pub async fn shutdown(&self) -> Result<()> {
-        self.raft
+        self.node
             .shutdown()
             .await
             .map_err(|e| SchedulerError::Raft(format!("Shutdown failed: {}", e)))?;
-        info!("Raft coordinator shut down");
         Ok(())
     }
 
-    /// Get a reference to the underlying Raft instance
+    /// Get a reference to the underlying Raft instance.
     ///
-    /// This is used by network handlers to forward RPCs to the Raft node.
+    /// This is used by the Raft RPC service to forward RPCs to the Raft node.
     pub fn raft_handle(&self) -> &ZLayerRaft {
-        &self.raft
+        self.node.raft()
+    }
+
+    /// Get a clone of the underlying Raft instance (cheap, Arc-based).
+    ///
+    /// Used to construct the `raft_service_router()` from `zlayer-consensus`.
+    pub fn raft_clone(&self) -> ZLayerRaft {
+        self.node.raft_clone()
     }
 }
 
@@ -1072,9 +732,16 @@ mod tests {
             overlay_port: 0,
             advertise_addr: String::new(),
             api_port: 0,
+            cpu_total: 8.0,
+            memory_total: 16_000_000_000,
+            disk_total: 500_000_000_000,
+            gpus: vec![],
         });
 
         let node = state.get_node(1).unwrap();
         assert_eq!(node.address, "192.168.1.1:8000");
+        assert_eq!(node.cpu_total, 8.0);
+        assert_eq!(node.memory_total, 16_000_000_000);
+        assert_eq!(node.status, "ready");
     }
 }

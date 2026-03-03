@@ -54,6 +54,7 @@ scheduler.register_service(
         },
     },
     2, // initial replicas
+    None, // optional ServiceSpec for placement
 ).await?;
 ```
 

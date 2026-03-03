@@ -51,6 +51,7 @@
 //! |------|---------|-------------|
 //! | `mem-store` | yes | In-memory BTreeMap-based storage (testing/dev) |
 //! | `zql-store` | no | Crash-safe persistent storage via ZQL |
+//! | `redb-store` | no | Crash-safe persistent storage via redb |
 
 pub mod config;
 pub mod error;

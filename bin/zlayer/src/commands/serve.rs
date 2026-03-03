@@ -401,6 +401,10 @@ pub(crate) async fn serve(
         node_config,
         raft: _raft,
         raft_server_handle,
+        heartbeat_handle,
+        dead_node_detection_handle,
+        scheduler: _scheduler,
+        internal_token: daemon_internal_token,
     } = state;
 
     // -----------------------------------------------------------------------
@@ -463,8 +467,9 @@ pub(crate) async fn serve(
         dns_handle.clone(),
     );
 
-    // Generate an internal token for scheduler-to-agent communication
-    let internal_token = generate_internal_token();
+    // Use the internal token generated during daemon init so the scheduler
+    // (which already has a copy) and the API InternalState share the same secret.
+    let internal_token = daemon_internal_token;
 
     // Build the core router using the orchestration-wired deployment state.
     // This ensures create_deployment actually orchestrates containers.
@@ -610,6 +615,17 @@ pub(crate) async fn serve(
     // -----------------------------------------------------------------------
     info!("API server stopped, shutting down daemon infrastructure");
 
+    // Stop heartbeat / dead-node detection background tasks
+    if let Some(handle) = heartbeat_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = dead_node_detection_handle {
+        handle.abort();
+        let _ = handle.await;
+    }
+    info!("Heartbeat / dead-node detection stopped");
+
     // Stop Raft RPC server
     if let Some(handle) = raft_server_handle {
         handle.abort();
@@ -674,15 +690,4 @@ pub(crate) async fn serve(
 
     info!("Daemon shutdown complete");
     Ok(())
-}
-
-/// Generate a random internal token for scheduler-to-agent communication.
-fn generate_internal_token() -> String {
-    use std::fmt::Write;
-    let mut buf = String::with_capacity(64);
-    for _ in 0..32 {
-        let byte: u8 = rand::random();
-        let _ = write!(buf, "{:02x}", byte);
-    }
-    buf
 }

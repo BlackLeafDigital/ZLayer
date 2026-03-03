@@ -48,6 +48,11 @@ pub enum ConsensusError {
     #[cfg(feature = "zql-store")]
     #[error("zql error: {0}")]
     Zql(String),
+
+    /// Redb storage error.
+    #[cfg(feature = "redb-store")]
+    #[error("redb error: {0}")]
+    Redb(String),
 }
 
 /// Result alias for consensus operations.

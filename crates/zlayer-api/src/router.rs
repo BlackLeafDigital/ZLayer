@@ -798,6 +798,7 @@ pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
     Router::new()
         .route("/join", post(handlers::cluster::cluster_join))
         .route("/nodes", get(handlers::cluster::cluster_list_nodes))
+        .route("/heartbeat", post(handlers::cluster::cluster_heartbeat))
         .with_state(cluster_state)
 }
 

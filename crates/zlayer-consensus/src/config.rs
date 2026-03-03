@@ -85,6 +85,7 @@ impl ConsensusConfig {
     ///
     /// Returns an error if the resulting openraft config fails validation
     /// (e.g., election_timeout_min > election_timeout_max).
+    #[allow(clippy::result_large_err)]
     pub fn to_openraft_config(&self) -> Result<openraft::Config, openraft::ConfigError> {
         let config = openraft::Config {
             cluster_name: self.cluster_name.clone(),

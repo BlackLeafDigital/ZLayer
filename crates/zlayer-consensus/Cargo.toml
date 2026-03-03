@@ -38,6 +38,7 @@ hex = { workspace = true }
 
 # Persistent storage (optional)
 zql = { workspace = true, optional = true }
+redb = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
@@ -47,3 +48,4 @@ tempfile = "3"
 default = ["mem-store"]
 mem-store = []
 zql-store = ["dep:zql", "dep:serde_json"]
+redb-store = ["dep:redb"]

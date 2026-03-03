@@ -22,7 +22,9 @@ use zlayer_agent::{
 use zlayer_api::{DeploymentStatus, DeploymentStorage, StoredDeployment, ZqlStorage};
 use zlayer_overlay::{DnsHandle, DnsServer, OverlayTransport};
 use zlayer_proxy::{ServiceRegistry, StreamRegistry};
-use zlayer_scheduler::{RaftConfig, RaftCoordinator, RaftService, Request};
+use zlayer_scheduler::{
+    RaftConfig, RaftCoordinator, RaftService, Request, Scheduler, SchedulerConfig,
+};
 use zlayer_secrets::{CredentialStore, KeyManager, PersistentSecretsStore};
 
 use crate::commands::node::{
@@ -139,6 +141,20 @@ pub struct DaemonState {
 
     /// Background task running the Raft RPC server.
     pub raft_server_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Background task for worker heartbeat (non-leader nodes).
+    pub heartbeat_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Background task for dead-node detection (leader nodes).
+    pub dead_node_detection_handle: Option<tokio::task::JoinHandle<()>>,
+
+    /// Scheduler for distributed autoscaling and rescheduling (leader nodes).
+    /// `None` if Raft is not initialised or this is not the leader.
+    pub scheduler: Option<Arc<Scheduler>>,
+
+    /// Internal authentication token shared between the scheduler and the API.
+    /// Needed by serve.rs to create `InternalState` with the same token.
+    pub internal_token: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -489,6 +505,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                     let leader_overlay_ip = "10.200.0.1".to_string();
                     let leader_raft_addr =
                         format!("{}:{}", node_config.advertise_addr, node_config.raft_port);
+                    let sys_res = crate::resources::detect_system_resources(&config.data_dir);
                     if let Err(e) = coordinator
                         .propose(Request::RegisterNode {
                             node_id: node_config.raft_node_id,
@@ -498,6 +515,10 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                             overlay_port: node_config.overlay_port,
                             advertise_addr: node_config.advertise_addr.clone(),
                             api_port: node_config.api_port,
+                            cpu_total: sys_res.cpu_total,
+                            memory_total: sys_res.memory_total,
+                            disk_total: sys_res.disk_total,
+                            gpus: vec![],
                         })
                         .await
                     {
@@ -538,6 +559,75 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     };
 
     // -----------------------------------------------------------------------
+    // Phase 15: Internal token + Scheduler + Heartbeat & dead-node detection
+    // -----------------------------------------------------------------------
+
+    // Generate the internal token up-front so both the Scheduler (for
+    // dispatching scale requests) and the API InternalState (for validating
+    // them) share the same secret.
+    let internal_token = generate_internal_token();
+
+    // Create the Scheduler (with raft if available) for rescheduling on
+    // node death.  On leader nodes the scheduler is passed to the
+    // dead-node detection loop so it can call `handle_node_death()`.
+    let api_port = node_config.api_port;
+    let agent_base_url = format!("http://127.0.0.1:{}", api_port);
+
+    let scheduler: Option<Arc<Scheduler>> = raft.as_ref().map(|raft_ref| {
+        let sched_config = SchedulerConfig {
+            raft: RaftConfig {
+                node_id: node_config.raft_node_id,
+                address: format!("{}:{}", node_config.advertise_addr, node_config.raft_port),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        Arc::new(Scheduler::with_raft(
+            sched_config,
+            Arc::clone(raft_ref),
+            internal_token.clone(),
+            agent_base_url.clone(),
+        ))
+    });
+
+    let (heartbeat_handle, dead_node_detection_handle) = match raft.as_ref() {
+        Some(raft_ref) => {
+            if node_config.is_leader {
+                // Leader: spawn dead-node detection (30-second timeout)
+                let raft_clone = Arc::clone(raft_ref);
+                let scheduler_clone = scheduler.clone();
+                let dnl_handle = Some(tokio::spawn(async move {
+                    dead_node_detection_loop(
+                        raft_clone,
+                        scheduler_clone,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await;
+                }));
+                info!("Dead-node detection loop started (30s timeout)");
+                (None, dnl_handle)
+            } else {
+                // Worker: spawn heartbeat loop (5-second interval)
+                let raft_clone = Arc::clone(raft_ref);
+                let data_dir_clone = config.data_dir.clone();
+                let raft_node_id = node_config.raft_node_id;
+                let hb_handle = Some(tokio::spawn(async move {
+                    heartbeat_loop(
+                        raft_clone,
+                        raft_node_id,
+                        data_dir_clone,
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await;
+                }));
+                info!("Heartbeat loop started (5s interval)");
+                (hb_handle, None)
+            }
+        }
+        None => (None, None),
+    };
+
+    // -----------------------------------------------------------------------
     info!("Daemon infrastructure initialisation complete");
 
     Ok(DaemonState {
@@ -559,7 +649,163 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         node_config,
         raft,
         raft_server_handle,
+        heartbeat_handle,
+        dead_node_detection_handle,
+        scheduler,
+        internal_token,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat & Dead-Node Detection
+// ---------------------------------------------------------------------------
+
+/// Worker heartbeat loop -- periodically reports resource usage to the leader.
+///
+/// Runs on non-leader nodes. Every `interval`, reads current CPU, memory, and
+/// disk usage via [`crate::resources::detect_current_usage`] and POSTs the
+/// data to the leader's `/api/v1/cluster/heartbeat` endpoint.
+///
+/// On failure, logs a warning and retries on the next cycle.
+async fn heartbeat_loop(
+    raft: Arc<zlayer_scheduler::RaftCoordinator>,
+    node_id: u64,
+    data_dir: std::path::PathBuf,
+    interval: std::time::Duration,
+) {
+    let client = reqwest::Client::new();
+    loop {
+        tokio::time::sleep(interval).await;
+
+        // Resolve the current leader's API address from Raft cluster state.
+        let leader_url = match resolve_leader_api_url(&raft).await {
+            Some(url) => url,
+            None => {
+                warn!("Heartbeat: no leader address available, will retry next cycle");
+                continue;
+            }
+        };
+
+        let usage = crate::resources::detect_current_usage(&data_dir);
+
+        let body = serde_json::json!({
+            "node_id": node_id,
+            "cpu_used": usage.cpu_used,
+            "memory_used": usage.memory_used,
+            "disk_used": usage.disk_used,
+        });
+
+        match client
+            .post(format!("{}/api/v1/cluster/heartbeat", leader_url))
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await
+        {
+            Ok(resp) if resp.status().is_success() => {
+                tracing::debug!("Heartbeat sent successfully");
+            }
+            Ok(resp) => {
+                warn!(
+                    status = %resp.status(),
+                    "Heartbeat response was not successful"
+                );
+            }
+            Err(e) => {
+                warn!("Heartbeat failed: {e}");
+            }
+        }
+    }
+}
+
+/// Leader-side dead-node detection loop.
+///
+/// Runs on the leader node. Every 10 seconds, scans the Raft cluster state for
+/// nodes whose `last_heartbeat` timestamp is older than `timeout`. Any such
+/// node (excluding self and already-dead nodes) is marked `"dead"` via a Raft
+/// proposal.
+///
+/// When a scheduler is provided, the loop also triggers rescheduling of the
+/// dead node's containers to remaining live nodes.
+async fn dead_node_detection_loop(
+    raft: Arc<zlayer_scheduler::RaftCoordinator>,
+    scheduler: Option<Arc<Scheduler>>,
+    timeout: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+        // Only the leader should perform dead-node detection.
+        if !raft.is_leader() {
+            continue;
+        }
+
+        let state = raft.read_state().await;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+
+        let self_id = raft.node_id();
+
+        for (id, node_info) in &state.nodes {
+            // Skip self (leader) and already-dead nodes.
+            if *id == self_id || node_info.status == "dead" {
+                continue;
+            }
+
+            if now.saturating_sub(node_info.last_heartbeat) > timeout.as_millis() as u64 {
+                warn!(
+                    node_id = id,
+                    last_heartbeat_ms = node_info.last_heartbeat,
+                    now_ms = now,
+                    "Node missed heartbeat deadline, marking dead"
+                );
+                let _ = raft
+                    .propose(Request::UpdateNodeStatus {
+                        node_id: *id,
+                        status: "dead".to_string(),
+                    })
+                    .await;
+
+                // Trigger rescheduling of the dead node's containers
+                if let Some(ref sched) = scheduler {
+                    if let Err(e) = sched.handle_node_death(*id).await {
+                        tracing::error!(
+                            node_id = id,
+                            error = %e,
+                            "Failed to reschedule containers from dead node"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Generate a random internal token for scheduler-to-agent communication.
+fn generate_internal_token() -> String {
+    use std::fmt::Write;
+    let mut buf = String::with_capacity(64);
+    for _ in 0..32 {
+        let byte: u8 = rand::random();
+        let _ = write!(buf, "{:02x}", byte);
+    }
+    buf
+}
+
+/// Resolve the current Raft leader's HTTP API URL from cluster state.
+///
+/// Returns `Some("http://{advertise_addr}:{api_port}")` if the leader is known
+/// and present in the node registry, or `None` if the leader is unknown.
+async fn resolve_leader_api_url(raft: &zlayer_scheduler::RaftCoordinator) -> Option<String> {
+    let leader_id = raft.leader_id()?;
+    let state = raft.read_state().await;
+    let leader_info = state.nodes.get(&leader_id)?;
+    Some(format!(
+        "http://{}:{}",
+        leader_info.advertise_addr, leader_info.api_port
+    ))
 }
 
 // ---------------------------------------------------------------------------
