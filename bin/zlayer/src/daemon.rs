@@ -315,12 +315,14 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         match OverlayManager::new(config.deployment_name.clone()).await {
             Ok(mut om) => {
                 if let Err(e) = om.setup_global_overlay().await {
-                    warn!("Failed to setup global overlay: {e}");
-                    None
+                    warn!(
+                        "Global overlay failed (cross-node disabled): {e}. \
+                         Container networking via veth pairs still available."
+                    );
                 } else {
                     info!("Global overlay network created");
-                    Some(Arc::new(RwLock::new(om)))
                 }
+                Some(Arc::new(RwLock::new(om)))
             }
             Err(e) => {
                 warn!("Overlay networks disabled: {e}");

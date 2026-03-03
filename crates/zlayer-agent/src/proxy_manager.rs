@@ -625,7 +625,7 @@ impl ProxyManager {
     pub async fn add_backend(&self, service: &str, addr: SocketAddr) {
         self.registry.add_backend(service, addr).await;
         self.load_balancer.add_backend(service, addr);
-        debug!(service = service, backend = %addr, "Added backend to service");
+        info!(service = service, backend = %addr, "Registered backend with proxy");
     }
 
     /// Remove a backend from a service
