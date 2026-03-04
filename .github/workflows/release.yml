@@ -46,6 +46,7 @@ jobs:
           mkdir -p artifacts
           VERSION="${{ steps.version.outputs.version }}"
           BASE_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
+          AUTH="zachhandley:${{ secrets.FORGEJO_TOKEN }}"
 
           echo "Downloading from: ${BASE_URL}"
 
@@ -55,7 +56,7 @@ jobs:
               artifact="zlayer-${os}-${arch}.tar.gz"
               output="artifacts/zlayer-${VERSION}-${os}-${arch}.tar.gz"
               echo "Downloading ${artifact}..."
-              if curl -fsSL "${BASE_URL}/${artifact}" -o "${output}"; then
+              if curl -fsSL --user "${AUTH}" "${BASE_URL}/${artifact}" -o "${output}"; then
                 echo "  OK ${artifact}"
               else
                 rm -f "${output}"
@@ -69,7 +70,7 @@ jobs:
             artifact="${img}-${VERSION}-oci.tar"
             output="artifacts/${artifact}"
             echo "Downloading ${artifact}..."
-            if curl -fsSL "${BASE_URL}/${artifact}" -o "${output}"; then
+            if curl -fsSL --user "${AUTH}" "${BASE_URL}/${artifact}" -o "${output}"; then
               echo "  OK ${artifact}"
             else
               rm -f "${output}"
