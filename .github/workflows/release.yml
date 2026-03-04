@@ -55,15 +55,26 @@ jobs:
               artifact="zlayer-${os}-${arch}.tar.gz"
               output="artifacts/zlayer-${VERSION}-${os}-${arch}.tar.gz"
               echo "Downloading ${artifact}..."
-              curl -fsSL "${BASE_URL}/${artifact}" -o "${output}" && echo "  OK ${artifact}" || echo "  SKIP ${artifact} not available"
+              if curl -fsSL "${BASE_URL}/${artifact}" -o "${output}"; then
+                echo "  OK ${artifact}"
+              else
+                rm -f "${output}"
+                echo "  SKIP ${artifact} not available"
+              fi
             done
           done
 
           # Download container image archives (OCI format only)
           for img in zlayer-node zlayer-manager; do
             artifact="${img}-${VERSION}-oci.tar"
+            output="artifacts/${artifact}"
             echo "Downloading ${artifact}..."
-            curl -fsSL "${BASE_URL}/${artifact}" -o "artifacts/${artifact}" && echo "  ✓ ${artifact}" || echo "  ✗ ${artifact} not available"
+            if curl -fsSL "${BASE_URL}/${artifact}" -o "${output}"; then
+              echo "  OK ${artifact}"
+            else
+              rm -f "${output}"
+              echo "  SKIP ${artifact} not available"
+            fi
           done
 
           echo ""
@@ -135,16 +146,24 @@ jobs:
           # Replace version placeholder
           sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" release_notes.md
 
-          # Create the release with all artifacts
-          gh release create "${TAG}" \
-            --title "ZLayer ${VERSION}" \
-            --notes-file release_notes.md \
-            --latest \
-            artifacts/*.tar.gz artifacts/*.tar 2>/dev/null || \
-          gh release create "${TAG}" \
-            --title "ZLayer ${VERSION}" \
-            --notes-file release_notes.md \
-            --latest \
-            artifacts/*.tar.gz
+          # Collect artifact files (nullglob avoids errors when no files match)
+          shopt -s nullglob
+          FILES=(artifacts/*.tar.gz artifacts/*.tar)
+          shopt -u nullglob
 
-          echo "✓ Release ${TAG} created successfully"
+          if [ ${#FILES[@]} -eq 0 ]; then
+            echo "WARNING: No artifacts downloaded, creating release without attachments"
+            gh release create "${TAG}" \
+              --title "ZLayer ${VERSION}" \
+              --notes-file release_notes.md \
+              --latest
+          else
+            echo "Attaching ${#FILES[@]} artifacts to release"
+            gh release create "${TAG}" \
+              --title "ZLayer ${VERSION}" \
+              --notes-file release_notes.md \
+              --latest \
+              "${FILES[@]}"
+          fi
+
+          echo "Release ${TAG} created successfully"
