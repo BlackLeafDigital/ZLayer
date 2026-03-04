@@ -10027,7 +10027,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -10072,7 +10072,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-agent"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10118,7 +10118,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-api"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10161,7 +10161,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-builder"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -10185,7 +10185,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-consensus"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "axum",
  "bincode",
@@ -10200,7 +10200,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-core"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -10214,7 +10214,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-init-actions"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
@@ -10227,7 +10227,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-manager"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "axum",
  "clap",
@@ -10258,7 +10258,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-observability"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "axum",
  "chrono",
@@ -10282,7 +10282,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-overlay"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "base64 0.22.1",
  "blake2",
@@ -10304,7 +10304,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-proxy"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "async-trait",
  "bytes",
@@ -10334,7 +10334,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-py"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "indexmap 2.13.0",
  "pyo3",
@@ -10354,7 +10354,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-registry"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10378,7 +10378,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-scheduler"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10406,7 +10406,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-secrets"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "argon2",
  "async-trait",
@@ -10429,7 +10429,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-spec"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "cron",
  "humantime",
@@ -10443,7 +10443,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-storage"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -10469,7 +10469,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-tui"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -10477,7 +10477,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-tunnel"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "bytes",
  "dashmap",
@@ -10498,7 +10498,7 @@ dependencies = [
 
 [[package]]
 name = "zlayer-web"
-version = "0.1.0"
+version = "0.0.0-dev"
 dependencies = [
  "axum",
  "console_error_panic_hook",

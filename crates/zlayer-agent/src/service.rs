@@ -273,6 +273,14 @@ impl ServiceInstance {
                     overlay_ip
                 };
 
+                tracing::info!(
+                    container = %id,
+                    service = %self.service_name,
+                    overlay_ip = ?overlay_ip,
+                    effective_ip = ?effective_ip,
+                    "Container IP resolution complete"
+                );
+
                 // Query port override from the runtime.
                 // On macOS sandbox, each container is assigned a unique port since
                 // all processes share the host network (no network namespaces).
@@ -1193,13 +1201,9 @@ impl ServiceManager {
     }
 
     /// Update backend addresses via ProxyManager after scaling
-    fn update_proxy_backends(&self, service_name: &str, addrs: Vec<SocketAddr>) {
+    async fn update_proxy_backends(&self, service_name: &str, addrs: Vec<SocketAddr>) {
         if let Some(proxy) = &self.proxy_manager {
-            let proxy = Arc::clone(proxy);
-            let name = service_name.to_string();
-            tokio::spawn(async move {
-                proxy.update_backends(&name, addrs).await;
-            });
+            proxy.update_backends(service_name, addrs).await;
         }
     }
 
@@ -1306,8 +1310,8 @@ impl ServiceManager {
         let addrs = self.collect_backend_addrs(instance, replicas).await;
 
         // Update HTTP backends via ProxyManager
-        if self.proxy_manager.is_some() {
-            self.update_proxy_backends(name, addrs.clone());
+        if self.proxy_manager.is_some() && !addrs.is_empty() {
+            self.update_proxy_backends(name, addrs.clone()).await;
         }
 
         // Update TCP/UDP backends in StreamRegistry

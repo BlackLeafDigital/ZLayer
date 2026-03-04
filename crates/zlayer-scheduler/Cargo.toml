@@ -12,9 +12,9 @@ readme = "README.md"
 
 [dependencies]
 # Internal crates
-zlayer-spec.path = "../zlayer-spec"
-zlayer-core.path = "../zlayer-core"
-zlayer-consensus.path = "../zlayer-consensus"
+zlayer-spec.workspace = true
+zlayer-core.workspace = true
+zlayer-consensus.workspace = true
 
 # Serialization
 serde.workspace = true
