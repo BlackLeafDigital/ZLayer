@@ -181,7 +181,22 @@ jobs:
           cargo generate-lockfile
       - name: Publish crates to Forgejo
         run: |
-          CRATES="zlayer-spec-zql zlayer-observability-zql zlayer-overlay-zql zlayer-storage-zql zlayer-core-zql zlayer-builder-zql zlayer-init-actions-zql zlayer-registry-zql zlayer-scheduler-zql zlayer-tunnel-zql"
+          # Topological publish order (leaves first, dependents after)
+          CRATES="
+            zlayer-spec-zql
+            zlayer-observability-zql
+            zlayer-init-actions-zql
+            zlayer-storage-zql
+            zlayer-registry-zql
+            zlayer-tui-zql
+            zlayer-secrets-zql
+            zlayer-consensus-zql
+            zlayer-tunnel-zql
+            zlayer-core-zql
+            zlayer-overlay-zql
+            zlayer-builder-zql
+            zlayer-scheduler-zql
+          "
 
           for crate in $CRATES; do
             echo "Publishing $crate to Forgejo..."
@@ -190,5 +205,5 @@ jobs:
             else
               echo "WARN: $crate may already exist or failed"
             fi
-            sleep 30
+            sleep 10
           done
