@@ -1,6 +1,6 @@
 //! Layer snapshot creation and extraction
 //!
-//! Handles tarball creation from OverlayFS upper layers with compression.
+//! Handles tarball creation from `OverlayFS` upper layers with compression.
 
 use crate::error::{LayerStorageError, Result};
 use crate::types::LayerSnapshot;
@@ -172,10 +172,12 @@ pub fn calculate_directory_digest(dir: impl AsRef<Path>) -> Result<String> {
 
     // Walk directory and hash file contents and metadata
     fn hash_dir(hasher: &mut Sha256, dir: &Path, prefix: &Path) -> Result<()> {
-        let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
+        let mut entries: Vec<_> = std::fs::read_dir(dir)?
+            .filter_map(std::result::Result::ok)
+            .collect();
 
         // Sort for deterministic ordering
-        entries.sort_by_key(|e| e.file_name());
+        entries.sort_by_key(std::fs::DirEntry::file_name);
 
         for entry in entries {
             let path = entry.path();

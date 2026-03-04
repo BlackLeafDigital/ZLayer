@@ -20,16 +20,19 @@ pub enum ShellOrExec {
 
 impl ShellOrExec {
     /// Returns true if this is the shell form
+    #[must_use]
     pub fn is_shell(&self) -> bool {
         matches!(self, Self::Shell(_))
     }
 
     /// Returns true if this is the exec form
+    #[must_use]
     pub fn is_exec(&self) -> bool {
         matches!(self, Self::Exec(_))
     }
 
     /// Convert to a vector of strings suitable for execution
+    #[must_use]
     pub fn to_exec_args(&self, shell: &[String]) -> Vec<String> {
         match self {
             Self::Shell(cmd) => {
@@ -102,6 +105,7 @@ pub enum Instruction {
 
 impl Instruction {
     /// Returns the instruction name as it would appear in a Dockerfile
+    #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
             Self::Run(_) => "RUN",
@@ -124,6 +128,7 @@ impl Instruction {
     }
 
     /// Returns true if this instruction creates a new layer
+    #[must_use]
     pub fn creates_layer(&self) -> bool {
         matches!(self, Self::Run(_) | Self::Copy(_) | Self::Add(_))
     }
@@ -147,6 +152,7 @@ impl Instruction {
     /// let key = run.cache_key();
     /// assert_eq!(key.len(), 16);
     /// ```
+    #[must_use]
     pub fn cache_key(&self) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -169,15 +175,15 @@ impl Instruction {
                 }
                 // Include mounts in the hash - they affect layer content
                 for mount in &run.mounts {
-                    format!("{:?}", mount).hash(&mut hasher);
+                    format!("{mount:?}").hash(&mut hasher);
                 }
                 // Include network mode if set
                 if let Some(network) = &run.network {
-                    format!("{:?}", network).hash(&mut hasher);
+                    format!("{network:?}").hash(&mut hasher);
                 }
                 // Include security mode if set
                 if let Some(security) = &run.security {
-                    format!("{:?}", security).hash(&mut hasher);
+                    format!("{security:?}").hash(&mut hasher);
                 }
             }
             Self::Copy(copy) => {
@@ -320,19 +326,19 @@ impl Instruction {
     }
 }
 
-/// RUN instruction with optional BuildKit features
+/// RUN instruction with optional `BuildKit` features
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunInstruction {
     /// The command to run
     pub command: ShellOrExec,
 
-    /// Optional mount specifications (BuildKit)
+    /// Optional mount specifications (`BuildKit`)
     pub mounts: Vec<RunMount>,
 
-    /// Optional network mode (BuildKit)
+    /// Optional network mode (`BuildKit`)
     pub network: Option<RunNetwork>,
 
-    /// Optional security mode (BuildKit)
+    /// Optional security mode (`BuildKit`)
     pub security: Option<RunSecurity>,
 }
 
@@ -348,6 +354,7 @@ impl RunInstruction {
     }
 
     /// Create a new RUN instruction from exec form
+    #[must_use]
     pub fn exec(args: Vec<String>) -> Self {
         Self {
             command: ShellOrExec::Exec(args),
@@ -413,6 +420,7 @@ impl RunMount {
     ///     "type=cache,target=/var/cache/apt,id=apt-cache,sharing=shared"
     /// );
     /// ```
+    #[must_use]
     pub fn to_buildah_arg(&self) -> String {
         match self {
             Self::Bind {
@@ -423,10 +431,10 @@ impl RunMount {
             } => {
                 let mut parts = vec![format!("type=bind,target={}", target)];
                 if let Some(src) = source {
-                    parts.push(format!("source={}", src));
+                    parts.push(format!("source={src}"));
                 }
                 if let Some(from_stage) = from {
-                    parts.push(format!("from={}", from_stage));
+                    parts.push(format!("from={from_stage}"));
                 }
                 if *readonly {
                     parts.push("ro".to_string());
@@ -441,7 +449,7 @@ impl RunMount {
             } => {
                 let mut parts = vec![format!("type=cache,target={}", target)];
                 if let Some(cache_id) = id {
-                    parts.push(format!("id={}", cache_id));
+                    parts.push(format!("id={cache_id}"));
                 }
                 // Only add sharing if not the default (locked)
                 if *sharing != CacheSharing::Locked {
@@ -455,7 +463,7 @@ impl RunMount {
             Self::Tmpfs { target, size } => {
                 let mut parts = vec![format!("type=tmpfs,target={}", target)];
                 if let Some(sz) = size {
-                    parts.push(format!("tmpfs-size={}", sz));
+                    parts.push(format!("tmpfs-size={sz}"));
                 }
                 parts.join(",")
             }
@@ -467,7 +475,7 @@ impl RunMount {
                 let mut parts = vec![format!("type=secret,id={}", id)];
                 // Only add target if it's not empty (some secrets use default paths)
                 if !target.is_empty() {
-                    parts.push(format!("target={}", target));
+                    parts.push(format!("target={target}"));
                 }
                 if *required {
                     parts.push("required".to_string());
@@ -481,10 +489,10 @@ impl RunMount {
             } => {
                 let mut parts = vec!["type=ssh".to_string()];
                 if let Some(ssh_id) = id {
-                    parts.push(format!("id={}", ssh_id));
+                    parts.push(format!("id={ssh_id}"));
                 }
                 if !target.is_empty() {
-                    parts.push(format!("target={}", target));
+                    parts.push(format!("target={target}"));
                 }
                 if *required {
                     parts.push("required".to_string());
@@ -509,6 +517,7 @@ pub enum CacheSharing {
 
 impl CacheSharing {
     /// Returns the string representation for buildah mount arguments
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Locked => "locked",
@@ -565,6 +574,7 @@ pub struct CopyInstruction {
 
 impl CopyInstruction {
     /// Create a new COPY instruction
+    #[must_use]
     pub fn new(sources: Vec<String>, destination: String) -> Self {
         Self {
             sources,
@@ -617,6 +627,7 @@ pub struct AddInstruction {
 
 impl AddInstruction {
     /// Create a new ADD instruction
+    #[must_use]
     pub fn new(sources: Vec<String>, destination: String) -> Self {
         Self {
             sources,
@@ -646,6 +657,7 @@ impl EnvInstruction {
     }
 
     /// Create a new ENV instruction with multiple variables
+    #[must_use]
     pub fn from_vars(vars: HashMap<String, String>) -> Self {
         Self { vars }
     }
@@ -663,6 +675,7 @@ pub struct ExposeInstruction {
 
 impl ExposeInstruction {
     /// Create a new TCP EXPOSE instruction
+    #[must_use]
     pub fn tcp(port: u16) -> Self {
         Self {
             port,
@@ -671,6 +684,7 @@ impl ExposeInstruction {
     }
 
     /// Create a new UDP EXPOSE instruction
+    #[must_use]
     pub fn udp(port: u16) -> Self {
         Self {
             port,
@@ -745,6 +759,7 @@ pub enum HealthcheckInstruction {
 
 impl HealthcheckInstruction {
     /// Create a new CMD-style healthcheck
+    #[must_use]
     pub fn cmd(command: ShellOrExec) -> Self {
         Self::Check {
             command,

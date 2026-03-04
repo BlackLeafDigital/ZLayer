@@ -37,18 +37,21 @@ impl TlsServerConfig {
     }
 
     /// Set ALPN protocols
+    #[must_use]
     pub fn with_alpn_protocols(mut self, protocols: Vec<Vec<u8>>) -> Self {
         self.alpn_protocols = protocols;
         self
     }
 
     /// Set minimum TLS version
+    #[must_use]
     pub fn with_min_version(mut self, version: TlsVersion) -> Self {
         self.min_version = version;
         self
     }
 
-    /// Create from a TlsConfig
+    /// Create from a `TlsConfig`
+    #[must_use]
     pub fn from_config(config: &TlsConfig) -> Self {
         let mut alpn = vec![];
         if config.alpn_h2 {
@@ -67,24 +70,17 @@ impl TlsServerConfig {
 
 /// Load certificates from a PEM file
 pub fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path).map_err(|e| {
-        ProxyError::Tls(format!("Failed to open certificate file '{}': {}", path, e))
-    })?;
+    let file = File::open(path)
+        .map_err(|e| ProxyError::Tls(format!("Failed to open certificate file '{path}': {e}")))?;
 
     let mut reader = BufReader::new(file);
     let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            ProxyError::Tls(format!(
-                "Failed to parse certificates from '{}': {}",
-                path, e
-            ))
-        })?;
+        .map_err(|e| ProxyError::Tls(format!("Failed to parse certificates from '{path}': {e}")))?;
 
     if certs.is_empty() {
         return Err(ProxyError::Tls(format!(
-            "No certificates found in '{}'",
-            path
+            "No certificates found in '{path}'"
         )));
     }
 
@@ -94,9 +90,8 @@ pub fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 
 /// Load a private key from a PEM file
 pub fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
-    let file = File::open(path).map_err(|e| {
-        ProxyError::Tls(format!("Failed to open private key file '{}': {}", path, e))
-    })?;
+    let file = File::open(path)
+        .map_err(|e| ProxyError::Tls(format!("Failed to open private key file '{path}': {e}")))?;
 
     let mut reader = BufReader::new(file);
 
@@ -120,15 +115,11 @@ pub fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
                 continue;
             }
             Ok(None) => {
-                return Err(ProxyError::Tls(format!(
-                    "No private key found in '{}'",
-                    path
-                )));
+                return Err(ProxyError::Tls(format!("No private key found in '{path}'")));
             }
             Err(e) => {
                 return Err(ProxyError::Tls(format!(
-                    "Failed to parse private key from '{}': {}",
-                    path, e
+                    "Failed to parse private key from '{path}': {e}"
                 )));
             }
         }
@@ -154,7 +145,7 @@ pub fn create_tls_acceptor(config: &TlsServerConfig) -> Result<TlsAcceptor> {
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
 
-/// Create a rustls ServerConfig
+/// Create a rustls `ServerConfig`
 fn create_server_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -169,7 +160,7 @@ fn create_server_config(
     let mut server_config = ServerConfig::builder_with_protocol_versions(&versions)
         .with_no_client_auth()
         .with_single_cert(certs, key)
-        .map_err(|e| ProxyError::Tls(format!("Failed to create TLS config: {}", e)))?;
+        .map_err(|e| ProxyError::Tls(format!("Failed to create TLS config: {e}")))?;
 
     // Configure ALPN
     if !config.alpn_protocols.is_empty() {

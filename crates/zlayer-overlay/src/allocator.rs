@@ -45,7 +45,7 @@ impl IpAllocator {
     pub fn new(cidr: &str) -> Result<Self> {
         let network: Ipv4Net = cidr
             .parse()
-            .map_err(|e| OverlayError::InvalidCidr(format!("{}: {}", cidr, e)))?;
+            .map_err(|e| OverlayError::InvalidCidr(format!("{cidr}: {e}")))?;
 
         Ok(Self {
             network,
@@ -63,6 +63,7 @@ impl IpAllocator {
     }
 
     /// Get the current state for persistence
+    #[must_use]
     pub fn to_state(&self) -> IpAllocatorState {
         IpAllocatorState {
             cidr: self.network.to_string(),
@@ -168,52 +169,62 @@ impl IpAllocator {
     }
 
     /// Check if an IP address is allocated
+    #[must_use]
     pub fn is_allocated(&self, ip: Ipv4Addr) -> bool {
         self.allocated.contains(&ip)
     }
 
     /// Check if an IP address is within the CIDR range
+    #[must_use]
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
         self.network.contains(&ip)
     }
 
     /// Get the number of allocated addresses
+    #[must_use]
     pub fn allocated_count(&self) -> usize {
         self.allocated.len()
     }
 
     /// Get the total number of usable addresses in the range
+    #[must_use]
     pub fn total_hosts(&self) -> u32 {
         self.network.hosts().count() as u32
     }
 
     /// Get the number of available addresses
+    #[must_use]
     pub fn available_count(&self) -> u32 {
         self.total_hosts()
             .saturating_sub(self.allocated.len() as u32)
     }
 
     /// Get the CIDR string
+    #[must_use]
     pub fn cidr(&self) -> String {
         self.network.to_string()
     }
 
     /// Get the network address
+    #[must_use]
     pub fn network_addr(&self) -> Ipv4Addr {
         self.network.network()
     }
 
     /// Get the broadcast address
+    #[must_use]
     pub fn broadcast_addr(&self) -> Ipv4Addr {
         self.network.broadcast()
     }
 
     /// Get the prefix length
+    #[must_use]
     pub fn prefix_len(&self) -> u8 {
         self.network.prefix_len()
     }
 
     /// Get all allocated IPs
+    #[must_use]
     pub fn allocated_ips(&self) -> Vec<Ipv4Addr> {
         self.allocated.iter().copied().collect()
     }
@@ -223,7 +234,7 @@ impl IpAllocator {
 pub fn first_ip_from_cidr(cidr: &str) -> Result<Ipv4Addr> {
     let network: Ipv4Net = cidr
         .parse()
-        .map_err(|e| OverlayError::InvalidCidr(format!("{}: {}", cidr, e)))?;
+        .map_err(|e| OverlayError::InvalidCidr(format!("{cidr}: {e}")))?;
 
     network.hosts().next().ok_or(OverlayError::NoAvailableIps)
 }

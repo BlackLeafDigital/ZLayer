@@ -1,4 +1,4 @@
-//! ZLayer Observability - Logging, Tracing, and Metrics
+//! `ZLayer` Observability - Logging, Tracing, and Metrics
 //!
 //! Provides unified observability infrastructure:
 //! - Structured logging with JSON/pretty formats

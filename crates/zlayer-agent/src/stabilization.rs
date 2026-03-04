@@ -24,7 +24,7 @@ pub struct ServiceHealthSummary {
     pub desired: u32,
     /// Whether health checks are passing for all running replicas
     pub healthy: bool,
-    /// Endpoint URLs for this service (e.g. "http://localhost:8080")
+    /// Endpoint URLs for this service (e.g. "<http://localhost:8080>")
     pub endpoints: Vec<String>,
 }
 
@@ -88,9 +88,6 @@ pub async fn wait_for_stabilization(
             let states = health_states.read().await;
             let healthy = match states.get(name) {
                 Some(HealthState::Healthy) => true,
-                // If no health state yet and replicas are up, consider transitionally OK
-                Some(HealthState::Unknown) if running == desired && desired > 0 => true,
-                None if running == desired && desired > 0 => true,
                 _ if desired == 0 => true, // Manual scaling / 0 replicas is trivially healthy
                 _ => false,
             };

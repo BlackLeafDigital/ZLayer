@@ -1,6 +1,6 @@
 //! Main menu view
 //!
-//! Shows the ZLayer logo, subtitle, and a navigable list of actions.
+//! Shows the `ZLayer` logo, subtitle, and a navigable list of actions.
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -95,12 +95,7 @@ fn render_menu_items(area: Rect, buf: &mut Buffer, state: &MainMenuState) {
             Style::default().fg(Color::White)
         };
 
-        buf.set_string(
-            area.x + 2,
-            y,
-            format!("{}{}", indicator, label),
-            label_style,
-        );
+        buf.set_string(area.x + 2, y, format!("{indicator}{label}"), label_style);
 
         // Description on the next line (if room)
         if y + 1 < area.y + area.height {

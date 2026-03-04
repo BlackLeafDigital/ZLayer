@@ -7,7 +7,7 @@ use std::time::Duration;
 /// Overlay network configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OverlayConfig {
-    /// Local overlay endpoint (WireGuard protocol)
+    /// Local overlay endpoint (`WireGuard` protocol)
     pub local_endpoint: SocketAddr,
 
     /// Private key (x25519)
@@ -43,7 +43,7 @@ impl OverlayConfig {
 impl Default for OverlayConfig {
     fn default() -> Self {
         Self {
-            local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 51820),
+            local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 51820),
             private_key: String::new(),
             public_key: String::new(),
             overlay_cidr: "10.0.0.0/8".to_string(),
@@ -70,6 +70,7 @@ pub struct PeerInfo {
 
 impl PeerInfo {
     /// Create a new peer info
+    #[must_use]
     pub fn new(
         public_key: String,
         endpoint: SocketAddr,
@@ -84,7 +85,8 @@ impl PeerInfo {
         }
     }
 
-    /// Create a peer config block (WireGuard protocol format)
+    /// Create a peer config block (`WireGuard` protocol format)
+    #[must_use]
     pub fn to_peer_config(&self) -> String {
         format!(
             "[Peer]\n\

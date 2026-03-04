@@ -1,8 +1,8 @@
-//! ZLayer WASM Host Function Implementations
+//! `ZLayer` WASM Host Function Implementations
 //!
-//! This module provides the host-side implementations of ZLayer interfaces
-//! that WASM plugins can call. It bridges WASIp2 component model exports
-//! with the ZLayer runtime capabilities.
+//! This module provides the host-side implementations of `ZLayer` interfaces
+//! that WASM plugins can call. It bridges `WASIp2` component model exports
+//! with the `ZLayer` runtime capabilities.
 //!
 //! # Architecture
 //!
@@ -28,7 +28,9 @@
 //! ```
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
 
 /// Log level for plugin logging
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -47,6 +49,7 @@ pub enum LogLevel {
 
 impl LogLevel {
     /// Convert from WIT level integer (0=trace, 4=error)
+    #[must_use]
     pub fn from_wit(level: u8) -> Self {
         match level {
             0 => LogLevel::Trace,
@@ -58,6 +61,7 @@ impl LogLevel {
     }
 
     /// Convert to WIT level integer
+    #[must_use]
     pub fn to_wit(self) -> u8 {
         match self {
             LogLevel::Trace => 0,
@@ -69,6 +73,7 @@ impl LogLevel {
     }
 
     /// Convert to tracing level
+    #[must_use]
     pub fn to_tracing(self) -> tracing::Level {
         match self {
             LogLevel::Trace => tracing::Level::TRACE,
@@ -114,16 +119,16 @@ impl std::fmt::Display for KvError {
             KvError::ValueTooLarge => write!(f, "value too large"),
             KvError::QuotaExceeded => write!(f, "storage quota exceeded"),
             KvError::InvalidKey => write!(f, "invalid key format"),
-            KvError::Storage(msg) => write!(f, "storage error: {}", msg),
+            KvError::Storage(msg) => write!(f, "storage error: {msg}"),
         }
     }
 }
 
 impl std::error::Error for KvError {}
 
-/// Host capabilities trait defining all ZLayer host functions
+/// Host capabilities trait defining all `ZLayer` host functions
 ///
-/// This trait defines the interface between WASM plugins and the ZLayer host.
+/// This trait defines the interface between WASM plugins and the `ZLayer` host.
 /// Implementations provide actual storage, logging, metrics, etc.
 ///
 /// # Thread Safety
@@ -144,7 +149,7 @@ pub trait ZLayerHost: Send {
     /// Get a configuration value, returning error if not found
     fn config_get_required(&self, key: &str) -> Result<String, String> {
         self.config_get(key)
-            .ok_or_else(|| format!("required config key '{}' not found", key))
+            .ok_or_else(|| format!("required config key '{key}' not found"))
     }
 
     /// Get multiple configuration values at once
@@ -203,7 +208,7 @@ pub trait ZLayerHost: Send {
         match self.kv_get(key)? {
             Some(bytes) => String::from_utf8(bytes)
                 .map(Some)
-                .map_err(|e| KvError::Storage(format!("invalid UTF-8: {}", e))),
+                .map_err(|e| KvError::Storage(format!("invalid UTF-8: {e}"))),
             None => Ok(None),
         }
     }
@@ -268,7 +273,7 @@ pub trait ZLayerHost: Send {
     /// Get a required secret, error if not found
     fn secret_get_required(&self, name: &str) -> Result<String, String> {
         self.secret_get(name)?
-            .ok_or_else(|| format!("required secret '{}' not found", name))
+            .ok_or_else(|| format!("required secret '{name}' not found"))
     }
 
     /// Check if a secret exists
@@ -363,19 +368,18 @@ impl KvEntry {
 
     fn is_expired(&self) -> bool {
         self.expires_at
-            .map(|exp| std::time::Instant::now() >= exp)
-            .unwrap_or(false)
+            .is_some_and(|exp| std::time::Instant::now() >= exp)
     }
 }
 
 /// In-memory metrics storage for testing
 #[derive(Debug, Default, Clone)]
 pub struct MetricsStore {
-    /// Counter values by (name, labels_key)
+    /// Counter values by (name, `labels_key`)
     pub counters: HashMap<String, u64>,
-    /// Gauge values by (name, labels_key)
+    /// Gauge values by (name, `labels_key`)
     pub gauges: HashMap<String, f64>,
-    /// Histogram observations by (name, labels_key)
+    /// Histogram observations by (name, `labels_key`)
     pub histograms: HashMap<String, Vec<f64>>,
 }
 
@@ -389,36 +393,41 @@ impl MetricsStore {
             sorted_labels.sort_by(|a, b| a.0.cmp(&b.0));
             let labels_str = sorted_labels
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
+                .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join(",");
-            format!("{}:{{{}}}", name, labels_str)
+            format!("{name}:{{{labels_str}}}")
         }
     }
 
     /// Get counter value for testing verification
+    #[must_use]
     pub fn get_counter(&self, name: &str) -> Option<u64> {
         self.counters.get(name).copied()
     }
 
     /// Get counter value with labels for testing verification
+    #[must_use]
     pub fn get_counter_labeled(&self, name: &str, labels: &[(String, String)]) -> Option<u64> {
         let key = Self::make_key(name, labels);
         self.counters.get(&key).copied()
     }
 
     /// Get gauge value for testing verification
+    #[must_use]
     pub fn get_gauge(&self, name: &str) -> Option<f64> {
         self.gauges.get(name).copied()
     }
 
     /// Get gauge value with labels for testing verification
+    #[must_use]
     pub fn get_gauge_labeled(&self, name: &str, labels: &[(String, String)]) -> Option<f64> {
         let key = Self::make_key(name, labels);
         self.gauges.get(&key).copied()
     }
 
     /// Get histogram observations for testing verification
+    #[must_use]
     pub fn get_histogram(&self, name: &str) -> Option<&Vec<f64>> {
         self.histograms.get(name)
     }
@@ -432,6 +441,7 @@ impl Default for DefaultHost {
 
 impl DefaultHost {
     /// Create a new default host with empty storage
+    #[must_use]
     pub fn new() -> Self {
         Self {
             plugin_id: "unknown".to_string(),
@@ -474,10 +484,7 @@ impl DefaultHost {
 
     /// Add a configuration value
     pub fn add_config(&mut self, key: impl Into<String>, value: impl Into<String>) {
-        self.config
-            .write()
-            .expect("config lock poisoned")
-            .insert(key.into(), value.into());
+        self.config.write().insert(key.into(), value.into());
     }
 
     /// Add multiple configuration values
@@ -487,7 +494,7 @@ impl DefaultHost {
         K: Into<String>,
         V: Into<String>,
     {
-        let mut config = self.config.write().expect("config lock poisoned");
+        let mut config = self.config.write();
         for (k, v) in configs {
             config.insert(k.into(), v.into());
         }
@@ -495,10 +502,7 @@ impl DefaultHost {
 
     /// Add a secret
     pub fn add_secret(&mut self, name: impl Into<String>, value: impl Into<String>) {
-        self.secrets
-            .write()
-            .expect("secrets lock poisoned")
-            .insert(name.into(), value.into());
+        self.secrets.write().insert(name.into(), value.into());
     }
 
     /// Add multiple secrets
@@ -508,23 +512,23 @@ impl DefaultHost {
         K: Into<String>,
         V: Into<String>,
     {
-        let mut secrets_store = self.secrets.write().expect("secrets lock poisoned");
+        let mut secrets_store = self.secrets.write();
         for (k, v) in secrets {
             secrets_store.insert(k.into(), v.into());
         }
     }
 
     /// Get a reference to the metrics store for testing verification
-    pub fn metrics(&self) -> std::sync::RwLockReadGuard<'_, MetricsStore> {
-        self.metrics.read().expect("metrics lock poisoned")
+    pub fn metrics(&self) -> parking_lot::RwLockReadGuard<'_, MetricsStore> {
+        self.metrics.read()
     }
 
     /// Clear all stored data (useful for test reset)
     pub fn clear(&mut self) {
-        self.config.write().expect("config lock poisoned").clear();
-        self.kv.write().expect("kv lock poisoned").clear();
-        self.secrets.write().expect("secrets lock poisoned").clear();
-        *self.metrics.write().expect("metrics lock poisoned") = MetricsStore::default();
+        self.config.write().clear();
+        self.kv.write().clear();
+        self.secrets.write().clear();
+        *self.metrics.write() = MetricsStore::default();
     }
 
     /// Validate key format
@@ -547,7 +551,7 @@ impl DefaultHost {
 
     /// Clean expired entries
     fn clean_expired(&self) {
-        let mut kv = self.kv.write().expect("kv lock poisoned");
+        let mut kv = self.kv.write();
         kv.retain(|_, entry| !entry.is_expired());
     }
 }
@@ -558,17 +562,12 @@ impl ZLayerHost for DefaultHost {
     // =========================================================================
 
     fn config_get(&self, key: &str) -> Option<String> {
-        self.config
-            .read()
-            .expect("config lock poisoned")
-            .get(key)
-            .cloned()
+        self.config.read().get(key).cloned()
     }
 
     fn config_get_prefix(&self, prefix: &str) -> Vec<(String, String)> {
         self.config
             .read()
-            .expect("config lock poisoned")
             .iter()
             .filter(|(k, _)| k.starts_with(prefix))
             .map(|(k, v)| (k.clone(), v.clone()))
@@ -576,7 +575,7 @@ impl ZLayerHost for DefaultHost {
     }
 
     fn config_get_all(&self) -> String {
-        let config = self.config.read().expect("config lock poisoned");
+        let config = self.config.read();
         serde_json::to_string(&*config).unwrap_or_else(|_| "{}".to_string())
     }
 
@@ -588,7 +587,7 @@ impl ZLayerHost for DefaultHost {
         Self::validate_key(key)?;
         self.clean_expired();
 
-        let kv = self.kv.read().expect("kv lock poisoned");
+        let kv = self.kv.read();
         match kv.get(key) {
             Some(entry) if !entry.is_expired() => Ok(Some(entry.value.clone())),
             _ => Ok(None),
@@ -602,7 +601,7 @@ impl ZLayerHost for DefaultHost {
             return Err(KvError::ValueTooLarge);
         }
 
-        let mut kv = self.kv.write().expect("kv lock poisoned");
+        let mut kv = self.kv.write();
 
         // Check quota (only if adding new key)
         if !kv.contains_key(key) && kv.len() >= self.max_keys {
@@ -620,7 +619,7 @@ impl ZLayerHost for DefaultHost {
             return Err(KvError::ValueTooLarge);
         }
 
-        let mut kv = self.kv.write().expect("kv lock poisoned");
+        let mut kv = self.kv.write();
 
         // Check quota (only if adding new key)
         if !kv.contains_key(key) && kv.len() >= self.max_keys {
@@ -634,19 +633,19 @@ impl ZLayerHost for DefaultHost {
     fn kv_delete(&mut self, key: &str) -> Result<bool, KvError> {
         Self::validate_key(key)?;
 
-        let mut kv = self.kv.write().expect("kv lock poisoned");
+        let mut kv = self.kv.write();
         Ok(kv.remove(key).is_some())
     }
 
     fn kv_exists(&self, key: &str) -> bool {
         self.clean_expired();
-        let kv = self.kv.read().expect("kv lock poisoned");
-        kv.get(key).map(|e| !e.is_expired()).unwrap_or(false)
+        let kv = self.kv.read();
+        kv.get(key).is_some_and(|e| !e.is_expired())
     }
 
     fn kv_list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError> {
         self.clean_expired();
-        let kv = self.kv.read().expect("kv lock poisoned");
+        let kv = self.kv.read();
         Ok(kv
             .iter()
             .filter(|(k, entry)| k.starts_with(prefix) && !entry.is_expired())
@@ -657,14 +656,14 @@ impl ZLayerHost for DefaultHost {
     fn kv_increment(&mut self, key: &str, delta: i64) -> Result<i64, KvError> {
         Self::validate_key(key)?;
 
-        let mut kv = self.kv.write().expect("kv lock poisoned");
+        let mut kv = self.kv.write();
 
         let current: i64 = match kv.get(key) {
             Some(entry) if !entry.is_expired() => {
                 let s = String::from_utf8(entry.value.clone())
-                    .map_err(|e| KvError::Storage(format!("invalid number: {}", e)))?;
+                    .map_err(|e| KvError::Storage(format!("invalid number: {e}")))?;
                 s.parse()
-                    .map_err(|e| KvError::Storage(format!("invalid number: {}", e)))?
+                    .map_err(|e| KvError::Storage(format!("invalid number: {e}")))?
             }
             _ => 0,
         };
@@ -693,7 +692,7 @@ impl ZLayerHost for DefaultHost {
             return Err(KvError::ValueTooLarge);
         }
 
-        let mut kv = self.kv.write().expect("kv lock poisoned");
+        let mut kv = self.kv.write();
 
         let current = kv.get(key).and_then(|e| {
             if e.is_expired() {
@@ -750,19 +749,19 @@ impl ZLayerHost for DefaultHost {
 
         match level {
             LogLevel::Trace => {
-                tracing::trace!(plugin = %plugin_id, fields = ?fields_json, "{}", message)
+                tracing::trace!(plugin = %plugin_id, fields = ?fields_json, "{}", message);
             }
             LogLevel::Debug => {
-                tracing::debug!(plugin = %plugin_id, fields = ?fields_json, "{}", message)
+                tracing::debug!(plugin = %plugin_id, fields = ?fields_json, "{}", message);
             }
             LogLevel::Info => {
-                tracing::info!(plugin = %plugin_id, fields = ?fields_json, "{}", message)
+                tracing::info!(plugin = %plugin_id, fields = ?fields_json, "{}", message);
             }
             LogLevel::Warn => {
-                tracing::warn!(plugin = %plugin_id, fields = ?fields_json, "{}", message)
+                tracing::warn!(plugin = %plugin_id, fields = ?fields_json, "{}", message);
             }
             LogLevel::Error => {
-                tracing::error!(plugin = %plugin_id, fields = ?fields_json, "{}", message)
+                tracing::error!(plugin = %plugin_id, fields = ?fields_json, "{}", message);
             }
         }
     }
@@ -776,28 +775,15 @@ impl ZLayerHost for DefaultHost {
     // =========================================================================
 
     fn secret_get(&self, name: &str) -> Result<Option<String>, String> {
-        Ok(self
-            .secrets
-            .read()
-            .expect("secrets lock poisoned")
-            .get(name)
-            .cloned())
+        Ok(self.secrets.read().get(name).cloned())
     }
 
     fn secret_exists(&self, name: &str) -> bool {
-        self.secrets
-            .read()
-            .expect("secrets lock poisoned")
-            .contains_key(name)
+        self.secrets.read().contains_key(name)
     }
 
     fn secret_list_names(&self) -> Vec<String> {
-        self.secrets
-            .read()
-            .expect("secrets lock poisoned")
-            .keys()
-            .cloned()
-            .collect()
+        self.secrets.read().keys().cloned().collect()
     }
 
     // =========================================================================
@@ -805,35 +791,35 @@ impl ZLayerHost for DefaultHost {
     // =========================================================================
 
     fn counter_inc(&self, name: &str, value: u64) {
-        let mut metrics = self.metrics.write().expect("metrics lock poisoned");
+        let mut metrics = self.metrics.write();
         *metrics.counters.entry(name.to_string()).or_insert(0) += value;
     }
 
     fn counter_inc_labeled(&self, name: &str, value: u64, labels: &[(String, String)]) {
         let key = MetricsStore::make_key(name, labels);
-        let mut metrics = self.metrics.write().expect("metrics lock poisoned");
+        let mut metrics = self.metrics.write();
         *metrics.counters.entry(key).or_insert(0) += value;
     }
 
     fn gauge_set(&self, name: &str, value: f64) {
-        let mut metrics = self.metrics.write().expect("metrics lock poisoned");
+        let mut metrics = self.metrics.write();
         metrics.gauges.insert(name.to_string(), value);
     }
 
     fn gauge_set_labeled(&self, name: &str, value: f64, labels: &[(String, String)]) {
         let key = MetricsStore::make_key(name, labels);
-        let mut metrics = self.metrics.write().expect("metrics lock poisoned");
+        let mut metrics = self.metrics.write();
         metrics.gauges.insert(key, value);
     }
 
     fn gauge_add(&self, name: &str, delta: f64) {
-        let mut metrics = self.metrics.write().expect("metrics lock poisoned");
+        let mut metrics = self.metrics.write();
         let current = metrics.gauges.entry(name.to_string()).or_insert(0.0);
         *current += delta;
     }
 
     fn histogram_observe(&self, name: &str, value: f64) {
-        let mut metrics = self.metrics.write().expect("metrics lock poisoned");
+        let mut metrics = self.metrics.write();
         metrics
             .histograms
             .entry(name.to_string())
@@ -843,7 +829,7 @@ impl ZLayerHost for DefaultHost {
 
     fn histogram_observe_labeled(&self, name: &str, value: f64, labels: &[(String, String)]) {
         let key = MetricsStore::make_key(name, labels);
-        let mut metrics = self.metrics.write().expect("metrics lock poisoned");
+        let mut metrics = self.metrics.write();
         metrics.histograms.entry(key).or_default().push(value);
     }
 
@@ -859,9 +845,9 @@ impl ZLayerHost for DefaultHost {
     }
 }
 
-/// Add ZLayer host functions to a wasmtime component linker
+/// Add `ZLayer` host functions to a wasmtime component linker
 ///
-/// This registers all ZLayer host interfaces with the linker so WASM components
+/// This registers all `ZLayer` host interfaces with the linker so WASM components
 /// can import and call them. The store must contain a type implementing `ZLayerHost`.
 ///
 /// # Interface Versions
@@ -1340,7 +1326,7 @@ where
     Ok(())
 }
 
-/// Convert KvError to WIT error code
+/// Convert `KvError` to WIT error code
 fn kv_error_to_wit(err: &KvError) -> u8 {
     match err {
         KvError::NotFound => 0,

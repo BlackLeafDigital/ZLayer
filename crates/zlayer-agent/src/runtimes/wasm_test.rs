@@ -1,7 +1,7 @@
 //! Test harness for WASM plugin testing
 //!
 //! This module provides utilities for testing WASM plugins in isolation.
-//! It includes a `TestHost` that implements all ZLayer host interfaces with
+//! It includes a `TestHost` that implements all `ZLayer` host interfaces with
 //! in-memory mock implementations, allowing plugin developers to test their
 //! plugins without needing a full runtime environment.
 //!
@@ -123,7 +123,7 @@ impl std::fmt::Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}.{}.{}", self.major, self.minor, self.patch)?;
         if let Some(ref pre) = self.pre_release {
-            write!(f, "-{}", pre)?;
+            write!(f, "-{pre}")?;
         }
         Ok(())
     }
@@ -158,7 +158,7 @@ pub struct PluginInfo {
 
 /// Internal state for the test host
 ///
-/// This struct implements both [`ZLayerHost`] (for ZLayer host functions)
+/// This struct implements both [`ZLayerHost`] (for `ZLayer` host functions)
 /// and [`WasiView`] (for WASI Preview 2 support).
 pub struct TestHostState {
     /// WASI context for file I/O, environment, etc.
@@ -288,9 +288,9 @@ impl ZLayerHost for TestHostState {
         let current: i64 = match self.kv.get(&bucket_key) {
             Some(bytes) => {
                 let s = String::from_utf8(bytes.clone())
-                    .map_err(|e| KvError::Storage(format!("invalid number: {}", e)))?;
+                    .map_err(|e| KvError::Storage(format!("invalid number: {e}")))?;
                 s.parse()
-                    .map_err(|e| KvError::Storage(format!("invalid number: {}", e)))?
+                    .map_err(|e| KvError::Storage(format!("invalid number: {e}")))?
             }
             None => 0,
         };
@@ -319,7 +319,7 @@ impl ZLayerHost for TestHostState {
         }
 
         let bucket_key = ("default".to_string(), key.to_string());
-        let current = self.kv.get(&bucket_key).map(|v| v.as_slice());
+        let current = self.kv.get(&bucket_key).map(std::vec::Vec::as_slice);
 
         if current == expected {
             if current.is_none() && self.kv.len() >= self.max_keys {
@@ -347,14 +347,14 @@ impl ZLayerHost for TestHostState {
         if level.to_wit() >= self.min_log_level.to_wit() {
             let fields_str = fields
                 .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
+                .map(|(k, v)| format!("{k}={v}"))
                 .collect::<Vec<_>>()
                 .join(" ");
 
             let full_message = if fields_str.is_empty() {
                 message.to_string()
             } else {
-                format!("{} [{}]", message, fields_str)
+                format!("{message} [{fields_str}]")
             };
 
             let mut logs = self.logs.lock().unwrap();
@@ -387,63 +387,57 @@ impl ZLayerHost for TestHostState {
     // =========================================================================
 
     fn counter_inc(&self, name: &str, value: u64) {
-        self.log(
-            LogLevel::Debug,
-            &format!("counter.inc: {} += {}", name, value),
-        );
+        self.log(LogLevel::Debug, &format!("counter.inc: {name} += {value}"));
     }
 
     fn counter_inc_labeled(&self, name: &str, value: u64, labels: &[(String, String)]) {
         let labels_str = labels
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(",");
         self.log(
             LogLevel::Debug,
-            &format!("counter.inc: {}{{{}}} += {}", name, labels_str, value),
+            &format!("counter.inc: {name}{{{labels_str}}} += {value}"),
         );
     }
 
     fn gauge_set(&self, name: &str, value: f64) {
-        self.log(LogLevel::Debug, &format!("gauge.set: {} = {}", name, value));
+        self.log(LogLevel::Debug, &format!("gauge.set: {name} = {value}"));
     }
 
     fn gauge_set_labeled(&self, name: &str, value: f64, labels: &[(String, String)]) {
         let labels_str = labels
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(",");
         self.log(
             LogLevel::Debug,
-            &format!("gauge.set: {}{{{}}} = {}", name, labels_str, value),
+            &format!("gauge.set: {name}{{{labels_str}}} = {value}"),
         );
     }
 
     fn gauge_add(&self, name: &str, delta: f64) {
-        self.log(
-            LogLevel::Debug,
-            &format!("gauge.add: {} += {}", name, delta),
-        );
+        self.log(LogLevel::Debug, &format!("gauge.add: {name} += {delta}"));
     }
 
     fn histogram_observe(&self, name: &str, value: f64) {
         self.log(
             LogLevel::Debug,
-            &format!("histogram.observe: {} <- {}", name, value),
+            &format!("histogram.observe: {name} <- {value}"),
         );
     }
 
     fn histogram_observe_labeled(&self, name: &str, value: f64, labels: &[(String, String)]) {
         let labels_str = labels
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(",");
         self.log(
             LogLevel::Debug,
-            &format!("histogram.observe: {}{{{}}} <- {}", name, labels_str, value),
+            &format!("histogram.observe: {name}{{{labels_str}}} <- {value}"),
         );
     }
 
@@ -451,7 +445,7 @@ impl ZLayerHost for TestHostState {
         let seconds = duration_ns as f64 / 1_000_000_000.0;
         self.log(
             LogLevel::Debug,
-            &format!("duration.record: {} <- {}s", name, seconds),
+            &format!("duration.record: {name} <- {seconds}s"),
         );
     }
 
@@ -459,20 +453,17 @@ impl ZLayerHost for TestHostState {
         let seconds = duration_ns as f64 / 1_000_000_000.0;
         let labels_str = labels
             .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
+            .map(|(k, v)| format!("{k}={v}"))
             .collect::<Vec<_>>()
             .join(",");
         self.log(
             LogLevel::Debug,
-            &format!(
-                "duration.record: {}{{{}}} <- {}s",
-                name, labels_str, seconds
-            ),
+            &format!("duration.record: {name}{{{labels_str}}} <- {seconds}s"),
         );
     }
 }
 
-/// Validate key format (same as DefaultHost)
+/// Validate key format (same as `DefaultHost`)
 fn validate_key(key: &str) -> Result<(), KvError> {
     if key.is_empty() {
         return Err(KvError::InvalidKey);
@@ -583,6 +574,7 @@ impl TestHost {
     ///     .with_config("api.endpoint", "https://api.example.com")
     ///     .with_config("api.timeout_ms", "5000");
     /// ```
+    #[must_use]
     pub fn with_config(mut self, key: &str, value: &str) -> Self {
         self.mock_config.insert(key.to_string(), value.to_string());
         self
@@ -617,6 +609,7 @@ impl TestHost {
     /// let host = TestHost::new()?
     ///     .with_kv("cache", "user:1", b"serialized user data");
     /// ```
+    #[must_use]
     pub fn with_kv(mut self, bucket: &str, key: &str, value: &[u8]) -> Self {
         self.mock_kv
             .insert((bucket.to_string(), key.to_string()), value.to_vec());
@@ -631,6 +624,7 @@ impl TestHost {
     /// let host = TestHost::new()?
     ///     .with_kv_string("cache", "user:1", "{\"name\": \"Alice\"}");
     /// ```
+    #[must_use]
     pub fn with_kv_string(mut self, bucket: &str, key: &str, value: &str) -> Self {
         self.mock_kv.insert(
             (bucket.to_string(), key.to_string()),
@@ -647,6 +641,7 @@ impl TestHost {
     /// let host = TestHost::new()?
     ///     .with_secret("api_key", "sk-test-123456");
     /// ```
+    #[must_use]
     pub fn with_secret(mut self, name: &str, value: &str) -> Self {
         self.mock_secrets
             .insert(name.to_string(), value.to_string());
@@ -654,18 +649,21 @@ impl TestHost {
     }
 
     /// Set maximum value size for KV storage
+    #[must_use]
     pub fn with_max_value_size(mut self, size: usize) -> Self {
         self.max_value_size = size;
         self
     }
 
     /// Set maximum number of keys in KV storage
+    #[must_use]
     pub fn with_max_keys(mut self, count: usize) -> Self {
         self.max_keys = count;
         self
     }
 
     /// Set minimum log level to capture
+    #[must_use]
     pub fn with_min_log_level(mut self, level: LogLevel) -> Self {
         self.min_log_level = level;
         self
@@ -674,7 +672,7 @@ impl TestHost {
     /// Load a plugin from WASM bytes
     ///
     /// This compiles and instantiates the WASM component with all
-    /// ZLayer host interfaces available.
+    /// `ZLayer` host interfaces available.
     ///
     /// # Errors
     ///
@@ -719,11 +717,11 @@ impl TestHost {
 
         // Add WASI interfaces
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-            .map_err(|e| TestError::Instantiation(format!("failed to add WASI: {}", e)))?;
+            .map_err(|e| TestError::Instantiation(format!("failed to add WASI: {e}")))?;
 
         // Add ZLayer host interfaces
         super::wasm_host::add_to_linker(&mut linker)
-            .map_err(|e| TestError::Instantiation(format!("failed to add ZLayer host: {}", e)))?;
+            .map_err(|e| TestError::Instantiation(format!("failed to add ZLayer host: {e}")))?;
 
         // Instantiate
         let instance = linker
@@ -756,6 +754,7 @@ impl TestHost {
     ///
     /// Returns a copy of all log messages captured since the host was created
     /// or since the last call to [`clear_logs`].
+    #[must_use]
     pub fn logs(&self) -> Vec<(LogLevel, String)> {
         self.logs.lock().unwrap().clone()
     }
@@ -766,6 +765,7 @@ impl TestHost {
     }
 
     /// Get logs filtered by level
+    #[must_use]
     pub fn logs_at_level(&self, level: LogLevel) -> Vec<String> {
         self.logs
             .lock()
@@ -777,6 +777,7 @@ impl TestHost {
     }
 
     /// Check if any log message contains the given substring
+    #[must_use]
     pub fn has_log_containing(&self, substring: &str) -> bool {
         self.logs
             .lock()
@@ -786,6 +787,7 @@ impl TestHost {
     }
 
     /// Get the number of captured log messages
+    #[must_use]
     pub fn log_count(&self) -> usize {
         self.logs.lock().unwrap().len()
     }
@@ -839,35 +841,32 @@ impl TestPlugin {
             .get_func(&mut self.store, "zlayer:plugin/handler@0.1.0#init")
             .or_else(|| self.instance.get_func(&mut self.store, "init"));
 
-        match init_func {
-            Some(func) => {
-                // For component model, we need to use typed_func or handle Vals properly
-                // The simplest approach is to call without expecting specific return values
-                // and handle any traps as errors
-                match func.call_async(&mut self.store, &[], &mut []).await {
-                    Ok(()) => {
-                        self.store
-                            .data()
-                            .log(LogLevel::Debug, "init completed successfully");
-                        Ok(Ok(()))
-                    }
-                    Err(e) => {
-                        let error_msg = e.to_string();
-                        self.store
-                            .data()
-                            .log(LogLevel::Error, &format!("init failed: {}", error_msg));
-                        Ok(Err(error_msg))
-                    }
+        if let Some(func) = init_func {
+            // For component model, we need to use typed_func or handle Vals properly
+            // The simplest approach is to call without expecting specific return values
+            // and handle any traps as errors
+            match func.call_async(&mut self.store, &[], &mut []).await {
+                Ok(()) => {
+                    self.store
+                        .data()
+                        .log(LogLevel::Debug, "init completed successfully");
+                    Ok(Ok(()))
+                }
+                Err(e) => {
+                    let error_msg = e.to_string();
+                    self.store
+                        .data()
+                        .log(LogLevel::Error, &format!("init failed: {error_msg}"));
+                    Ok(Err(error_msg))
                 }
             }
-            None => {
-                // No init function is OK - plugin may not need initialization
-                self.store.data().log(
-                    LogLevel::Debug,
-                    "no init function found, skipping initialization",
-                );
-                Ok(Ok(()))
-            }
+        } else {
+            // No init function is OK - plugin may not need initialization
+            self.store.data().log(
+                LogLevel::Debug,
+                "no init function found, skipping initialization",
+            );
+            Ok(Ok(()))
         }
     }
 
@@ -982,6 +981,7 @@ impl TestPlugin {
     }
 
     /// Get a reference to the plugin's state
+    #[must_use]
     pub fn state(&self) -> &TestHostState {
         self.store.data()
     }
@@ -992,6 +992,7 @@ impl TestPlugin {
     }
 
     /// Directly access the KV store
+    #[must_use]
     pub fn get_kv(&self, key: &str) -> Option<Vec<u8>> {
         self.store
             .data()
@@ -1009,6 +1010,7 @@ impl TestPlugin {
     }
 
     /// Get all logs from the plugin's execution
+    #[must_use]
     pub fn logs(&self) -> Vec<(LogLevel, String)> {
         self.store.data().logs.lock().unwrap().clone()
     }

@@ -136,14 +136,14 @@ pub enum BuildError {
         message: String,
     },
 
-    /// ZImagefile YAML deserialization failed
+    /// `ZImagefile` YAML deserialization failed
     #[error("ZImagefile parse error: {message}")]
     ZImagefileParse {
         /// The underlying YAML parse error message
         message: String,
     },
 
-    /// ZImagefile semantic validation failed
+    /// `ZImagefile` semantic validation failed
     #[error("ZImagefile validation error: {message}")]
     ZImagefileValidation {
         /// Description of what validation rule was violated
@@ -159,7 +159,7 @@ pub enum BuildError {
 }
 
 impl BuildError {
-    /// Create a DockerfileParse error from a message and line number
+    /// Create a `DockerfileParse` error from a message and line number
     pub fn parse_error(msg: impl Into<String>, line: usize) -> Self {
         Self::DockerfileParse {
             message: msg.into(),
@@ -167,7 +167,7 @@ impl BuildError {
         }
     }
 
-    /// Create a ContextRead error from a path and IO error
+    /// Create a `ContextRead` error from a path and IO error
     pub fn context_read(path: impl Into<PathBuf>, source: std::io::Error) -> Self {
         Self::ContextRead {
             path: path.into(),
@@ -175,17 +175,17 @@ impl BuildError {
         }
     }
 
-    /// Create a PathEscape error
+    /// Create a `PathEscape` error
     pub fn path_escape(path: impl Into<PathBuf>) -> Self {
         Self::PathEscape { path: path.into() }
     }
 
-    /// Create a StageNotFound error
+    /// Create a `StageNotFound` error
     pub fn stage_not_found(name: impl Into<String>) -> Self {
         Self::StageNotFound { name: name.into() }
     }
 
-    /// Create a RunFailed error
+    /// Create a `RunFailed` error
     pub fn run_failed(command: impl Into<String>, exit_code: i32) -> Self {
         Self::RunFailed {
             command: command.into(),
@@ -193,28 +193,28 @@ impl BuildError {
         }
     }
 
-    /// Create a LayerCreate error
+    /// Create a `LayerCreate` error
     pub fn layer_create(msg: impl Into<String>) -> Self {
         Self::LayerCreate {
             message: msg.into(),
         }
     }
 
-    /// Create a CacheError
+    /// Create a `CacheError`
     pub fn cache_error(msg: impl Into<String>) -> Self {
         Self::CacheError {
             message: msg.into(),
         }
     }
 
-    /// Create a RegistryError
+    /// Create a `RegistryError`
     pub fn registry_error(msg: impl Into<String>) -> Self {
         Self::RegistryError {
             message: msg.into(),
         }
     }
 
-    /// Create an InvalidInstruction error
+    /// Create an `InvalidInstruction` error
     pub fn invalid_instruction(instruction: impl Into<String>, reason: impl Into<String>) -> Self {
         Self::InvalidInstruction {
             instruction: instruction.into(),
@@ -222,7 +222,7 @@ impl BuildError {
         }
     }
 
-    /// Create a BuildahExecution error
+    /// Create a `BuildahExecution` error
     pub fn buildah_execution(
         command: impl Into<String>,
         exit_code: i32,
@@ -235,28 +235,28 @@ impl BuildError {
         }
     }
 
-    /// Create a BuildahNotFound error
+    /// Create a `BuildahNotFound` error
     pub fn buildah_not_found(message: impl Into<String>) -> Self {
         Self::BuildahNotFound {
             message: message.into(),
         }
     }
 
-    /// Create a ZImagefileParse error
+    /// Create a `ZImagefileParse` error
     pub fn zimagefile_parse(message: impl Into<String>) -> Self {
         Self::ZImagefileParse {
             message: message.into(),
         }
     }
 
-    /// Create a ZImagefileValidation error
+    /// Create a `ZImagefileValidation` error
     pub fn zimagefile_validation(message: impl Into<String>) -> Self {
         Self::ZImagefileValidation {
             message: message.into(),
         }
     }
 
-    /// Create a PipelineError
+    /// Create a `PipelineError`
     pub fn pipeline_error(message: impl Into<String>) -> Self {
         Self::PipelineError {
             message: message.into(),

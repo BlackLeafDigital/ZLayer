@@ -1,4 +1,4 @@
-//! A unified progress bar widget for ZLayer TUI applications.
+//! A unified progress bar widget for `ZLayer` TUI applications.
 //!
 //! Replaces the builder's `BuildProgress` and the deploy TUI's
 //! `render_progress_bar()` with a single configurable widget that supports
@@ -57,6 +57,7 @@ impl ProgressBar {
     ///
     /// Defaults: no label, no percentage, bar styled with [`ACCENT`] foreground,
     /// label styled with [`TEXT`] foreground.
+    #[must_use]
     pub fn new(current: usize, total: usize) -> Self {
         Self {
             current,
@@ -75,6 +76,7 @@ impl ProgressBar {
     }
 
     /// Enable a trailing percentage indicator (e.g. `" 30%"`).
+    #[must_use]
     pub fn with_percentage(mut self) -> Self {
         self.show_percentage = true;
         self
@@ -111,6 +113,7 @@ impl ProgressBar {
     /// `width` columns; the suffix is appended after a space.
     ///
     /// If `total` is zero the bar is empty but still occupies `width` columns.
+    #[must_use]
     pub fn to_string_compact(&self, width: usize) -> String {
         let ratio = self.ratio();
         let bar = Self::bar_string(ratio, width);
@@ -123,10 +126,10 @@ impl ProgressBar {
         if self.show_percentage {
             let percent = (ratio * 100.0) as u32;
             suffix.push(' ');
-            suffix.push_str(&format!("{}%", percent));
+            suffix.push_str(&format!("{percent}%"));
         }
 
-        format!("{}{}", bar, suffix)
+        format!("{bar}{suffix}")
     }
 }
 
@@ -148,7 +151,7 @@ impl Widget for ProgressBar {
         if self.show_percentage {
             let percent = (ratio * 100.0) as u32;
             suffix.push(' ');
-            suffix.push_str(&format!("{}%", percent));
+            suffix.push_str(&format!("{percent}%"));
         }
 
         let suffix_width = suffix.len() as u16;

@@ -50,10 +50,10 @@ pub(crate) async fn exec(
 
     // Print output
     if !stdout.is_empty() {
-        print!("{}", stdout);
+        print!("{stdout}");
     }
     if !stderr.is_empty() {
-        eprint!("{}", stderr);
+        eprint!("{stderr}");
     }
 
     if exit_code != 0 {

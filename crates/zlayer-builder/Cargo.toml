@@ -23,7 +23,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
 # Serialization
-serde_yaml.workspace = true
+serde_yml.workspace = true
 
 # Hashing
 sha2.workspace = true
@@ -57,3 +57,6 @@ cache-persistent = ["cache", "zlayer-registry/persistent"]
 cache-s3 = ["cache", "zlayer-registry/s3"]
 # Enable local OCI registry for image resolution (check local store before pulling)
 local-registry = ["cache", "zlayer-registry/local"]
+
+[lints]
+workspace = true

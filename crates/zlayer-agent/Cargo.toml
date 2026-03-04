@@ -24,12 +24,13 @@ wasm = [
     "dep:hyper",
     "dep:anyhow",
 ]
-s3 = ["zlayer-init-actions/s3", "zlayer-registry/s3"]
+s3 = ["zlayer-init-actions/s3", "zlayer-registry/s3", "dep:zlayer-storage"]
 
 [dependencies]
 async-trait.workspace = true
 chrono.workspace = true
 cron.workspace = true
+parking_lot.workspace = true
 zlayer-init-actions.workspace = true
 libc.workspace = true
 nix.workspace = true
@@ -37,7 +38,7 @@ oci-spec.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
+serde_yml.workspace = true
 zlayer-secrets.workspace = true
 zlayer-spec.workspace = true
 thiserror.workspace = true
@@ -51,6 +52,7 @@ zlayer-overlay.workspace = true
 ipnetwork = "0.21.1"
 num_cpus.workspace = true
 zlayer-scheduler.workspace = true
+zlayer-storage = { workspace = true, optional = true }
 ulid = "1.2.1"
 
 # Streaming utilities (needed for Docker streaming)
@@ -89,6 +91,9 @@ libcontainer = "0.5"
 libloading = "0.8"
 
 [dev-dependencies]
-rand = "0.9"
+rand = { workspace = true }
 tempfile = "3.24.0"
 wat = "1.244.0"
+
+[lints]
+workspace = true

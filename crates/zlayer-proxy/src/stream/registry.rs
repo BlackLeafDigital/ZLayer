@@ -26,6 +26,7 @@ pub enum BackendHealth {
 
 impl BackendHealth {
     /// Returns `true` if the backend should be considered usable.
+    #[must_use]
     pub fn is_usable(self) -> bool {
         matches!(self, BackendHealth::Healthy | BackendHealth::Unknown)
     }
@@ -46,6 +47,7 @@ pub struct StreamService {
 
 impl StreamService {
     /// Create a new stream service
+    #[must_use]
     pub fn new(name: String, backends: Vec<SocketAddr>) -> Self {
         let health: HashMap<SocketAddr, BackendHealth> = backends
             .iter()
@@ -63,6 +65,7 @@ impl StreamService {
     ///
     /// Tries up to `backends.len()` candidates. If all backends are unhealthy,
     /// falls back to returning *any* backend (better than nothing).
+    #[must_use]
     pub fn select_backend(&self) -> Option<SocketAddr> {
         if self.backends.is_empty() {
             return None;
@@ -136,6 +139,7 @@ impl StreamService {
     }
 
     /// Get current backend count
+    #[must_use]
     pub fn backend_count(&self) -> usize {
         self.backends.len()
     }
@@ -169,6 +173,7 @@ pub struct StreamRegistry {
 
 impl StreamRegistry {
     /// Create a new empty registry
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -196,11 +201,13 @@ impl StreamRegistry {
     }
 
     /// Resolve TCP service for a port
+    #[must_use]
     pub fn resolve_tcp(&self, port: u16) -> Option<StreamService> {
         self.tcp_services.get(&port).map(|s| s.clone())
     }
 
     /// Resolve UDP service for a port
+    #[must_use]
     pub fn resolve_udp(&self, port: u16) -> Option<StreamService> {
         self.udp_services.get(&port).map(|s| s.clone())
     }
@@ -234,31 +241,37 @@ impl StreamRegistry {
     }
 
     /// Remove a TCP service
+    #[must_use]
     pub fn unregister_tcp(&self, port: u16) -> Option<StreamService> {
         self.tcp_services.remove(&port).map(|(_, s)| s)
     }
 
     /// Remove a UDP service
+    #[must_use]
     pub fn unregister_udp(&self, port: u16) -> Option<StreamService> {
         self.udp_services.remove(&port).map(|(_, s)| s)
     }
 
     /// Get count of registered TCP services
+    #[must_use]
     pub fn tcp_count(&self) -> usize {
         self.tcp_services.len()
     }
 
     /// Get count of registered UDP services
+    #[must_use]
     pub fn udp_count(&self) -> usize {
         self.udp_services.len()
     }
 
     /// List all registered TCP ports
+    #[must_use]
     pub fn tcp_ports(&self) -> Vec<u16> {
         self.tcp_services.iter().map(|e| *e.key()).collect()
     }
 
     /// List all registered UDP ports
+    #[must_use]
     pub fn udp_ports(&self) -> Vec<u16> {
         self.udp_services.iter().map(|e| *e.key()).collect()
     }
@@ -271,6 +284,7 @@ impl StreamRegistry {
     ///
     /// The task runs every `interval` and uses `timeout` for each probe.
     /// Returns a `JoinHandle` that can be used to cancel the checker.
+    #[must_use]
     pub fn spawn_health_checker(
         self: &Arc<Self>,
         interval: Duration,
@@ -287,7 +301,7 @@ impl StreamRegistry {
                 ticker.tick().await;
 
                 // Iterate all TCP services and probe each backend
-                for entry in registry.tcp_services.iter() {
+                for entry in &registry.tcp_services {
                     let service = entry.value().clone();
                     let backends = service.backends.clone();
 

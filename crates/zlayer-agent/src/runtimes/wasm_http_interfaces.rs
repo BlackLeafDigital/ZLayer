@@ -1,7 +1,7 @@
-//! Host-side Rust bindings for ZLayer custom HTTP interfaces
+//! Host-side Rust bindings for `ZLayer` custom HTTP interfaces
 //!
 //! This module provides Rust types and helper functions for interacting with
-//! WASM components that export the custom ZLayer HTTP interfaces defined in
+//! WASM components that export the custom `ZLayer` HTTP interfaces defined in
 //! `wit/zlayer/http.wit`:
 //!
 //! - **Router**: Custom request routing logic
@@ -88,12 +88,14 @@ pub type Timestamp = u64;
 /// Maps to WIT: `type duration = u64`
 pub type DurationNs = u64;
 
-/// Convert std::time::Duration to nanoseconds
+/// Convert `std::time::Duration` to nanoseconds
+#[must_use]
 pub fn duration_to_ns(d: Duration) -> DurationNs {
     d.as_nanos() as u64
 }
 
-/// Convert nanoseconds to std::time::Duration
+/// Convert nanoseconds to `std::time::Duration`
+#[must_use]
 pub fn ns_to_duration(ns: DurationNs) -> Duration {
     Duration::from_nanos(ns)
 }
@@ -182,6 +184,7 @@ impl Default for RequestMetadata {
 
 impl RequestMetadata {
     /// Create metadata for a local request (testing/internal)
+    #[must_use]
     pub fn local() -> Self {
         Self::default()
     }
@@ -209,12 +212,14 @@ impl RequestMetadata {
     }
 
     /// Set HTTP version
+    #[must_use]
     pub fn with_http_version(mut self, version: HttpVersion) -> Self {
         self.http_version = version;
         self
     }
 
     /// Set timestamp
+    #[must_use]
     pub fn with_timestamp(mut self, ts: Timestamp) -> Self {
         self.received_at = ts;
         self
@@ -268,28 +273,33 @@ impl Upstream {
     }
 
     /// Set connection timeout
+    #[must_use]
     pub fn with_connect_timeout(mut self, timeout: Duration) -> Self {
         self.connect_timeout_ns = duration_to_ns(timeout);
         self
     }
 
     /// Set request timeout
+    #[must_use]
     pub fn with_request_timeout(mut self, timeout: Duration) -> Self {
         self.request_timeout_ns = duration_to_ns(timeout);
         self
     }
 
     /// Get connection timeout as Duration
+    #[must_use]
     pub fn connect_timeout(&self) -> Duration {
         ns_to_duration(self.connect_timeout_ns)
     }
 
     /// Get request timeout as Duration
+    #[must_use]
     pub fn request_timeout(&self) -> Duration {
         ns_to_duration(self.request_timeout_ns)
     }
 
     /// Get the upstream URL
+    #[must_use]
     pub fn url(&self) -> String {
         let scheme = if self.tls { "https" } else { "http" };
         format!("{}://{}:{}", scheme, self.host, self.port)
@@ -376,6 +386,7 @@ pub struct ImmediateResponse {
 
 impl ImmediateResponse {
     /// Create a new immediate response
+    #[must_use]
     pub fn new(status: u16) -> Self {
         Self {
             status,
@@ -385,21 +396,25 @@ impl ImmediateResponse {
     }
 
     /// Create a 200 OK response
+    #[must_use]
     pub fn ok() -> Self {
         Self::new(200)
     }
 
     /// Create a 404 Not Found response
+    #[must_use]
     pub fn not_found() -> Self {
         Self::new(404)
     }
 
     /// Create a 403 Forbidden response
+    #[must_use]
     pub fn forbidden() -> Self {
         Self::new(403)
     }
 
     /// Create a 500 Internal Server Error response
+    #[must_use]
     pub fn internal_error() -> Self {
         Self::new(500)
     }
@@ -478,11 +493,13 @@ impl RoutingDecision {
     }
 
     /// Create an immediate response
+    #[must_use]
     pub fn respond(status: u16) -> Self {
         Self::RespondImmediate(ImmediateResponse::new(status))
     }
 
     /// Continue processing (pass to next handler)
+    #[must_use]
     pub fn continue_processing() -> Self {
         Self::ContinueProcessing
     }
@@ -516,11 +533,13 @@ pub enum MiddlewareAction {
 
 impl MiddlewareAction {
     /// Continue without modifications
+    #[must_use]
     pub fn continue_unchanged() -> Self {
         Self::ContinueWith(Vec::new())
     }
 
     /// Continue with additional headers
+    #[must_use]
     pub fn continue_with_headers(headers: Vec<KeyValue>) -> Self {
         Self::ContinueWith(headers)
     }
@@ -579,11 +598,13 @@ impl MiddlewareAction {
     }
 
     /// Check if this action allows continuation
+    #[must_use]
     pub fn is_continue(&self) -> bool {
         matches!(self, Self::ContinueWith(_))
     }
 
     /// Check if this action is an abort
+    #[must_use]
     pub fn is_abort(&self) -> bool {
         matches!(self, Self::Abort { .. })
     }
@@ -678,6 +699,7 @@ impl WebSocketMessage {
     }
 
     /// Create a close message
+    #[must_use]
     pub fn close() -> Self {
         Self {
             msg_type: MessageType::Close,
@@ -686,6 +708,7 @@ impl WebSocketMessage {
     }
 
     /// Create a close message with a reason code
+    #[must_use]
     pub fn close_with_code(code: u16) -> Self {
         Self {
             msg_type: MessageType::Close,
@@ -694,6 +717,7 @@ impl WebSocketMessage {
     }
 
     /// Get text content if this is a text message
+    #[must_use]
     pub fn as_text(&self) -> Option<&str> {
         if self.msg_type == MessageType::Text {
             std::str::from_utf8(&self.data).ok()
@@ -703,6 +727,7 @@ impl WebSocketMessage {
     }
 
     /// Check if this is a control frame (ping, pong, close)
+    #[must_use]
     pub fn is_control(&self) -> bool {
         matches!(
             self.msg_type,
@@ -738,11 +763,13 @@ pub enum UpgradeDecision {
 
 impl UpgradeDecision {
     /// Accept the WebSocket upgrade
+    #[must_use]
     pub fn accept() -> Self {
         Self::Accept
     }
 
     /// Accept with custom response headers
+    #[must_use]
     pub fn accept_with_headers(headers: Vec<KeyValue>) -> Self {
         Self::AcceptWithHeaders(headers)
     }
@@ -777,6 +804,7 @@ impl UpgradeDecision {
     }
 
     /// Check if this decision accepts the upgrade
+    #[must_use]
     pub fn is_accepted(&self) -> bool {
         matches!(self, Self::Accept | Self::AcceptWithHeaders(_))
     }
@@ -811,6 +839,7 @@ pub struct CacheEntry {
 
 impl CacheEntry {
     /// Create a new cache entry with the specified TTL
+    #[must_use]
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl_ns: duration_to_ns(ttl),
@@ -821,6 +850,7 @@ impl CacheEntry {
     }
 
     /// Set TTL in seconds (convenience)
+    #[must_use]
     pub fn ttl_secs(seconds: u64) -> Self {
         Self::new(Duration::from_secs(seconds))
     }
@@ -844,12 +874,14 @@ impl CacheEntry {
     }
 
     /// Set stale-while-revalidate window
+    #[must_use]
     pub fn with_stale_while_revalidate(mut self, duration: Duration) -> Self {
         self.stale_while_revalidate_ns = Some(duration_to_ns(duration));
         self
     }
 
     /// Get TTL as Duration
+    #[must_use]
     pub fn ttl(&self) -> Duration {
         ns_to_duration(self.ttl_ns)
     }
@@ -882,31 +914,37 @@ pub enum CacheDecision {
 
 impl CacheDecision {
     /// Don't cache this response
+    #[must_use]
     pub fn no_cache() -> Self {
         Self::NoCache
     }
 
     /// Cache for the specified duration
+    #[must_use]
     pub fn cache_for(duration: Duration) -> Self {
         Self::CacheFor(duration_to_ns(duration))
     }
 
     /// Cache for N seconds
+    #[must_use]
     pub fn cache_for_secs(seconds: u64) -> Self {
         Self::cache_for(Duration::from_secs(seconds))
     }
 
     /// Cache with full entry metadata
+    #[must_use]
     pub fn cache_with_entry(entry: CacheEntry) -> Self {
         Self::CacheWithTags(entry)
     }
 
     /// Check if caching is enabled
+    #[must_use]
     pub fn is_cacheable(&self) -> bool {
         !matches!(self, Self::NoCache)
     }
 
     /// Get the TTL if cacheable
+    #[must_use]
     pub fn ttl(&self) -> Option<Duration> {
         match self {
             Self::NoCache => None,
@@ -973,7 +1011,7 @@ impl std::str::FromStr for HttpMethod {
             "OPTIONS" => Ok(HttpMethod::Options),
             "CONNECT" => Ok(HttpMethod::Connect),
             "TRACE" => Ok(HttpMethod::Trace),
-            _ => Err(format!("Unknown HTTP method: {}", s)),
+            _ => Err(format!("Unknown HTTP method: {s}")),
         }
     }
 }
@@ -1066,6 +1104,7 @@ impl PluginRequest {
     }
 
     /// Get a header value by name (case-insensitive)
+    #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
             .iter()
@@ -1074,6 +1113,7 @@ impl PluginRequest {
     }
 
     /// Get a context value by key
+    #[must_use]
     pub fn context_value(&self, key: &str) -> Option<&str> {
         self.context
             .iter()
@@ -1082,6 +1122,7 @@ impl PluginRequest {
     }
 
     /// Get the full URI (path + query)
+    #[must_use]
     pub fn uri(&self) -> String {
         match &self.query {
             Some(q) if !q.is_empty() => format!("{}?{}", self.path, q),

@@ -55,16 +55,16 @@ pub async fn cmd_pipeline(
     for s in &set {
         let (key, value) = s
             .split_once('=')
-            .with_context(|| format!("Invalid --set format '{}', expected KEY=VALUE", s))?;
+            .with_context(|| format!("Invalid --set format '{s}', expected KEY=VALUE"))?;
         pipeline.vars.insert(key.to_string(), value.to_string());
     }
 
     // 3. Filter --only images
     if let Some(ref only_filter) = only {
-        let names: HashSet<&str> = only_filter.split(',').map(|s| s.trim()).collect();
+        let names: HashSet<&str> = only_filter.split(',').map(str::trim).collect();
         pipeline.images.retain(|k, _| names.contains(k.as_str()));
         if pipeline.images.is_empty() {
-            bail!("No images match --only filter: {}", only_filter);
+            bail!("No images match --only filter: {only_filter}");
         }
     }
 
@@ -103,7 +103,7 @@ pub async fn cmd_pipeline(
     if !result.failed.is_empty() {
         println!("  Failed: {}", result.failed.len());
         for (name, err) in &result.failed {
-            println!("    {}: {}", name, err);
+            println!("    {name}: {err}");
         }
         bail!("Pipeline failed with {} errors", result.failed.len());
     }

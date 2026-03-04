@@ -16,11 +16,10 @@ pub fn is_upgrade_request<B>(req: &Request<B>) -> bool {
     req.headers()
         .get(header::CONNECTION)
         .and_then(|h| h.to_str().ok())
-        .map(|v| {
+        .is_some_and(|v| {
             v.split(',')
                 .any(|t| t.trim().eq_ignore_ascii_case("upgrade"))
         })
-        .unwrap_or(false)
 }
 
 /// Check if a request is a WebSocket upgrade request
@@ -34,8 +33,7 @@ pub fn is_websocket_upgrade<B>(req: &Request<B>) -> bool {
     req.headers()
         .get(header::UPGRADE)
         .and_then(|h| h.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false)
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
 }
 
 /// Get the upgrade protocol from a request
@@ -85,7 +83,7 @@ where
 
 /// Handle upgrade with explicit upgrade futures
 ///
-/// This is a higher-level function that takes OnUpgrade futures from hyper
+/// This is a higher-level function that takes `OnUpgrade` futures from hyper
 /// and handles the bidirectional copying between them.
 pub async fn proxy_upgrade(client_upgrade: OnUpgrade, server_upgrade: OnUpgrade) -> Result<()> {
     // Wait for both upgrades to complete
@@ -93,12 +91,12 @@ pub async fn proxy_upgrade(client_upgrade: OnUpgrade, server_upgrade: OnUpgrade)
 
     let client_io = client_result.map_err(|e| {
         error!(error = %e, "Client upgrade failed");
-        ProxyError::Internal(format!("Client upgrade failed: {}", e))
+        ProxyError::Internal(format!("Client upgrade failed: {e}"))
     })?;
 
     let server_io = server_result.map_err(|e| {
         error!(error = %e, "Server upgrade failed");
-        ProxyError::Internal(format!("Server upgrade failed: {}", e))
+        ProxyError::Internal(format!("Server upgrade failed: {e}"))
     })?;
 
     info!("Upgrade successful, starting bidirectional tunnel");
@@ -134,6 +132,7 @@ const WEBSOCKET_HEADERS: &[&str] = &[
 ];
 
 /// Check if a header should be preserved for WebSocket upgrades
+#[must_use]
 pub fn is_websocket_header(name: &str) -> bool {
     WEBSOCKET_HEADERS
         .iter()

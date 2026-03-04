@@ -57,7 +57,7 @@ pub(crate) async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) 
     println!("  Digest: {}", import_info.digest);
     println!("  Layers: {}", import_info.layers);
     if let Some(tag) = import_info.tag {
-        println!("  Tagged as: {}", tag);
+        println!("  Tagged as: {tag}");
     }
 
     Ok(())
@@ -68,7 +68,7 @@ pub(crate) async fn handle_pull(image: &str, cli_data_dir: &std::path::Path) -> 
     use zlayer_registry::{BlobCache, ImagePuller, LocalRegistry, RegistryAuth};
 
     info!(image = %image, "Pulling image from registry");
-    println!("Pulling {}...", image);
+    println!("Pulling {image}...");
 
     // Set up directories
     let data_dir = cli_data_dir.to_path_buf();
@@ -103,7 +103,7 @@ pub(crate) async fn handle_pull(image: &str, cli_data_dir: &std::path::Path) -> 
     // Calculate total size
     let total_size: i64 = manifest.layers.iter().map(|l| l.size).sum();
     let total_mb = total_size as f64 / 1024.0 / 1024.0;
-    println!("  Total size: {:.2} MB", total_mb);
+    println!("  Total size: {total_mb:.2} MB");
 
     // Pull all layers
     println!("\nPulling layers...");
@@ -154,8 +154,8 @@ pub(crate) async fn handle_pull(image: &str, cli_data_dir: &std::path::Path) -> 
         .context("Failed to store manifest")?;
 
     println!("\nPull complete!");
-    println!("  Image: {}:{}", name, tag);
-    println!("  Digest: {}", manifest_digest);
+    println!("  Image: {name}:{tag}");
+    println!("  Digest: {manifest_digest}");
     println!("  Layers: {}", layers.len());
 
     Ok(())

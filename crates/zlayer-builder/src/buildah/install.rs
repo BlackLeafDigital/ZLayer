@@ -86,6 +86,7 @@ impl BuildahInstaller {
     ///
     /// User install directory: `~/.zlayer/bin/`
     /// System install directory: `/usr/local/lib/zlayer/`
+    #[must_use]
     pub fn new() -> Self {
         let install_dir = default_install_dir();
         Self {
@@ -95,6 +96,7 @@ impl BuildahInstaller {
     }
 
     /// Create with custom install directory
+    #[must_use]
     pub fn with_install_dir(dir: PathBuf) -> Self {
         Self {
             install_dir: dir,
@@ -103,11 +105,13 @@ impl BuildahInstaller {
     }
 
     /// Get the install directory
+    #[must_use]
     pub fn install_dir(&self) -> &Path {
         &self.install_dir
     }
 
     /// Get the minimum required version
+    #[must_use]
     pub fn min_version(&self) -> &str {
         self.min_version
     }
@@ -265,6 +269,7 @@ impl BuildahInstaller {
 }
 
 /// Get the current platform (OS and architecture)
+#[must_use]
 pub fn current_platform() -> (&'static str, &'static str) {
     let os = std::env::consts::OS; // "linux", "macos", "windows"
     let arch = std::env::consts::ARCH; // "x86_64", "aarch64"
@@ -275,15 +280,14 @@ pub fn current_platform() -> (&'static str, &'static str) {
 ///
 /// Buildah is primarily a Linux tool, though it can work on macOS
 /// through virtualization.
+#[must_use]
 pub fn is_platform_supported() -> bool {
     let (os, arch) = current_platform();
-    matches!(
-        (os, arch),
-        ("linux", "x86_64" | "aarch64") | ("macos", "x86_64" | "aarch64")
-    )
+    matches!((os, arch), ("linux" | "macos", "x86_64" | "aarch64"))
 }
 
 /// Get installation instructions for the current platform
+#[must_use]
 pub fn install_instructions() -> String {
     let (os, _arch) = current_platform();
 
@@ -337,7 +341,7 @@ pub fn install_instructions() -> String {
 // Internal Helper Functions
 // ============================================================================
 
-/// Get the default install directory for ZLayer binaries
+/// Get the default install directory for `ZLayer` binaries
 fn default_install_dir() -> PathBuf {
     // Try user directory first
     if let Some(home) = dirs::home_dir() {
@@ -394,7 +398,7 @@ async fn find_in_path(binary: &str) -> Option<PathBuf> {
 
     // Also try `command -v` as a fallback (works in more shells)
     let output = Command::new("sh")
-        .args(["-c", &format!("command -v {}", binary)])
+        .args(["-c", &format!("command -v {binary}")])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -441,8 +445,7 @@ fn parse_version(output: &str) -> Result<String, InstallError> {
     }
 
     Err(InstallError::VersionParse(format!(
-        "Could not parse version from: {}",
-        output
+        "Could not parse version from: {output}"
     )))
 }
 

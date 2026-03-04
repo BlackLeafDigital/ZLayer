@@ -1,4 +1,4 @@
-//! ZLayer Scheduler - Distributed autoscaling with OpenRaft
+//! `ZLayer` Scheduler - Distributed autoscaling with `OpenRaft`
 //!
 //! This crate provides:
 //! - **Metrics collection** from container runtimes
@@ -107,7 +107,7 @@ pub struct Scheduler {
     agent_base_url: String,
     /// Placement state tracking where containers are placed across nodes
     placement_state: Arc<RwLock<PlacementState>>,
-    /// Service specs for placement decisions (service_name -> ServiceSpec)
+    /// Service specs for placement decisions (`service_name` -> `ServiceSpec`)
     service_specs: Arc<RwLock<HashMap<String, ServiceSpec>>>,
 }
 
@@ -117,7 +117,8 @@ impl Scheduler {
     /// # Arguments
     /// * `config` - Scheduler configuration
     /// * `internal_token` - Token for authenticating with agent internal endpoints
-    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:3669")
+    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "<http://localhost:3669>")
+    #[must_use]
     pub fn new_standalone(
         config: SchedulerConfig,
         internal_token: String,
@@ -142,7 +143,7 @@ impl Scheduler {
     /// # Arguments
     /// * `config` - Scheduler configuration
     /// * `internal_token` - Token for authenticating with agent internal endpoints
-    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:3669")
+    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "<http://localhost:3669>")
     pub async fn new_distributed(
         config: SchedulerConfig,
         internal_token: String,
@@ -177,7 +178,8 @@ impl Scheduler {
     /// * `config` - Scheduler configuration
     /// * `raft` - Pre-existing Raft coordinator
     /// * `internal_token` - Token for authenticating with agent internal endpoints
-    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:3669")
+    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "<http://localhost:3669>")
+    #[must_use]
     pub fn with_raft(
         config: SchedulerConfig,
         raft: Arc<RaftCoordinator>,
@@ -336,8 +338,7 @@ impl Scheduler {
                     .await
                     .unwrap_or_else(|_| "unknown".to_string());
                 return Err(SchedulerError::AgentCommunication(format!(
-                    "agent returned status {}: {}",
-                    status, body
+                    "agent returned status {status}: {body}"
                 )));
             }
 
@@ -393,7 +394,7 @@ impl Scheduler {
     /// Uses the placement module's `place_service_replicas` to run bin-packing,
     /// dedicated, or exclusive placement depending on the service's `node_mode`.
     ///
-    /// Returns a map of node_id -> list of container IDs assigned to that node.
+    /// Returns a map of `node_id` -> list of container IDs assigned to that node.
     fn compute_placement(
         &self,
         service_name: &str,
@@ -520,7 +521,7 @@ impl Scheduler {
                 3669 // Default ZLayer API port
             };
 
-            let url = format!("http://{}:{}/api/v1/internal/scale", addr, port);
+            let url = format!("http://{addr}:{port}/api/v1/internal/scale");
 
             info!(
                 service = service_name,
@@ -748,7 +749,7 @@ impl Scheduler {
                         }
                     }
                 }
-                _ = self.shutdown.notified() => {
+                () = self.shutdown.notified() => {
                     info!("Scheduler shutdown requested");
                     break;
                 }

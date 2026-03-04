@@ -27,93 +27,92 @@ pub(crate) async fn status(_cli: &Cli) -> Result<()> {
     // Try connecting to the daemon without auto-starting it
     let client = crate::daemon_client::DaemonClient::try_connect_to(&socket_path).await;
 
-    match client {
-        Ok(Some(client)) => {
-            // Daemon is running -- show rich status
-            println!();
-            println!("ZLayer Daemon");
+    if let Ok(Some(client)) = client {
+        // Daemon is running -- show rich status
+        println!();
+        println!("ZLayer Daemon");
 
-            // PID from daemon.json
-            if let Some(ref meta) = metadata {
-                if let Some(pid) = meta.get("pid").and_then(|v| v.as_u64()) {
-                    println!("  Status:    running (PID {})", pid);
-                } else {
-                    println!("  Status:    running");
-                }
-                if let Some(api_bind) = meta.get("api_bind").and_then(|v| v.as_str()) {
-                    println!("  API:       {}", api_bind);
-                }
+        // PID from daemon.json
+        if let Some(ref meta) = metadata {
+            if let Some(pid) = meta.get("pid").and_then(serde_json::Value::as_u64) {
+                println!("  Status:    running (PID {pid})");
             } else {
                 println!("  Status:    running");
             }
+            if let Some(api_bind) = meta.get("api_bind").and_then(|v| v.as_str()) {
+                println!("  API:       {api_bind}");
+            }
+        } else {
+            println!("  Status:    running");
+        }
 
-            println!("  Socket:    {}", socket_path);
+        println!("  Socket:    {socket_path}");
 
-            // Detect runtime from metadata or platform
-            if let Some(ref meta) = metadata {
-                if let Some(host_net) = meta.get("host_network").and_then(|v| v.as_bool()) {
-                    if host_net {
-                        println!("  Network:   host");
+        // Detect runtime from metadata or platform
+        if let Some(ref meta) = metadata {
+            if let Some(host_net) = meta
+                .get("host_network")
+                .and_then(serde_json::Value::as_bool)
+            {
+                if host_net {
+                    println!("  Network:   host");
+                }
+            }
+        }
+
+        println!("  Runtime:   {}", detect_runtime_name());
+
+        // Fetch deployment info
+        println!();
+        match client.list_deployments().await {
+            Ok(deployments) if deployments.is_empty() => {
+                println!("Deployments: none");
+            }
+            Ok(deployments) => {
+                let active_count = deployments.len();
+                println!("Deployments: {active_count} active");
+
+                for dep in &deployments {
+                    let name = dep
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let status = dep
+                        .get("status")
+                        .and_then(|v| {
+                            v.as_str()
+                                .map(std::string::ToString::to_string)
+                                .or_else(|| serde_json::to_string(v).ok())
+                        })
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    // Try to get service/replica counts from the spec
+                    let (svc_count, replica_count) = extract_deployment_counts(dep);
+
+                    if svc_count > 0 {
+                        println!(
+                            "  {name}: {svc_count} services, {replica_count} replicas ({status})"
+                        );
+                    } else {
+                        println!("  {name}: ({status})");
                     }
                 }
             }
-
-            println!("  Runtime:   {}", detect_runtime_name());
-
-            // Fetch deployment info
-            println!();
-            match client.list_deployments().await {
-                Ok(deployments) if deployments.is_empty() => {
-                    println!("Deployments: none");
-                }
-                Ok(deployments) => {
-                    let active_count = deployments.len();
-                    println!("Deployments: {} active", active_count);
-
-                    for dep in &deployments {
-                        let name = dep
-                            .get("name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown");
-                        let status = dep
-                            .get("status")
-                            .and_then(|v| {
-                                v.as_str()
-                                    .map(|s| s.to_string())
-                                    .or_else(|| serde_json::to_string(v).ok())
-                            })
-                            .unwrap_or_else(|| "unknown".to_string());
-
-                        // Try to get service/replica counts from the spec
-                        let (svc_count, replica_count) = extract_deployment_counts(dep);
-
-                        if svc_count > 0 {
-                            println!(
-                                "  {}: {} services, {} replicas ({})",
-                                name, svc_count, replica_count, status
-                            );
-                        } else {
-                            println!("  {}: ({})", name, status);
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to fetch deployments");
-                    println!("Deployments: error fetching ({})", e);
-                }
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch deployments");
+                println!("Deployments: error fetching ({e})");
             }
+        }
 
-            println!();
-        }
-        Ok(None) | Err(_) => {
-            // Daemon is not running
-            println!();
-            println!("ZLayer Daemon: not running");
-            println!();
-            println!("  Start:  zlayer serve --daemon");
-            println!("  Or:     zlayer up (auto-starts daemon)");
-            println!();
-        }
+        println!();
+    } else {
+        // Daemon is not running
+        println!();
+        println!("ZLayer Daemon: not running");
+        println!();
+        println!("  Start:  zlayer serve --daemon");
+        println!("  Or:     zlayer up (auto-starts daemon)");
+        println!();
     }
 
     Ok(())
@@ -139,9 +138,9 @@ fn extract_deployment_counts(dep: &serde_json::Value) -> (usize, u32) {
         let mut total_replicas: u32 = 0;
         for (_name, svc) in services {
             if let Some(scale) = svc.get("scale") {
-                if let Some(replicas) = scale.get("replicas").and_then(|r| r.as_u64()) {
+                if let Some(replicas) = scale.get("replicas").and_then(serde_json::Value::as_u64) {
                     total_replicas += replicas as u32;
-                } else if let Some(min) = scale.get("min").and_then(|r| r.as_u64()) {
+                } else if let Some(min) = scale.get("min").and_then(serde_json::Value::as_u64) {
                     total_replicas += min as u32;
                 } else {
                     total_replicas += 1;
@@ -184,7 +183,7 @@ pub(crate) async fn validate(spec_path: &Path) -> Result<()> {
         }
         Err(e) => {
             println!("Spec validation: FAILED");
-            println!("Error: {}", e);
+            println!("Error: {e}");
             Err(e)
         }
     }
@@ -225,7 +224,7 @@ pub(crate) async fn logs(
 
         // Read lines from the channel until the stream ends or Ctrl+C.
         while let Some(line) = rx.recv().await {
-            println!("{}", line);
+            println!("{line}");
         }
     } else {
         // ---- Non-follow mode: one-shot fetch ----
@@ -234,7 +233,7 @@ pub(crate) async fn logs(
             .await
             .context("Failed to fetch logs from daemon")?;
 
-        print!("{}", log_output);
+        print!("{log_output}");
     }
 
     Ok(())
@@ -243,7 +242,7 @@ pub(crate) async fn logs(
 /// Stop a deployment or specific service
 ///
 /// Directly stops and removes containers via the runtime, rather than going through
-/// ServiceManager (which has no knowledge of already-running containers).
+/// `ServiceManager` (which has no knowledge of already-running containers).
 /// If a spec is found matching the deployment, it iterates over services and replicas.
 /// Also scans the state directory for any extra containers beyond the spec's replica count.
 pub(crate) async fn stop(
@@ -256,7 +255,7 @@ pub(crate) async fn stop(
     use std::time::Duration;
 
     let target = match &service {
-        Some(s) => format!("{}/{}", deployment, s),
+        Some(s) => format!("{deployment}/{s}"),
         None => deployment.to_string(),
     };
 
@@ -268,9 +267,9 @@ pub(crate) async fn stop(
     );
 
     if force {
-        println!("Force stopping {}...", target);
+        println!("Force stopping {target}...");
     } else {
-        println!("Gracefully stopping {} (timeout: {}s)...", target, timeout);
+        println!("Gracefully stopping {target} (timeout: {timeout}s)...");
     }
 
     // Try to discover and parse the spec for this deployment
@@ -310,7 +309,7 @@ pub(crate) async fn stop(
                     zlayer_spec::ScaleSpec::Manual => 1,
                 };
 
-                println!("  Stopping service: {} (up to {} replicas)", name, replicas);
+                println!("  Stopping service: {name} (up to {replicas} replicas)");
 
                 for replica in 1..=replicas {
                     let id = zlayer_agent::ContainerId {
@@ -328,7 +327,7 @@ pub(crate) async fn stop(
                 }
 
                 // Scan state dir for any extra containers beyond the spec replica count
-                let prefix = format!("{}-", name);
+                let prefix = format!("{name}-");
                 if let Ok(mut entries) = tokio::fs::read_dir(state_dir).await {
                     while let Ok(Some(entry)) = entries.next_entry().await {
                         let entry_name = entry.file_name().to_string_lossy().to_string();
@@ -359,13 +358,13 @@ pub(crate) async fn stop(
                 }
             }
 
-            println!("Stopped {} container(s).", stopped_count);
+            println!("Stopped {stopped_count} container(s).");
             return Ok(());
         }
     }
 
     // Fallback: no spec available, just print message
-    println!("No spec found for deployment '{}'. Use the spec file path or run from the deployment directory.", deployment);
+    println!("No spec found for deployment '{deployment}'. Use the spec file path or run from the deployment directory.");
     Ok(())
 }
 
@@ -381,17 +380,17 @@ fn print_deployment_plan(spec: &DeploymentSpec) {
     println!();
 
     for (name, service) in &spec.services {
-        println!("  Service: {}", name);
+        println!("  Service: {name}");
         println!("    Image: {}", service.image.name);
         println!("    Type: {:?}", service.rtype);
 
         // Print scaling info
         match &service.scale {
             zlayer_spec::ScaleSpec::Fixed { replicas } => {
-                println!("    Scale: fixed ({} replicas)", replicas);
+                println!("    Scale: fixed ({replicas} replicas)");
             }
             zlayer_spec::ScaleSpec::Adaptive { min, max, .. } => {
-                println!("    Scale: adaptive ({}-{} replicas)", min, max);
+                println!("    Scale: adaptive ({min}-{max} replicas)");
             }
             zlayer_spec::ScaleSpec::Manual => {
                 println!("    Scale: manual");
@@ -402,10 +401,10 @@ fn print_deployment_plan(spec: &DeploymentSpec) {
         if service.resources.cpu.is_some() || service.resources.memory.is_some() {
             print!("    Resources:");
             if let Some(cpu) = service.resources.cpu {
-                print!(" cpu={}", cpu);
+                print!(" cpu={cpu}");
             }
             if let Some(ref mem) = service.resources.memory {
-                print!(" memory={}", mem);
+                print!(" memory={mem}");
             }
             println!();
         }

@@ -99,6 +99,7 @@ impl ImagePuller {
     }
 
     /// Create a new image puller with boxed cache backend
+    #[must_use]
     pub fn with_cache(cache: Arc<Box<dyn BlobCacheBackend>>) -> Self {
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
@@ -206,7 +207,7 @@ impl ImagePuller {
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
         // Cache key: use "manifest:" prefix + image reference
-        let cache_key = format!("manifest:{}", image);
+        let cache_key = format!("manifest:{image}");
 
         // Check cache first
         if let Ok(Some(data)) = self.cache.get(&cache_key).await {
@@ -304,7 +305,7 @@ impl ImagePuller {
             has_cmd = config.cmd.is_some(),
             has_working_dir = config.working_dir.is_some(),
             has_user = config.user.is_some(),
-            env_count = config.env.as_ref().map_or(0, |e| e.len()),
+            env_count = config.env.as_ref().map_or(0, std::vec::Vec::len),
             "image config parsed successfully"
         );
 
@@ -422,7 +423,7 @@ impl ImagePuller {
 
     /// Pull a complete image (manifest + all layers)
     ///
-    /// Returns a vector of (layer_data, media_type) tuples in order (base layer first).
+    /// Returns a vector of (`layer_data`, `media_type`) tuples in order (base layer first).
     pub async fn pull_image(
         &self,
         image: &str,

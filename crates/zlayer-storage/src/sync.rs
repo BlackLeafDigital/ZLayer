@@ -79,13 +79,13 @@ impl LayerSyncManager {
 
         // Create sync_state table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS sync_state (
                 container_key TEXT PRIMARY KEY NOT NULL,
                 state_json TEXT NOT NULL,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
-            "#,
+            ",
         )
         .execute(&pool)
         .await
@@ -123,10 +123,10 @@ impl LayerSyncManager {
         let value = serde_json::to_string(state)?;
 
         sqlx::query(
-            r#"
+            r"
             INSERT OR REPLACE INTO sync_state (container_key, state_json, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
-            "#,
+            ",
         )
         .bind(&key)
         .bind(&value)
@@ -213,7 +213,7 @@ impl LayerSyncManager {
         let tarball_path = self
             .config
             .staging_dir
-            .join(format!("{}.tar.zst", current_digest));
+            .join(format!("{current_digest}.tar.zst"));
 
         let snapshot = tokio::task::spawn_blocking({
             let source = upper_layer_path.to_path_buf();
@@ -367,7 +367,7 @@ impl LayerSyncManager {
         let mut completed = Vec::new();
 
         for part_number in 1..=total_parts {
-            let offset = (part_number as u64 - 1) * part_size;
+            let offset = (u64::from(part_number) - 1) * part_size;
 
             // Read part data
             let mut file = File::open(tarball_path).await?;
@@ -436,7 +436,7 @@ impl LayerSyncManager {
 
             // Upload missing parts
             for part_number in missing {
-                let offset = (part_number as u64 - 1) * pending.part_size;
+                let offset = (u64::from(part_number) - 1) * pending.part_size;
 
                 let mut file = File::open(&pending.local_tarball_path).await?;
                 file.seek(std::io::SeekFrom::Start(offset)).await?;
@@ -555,9 +555,7 @@ impl LayerSyncManager {
             states
                 .get(&key)
                 .and_then(|s| s.remote_digest.clone())
-                .ok_or_else(|| {
-                    LayerStorageError::NotFound(format!("No remote layer for {}", key))
-                })?
+                .ok_or_else(|| LayerStorageError::NotFound(format!("No remote layer for {key}")))?
         };
 
         info!("Restoring layer {} from S3", remote_digest);
@@ -566,7 +564,7 @@ impl LayerSyncManager {
         let tarball_path = self
             .config
             .staging_dir
-            .join(format!("{}.tar.zst", remote_digest));
+            .join(format!("{remote_digest}.tar.zst"));
 
         let object_key = self.config.object_key(&remote_digest);
         let response = self

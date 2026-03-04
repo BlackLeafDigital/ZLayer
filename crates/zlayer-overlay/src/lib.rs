@@ -1,10 +1,10 @@
-//! ZLayer Overlay - Encrypted overlay networking via boringtun
+//! `ZLayer` Overlay - Encrypted overlay networking via boringtun
 //!
 //! Provides encrypted overlay networks using boringtun (Cloudflare's Rust userspace
-//! WireGuard implementation) with DNS service discovery, automatic bootstrap on
+//! `WireGuard` implementation) with DNS service discovery, automatic bootstrap on
 //! node init/join, IP allocation, and health checking.
 //!
-//! No kernel WireGuard module or wireguard-tools required -- uses TUN devices
+//! No kernel `WireGuard` module or wireguard-tools required -- uses TUN devices
 //! via `/dev/net/tun` and configures peers via the UAPI protocol.
 //!
 //! # Modules

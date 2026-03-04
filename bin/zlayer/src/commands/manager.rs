@@ -34,7 +34,7 @@ pub(crate) async fn handle_manager_init(
     // We use target_port to tell the proxy where the container actually listens,
     // while `port` is the external-facing proxy listen port.
     let spec = format!(
-        r#"version: v1
+        r"version: v1
 deployment: zlayer-manager
 
 services:
@@ -59,9 +59,7 @@ services:
       check:
         type: http
         url: http://localhost:9120/health
-"#,
-        version = version,
-        port = port
+"
     );
 
     // Ensure output directory exists
@@ -78,8 +76,8 @@ services:
     println!("Created deployment spec: {}", spec_path.display());
     println!();
     println!("Manager configuration:");
-    println!("  - Image: zachhandley/zlayer-manager:{}", version);
-    println!("  - Port: {}", port);
+    println!("  - Image: zachhandley/zlayer-manager:{version}");
+    println!("  - Port: {port}");
     println!();
 
     if deploy {

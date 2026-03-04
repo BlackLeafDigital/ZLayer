@@ -403,7 +403,7 @@ services:
             image_name
         );
 
-        let spec = serde_yaml::from_str::<DeploymentSpec>(&yaml)
+        let spec = serde_yml::from_str::<DeploymentSpec>(&yaml)
             .expect("Failed to parse spec")
             .services
             .remove("metal-dev")
@@ -488,7 +488,7 @@ services:
             image_name
         );
 
-        let spec = serde_yaml::from_str::<DeploymentSpec>(&yaml)
+        let spec = serde_yml::from_str::<DeploymentSpec>(&yaml)
             .expect("Failed to parse spec")
             .services
             .remove("mps-compute")
@@ -573,7 +573,7 @@ services:
             image_name
         );
 
-        let spec = serde_yaml::from_str::<DeploymentSpec>(&yaml)
+        let spec = serde_yml::from_str::<DeploymentSpec>(&yaml)
             .expect("Failed to parse spec")
             .services
             .remove("shader-compile")
@@ -663,7 +663,7 @@ services:
             image_name
         );
 
-        let spec = serde_yaml::from_str::<DeploymentSpec>(&yaml)
+        let spec = serde_yml::from_str::<DeploymentSpec>(&yaml)
             .expect("Failed to parse spec")
             .services
             .remove("gpu-denied")

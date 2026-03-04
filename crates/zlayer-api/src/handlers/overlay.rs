@@ -17,7 +17,7 @@ pub struct OverlayStatusResponse {
     pub node_ip: String,
     /// Overlay network CIDR
     pub cidr: String,
-    /// Overlay listen port (WireGuard protocol)
+    /// Overlay listen port (`WireGuard` protocol)
     pub port: u16,
     /// Total number of peers
     pub total_peers: usize,
@@ -114,6 +114,7 @@ impl Default for OverlayApiState {
 
 impl OverlayApiState {
     /// Create a new overlay API state
+    #[must_use]
     pub fn new() -> Self {
         Self {}
     }

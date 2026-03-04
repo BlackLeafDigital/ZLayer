@@ -1,4 +1,4 @@
-//! AutoscaleController - Connects autoscaling decisions to container scaling
+//! `AutoscaleController` - Connects autoscaling decisions to container scaling
 //!
 //! This module provides an `AutoscaleController` that bridges the scheduler's
 //! autoscaling logic with the agent's `ServiceManager` to automatically scale
@@ -75,9 +75,9 @@ pub struct AutoscaleController {
     metrics: Arc<MetricsCollector>,
     /// Autoscaler decision engine
     autoscaler: Arc<RwLock<Autoscaler>>,
-    /// Service specs for scale configuration (service_name -> spec)
+    /// Service specs for scale configuration (`service_name` -> spec)
     service_specs: Arc<RwLock<HashMap<String, ScaleSpec>>>,
-    /// Last scale times for cooldown tracking (service_name -> instant)
+    /// Last scale times for cooldown tracking (`service_name` -> instant)
     last_scale_times: Arc<RwLock<HashMap<String, Instant>>>,
     /// Evaluation interval
     interval: Duration,
@@ -292,7 +292,7 @@ impl AutoscaleController {
                 _ = ticker.tick() => {
                     self.evaluate_all_services().await;
                 }
-                _ = self.shutdown.notified() => {
+                () = self.shutdown.notified() => {
                     info!("Autoscale controller shutting down");
                     break;
                 }
@@ -418,6 +418,7 @@ impl AutoscaleController {
     }
 
     /// Get the current evaluation interval
+    #[must_use]
     pub fn interval(&self) -> Duration {
         self.interval
     }
@@ -433,6 +434,7 @@ impl AutoscaleController {
 ///
 /// This is a helper function to determine if the autoscale controller should
 /// be started for a deployment.
+#[must_use]
 pub fn has_adaptive_scaling(services: &HashMap<String, zlayer_spec::ServiceSpec>) -> bool {
     services
         .values()
@@ -448,7 +450,7 @@ mod tests {
     use zlayer_spec::ScaleTargets;
 
     fn mock_spec() -> zlayer_spec::ServiceSpec {
-        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test

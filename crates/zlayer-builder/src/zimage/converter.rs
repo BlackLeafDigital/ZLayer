@@ -1,7 +1,7 @@
 //! ZImage-to-Dockerfile converter
 //!
 //! Converts a parsed [`ZImage`] into the internal [`Dockerfile`] IR so the
-//! existing buildah pipeline can execute ZImagefile builds without any
+//! existing buildah pipeline can execute `ZImagefile` builds without any
 //! changes to the downstream execution logic.
 
 use std::collections::HashMap;
@@ -38,7 +38,7 @@ use crate::dockerfile::CacheSharing;
 ///
 /// # Errors
 ///
-/// Returns [`BuildError::ZImagefileValidation`] if the ZImage cannot be
+/// Returns [`BuildError::ZImagefileValidation`] if the `ZImage` cannot be
 /// meaningfully converted (e.g. no `base` or `stages` present, or a
 /// healthcheck duration string cannot be parsed).
 pub fn zimage_to_dockerfile(zimage: &ZImage) -> Result<Dockerfile> {
@@ -503,6 +503,7 @@ fn parse_optional_duration(
 // Cache mount
 // ---------------------------------------------------------------------------
 
+#[must_use]
 pub fn convert_cache_mount(cm: &ZCacheMount) -> RunMount {
     let sharing = match cm.sharing.as_deref() {
         Some("shared") => CacheSharing::Shared,

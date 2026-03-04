@@ -100,21 +100,25 @@ impl ProxyServer {
     }
 
     /// Check if TLS is enabled
+    #[must_use]
     pub fn has_tls(&self) -> bool {
         self.tls_acceptor.is_some()
     }
 
     /// Get the TLS acceptor if configured
+    #[must_use]
     pub fn tls_acceptor(&self) -> Option<&TlsAcceptor> {
         self.tls_acceptor.as_ref()
     }
 
     /// Get the service registry
+    #[must_use]
     pub fn registry(&self) -> Arc<ServiceRegistry> {
         self.registry.clone()
     }
 
     /// Get the configuration
+    #[must_use]
     pub fn config(&self) -> Arc<ProxyConfig> {
         self.config.clone()
     }
@@ -245,7 +249,7 @@ impl ProxyServer {
 
     /// Run the HTTPS server
     ///
-    /// This requires TLS to be configured when creating the ProxyServer.
+    /// This requires TLS to be configured when creating the `ProxyServer`.
     pub async fn run_https(&self) -> Result<()> {
         let acceptor = self
             .tls_acceptor
@@ -286,7 +290,7 @@ impl ProxyServer {
 
     /// Run both HTTP and HTTPS servers concurrently
     ///
-    /// This requires TLS to be configured when creating the ProxyServer.
+    /// This requires TLS to be configured when creating the `ProxyServer`.
     pub async fn run_both(&self) -> Result<()> {
         let http_addr = self.config.server.http_addr;
         let https_addr = self.config.server.https_addr;
@@ -389,7 +393,7 @@ impl ProxyServer {
         let tls_stream = acceptor
             .accept(stream)
             .await
-            .map_err(|e| ProxyError::Tls(format!("TLS handshake failed: {}", e)))?;
+            .map_err(|e| ProxyError::Tls(format!("TLS handshake failed: {e}")))?;
 
         let io = TokioIo::new(tls_stream);
 

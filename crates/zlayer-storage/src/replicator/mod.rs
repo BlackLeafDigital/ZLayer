@@ -1,6 +1,6 @@
-//! SQLite WAL-based replication to S3
+//! `SQLite` WAL-based replication to S3
 //!
-//! Provides automatic backup and restore of SQLite databases to S3, using WAL
+//! Provides automatic backup and restore of `SQLite` databases to S3, using WAL
 //! (Write-Ahead Logging) for incremental replication. This enables crash-tolerant
 //! persistence and cross-node database restoration.
 //!
@@ -99,9 +99,9 @@ pub struct ReplicationStatus {
     pub wal_frame_count: u64,
 }
 
-/// SQLite WAL-based replicator to S3
+/// `SQLite` WAL-based replicator to S3
 ///
-/// Monitors a SQLite database's WAL file and replicates changes to S3 for
+/// Monitors a `SQLite` database's WAL file and replicates changes to S3 for
 /// persistence and disaster recovery.
 pub struct SqliteReplicator {
     config: SqliteReplicatorConfig,
@@ -124,7 +124,7 @@ pub struct SqliteReplicator {
 }
 
 impl SqliteReplicator {
-    /// Create a new SQLite replicator
+    /// Create a new `SQLite` replicator
     ///
     /// # Arguments
     ///
@@ -311,6 +311,7 @@ impl SqliteReplicator {
     }
 
     /// Get current replication status
+    #[must_use]
     pub fn status(&self) -> ReplicationStatus {
         let cache = self.cache.clone();
 

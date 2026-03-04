@@ -260,7 +260,7 @@ pub async fn create_runtime_for_image(
         .await
         .map_err(|e| AgentError::PullFailed {
             image: image.to_string(),
-            reason: format!("failed to detect artifact type: {}", e),
+            reason: format!("failed to detect artifact type: {e}"),
         })?;
 
     match artifact_type {
@@ -324,7 +324,7 @@ pub async fn detect_image_artifact_type(
         .await
         .map_err(|e| AgentError::PullFailed {
             image: image.to_string(),
-            reason: format!("failed to detect artifact type: {}", e),
+            reason: format!("failed to detect artifact type: {e}"),
         })?;
 
     Ok(artifact_type)

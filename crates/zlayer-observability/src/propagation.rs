@@ -6,7 +6,7 @@
 use opentelemetry::propagation::{Extractor, Injector};
 use std::collections::HashMap;
 
-/// HTTP header extractor for incoming requests (works with http crate HeaderMap)
+/// HTTP header extractor for incoming requests (works with http crate `HeaderMap`)
 pub struct HeaderExtractor<'a, T>(pub &'a T);
 
 impl Extractor for HeaderExtractor<'_, http::HeaderMap> {
@@ -15,17 +15,17 @@ impl Extractor for HeaderExtractor<'_, http::HeaderMap> {
     }
 
     fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|k| k.as_str()).collect()
+        self.0.keys().map(http::HeaderName::as_str).collect()
     }
 }
 
 impl Extractor for HeaderExtractor<'_, HashMap<String, String>> {
     fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).map(|s| s.as_str())
+        self.0.get(key).map(std::string::String::as_str)
     }
 
     fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(|s| s.as_str()).collect()
+        self.0.keys().map(std::string::String::as_str).collect()
     }
 }
 
@@ -53,6 +53,7 @@ impl Injector for HeaderInjector<'_, HashMap<String, String>> {
 /// Returns a Context that should be used as the parent for spans
 /// handling this request.
 #[cfg(feature = "propagation")]
+#[must_use]
 pub fn extract_context_from_headers(headers: &http::HeaderMap) -> opentelemetry::Context {
     use opentelemetry::global;
     global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(headers)))
@@ -69,14 +70,15 @@ pub fn inject_context_to_headers(headers: &mut http::HeaderMap) {
     });
 }
 
-/// Extract trace context from a HashMap (useful for gRPC metadata)
+/// Extract trace context from a `HashMap` (useful for gRPC metadata)
 #[cfg(feature = "propagation")]
+#[must_use]
 pub fn extract_context_from_map(map: &HashMap<String, String>) -> opentelemetry::Context {
     use opentelemetry::global;
     global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(map)))
 }
 
-/// Inject trace context into a HashMap
+/// Inject trace context into a `HashMap`
 #[cfg(feature = "propagation")]
 pub fn inject_context_to_map(map: &mut HashMap<String, String>) {
     use opentelemetry::global;

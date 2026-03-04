@@ -111,7 +111,7 @@ pub fn parse_memory_string(s: &str) -> std::result::Result<u64, String> {
 
     let num: u64 = num_str
         .parse()
-        .map_err(|e| format!("invalid number: {}", e))?;
+        .map_err(|e| format!("invalid number: {e}"))?;
 
     Ok(num * multiplier)
 }
@@ -166,7 +166,7 @@ pub struct BundleBuilder {
     cwd: Option<String>,
     /// Custom command/args to run (overrides image default)
     args: Option<Vec<String>>,
-    /// Pre-resolved volume paths from StorageManager
+    /// Pre-resolved volume paths from `StorageManager`
     volume_paths: HashMap<String, PathBuf>,
     /// Image configuration from the OCI registry (entrypoint, cmd, env, workdir, user)
     image_config: Option<zlayer_registry::ImageConfig>,
@@ -197,7 +197,7 @@ impl std::fmt::Debug for BundleBuilder {
 }
 
 impl BundleBuilder {
-    /// Create a new BundleBuilder with the specified bundle directory
+    /// Create a new `BundleBuilder` with the specified bundle directory
     ///
     /// The bundle directory will be created if it doesn't exist.
     /// The structure will be:
@@ -206,6 +206,7 @@ impl BundleBuilder {
     /// ├── config.json
     /// └── rootfs/  (symlink to actual rootfs or mount point)
     /// ```
+    #[must_use]
     pub fn new(bundle_dir: PathBuf) -> Self {
         Self {
             bundle_dir,
@@ -222,7 +223,8 @@ impl BundleBuilder {
         }
     }
 
-    /// Create a BundleBuilder for a container in the default bundle location
+    /// Create a `BundleBuilder` for a container in the default bundle location
+    #[must_use]
     pub fn for_container(container_id: &ContainerId) -> Self {
         let bundle_dir = PathBuf::from(DEFAULT_BUNDLE_DIR).join(container_id.to_string());
         Self::new(bundle_dir)
@@ -231,39 +233,45 @@ impl BundleBuilder {
     /// Set the rootfs path (from unpacked image layers)
     ///
     /// This path will be symlinked into the bundle as `rootfs/`
+    #[must_use]
     pub fn with_rootfs(mut self, rootfs_path: PathBuf) -> Self {
         self.rootfs_path = Some(rootfs_path);
         self
     }
 
     /// Set a custom hostname for the container
+    #[must_use]
     pub fn with_hostname(mut self, hostname: String) -> Self {
         self.hostname = Some(hostname);
         self
     }
 
     /// Add extra environment variables
+    #[must_use]
     pub fn with_env(mut self, key: String, value: String) -> Self {
         self.extra_env.push((key, value));
         self
     }
 
     /// Set the working directory
+    #[must_use]
     pub fn with_cwd(mut self, cwd: String) -> Self {
         self.cwd = Some(cwd);
         self
     }
 
     /// Set the command/args to run
+    #[must_use]
     pub fn with_args(mut self, args: Vec<String>) -> Self {
         self.args = Some(args);
         self
     }
 
-    /// Set pre-resolved volume paths from StorageManager
+    /// Set pre-resolved volume paths from `StorageManager`
     ///
     /// These are used to map named/anonymous/S3 volumes to their host paths
     /// when building storage mounts in the OCI spec.
+    #[must_use]
     pub fn with_volume_paths(mut self, volume_paths: HashMap<String, PathBuf>) -> Self {
         self.volume_paths = volume_paths;
         self
@@ -273,6 +281,7 @@ impl BundleBuilder {
     ///
     /// When set, the image config provides defaults for the container process
     /// that are used when the deployment spec doesn't override them.
+    #[must_use]
     pub fn with_image_config(mut self, config: zlayer_registry::ImageConfig) -> Self {
         self.image_config = Some(config);
         self
@@ -283,6 +292,7 @@ impl BundleBuilder {
     /// When true, the container will NOT get its own network namespace and will
     /// share the host's network stack. This is equivalent to Docker's `--network host`.
     /// Use this when overlay networking is unavailable or not desired.
+    #[must_use]
     pub fn with_host_network(mut self, host_network: bool) -> Self {
         self.host_network = host_network;
         self
@@ -301,17 +311,19 @@ impl BundleBuilder {
     ///
     /// This is typically the deployment name and is used as the scope when
     /// resolving `$S:` prefixed environment variables.
+    #[must_use]
     pub fn with_deployment_scope(mut self, scope: String) -> Self {
         self.deployment_scope = Some(scope);
         self
     }
 
     /// Get the bundle directory path
+    #[must_use]
     pub fn bundle_dir(&self) -> &Path {
         &self.bundle_dir
     }
 
-    /// Build the OCI bundle from a ServiceSpec
+    /// Build the OCI bundle from a `ServiceSpec`
     ///
     /// Creates the bundle directory structure and generates config.json
     /// based on the provided service specification.
@@ -328,7 +340,7 @@ impl BundleBuilder {
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: container_id.to_string(),
-                reason: format!("failed to create bundle directory: {}", e),
+                reason: format!("failed to create bundle directory: {e}"),
             })?;
 
         // Set up rootfs (symlink or create empty directory)
@@ -356,7 +368,7 @@ impl BundleBuilder {
                 .await
                 .map_err(|e| AgentError::CreateFailed {
                     id: container_id.to_string(),
-                    reason: format!("failed to create rootfs directory: {}", e),
+                    reason: format!("failed to create rootfs directory: {e}"),
                 })?;
         }
 
@@ -370,14 +382,14 @@ impl BundleBuilder {
         let config_json =
             serde_json::to_string_pretty(&oci_spec).map_err(|e| AgentError::CreateFailed {
                 id: container_id.to_string(),
-                reason: format!("failed to serialize OCI spec: {}", e),
+                reason: format!("failed to serialize OCI spec: {e}"),
             })?;
 
         fs::write(&config_path, config_json)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: container_id.to_string(),
-                reason: format!("failed to write config.json: {}", e),
+                reason: format!("failed to write config.json: {e}"),
             })?;
 
         tracing::debug!(
@@ -389,7 +401,7 @@ impl BundleBuilder {
         Ok(self.bundle_dir.clone())
     }
 
-    /// Build the OCI runtime spec from ServiceSpec
+    /// Build the OCI runtime spec from `ServiceSpec`
     async fn build_oci_spec(
         &self,
         container_id: &ContainerId,
@@ -421,7 +433,7 @@ impl BundleBuilder {
                 .uid(uid)
                 .gid(gid)
                 .build()
-                .map_err(|e| AgentError::InvalidSpec(format!("failed to build user: {}", e)))?
+                .map_err(|e| AgentError::InvalidSpec(format!("failed to build user: {e}")))?
         };
 
         // Build environment variables
@@ -467,8 +479,7 @@ impl BundleBuilder {
                     .await
                     .map_err(|e| {
                         AgentError::InvalidSpec(format!(
-                            "environment variable resolution failed: {}",
-                            e
+                            "environment variable resolution failed: {e}"
                         ))
                     })?;
 
@@ -477,11 +488,11 @@ impl BundleBuilder {
                     env.retain(|e| e.split('=').next() != Some(key.as_str()));
                 }
                 env_keys.insert(key.clone());
-                env.push(format!("{}={}", key, value));
+                env.push(format!("{key}={value}"));
             }
         } else {
             let resolved = crate::env::resolve_env_vars_with_warnings(&spec.env).map_err(|e| {
-                AgentError::InvalidSpec(format!("environment variable resolution failed: {}", e))
+                AgentError::InvalidSpec(format!("environment variable resolution failed: {e}"))
             })?;
 
             // Log any warnings about resolved env vars
@@ -508,7 +519,7 @@ impl BundleBuilder {
                 env.retain(|e| e.split('=').next() != Some(key.as_str()));
             }
             env_keys.insert(key.clone());
-            env.push(format!("{}={}", key, value));
+            env.push(format!("{key}={value}"));
         }
 
         // Build capabilities
@@ -551,7 +562,7 @@ impl BundleBuilder {
 
         let process = process_builder
             .build()
-            .map_err(|e| AgentError::InvalidSpec(format!("failed to build process: {}", e)))?;
+            .map_err(|e| AgentError::InvalidSpec(format!("failed to build process: {e}")))?;
 
         // Build root filesystem config
         // Note: "rootfs" is relative to the bundle directory per OCI spec
@@ -559,7 +570,7 @@ impl BundleBuilder {
             .path("rootfs".to_string())
             .readonly(false)
             .build()
-            .map_err(|e| AgentError::InvalidSpec(format!("failed to build root: {}", e)))?;
+            .map_err(|e| AgentError::InvalidSpec(format!("failed to build root: {e}")))?;
 
         // Build default mounts
         let mut mounts = self.build_default_mounts(spec)?;
@@ -586,7 +597,7 @@ impl BundleBuilder {
             .mounts(mounts)
             .linux(linux)
             .build()
-            .map_err(|e| AgentError::InvalidSpec(format!("failed to build OCI spec: {}", e)))?;
+            .map_err(|e| AgentError::InvalidSpec(format!("failed to build OCI spec: {e}")))?;
 
         Ok(oci_spec)
     }
@@ -609,7 +620,7 @@ impl BundleBuilder {
                 .ambient(empty_caps)
                 .build()
                 .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build capabilities: {}", e))
+                    AgentError::InvalidSpec(format!("failed to build capabilities: {e}"))
                 })?;
 
             Ok(Some(caps))
@@ -639,7 +650,7 @@ impl BundleBuilder {
                 .ambient(empty_caps)
                 .build()
                 .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build capabilities: {}", e))
+                    AgentError::InvalidSpec(format!("failed to build capabilities: {e}"))
                 })?;
 
             Ok(Some(built_caps))
@@ -674,7 +685,7 @@ impl BundleBuilder {
                 .ambient(empty_caps)
                 .build()
                 .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build capabilities: {}", e))
+                    AgentError::InvalidSpec(format!("failed to build capabilities: {e}"))
                 })?;
 
             Ok(Some(built_caps))
@@ -698,7 +709,7 @@ impl BundleBuilder {
                 ])
                 .build()
                 .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build /proc mount: {}", e))
+                    AgentError::InvalidSpec(format!("failed to build /proc mount: {e}"))
                 })?,
         );
 
@@ -715,9 +726,7 @@ impl BundleBuilder {
                     "size=65536k".to_string(),
                 ])
                 .build()
-                .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build /dev mount: {}", e))
-                })?,
+                .map_err(|e| AgentError::InvalidSpec(format!("failed to build /dev mount: {e}")))?,
         );
 
         // /dev/pts
@@ -736,7 +745,7 @@ impl BundleBuilder {
                 ])
                 .build()
                 .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build /dev/pts mount: {}", e))
+                    AgentError::InvalidSpec(format!("failed to build /dev/pts mount: {e}"))
                 })?,
         );
 
@@ -755,7 +764,7 @@ impl BundleBuilder {
                 ])
                 .build()
                 .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build /dev/shm mount: {}", e))
+                    AgentError::InvalidSpec(format!("failed to build /dev/shm mount: {e}"))
                 })?,
         );
 
@@ -772,7 +781,7 @@ impl BundleBuilder {
                 ])
                 .build()
                 .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build /dev/mqueue mount: {}", e))
+                    AgentError::InvalidSpec(format!("failed to build /dev/mqueue mount: {e}"))
                 })?,
         );
 
@@ -799,9 +808,7 @@ impl BundleBuilder {
                 .source("sysfs".to_string())
                 .options(sys_options)
                 .build()
-                .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build /sys mount: {}", e))
-                })?,
+                .map_err(|e| AgentError::InvalidSpec(format!("failed to build /sys mount: {e}")))?,
         );
 
         // /sys/fs/cgroup - for cgroup access
@@ -818,17 +825,17 @@ impl BundleBuilder {
                 ])
                 .build()
                 .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build cgroup mount: {}", e))
+                    AgentError::InvalidSpec(format!("failed to build cgroup mount: {e}"))
                 })?,
         );
 
         Ok(mounts)
     }
 
-    /// Build storage mounts from ServiceSpec storage entries
+    /// Build storage mounts from `ServiceSpec` storage entries
     ///
-    /// Converts StorageSpec entries to OCI Mount entries.
-    /// Note: Named and Anonymous volumes require StorageManager to prepare paths.
+    /// Converts `StorageSpec` entries to OCI Mount entries.
+    /// Note: Named and Anonymous volumes require `StorageManager` to prepare paths.
     /// S3 volumes require s3fs FUSE mount (handled separately).
     fn build_storage_mounts(
         &self,
@@ -859,8 +866,7 @@ impl BundleBuilder {
                         .build()
                         .map_err(|e| {
                             AgentError::InvalidSpec(format!(
-                                "failed to build bind mount for {}: {}",
-                                target, e
+                                "failed to build bind mount for {target}: {e}"
                             ))
                         })?
                 }
@@ -875,8 +881,7 @@ impl BundleBuilder {
                     // Get the prepared volume path from StorageManager
                     let source = volume_paths.get(name).ok_or_else(|| {
                         AgentError::InvalidSpec(format!(
-                            "volume '{}' not prepared - ensure StorageManager.ensure_volume() was called",
-                            name
+                            "volume '{name}' not prepared - ensure StorageManager.ensure_volume() was called"
                         ))
                     })?;
 
@@ -904,8 +909,7 @@ impl BundleBuilder {
                         .build()
                         .map_err(|e| {
                             AgentError::InvalidSpec(format!(
-                                "failed to build named volume mount for {}: {}",
-                                target, e
+                                "failed to build named volume mount for {target}: {e}"
                             ))
                         })?
                 }
@@ -916,8 +920,7 @@ impl BundleBuilder {
                     let key = format!("_anon_{}", target.trim_start_matches('/').replace('/', "_"));
                     let source = volume_paths.get(&key).ok_or_else(|| {
                         AgentError::InvalidSpec(format!(
-                            "anonymous volume for '{}' not prepared",
-                            target
+                            "anonymous volume for '{target}' not prepared"
                         ))
                     })?;
 
@@ -939,8 +942,7 @@ impl BundleBuilder {
                         .build()
                         .map_err(|e| {
                             AgentError::InvalidSpec(format!(
-                                "failed to build anonymous volume mount for {}: {}",
-                                target, e
+                                "failed to build anonymous volume mount for {target}: {e}"
                             ))
                         })?
                 }
@@ -949,11 +951,11 @@ impl BundleBuilder {
                     let mut options = vec!["nosuid".to_string(), "nodev".to_string()];
 
                     if let Some(size_str) = size {
-                        options.push(format!("size={}", size_str));
+                        options.push(format!("size={size_str}"));
                     }
 
                     if let Some(mode_val) = mode {
-                        options.push(format!("mode={:o}", mode_val));
+                        options.push(format!("mode={mode_val:o}"));
                     }
 
                     MountBuilder::default()
@@ -964,8 +966,7 @@ impl BundleBuilder {
                         .build()
                         .map_err(|e| {
                             AgentError::InvalidSpec(format!(
-                                "failed to build tmpfs mount for {}: {}",
-                                target, e
+                                "failed to build tmpfs mount for {target}: {e}"
                             ))
                         })?
                 }
@@ -983,8 +984,7 @@ impl BundleBuilder {
                     let key = format!("_s3_{}_{}", bucket, prefix.as_deref().unwrap_or(""));
                     let source = volume_paths.get(&key).ok_or_else(|| {
                         AgentError::InvalidSpec(format!(
-                            "S3 volume for bucket '{}' not mounted - ensure StorageManager.mount_s3() was called",
-                            bucket
+                            "S3 volume for bucket '{bucket}' not mounted - ensure StorageManager.mount_s3() was called"
                         ))
                     })?;
 
@@ -1009,8 +1009,7 @@ impl BundleBuilder {
                         .build()
                         .map_err(|e| {
                             AgentError::InvalidSpec(format!(
-                                "failed to build S3 mount for {}: {}",
-                                target, e
+                                "failed to build S3 mount for {target}: {e}"
                             ))
                         })?
                 }
@@ -1105,7 +1104,7 @@ impl BundleBuilder {
 
         linux_builder
             .build()
-            .map_err(|e| AgentError::InvalidSpec(format!("failed to build linux config: {}", e)))
+            .map_err(|e| AgentError::InvalidSpec(format!("failed to build linux config: {e}")))
     }
 
     /// Build resource limits (CPU, memory, device cgroups)
@@ -1125,9 +1124,7 @@ impl BundleBuilder {
                 .quota(quota)
                 .period(100_000u64)
                 .build()
-                .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build CPU limits: {}", e))
-                })?;
+                .map_err(|e| AgentError::InvalidSpec(format!("failed to build CPU limits: {e}")))?;
 
             resources_builder = resources_builder.cpu(cpu);
             has_resources = true;
@@ -1136,13 +1133,13 @@ impl BundleBuilder {
         // Memory limits
         if let Some(ref memory_str) = spec.resources.memory {
             let bytes = parse_memory_string(memory_str)
-                .map_err(|e| AgentError::InvalidSpec(format!("invalid memory limit: {}", e)))?;
+                .map_err(|e| AgentError::InvalidSpec(format!("invalid memory limit: {e}")))?;
 
             let memory = LinuxMemoryBuilder::default()
                 .limit(bytes as i64)
                 .build()
                 .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build memory limits: {}", e))
+                    AgentError::InvalidSpec(format!("failed to build memory limits: {e}"))
                 })?;
 
             resources_builder = resources_builder.memory(memory);
@@ -1157,9 +1154,9 @@ impl BundleBuilder {
         }
 
         if has_resources {
-            let resources = resources_builder.build().map_err(|e| {
-                AgentError::InvalidSpec(format!("failed to build resources: {}", e))
-            })?;
+            let resources = resources_builder
+                .build()
+                .map_err(|e| AgentError::InvalidSpec(format!("failed to build resources: {e}")))?;
             Ok(Some(resources))
         } else {
             Ok(None)
@@ -1180,7 +1177,7 @@ impl BundleBuilder {
                 .access("rwm".to_string())
                 .build()
                 .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build device cgroup rule: {}", e))
+                    AgentError::InvalidSpec(format!("failed to build device cgroup rule: {e}"))
                 })?;
             rules.push(rule);
         } else {
@@ -1189,9 +1186,7 @@ impl BundleBuilder {
                 .allow(false)
                 .access("rwm".to_string())
                 .build()
-                .map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build deny rule: {}", e))
-                })?;
+                .map_err(|e| AgentError::InvalidSpec(format!("failed to build deny rule: {e}")))?;
             rules.push(deny_all);
 
             // Allow standard container devices
@@ -1212,15 +1207,15 @@ impl BundleBuilder {
                 let mut builder = LinuxDeviceCgroupBuilder::default()
                     .allow(true)
                     .typ(LinuxDeviceType::C)
-                    .major(major as i64)
+                    .major(i64::from(major))
                     .access(access.to_string());
 
                 if minor >= 0 {
-                    builder = builder.minor(minor as i64);
+                    builder = builder.minor(i64::from(minor));
                 }
 
                 let rule = builder.build().map_err(|e| {
-                    AgentError::InvalidSpec(format!("failed to build char device rule: {}", e))
+                    AgentError::InvalidSpec(format!("failed to build char device rule: {e}"))
                 })?;
                 rules.push(rule);
             }
@@ -1277,8 +1272,7 @@ impl BundleBuilder {
                             .build()
                             .map_err(|e| {
                                 AgentError::InvalidSpec(format!(
-                                    "failed to build GPU cgroup rule: {}",
-                                    e
+                                    "failed to build GPU cgroup rule: {e}"
                                 ))
                             })?;
                         rules.push(rule);
@@ -1292,8 +1286,7 @@ impl BundleBuilder {
                             .build()
                             .map_err(|e| {
                                 AgentError::InvalidSpec(format!(
-                                    "failed to build GPU UVM cgroup rule: {}",
-                                    e
+                                    "failed to build GPU UVM cgroup rule: {e}"
                                 ))
                             })?;
                         rules.push(uvm_rule);
@@ -1308,8 +1301,7 @@ impl BundleBuilder {
                             .build()
                             .map_err(|e| {
                                 AgentError::InvalidSpec(format!(
-                                    "failed to build AMD DRI cgroup rule: {}",
-                                    e
+                                    "failed to build AMD DRI cgroup rule: {e}"
                                 ))
                             })?;
                         rules.push(dri_rule);
@@ -1323,8 +1315,7 @@ impl BundleBuilder {
                             .build()
                             .map_err(|e| {
                                 AgentError::InvalidSpec(format!(
-                                    "failed to build AMD KFD cgroup rule: {}",
-                                    e
+                                    "failed to build AMD KFD cgroup rule: {e}"
                                 ))
                             })?;
                         rules.push(kfd_rule);
@@ -1339,8 +1330,7 @@ impl BundleBuilder {
                             .build()
                             .map_err(|e| {
                                 AgentError::InvalidSpec(format!(
-                                    "failed to build Intel DRI cgroup rule: {}",
-                                    e
+                                    "failed to build Intel DRI cgroup rule: {e}"
                                 ))
                             })?;
                         rules.push(dri_rule);
@@ -1359,8 +1349,7 @@ impl BundleBuilder {
                             .build()
                             .map_err(|e| {
                                 AgentError::InvalidSpec(format!(
-                                    "failed to build GPU DRI cgroup rule: {}",
-                                    e
+                                    "failed to build GPU DRI cgroup rule: {e}"
                                 ))
                             })?;
                         rules.push(dri_rule);
@@ -1411,7 +1400,7 @@ impl BundleBuilder {
                         if let Ok((major, minor)) = get_device_major_minor(dev_path) {
                             let dev_type = get_device_type(dev_path).unwrap_or(LinuxDeviceType::C);
                             let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.to_string())
+                                .path((*dev_path).to_string())
                                 .typ(dev_type)
                                 .major(major)
                                 .minor(minor)
@@ -1421,8 +1410,7 @@ impl BundleBuilder {
                                 .build()
                                 .map_err(|e| {
                                     AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {}: {}",
-                                        dev_path, e
+                                        "failed to build GPU device {dev_path}: {e}"
                                     ))
                                 })?;
                             devices.push(linux_device);
@@ -1433,7 +1421,7 @@ impl BundleBuilder {
 
                     // Per-GPU devices: /dev/nvidia0, /dev/nvidia1, etc.
                     for i in 0..gpu.count {
-                        let dev_path = format!("/dev/nvidia{}", i);
+                        let dev_path = format!("/dev/nvidia{i}");
                         if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
                             let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
                             let linux_device = LinuxDeviceBuilder::default()
@@ -1447,8 +1435,7 @@ impl BundleBuilder {
                                 .build()
                                 .map_err(|e| {
                                     AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {}: {}",
-                                        dev_path, e
+                                        "failed to build GPU device {dev_path}: {e}"
                                     ))
                                 })?;
                             devices.push(linux_device);
@@ -1464,7 +1451,7 @@ impl BundleBuilder {
                         if let Ok((major, minor)) = get_device_major_minor(dev_path) {
                             let dev_type = get_device_type(dev_path).unwrap_or(LinuxDeviceType::C);
                             let linux_device = LinuxDeviceBuilder::default()
-                                .path(dev_path.to_string())
+                                .path((*dev_path).to_string())
                                 .typ(dev_type)
                                 .major(major)
                                 .minor(minor)
@@ -1474,8 +1461,7 @@ impl BundleBuilder {
                                 .build()
                                 .map_err(|e| {
                                     AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {}: {}",
-                                        dev_path, e
+                                        "failed to build GPU device {dev_path}: {e}"
                                     ))
                                 })?;
                             devices.push(linux_device);
@@ -1500,8 +1486,7 @@ impl BundleBuilder {
                                 .build()
                                 .map_err(|e| {
                                     AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {}: {}",
-                                        dev_path, e
+                                        "failed to build GPU device {dev_path}: {e}"
                                     ))
                                 })?;
                             devices.push(linux_device);
@@ -1512,7 +1497,7 @@ impl BundleBuilder {
 
                     // DRI card nodes: /dev/dri/card0, card1, etc.
                     for i in 0..gpu.count {
-                        let dev_path = format!("/dev/dri/card{}", i);
+                        let dev_path = format!("/dev/dri/card{i}");
                         if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
                             let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
                             let linux_device = LinuxDeviceBuilder::default()
@@ -1526,8 +1511,7 @@ impl BundleBuilder {
                                 .build()
                                 .map_err(|e| {
                                     AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {}: {}",
-                                        dev_path, e
+                                        "failed to build GPU device {dev_path}: {e}"
                                     ))
                                 })?;
                             devices.push(linux_device);
@@ -1553,8 +1537,7 @@ impl BundleBuilder {
                                 .build()
                                 .map_err(|e| {
                                     AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {}: {}",
-                                        dev_path, e
+                                        "failed to build GPU device {dev_path}: {e}"
                                     ))
                                 })?;
                             devices.push(linux_device);
@@ -1565,7 +1548,7 @@ impl BundleBuilder {
 
                     // Intel DRI card nodes: /dev/dri/card0, card1, etc.
                     for i in 0..gpu.count {
-                        let dev_path = format!("/dev/dri/card{}", i);
+                        let dev_path = format!("/dev/dri/card{i}");
                         if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
                             let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
                             let linux_device = LinuxDeviceBuilder::default()
@@ -1579,8 +1562,7 @@ impl BundleBuilder {
                                 .build()
                                 .map_err(|e| {
                                     AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {}: {}",
-                                        dev_path, e
+                                        "failed to build GPU device {dev_path}: {e}"
                                     ))
                                 })?;
                             devices.push(linux_device);
@@ -1610,8 +1592,7 @@ impl BundleBuilder {
                                 .build()
                                 .map_err(|e| {
                                     AgentError::InvalidSpec(format!(
-                                        "failed to build GPU device {}: {}",
-                                        dev_path, e
+                                        "failed to build GPU device {dev_path}: {e}"
                                     ))
                                 })?;
                             devices.push(linux_device);
@@ -1630,7 +1611,7 @@ impl BundleBuilder {
     ///
     /// Unlike `build()`, this does NOT create the bundle directory or set up rootfs.
     /// Use this when the bundle directory and rootfs already exist (e.g., rootfs was
-    /// extracted directly by LayerUnpacker).
+    /// extracted directly by `LayerUnpacker`).
     ///
     /// # Returns
     /// The path to the bundle directory on success
@@ -1649,14 +1630,14 @@ impl BundleBuilder {
         let config_json =
             serde_json::to_string_pretty(&oci_spec).map_err(|e| AgentError::CreateFailed {
                 id: container_id.to_string(),
-                reason: format!("failed to serialize OCI spec: {}", e),
+                reason: format!("failed to serialize OCI spec: {e}"),
             })?;
 
         fs::write(&config_path, config_json)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: container_id.to_string(),
-                reason: format!("failed to write config.json: {}", e),
+                reason: format!("failed to write config.json: {e}"),
             })?;
 
         tracing::debug!(
@@ -1668,13 +1649,13 @@ impl BundleBuilder {
         Ok(self.bundle_dir.clone())
     }
 
-    /// Resolve command from ServiceSpec and optional image config following Docker/OCI semantics
+    /// Resolve command from `ServiceSpec` and optional image config following Docker/OCI semantics
     ///
     /// Resolution order:
     /// 1. spec entrypoint + args -> use those
     /// 2. spec entrypoint only -> use entrypoint
     /// 3. spec args only -> use args
-    /// 4. image_config entrypoint/cmd -> use image_config.full_command()
+    /// 4. `image_config` entrypoint/cmd -> use `image_config.full_command()`
     /// 5. fallback to /bin/sh
     fn resolve_command_from_spec(
         spec: &ServiceSpec,
@@ -1695,11 +1676,13 @@ impl BundleBuilder {
             }
             _ => {
                 // No spec command - try image config
-                if let Some(img_cmd) = image_config.and_then(|c| c.full_command()) {
-                    if !img_cmd.is_empty() {
-                        args.extend(img_cmd);
-                    } else {
+                if let Some(img_cmd) =
+                    image_config.and_then(zlayer_registry::ImageConfig::full_command)
+                {
+                    if img_cmd.is_empty() {
                         args.push("/bin/sh".to_string());
+                    } else {
+                        args.extend(img_cmd);
                     }
                 } else {
                     args.push("/bin/sh".to_string());
@@ -1762,7 +1745,7 @@ mod tests {
     use zlayer_spec::*;
 
     fn mock_spec() -> ServiceSpec {
-        serde_yaml::from_str::<DeploymentSpec>(
+        serde_yml::from_str::<DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -1784,7 +1767,7 @@ services:
     }
 
     fn mock_spec_with_resources() -> ServiceSpec {
-        serde_yaml::from_str::<DeploymentSpec>(
+        serde_yml::from_str::<DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -1812,7 +1795,7 @@ services:
     }
 
     fn mock_privileged_spec() -> ServiceSpec {
-        serde_yaml::from_str::<DeploymentSpec>(
+        serde_yml::from_str::<DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2063,7 +2046,7 @@ services:
 
     #[test]
     fn test_build_storage_mounts_bind() {
-        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2104,7 +2087,7 @@ services:
 
     #[test]
     fn test_build_storage_mounts_named() {
-        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2145,7 +2128,7 @@ services:
 
     #[test]
     fn test_build_storage_mounts_tmpfs() {
-        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2180,7 +2163,7 @@ services:
 
     #[test]
     fn test_build_storage_mounts_multiple() {
-        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2228,7 +2211,7 @@ services:
 
     #[test]
     fn test_build_storage_mounts_anonymous_missing_path() {
-        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2261,7 +2244,7 @@ services:
             service: "test".to_string(),
             replica: 1,
         };
-        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test

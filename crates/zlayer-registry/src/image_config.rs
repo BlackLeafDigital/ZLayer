@@ -82,6 +82,7 @@ impl ImageConfig {
     /// - If entrypoint is set, it is the executable and cmd provides default args
     /// - If only cmd is set, it is the full command
     /// - If neither is set, returns None
+    #[must_use]
     pub fn full_command(&self) -> Option<Vec<String>> {
         match (&self.entrypoint, &self.cmd) {
             (Some(ep), Some(cmd)) => {

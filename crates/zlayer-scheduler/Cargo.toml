@@ -67,3 +67,6 @@ test-skip-http = []
 # Persistent storage is now provided by zlayer-consensus's redb-store feature.
 # This feature flag is kept for backward compatibility with dependents.
 persistent = ["zlayer-consensus/redb-store"]
+
+[lints]
+workspace = true

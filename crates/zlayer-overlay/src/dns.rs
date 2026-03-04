@@ -1,5 +1,12 @@
 //! DNS server for service discovery over overlay networks
 
+use hickory_client::client::{Client, SyncClient};
+use hickory_client::udp::UdpClientConnection;
+use hickory_server::authority::{Catalog, ZoneType};
+use hickory_server::proto::rr::rdata::A;
+use hickory_server::proto::rr::{DNSClass, Name, RData, Record, RecordType};
+use hickory_server::server::ServerFuture;
+use hickory_server::store::in_memory::InMemoryAuthority;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -8,13 +15,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::RwLock;
-use trust_dns_client::client::{Client, SyncClient};
-use trust_dns_client::udp::UdpClientConnection;
-use trust_dns_server::authority::{Catalog, ZoneType};
-use trust_dns_server::proto::rr::rdata::A;
-use trust_dns_server::proto::rr::{DNSClass, Name, RData, Record, RecordType};
-use trust_dns_server::server::ServerFuture;
-use trust_dns_server::store::in_memory::InMemoryAuthority;
 
 /// Default DNS port for overlay service discovery (non-standard to avoid conflicts)
 pub const DEFAULT_DNS_PORT: u16 = 15353;
@@ -32,6 +32,7 @@ pub struct DnsConfig {
 
 impl DnsConfig {
     /// Create a new DNS config with defaults
+    #[must_use]
     pub fn new(zone: &str, bind_addr: IpAddr) -> Self {
         Self {
             zone: zone.to_string(),
@@ -41,6 +42,7 @@ impl DnsConfig {
     }
 
     /// Set a custom port
+    #[must_use]
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
@@ -50,6 +52,7 @@ impl DnsConfig {
 /// Generate a hostname from an IPv4 address for DNS registration
 ///
 /// Converts an IP like 10.200.0.5 to "node-0-5" (using last two octets)
+#[must_use]
 pub fn peer_hostname(ip: Ipv4Addr) -> String {
     let octets = ip.octets();
     format!("node-{}-{}", octets[2], octets[3])
@@ -90,13 +93,13 @@ impl DnsHandle {
         // Create the fully qualified domain name
         let fqdn = if hostname.ends_with('.') {
             Name::from_str(hostname)
-                .map_err(|e| DnsError::InvalidName(format!("{}: {}", hostname, e)))?
+                .map_err(|e| DnsError::InvalidName(format!("{hostname}: {e}")))?
         } else {
             // Append the zone origin
             let name = Name::from_str(hostname)
-                .map_err(|e| DnsError::InvalidName(format!("{}: {}", hostname, e)))?;
+                .map_err(|e| DnsError::InvalidName(format!("{hostname}: {e}")))?;
             name.append_domain(&self.zone_origin)
-                .map_err(|e| DnsError::InvalidName(format!("Failed to append zone: {}", e)))?
+                .map_err(|e| DnsError::InvalidName(format!("Failed to append zone: {e}")))?
         };
 
         // Create the A record
@@ -122,12 +125,12 @@ impl DnsHandle {
     pub async fn remove_record(&self, hostname: &str) -> Result<bool, DnsError> {
         let fqdn = if hostname.ends_with('.') {
             Name::from_str(hostname)
-                .map_err(|e| DnsError::InvalidName(format!("{}: {}", hostname, e)))?
+                .map_err(|e| DnsError::InvalidName(format!("{hostname}: {e}")))?
         } else {
             let name = Name::from_str(hostname)
-                .map_err(|e| DnsError::InvalidName(format!("{}: {}", hostname, e)))?;
+                .map_err(|e| DnsError::InvalidName(format!("{hostname}: {e}")))?;
             name.append_domain(&self.zone_origin)
-                .map_err(|e| DnsError::InvalidName(format!("Failed to append zone: {}", e)))?
+                .map_err(|e| DnsError::InvalidName(format!("Failed to append zone: {e}")))?
         };
 
         let serial = {
@@ -138,7 +141,7 @@ impl DnsHandle {
         };
 
         // Create an empty record to effectively "remove" by setting empty data
-        // Note: trust-dns doesn't have a direct remove, so we create a tombstone
+        // Note: hickory-dns doesn't have a direct remove, so we create a tombstone
         let record = Record::with(fqdn.clone(), RecordType::A, 0);
         self.authority.upsert(record, serial).await;
 
@@ -146,6 +149,7 @@ impl DnsHandle {
     }
 
     /// Get the zone origin
+    #[must_use]
     pub fn zone_origin(&self) -> &Name {
         &self.zone_origin
     }
@@ -163,7 +167,7 @@ impl DnsServer {
     /// Create a new DNS server for the given zone
     pub fn new(listen_addr: SocketAddr, zone: &str) -> Result<Self, DnsError> {
         let zone_origin =
-            Name::from_str(zone).map_err(|e| DnsError::InvalidName(format!("{}: {}", zone, e)))?;
+            Name::from_str(zone).map_err(|e| DnsError::InvalidName(format!("{zone}: {e}")))?;
 
         // Create an empty in-memory authority for the zone
         // Using Arc directly since InMemoryAuthority has internal synchronization via upsert()
@@ -181,7 +185,7 @@ impl DnsServer {
         })
     }
 
-    /// Create from a DnsConfig
+    /// Create from a `DnsConfig`
     pub fn from_config(config: &DnsConfig) -> Result<Self, DnsError> {
         let listen_addr = SocketAddr::new(config.bind_addr, config.port);
         Self::new(listen_addr, &config.zone)
@@ -191,6 +195,7 @@ impl DnsServer {
     ///
     /// The handle can be cloned and used to add/remove records even after
     /// the server has been started.
+    #[must_use]
     pub fn handle(&self) -> DnsHandle {
         DnsHandle {
             authority: Arc::clone(&self.authority),
@@ -231,8 +236,8 @@ impl DnsServer {
 
     /// Start the DNS server in a background task without consuming self.
     ///
-    /// Unlike `start(self)`, this method borrows self, allowing the DnsServer
-    /// to be wrapped in an Arc and shared (e.g., with ServiceManager) while
+    /// Unlike `start(self)`, this method borrows self, allowing the `DnsServer`
+    /// to be wrapped in an Arc and shared (e.g., with `ServiceManager`) while
     /// the server runs in the background.
     pub async fn start_background(&self) -> Result<DnsHandle, DnsError> {
         let handle = self.handle();
@@ -284,11 +289,13 @@ impl DnsServer {
     }
 
     /// Get the listen address
+    #[must_use]
     pub fn listen_addr(&self) -> SocketAddr {
         self.listen_addr
     }
 
     /// Get the zone origin
+    #[must_use]
     pub fn zone_origin(&self) -> &Name {
         &self.zone_origin
     }
@@ -301,6 +308,7 @@ pub struct DnsClient {
 
 impl DnsClient {
     /// Create a new DNS client
+    #[must_use]
     pub fn new(server_addr: SocketAddr) -> Self {
         Self { server_addr }
     }
@@ -308,7 +316,7 @@ impl DnsClient {
     /// Query for an A record
     pub fn query_a(&self, hostname: &str) -> Result<Option<Ipv4Addr>, DnsError> {
         let name = Name::from_str(hostname)
-            .map_err(|e| DnsError::InvalidName(format!("{}: {}", hostname, e)))?;
+            .map_err(|e| DnsError::InvalidName(format!("{hostname}: {e}")))?;
 
         let conn = UdpClientConnection::new(self.server_addr)
             .map_err(|e| DnsError::Client(e.to_string()))?;
@@ -338,6 +346,7 @@ pub struct ServiceDiscovery {
 
 impl ServiceDiscovery {
     /// Create a new service discovery instance
+    #[must_use]
     pub fn new(dns_server_addr: SocketAddr) -> Self {
         Self {
             dns_server: dns_server_addr,

@@ -113,8 +113,8 @@ fn default_lines() -> u32 {
 /// allowing service handlers to perform scaling operations and
 /// look up deployment/service information.
 ///
-/// The service_manager is optional to allow read-only mode (viewing service
-/// specs from storage) when no ServiceManager is available.
+/// The `service_manager` is optional to allow read-only mode (viewing service
+/// specs from storage) when no `ServiceManager` is available.
 #[derive(Clone)]
 pub struct ServiceState {
     /// Service manager for container lifecycle operations (optional)
@@ -172,8 +172,8 @@ pub async fn list_services(
         .storage
         .get(&deployment)
         .await
-        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?
-        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{}' not found", deployment)))?;
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{deployment}' not found")))?;
 
     // Build service summaries from the deployment spec
     let mut summaries = Vec::new();
@@ -253,13 +253,14 @@ pub async fn get_service(
         .storage
         .get(&deployment)
         .await
-        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?
-        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{}' not found", deployment)))?;
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{deployment}' not found")))?;
 
     // Get the service spec
-    let spec = stored.spec.services.get(&service).ok_or_else(|| {
-        ApiError::NotFound(format!("Service '{}/{}' not found", deployment, service))
-    })?;
+    let spec =
+        stored.spec.services.get(&service).ok_or_else(|| {
+            ApiError::NotFound(format!("Service '{deployment}/{service}' not found"))
+        })?;
 
     // Get current replica count from service manager if available
     let replicas = if let Some(ref manager) = state.service_manager {
@@ -354,13 +355,14 @@ pub async fn scale_service(
         .storage
         .get(&deployment)
         .await
-        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?
-        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{}' not found", deployment)))?;
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{deployment}' not found")))?;
 
     // Get the service spec to verify it exists
-    let spec = stored.spec.services.get(&service).ok_or_else(|| {
-        ApiError::NotFound(format!("Service '{}/{}' not found", deployment, service))
-    })?;
+    let spec =
+        stored.spec.services.get(&service).ok_or_else(|| {
+            ApiError::NotFound(format!("Service '{deployment}/{service}' not found"))
+        })?;
 
     // Require service manager for scaling operations
     let manager_arc = state.service_manager.as_ref().ok_or_else(|| {
@@ -379,14 +381,14 @@ pub async fn scale_service(
         manager
             .upsert_service(service.clone(), spec.clone())
             .await
-            .map_err(|e| ApiError::Internal(format!("Failed to register service: {}", e)))?;
+            .map_err(|e| ApiError::Internal(format!("Failed to register service: {e}")))?;
     }
 
     // Now scale to the requested replica count
     manager
         .scale_service(&service, request.replicas)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to scale service: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to scale service: {e}")))?;
 
     // Get updated replica count
     let replicas = manager.service_replica_count(&service).await.unwrap_or(0) as u32;
@@ -473,13 +475,12 @@ pub async fn list_containers(
         .storage
         .get(&deployment)
         .await
-        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?
-        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{}' not found", deployment)))?;
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{deployment}' not found")))?;
 
     if !stored.spec.services.contains_key(&service) {
         return Err(ApiError::NotFound(format!(
-            "Service '{}/{}' not found",
-            deployment, service
+            "Service '{deployment}/{service}' not found"
         )));
     }
 
@@ -536,14 +537,13 @@ pub async fn get_service_logs(
         .storage
         .get(&deployment)
         .await
-        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?
-        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{}' not found", deployment)))?;
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{deployment}' not found")))?;
 
     // Verify service exists in deployment
     if !stored.spec.services.contains_key(&service) {
         return Err(ApiError::NotFound(format!(
-            "Service '{}/{}' not found",
-            deployment, service
+            "Service '{deployment}/{service}' not found"
         )));
     }
 
@@ -561,24 +561,7 @@ pub async fn get_service_logs(
     let tail = query.lines as usize;
     let instance = query.instance.clone();
 
-    if !query.follow {
-        // ---- Non-follow mode: return plain text as before ----
-        let manager = manager_arc.read().await;
-        let logs = match manager
-            .get_service_logs(&service, tail, instance.as_deref())
-            .await
-        {
-            Ok(logs) => logs,
-            Err(zlayer_agent::AgentError::NotFound { reason, .. }) => {
-                format!(
-                    "# Logs for {}/{}\n# No running containers ({})\n",
-                    deployment, service, reason
-                )
-            }
-            Err(e) => return Err(ApiError::Internal(format!("Failed to fetch logs: {}", e))),
-        };
-        Ok(logs.into_response())
-    } else {
+    if query.follow {
         // ---- Follow mode: SSE stream ----
         let stream = log_follow_stream(manager_arc, service, tail, instance);
         let sse = Sse::new(stream).keep_alive(
@@ -587,6 +570,20 @@ pub async fn get_service_logs(
                 .text("keep-alive"),
         );
         Ok(sse.into_response())
+    } else {
+        // ---- Non-follow mode: return plain text as before ----
+        let manager = manager_arc.read().await;
+        let logs = match manager
+            .get_service_logs(&service, tail, instance.as_deref())
+            .await
+        {
+            Ok(logs) => logs,
+            Err(zlayer_agent::AgentError::NotFound { reason, .. }) => {
+                format!("# Logs for {deployment}/{service}\n# No running containers ({reason})\n")
+            }
+            Err(e) => return Err(ApiError::Internal(format!("Failed to fetch logs: {e}"))),
+        };
+        Ok(logs.into_response())
     }
 }
 
@@ -726,11 +723,13 @@ pub struct ExecResponse {
     tag = "Services"
 )]
 pub async fn exec_in_service(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<ServiceState>,
     Path((deployment, service)): Path<(String, String)>,
     Json(request): Json<ExecRequest>,
 ) -> Result<Json<ExecResponse>> {
+    user.require_role("admin")?;
+
     // Validate command
     if request.command.is_empty() {
         return Err(ApiError::BadRequest("Command cannot be empty".to_string()));
@@ -741,13 +740,12 @@ pub async fn exec_in_service(
         .storage
         .get(&deployment)
         .await
-        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?
-        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{}' not found", deployment)))?;
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{deployment}' not found")))?;
 
     if !stored.spec.services.contains_key(&service) {
         return Err(ApiError::NotFound(format!(
-            "Service '{}/{}' not found",
-            deployment, service
+            "Service '{deployment}/{service}' not found"
         )));
     }
 
@@ -766,9 +764,9 @@ pub async fn exec_in_service(
         .await
         .map_err(|e| match e {
             zlayer_agent::AgentError::NotFound { reason, .. } => {
-                ApiError::NotFound(format!("Container not found: {}", reason))
+                ApiError::NotFound(format!("Container not found: {reason}"))
             }
-            other => ApiError::Internal(format!("Exec failed: {}", other)),
+            other => ApiError::Internal(format!("Exec failed: {other}")),
         })?;
 
     Ok(Json(ExecResponse {

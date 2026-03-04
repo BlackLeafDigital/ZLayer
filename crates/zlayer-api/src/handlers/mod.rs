@@ -12,6 +12,7 @@ pub mod nodes;
 pub mod overlay;
 pub mod secrets;
 pub mod services;
+pub mod storage;
 pub mod tunnels;
 
 pub use auth::*;
@@ -26,4 +27,5 @@ pub use nodes::*;
 pub use overlay::*;
 pub use secrets::*;
 pub use services::*;
+pub use storage::*;
 pub use tunnels::*;

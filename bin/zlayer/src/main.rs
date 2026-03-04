@@ -1,4 +1,4 @@
-//! ZLayer -- unified CLI for the ZLayer container orchestration platform.
+//! `ZLayer` -- unified CLI for the `ZLayer` container orchestration platform.
 //!
 //! Without a subcommand (or with `tui`) the interactive Ratatui-based TUI is
 //! launched.  All other subcommands (deploy, serve, build, etc.) are handled

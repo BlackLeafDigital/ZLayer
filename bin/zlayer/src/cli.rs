@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
-/// Return the platform-appropriate default data directory for ZLayer.
+/// Return the platform-appropriate default data directory for `ZLayer`.
 ///
 /// - macOS: `~/.local/share/zlayer` (user-writable without root)
 /// - Linux: `/var/lib/zlayer` (traditional, typically runs as root)
@@ -68,7 +68,7 @@ pub(crate) fn default_socket_path(data_dir: &std::path::Path) -> String {
     }
 }
 
-/// ZLayer container orchestration platform
+/// `ZLayer` container orchestration platform
 #[derive(Parser)]
 #[command(name = "zlayer")]
 #[command(version, about = "ZLayer container orchestration platform")]
@@ -88,7 +88,7 @@ pub(crate) struct Cli {
     #[arg(long, default_value = "auto", value_enum)]
     pub(crate) runtime: RuntimeType,
 
-    /// Root data directory for all ZLayer state (databases, secrets, containers).
+    /// Root data directory for all `ZLayer` state (databases, secrets, containers).
     ///
     /// On macOS defaults to ~/.local/share/zlayer (no root required).
     /// On Linux defaults to /var/lib/zlayer.
@@ -365,7 +365,7 @@ pub(crate) enum Commands {
         #[arg(short = 'f', long)]
         file: Option<PathBuf>,
 
-        /// ZImagefile path (alternative to Dockerfile)
+        /// `ZImagefile` path (alternative to Dockerfile)
         #[arg(long = "zimagefile", short = 'z')]
         zimagefile: Option<PathBuf>,
 
@@ -516,7 +516,7 @@ pub(crate) enum Commands {
         #[arg(long, default_value = "0.0.0.0:3669")]
         bind: String,
 
-        /// JWT secret for authentication (can also be set via ZLAYER_JWT_SECRET env var)
+        /// JWT secret for authentication (can also be set via `ZLAYER_JWT_SECRET` env var)
         #[arg(long, env = "ZLAYER_JWT_SECRET")]
         jwt_secret: Option<String>,
 
@@ -540,9 +540,9 @@ pub(crate) enum Commands {
     #[command(subcommand, display_order = 32)]
     Tunnel(TunnelCommands),
 
-    /// ZLayer Manager commands
+    /// `ZLayer` Manager commands
     ///
-    /// Initialize, configure, and manage the ZLayer Manager web UI.
+    /// Initialize, configure, and manage the `ZLayer` Manager web UI.
     #[command(subcommand, display_order = 33)]
     Manager(ManagerCommands),
 
@@ -623,11 +623,11 @@ pub(crate) enum TunnelCommands {
     /// Establishes a connection to a tunnel server and exposes local services.
     ///
     /// Examples:
-    ///   zlayer tunnel connect --server wss://tunnel.example.com --token tun_xxx --service ssh:22:2222
-    ///   zlayer tunnel connect --server wss://tunnel.example.com --token tun_xxx --service postgres:5432
+    ///   zlayer tunnel connect --server <wss://tunnel.example.com> --token `tun_xxx` --service ssh:22:2222
+    ///   zlayer tunnel connect --server <wss://tunnel.example.com> --token `tun_xxx` --service postgres:5432
     #[command(verbatim_doc_comment)]
     Connect {
-        /// Tunnel server URL (e.g., wss://tunnel.example.com/tunnel/v1)
+        /// Tunnel server URL (e.g., <wss://tunnel.example.com/tunnel/v1>)
         #[arg(long)]
         server: String,
 
@@ -635,7 +635,7 @@ pub(crate) enum TunnelCommands {
         #[arg(long)]
         token: String,
 
-        /// Service to expose (format: name:local_port[:remote_port], can be repeated)
+        /// Service to expose (format: `name:local_port`[:`remote_port`], can be repeated)
         #[arg(short, long = "service")]
         services: Vec<String>,
     },
@@ -707,7 +707,7 @@ pub(crate) enum TunnelCommands {
     },
 }
 
-/// ZLayer Manager subcommands
+/// `ZLayer` Manager subcommands
 #[derive(Subcommand, Debug)]
 pub(crate) enum ManagerCommands {
     /// Initialize zlayer-manager deployment
@@ -733,7 +733,7 @@ pub(crate) enum ManagerCommands {
         #[arg(long)]
         deploy: bool,
 
-        /// ZLayer version to use (default: latest)
+        /// `ZLayer` version to use (default: latest)
         #[arg(long)]
         version: Option<String>,
     },
@@ -885,7 +885,7 @@ pub(crate) enum NodeCommands {
         #[arg(long, default_value = "9000")]
         raft_port: u16,
 
-        /// Overlay network port (WireGuard protocol)
+        /// Overlay network port (`WireGuard` protocol)
         #[arg(long, default_value = "51820")]
         overlay_port: u16,
 
@@ -980,7 +980,7 @@ pub(crate) enum NodeCommands {
     /// Examples:
     ///   zlayer node generate-join-token
     ///   zlayer node generate-join-token my-deploy
-    ///   zlayer node generate-join-token my-deploy -a http://10.0.0.1:3669
+    ///   zlayer node generate-join-token my-deploy -a <http://10.0.0.1:3669>
     #[command(verbatim_doc_comment)]
     GenerateJoinToken {
         /// Deployment name/key (auto-discovered from .zlayer.yml if not given)
@@ -994,7 +994,7 @@ pub(crate) enum NodeCommands {
         #[arg(short, long)]
         service: Option<String>,
 
-        /// Data directory (where node_config.json lives, defaults to platform default)
+        /// Data directory (where `node_config.json` lives, defaults to platform default)
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
@@ -1009,7 +1009,7 @@ pub(crate) enum TokenCommands {
         #[arg(short, long, default_value = "dev")]
         subject: String,
 
-        /// JWT secret (or use ZLAYER_JWT_SECRET env var)
+        /// JWT secret (or use `ZLAYER_JWT_SECRET` env var)
         #[arg(long)]
         secret: Option<String>,
 

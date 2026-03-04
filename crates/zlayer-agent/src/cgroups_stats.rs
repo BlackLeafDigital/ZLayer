@@ -13,7 +13,7 @@ pub struct ContainerStats {
     pub cpu_usage_usec: u64,
     /// Current memory usage in bytes
     pub memory_bytes: u64,
-    /// Memory limit in bytes (u64::MAX if unlimited)
+    /// Memory limit in bytes (`u64::MAX` if unlimited)
     pub memory_limit: u64,
     /// Timestamp when stats were collected
     pub timestamp: Instant,
@@ -22,7 +22,8 @@ pub struct ContainerStats {
 impl ContainerStats {
     /// Calculate memory usage as a percentage of the limit
     ///
-    /// Returns 0.0 if there is no limit (memory_limit == u64::MAX)
+    /// Returns 0.0 if there is no limit (`memory_limit` == `u64::MAX`)
+    #[must_use]
     pub fn memory_percent(&self) -> f64 {
         if self.memory_limit == u64::MAX || self.memory_limit == 0 {
             0.0
@@ -35,7 +36,7 @@ impl ContainerStats {
 /// Read container statistics from cgroups v2 filesystem
 ///
 /// Reads the following cgroup files:
-/// - `cpu.stat` for CPU usage (usage_usec field)
+/// - `cpu.stat` for CPU usage (`usage_usec` field)
 /// - `memory.current` for current memory usage
 /// - `memory.max` for memory limit
 ///
@@ -137,6 +138,7 @@ pub async fn read_container_stats(cgroup_path: &Path) -> std::io::Result<Contain
 /// let cpu_pct = calculate_cpu_percent(&prev, &curr);
 /// // Result depends on elapsed time and num_cpus
 /// ```
+#[must_use]
 pub fn calculate_cpu_percent(prev: &ContainerStats, curr: &ContainerStats) -> f64 {
     // Calculate CPU usage delta in microseconds
     let usage_delta_usec = curr.cpu_usage_usec.saturating_sub(prev.cpu_usage_usec);
@@ -171,6 +173,7 @@ pub fn calculate_cpu_percent(prev: &ContainerStats, curr: &ContainerStats) -> f6
 ///
 /// # Returns
 /// CPU usage percentage
+#[must_use]
 pub fn calculate_cpu_percent_with_cpus(
     prev: &ContainerStats,
     curr: &ContainerStats,

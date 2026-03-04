@@ -18,6 +18,7 @@ use crate::palette::ansi;
 /// - `TERM` -- colors are disabled only when set to `"dumb"`
 ///
 /// Returns `false` when none of the above variables are set.
+#[must_use]
 pub fn detect_color_support() -> bool {
     if std::env::var("NO_COLOR").is_ok() {
         return false;
@@ -51,6 +52,7 @@ pub fn detect_color_support() -> bool {
 /// let plain = colorize("ok", ansi::GREEN, false);
 /// assert_eq!(plain, "ok");
 /// ```
+#[must_use]
 pub fn colorize(text: &str, color: &str, enabled: bool) -> String {
     if enabled {
         format!("{}{}{}", color, text, ansi::RESET)

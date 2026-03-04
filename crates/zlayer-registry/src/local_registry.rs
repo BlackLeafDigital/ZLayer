@@ -85,6 +85,7 @@ pub struct RegistryIndex {
 
 impl RegistryIndex {
     /// Create a new empty index
+    #[must_use]
     pub fn new() -> Self {
         Self {
             schema_version: 1,
@@ -244,8 +245,7 @@ impl LocalRegistry {
         let actual_digest = compute_digest(&data);
         if actual_digest != digest {
             return Err(LocalRegistryError::Cache(CacheError::Corrupted(format!(
-                "blob integrity check failed: expected {}, got {}",
-                digest, actual_digest
+                "blob integrity check failed: expected {digest}, got {actual_digest}"
             ))));
         }
 
@@ -353,8 +353,7 @@ impl LocalRegistry {
         let actual_digest = compute_digest(&data);
         if actual_digest != digest {
             return Err(LocalRegistryError::Cache(CacheError::Corrupted(format!(
-                "manifest integrity check failed: expected {}, got {}",
-                digest, actual_digest
+                "manifest integrity check failed: expected {digest}, got {actual_digest}"
             ))));
         }
 

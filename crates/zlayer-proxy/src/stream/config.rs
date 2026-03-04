@@ -32,7 +32,7 @@ pub struct UdpListenerConfig {
     #[serde(default)]
     pub protocol_hint: Option<String>,
 
-    /// Session timeout override (default uses global udp_session_timeout)
+    /// Session timeout override (default uses global `udp_session_timeout`)
     #[serde(default, with = "optional_duration_serde")]
     pub session_timeout: Option<Duration>,
 }

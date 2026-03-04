@@ -114,6 +114,7 @@ pub struct NodeApiState {
 
 impl NodeApiState {
     /// Create a new node API state
+    #[must_use]
     pub fn new() -> Self {
         Self {}
     }
@@ -165,7 +166,7 @@ pub async fn get_node(
     Path(id): Path<u64>,
 ) -> Result<Json<NodeDetails>> {
     // Placeholder: return not found until scheduler integration
-    Err(ApiError::NotFound(format!("Node '{}' not found", id)))
+    Err(ApiError::NotFound(format!("Node '{id}' not found")))
 }
 
 /// Update labels on a node
@@ -195,7 +196,7 @@ pub async fn update_node_labels(
     user.require_role("admin")?;
 
     // Placeholder: return not found until scheduler integration
-    Err(ApiError::NotFound(format!("Node '{}' not found", id)))
+    Err(ApiError::NotFound(format!("Node '{id}' not found")))
 }
 
 /// Generate a join token for new nodes to join the cluster

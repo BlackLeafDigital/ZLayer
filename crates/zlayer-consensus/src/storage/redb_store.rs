@@ -43,8 +43,8 @@ use crate::types::NodeId;
 /// Log entries table: index -> bincode(Entry<C>)
 const LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("log_entries");
 
-/// Metadata table: key_name -> bincode(value)
-/// Keys: "vote", "last_purged", "committed"
+/// Metadata table: `key_name` -> bincode(value)
+/// Keys: "vote", "`last_purged`", "committed"
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
 /// Snapshot table: "current" -> bincode(snapshot)
@@ -124,6 +124,7 @@ impl<C: RaftTypeConfig<NodeId = NodeId>> RedbLogStore<C> {
     }
 
     /// Create from an already-open `Database`.
+    #[must_use]
     pub fn from_db(db: Arc<Database>) -> Self {
         Self {
             db,
@@ -606,6 +607,7 @@ where
     }
 
     /// Get read access to the cached state.
+    #[must_use]
     pub fn state(&self) -> Arc<RwLock<RedbSmCache<C, S>>> {
         Arc::clone(&self.sm)
     }

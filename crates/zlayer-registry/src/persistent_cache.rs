@@ -1,6 +1,6 @@
-//! Persistent blob cache for OCI images using SQLx with SQLite
+//! Persistent blob cache for OCI images using `SQLx` with `SQLite`
 //!
-//! This module provides a persistent blob cache backed by SQLite for durability.
+//! This module provides a persistent blob cache backed by `SQLite` for durability.
 //! Uses WAL mode for concurrent multi-process access.
 //! Blobs are stored with metadata for LRU eviction.
 
@@ -24,7 +24,7 @@ fn current_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
-/// Persistent blob cache for OCI images backed by SQLite
+/// Persistent blob cache for OCI images backed by `SQLite`
 pub struct PersistentBlobCache {
     pool: SqlitePool,
     max_size_bytes: u64,
@@ -54,7 +54,7 @@ impl PersistentBlobCache {
         // Build connection options with WAL mode and busy timeout
         let connect_options =
             SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", db_path.display()))
-                .map_err(|e| CacheError::Database(format!("invalid database path: {}", e)))?
+                .map_err(|e| CacheError::Database(format!("invalid database path: {e}")))?
                 .pragma("journal_mode", "WAL")
                 .pragma("busy_timeout", "5000")
                 .pragma("synchronous", "NORMAL")
@@ -65,11 +65,11 @@ impl PersistentBlobCache {
             .max_connections(5)
             .connect_with(connect_options)
             .await
-            .map_err(|e| CacheError::Database(format!("failed to open database: {}", e)))?;
+            .map_err(|e| CacheError::Database(format!("failed to open database: {e}")))?;
 
         // Initialize schema
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS blobs (
                 digest TEXT PRIMARY KEY NOT NULL,
                 data BLOB NOT NULL,
@@ -77,20 +77,20 @@ impl PersistentBlobCache {
                 created_at INTEGER NOT NULL,
                 last_accessed INTEGER NOT NULL
             )
-            "#,
+            ",
         )
         .execute(&pool)
         .await
-        .map_err(|e| CacheError::Database(format!("failed to create blobs table: {}", e)))?;
+        .map_err(|e| CacheError::Database(format!("failed to create blobs table: {e}")))?;
 
         sqlx::query(
-            r#"
+            r"
             CREATE INDEX IF NOT EXISTS idx_blobs_last_accessed ON blobs(last_accessed)
-            "#,
+            ",
         )
         .execute(&pool)
         .await
-        .map_err(|e| CacheError::Database(format!("failed to create index: {}", e)))?;
+        .map_err(|e| CacheError::Database(format!("failed to create index: {e}")))?;
 
         info!("Opened persistent blob cache at {:?}", db_path);
 
@@ -115,7 +115,7 @@ impl PersistentBlobCache {
             .bind(digest)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|e| CacheError::Database(format!("failed to get blob: {}", e)))?;
+            .map_err(|e| CacheError::Database(format!("failed to get blob: {e}")))?;
 
         // Update last_accessed timestamp asynchronously (best effort)
         if result.is_some() {
@@ -125,7 +125,7 @@ impl PersistentBlobCache {
         Ok(result)
     }
 
-    /// Update the last_accessed timestamp for a blob
+    /// Update the `last_accessed` timestamp for a blob
     async fn update_access_time(&self, digest: &str) -> Result<(), CacheError> {
         let now = current_timestamp();
 
@@ -134,7 +134,7 @@ impl PersistentBlobCache {
             .bind(digest)
             .execute(&self.pool)
             .await
-            .map_err(|e| CacheError::Database(format!("failed to update access time: {}", e)))?;
+            .map_err(|e| CacheError::Database(format!("failed to update access time: {e}")))?;
 
         Ok(())
     }
@@ -148,8 +148,7 @@ impl PersistentBlobCache {
             let actual_digest = compute_digest(data);
             if actual_digest != digest {
                 return Err(CacheError::Corrupted(format!(
-                    "digest mismatch: expected {}, got {}",
-                    digest, actual_digest
+                    "digest mismatch: expected {digest}, got {actual_digest}"
                 )));
             }
         }
@@ -158,10 +157,10 @@ impl PersistentBlobCache {
         let size_bytes = data.len() as i64;
 
         sqlx::query(
-            r#"
+            r"
             INSERT OR REPLACE INTO blobs (digest, data, size_bytes, created_at, last_accessed)
             VALUES (?, ?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(digest)
         .bind(data)
@@ -170,7 +169,7 @@ impl PersistentBlobCache {
         .bind(now)
         .execute(&self.pool)
         .await
-        .map_err(|e| CacheError::Database(format!("failed to insert blob: {}", e)))?;
+        .map_err(|e| CacheError::Database(format!("failed to insert blob: {e}")))?;
 
         debug!("Stored blob {} ({} bytes)", digest, data.len());
 
@@ -189,7 +188,7 @@ impl PersistentBlobCache {
                 .bind(digest)
                 .fetch_one(&self.pool)
                 .await
-                .map_err(|e| CacheError::Database(format!("failed to check blob: {}", e)))?;
+                .map_err(|e| CacheError::Database(format!("failed to check blob: {e}")))?;
 
         Ok(exists)
     }
@@ -202,7 +201,7 @@ impl PersistentBlobCache {
             .bind(digest)
             .execute(&self.pool)
             .await
-            .map_err(|e| CacheError::Database(format!("failed to delete blob: {}", e)))?;
+            .map_err(|e| CacheError::Database(format!("failed to delete blob: {e}")))?;
 
         debug!("Deleted blob {}", digest);
 
@@ -214,7 +213,7 @@ impl PersistentBlobCache {
         let total: Option<i64> = sqlx::query_scalar("SELECT SUM(size_bytes) FROM blobs")
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| CacheError::Database(format!("failed to get cache size: {}", e)))?;
+            .map_err(|e| CacheError::Database(format!("failed to get cache size: {e}")))?;
 
         Ok(total.unwrap_or(0) as u64)
     }
@@ -224,7 +223,7 @@ impl PersistentBlobCache {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| CacheError::Database(format!("failed to get blob count: {}", e)))?;
+            .map_err(|e| CacheError::Database(format!("failed to get blob count: {e}")))?;
 
         Ok(count as u64)
     }
@@ -234,7 +233,7 @@ impl PersistentBlobCache {
         sqlx::query("DELETE FROM blobs")
             .execute(&self.pool)
             .await
-            .map_err(|e| CacheError::Database(format!("failed to clear cache: {}", e)))?;
+            .map_err(|e| CacheError::Database(format!("failed to clear cache: {e}")))?;
 
         info!("Cleared all blobs from cache");
 
@@ -263,7 +262,7 @@ impl PersistentBlobCache {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(|e| {
-                    CacheError::Database(format!("failed to get blobs for eviction: {}", e))
+                    CacheError::Database(format!("failed to get blobs for eviction: {e}"))
                 })?;
 
         // Evict oldest entries until we reach target
@@ -287,7 +286,7 @@ impl PersistentBlobCache {
                 .bind(digest)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| CacheError::Database(format!("failed to delete blob: {}", e)))?;
+                .map_err(|e| CacheError::Database(format!("failed to delete blob: {e}")))?;
         }
 
         info!(

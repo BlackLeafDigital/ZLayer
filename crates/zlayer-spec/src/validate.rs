@@ -1,4 +1,4 @@
-//! Validation functions for ZLayer deployment specifications
+//! Validation functions for `ZLayer` deployment specifications
 //!
 //! This module provides validators for all spec fields with proper error reporting.
 
@@ -26,19 +26,19 @@ fn make_validation_error(
     err
 }
 
-/// Wrapper for validate_version for use with validator crate
+/// Wrapper for `validate_version` for use with validator crate
 pub fn validate_version_wrapper(version: &str) -> Result<(), validator::ValidationError> {
     if version == "v1" {
         Ok(())
     } else {
         Err(make_validation_error(
             "invalid_version",
-            format!("version must be 'v1', found '{}'", version),
+            format!("version must be 'v1', found '{version}'"),
         ))
     }
 }
 
-/// Wrapper for validate_deployment_name for use with validator crate
+/// Wrapper for `validate_deployment_name` for use with validator crate
 pub fn validate_deployment_name_wrapper(name: &str) -> Result<(), validator::ValidationError> {
     // Check length
     if name.len() < 3 || name.len() > 63 {
@@ -71,7 +71,7 @@ pub fn validate_deployment_name_wrapper(name: &str) -> Result<(), validator::Val
     Ok(())
 }
 
-/// Wrapper for validate_image_name for use with validator crate
+/// Wrapper for `validate_image_name` for use with validator crate
 pub fn validate_image_name_wrapper(name: &str) -> Result<(), validator::ValidationError> {
     if name.is_empty() || name.trim().is_empty() {
         Err(make_validation_error(
@@ -83,20 +83,20 @@ pub fn validate_image_name_wrapper(name: &str) -> Result<(), validator::Validati
     }
 }
 
-/// Wrapper for validate_cpu for use with validator crate
+/// Wrapper for `validate_cpu` for use with validator crate
 /// Note: For Option<f64> fields, validator crate unwraps and passes the inner f64
 pub fn validate_cpu_option_wrapper(cpu: f64) -> Result<(), validator::ValidationError> {
     if cpu <= 0.0 {
         Err(make_validation_error(
             "invalid_cpu",
-            format!("CPU limit must be > 0, found {}", cpu),
+            format!("CPU limit must be > 0, found {cpu}"),
         ))
     } else {
         Ok(())
     }
 }
 
-/// Wrapper for validate_memory_format for use with validator crate
+/// Wrapper for `validate_memory_format` for use with validator crate
 /// Note: For Option<String> fields, validator crate unwraps and passes &String
 pub fn validate_memory_option_wrapper(value: &String) -> Result<(), validator::ValidationError> {
     const VALID_SUFFIXES: [&str; 4] = ["Ki", "Mi", "Gi", "Ti"];
@@ -112,21 +112,18 @@ pub fn validate_memory_option_wrapper(value: &String) -> Result<(), validator::V
                 Ok(n) if n > 0 => Ok(()),
                 _ => Err(make_validation_error(
                     "invalid_memory_format",
-                    format!("invalid memory format: '{}'", value),
+                    format!("invalid memory format: '{value}'"),
                 )),
             }
         }
         None => Err(make_validation_error(
             "invalid_memory_format",
-            format!(
-                "invalid memory format: '{}' (use Ki, Mi, Gi, or Ti suffix)",
-                value
-            ),
+            format!("invalid memory format: '{value}' (use Ki, Mi, Gi, or Ti suffix)"),
         )),
     }
 }
 
-/// Wrapper for validate_port for use with validator crate
+/// Wrapper for `validate_port` for use with validator crate
 /// Note: validator crate passes primitive types by value for custom validators
 pub fn validate_port_wrapper(port: u16) -> Result<(), validator::ValidationError> {
     if port >= 1 {
@@ -139,26 +136,26 @@ pub fn validate_port_wrapper(port: u16) -> Result<(), validator::ValidationError
     }
 }
 
-/// Validate scale range (min <= max) for ScaleSpec
+/// Validate scale range (min <= max) for `ScaleSpec`
 pub fn validate_scale_spec(scale: &ScaleSpec) -> Result<(), validator::ValidationError> {
     if let ScaleSpec::Adaptive { min, max, .. } = scale {
         if *min > *max {
             return Err(make_validation_error(
                 "invalid_scale_range",
-                format!("scale min ({}) cannot be greater than max ({})", min, max),
+                format!("scale min ({min}) cannot be greater than max ({max})"),
             ));
         }
     }
     Ok(())
 }
 
-/// Wrapper for validate_cron_schedule for use with validator crate
+/// Wrapper for `validate_cron_schedule` for use with validator crate
 /// Note: For Option<String> fields, validator crate unwraps and passes &String
 pub fn validate_schedule_wrapper(schedule: &String) -> Result<(), validator::ValidationError> {
     Schedule::from_str(schedule).map(|_| ()).map_err(|e| {
         make_validation_error(
             "invalid_cron_schedule",
-            format!("invalid cron schedule '{}': {}", schedule, e),
+            format!("invalid cron schedule '{schedule}': {e}"),
         )
     })
 }
@@ -197,8 +194,7 @@ pub fn validate_secret_reference(value: &str) -> Result<(), validator::Validatio
             return Err(make_validation_error(
                 "invalid_secret_reference",
                 format!(
-                    "cross-service secret reference '{}' must have format @service/secret-name",
-                    value
+                    "cross-service secret reference '{value}' must have format @service/secret-name"
                 ),
             ));
         }
@@ -210,20 +206,14 @@ pub fn validate_secret_reference(value: &str) -> Result<(), validator::Validatio
         if service_name.is_empty() {
             return Err(make_validation_error(
                 "invalid_secret_reference",
-                format!(
-                    "service name in secret reference '{}' cannot be empty",
-                    value
-                ),
+                format!("service name in secret reference '{value}' cannot be empty"),
             ));
         }
 
         if !service_name.chars().next().unwrap().is_ascii_alphabetic() {
             return Err(make_validation_error(
                 "invalid_secret_reference",
-                format!(
-                    "service name in secret reference '{}' must start with a letter",
-                    value
-                ),
+                format!("service name in secret reference '{value}' must start with a letter"),
             ));
         }
 
@@ -232,8 +222,7 @@ pub fn validate_secret_reference(value: &str) -> Result<(), validator::Validatio
                 return Err(make_validation_error(
                     "invalid_secret_reference",
                     format!(
-                        "service name in secret reference '{}' contains invalid character '{}'",
-                        value, c
+                        "service name in secret reference '{value}' contains invalid character '{c}'"
                     ),
                 ));
             }
@@ -248,7 +237,7 @@ pub fn validate_secret_reference(value: &str) -> Result<(), validator::Validatio
     if secret_name.is_empty() {
         return Err(make_validation_error(
             "invalid_secret_reference",
-            format!("secret name in '{}' cannot be empty", value),
+            format!("secret name in '{value}' cannot be empty"),
         ));
     }
 
@@ -257,10 +246,7 @@ pub fn validate_secret_reference(value: &str) -> Result<(), validator::Validatio
     if !first_char.is_ascii_alphabetic() {
         return Err(make_validation_error(
             "invalid_secret_reference",
-            format!(
-                "secret name in '{}' must start with a letter, found '{}'",
-                value, first_char
-            ),
+            format!("secret name in '{value}' must start with a letter, found '{first_char}'"),
         ));
     }
 
@@ -270,8 +256,7 @@ pub fn validate_secret_reference(value: &str) -> Result<(), validator::Validatio
             return Err(make_validation_error(
                 "invalid_secret_reference",
                 format!(
-                    "secret name in '{}' contains invalid character '{}' (only alphanumeric, hyphens, underscores allowed)",
-                    value, c
+                    "secret name in '{value}' contains invalid character '{c}' (only alphanumeric, hyphens, underscores allowed)"
                 ),
             ));
         }
@@ -292,10 +277,9 @@ pub fn validate_env_vars(
                     key: key.clone(),
                     reason: e
                         .message
-                        .map(|m| m.to_string())
-                        .unwrap_or_else(|| "invalid secret reference".to_string()),
+                        .map_or_else(|| "invalid secret reference".to_string(), |m| m.to_string()),
                 },
-                path: format!("services.{}.env.{}", service_name, key),
+                path: format!("services.{service_name}.env.{key}"),
             });
         }
     }
@@ -309,13 +293,13 @@ pub fn validate_storage_name(name: &str) -> Result<(), validator::ValidationErro
     if !re.is_match(name) || name.len() > 63 {
         return Err(make_validation_error(
             "invalid_storage_name",
-            format!("storage name '{}' must be lowercase alphanumeric with hyphens, 1-63 chars, not starting/ending with hyphen", name),
+            format!("storage name '{name}' must be lowercase alphanumeric with hyphens, 1-63 chars, not starting/ending with hyphen"),
         ));
     }
     Ok(())
 }
 
-/// Wrapper for validate_storage_name for use with validator crate
+/// Wrapper for `validate_storage_name` for use with validator crate
 pub fn validate_storage_name_wrapper(name: &str) -> Result<(), validator::ValidationError> {
     validate_storage_name(name)
 }
@@ -326,7 +310,11 @@ pub fn validate_storage_name_wrapper(name: &str) -> Result<(), validator::Valida
 
 /// Validate that all dependency service references exist
 pub fn validate_dependencies(spec: &DeploymentSpec) -> Result<(), ValidationError> {
-    let service_names: HashSet<&str> = spec.services.keys().map(|s| s.as_str()).collect();
+    let service_names: HashSet<&str> = spec
+        .services
+        .keys()
+        .map(std::string::String::as_str)
+        .collect();
 
     for (service_name, service_spec) in &spec.services {
         for dep in &service_spec.depends {
@@ -335,7 +323,7 @@ pub fn validate_dependencies(spec: &DeploymentSpec) -> Result<(), ValidationErro
                     kind: ValidationErrorKind::UnknownDependency {
                         service: dep.service.clone(),
                     },
-                    path: format!("services.{}.depends", service_name),
+                    path: format!("services.{service_name}.depends"),
                 });
             }
         }
@@ -354,7 +342,7 @@ pub fn validate_unique_service_endpoints(spec: &DeploymentSpec) -> Result<(), Va
                     kind: ValidationErrorKind::DuplicateEndpoint {
                         name: endpoint.name.clone(),
                     },
-                    path: format!("services.{}.endpoints", service_name),
+                    path: format!("services.{service_name}.endpoints"),
                 });
             }
         }
@@ -380,7 +368,7 @@ pub fn validate_service_schedule(
     if spec.schedule.is_some() && spec.rtype != ResourceType::Cron {
         return Err(ValidationError {
             kind: ValidationErrorKind::ScheduleOnlyForCron,
-            path: format!("services.{}.schedule", service_name),
+            path: format!("services.{service_name}.schedule"),
         });
     }
 
@@ -388,7 +376,7 @@ pub fn validate_service_schedule(
     if spec.rtype == ResourceType::Cron && spec.schedule.is_none() {
         return Err(ValidationError {
             kind: ValidationErrorKind::CronRequiresSchedule,
-            path: format!("services.{}.schedule", service_name),
+            path: format!("services.{service_name}.schedule"),
         });
     }
 
@@ -529,7 +517,9 @@ pub fn validate_port(port: &u16) -> Result<(), ValidationError> {
         Ok(())
     } else {
         Err(ValidationError {
-            kind: ValidationErrorKind::InvalidPort { port: *port as u32 },
+            kind: ValidationErrorKind::InvalidPort {
+                port: u32::from(*port),
+            },
             path: "endpoints[].port".to_string(),
         })
     }
@@ -577,12 +567,12 @@ pub fn validate_tunnel_ttl(ttl: &str) -> Result<(), validator::ValidationError> 
     humantime::parse_duration(ttl).map(|_| ()).map_err(|e| {
         make_validation_error(
             "invalid_tunnel_ttl",
-            format!("invalid TTL format '{}': {}", ttl, e),
+            format!("invalid TTL format '{ttl}': {e}"),
         )
     })
 }
 
-/// Validate a TunnelAccessConfig
+/// Validate a `TunnelAccessConfig`
 pub fn validate_tunnel_access_config(
     config: &TunnelAccessConfig,
     path: &str,
@@ -593,16 +583,15 @@ pub fn validate_tunnel_access_config(
                 value: max_ttl.clone(),
                 reason: e
                     .message
-                    .map(|m| m.to_string())
-                    .unwrap_or_else(|| "invalid duration format".to_string()),
+                    .map_or_else(|| "invalid duration format".to_string(), |m| m.to_string()),
             },
-            path: format!("{}.access.max_ttl", path),
+            path: format!("{path}.access.max_ttl"),
         })?;
     }
     Ok(())
 }
 
-/// Validate an EndpointTunnelConfig
+/// Validate an `EndpointTunnelConfig`
 pub fn validate_endpoint_tunnel_config(
     config: &EndpointTunnelConfig,
     path: &str,
@@ -618,12 +607,12 @@ pub fn validate_endpoint_tunnel_config(
     Ok(())
 }
 
-/// Validate a top-level TunnelDefinition
+/// Validate a top-level `TunnelDefinition`
 pub fn validate_tunnel_definition(
     name: &str,
     tunnel: &TunnelDefinition,
 ) -> Result<(), ValidationError> {
-    let path = format!("tunnels.{}", name);
+    let path = format!("tunnels.{name}");
 
     // Validate local_port (must be 1-65535, not 0)
     if tunnel.local_port == 0 {
@@ -632,7 +621,7 @@ pub fn validate_tunnel_definition(
                 port: tunnel.local_port,
                 field: "local_port".to_string(),
             },
-            path: format!("{}.local_port", path),
+            path: format!("{path}.local_port"),
         });
     }
 
@@ -643,7 +632,7 @@ pub fn validate_tunnel_definition(
                 port: tunnel.remote_port,
                 field: "remote_port".to_string(),
             },
-            path: format!("{}.remote_port", path),
+            path: format!("{path}.remote_port"),
         });
     }
 
@@ -661,7 +650,7 @@ pub fn validate_tunnels(spec: &DeploymentSpec) -> Result<(), ValidationError> {
     for (service_name, service_spec) in &spec.services {
         for (idx, endpoint) in service_spec.endpoints.iter().enumerate() {
             if let Some(ref tunnel_config) = endpoint.tunnel {
-                let path = format!("services.{}.endpoints[{}].tunnel", service_name, idx);
+                let path = format!("services.{service_name}.endpoints[{idx}].tunnel");
                 validate_endpoint_tunnel_config(tunnel_config, &path)?;
             }
         }

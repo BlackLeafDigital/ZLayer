@@ -1,6 +1,6 @@
 //! Deployment storage traits and implementations
 //!
-//! This module provides persistent storage for deployment specifications using SQLite.
+//! This module provides persistent storage for deployment specifications using `SQLite`.
 //!
 //! # Example
 //!
@@ -48,6 +48,7 @@ pub struct StoredDeployment {
 
 impl StoredDeployment {
     /// Create a new stored deployment from a spec
+    #[must_use]
     pub fn new(spec: DeploymentSpec) -> Self {
         let now = Utc::now();
         Self {
@@ -101,7 +102,7 @@ impl std::fmt::Display for DeploymentStatus {
             DeploymentStatus::Pending => write!(f, "pending"),
             DeploymentStatus::Deploying => write!(f, "deploying"),
             DeploymentStatus::Running => write!(f, "running"),
-            DeploymentStatus::Failed { message } => write!(f, "failed: {}", message),
+            DeploymentStatus::Failed { message } => write!(f, "failed: {message}"),
             DeploymentStatus::Stopped => write!(f, "stopped"),
         }
     }

@@ -21,6 +21,7 @@ impl ContainerLayerId {
         }
     }
 
+    #[must_use]
     pub fn to_key(&self) -> String {
         format!("{}_{}", self.service, self.instance_id)
     }
@@ -63,6 +64,7 @@ pub struct SyncState {
 }
 
 impl SyncState {
+    #[must_use]
     pub fn new(container_id: ContainerLayerId) -> Self {
         Self {
             container_id,
@@ -73,6 +75,7 @@ impl SyncState {
         }
     }
 
+    #[must_use]
     pub fn needs_upload(&self) -> bool {
         match (&self.local_digest, &self.remote_digest) {
             (Some(local), Some(remote)) => local != remote,
@@ -91,7 +94,7 @@ pub struct PendingUpload {
     pub object_key: String,
     /// Total parts expected
     pub total_parts: u32,
-    /// Parts successfully uploaded (part_number -> ETag)
+    /// Parts successfully uploaded (`part_number` -> `ETag`)
     pub completed_parts: HashMap<u32, CompletedPart>,
     /// Part size in bytes
     pub part_size: u64,
@@ -104,12 +107,14 @@ pub struct PendingUpload {
 }
 
 impl PendingUpload {
+    #[must_use]
     pub fn missing_parts(&self) -> Vec<u32> {
         (1..=self.total_parts)
             .filter(|p| !self.completed_parts.contains_key(p))
             .collect()
     }
 
+    #[must_use]
     pub fn is_complete(&self) -> bool {
         self.completed_parts.len() == self.total_parts as usize
     }

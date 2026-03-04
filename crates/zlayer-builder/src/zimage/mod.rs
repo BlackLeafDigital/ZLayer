@@ -1,6 +1,6 @@
-//! ZImagefile - YAML-based image build format
+//! `ZImagefile` - YAML-based image build format
 //!
-//! This module provides types, parsing, and conversion for ZImagefiles,
+//! This module provides types, parsing, and conversion for `ZImagefiles`,
 //! an alternative to Dockerfiles using YAML syntax.
 
 mod converter;

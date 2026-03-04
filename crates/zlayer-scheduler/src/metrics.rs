@@ -56,6 +56,7 @@ pub struct ServiceMetrics {
 
 impl ServiceMetrics {
     /// Calculate memory usage as percentage
+    #[must_use]
     pub fn memory_percent(&self) -> f64 {
         if self.memory_limit > 0 {
             (self.memory_bytes as f64 / self.memory_limit as f64) * 100.0
@@ -65,10 +66,9 @@ impl ServiceMetrics {
     }
 
     /// Check if metrics are stale (older than given duration)
+    #[must_use]
     pub fn is_stale(&self, max_age: Duration) -> bool {
-        self.timestamp
-            .map(|ts| ts.elapsed() > max_age)
-            .unwrap_or(true)
+        self.timestamp.is_none_or(|ts| ts.elapsed() > max_age)
     }
 }
 
@@ -110,11 +110,13 @@ pub struct MetricsCollector {
 
 impl MetricsCollector {
     /// Create a new metrics collector
+    #[must_use]
     pub fn new() -> Self {
         Self::with_cache_ttl(Duration::from_secs(5))
     }
 
     /// Create with custom cache TTL
+    #[must_use]
     pub fn with_cache_ttl(cache_ttl: Duration) -> Self {
         let registry = Registry::new();
 
@@ -168,6 +170,7 @@ impl MetricsCollector {
     }
 
     /// Get the Prometheus registry for exposition
+    #[must_use]
     pub fn registry(&self) -> &Registry {
         &self.registry
     }
@@ -211,8 +214,7 @@ impl MetricsCollector {
 
         if all_metrics.is_empty() {
             return Err(SchedulerError::MetricsCollection(format!(
-                "No metrics available for service: {}",
-                service_name
+                "No metrics available for service: {service_name}"
             )));
         }
 
@@ -253,7 +255,7 @@ impl MetricsCollector {
 
         let instance_count = metrics.len();
         let total_cpu: f64 = metrics.iter().map(|m| m.cpu_percent).sum();
-        let total_memory_percent: f64 = metrics.iter().map(|m| m.memory_percent()).sum();
+        let total_memory_percent: f64 = metrics.iter().map(ServiceMetrics::memory_percent).sum();
         let total_rps: Option<f64> = {
             let rps_values: Vec<f64> = metrics.iter().filter_map(|m| m.rps).collect();
             if rps_values.is_empty() {
@@ -297,6 +299,7 @@ pub struct MockMetricsSource {
 
 impl MockMetricsSource {
     /// Create a new mock source
+    #[must_use]
     pub fn new() -> Self {
         Self {
             metrics: Arc::new(RwLock::new(HashMap::new())),
@@ -328,8 +331,7 @@ impl MetricsSource for MockMetricsSource {
         let map = self.metrics.read().await;
         map.get(service_name).cloned().ok_or_else(|| {
             SchedulerError::MetricsCollection(format!(
-                "No mock metrics for service: {}",
-                service_name
+                "No mock metrics for service: {service_name}"
             ))
         })
     }
@@ -357,16 +359,19 @@ impl ContainerdMetricsSource {
     }
 
     /// Default socket path for containerd
+    #[must_use]
     pub fn default_socket() -> &'static str {
         "/run/containerd/containerd.sock"
     }
 
     /// Default namespace
+    #[must_use]
     pub fn default_namespace() -> &'static str {
         "zlayer"
     }
 
     /// Create with defaults
+    #[must_use]
     pub fn with_defaults() -> Self {
         Self::new(Self::default_socket(), Self::default_namespace())
     }
@@ -412,7 +417,7 @@ impl MetricsSource for ContainerdMetricsSource {
 
 /// Container identifier for metrics collection
 ///
-/// This is a simplified identifier that matches the agent crate's ContainerId
+/// This is a simplified identifier that matches the agent crate's `ContainerId`
 /// but avoids a direct dependency.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct MetricsContainerId {
@@ -430,7 +435,7 @@ impl std::fmt::Display for MetricsContainerId {
 
 /// Raw container statistics from cgroups
 ///
-/// This mirrors the agent crate's ContainerStats structure but allows
+/// This mirrors the agent crate's `ContainerStats` structure but allows
 /// the scheduler to work without a direct dependency on agent.
 #[derive(Debug, Clone)]
 pub struct RawContainerStats {
@@ -438,7 +443,7 @@ pub struct RawContainerStats {
     pub cpu_usage_usec: u64,
     /// Current memory usage in bytes
     pub memory_bytes: u64,
-    /// Memory limit in bytes (u64::MAX if unlimited)
+    /// Memory limit in bytes (`u64::MAX` if unlimited)
     pub memory_limit: u64,
     /// Timestamp when stats were collected
     pub timestamp: Instant,
@@ -446,6 +451,7 @@ pub struct RawContainerStats {
 
 impl RawContainerStats {
     /// Calculate memory usage as a percentage
+    #[must_use]
     pub fn memory_percent(&self) -> f64 {
         if self.memory_limit == u64::MAX || self.memory_limit == 0 {
             0.0
@@ -459,7 +465,7 @@ impl RawContainerStats {
 ///
 /// Implementations of this trait provide the mapping from service names
 /// to container identifiers. This is typically implemented by the agent's
-/// ServiceManager.
+/// `ServiceManager`.
 #[async_trait]
 pub trait ServiceContainerProvider: Send + Sync {
     /// Get all container IDs for a given service
@@ -512,7 +518,7 @@ where
     service_provider: Arc<S>,
     /// Provider for container statistics
     stats_provider: Arc<P>,
-    /// Previous stats for CPU delta calculation (container_id -> stats)
+    /// Previous stats for CPU delta calculation (`container_id` -> stats)
     prev_stats: RwLock<HashMap<String, RawContainerStats>>,
     /// Number of CPUs for CPU percentage calculation
     num_cpus: u64,
@@ -549,7 +555,7 @@ where
 
     /// Calculate CPU percentage from two consecutive samples
     ///
-    /// Uses the formula: (delta_usage / (delta_time * num_cpus)) * 100
+    /// Uses the formula: (`delta_usage` / (`delta_time` * `num_cpus`)) * 100
     fn calculate_cpu_percent(&self, prev: &RawContainerStats, curr: &RawContainerStats) -> f64 {
         let usage_delta = curr.cpu_usage_usec.saturating_sub(prev.cpu_usage_usec);
         let time_delta = curr.timestamp.duration_since(prev.timestamp);
@@ -631,8 +637,7 @@ where
         if container_ids.is_empty() {
             debug!(service = service_name, "No containers found for service");
             return Err(SchedulerError::MetricsCollection(format!(
-                "No containers found for service: {}",
-                service_name
+                "No containers found for service: {service_name}"
             )));
         }
 
@@ -646,8 +651,7 @@ where
 
         if metrics.is_empty() {
             return Err(SchedulerError::MetricsCollection(format!(
-                "Failed to collect metrics from any container for service: {}",
-                service_name
+                "Failed to collect metrics from any container for service: {service_name}"
             )));
         }
 
@@ -692,7 +696,7 @@ pub struct AutoscaleMetrics {
 
 /// Collect all service metrics for autoscaling decisions
 ///
-/// This is a convenience function that uses a CgroupsMetricsSource to
+/// This is a convenience function that uses a `CgroupsMetricsSource` to
 /// collect and aggregate metrics for all services.
 pub async fn collect_all_service_metrics<S, P>(
     source: &CgroupsMetricsSource<S, P>,

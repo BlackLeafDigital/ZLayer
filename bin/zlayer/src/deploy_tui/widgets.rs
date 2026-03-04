@@ -43,7 +43,7 @@ impl Widget for InfraProgress<'_> {
 
         let done_count = self.phases.iter().filter(|(_, s)| s.is_done()).count();
         let total = self.phases.len();
-        let title = format!(" Infrastructure  {}/{} ", done_count, total);
+        let title = format!(" Infrastructure  {done_count}/{total} ");
 
         let block = Block::default()
             .title(title)

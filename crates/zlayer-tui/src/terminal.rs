@@ -1,7 +1,7 @@
 //! Terminal setup, teardown, and panic hook utilities.
 //!
 //! Unifies the identical terminal initialization and restoration code
-//! used across all ZLayer TUI applications (builder, deploy, main CLI).
+//! used across all `ZLayer` TUI applications (builder, deploy, main CLI).
 
 use std::io::{self, Stdout};
 use std::time::Duration;

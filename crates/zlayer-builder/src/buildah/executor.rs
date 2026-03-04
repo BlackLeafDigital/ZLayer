@@ -29,11 +29,13 @@ pub struct CommandOutput {
 
 impl CommandOutput {
     /// Returns true if the command succeeded (exit code 0)
+    #[must_use]
     pub fn success(&self) -> bool {
         self.exit_code == 0
     }
 
     /// Returns the combined stdout and stderr
+    #[must_use]
     pub fn combined_output(&self) -> String {
         if self.stderr.is_empty() {
             self.stdout.clone()
@@ -73,7 +75,7 @@ impl Default for BuildahExecutor {
 }
 
 impl BuildahExecutor {
-    /// Create a new BuildahExecutor, locating the buildah binary (sync version)
+    /// Create a new `BuildahExecutor`, locating the buildah binary (sync version)
     ///
     /// This will search for buildah in common system locations and PATH.
     /// For more comprehensive discovery with version checking, use [`new_async`].
@@ -87,7 +89,7 @@ impl BuildahExecutor {
         })
     }
 
-    /// Create a new BuildahExecutor using the BuildahInstaller
+    /// Create a new `BuildahExecutor` using the `BuildahInstaller`
     ///
     /// This async version uses [`BuildahInstaller`] to find buildah and verify
     /// it meets minimum version requirements. If buildah is not found, it returns
@@ -124,7 +126,7 @@ impl BuildahExecutor {
         })
     }
 
-    /// Create a BuildahExecutor with a specific path to the buildah binary
+    /// Create a `BuildahExecutor` with a specific path to the buildah binary
     pub fn with_path(path: impl Into<PathBuf>) -> Self {
         Self {
             buildah_path: path.into(),
@@ -153,6 +155,7 @@ impl BuildahExecutor {
     }
 
     /// Get the path to the buildah binary
+    #[must_use]
     pub fn buildah_path(&self) -> &PathBuf {
         &self.buildah_path
     }

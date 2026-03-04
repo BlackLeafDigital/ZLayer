@@ -1,4 +1,4 @@
-//! ZLayer Registry - OCI image pulling and caching
+//! `ZLayer` Registry - OCI image pulling and caching
 //!
 //! This module provides OCI distribution client functionality with local blob caching.
 //!

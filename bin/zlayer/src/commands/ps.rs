@@ -53,7 +53,7 @@ pub(crate) async fn ps(
             Err(e) => {
                 let msg = e.to_string();
                 if msg.contains("404") {
-                    bail!("Deployment '{}' not found", name);
+                    bail!("Deployment '{name}' not found");
                 }
                 return Err(e);
             }
@@ -110,7 +110,7 @@ pub(crate) async fn ps(
             ps_rows.push(PsRow {
                 deployment: deploy_name.clone(),
                 service: svc_name.clone(),
-                replicas: format!("{}/{}", replicas, desired),
+                replicas: format!("{replicas}/{desired}"),
                 status,
                 ports,
                 age,
@@ -118,21 +118,18 @@ pub(crate) async fn ps(
 
             // If --containers requested, fetch container info
             if show_containers {
-                match client.list_containers(&deploy_name, &svc_name).await {
-                    Ok(containers) => {
-                        for c in &containers {
-                            container_rows.push(ContainerRow {
-                                deployment: deploy_name.clone(),
-                                service: svc_name.clone(),
-                                container: c["id"].as_str().unwrap_or("unknown").to_string(),
-                                replica: c["replica"].as_u64().unwrap_or(0) as u32,
-                                state: c["state"].as_str().unwrap_or("unknown").to_string(),
-                            });
-                        }
+                if let Ok(containers) = client.list_containers(&deploy_name, &svc_name).await {
+                    for c in &containers {
+                        container_rows.push(ContainerRow {
+                            deployment: deploy_name.clone(),
+                            service: svc_name.clone(),
+                            container: c["id"].as_str().unwrap_or("unknown").to_string(),
+                            replica: c["replica"].as_u64().unwrap_or(0) as u32,
+                            state: c["state"].as_str().unwrap_or("unknown").to_string(),
+                        });
                     }
-                    Err(_) => {
-                        // Containers endpoint may not be available; silently skip
-                    }
+                } else {
+                    // Containers endpoint may not be available; silently skip
                 }
             }
         }
@@ -189,7 +186,7 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
     );
 
     // Print header
-    println!("{}", sep);
+    println!("{sep}");
     println!(
         "{:<w0$} | {:<w1$} | {:<w2$} | {:<w3$} | {:<w4$} | {:<w5$}",
         hdr[0],
@@ -205,7 +202,7 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
         w4 = widths[4],
         w5 = widths[5],
     );
-    println!("{}", sep);
+    println!("{sep}");
 
     // Print rows
     for r in rows {
@@ -225,7 +222,7 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
             w5 = widths[5],
         );
     }
-    println!("{}", sep);
+    println!("{sep}");
 
     // Print containers if requested
     if show_containers && !container_rows.is_empty() {
@@ -251,7 +248,7 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
             "-".repeat(cwidths[4]),
         );
 
-        println!("{}", csep);
+        println!("{csep}");
         println!(
             "{:<w0$} | {:<w1$} | {:<w2$} | {:<w3$} | {:<w4$}",
             chdr[0],
@@ -265,7 +262,7 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
             w3 = cwidths[3],
             w4 = cwidths[4],
         );
-        println!("{}", csep);
+        println!("{csep}");
 
         for c in container_rows {
             println!(
@@ -282,7 +279,7 @@ fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers:
                 w4 = cwidths[4],
             );
         }
-        println!("{}", csep);
+        println!("{csep}");
     }
 }
 
@@ -320,7 +317,7 @@ fn print_yaml(
             "services": rows,
         })
     };
-    println!("{}", serde_yaml::to_string(&output)?);
+    println!("{}", serde_yml::to_string(&output)?);
     Ok(())
 }
 
@@ -336,7 +333,7 @@ fn extract_ports(svc: &serde_json::Value) -> String {
             .filter_map(|ep| {
                 let port = ep.get("port")?.as_u64()?;
                 let proto = ep.get("protocol").and_then(|p| p.as_str()).unwrap_or("tcp");
-                Some(format!("{}/{}", port, proto))
+                Some(format!("{port}/{proto}"))
             })
             .collect();
         if ports.is_empty() {
@@ -361,25 +358,25 @@ fn extract_age(deploy: &serde_json::Value) -> String {
     "-".to_string()
 }
 
-/// Format a chrono::Duration into a human-readable age string.
+/// Format a `chrono::Duration` into a human-readable age string.
 fn format_duration(d: chrono::Duration) -> String {
     let secs = d.num_seconds();
     if secs < 0 {
         return "0s".to_string();
     }
     if secs < 60 {
-        return format!("{}s", secs);
+        return format!("{secs}s");
     }
     let mins = d.num_minutes();
     if mins < 60 {
-        return format!("{}m", mins);
+        return format!("{mins}m");
     }
     let hours = d.num_hours();
     if hours < 24 {
-        return format!("{}h", hours);
+        return format!("{hours}h");
     }
     let days = d.num_days();
-    format!("{}d", days)
+    format!("{days}d")
 }
 
 #[cfg(test)]

@@ -1,6 +1,6 @@
 //! Build wizard view -- multi-step interactive build configuration
 //!
-//! Steps: SelectSource -> Configure -> Review -> Building -> Complete
+//! Steps: `SelectSource` -> Configure -> Review -> Building -> Complete
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::prelude::*;
@@ -102,7 +102,7 @@ fn render_step_indicator(area: Rect, buf: &mut Buffer, current: BuildStep) {
             zlayer_tui::icons::PENDING
         };
 
-        let text = format!("{} {}", icon, label);
+        let text = format!("{icon} {label}");
         let width = text.len() as u16;
 
         if x + width < area.x + area.width {
@@ -173,7 +173,7 @@ fn render_configure(area: Rect, buf: &mut Buffer, state: &BuildWizardState) {
                 state
                     .build_args
                     .iter()
-                    .map(|(k, v)| format!("{}={}", k, v))
+                    .map(|(k, v)| format!("{k}={v}"))
                     .collect::<Vec<_>>()
                     .join(", ")
             },
@@ -205,7 +205,7 @@ fn render_configure(area: Rect, buf: &mut Buffer, state: &BuildWizardState) {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        buf.set_string(inner.x + 1, y, format!("{}:", label), label_style);
+        buf.set_string(inner.x + 1, y, format!("{label}:"), label_style);
 
         // Value
         let val_style = if is_focused {
@@ -219,7 +219,7 @@ fn render_configure(area: Rect, buf: &mut Buffer, state: &BuildWizardState) {
         let display_value = if is_focused && !state.input_buf.is_empty() {
             format!("{}_", state.input_buf)
         } else if is_focused {
-            format!("{}_", value)
+            format!("{value}_")
         } else {
             value.clone()
         };
@@ -246,15 +246,15 @@ fn render_review(area: Rect, buf: &mut Buffer, state: &BuildWizardState) {
     ]));
     lines.push(Line::from(""));
 
-    if !state.tags.is_empty() {
+    if state.tags.is_empty() {
         lines.push(Line::from(vec![
             Span::styled("Tags:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled(state.tags.join(", "), Style::default().fg(Color::Cyan)),
+            Span::styled("(none)", Style::default().fg(Color::DarkGray)),
         ]));
     } else {
         lines.push(Line::from(vec![
             Span::styled("Tags:    ", Style::default().fg(Color::DarkGray)),
-            Span::styled("(none)", Style::default().fg(Color::DarkGray)),
+            Span::styled(state.tags.join(", "), Style::default().fg(Color::Cyan)),
         ]));
     }
 
@@ -306,7 +306,7 @@ fn render_review(area: Rect, buf: &mut Buffer, state: &BuildWizardState) {
     paragraph.render(inner, buf);
 }
 
-/// Step 4: Building -- show progress using zlayer-builder's BuildView
+/// Step 4: Building -- show progress using zlayer-builder's `BuildView`
 fn render_building(area: Rect, frame: &mut Frame, state: &BuildWizardState) {
     if let Some(ref build_state) = state.build_state {
         // Reuse the existing BuildView widget from zlayer-builder
@@ -543,7 +543,7 @@ fn handle_complete_key(key: KeyEvent, state: &mut BuildWizardState) {
 // Build execution
 // ---------------------------------------------------------------------------
 
-/// Kick off the async build using tokio::spawn
+/// Kick off the async build using `tokio::spawn`
 fn start_build(state: &mut BuildWizardState) {
     let (tx, rx) = std::sync::mpsc::channel();
     state.build_rx = Some(rx);
@@ -614,7 +614,7 @@ fn source_display(state: &BuildWizardState) -> String {
     if let Some(ref path) = state.source_path {
         path.display().to_string()
     } else if let Some(ref rt) = state.runtime {
-        format!("Runtime: {}", rt)
+        format!("Runtime: {rt}")
     } else {
         "(not selected)".to_string()
     }

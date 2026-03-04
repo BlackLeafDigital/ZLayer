@@ -1,4 +1,4 @@
-//! OpenAPI documentation generation
+//! `OpenAPI` documentation generation
 
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
@@ -76,7 +76,7 @@ impl Modify for SecurityAddon {
     }
 }
 
-/// ZLayer API OpenAPI documentation
+/// `ZLayer` API `OpenAPI` documentation
 #[derive(OpenApi)]
 #[openapi(
     info(

@@ -1,6 +1,6 @@
-//! ZLayer V1 Service Specification
+//! `ZLayer` V1 Service Specification
 //!
-//! This crate provides types for parsing and validating ZLayer deployment specifications.
+//! This crate provides types for parsing and validating `ZLayer` deployment specifications.
 
 mod error;
 mod types;
@@ -14,7 +14,7 @@ use validator::Validate;
 
 /// Parse a deployment spec from YAML string
 pub fn from_yaml_str(yaml: &str) -> Result<DeploymentSpec, SpecError> {
-    let spec: DeploymentSpec = serde_yaml::from_str(yaml)?;
+    let spec: DeploymentSpec = serde_yml::from_str(yaml)?;
 
     // Run validator crate validation
     spec.validate().map_err(|e| {

@@ -14,12 +14,13 @@ const MAX_IFNAME_LEN: usize = 15;
 /// Joins the `parts` with `-` after a `"zl-"` prefix and appends `-{suffix}` if non-empty.
 /// When the result exceeds 15 characters, a deterministic hash of all parts is used instead
 /// to keep the name unique and within the kernel limit.
+#[must_use]
 pub fn make_interface_name(parts: &[&str], suffix: &str) -> String {
     let base = format!("zl-{}", parts.join("-"));
     let candidate = if suffix.is_empty() {
         base
     } else {
-        format!("{}-{}", base, suffix)
+        format!("{base}-{suffix}")
     };
 
     if candidate.len() <= MAX_IFNAME_LEN {
@@ -60,7 +61,7 @@ pub struct OverlayManager {
     global_interface: Option<String>,
     /// Global overlay transport (must be kept alive for the TUN device lifetime)
     global_transport: Option<OverlayTransport>,
-    /// Service-specific overlay interfaces (service_name -> interface_name)
+    /// Service-specific overlay interfaces (`service_name` -> `interface_name`)
     service_interfaces: RwLock<HashMap<String, String>>,
     /// Service-specific overlay transports (must be kept alive for TUN device lifetimes)
     service_transports: RwLock<HashMap<String, OverlayTransport>>,
@@ -91,7 +92,7 @@ impl OverlayManager {
 
         let (private_key, public_key) = OverlayTransport::generate_keys()
             .await
-            .map_err(|e| AgentError::Network(format!("Failed to generate keys: {}", e)))?;
+            .map_err(|e| AgentError::Network(format!("Failed to generate keys: {e}")))?;
 
         let node_ip = self.ip_allocator.allocate()?;
         let config = self.build_config(private_key, public_key, node_ip, 16, 51820);
@@ -100,10 +101,11 @@ impl OverlayManager {
         transport
             .create_interface()
             .await
-            .map_err(|e| AgentError::Network(format!("Failed to create global overlay: {}", e)))?;
-        transport.configure(&[]).await.map_err(|e| {
-            AgentError::Network(format!("Failed to configure global overlay: {}", e))
-        })?;
+            .map_err(|e| AgentError::Network(format!("Failed to create global overlay: {e}")))?;
+        transport
+            .configure(&[])
+            .await
+            .map_err(|e| AgentError::Network(format!("Failed to configure global overlay: {e}")))?;
 
         self.node_ip = Some(node_ip);
         self.global_interface = Some(interface_name);
@@ -151,7 +153,7 @@ impl OverlayManager {
     ) -> Result<(), AgentError> {
         let (private_key, public_key) = OverlayTransport::generate_keys()
             .await
-            .map_err(|e| AgentError::Network(format!("Failed to generate keys: {}", e)))?;
+            .map_err(|e| AgentError::Network(format!("Failed to generate keys: {e}")))?;
 
         let service_ip = self.ip_allocator.allocate_for_service(service_name)?;
         let config = self.build_config(private_key, public_key, service_ip, 24, 0);
@@ -160,9 +162,9 @@ impl OverlayManager {
         transport
             .create_interface()
             .await
-            .map_err(|e| AgentError::Network(format!("Failed to create service overlay: {}", e)))?;
+            .map_err(|e| AgentError::Network(format!("Failed to create service overlay: {e}")))?;
         transport.configure(&[]).await.map_err(|e| {
-            AgentError::Network(format!("Failed to configure service overlay: {}", e))
+            AgentError::Network(format!("Failed to configure service overlay: {e}"))
         })?;
 
         self.service_transports
@@ -202,7 +204,7 @@ impl OverlayManager {
         {
             let interfaces = self.service_interfaces.read().await;
             let service_iface = interfaces.get(service_name).ok_or_else(|| {
-                AgentError::Network(format!("No overlay for service: {}", service_name))
+                AgentError::Network(format!("No overlay for service: {service_name}"))
             })?;
 
             let container_ip = self.ip_allocator.allocate()?;
@@ -227,7 +229,7 @@ impl OverlayManager {
         _interface: &str,
         ip: Ipv4Addr,
     ) -> Result<(), AgentError> {
-        let veth_host = format!("veth-{}", container_pid);
+        let veth_host = format!("veth-{container_pid}");
         let veth_container = "eth0";
 
         // Clean up any stale veth pair left by a previous daemon crash.
@@ -272,7 +274,7 @@ impl OverlayManager {
                 "ip",
                 "addr",
                 "add",
-                &format!("{}/24", ip),
+                &format!("{ip}/24"),
                 "dev",
                 veth_container,
             ],
@@ -302,7 +304,7 @@ impl OverlayManager {
         // daemon run don't cause a failure (EEXIST).
         self.run_command(
             "ip",
-            &["route", "replace", &format!("{}/32", ip), "dev", &veth_host],
+            &["route", "replace", &format!("{ip}/32"), "dev", &veth_host],
         )
         .await?;
 
@@ -373,7 +375,7 @@ impl OverlayManager {
             local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
             private_key,
             public_key,
-            overlay_cidr: format!("{}/{}", ip, mask),
+            overlay_cidr: format!("{ip}/{mask}"),
             ..OverlayConfig::default()
         }
     }
@@ -383,7 +385,7 @@ impl OverlayManager {
             .args(args)
             .output()
             .await
-            .map_err(|e| AgentError::Network(format!("Failed to run {}: {}", cmd, e)))?;
+            .map_err(|e| AgentError::Network(format!("Failed to run {cmd}: {e}")))?;
 
         if !output.status.success() {
             return Err(AgentError::Network(format!(
@@ -419,8 +421,8 @@ impl IpAllocator {
         Ok(Ipv4Addr::new(
             octets[0],
             octets[1],
-            (octets[2] as u32 + (offset >> 8)) as u8,
-            (octets[3] as u32 + (offset & 0xFF)) as u8,
+            (u32::from(octets[2]) + (offset >> 8)) as u8,
+            (u32::from(octets[3]) + (offset & 0xFF)) as u8,
         ))
     }
 

@@ -20,7 +20,7 @@ pub(crate) struct NodeConfig {
     pub(crate) api_port: u16,
     /// Raft consensus port
     pub(crate) raft_port: u16,
-    /// Overlay network port (WireGuard protocol)
+    /// Overlay network port (`WireGuard` protocol)
     pub(crate) overlay_port: u16,
     /// Overlay network CIDR
     pub(crate) overlay_cidr: String,
@@ -113,8 +113,8 @@ struct NodeStatus {
 /// Generate a secure random token
 fn generate_secure_token() -> String {
     use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 32] = rng.gen();
+    let mut rng = rand::rng();
+    let bytes: [u8; 32] = rng.random();
     base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, bytes)
 }
 
@@ -153,27 +153,25 @@ pub(crate) async fn load_node_config(data_dir: &Path) -> Result<NodeConfig> {
 
 /// Load node config, or auto-initialize as single-node leader if none exists.
 pub(crate) async fn load_or_init_node_config(data_dir: &Path) -> Result<NodeConfig> {
-    match load_node_config(data_dir).await {
-        Ok(cfg) => Ok(cfg),
-        Err(_) => {
-            let advertise_addr = detect_local_ip();
-            println!(
-                "Node not yet initialized. Auto-initializing with advertise address {}...",
-                advertise_addr
-            );
-            handle_node_init(
-                advertise_addr,
-                3669,
-                9000,
-                51820,
-                data_dir.to_path_buf(),
-                "10.200.0.0/16".to_string(),
-            )
-            .await?;
-            load_node_config(data_dir)
-                .await
-                .context("Failed to load node config after auto-initialization")
-        }
+    if let Ok(cfg) = load_node_config(data_dir).await {
+        Ok(cfg)
+    } else {
+        let advertise_addr = detect_local_ip();
+        println!(
+            "Node not yet initialized. Auto-initializing with advertise address {advertise_addr}..."
+        );
+        handle_node_init(
+            advertise_addr,
+            3669,
+            9000,
+            51820,
+            data_dir.to_path_buf(),
+            "10.200.0.0/16".to_string(),
+        )
+        .await?;
+        load_node_config(data_dir)
+            .await
+            .context("Failed to load node config after auto-initialization")
     }
 }
 
@@ -186,8 +184,8 @@ fn generate_join_token_data(
     overlay_cidr: &str,
 ) -> Result<String> {
     let token_data = ClusterJoinToken {
-        api_endpoint: format!("{}:{}", advertise_addr, api_port),
-        raft_endpoint: format!("{}:{}", advertise_addr, raft_port),
+        api_endpoint: format!("{advertise_addr}:{api_port}"),
+        raft_endpoint: format!("{advertise_addr}:{raft_port}"),
         leader_wg_pubkey: wg_public_key.to_string(),
         overlay_cidr: overlay_cidr.to_string(),
         auth_secret: generate_secure_token(),
@@ -355,7 +353,7 @@ pub(crate) async fn handle_node_init(
     println!("  Generating overlay keypair...");
     let (private_key, public_key) = OverlayTransport::generate_keys()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to generate overlay keys: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to generate overlay keys: {e}"))?;
     info!("Generated overlay keypair");
 
     // 5. Save node config
@@ -400,7 +398,7 @@ pub(crate) async fn handle_node_init(
     println!("  Starting Raft consensus...");
     let raft_config = zlayer_scheduler::RaftConfig {
         node_id: raft_node_id,
-        address: format!("{}:{}", advertise_addr, raft_port),
+        address: format!("{advertise_addr}:{raft_port}"),
         raft_port,
         ..Default::default()
     };
@@ -418,7 +416,7 @@ pub(crate) async fn handle_node_init(
     let leader_overlay_ip = "10.200.0.1".to_string();
     raft.propose(zlayer_scheduler::Request::RegisterNode {
         node_id: raft_node_id,
-        address: format!("{}:{}", advertise_addr, raft_port),
+        address: format!("{advertise_addr}:{raft_port}"),
         wg_public_key: public_key.clone(),
         overlay_ip: leader_overlay_ip,
         overlay_port,
@@ -445,13 +443,13 @@ pub(crate) async fn handle_node_init(
     println!();
     println!("Node initialized successfully!");
     println!();
-    println!("Node ID:        {}", node_id);
-    println!("Raft Node ID:   {}", raft_node_id);
-    println!("API Server:     http://{}:{}", advertise_addr, api_port);
-    println!("Raft Address:   {}:{}", advertise_addr, raft_port);
-    println!("Overlay Port:   {}", overlay_port);
-    println!("Overlay CIDR:   {}", overlay_cidr);
-    println!("WG Public Key:  {}", public_key);
+    println!("Node ID:        {node_id}");
+    println!("Raft Node ID:   {raft_node_id}");
+    println!("API Server:     http://{advertise_addr}:{api_port}");
+    println!("Raft Address:   {advertise_addr}:{raft_port}");
+    println!("Overlay Port:   {overlay_port}");
+    println!("Overlay CIDR:   {overlay_cidr}");
+    println!("WG Public Key:  {public_key}");
     if detected_gpus.is_empty() {
         println!("GPUs:           None detected");
     } else {
@@ -467,8 +465,7 @@ pub(crate) async fn handle_node_init(
     println!("To join other nodes to this cluster, run:");
     println!();
     println!(
-        "  zlayer node join {}:{} --token {} --advertise-addr <NODE_IP>",
-        advertise_addr, api_port, join_token
+        "  zlayer node join {advertise_addr}:{api_port} --token {join_token} --advertise-addr <NODE_IP>"
     );
     println!();
     println!("Note: The API server starts automatically when deploying with 'zlayer deploy' or 'zlayer up'.");
@@ -488,7 +485,7 @@ pub(crate) async fn handle_node_join(
     use std::time::Duration;
     use zlayer_overlay::OverlayTransport;
 
-    println!("Joining ZLayer cluster at {}...", leader_addr);
+    println!("Joining ZLayer cluster at {leader_addr}...");
 
     // 1. Parse and validate the join token
     let token_data = parse_cluster_join_token(&token).context("Invalid join token")?;
@@ -503,7 +500,7 @@ pub(crate) async fn handle_node_join(
     println!("  Generating overlay keypair...");
     let (private_key, public_key) = OverlayTransport::generate_keys()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to generate overlay keys: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to generate overlay keys: {e}"))?;
 
     // 3. Determine data directory
     let data_dir = data_dir_override;
@@ -555,7 +552,7 @@ pub(crate) async fn handle_node_join(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Join request failed: {} - {}", status, body);
+        anyhow::bail!("Join request failed: {status} - {body}");
     }
 
     let join_response: NodeJoinResponse = response
@@ -605,7 +602,7 @@ pub(crate) async fn handle_node_join(
 
     // Build the overlay IP with the network prefix for proper routing
     // e.g. "10.200.0.5/16" so all overlay peers are routable
-    let overlay_ip_cidr = format!("{}/{}", our_overlay_ip, overlay_prefix_len);
+    let overlay_ip_cidr = format!("{our_overlay_ip}/{overlay_prefix_len}");
 
     // Convert join response peers into zlayer_overlay PeerConfig entries
     let mut overlay_peers: Vec<zlayer_overlay::PeerConfig> = Vec::new();
@@ -682,7 +679,7 @@ pub(crate) async fn handle_node_join(
     // will re-create it from the persisted bootstrap state on next start.
     let overlay_config = zlayer_overlay::OverlayConfig {
         local_endpoint: std::net::SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             overlay_port,
         ),
         private_key: node_config.wireguard_private_key.clone(),
@@ -732,10 +729,7 @@ pub(crate) async fn handle_node_join(
                          The overlay bootstrap state has been saved and the daemon will \
                          retry on next start."
                     );
-                    println!(
-                        "  Warning: Overlay interface created but configuration failed: {}",
-                        e
-                    );
+                    println!("  Warning: Overlay interface created but configuration failed: {e}");
                 }
             }
         }
@@ -750,9 +744,8 @@ pub(crate) async fn handle_node_join(
                  been saved and the daemon will create the interface on next start."
             );
             println!(
-                "  Warning: Could not create overlay interface ({}). \
-                 The daemon will set it up on next start.",
-                e
+                "  Warning: Could not create overlay interface ({e}). \
+                 The daemon will set it up on next start."
             );
         }
     }
@@ -790,7 +783,7 @@ pub(crate) async fn handle_node_join(
     println!("Node ID:        {}", join_response.node_id);
     println!("Raft Node ID:   {}", join_response.raft_node_id);
     println!("Overlay IP:     {}", join_response.overlay_ip);
-    println!("Mode:           {}", mode);
+    println!("Mode:           {mode}");
     if let Some(svcs) = services {
         println!("Services:       {}", svcs.join(", "));
     }
@@ -829,7 +822,7 @@ pub(crate) async fn handle_node_list(output: String, cli_data_dir: &std::path::P
         .context("Failed to create HTTP client")?;
 
     let response = client
-        .get(format!("http://{}/api/v1/cluster/nodes", api_endpoint))
+        .get(format!("http://{api_endpoint}/api/v1/cluster/nodes"))
         .send()
         .await;
 
@@ -964,15 +957,14 @@ pub(crate) async fn handle_node_status(
 
         let response = client
             .get(format!(
-                "http://{}/api/v1/cluster/nodes/{}",
-                api_endpoint, target_id
+                "http://{api_endpoint}/api/v1/cluster/nodes/{target_id}"
             ))
             .send()
             .await
             .context("Failed to fetch node status")?;
 
         if !response.status().is_success() {
-            anyhow::bail!("Node '{}' not found in cluster", target_id);
+            anyhow::bail!("Node '{target_id}' not found in cluster");
         }
 
         let status: NodeStatus = response
@@ -1019,7 +1011,7 @@ pub(crate) async fn handle_node_remove(
 
     let api_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.api_port);
 
-    println!("Removing node '{}' from cluster...", node_id);
+    println!("Removing node '{node_id}' from cluster...");
     if force {
         warn!("Force removal enabled - services will not be migrated");
     }
@@ -1029,7 +1021,7 @@ pub(crate) async fn handle_node_remove(
         .build()
         .context("Failed to create HTTP client")?;
 
-    let mut url = format!("http://{}/api/v1/cluster/nodes/{}", api_endpoint, node_id);
+    let mut url = format!("http://{api_endpoint}/api/v1/cluster/nodes/{node_id}");
     if force {
         url.push_str("?force=true");
     }
@@ -1043,10 +1035,10 @@ pub(crate) async fn handle_node_remove(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to remove node: {} - {}", status, body);
+        anyhow::bail!("Failed to remove node: {status} - {body}");
     }
 
-    println!("Node '{}' removed successfully.", node_id);
+    println!("Node '{node_id}' removed successfully.");
     if !force {
         println!("Services have been migrated to other nodes.");
     }
@@ -1075,7 +1067,7 @@ pub(crate) async fn handle_node_set_mode(
 
     // Validate mode-service combination
     if (mode == "dedicated" || mode == "replicate") && services.is_none() {
-        anyhow::bail!("Mode '{}' requires --services to be specified", mode);
+        anyhow::bail!("Mode '{mode}' requires --services to be specified");
     }
 
     let data_dir = cli_data_dir.to_path_buf();
@@ -1083,7 +1075,7 @@ pub(crate) async fn handle_node_set_mode(
 
     let api_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.api_port);
 
-    println!("Setting mode for node '{}'...", node_id);
+    println!("Setting mode for node '{node_id}'...");
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -1103,8 +1095,7 @@ pub(crate) async fn handle_node_set_mode(
 
     let response = client
         .put(format!(
-            "http://{}/api/v1/cluster/nodes/{}/mode",
-            api_endpoint, node_id
+            "http://{api_endpoint}/api/v1/cluster/nodes/{node_id}/mode"
         ))
         .json(&request)
         .send()
@@ -1114,10 +1105,10 @@ pub(crate) async fn handle_node_set_mode(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to set node mode: {} - {}", status, body);
+        anyhow::bail!("Failed to set node mode: {status} - {body}");
     }
 
-    println!("Node '{}' mode set to '{}'.", node_id, mode);
+    println!("Node '{node_id}' mode set to '{mode}'.");
     if let Some(svcs) = services {
         println!("Services: {}", svcs.join(", "));
     }
@@ -1136,10 +1127,7 @@ pub(crate) async fn handle_node_label(
     // Parse label
     let parts: Vec<&str> = label.splitn(2, '=').collect();
     if parts.len() != 2 {
-        anyhow::bail!(
-            "Invalid label format '{}'. Expected key=value format.",
-            label
-        );
+        anyhow::bail!("Invalid label format '{label}'. Expected key=value format.");
     }
     let (key, value) = (parts[0], parts[1]);
 
@@ -1153,7 +1141,7 @@ pub(crate) async fn handle_node_label(
 
     let api_endpoint = format!("{}:{}", node_config.advertise_addr, node_config.api_port);
 
-    println!("Adding label to node '{}'...", node_id);
+    println!("Adding label to node '{node_id}'...");
 
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -1173,8 +1161,7 @@ pub(crate) async fn handle_node_label(
 
     let response = client
         .post(format!(
-            "http://{}/api/v1/cluster/nodes/{}/labels",
-            api_endpoint, node_id
+            "http://{api_endpoint}/api/v1/cluster/nodes/{node_id}/labels"
         ))
         .json(&request)
         .send()
@@ -1184,10 +1171,10 @@ pub(crate) async fn handle_node_label(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to add label: {} - {}", status, body);
+        anyhow::bail!("Failed to add label: {status} - {body}");
     }
 
-    println!("Label '{}={}' added to node '{}'.", key, value, node_id);
+    println!("Label '{key}={value}' added to node '{node_id}'.");
 
     Ok(())
 }
@@ -1238,15 +1225,14 @@ pub(crate) async fn handle_node_generate_join_token(
     use base64::Engine;
 
     // --- Resolve the API endpoint ---
-    let api_endpoint = match api {
-        Some(a) => a,
-        None => {
-            let node_config = load_or_init_node_config(&data_dir).await?;
-            format!(
-                "http://{}:{}",
-                node_config.advertise_addr, node_config.api_port
-            )
-        }
+    let api_endpoint = if let Some(a) = api {
+        a
+    } else {
+        let node_config = load_or_init_node_config(&data_dir).await?;
+        format!(
+            "http://{}:{}",
+            node_config.advertise_addr, node_config.api_port
+        )
     };
 
     // --- Resolve the deployment name ---
@@ -1254,15 +1240,12 @@ pub(crate) async fn handle_node_generate_join_token(
         Some(d) => d,
         None => {
             // Try to discover from spec files in the current directory
-            match try_discover_deployment_name() {
-                Some(name) => {
-                    info!(deployment = %name, "Auto-discovered deployment name from spec");
-                    name
-                }
-                None => {
-                    warn!("No deployment spec found in current directory, using 'default'");
-                    "default".to_string()
-                }
+            if let Some(name) = try_discover_deployment_name() {
+                info!(deployment = %name, "Auto-discovered deployment name from spec");
+                name
+            } else {
+                warn!("No deployment spec found in current directory, using 'default'");
+                "default".to_string()
             }
         }
     };
@@ -1278,15 +1261,15 @@ pub(crate) async fn handle_node_generate_join_token(
 
     println!("Join Token Generated");
     println!("====================\n");
-    println!("Deployment: {}", deployment_name);
-    println!("API: {}", api_endpoint);
+    println!("Deployment: {deployment_name}");
+    println!("API: {api_endpoint}");
     if let Some(svc) = &service {
-        println!("Service: {}", svc);
+        println!("Service: {svc}");
     }
     println!("\nToken:");
-    println!("{}", token);
+    println!("{token}");
     println!("\nUsage:");
-    println!("  zlayer node join <leader-addr> --token {}", token);
+    println!("  zlayer node join <leader-addr> --token {token}");
 
     Ok(())
 }

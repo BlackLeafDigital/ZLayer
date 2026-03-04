@@ -61,11 +61,13 @@ pub struct PipelineResult {
 
 impl PipelineResult {
     /// Returns true if all images were built successfully
+    #[must_use]
     pub fn is_success(&self) -> bool {
         self.failed.is_empty()
     }
 
     /// Returns the total number of images in the pipeline
+    #[must_use]
     pub fn total_images(&self) -> usize {
         self.succeeded.len() + self.failed.len()
     }
@@ -93,9 +95,10 @@ impl PipelineExecutor {
     ///
     /// # Arguments
     ///
-    /// * `pipeline` - The parsed ZPipeline configuration
+    /// * `pipeline` - The parsed `ZPipeline` configuration
     /// * `base_dir` - Base directory for resolving relative paths in the pipeline
     /// * `executor` - The buildah executor to use for all builds
+    #[must_use]
     pub fn new(pipeline: ZPipeline, base_dir: PathBuf, executor: BuildahExecutor) -> Self {
         // Determine push behavior from pipeline config
         let push_enabled = pipeline.push.after_all;
@@ -114,15 +117,17 @@ impl PipelineExecutor {
     /// When enabled, the executor will abort immediately when any image
     /// fails to build. When disabled, it will continue building independent
     /// images even after failures.
+    #[must_use]
     pub fn fail_fast(mut self, fail_fast: bool) -> Self {
         self.fail_fast = fail_fast;
         self
     }
 
-    /// Enable or disable pushing (overrides pipeline.push.after_all)
+    /// Enable or disable pushing (overrides `pipeline.push.after_all`)
     ///
     /// When enabled and all builds succeed, images will be pushed to their
     /// configured registries.
+    #[must_use]
     pub fn push(mut self, enabled: bool) -> Self {
         self.push_enabled = enabled;
         self
@@ -150,7 +155,7 @@ impl PipelineExecutor {
                 if !self.pipeline.images.contains_key(dep) {
                     return Err(BuildError::invalid_instruction(
                         "pipeline",
-                        format!("Image '{}' depends on unknown image '{}'", name, dep),
+                        format!("Image '{name}' depends on unknown image '{dep}'"),
                     ));
                 }
             }
@@ -308,7 +313,7 @@ impl PipelineExecutor {
                         "unknown".to_string(),
                         Err(BuildError::invalid_instruction(
                             "pipeline",
-                            format!("Build task panicked: {}", e),
+                            format!("Build task panicked: {e}"),
                         )),
                     ));
                 }
@@ -414,7 +419,7 @@ async fn build_single_image(
 fn expand_tag_with_vars(tag: &str, vars: &HashMap<String, String>) -> String {
     let mut result = tag.to_string();
     for (key, value) in vars {
-        result = result.replace(&format!("${{{}}}", key), value);
+        result = result.replace(&format!("${{{key}}}"), value);
     }
     result
 }

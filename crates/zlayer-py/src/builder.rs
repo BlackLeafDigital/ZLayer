@@ -1,4 +1,4 @@
-//! ImageBuilder class for Python bindings
+//! `ImageBuilder` class for Python bindings
 //!
 //! Provides container image building capabilities via buildah.
 
@@ -35,10 +35,10 @@ impl Image {
     }
 
     fn __str__(&self) -> String {
-        if !self.tags.is_empty() {
-            self.tags[0].clone()
-        } else {
+        if self.tags.is_empty() {
             self.id.clone()
+        } else {
+            self.tags[0].clone()
         }
     }
 }
@@ -101,7 +101,7 @@ struct BuilderInner {
 ///     >>> builder = ImageBuilder("./my-app")
 ///     >>> builder.tag("myapp:latest")
 ///     >>> builder.tag("myapp:v1.0.0")
-///     >>> image = await builder.build()
+///     >>> image = await `builder.build()`
 ///     >>> print(image.id)
 #[pyclass]
 pub struct ImageBuilder {
@@ -110,14 +110,14 @@ pub struct ImageBuilder {
 
 #[pymethods]
 impl ImageBuilder {
-    /// Create a new ImageBuilder for a context directory
+    /// Create a new `ImageBuilder` for a context directory
     ///
     /// Args:
     ///     context: Path to the build context directory
     ///     dockerfile: Optional path to Dockerfile (default: context/Dockerfile)
     ///
     /// Returns:
-    ///     A new ImageBuilder instance
+    ///     A new `ImageBuilder` instance
     #[new]
     #[pyo3(signature = (context, dockerfile=None))]
     fn new(context: &str, dockerfile: Option<&str>) -> Self {
@@ -148,7 +148,7 @@ impl ImageBuilder {
 
         // Block on the lock since this is a sync method
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {}", e)))?;
+            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {e}")))?;
         rt.block_on(async {
             let mut inner = inner.write().await;
             inner.tags.push(tag);
@@ -164,11 +164,11 @@ impl ImageBuilder {
     ///
     /// Returns:
     ///     Self for method chaining
-    fn tags<'py>(slf: PyRef<'py, Self>, tags: Vec<String>) -> PyResult<PyRef<'py, Self>> {
+    fn tags(slf: PyRef<'_, Self>, tags: Vec<String>) -> PyResult<PyRef<'_, Self>> {
         let inner = slf.inner.clone();
 
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {}", e)))?;
+            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {e}")))?;
         rt.block_on(async {
             let mut inner = inner.write().await;
             inner.tags.extend(tags);
@@ -191,7 +191,7 @@ impl ImageBuilder {
         let value = value.to_string();
 
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {}", e)))?;
+            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {e}")))?;
         rt.block_on(async {
             let mut inner = inner.write().await;
             inner.build_args.insert(name, value);
@@ -207,14 +207,11 @@ impl ImageBuilder {
     ///
     /// Returns:
     ///     Self for method chaining
-    fn args<'py>(
-        slf: PyRef<'py, Self>,
-        args: HashMap<String, String>,
-    ) -> PyResult<PyRef<'py, Self>> {
+    fn args(slf: PyRef<'_, Self>, args: HashMap<String, String>) -> PyResult<PyRef<'_, Self>> {
         let inner = slf.inner.clone();
 
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {}", e)))?;
+            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {e}")))?;
         rt.block_on(async {
             let mut inner = inner.write().await;
             inner.build_args.extend(args);
@@ -235,7 +232,7 @@ impl ImageBuilder {
         let stage = stage.to_string();
 
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {}", e)))?;
+            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {e}")))?;
         rt.block_on(async {
             let mut inner = inner.write().await;
             inner.target_stage = Some(stage);
@@ -267,15 +264,14 @@ impl ImageBuilder {
             "bun" => zlayer_builder::Runtime::Bun,
             _ => {
                 return Err(ZLayerError::InvalidArgument(format!(
-                    "Unknown runtime: {}. Valid options: node20, node22, python312, python313, rust, go, deno, bun",
-                    runtime
+                    "Unknown runtime: {runtime}. Valid options: node20, node22, python312, python313, rust, go, deno, bun"
                 ))
                 .into());
             }
         };
 
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {}", e)))?;
+            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {e}")))?;
         rt.block_on(async {
             let mut inner = inner.write().await;
             inner.runtime = Some(rt_enum);
@@ -288,11 +284,11 @@ impl ImageBuilder {
     ///
     /// Returns:
     ///     Self for method chaining
-    fn no_cache<'py>(slf: PyRef<'py, Self>) -> PyResult<PyRef<'py, Self>> {
+    fn no_cache(slf: PyRef<'_, Self>) -> PyResult<PyRef<'_, Self>> {
         let inner = slf.inner.clone();
 
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {}", e)))?;
+            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {e}")))?;
         rt.block_on(async {
             let mut inner = inner.write().await;
             inner.no_cache = true;
@@ -320,7 +316,7 @@ impl ImageBuilder {
         let auth = (username.to_string(), password.to_string());
 
         let rt = tokio::runtime::Runtime::new()
-            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {}", e)))?;
+            .map_err(|e| ZLayerError::Runtime(format!("Failed to create runtime: {e}")))?;
         rt.block_on(async {
             let mut inner = inner.write().await;
             inner.registry_auth = Some(auth);
@@ -335,7 +331,7 @@ impl ImageBuilder {
     ///     The built Image
     ///
     /// Raises:
-    ///     RuntimeError: If the build fails
+    ///     `RuntimeError`: If the build fails
     fn build<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
 
@@ -394,11 +390,11 @@ impl ImageBuilder {
     ///     tag: Optional specific tag to push (pushes all if not specified)
     ///
     /// Raises:
-    ///     RuntimeError: If the push fails
+    ///     `RuntimeError`: If the push fails
     #[pyo3(signature = (tag=None))]
     fn push<'py>(&self, py: Python<'py>, tag: Option<&str>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let tag = tag.map(|s| s.to_string());
+        let tag = tag.map(std::string::ToString::to_string);
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let inner = inner.read().await;
@@ -407,7 +403,7 @@ impl ImageBuilder {
             let tags_to_push: Vec<&str> = if let Some(ref t) = tag {
                 vec![t.as_str()]
             } else {
-                inner.tags.iter().map(|s| s.as_str()).collect()
+                inner.tags.iter().map(std::string::String::as_str).collect()
             };
 
             if tags_to_push.is_empty() {
@@ -487,22 +483,22 @@ pub fn buildah_install_instructions() -> String {
 /// Build a container image from a directory
 ///
 /// This is a convenience function that provides a simple one-liner interface
-/// for building container images. For more control, use the ImageBuilder class.
+/// for building container images. For more control, use the `ImageBuilder` class.
 ///
 /// Args:
 ///     path: Path to the build context directory (required)
 ///     tag: Image tag to apply (required, e.g., "myapp:latest")
 ///     dockerfile: Path to Dockerfile (default: "Dockerfile" in context)
-///     build_args: Dictionary of build arguments (optional)
-///     no_cache: Disable build cache (default: False)
+///     `build_args`: Dictionary of build arguments (optional)
+///     `no_cache`: Disable build cache (default: False)
 ///     progress: Show build progress - currently unused, reserved for future use (default: True)
 ///
 /// Returns:
 ///     The image tag on success
 ///
 /// Raises:
-///     RuntimeError: If the build fails
-///     ValueError: If invalid arguments are provided
+///     `RuntimeError`: If the build fails
+///     `ValueError`: If invalid arguments are provided
 ///
 /// Example:
 /// ```python
@@ -575,10 +571,10 @@ pub fn build<'py>(
         let built = builder.build().await.map_err(ZLayerError::from)?;
 
         // Return the primary tag (or image ID if no tags)
-        let result = if !built.tags.is_empty() {
-            built.tags[0].clone()
-        } else {
+        let result = if built.tags.is_empty() {
             built.image_id
+        } else {
+            built.tags[0].clone()
         };
 
         to_py_result(Ok(result))

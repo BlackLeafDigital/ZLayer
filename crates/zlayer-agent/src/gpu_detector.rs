@@ -8,7 +8,7 @@
 //!   and unified memory via `sysctl -n hw.memsize`.
 //! - **Other**: Returns an empty GPU list.
 //!
-//! No external dependencies required -- pure sysfs/system_profiler scanning with optional
+//! No external dependencies required -- pure `sysfs/system_profiler` scanning with optional
 //! subprocess calls for enrichment.
 
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ pub struct GpuInfo {
     pub model: String,
     /// VRAM in MB (0 if unknown; on Apple Silicon, this is unified memory)
     pub memory_mb: u64,
-    /// Device path (e.g., "/dev/nvidia0", "/dev/dri/card0", "iokit://AppleGPU/0")
+    /// Device path (e.g., "/dev/nvidia0", "/dev/dri/card0", "<iokit://AppleGPU/0>")
     pub device_path: String,
     /// Render node path if applicable (e.g., "/dev/dri/renderD128"); None on macOS
     pub render_path: Option<String>,
@@ -43,6 +43,7 @@ pub struct GpuInfo {
 ///
 /// For each GPU found, determines vendor, model name, VRAM, and device paths.
 #[cfg(target_os = "linux")]
+#[must_use]
 pub fn detect_gpus() -> Vec<GpuInfo> {
     use std::path::Path;
 
@@ -292,7 +293,7 @@ impl NvidiaSmiData {
     fn query(field: &str) -> Vec<String> {
         let output = std::process::Command::new("nvidia-smi")
             .args([
-                &format!("--query-gpu={}", field),
+                &format!("--query-gpu={field}"),
                 "--format=csv,noheader,nounits",
             ])
             .output();
@@ -446,17 +447,14 @@ fn find_device_paths(
     vendor: &str,
     vendor_index: usize,
 ) -> (String, Option<String>) {
-    match vendor {
-        "nvidia" => {
-            let dev = format!("/dev/nvidia{}", vendor_index);
-            (dev, None)
-        }
-        _ => {
-            // AMD, Intel, and unknown vendors use DRI device nodes
-            let card = format!("/dev/dri/card{}", vendor_index);
-            let render = format!("/dev/dri/renderD{}", 128 + vendor_index);
-            (card, Some(render))
-        }
+    if vendor == "nvidia" {
+        let dev = format!("/dev/nvidia{vendor_index}");
+        (dev, None)
+    } else {
+        // AMD, Intel, and unknown vendors use DRI device nodes
+        let card = format!("/dev/dri/card{vendor_index}");
+        let render = format!("/dev/dri/renderD{}", 128 + vendor_index);
+        (card, Some(render))
     }
 }
 

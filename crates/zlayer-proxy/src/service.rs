@@ -42,6 +42,7 @@ fn is_overlay_ip(ip: IpAddr) -> bool {
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 
 /// Empty body utility
+#[must_use]
 pub fn empty_body() -> BoxBody {
     http_body_util::Empty::<Bytes>::new()
         .map_err(|never| match never {})
@@ -99,12 +100,14 @@ impl ReverseProxyService {
     }
 
     /// Set the remote client address for this request
+    #[must_use]
     pub fn with_remote_addr(mut self, addr: SocketAddr) -> Self {
         self.remote_addr = Some(addr);
         self
     }
 
     /// Mark this connection as being over TLS
+    #[must_use]
     pub fn with_tls(mut self, is_tls: bool) -> Self {
         self.is_tls = is_tls;
         self
@@ -117,6 +120,7 @@ impl ReverseProxyService {
     }
 
     /// Check if this connection is over TLS
+    #[must_use]
     pub fn is_tls(&self) -> bool {
         self.is_tls
     }
@@ -132,7 +136,7 @@ impl ReverseProxyService {
             .get(header::HOST)
             .and_then(|h| h.to_str().ok())
             .or_else(|| uri.host())
-            .map(|h| h.to_string());
+            .map(std::string::ToString::to_string);
 
         let path = uri.path().to_string();
 
@@ -206,7 +210,7 @@ impl ReverseProxyService {
                 transformed_path,
                 req.uri()
                     .query()
-                    .map(|q| format!("?{}", q))
+                    .map(|q| format!("?{q}"))
                     .unwrap_or_default()
             );
 
@@ -217,7 +221,7 @@ impl ReverseProxyService {
                 .uri(
                     new_uri
                         .parse::<Uri>()
-                        .map_err(|e| ProxyError::InvalidRequest(format!("Invalid URI: {}", e)))?,
+                        .map_err(|e| ProxyError::InvalidRequest(format!("Invalid URI: {e}")))?,
                 )
                 .body(())
                 .unwrap()
@@ -225,7 +229,7 @@ impl ReverseProxyService {
                 .0;
 
             // Copy all original headers first (preserving Host, etc.)
-            for (name, value) in orig_parts.headers.iter() {
+            for (name, value) in &orig_parts.headers {
                 backend_parts.headers.insert(name.clone(), value.clone());
             }
 
@@ -252,7 +256,7 @@ impl ReverseProxyService {
                 .await
                 .map_err(|e| {
                     error!(error = %e, backend = %backend_addr, "Backend upgrade handshake failed");
-                    ProxyError::BackendRequestFailed(format!("Upgrade handshake failed: {}", e))
+                    ProxyError::BackendRequestFailed(format!("Upgrade handshake failed: {e}"))
                 })?;
 
             // Spawn the connection driver
@@ -291,7 +295,7 @@ impl ReverseProxyService {
                 resp_builder = resp_builder.header(header::CONNECTION, "upgrade");
 
                 let client_response = resp_builder.body(empty_body()).map_err(|e| {
-                    ProxyError::Internal(format!("Failed to build 101 response: {}", e))
+                    ProxyError::Internal(format!("Failed to build 101 response: {e}"))
                 })?;
 
                 // Spawn background task to bridge the upgraded connections
@@ -450,13 +454,13 @@ impl ReverseProxyService {
             parts
                 .uri
                 .query()
-                .map(|q| format!("?{}", q))
+                .map(|q| format!("?{q}"))
                 .unwrap_or_default()
         );
 
         parts.uri = new_uri
             .parse::<Uri>()
-            .map_err(|e| ProxyError::InvalidRequest(format!("Invalid URI: {}", e)))?;
+            .map_err(|e| ProxyError::InvalidRequest(format!("Invalid URI: {e}")))?;
 
         // Add forwarding headers
         self.add_forwarding_headers(&mut parts);
@@ -480,8 +484,10 @@ impl ReverseProxyService {
                     .headers
                     .get("x-forwarded-for")
                     .and_then(|h| h.to_str().ok())
-                    .map(|s| format!("{}, {}", s, addr.ip()))
-                    .unwrap_or_else(|| addr.ip().to_string());
+                    .map_or_else(
+                        || addr.ip().to_string(),
+                        |s| format!("{}, {}", s, addr.ip()),
+                    );
 
                 if let Ok(value) = existing.parse() {
                     parts.headers.insert("x-forwarded-for", value);
@@ -533,7 +539,7 @@ impl ReverseProxyService {
                 .headers
                 .get(header::VIA)
                 .and_then(|h| h.to_str().ok())
-                .map(|s| format!("{}, {}", s, via_value))
+                .map(|s| format!("{s}, {via_value}"))
                 .unwrap_or(via_value);
 
             if let Ok(value) = existing.parse() {
@@ -576,7 +582,7 @@ impl ReverseProxyService {
     /// Create an error response
     pub fn error_response(error: &ProxyError) -> Response<BoxBody> {
         let status = error.status_code();
-        let body = format!("{{\"error\": \"{}\"}}", error);
+        let body = format!("{{\"error\": \"{error}\"}}");
 
         Response::builder()
             .status(status)

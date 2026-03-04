@@ -55,7 +55,7 @@ impl WaitHttp {
             .build()
             .map_err(|e| InitError::HttpFailed {
                 url: self.url.clone(),
-                reason: format!("failed to create client: {}", e),
+                reason: format!("failed to create client: {e}"),
             })?;
 
         loop {
@@ -201,7 +201,7 @@ impl S3Push {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: key.to_string(),
-                reason: format!("failed to read file: {}", e),
+                reason: format!("failed to read file: {e}"),
             })?;
 
         tokio::time::timeout(
@@ -221,7 +221,7 @@ impl S3Push {
         .map_err(|e| InitError::S3Failed {
             bucket: self.bucket.clone(),
             key: key.to_string(),
-            reason: format!("put_object failed: {}", e),
+            reason: format!("put_object failed: {e}"),
         })?;
 
         tracing::info!(bucket = %self.bucket, key = %key, "S3 push complete");
@@ -240,7 +240,7 @@ impl S3Push {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: prefix.to_string(),
-                reason: format!("failed to read directory: {}", e),
+                reason: format!("failed to read directory: {e}"),
             })?;
 
         while let Some(entry) = entries
@@ -249,7 +249,7 @@ impl S3Push {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: prefix.to_string(),
-                reason: format!("failed to read directory entry: {}", e),
+                reason: format!("failed to read directory entry: {e}"),
             })?
         {
             let path = entry.path();
@@ -332,7 +332,7 @@ impl S3Pull {
         .map_err(|e| InitError::S3Failed {
             bucket: self.bucket.clone(),
             key: self.key.clone(),
-            reason: format!("get_object failed: {}", e),
+            reason: format!("get_object failed: {e}"),
         })?;
 
         // Read body
@@ -343,7 +343,7 @@ impl S3Pull {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: self.key.clone(),
-                reason: format!("failed to read body: {}", e),
+                reason: format!("failed to read body: {e}"),
             })?
             .into_bytes();
 
@@ -355,7 +355,7 @@ impl S3Pull {
                 .map_err(|e| InitError::S3Failed {
                     bucket: self.bucket.clone(),
                     key: self.key.clone(),
-                    reason: format!("failed to create destination directory: {}", e),
+                    reason: format!("failed to create destination directory: {e}"),
                 })?;
         }
 
@@ -364,7 +364,7 @@ impl S3Pull {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: self.key.clone(),
-                reason: format!("failed to create file: {}", e),
+                reason: format!("failed to create file: {e}"),
             })?;
 
         file.write_all(&data)
@@ -372,7 +372,7 @@ impl S3Pull {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: self.key.clone(),
-                reason: format!("failed to write file: {}", e),
+                reason: format!("failed to write file: {e}"),
             })?;
 
         tracing::info!(
@@ -403,14 +403,18 @@ pub fn from_spec(
                 })?
                 .to_string();
 
-            let port = params.get("port").and_then(|v| v.as_u64()).ok_or_else(|| {
-                InitError::InvalidParams {
+            let port = params
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| InitError::InvalidParams {
                     action: action.to_string(),
                     reason: "missing or invalid 'port' parameter".to_string(),
-                }
-            })? as u16;
+                })? as u16;
 
-            let timeout_secs = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+            let timeout_secs = params
+                .get("timeout")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(30);
 
             Ok(InitAction::WaitTcp(WaitTcp {
                 host,
@@ -432,10 +436,13 @@ pub fn from_spec(
 
             let expect_status = params
                 .get("expect_status")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .map(|v| v as u16);
 
-            let timeout_secs = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+            let timeout_secs = params
+                .get("timeout")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(30);
 
             Ok(InitAction::WaitHttp(WaitHttp {
                 url,
@@ -457,7 +464,7 @@ pub fn from_spec(
 
             let timeout_secs = params
                 .get("timeout")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(300);
 
             Ok(InitAction::Run(RunCommand {
@@ -505,7 +512,7 @@ pub fn from_spec(
                 .map(String::from);
             let timeout_secs = params
                 .get("timeout")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(300);
 
             Ok(InitAction::S3Push(S3Push {
@@ -557,7 +564,7 @@ pub fn from_spec(
                 .map(String::from);
             let timeout_secs = params
                 .get("timeout")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(300);
 
             Ok(InitAction::S3Pull(S3Pull {

@@ -104,13 +104,13 @@ pub struct DeployState {
     pub infra_phases: Vec<(InfraPhase, PhaseStatus)>,
     /// Per-service deployment states
     pub services: Vec<ServiceState>,
-    /// Service plans from the PlanReady event
+    /// Service plans from the `PlanReady` event
     pub service_plans: Vec<ServicePlan>,
     /// Log entries for the log pane
     pub log_entries: Vec<LogEntry>,
     /// Current scroll offset in the log pane
     pub log_scroll_offset: usize,
-    /// Running service summary from DeploymentRunning event
+    /// Running service summary from `DeploymentRunning` event
     pub running_services: Vec<(String, u32)>,
 }
 

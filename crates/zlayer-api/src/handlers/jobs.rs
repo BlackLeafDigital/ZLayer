@@ -77,7 +77,7 @@ fn default_limit() -> usize {
     50
 }
 
-/// Convert internal JobExecution to API response
+/// Convert internal `JobExecution` to API response
 fn execution_to_response(exec: &JobExecution) -> JobExecutionResponse {
     let (status_str, exit_code, error, duration_ms) = match &exec.status {
         JobStatus::Pending => ("pending".to_string(), None, None, None),
@@ -101,14 +101,14 @@ fn execution_to_response(exec: &JobExecution) -> JobExecutionResponse {
     let trigger_str = match &exec.trigger {
         JobTrigger::Endpoint { remote_addr } => {
             if let Some(addr) = remote_addr {
-                format!("endpoint:{}", addr)
+                format!("endpoint:{addr}")
             } else {
                 "endpoint".to_string()
             }
         }
         JobTrigger::Cli => "cli".to_string(),
         JobTrigger::Scheduler => "scheduler".to_string(),
-        JobTrigger::Internal { reason } => format!("internal:{}", reason),
+        JobTrigger::Internal { reason } => format!("internal:{reason}"),
     };
 
     // Convert Instant to approximate ISO 8601 string
@@ -160,7 +160,7 @@ pub async fn trigger_job(
     // Get the job spec
     let spec =
         state.executor.get_job_spec(&name).await.ok_or_else(|| {
-            ApiError::NotFound(format!("Job '{}' not found or not registered", name))
+            ApiError::NotFound(format!("Job '{name}' not found or not registered"))
         })?;
 
     // Trigger the job
@@ -168,18 +168,18 @@ pub async fn trigger_job(
         .executor
         .trigger(&name, &spec, JobTrigger::Endpoint { remote_addr: None })
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to trigger job: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to trigger job: {e}")))?;
 
     Ok((
         StatusCode::ACCEPTED,
         Json(TriggerJobResponse {
             execution_id: exec_id.0,
-            message: format!("Job '{}' triggered successfully", name),
+            message: format!("Job '{name}' triggered successfully"),
         }),
     ))
 }
 
-/// GET /api/v1/jobs/{execution_id}/status - Get execution status
+/// GET /`api/v1/jobs/{execution_id}/status` - Get execution status
 ///
 /// Returns the current status of a job execution, including logs if available.
 #[utoipa::path(
@@ -207,7 +207,7 @@ pub async fn get_execution_status(
         .executor
         .get_execution(&exec_id)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("Execution '{}' not found", execution_id)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("Execution '{execution_id}' not found")))?;
 
     Ok(Json(execution_to_response(&execution)))
 }
@@ -262,7 +262,7 @@ pub async fn list_job_executions(
     Ok(Json(filtered))
 }
 
-/// POST /api/v1/jobs/{execution_id}/cancel - Cancel a running execution
+/// POST /`api/v1/jobs/{execution_id}/cancel` - Cancel a running execution
 ///
 /// Attempts to cancel a running or pending job execution.
 #[utoipa::path(
@@ -295,7 +295,7 @@ pub async fn cancel_execution(
         .executor
         .get_execution(&exec_id)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("Execution '{}' not found", execution_id)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("Execution '{execution_id}' not found")))?;
 
     // Check if it's in a cancellable state
     if matches!(
@@ -313,7 +313,7 @@ pub async fn cancel_execution(
         .executor
         .cancel(&exec_id)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to cancel execution: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to cancel execution: {e}")))?;
 
     // Get updated status
     let updated = state

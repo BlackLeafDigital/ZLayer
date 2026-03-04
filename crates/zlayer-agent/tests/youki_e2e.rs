@@ -199,7 +199,7 @@ services:
         image, port, port
     );
 
-    serde_yaml::from_str::<DeploymentSpec>(&yaml)
+    serde_yml::from_str::<DeploymentSpec>(&yaml)
         .expect("Failed to parse test spec")
         .services
         .remove("test")
@@ -225,7 +225,7 @@ services:
       replicas: 1
 "#;
 
-    serde_yaml::from_str::<DeploymentSpec>(yaml)
+    serde_yml::from_str::<DeploymentSpec>(yaml)
         .expect("Failed to parse alpine spec")
         .services
         .remove("alpine")
@@ -257,7 +257,7 @@ services:
       retries: 3
 "#;
 
-    serde_yaml::from_str::<DeploymentSpec>(yaml)
+    serde_yml::from_str::<DeploymentSpec>(yaml)
         .expect("Failed to parse nginx spec")
         .services
         .remove("nginx")

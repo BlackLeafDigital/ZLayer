@@ -31,7 +31,7 @@ pub enum Screen {
     BuildWizard(Box<BuildWizardState>),
     /// Runtime template browser
     RuntimeBrowser(RuntimeBrowserState),
-    /// Dockerfile / ZImagefile validator
+    /// Dockerfile / `ZImagefile` validator
     Validate(ValidateState),
 }
 
@@ -59,9 +59,9 @@ pub enum BuildStep {
 /// State for the build wizard
 pub struct BuildWizardState {
     pub step: BuildStep,
-    /// Path to Dockerfile / ZImagefile (or None to use runtime template)
+    /// Path to Dockerfile / `ZImagefile` (or None to use runtime template)
     pub source_path: Option<PathBuf>,
-    /// Selected runtime template name (alternative to source_path)
+    /// Selected runtime template name (alternative to `source_path`)
     pub runtime: Option<String>,
     /// Image tags to apply
     pub tags: Vec<String>,
@@ -77,7 +77,7 @@ pub struct BuildWizardState {
     pub input_buf: String,
     /// Which configure field is focused
     pub config_field: usize,
-    /// File picker state (for SelectSource step)
+    /// File picker state (for `SelectSource` step)
     pub file_picker: crate::widgets::file_picker::FilePickerState,
     /// Build result: image ID
     pub result_image_id: Option<String>,
@@ -140,7 +140,7 @@ pub enum ValidateResult {
         path: String,
         stages: Vec<ValidateStageInfo>,
     },
-    /// Successfully parsed ZImagefile
+    /// Successfully parsed `ZImagefile`
     ZImagefile { path: String, summary: String },
     /// Parse error
     Error { path: String, message: String },

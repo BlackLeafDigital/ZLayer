@@ -120,7 +120,7 @@ pub async fn create_secret(
         .store
         .exists(scope, &request.name)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to check secret existence: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to check secret existence: {e}")))?;
 
     // Store the secret
     let secret = Secret::new(&request.value);
@@ -128,14 +128,14 @@ pub async fn create_secret(
         .store
         .set_secret(scope, &request.name, &secret)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to store secret: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to store secret: {e}")))?;
 
     // Get the metadata to return
     let metadata_list = state
         .store
         .list_secrets(scope)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to list secrets: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to list secrets: {e}")))?;
 
     let metadata = metadata_list
         .into_iter()
@@ -177,7 +177,7 @@ pub async fn list_secrets(
         .store
         .list_secrets(scope)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to list secrets: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to list secrets: {e}")))?;
 
     let response: Vec<SecretMetadataResponse> = metadata_list
         .iter()
@@ -217,10 +217,10 @@ pub async fn get_secret_metadata(
         .store
         .exists(scope, &name)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to check secret existence: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to check secret existence: {e}")))?;
 
     if !exists {
-        return Err(ApiError::NotFound(format!("Secret '{}' not found", name)));
+        return Err(ApiError::NotFound(format!("Secret '{name}' not found")));
     }
 
     // Get the metadata from the list
@@ -228,12 +228,12 @@ pub async fn get_secret_metadata(
         .store
         .list_secrets(scope)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to list secrets: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to list secrets: {e}")))?;
 
     let metadata = metadata_list
         .into_iter()
         .find(|m| m.name == name)
-        .ok_or_else(|| ApiError::NotFound(format!("Secret '{}' not found", name)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("Secret '{name}' not found")))?;
 
     Ok(Json(SecretMetadataResponse::from(metadata)))
 }
@@ -271,10 +271,10 @@ pub async fn delete_secret(
         .store
         .exists(scope, &name)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to check secret existence: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to check secret existence: {e}")))?;
 
     if !exists {
-        return Err(ApiError::NotFound(format!("Secret '{}' not found", name)));
+        return Err(ApiError::NotFound(format!("Secret '{name}' not found")));
     }
 
     // Delete the secret
@@ -282,7 +282,7 @@ pub async fn delete_secret(
         .store
         .delete_secret(scope, &name)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to delete secret: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to delete secret: {e}")))?;
 
     Ok(StatusCode::NO_CONTENT)
 }

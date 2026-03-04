@@ -59,7 +59,7 @@ pub struct CronStatusResponse {
     pub message: String,
 }
 
-/// Convert internal CronJobInfo to API response
+/// Convert internal `CronJobInfo` to API response
 fn cron_info_to_response(info: &CronJobInfo) -> CronJobResponse {
     CronJobResponse {
         name: info.name.clone(),
@@ -118,7 +118,7 @@ pub async fn get_cron_job(
         .scheduler
         .get_job_info(&name)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("Cron job '{}' not found", name)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("Cron job '{name}' not found")))?;
 
     Ok(Json(cron_info_to_response(&info)))
 }
@@ -154,16 +154,16 @@ pub async fn trigger_cron_job(
         .await
         .map_err(|e| match e {
             zlayer_agent::AgentError::NotFound { .. } => {
-                ApiError::NotFound(format!("Cron job '{}' not found", name))
+                ApiError::NotFound(format!("Cron job '{name}' not found"))
             }
-            _ => ApiError::Internal(format!("Failed to trigger cron job: {}", e)),
+            _ => ApiError::Internal(format!("Failed to trigger cron job: {e}")),
         })?;
 
     Ok((
         StatusCode::ACCEPTED,
         Json(TriggerCronResponse {
             execution_id: exec_id.0,
-            message: format!("Cron job '{}' triggered manually", name),
+            message: format!("Cron job '{name}' triggered manually"),
         }),
     ))
 }
@@ -198,7 +198,7 @@ pub async fn enable_cron_job(
         .scheduler
         .get_job_info(&name)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("Cron job '{}' not found", name)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("Cron job '{name}' not found")))?;
 
     // Enable the job
     state.scheduler.set_enabled(&name, true).await;
@@ -206,7 +206,7 @@ pub async fn enable_cron_job(
     Ok(Json(CronStatusResponse {
         name: name.clone(),
         enabled: true,
-        message: format!("Cron job '{}' enabled", name),
+        message: format!("Cron job '{name}' enabled"),
     }))
 }
 
@@ -241,7 +241,7 @@ pub async fn disable_cron_job(
         .scheduler
         .get_job_info(&name)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("Cron job '{}' not found", name)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("Cron job '{name}' not found")))?;
 
     // Disable the job
     state.scheduler.set_enabled(&name, false).await;
@@ -249,7 +249,7 @@ pub async fn disable_cron_job(
     Ok(Json(CronStatusResponse {
         name: name.clone(),
         enabled: false,
-        message: format!("Cron job '{}' disabled", name),
+        message: format!("Cron job '{name}' disabled"),
     }))
 }
 

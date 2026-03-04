@@ -41,7 +41,7 @@ use tracing::{debug, trace, warn};
 /// The resolver is thread-safe and supports concurrent certificate updates.
 #[derive(Debug)]
 pub struct SniCertResolver {
-    /// Domain -> CertifiedKey mapping
+    /// Domain -> `CertifiedKey` mapping
     certs: DashMap<String, Arc<CertifiedKey>>,
     /// Default/fallback certificate (optional)
     default_cert: RwLock<Option<Arc<CertifiedKey>>>,

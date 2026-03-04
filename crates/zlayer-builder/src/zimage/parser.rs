@@ -1,4 +1,4 @@
-//! ZImagefile parser — YAML deserialization + semantic validation.
+//! `ZImagefile` parser — YAML deserialization + semantic validation.
 //!
 //! The entry point is [`parse_zimagefile`], which takes raw YAML content,
 //! deserializes it into a [`ZImage`], and then runs validation rules that
@@ -7,7 +7,7 @@
 use super::types::{ZImage, ZStep};
 use crate::error::{BuildError, Result};
 
-/// Parse and validate a ZImagefile from its YAML content.
+/// Parse and validate a `ZImagefile` from its YAML content.
 ///
 /// This performs two phases:
 /// 1. **Deserialization** — YAML string into [`ZImage`] via `serde_yaml`.
@@ -20,7 +20,7 @@ use crate::error::{BuildError, Result};
 pub fn parse_zimagefile(content: &str) -> Result<ZImage> {
     // Phase 1: Deserialize YAML into the ZImage struct.
     let image: ZImage =
-        serde_yaml::from_str(content).map_err(|e| BuildError::zimagefile_parse(e.to_string()))?;
+        serde_yml::from_str(content).map_err(|e| BuildError::zimagefile_parse(e.to_string()))?;
 
     // Phase 2: Semantic validation.
     validate_version(&image)?;

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use utoipa::ToSchema;
 
+use secrecy::ExposeSecret;
+
 use crate::auth::{create_token, AuthState};
 use crate::error::{ApiError, Result};
 
@@ -51,7 +53,12 @@ pub async fn get_token(
         {
             Ok(Some(roles)) => {
                 let expiry = Duration::from_secs(3600);
-                let token = create_token(&auth.jwt_secret, &request.api_key, expiry, roles)?;
+                let token = create_token(
+                    auth.jwt_secret.expose_secret(),
+                    &request.api_key,
+                    expiry,
+                    roles,
+                )?;
 
                 return Ok(Json(TokenResponse {
                     access_token: token,
@@ -74,7 +81,12 @@ pub async fn get_token(
         if request.api_key == "dev" && request.api_secret == "dev-secret" {
             tracing::warn!("Using dev credentials -- NOT SAFE FOR PRODUCTION");
             let expiry = Duration::from_secs(3600);
-            let token = create_token(&auth.jwt_secret, "dev", expiry, vec!["admin".to_string()])?;
+            let token = create_token(
+                auth.jwt_secret.expose_secret(),
+                "dev",
+                expiry,
+                vec!["admin".to_string()],
+            )?;
 
             return Ok(Json(TokenResponse {
                 access_token: token,

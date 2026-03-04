@@ -1,4 +1,4 @@
-//! ImageBuilder - High-level API for building container images
+//! `ImageBuilder` - High-level API for building container images
 //!
 //! This module provides the [`ImageBuilder`] type which orchestrates the full
 //! container image build process, from Dockerfile parsing through buildah
@@ -226,7 +226,7 @@ pub enum CacheBackendConfig {
 ///    semantics by pulling/pushing layer digests from a remote registry
 #[derive(Debug, Default)]
 struct LayerCacheTracker {
-    /// Maps (instruction_cache_key, base_layer_id) -> was_cached
+    /// Maps (`instruction_cache_key`, `base_layer_id`) -> `was_cached`
     known_layers: HashMap<(String, String), bool>,
 }
 
@@ -357,7 +357,7 @@ impl RegistryAuth {
 pub struct BuildOptions {
     /// Dockerfile path (default: Dockerfile in context)
     pub dockerfile: Option<PathBuf>,
-    /// ZImagefile path (alternative to Dockerfile)
+    /// `ZImagefile` path (alternative to Dockerfile)
     pub zimagefile: Option<PathBuf>,
     /// Use runtime template instead of Dockerfile
     pub runtime: Option<Runtime>,
@@ -380,14 +380,14 @@ pub struct BuildOptions {
     /// Enable buildah layer caching (--layers flag for `buildah build`).
     /// Default: true
     ///
-    /// Note: ZLayer uses manual container creation (`buildah from`, `buildah run`,
+    /// Note: `ZLayer` uses manual container creation (`buildah from`, `buildah run`,
     /// `buildah commit`) rather than `buildah build`, so this flag is reserved
     /// for future use when/if we switch to `buildah build` (bud) command.
     pub layers: bool,
     /// Registry to pull cache from (--cache-from for `buildah build`).
     ///
     /// Note: This would be used with `buildah build --cache-from=<registry>`.
-    /// Currently ZLayer uses manual container creation, so this is reserved
+    /// Currently `ZLayer` uses manual container creation, so this is reserved
     /// for future implementation or for switching to `buildah build`.
     ///
     /// TODO: Implement remote cache support. This would require either:
@@ -397,7 +397,7 @@ pub struct BuildOptions {
     /// Registry to push cache to (--cache-to for `buildah build`).
     ///
     /// Note: This would be used with `buildah build --cache-to=<registry>`.
-    /// Currently ZLayer uses manual container creation, so this is reserved
+    /// Currently `ZLayer` uses manual container creation, so this is reserved
     /// for future implementation or for switching to `buildah build`.
     ///
     /// TODO: Implement remote cache support. This would require either:
@@ -407,7 +407,7 @@ pub struct BuildOptions {
     /// Maximum cache age (--cache-ttl for `buildah build`).
     ///
     /// Note: This would be used with `buildah build --cache-ttl=<duration>`.
-    /// Currently ZLayer uses manual container creation, so this is reserved
+    /// Currently `ZLayer` uses manual container creation, so this is reserved
     /// for future implementation or for switching to `buildah build`.
     ///
     /// TODO: Implement cache TTL support. This would require either:
@@ -440,7 +440,7 @@ pub struct BuildOptions {
     ///
     /// When set, the builder will probe this registry for short image names
     /// before qualifying them to `docker.io`. For example, if set to
-    /// `"git.example.com:5000"` and the ZImagefile uses `base: "myapp:latest"`,
+    /// `"git.example.com:5000"` and the `ZImagefile` uses `base: "myapp:latest"`,
     /// the builder will check `git.example.com:5000/myapp:latest` first.
     pub default_registry: Option<String>,
     /// Default cache mounts injected into all RUN instructions.
@@ -533,7 +533,7 @@ pub struct ImageBuilder {
 }
 
 impl ImageBuilder {
-    /// Create a new ImageBuilder with the given context directory
+    /// Create a new `ImageBuilder` with the given context directory
     ///
     /// The context directory should contain the Dockerfile (unless using
     /// a runtime template) and any files that will be copied into the image.
@@ -590,7 +590,7 @@ impl ImageBuilder {
         })
     }
 
-    /// Create an ImageBuilder with a custom buildah executor
+    /// Create an `ImageBuilder` with a custom buildah executor
     ///
     /// This is useful for testing or when you need to configure
     /// the executor with specific storage options.
@@ -639,10 +639,10 @@ impl ImageBuilder {
         self
     }
 
-    /// Set a custom ZImagefile path
+    /// Set a custom `ZImagefile` path
     ///
-    /// ZImagefiles are a YAML-based alternative to Dockerfiles. When set,
-    /// the builder will parse the ZImagefile and convert it to the internal
+    /// `ZImagefiles` are a YAML-based alternative to Dockerfiles. When set,
+    /// the builder will parse the `ZImagefile` and convert it to the internal
     /// Dockerfile IR for execution.
     ///
     /// # Example
@@ -676,6 +676,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn runtime(mut self, runtime: Runtime) -> Self {
         self.options.runtime = Some(runtime);
         self
@@ -703,6 +704,7 @@ impl ImageBuilder {
     }
 
     /// Set multiple build arguments at once
+    #[must_use]
     pub fn build_args(mut self, args: HashMap<String, String>) -> Self {
         self.options.build_args.extend(args);
         self
@@ -763,10 +765,11 @@ impl ImageBuilder {
     /// they could be served from cache.
     ///
     /// Note: Currently this flag is tracked but not fully implemented in the
-    /// build process. ZLayer uses manual container creation (`buildah from`,
+    /// build process. `ZLayer` uses manual container creation (`buildah from`,
     /// `buildah run`, `buildah commit`) which doesn't have built-in caching
     /// like `buildah build` does. Future work could implement layer-level
     /// caching by checking instruction hashes against previously built layers.
+    #[must_use]
     pub fn no_cache(mut self) -> Self {
         self.options.no_cache = true;
         self
@@ -777,7 +780,7 @@ impl ImageBuilder {
     /// This controls the `--layers` flag for buildah. When enabled (default),
     /// buildah can cache and reuse intermediate layers.
     ///
-    /// Note: ZLayer currently uses manual container creation (`buildah from`,
+    /// Note: `ZLayer` currently uses manual container creation (`buildah from`,
     /// `buildah run`, `buildah commit`) rather than `buildah build`, so this
     /// flag is reserved for future use when/if we switch to `buildah build`.
     ///
@@ -792,6 +795,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn layers(mut self, enable: bool) -> Self {
         self.options.layers = enable;
         self
@@ -802,7 +806,7 @@ impl ImageBuilder {
     /// This corresponds to buildah's `--cache-from` flag, which allows
     /// pulling cached layers from a remote registry to speed up builds.
     ///
-    /// Note: ZLayer currently uses manual container creation (`buildah from`,
+    /// Note: `ZLayer` currently uses manual container creation (`buildah from`,
     /// `buildah run`, `buildah commit`) rather than `buildah build`, so this
     /// option is reserved for future implementation.
     ///
@@ -831,7 +835,7 @@ impl ImageBuilder {
     /// This corresponds to buildah's `--cache-to` flag, which allows
     /// pushing cached layers to a remote registry for future builds to use.
     ///
-    /// Note: ZLayer currently uses manual container creation (`buildah from`,
+    /// Note: `ZLayer` currently uses manual container creation (`buildah from`,
     /// `buildah run`, `buildah commit`) rather than `buildah build`, so this
     /// option is reserved for future implementation.
     ///
@@ -860,7 +864,7 @@ impl ImageBuilder {
     /// This corresponds to buildah's `--cache-ttl` flag, which sets the
     /// maximum age for cached layers before they are considered stale.
     ///
-    /// Note: ZLayer currently uses manual container creation (`buildah from`,
+    /// Note: `ZLayer` currently uses manual container creation (`buildah from`,
     /// `buildah run`, `buildah commit`) rather than `buildah build`, so this
     /// option is reserved for future implementation.
     ///
@@ -880,6 +884,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn cache_ttl(mut self, ttl: std::time::Duration) -> Self {
         self.options.cache_ttl = Some(ttl);
         self
@@ -903,6 +908,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn push(mut self, auth: RegistryAuth) -> Self {
         self.options.push = true;
         self.options.registry_auth = Some(auth);
@@ -913,6 +919,7 @@ impl ImageBuilder {
     ///
     /// Use this for registries that don't require authentication
     /// (e.g., local registries, insecure registries).
+    #[must_use]
     pub fn push_without_auth(mut self) -> Self {
         self.options.push = true;
         self.options.registry_auth = None;
@@ -923,7 +930,7 @@ impl ImageBuilder {
     ///
     /// When set, the builder will probe this registry for short image names
     /// before qualifying them to `docker.io`. For example, if set to
-    /// `"git.example.com:5000"` and the ZImagefile uses `base: "myapp:latest"`,
+    /// `"git.example.com:5000"` and the `ZImagefile` uses `base: "myapp:latest"`,
     /// the builder will check `git.example.com:5000/myapp:latest` first.
     pub fn default_registry(mut self, registry: impl Into<String>) -> Self {
         self.options.default_registry = Some(registry.into());
@@ -943,6 +950,7 @@ impl ImageBuilder {
     /// Squash all layers into a single layer
     ///
     /// This reduces image size but loses layer caching benefits.
+    #[must_use]
     pub fn squash(mut self) -> Self {
         self.options.squash = true;
         self
@@ -957,12 +965,14 @@ impl ImageBuilder {
     }
 
     /// Set default cache mounts to inject into all RUN instructions
+    #[must_use]
     pub fn default_cache_mounts(mut self, mounts: Vec<RunMount>) -> Self {
         self.options.default_cache_mounts = mounts;
         self
     }
 
     /// Set the number of retries for failed RUN steps
+    #[must_use]
     pub fn retries(mut self, retries: u32) -> Self {
         self.options.retries = retries;
         self
@@ -988,6 +998,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn with_events(mut self, tx: mpsc::Sender<BuildEvent>) -> Self {
         self.event_tx = Some(tx);
         self
@@ -1299,7 +1310,7 @@ impl ImageBuilder {
                 self.send_event(BuildEvent::InstructionStarted {
                     stage: stage_idx,
                     index: inst_idx,
-                    instruction: format!("{:?}", instruction),
+                    instruction: format!("{instruction:?}"),
                 });
 
                 // Generate the cache key for this instruction
@@ -1331,9 +1342,9 @@ impl ImageBuilder {
                                         } else {
                                             // Relative path - prepend source stage's workdir
                                             if source_workdir == "/" {
-                                                format!("/{}", src)
+                                                format!("/{src}")
                                             } else {
-                                                format!("{}/{}", source_workdir, src)
+                                                format!("{source_workdir}/{src}")
                                             }
                                         }
                                     })
@@ -1354,7 +1365,9 @@ impl ImageBuilder {
 
                 // Inject default cache mounts into RUN instructions
                 let instruction_with_defaults;
-                let instruction_ref = if !self.options.default_cache_mounts.is_empty() {
+                let instruction_ref = if self.options.default_cache_mounts.is_empty() {
+                    instruction_ref
+                } else {
                     if let Instruction::Run(run) = instruction_ref {
                         let mut merged = run.clone();
                         for default_mount in &self.options.default_cache_mounts {
@@ -1375,8 +1388,6 @@ impl ImageBuilder {
                     } else {
                         instruction_ref
                     }
-                } else {
-                    instruction_ref
                 };
 
                 let is_run_instruction = matches!(instruction_ref, Instruction::Run(_));
@@ -1401,8 +1412,7 @@ impl ImageBuilder {
                             );
                             self.send_event(BuildEvent::Output {
                                 line: format!(
-                                    "⟳ Retrying step (attempt {}/{})...",
-                                    attempt, max_attempts
+                                    "⟳ Retrying step (attempt {attempt}/{max_attempts})..."
                                 ),
                                 is_stderr: false,
                             });
@@ -1482,7 +1492,7 @@ impl ImageBuilder {
                 // In a proper implementation, this would be the new layer digest
                 // after the instruction was committed. For now, we use a composite
                 // of the previous base and the instruction key.
-                current_base_layer = format!("{}:{}", current_base_layer, instruction_cache_key);
+                current_base_layer = format!("{current_base_layer}:{instruction_cache_key}");
 
                 self.send_event(BuildEvent::InstructionComplete {
                     stage: stage_idx,
@@ -1499,7 +1509,7 @@ impl ImageBuilder {
                 // Include the build_id to prevent collisions when parallel
                 // builds share stage names (e.g., two Dockerfiles both having
                 // a stage named "builder").
-                let image_name = format!("zlayer-build-{}-stage-{}", build_id, name);
+                let image_name = format!("zlayer-build-{build_id}-stage-{name}");
                 self.commit_container(&container_id, &image_name, false)
                     .await?;
                 stage_images.insert(name.clone(), image_name.clone());
@@ -1612,7 +1622,7 @@ impl ImageBuilder {
     ///
     /// Detection order:
     /// 1. If `runtime` is set → use template string → parse as Dockerfile
-    /// 2. If `zimagefile` is explicitly set → read & parse ZImagefile → convert
+    /// 2. If `zimagefile` is explicitly set → read & parse `ZImagefile` → convert
     /// 3. If a file called `ZImagefile` exists in the context dir → same as (2)
     /// 4. Fall back to reading a Dockerfile (from `dockerfile` option or default)
     async fn get_dockerfile(&self) -> Result<Dockerfile> {
@@ -1676,7 +1686,7 @@ impl ImageBuilder {
 
     /// Convert a parsed [`ZImage`] into the internal [`Dockerfile`] IR.
     ///
-    /// Handles the three ZImage modes that can produce a Dockerfile:
+    /// Handles the three `ZImage` modes that can produce a Dockerfile:
     /// - **Runtime** mode: delegates to the template system
     /// - **Single-stage / Multi-stage**: converts via [`zimage_to_dockerfile`]
     /// - **WASM** mode: errors out (WASM uses `zlayer wasm build`, not `zlayer build`)
@@ -1709,11 +1719,11 @@ impl ImageBuilder {
         crate::zimage::zimage_to_dockerfile(&resolved)
     }
 
-    /// Resolve `build:` directives in a ZImage by running nested builds.
+    /// Resolve `build:` directives in a `ZImage` by running nested builds.
     ///
     /// For each `build:` directive (top-level or per-stage), this method:
     /// 1. Determines the build context directory
-    /// 2. Auto-detects the build file (ZImagefile > Dockerfile) unless specified
+    /// 2. Auto-detects the build file (`ZImagefile` > Dockerfile) unless specified
     /// 3. Spawns a nested `ImageBuilder` to build the context
     /// 4. Tags the result and replaces `build` with `base`
     async fn resolve_build_directives(
@@ -1945,7 +1955,7 @@ impl ImageBuilder {
 
         // 2. Check configured default registry
         if let Some(ref registry) = self.options.default_registry {
-            let qualified = format!("{}/{}:{}", registry, name, tag_str);
+            let qualified = format!("{registry}/{name}:{tag_str}");
             debug!("Checking default registry for image: {}", qualified);
             // Return the qualified name for the configured registry.
             // buildah will attempt to pull from this registry; if it fails,

@@ -56,43 +56,40 @@ impl<'a> DeployView<'a> {
 
     /// Calculate the layout regions based on current deploy phase
     fn layout(&self, area: Rect) -> ViewLayout {
-        match self.state.phase {
-            DeployPhase::Running => {
-                // In Running mode, collapse the infra section
-                let chunks = Layout::vertical([
-                    Constraint::Length(3), // Header
-                    Constraint::Min(6),    // Services (dashboard mode)
-                    Constraint::Min(4),    // Logs
-                    Constraint::Length(1), // Footer
-                ])
-                .split(area);
+        if self.state.phase == DeployPhase::Running {
+            // In Running mode, collapse the infra section
+            let chunks = Layout::vertical([
+                Constraint::Length(3), // Header
+                Constraint::Min(6),    // Services (dashboard mode)
+                Constraint::Min(4),    // Logs
+                Constraint::Length(1), // Footer
+            ])
+            .split(area);
 
-                ViewLayout {
-                    header: chunks[0],
-                    infra: None,
-                    services: chunks[1],
-                    logs: chunks[2],
-                    footer: chunks[3],
-                }
+            ViewLayout {
+                header: chunks[0],
+                infra: None,
+                services: chunks[1],
+                logs: chunks[2],
+                footer: chunks[3],
             }
-            _ => {
-                // Full layout with all sections
-                let chunks = Layout::vertical([
-                    Constraint::Length(3), // Header
-                    Constraint::Length(5), // Infrastructure phases
-                    Constraint::Min(6),    // Services
-                    Constraint::Min(4),    // Logs
-                    Constraint::Length(1), // Footer
-                ])
-                .split(area);
+        } else {
+            // Full layout with all sections
+            let chunks = Layout::vertical([
+                Constraint::Length(3), // Header
+                Constraint::Length(5), // Infrastructure phases
+                Constraint::Min(6),    // Services
+                Constraint::Min(4),    // Logs
+                Constraint::Length(1), // Footer
+            ])
+            .split(area);
 
-                ViewLayout {
-                    header: chunks[0],
-                    infra: Some(chunks[1]),
-                    services: chunks[2],
-                    logs: chunks[3],
-                    footer: chunks[4],
-                }
+            ViewLayout {
+                header: chunks[0],
+                infra: Some(chunks[1]),
+                services: chunks[2],
+                logs: chunks[3],
+                footer: chunks[4],
             }
         }
     }
@@ -131,7 +128,7 @@ impl DeployView<'_> {
         let (phase_text, phase_style) = self.phase_display();
 
         let title_text = if self.state.deployment_name.is_empty() {
-            format!("  ZLayer Deploy | {}", phase_text)
+            format!("  ZLayer Deploy | {phase_text}")
         } else if self.state.version.is_empty() {
             format!(
                 "  ZLayer Deploy: {} | {}",

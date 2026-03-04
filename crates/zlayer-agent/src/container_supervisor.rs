@@ -17,13 +17,13 @@ use zlayer_spec::{PanicAction, ServiceSpec};
 /// Type alias for the isolate callback function
 pub type IsolateCallback = Arc<dyn Fn(&ContainerId) + Send + Sync>;
 
-/// Default maximum restarts within the tracking window before entering CrashLoopBackOff
+/// Default maximum restarts within the tracking window before entering `CrashLoopBackOff`
 const DEFAULT_MAX_RESTARTS: u32 = 5;
 /// Default time window for tracking restarts
 const DEFAULT_RESTART_WINDOW: Duration = Duration::from_secs(300); // 5 minutes
 /// Default poll interval for checking container health
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(5);
-/// Backoff delay when in CrashLoopBackOff state
+/// Backoff delay when in `CrashLoopBackOff` state
 const CRASH_LOOP_BACKOFF_DELAY: Duration = Duration::from_secs(30);
 
 /// Container state as tracked by the supervisor
@@ -66,6 +66,7 @@ pub struct SupervisedContainer {
 
 impl SupervisedContainer {
     /// Create a new supervised container entry
+    #[must_use]
     pub fn new(id: ContainerId, service_name: String, panic_action: PanicAction) -> Self {
         Self {
             id,
@@ -94,6 +95,7 @@ impl SupervisedContainer {
     }
 
     /// Check if the container is in a state that should be monitored
+    #[must_use]
     pub fn should_monitor(&self) -> bool {
         matches!(
             self.state,
@@ -284,11 +286,11 @@ impl ContainerSupervisor {
 
         loop {
             tokio::select! {
-                _ = self.shutdown.notified() => {
+                () = self.shutdown.notified() => {
                     tracing::info!("Container supervisor shutting down");
                     break;
                 }
-                _ = tokio::time::sleep(self.config.poll_interval) => {
+                () = tokio::time::sleep(self.config.poll_interval) => {
                     if let Err(e) = self.check_all_containers().await {
                         tracing::error!(error = %e, "Error during container health check");
                     }
@@ -305,6 +307,7 @@ impl ContainerSupervisor {
     }
 
     /// Check if the supervisor is currently running
+    #[must_use]
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::SeqCst)
     }
@@ -444,10 +447,7 @@ impl ContainerSupervisor {
     ) -> Result<()> {
         let restart_count = {
             let containers = self.containers.read().await;
-            containers
-                .get(container_id)
-                .map(|c| c.total_restarts)
-                .unwrap_or(0)
+            containers.get(container_id).map_or(0, |c| c.total_restarts)
         };
 
         tracing::info!(
@@ -497,10 +497,7 @@ impl ContainerSupervisor {
     ) -> Result<()> {
         let restart_count = {
             let containers = self.containers.read().await;
-            containers
-                .get(container_id)
-                .map(|c| c.total_restarts)
-                .unwrap_or(0)
+            containers.get(container_id).map_or(0, |c| c.total_restarts)
         };
 
         tracing::warn!(
@@ -653,7 +650,7 @@ mod tests {
     }
 
     fn mock_service_spec(panic_action: PanicAction) -> ServiceSpec {
-        let mut spec: ServiceSpec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        let mut spec: ServiceSpec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test

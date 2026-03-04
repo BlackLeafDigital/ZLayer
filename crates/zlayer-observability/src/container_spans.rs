@@ -32,6 +32,7 @@ pub enum ContainerOperation {
 }
 
 impl ContainerOperation {
+    #[must_use]
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Create => "container.create",
@@ -61,7 +62,7 @@ pub fn container_span(
     replica: u32,
     image: Option<&str>,
 ) -> Span {
-    let container_id = format!("{}-{}", service, replica);
+    let container_id = format!("{service}-{replica}");
 
     let span = info_span!(
         target: "zlayer::container",

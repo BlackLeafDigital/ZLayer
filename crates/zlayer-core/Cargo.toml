@@ -19,3 +19,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing = "0.1"
 zlayer-spec.workspace = true
+
+[lints]
+workspace = true

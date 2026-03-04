@@ -91,7 +91,7 @@ fn render_daemon_status(area: Rect, buf: &mut Buffer, state: &DashboardState) {
     buf.set_string(
         area.x + 2,
         area.y,
-        format!("{} Daemon: {}", icon, status_text),
+        format!("{icon} Daemon: {status_text}"),
         Style::default()
             .fg(status_color)
             .add_modifier(Modifier::BOLD),
@@ -315,7 +315,7 @@ pub fn refresh_data(rt: &tokio::runtime::Runtime, state: &mut DashboardState) {
         .await
         {
             Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(format!("{:#}", e)),
+            Ok(Err(e)) => return Err(format!("{e:#}")),
             Err(_) => return Err("Connection timed out".to_string()),
         };
 
@@ -323,13 +323,13 @@ pub fn refresh_data(rt: &tokio::runtime::Runtime, state: &mut DashboardState) {
         match client.health_check().await {
             Ok(true) => {}
             Ok(false) => return Err("Daemon unhealthy".to_string()),
-            Err(e) => return Err(format!("Health check failed: {:#}", e)),
+            Err(e) => return Err(format!("Health check failed: {e:#}")),
         }
 
         // List deployments
         let deployments = match client.list_deployments().await {
             Ok(d) => d,
-            Err(e) => return Err(format!("Failed to list deployments: {:#}", e)),
+            Err(e) => return Err(format!("Failed to list deployments: {e:#}")),
         };
 
         let mut infos = Vec::new();
@@ -347,16 +347,16 @@ pub fn refresh_data(rt: &tokio::runtime::Runtime, state: &mut DashboardState) {
             let services_count = dep
                 .get("services")
                 .and_then(|v| v.as_array())
-                .map(|a| a.len())
+                .map(std::vec::Vec::len)
                 .or_else(|| {
                     dep.get("service_count")
-                        .and_then(|v| v.as_u64())
+                        .and_then(serde_json::Value::as_u64)
                         .map(|n| n as usize)
                 })
                 .unwrap_or(0);
             let total_replicas = dep
                 .get("total_replicas")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0) as u32;
 
             infos.push(DeploymentInfo {
@@ -406,13 +406,13 @@ pub fn refresh_detail(
         .await
         {
             Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(format!("{:#}", e)),
+            Ok(Err(e)) => return Err(format!("{e:#}")),
             Err(_) => return Err("Connection timed out".to_string()),
         };
 
         let services = match client.list_services(&name).await {
             Ok(s) => s,
-            Err(e) => return Err(format!("Failed to list services: {:#}", e)),
+            Err(e) => return Err(format!("Failed to list services: {e:#}")),
         };
 
         let mut infos = Vec::new();
@@ -429,8 +429,7 @@ pub fn refresh_detail(
                 .to_string();
             let replicas = svc
                 .get("replicas")
-                .map(|v| v.to_string())
-                .unwrap_or_else(|| "?".to_string());
+                .map_or_else(|| "?".to_string(), std::string::ToString::to_string);
             let health = svc
                 .get("health")
                 .and_then(|v| v.as_str())

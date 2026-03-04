@@ -140,7 +140,7 @@ services:
       replicas: 1
 "#;
 
-    serde_yaml::from_str::<DeploymentSpec>(yaml)
+    serde_yml::from_str::<DeploymentSpec>(yaml)
         .expect("Failed to parse echo spec")
         .services
         .remove("echo")
@@ -174,7 +174,7 @@ services:
         seconds
     );
 
-    serde_yaml::from_str::<DeploymentSpec>(&yaml)
+    serde_yml::from_str::<DeploymentSpec>(&yaml)
         .expect("Failed to parse sleep spec")
         .services
         .remove("sleeper")
@@ -206,7 +206,7 @@ services:
       replicas: 1
 "#;
 
-    serde_yaml::from_str::<DeploymentSpec>(yaml)
+    serde_yml::from_str::<DeploymentSpec>(yaml)
         .expect("Failed to parse gpu spec")
         .services
         .remove("gpu-test")
@@ -239,7 +239,7 @@ services:
       replicas: 1
 "#;
 
-    serde_yaml::from_str::<DeploymentSpec>(yaml)
+    serde_yml::from_str::<DeploymentSpec>(yaml)
         .expect("Failed to parse mps spec")
         .services
         .remove("mps-test")
@@ -263,7 +263,7 @@ services:
       replicas: 1
 "#;
 
-    serde_yaml::from_str::<DeploymentSpec>(yaml)
+    serde_yml::from_str::<DeploymentSpec>(yaml)
         .expect("Failed to parse no-endpoints spec")
         .services
         .remove("no-net")
@@ -293,7 +293,7 @@ services:
       replicas: 1
 "#;
 
-    serde_yaml::from_str::<DeploymentSpec>(yaml)
+    serde_yml::from_str::<DeploymentSpec>(yaml)
         .expect("Failed to parse memory-limited spec")
         .services
         .remove("memlimit")
@@ -326,7 +326,7 @@ services:
       replicas: 1
 "#;
 
-    serde_yaml::from_str::<DeploymentSpec>(yaml)
+    serde_yml::from_str::<DeploymentSpec>(yaml)
         .expect("Failed to parse volume spec")
         .services
         .remove("vol-test")
@@ -1513,7 +1513,7 @@ services:
       mode: fixed
       replicas: 1
 "#;
-        let spec = serde_yaml::from_str::<DeploymentSpec>(yaml)
+        let spec = serde_yml::from_str::<DeploymentSpec>(yaml)
             .unwrap()
             .services
             .remove("missing")

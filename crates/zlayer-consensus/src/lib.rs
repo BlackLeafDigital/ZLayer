@@ -4,7 +4,7 @@
 //! Provides pluggable storage backends and network transports that can be
 //! parameterized with any application's state machine types.
 //!
-//! Used by both **ZLayer** (container orchestration) and **ZDB** (database replication).
+//! Used by both **`ZLayer`** (container orchestration) and **ZDB** (database replication).
 //!
 //! ## Quick Start
 //!

@@ -43,6 +43,7 @@ where
     C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode, Responder = OneshotResponder<C>>,
 {
     /// Create a `ConsensusNode` directly from an already-constructed `Raft` instance.
+    #[must_use]
     pub fn from_raft(raft: Raft<C>, node_id: NodeId, address: String) -> Self {
         Self {
             raft,
@@ -52,21 +53,25 @@ where
     }
 
     /// This node's ID.
+    #[must_use]
     pub fn node_id(&self) -> NodeId {
         self.node_id
     }
 
     /// This node's address.
+    #[must_use]
     pub fn address(&self) -> &str {
         &self.address
     }
 
     /// Get a reference to the inner `Raft` instance for advanced usage.
+    #[must_use]
     pub fn raft(&self) -> &Raft<C> {
         &self.raft
     }
 
     /// Get a clone of the inner `Raft` instance (cheap, Arc-based).
+    #[must_use]
     pub fn raft_clone(&self) -> Raft<C> {
         self.raft.clone()
     }
@@ -98,12 +103,14 @@ where
     }
 
     /// Check if this node is the current leader.
+    #[must_use]
     pub fn is_leader(&self) -> bool {
         let metrics = self.raft.metrics().borrow().clone();
         metrics.current_leader == Some(self.node_id)
     }
 
     /// Get the current leader's node ID, if known.
+    #[must_use]
     pub fn leader_id(&self) -> Option<NodeId> {
         self.raft.metrics().borrow().current_leader
     }
@@ -190,7 +197,7 @@ where
             .get_joint_config()
             .last()
         {
-            for id in membership.iter() {
+            for id in membership {
                 voter_ids.insert(*id);
             }
         }
@@ -204,6 +211,7 @@ where
     }
 
     /// Get current Raft metrics (leader, term, log indices, etc.).
+    #[must_use]
     pub fn metrics(&self) -> RaftMetrics<NodeId, BasicNode> {
         self.raft.metrics().borrow().clone()
     }
@@ -244,6 +252,7 @@ pub struct ConsensusNodeBuilder {
 
 impl ConsensusNodeBuilder {
     /// Create a new builder for the given node ID and address.
+    #[must_use]
     pub fn new(node_id: NodeId, address: String) -> Self {
         Self {
             node_id,
@@ -253,6 +262,7 @@ impl ConsensusNodeBuilder {
     }
 
     /// Set the consensus configuration.
+    #[must_use]
     pub fn with_config(mut self, config: ConsensusConfig) -> Self {
         self.config = config;
         self

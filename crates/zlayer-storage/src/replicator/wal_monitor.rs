@@ -1,6 +1,6 @@
 //! WAL file change detection
 //!
-//! Monitors SQLite WAL files for changes and parses WAL headers to track frame counts.
+//! Monitors `SQLite` WAL files for changes and parses WAL headers to track frame counts.
 
 use crate::error::{LayerStorageError, Result};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
@@ -21,9 +21,9 @@ pub struct WalEvent {
     pub is_checkpoint: bool,
 }
 
-/// SQLite WAL header structure (first 32 bytes)
+/// `SQLite` WAL header structure (first 32 bytes)
 ///
-/// See: https://www.sqlite.org/fileformat2.html#walformat
+/// See: <https://www.sqlite.org/fileformat2.html#walformat>
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct WalHeader {
@@ -94,7 +94,7 @@ struct WalFrameHeader {
     checksum2: u32,
 }
 
-/// Monitors a SQLite WAL file for changes
+/// Monitors a `SQLite` WAL file for changes
 pub struct WalMonitor {
     /// Path to the WAL file
     wal_path: PathBuf,
@@ -113,7 +113,7 @@ impl WalMonitor {
     ///
     /// # Arguments
     ///
-    /// * `wal_path` - Path to the SQLite WAL file
+    /// * `wal_path` - Path to the `SQLite` WAL file
     ///
     /// # Errors
     ///
@@ -166,8 +166,7 @@ impl WalMonitor {
                     if let Ok(event) = &res {
                         let is_wal_event = event.paths.iter().any(|p| {
                             p.file_name()
-                                .map(|n| n.to_string_lossy().ends_with("-wal"))
-                                .unwrap_or(false)
+                                .is_some_and(|n| n.to_string_lossy().ends_with("-wal"))
                                 || p == &wal_path
                         });
                         if is_wal_event {

@@ -20,6 +20,7 @@ zlayer-spec.workspace = true
 zlayer-scheduler.workspace = true
 zlayer-observability.workspace = true
 zlayer-secrets.workspace = true
+zlayer-storage.workspace = true
 
 # Web framework
 axum.workspace = true
@@ -30,6 +31,7 @@ hyper-util.workspace = true
 
 # Authentication
 jsonwebtoken.workspace = true
+secrecy.workspace = true
 
 # Rate limiting
 governor.workspace = true
@@ -68,6 +70,9 @@ base64.workspace = true
 sha2.workspace = true
 hex.workspace = true
 
+# HTTP client (for peer broadcast)
+reqwest.workspace = true
+
 # Synchronization
 parking_lot.workspace = true
 
@@ -85,3 +90,6 @@ sqlx.workspace = true
 # Temp directories for tests
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true

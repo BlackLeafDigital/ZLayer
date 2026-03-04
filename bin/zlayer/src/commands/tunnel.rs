@@ -60,20 +60,19 @@ pub(crate) async fn handle_tunnel_create(
     let id = uuid::Uuid::new_v4().to_string();
 
     println!("Tunnel token created successfully!\n");
-    println!("Tunnel ID: {}", id);
-    println!("Name: {}", name);
-    if !services.is_empty() {
-        println!("Allowed services: {}", services.join(", "));
-    } else {
+    println!("Tunnel ID: {id}");
+    println!("Name: {name}");
+    if services.is_empty() {
         println!("Allowed services: all");
+    } else {
+        println!("Allowed services: {}", services.join(", "));
     }
-    println!("Expires in: {} hours", ttl_hours);
+    println!("Expires in: {ttl_hours} hours");
     println!("\nToken:");
-    println!("{}", token);
+    println!("{token}");
     println!("\nUsage:");
     println!(
-        "  zlayer tunnel connect --server wss://your-server/tunnel/v1 --token {} --service name:local:remote",
-        token
+        "  zlayer tunnel connect --server wss://your-server/tunnel/v1 --token {token} --service name:local:remote"
     );
 
     // Note: In production, this would store the token in the cluster state via API
@@ -100,11 +99,10 @@ pub(crate) async fn handle_tunnel_list(output: &str) -> Result<()> {
 pub(crate) async fn handle_tunnel_revoke(id: &str) -> Result<()> {
     info!(id = %id, "Revoking tunnel");
 
-    println!("Revoking tunnel: {}", id);
+    println!("Revoking tunnel: {id}");
     println!("\nTo revoke via API:");
     println!(
-        "  curl -X DELETE -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/{}",
-        id
+        "  curl -X DELETE -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/{id}"
     );
 
     // In production, this would call the API
@@ -134,19 +132,18 @@ pub(crate) async fn handle_tunnel_connect(
         let parts: Vec<&str> = service.split(':').collect();
         if parts.len() < 2 {
             anyhow::bail!(
-                "Invalid service format '{}'. Expected name:local_port[:remote_port]",
-                service
+                "Invalid service format '{service}'. Expected name:local_port[:remote_port]"
             );
         }
 
         let name = parts[0].to_string();
         let local_port: u16 = parts[1]
             .parse()
-            .with_context(|| format!("Invalid local port in '{}'", service))?;
+            .with_context(|| format!("Invalid local port in '{service}'"))?;
         let remote_port: u16 = if parts.len() > 2 {
             parts[2]
                 .parse()
-                .with_context(|| format!("Invalid remote port in '{}'", service))?
+                .with_context(|| format!("Invalid remote port in '{service}'"))?
         } else {
             0 // Auto-assign
         };
@@ -167,9 +164,9 @@ pub(crate) async fn handle_tunnel_connect(
     // Validate config
     config
         .validate()
-        .map_err(|e| anyhow::anyhow!("Invalid configuration: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Invalid configuration: {e}"))?;
 
-    println!("Connecting to tunnel server: {}", server);
+    println!("Connecting to tunnel server: {server}");
     println!("Services to expose:");
     for svc in &config.services {
         if svc.remote_port > 0 {
@@ -203,12 +200,12 @@ pub(crate) async fn handle_tunnel_connect(
                     println!("Tunnel disconnected gracefully.");
                 }
                 Err(e) => {
-                    println!("Tunnel error: {}", e);
+                    println!("Tunnel error: {e}");
                     return Err(e.into());
                 }
             }
         }
-        _ = shutdown => {
+        () = shutdown => {
             agent.disconnect();
             println!("Disconnected.");
         }
@@ -240,17 +237,16 @@ pub(crate) async fn handle_tunnel_add(
         anyhow::bail!("Expose must be 'public' or 'internal'");
     }
 
-    println!("Creating node-to-node tunnel: {}", name);
-    println!("  From: {} (port {})", from, local_port);
-    println!("  To: {} (port {})", to, remote_port);
-    println!("  Expose: {}", expose);
+    println!("Creating node-to-node tunnel: {name}");
+    println!("  From: {from} (port {local_port})");
+    println!("  To: {to} (port {remote_port})");
+    println!("  Expose: {expose}");
     println!();
     println!("To create via API:");
     println!(
         r#"  curl -X POST -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
-    -d '{{"name":"{}","from_node":"{}","to_node":"{}","local_port":{},"remote_port":{},"expose":"{}"}}' \
-    http://localhost:3669/api/v1/tunnels/node"#,
-        name, from, to, local_port, remote_port, expose
+    -d '{{"name":"{name}","from_node":"{from}","to_node":"{to}","local_port":{local_port},"remote_port":{remote_port},"expose":"{expose}"}}' \
+    http://localhost:3669/api/v1/tunnels/node"#
     );
 
     // In production, this would call the API
@@ -263,11 +259,10 @@ pub(crate) async fn handle_tunnel_add(
 pub(crate) async fn handle_tunnel_remove(name: &str) -> Result<()> {
     info!(name = %name, "Removing node-to-node tunnel");
 
-    println!("Removing node-to-node tunnel: {}", name);
+    println!("Removing node-to-node tunnel: {name}");
     println!("\nTo remove via API:");
     println!(
-        "  curl -X DELETE -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/node/{}",
-        name
+        "  curl -X DELETE -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/node/{name}"
     );
 
     // In production, this would call the API
@@ -280,25 +275,19 @@ pub(crate) async fn handle_tunnel_remove(name: &str) -> Result<()> {
 pub(crate) async fn handle_tunnel_status(id: Option<String>) -> Result<()> {
     info!(id = ?id, "Getting tunnel status");
 
-    match id {
-        Some(tunnel_id) => {
-            println!("Tunnel Status: {}", tunnel_id);
-            println!("==============={}", "=".repeat(tunnel_id.len()));
-            println!("\nTo get status via API:");
-            println!(
-                "  curl -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/{}/status",
-                tunnel_id
-            );
-        }
-        None => {
-            println!("All Tunnel Status");
-            println!("=================\n");
-            println!("[Use the API to list tunnel status]");
-            println!("\nTo list all tunnels via API:");
-            println!(
-                "  curl -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels"
-            );
-        }
+    if let Some(tunnel_id) = id {
+        println!("Tunnel Status: {tunnel_id}");
+        println!("==============={}", "=".repeat(tunnel_id.len()));
+        println!("\nTo get status via API:");
+        println!(
+            "  curl -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/{tunnel_id}/status"
+        );
+    } else {
+        println!("All Tunnel Status");
+        println!("=================\n");
+        println!("[Use the API to list tunnel status]");
+        println!("\nTo list all tunnels via API:");
+        println!("  curl -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels");
     }
 
     // In production, this would query the API
@@ -329,7 +318,7 @@ pub(crate) async fn handle_tunnel_access(
     // Use provided port or auto-assign
     let port = local_port.unwrap_or(0);
 
-    println!("Requesting temporary access to: {}", endpoint);
+    println!("Requesting temporary access to: {endpoint}");
     println!(
         "  Local port: {}",
         if port == 0 {
@@ -338,7 +327,7 @@ pub(crate) async fn handle_tunnel_access(
             port.to_string()
         }
     );
-    println!("  TTL: {}", ttl);
+    println!("  TTL: {ttl}");
     println!();
 
     // In production, this would:
@@ -348,8 +337,8 @@ pub(crate) async fn handle_tunnel_access(
 
     println!("[Access functionality requires API integration]");
     println!("\nOnce implemented, you would connect to:");
-    println!("  localhost:{} -> {}", port, endpoint);
-    println!("\nThe connection will automatically close after {}.", ttl);
+    println!("  localhost:{port} -> {endpoint}");
+    println!("\nThe connection will automatically close after {ttl}.");
 
     Ok(())
 }

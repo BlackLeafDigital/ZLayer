@@ -1,4 +1,4 @@
-//! JWT authentication for the ZLayer API
+//! JWT authentication for the `ZLayer` API
 //!
 //! Provides token creation, verification, and Axum request extractors.
 
@@ -7,6 +7,7 @@ use axum::{
     http::{header::AUTHORIZATION, request::Parts},
 };
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::warn;
@@ -34,7 +35,7 @@ impl Claims {
     pub fn new(subject: impl Into<String>, expiry: Duration, roles: Vec<String>) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before Unix epoch")
             .as_secs();
 
         Self {
@@ -47,15 +48,17 @@ impl Claims {
     }
 
     /// Check if token is expired
+    #[must_use]
     pub fn is_expired(&self) -> bool {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .unwrap()
+            .expect("system clock before Unix epoch")
             .as_secs();
         self.exp < now
     }
 
     /// Check if the user has a specific role
+    #[must_use]
     pub fn has_role(&self, role: &str) -> bool {
         self.roles.iter().any(|r| r == role || r == "admin")
     }
@@ -75,7 +78,7 @@ pub fn create_token(
         &claims,
         &EncodingKey::from_secret(secret.as_bytes()),
     )
-    .map_err(|e| ApiError::Internal(format!("Failed to create token: {}", e)))
+    .map_err(|e| ApiError::Internal(format!("Failed to create token: {e}")))
 }
 
 /// Verify and decode a JWT token
@@ -91,7 +94,7 @@ pub fn verify_token(secret: &str, token: &str) -> Result<Claims, ApiError> {
     .map(|data| data.claims)
     .map_err(|e| {
         warn!(error = %e, "Token verification failed");
-        ApiError::Unauthorized(format!("Invalid token: {}", e))
+        ApiError::Unauthorized(format!("Invalid token: {e}"))
     })
 }
 
@@ -103,16 +106,19 @@ pub struct AuthUser {
 
 impl AuthUser {
     /// Get the user/subject ID
+    #[must_use]
     pub fn id(&self) -> &str {
         &self.claims.sub
     }
 
     /// Get the subject (alias for id)
+    #[must_use]
     pub fn subject(&self) -> &str {
         &self.claims.sub
     }
 
     /// Check if user has a role
+    #[must_use]
     pub fn has_role(&self, role: &str) -> bool {
         self.claims.has_role(role)
     }
@@ -122,7 +128,7 @@ impl AuthUser {
         if self.has_role(role) {
             Ok(())
         } else {
-            Err(ApiError::Forbidden(format!("Role '{}' required", role)))
+            Err(ApiError::Forbidden(format!("Role '{role}' required")))
         }
     }
 }
@@ -130,7 +136,7 @@ impl AuthUser {
 /// State needed for authentication
 #[derive(Clone)]
 pub struct AuthState {
-    pub jwt_secret: String,
+    pub jwt_secret: SecretString,
     /// Credential store for validating API keys (optional; falls back to rejection
     /// if not set).
     pub credential_store: Option<
@@ -168,7 +174,7 @@ where
         })?;
 
         // Verify token
-        let claims = verify_token(&auth_state.jwt_secret, token)?;
+        let claims = verify_token(auth_state.jwt_secret.expose_secret(), token)?;
 
         if claims.is_expired() {
             return Err(ApiError::Unauthorized("Token expired".to_string()));

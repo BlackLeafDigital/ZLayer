@@ -101,6 +101,7 @@ pub struct OverlayHealthChecker {
 
 impl OverlayHealthChecker {
     /// Create a new health checker for the given interface
+    #[must_use]
     pub fn new(interface: &str, check_interval: Duration) -> Self {
         Self {
             interface: interface.to_string(),
@@ -111,6 +112,7 @@ impl OverlayHealthChecker {
     }
 
     /// Create with default settings
+    #[must_use]
     pub fn default_for_interface(interface: &str) -> Self {
         Self::new(interface, DEFAULT_CHECK_INTERVAL)
     }
@@ -142,8 +144,7 @@ impl OverlayHealthChecker {
                         let mut cache = self.peer_status.write().await;
                         let changed = cache
                             .get(&peer.public_key)
-                            .map(|prev| prev.healthy != peer.healthy)
-                            .unwrap_or(true);
+                            .map_or(true, |prev| prev.healthy != peer.healthy);
 
                         if changed {
                             on_status_change(&peer.public_key, peer.healthy);
@@ -191,7 +192,7 @@ impl OverlayHealthChecker {
                 healthy,
                 last_handshake_secs: stat.last_handshake_time.map(|t| now.saturating_sub(t)),
                 last_ping_ms: None, // Ping is optional
-                failure_count: if healthy { 0 } else { 1 },
+                failure_count: u32::from(!healthy),
                 last_check: now,
             };
 
@@ -216,8 +217,7 @@ impl OverlayHealthChecker {
 
         stats
             .last_handshake_time
-            .map(|t| now.saturating_sub(t) < timeout_secs)
-            .unwrap_or(false)
+            .is_some_and(|t| now.saturating_sub(t) < timeout_secs)
     }
 
     /// Ping a specific peer via its overlay IP
@@ -347,7 +347,7 @@ async fn uapi_get_raw(sock_path: &str) -> std::result::Result<String, Box<dyn st
     Ok(response)
 }
 
-/// Convert a hex-encoded key (from UAPI) to base64 (standard WireGuard format).
+/// Convert a hex-encoded key (from UAPI) to base64 (standard `WireGuard` format).
 fn hex_key_to_base64(hex_key: &str) -> String {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     match hex::decode(hex_key) {
@@ -359,10 +359,10 @@ fn hex_key_to_base64(hex_key: &str) -> String {
 /// Parse a UAPI `get=1` response into a list of [`WgPeerStats`].
 ///
 /// The UAPI response is newline-delimited `key=value` pairs. Interface-level
-/// fields come first (private_key, listen_port, fwmark). Each `public_key=`
+/// fields come first (`private_key`, `listen_port`, fwmark). Each `public_key=`
 /// line starts a new peer block. Peer fields include endpoint,
-/// last_handshake_time_sec, last_handshake_time_nsec, rx_bytes, tx_bytes,
-/// persistent_keepalive_interval, and allowed_ip.
+/// `last_handshake_time_sec`, `last_handshake_time_nsec`, `rx_bytes`, `tx_bytes`,
+/// `persistent_keepalive_interval`, and `allowed_ip`.
 fn parse_uapi_get_response(response: &str) -> Vec<WgPeerStats> {
     let mut peers = Vec::new();
     let mut current_peer: Option<WgPeerStats> = None;

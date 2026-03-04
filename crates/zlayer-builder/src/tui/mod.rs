@@ -132,21 +132,25 @@ pub enum InstructionStatus {
 
 impl InstructionStatus {
     /// Returns true if the instruction is complete (successfully or from cache)
+    #[must_use]
     pub fn is_complete(&self) -> bool {
         matches!(self, Self::Complete { .. })
     }
 
     /// Returns true if the instruction is currently running
+    #[must_use]
     pub fn is_running(&self) -> bool {
         matches!(self, Self::Running)
     }
 
     /// Returns true if the instruction failed
+    #[must_use]
     pub fn is_failed(&self) -> bool {
         matches!(self, Self::Failed)
     }
 
     /// Returns the status indicator character
+    #[must_use]
     pub fn indicator(&self) -> char {
         match self {
             Self::Pending => '\u{25CB}',         // ○

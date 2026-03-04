@@ -8,7 +8,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::TryRngCore;
 use zeroize::Zeroizing;
 
 use crate::{Result, SecretsError};
@@ -66,7 +66,9 @@ impl EncryptionKey {
     #[must_use]
     pub fn generate() -> Self {
         let mut key_bytes = Zeroizing::new([0u8; KEY_SIZE]);
-        OsRng.fill_bytes(key_bytes.as_mut());
+        OsRng
+            .try_fill_bytes(key_bytes.as_mut())
+            .expect("OS RNG failed");
         Self { key: key_bytes }
     }
 
@@ -115,7 +117,9 @@ impl EncryptionKey {
 
         // Generate random nonce
         let mut nonce_bytes = [0u8; NONCE_SIZE];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        OsRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .expect("OS RNG failed");
         let nonce = XNonce::from_slice(&nonce_bytes);
 
         // Encrypt

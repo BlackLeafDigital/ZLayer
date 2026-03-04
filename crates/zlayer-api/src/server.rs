@@ -19,11 +19,13 @@ pub struct ApiServer {
 
 impl ApiServer {
     /// Create a new API server
+    #[must_use]
     pub fn new(config: ApiConfig) -> Self {
         Self { config }
     }
 
     /// Get the bind address
+    #[must_use]
     pub fn bind_addr(&self) -> SocketAddr {
         self.config.bind
     }
@@ -212,9 +214,9 @@ impl ApiServer {
             std::time::Duration::from_secs(86400),
             vec!["admin".to_string()],
         )
-        .map_err(|e| anyhow::anyhow!("Failed to mint local admin token: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to mint local admin token: {e}"))?;
 
-        let bearer = format!("Bearer {}", local_token);
+        let bearer = format!("Bearer {local_token}");
 
         // Bind TCP listener
         let tcp_listener = TcpListener::bind(tcp_addr).await?;

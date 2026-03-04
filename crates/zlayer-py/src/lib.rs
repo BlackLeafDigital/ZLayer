@@ -1,7 +1,7 @@
-//! ZLayer Python Bindings
+//! `ZLayer` Python Bindings
 //!
-//! This crate provides Python bindings for the ZLayer container runtime,
-//! enabling Python developers to orchestrate containers using ZLayer's
+//! This crate provides Python bindings for the `ZLayer` container runtime,
+//! enabling Python developers to orchestrate containers using `ZLayer`'s
 //! specification-driven approach.
 //!
 //! # Overview
@@ -11,7 +11,7 @@
 //! - [`Container`] - Individual container lifecycle management
 //! - [`Runtime`] - Deployment-level orchestration
 //! - [`ImageBuilder`] - Container image building via buildah
-//! - [`Spec`] - ZLayer specification parsing and validation
+//! - [`Spec`] - `ZLayer` specification parsing and validation
 //!
 //! # Quick Start
 //!
@@ -55,35 +55,35 @@ pub use spec::{
     DependsSpec, EndpointSpec, HealthSpec, ResourcesSpec, ScaleSpec, ServiceSpec, Spec,
 };
 
-/// ZLayer - Python bindings for the ZLayer container runtime
+/// `ZLayer` - Python bindings for the `ZLayer` container runtime
 ///
 /// This module provides comprehensive tools for container orchestration:
 ///
 /// Classes:
 ///     Container: Individual container lifecycle management
 ///     Runtime: Deployment-level orchestration
-///     RuntimeOptions: Configuration for Runtime creation
-///     ImageBuilder: Container image building
+///     `RuntimeOptions`: Configuration for Runtime creation
+///     `ImageBuilder`: Container image building
 ///     Image: A built container image
 ///     Spec: Deployment specification parsing
-///     ServiceSpec: Service configuration
-///     EndpointSpec: Endpoint configuration
-///     ScaleSpec: Scaling configuration
-///     DependsSpec: Dependency configuration
-///     ResourcesSpec: Resource limits
-///     HealthSpec: Health check configuration
-///     ContainerState: Container state enumeration
+///     `ServiceSpec`: Service configuration
+///     `EndpointSpec`: Endpoint configuration
+///     `ScaleSpec`: Scaling configuration
+///     `DependsSpec`: Dependency configuration
+///     `ResourcesSpec`: Resource limits
+///     `HealthSpec`: Health check configuration
+///     `ContainerState`: Container state enumeration
 ///
 /// Functions:
 ///     run: Run a container quickly with simple parameters
 ///     build: Build a container image from a directory
-///     parse_spec: Parse a YAML spec string
-///     validate_spec: Validate a YAML spec string
-///     detect_runtime: Detect runtime from project files
-///     list_runtimes: List available runtime templates
-///     is_buildah_available: Check if buildah is installed
-///     buildah_install_instructions: Get buildah installation instructions
-///     create_service_spec: Create a service spec programmatically
+///     `parse_spec`: Parse a YAML spec string
+///     `validate_spec`: Validate a YAML spec string
+///     `detect_runtime`: Detect runtime from project files
+///     `list_runtimes`: List available runtime templates
+///     `is_buildah_available`: Check if buildah is installed
+///     `buildah_install_instructions`: Get buildah installation instructions
+///     `create_service_spec`: Create a service spec programmatically
 #[pymodule]
 fn _zlayer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Container classes

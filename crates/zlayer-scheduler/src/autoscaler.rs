@@ -32,6 +32,7 @@ pub enum ScalingDecision {
 
 impl ScalingDecision {
     /// Check if this decision involves a change
+    #[must_use]
     pub fn is_change(&self) -> bool {
         matches!(
             self,
@@ -40,6 +41,7 @@ impl ScalingDecision {
     }
 
     /// Get the target replica count, if any
+    #[must_use]
     pub fn target_replicas(&self) -> Option<u32> {
         match self {
             ScalingDecision::ScaleUp { to, .. } => Some(*to),
@@ -62,6 +64,7 @@ pub struct EmaCalculator {
 
 impl EmaCalculator {
     /// Create a new EMA calculator with given alpha
+    #[must_use]
     pub fn new(alpha: f64) -> Self {
         Self {
             value: 0.0,
@@ -72,22 +75,24 @@ impl EmaCalculator {
 
     /// Update EMA with a new sample
     pub fn update(&mut self, sample: f64) -> f64 {
-        if !self.initialized {
-            self.value = sample;
-            self.initialized = true;
-        } else {
+        if self.initialized {
             // EMA formula: new_value = alpha * sample + (1 - alpha) * old_value
             self.value = self.alpha * sample + (1.0 - self.alpha) * self.value;
+        } else {
+            self.value = sample;
+            self.initialized = true;
         }
         self.value
     }
 
     /// Get current EMA value
+    #[must_use]
     pub fn value(&self) -> f64 {
         self.value
     }
 
     /// Get the alpha (smoothing factor)
+    #[must_use]
     pub fn alpha(&self) -> f64 {
         self.alpha
     }
@@ -139,8 +144,7 @@ impl ServiceScaleState {
 
     fn is_in_cooldown(&self) -> bool {
         self.last_scale_time
-            .map(|t| t.elapsed() < self.cooldown)
-            .unwrap_or(false)
+            .is_some_and(|t| t.elapsed() < self.cooldown)
     }
 }
 
@@ -155,6 +159,7 @@ pub struct Autoscaler {
 
 impl Autoscaler {
     /// Create a new autoscaler
+    #[must_use]
     pub fn new() -> Self {
         Self {
             services: HashMap::new(),
@@ -163,6 +168,7 @@ impl Autoscaler {
     }
 
     /// Create with custom EMA alpha
+    #[must_use]
     pub fn with_ema_alpha(alpha: f64) -> Self {
         Self {
             services: HashMap::new(),
@@ -219,26 +225,26 @@ impl Autoscaler {
                 reason: "Manual scaling mode".to_string(),
             }),
             ScaleSpec::Fixed { replicas } => {
-                if state.current_replicas != *replicas {
+                if state.current_replicas == *replicas {
+                    Ok(ScalingDecision::NoChange {
+                        reason: "Fixed mode: at target".to_string(),
+                    })
+                } else {
                     let from = state.current_replicas;
                     let to = *replicas;
                     if to > from {
                         Ok(ScalingDecision::ScaleUp {
                             from,
                             to,
-                            reason: format!("Fixed mode: adjusting to {} replicas", replicas),
+                            reason: format!("Fixed mode: adjusting to {replicas} replicas"),
                         })
                     } else {
                         Ok(ScalingDecision::ScaleDown {
                             from,
                             to,
-                            reason: format!("Fixed mode: adjusting to {} replicas", replicas),
+                            reason: format!("Fixed mode: adjusting to {replicas} replicas"),
                         })
                     }
-                } else {
-                    Ok(ScalingDecision::NoChange {
-                        reason: "Fixed mode: at target".to_string(),
-                    })
                 }
             }
             ScaleSpec::Adaptive {
@@ -292,9 +298,9 @@ impl Autoscaler {
 
         // Check CPU
         if let Some(cpu_target) = targets.cpu {
-            let target = cpu_target as f64;
+            let target = f64::from(cpu_target);
             if cpu_ema >= target {
-                scale_up_reasons.push(format!("CPU {:.1}% >= {}%", cpu_ema, cpu_target));
+                scale_up_reasons.push(format!("CPU {cpu_ema:.1}% >= {cpu_target}%"));
             }
             // Scale down only if well below target (hysteresis)
             if cpu_ema > target * 0.5 {
@@ -304,9 +310,9 @@ impl Autoscaler {
 
         // Check memory
         if let Some(mem_target) = targets.memory {
-            let target = mem_target as f64;
+            let target = f64::from(mem_target);
             if memory_ema >= target {
-                scale_up_reasons.push(format!("Memory {:.1}% >= {}%", memory_ema, mem_target));
+                scale_up_reasons.push(format!("Memory {memory_ema:.1}% >= {mem_target}%"));
             }
             if memory_ema > target * 0.5 {
                 scale_down_ok = false;
@@ -315,16 +321,13 @@ impl Autoscaler {
 
         // Check RPS
         if let (Some(rps_target), Some(rps)) = (targets.rps, rps_ema) {
-            let target = rps_target as f64;
+            let target = f64::from(rps_target);
             // RPS is total across instances, so per-instance = rps / current
-            let per_instance = rps / current as f64;
+            let per_instance = rps / f64::from(current);
             let per_instance_target = target;
 
             if per_instance >= per_instance_target {
-                scale_up_reasons.push(format!(
-                    "RPS/instance {:.1} >= {}",
-                    per_instance, rps_target
-                ));
+                scale_up_reasons.push(format!("RPS/instance {per_instance:.1} >= {rps_target}"));
             }
             if per_instance > per_instance_target * 0.5 {
                 scale_down_ok = false;
@@ -350,10 +353,7 @@ impl Autoscaler {
             }
         } else {
             ScalingDecision::NoChange {
-                reason: format!(
-                    "Within bounds (CPU: {:.1}%, Mem: {:.1}%)",
-                    cpu_ema, memory_ema
-                ),
+                reason: format!("Within bounds (CPU: {cpu_ema:.1}%, Mem: {memory_ema:.1}%)"),
             }
         }
     }
@@ -378,13 +378,17 @@ impl Autoscaler {
     }
 
     /// Get current replica count for a service
+    #[must_use]
     pub fn current_replicas(&self, service_name: &str) -> Option<u32> {
         self.services.get(service_name).map(|s| s.current_replicas)
     }
 
     /// Check if service is in cooldown
+    #[must_use]
     pub fn is_in_cooldown(&self, service_name: &str) -> Option<bool> {
-        self.services.get(service_name).map(|s| s.is_in_cooldown())
+        self.services
+            .get(service_name)
+            .map(ServiceScaleState::is_in_cooldown)
     }
 }
 

@@ -28,6 +28,9 @@ pub struct InternalState {
     pub service_manager: Arc<RwLock<ServiceManager>>,
     /// Shared secret for authenticating internal calls
     pub internal_token: String,
+    /// `WireGuard` overlay interface name (e.g. "zl-overlay0") for add-peer operations.
+    /// `None` if overlay networking is not configured.
+    pub overlay_interface: Option<String>,
 }
 
 impl InternalState {
@@ -36,6 +39,20 @@ impl InternalState {
         Self {
             service_manager,
             internal_token,
+            overlay_interface: None,
+        }
+    }
+
+    /// Create a new internal state with overlay interface for peer management
+    pub fn with_overlay(
+        service_manager: Arc<RwLock<ServiceManager>>,
+        internal_token: String,
+        overlay_interface: Option<String>,
+    ) -> Self {
+        Self {
+            service_manager,
+            internal_token,
+            overlay_interface,
         }
     }
 }
@@ -69,7 +86,7 @@ where
             .and_then(|value: &HeaderValue| value.to_str().ok())
             .ok_or_else(|| {
                 warn!("Missing internal authentication header");
-                ApiError::Unauthorized(format!("Missing {} header", INTERNAL_AUTH_HEADER))
+                ApiError::Unauthorized(format!("Missing {INTERNAL_AUTH_HEADER} header"))
             })?;
 
         // Verify the token
@@ -158,7 +175,7 @@ pub async fn scale_service_internal(
     manager
         .scale_service(&request.service, request.replicas)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to scale service: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Failed to scale service: {e}")))?;
 
     // Get updated replica count
     let actual_replicas = manager
@@ -206,13 +223,112 @@ pub async fn get_replicas_internal(
     let replicas = manager
         .service_replica_count(&service)
         .await
-        .map_err(|_| ApiError::NotFound(format!("Service '{}' not found", service)))?
+        .map_err(|_| ApiError::NotFound(format!("Service '{service}' not found")))?
         as u32;
 
     Ok(Json(InternalScaleResponse {
         success: true,
         service,
         replicas,
+        message: None,
+    }))
+}
+
+/// Request to add a `WireGuard` peer to the local overlay transport.
+///
+/// Sent by the leader to existing nodes when a new node joins the cluster,
+/// so that all nodes learn about the new peer without waiting for periodic
+/// reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct InternalAddPeerRequest {
+    /// New peer's `WireGuard` public key (base64)
+    pub wg_public_key: String,
+    /// New peer's overlay IP (e.g. "10.200.0.3")
+    pub overlay_ip: String,
+    /// New peer's `WireGuard` endpoint (e.g. "203.0.113.5:51820")
+    pub endpoint: String,
+}
+
+/// Response from internal add-peer operation
+#[derive(Debug, Serialize, ToSchema)]
+pub struct InternalAddPeerResponse {
+    /// Whether the operation succeeded
+    pub success: bool,
+    /// Optional message
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Add a `WireGuard` peer to the local overlay transport.
+///
+/// Called by the cluster leader after a new node joins, so existing nodes
+/// can immediately route traffic to the new peer.
+///
+/// `POST /api/v1/internal/add-peer`
+#[utoipa::path(
+    post,
+    path = "/api/v1/internal/add-peer",
+    request_body = InternalAddPeerRequest,
+    responses(
+        (status = 200, description = "Peer added successfully", body = InternalAddPeerResponse),
+        (status = 401, description = "Unauthorized - invalid or missing internal token"),
+        (status = 500, description = "Internal error"),
+    ),
+    tag = "Internal"
+)]
+pub async fn add_peer_internal(
+    _auth: InternalAuth,
+    State(state): State<InternalState>,
+    Json(request): Json<InternalAddPeerRequest>,
+) -> Result<Json<InternalAddPeerResponse>> {
+    let interface_name = state.overlay_interface.as_deref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Overlay networking not configured on this node".into())
+    })?;
+
+    info!(
+        wg_public_key = %request.wg_public_key,
+        overlay_ip = %request.overlay_ip,
+        endpoint = %request.endpoint,
+        "Internal add-peer request received"
+    );
+
+    // Parse the endpoint into a SocketAddr
+    let endpoint: std::net::SocketAddr = request.endpoint.parse().map_err(|e| {
+        ApiError::BadRequest(format!(
+            "Invalid endpoint address '{}': {}",
+            request.endpoint, e
+        ))
+    })?;
+
+    // Build a PeerInfo for the WireGuard UAPI call
+    let peer_info = zlayer_overlay::PeerInfo::new(
+        request.wg_public_key.clone(),
+        endpoint,
+        &format!("{}/32", request.overlay_ip),
+        std::time::Duration::from_secs(25),
+    );
+
+    // Create a temporary OverlayTransport pointing at the existing interface's
+    // UAPI socket.  We only need the interface name — the UAPI socket path is
+    // derived from it (`/var/run/wireguard/{name}.sock`).
+    let transport = zlayer_overlay::OverlayTransport::new(
+        zlayer_overlay::OverlayConfig::default(),
+        interface_name.to_string(),
+    );
+
+    transport
+        .add_peer(&peer_info)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to add WireGuard peer: {e}")))?;
+
+    info!(
+        wg_public_key = %request.wg_public_key,
+        overlay_ip = %request.overlay_ip,
+        "Successfully added WireGuard peer via internal endpoint"
+    );
+
+    Ok(Json(InternalAddPeerResponse {
+        success: true,
         message: None,
     }))
 }
@@ -254,5 +370,42 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("message"));
         assert!(json.contains("Scaled successfully"));
+    }
+
+    #[test]
+    fn test_add_peer_request_deserialize() {
+        let json = r#"{
+            "wg_public_key": "abc123base64key==",
+            "overlay_ip": "10.200.0.5",
+            "endpoint": "203.0.113.5:51820"
+        }"#;
+        let request: InternalAddPeerRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.wg_public_key, "abc123base64key==");
+        assert_eq!(request.overlay_ip, "10.200.0.5");
+        assert_eq!(request.endpoint, "203.0.113.5:51820");
+    }
+
+    #[test]
+    fn test_add_peer_response_serialize() {
+        let response = InternalAddPeerResponse {
+            success: true,
+            message: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("true"));
+        assert!(!json.contains("message")); // skip_serializing_if
+    }
+
+    #[test]
+    fn test_internal_state_with_overlay() {
+        let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> =
+            Arc::new(zlayer_agent::MockRuntime::new());
+        let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));
+        let state = InternalState::with_overlay(
+            service_manager,
+            "token".to_string(),
+            Some("zl-overlay0".to_string()),
+        );
+        assert_eq!(state.overlay_interface.as_deref(), Some("zl-overlay0"));
     }
 }

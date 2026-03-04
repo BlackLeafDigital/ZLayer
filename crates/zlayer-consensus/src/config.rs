@@ -44,12 +44,12 @@ pub struct ConsensusConfig {
     /// Default: 10,000 entries.
     pub snapshot_logs_since_last: u64,
 
-    /// Maximum number of entries per AppendEntries RPC payload.
+    /// Maximum number of entries per `AppendEntries` RPC payload.
     ///
     /// Default: 300.
     pub max_payload_entries: u64,
 
-    /// Timeout for vote and append_entries RPCs.
+    /// Timeout for vote and `append_entries` RPCs.
     ///
     /// Default: 5 seconds.
     pub rpc_timeout: Duration,
@@ -84,7 +84,7 @@ impl ConsensusConfig {
     /// # Errors
     ///
     /// Returns an error if the resulting openraft config fails validation
-    /// (e.g., election_timeout_min > election_timeout_max).
+    /// (e.g., `election_timeout_min` > `election_timeout_max`).
     #[allow(clippy::result_large_err)]
     pub fn to_openraft_config(&self) -> Result<openraft::Config, openraft::ConfigError> {
         let config = openraft::Config {

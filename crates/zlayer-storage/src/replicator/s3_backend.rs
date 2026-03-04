@@ -1,4 +1,4 @@
-//! S3 upload/download for SQLite backups
+//! S3 upload/download for `SQLite` backups
 //!
 //! Handles uploading snapshots and WAL segments to S3, and downloading for restore.
 
@@ -40,7 +40,7 @@ impl Default for ReplicationMetadata {
     }
 }
 
-/// S3 backend for SQLite replication
+/// S3 backend for `SQLite` replication
 pub struct S3Backend {
     client: S3Client,
     bucket: String,
@@ -161,16 +161,15 @@ impl S3Backend {
         // Get metadata to find latest snapshot
         let metadata = self.get_metadata().await?;
 
-        let snapshot_key = match &metadata.latest_snapshot {
-            Some(key) => key.clone(),
-            None => {
-                // List snapshots to find the latest
-                let snapshots = self.list_snapshots().await?;
-                if snapshots.is_empty() {
-                    return Ok(None);
-                }
-                snapshots.last().unwrap().clone()
+        let snapshot_key = if let Some(key) = &metadata.latest_snapshot {
+            key.clone()
+        } else {
+            // List snapshots to find the latest
+            let snapshots = self.list_snapshots().await?;
+            if snapshots.is_empty() {
+                return Ok(None);
             }
+            snapshots.last().unwrap().clone()
         };
 
         info!("Downloading snapshot: {}", snapshot_key);

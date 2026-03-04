@@ -66,6 +66,7 @@ pub type Result<T, E = ProxyError> = std::result::Result<T, E>;
 
 impl ProxyError {
     /// Returns the HTTP status code for this error
+    #[must_use]
     pub fn status_code(&self) -> http::StatusCode {
         match self {
             ProxyError::RouteNotFound { .. } => http::StatusCode::NOT_FOUND,

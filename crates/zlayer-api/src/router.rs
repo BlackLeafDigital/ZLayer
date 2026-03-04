@@ -24,6 +24,7 @@ use crate::handlers::nodes::NodeApiState;
 use crate::handlers::overlay::OverlayApiState;
 use crate::handlers::secrets::SecretsState;
 use crate::handlers::services::ServiceState;
+use crate::handlers::storage::StorageState;
 use crate::handlers::tunnels::TunnelApiState;
 use crate::openapi::ApiDoc;
 use crate::ratelimit::{rate_limit_middleware, IpRateLimiter, RateLimitState};
@@ -239,14 +240,14 @@ pub fn build_router_full(
 
 /// Build the API router with service management capabilities
 ///
-/// This extends the basic router with a ServiceManager for service scaling operations.
+/// This extends the basic router with a `ServiceManager` for service scaling operations.
 /// The service endpoints (`/deployments/{name}/services/...`) will use the provided
-/// ServiceManager to perform actual container lifecycle operations.
+/// `ServiceManager` to perform actual container lifecycle operations.
 ///
 /// # Arguments
 /// * `config` - API configuration
 /// * `storage` - Deployment storage backend
-/// * `service_manager` - ServiceManager for container lifecycle operations
+/// * `service_manager` - `ServiceManager` for container lifecycle operations
 ///
 /// # Example
 ///
@@ -363,17 +364,17 @@ pub fn build_router_with_services(
     router
 }
 
-/// Build the API router with services, using a pre-built DeploymentState.
+/// Build the API router with services, using a pre-built `DeploymentState`.
 ///
-/// This variant allows the caller to provide a DeploymentState with orchestration
+/// This variant allows the caller to provide a `DeploymentState` with orchestration
 /// handles (service manager, overlay, proxy) already wired in, enabling the
-/// create_deployment handler to perform actual container orchestration.
+/// `create_deployment` handler to perform actual container orchestration.
 ///
 /// # Arguments
 /// * `config` - API configuration
 /// * `deployment_state` - Pre-built deployment state (may include orchestration handles)
-/// * `service_manager` - ServiceManager for service scaling operations
-/// * `storage` - Storage backend (for ServiceState)
+/// * `service_manager` - `ServiceManager` for service scaling operations
+/// * `storage` - Storage backend (for `ServiceState`)
 pub fn build_router_with_deployment_state(
     config: &ApiConfig,
     deployment_state: DeploymentState,
@@ -485,6 +486,7 @@ pub fn build_internal_routes(internal_state: InternalState) -> Router {
             "/replicas/{service}",
             get(handlers::internal::get_replicas_internal),
         )
+        .route("/add-peer", post(handlers::internal::add_peer_internal))
         .layer(Extension(internal_state.clone()))
         .with_state(internal_state)
 }
@@ -498,7 +500,7 @@ pub fn build_internal_routes(internal_state: InternalState) -> Router {
 /// # Arguments
 /// * `config` - API configuration
 /// * `storage` - Deployment storage backend
-/// * `service_manager` - ServiceManager for container lifecycle operations
+/// * `service_manager` - `ServiceManager` for container lifecycle operations
 /// * `internal_token` - Shared secret for authenticating internal API calls
 ///
 /// # Example
@@ -615,7 +617,7 @@ pub fn build_router_with_secrets(
 /// # Arguments
 /// * `config` - API configuration
 /// * `storage` - Deployment storage backend
-/// * `service_manager` - ServiceManager for container lifecycle operations
+/// * `service_manager` - `ServiceManager` for container lifecycle operations
 /// * `secrets_store` - Secrets store for CRUD operations
 pub fn build_router_with_services_and_secrets(
     config: &ApiConfig,
@@ -644,7 +646,7 @@ pub fn build_router_with_services_and_secrets(
 /// # Arguments
 /// * `config` - API configuration
 /// * `storage` - Deployment storage backend
-/// * `service_manager` - ServiceManager for container lifecycle operations
+/// * `service_manager` - `ServiceManager` for container lifecycle operations
 /// * `internal_token` - Shared secret for authenticating internal API calls
 /// * `secrets_store` - Secrets store for CRUD operations
 pub fn build_router_with_internal_and_secrets(
@@ -714,7 +716,7 @@ pub fn build_overlay_routes(overlay_state: OverlayApiState) -> Router<()> {
 /// # Arguments
 /// * `config` - API configuration
 /// * `storage` - Deployment storage backend
-/// * `service_manager` - ServiceManager for container lifecycle operations
+/// * `service_manager` - `ServiceManager` for container lifecycle operations
 /// * `node_state` - State for node management endpoints
 /// * `overlay_state` - State for overlay network endpoints
 pub fn build_router_with_nodes_and_overlay(
@@ -800,6 +802,22 @@ pub fn build_cluster_routes(cluster_state: ClusterApiState) -> Router<()> {
         .route("/nodes", get(handlers::cluster::cluster_list_nodes))
         .route("/heartbeat", post(handlers::cluster::cluster_heartbeat))
         .with_state(cluster_state)
+}
+
+/// Build routes for storage replication status
+///
+/// Creates the route for querying storage replication status.
+/// This route requires authentication but no specific role (read-only).
+///
+/// # Arguments
+/// * `storage_state` - State containing the optional `SQLite` replicator
+///
+/// # Returns
+/// A Router with the storage status endpoint
+pub fn build_storage_routes(storage_state: StorageState) -> Router<()> {
+    Router::new()
+        .route("/status", get(handlers::storage::get_storage_status))
+        .with_state(storage_state)
 }
 
 fn build_cors_layer(config: &ApiConfig) -> CorsLayer {
@@ -942,5 +960,19 @@ mod tests {
 
         let _router = build_router_with_tunnels(&config, storage, tunnel_state);
         // Router builds without error
+    }
+
+    #[test]
+    fn test_build_storage_routes() {
+        let storage_state = StorageState::new();
+        let _routes = build_storage_routes(storage_state);
+        // Routes build without error
+    }
+
+    #[test]
+    fn test_build_storage_routes_default() {
+        let storage_state = StorageState::default();
+        let _routes = build_storage_routes(storage_state);
+        // Routes build without error (disabled replicator)
     }
 }

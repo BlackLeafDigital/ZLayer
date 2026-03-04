@@ -43,11 +43,11 @@ impl DockerConfigAuth {
         }
 
         let contents = fs::read_to_string(path).map_err(|e| {
-            crate::error::Error::config(format!("Failed to read Docker config: {}", e))
+            crate::error::Error::config(format!("Failed to read Docker config: {e}"))
         })?;
 
         let config: DockerConfigAuth = serde_json::from_str(&contents).map_err(|e| {
-            crate::error::Error::config(format!("Failed to parse Docker config: {}", e))
+            crate::error::Error::config(format!("Failed to parse Docker config: {e}"))
         })?;
 
         Ok(config)
@@ -57,6 +57,7 @@ impl DockerConfigAuth {
     ///
     /// Returns (username, password) if credentials are found for the registry.
     /// The registry parameter should match the registry hostname (e.g., "docker.io", "ghcr.io").
+    #[must_use]
     pub fn get_credentials(&self, registry: &str) -> Option<(String, String)> {
         // Try exact match first
         if let Some(entry) = self.auths.get(registry) {
@@ -64,7 +65,7 @@ impl DockerConfigAuth {
         }
 
         // Try with https:// prefix
-        let https_registry = format!("https://{}", registry);
+        let https_registry = format!("https://{registry}");
         if let Some(entry) = self.auths.get(&https_registry) {
             return Self::extract_credentials(entry);
         }
@@ -121,6 +122,7 @@ impl DockerConfigAuth {
     }
 
     /// Get all configured registry hostnames
+    #[must_use]
     pub fn registries(&self) -> Vec<String> {
         self.auths.keys().cloned().collect()
     }

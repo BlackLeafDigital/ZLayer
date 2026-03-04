@@ -59,6 +59,9 @@ pub struct DaemonConfig {
 
     /// Runtime directory (sockets, PID files).  Default: `{data_dir}/run` on macOS, `/var/run/zlayer` on Linux.
     pub run_dir: PathBuf,
+
+    /// S3 configuration for `SQLite` replication (None = disabled).
+    pub s3_storage: Option<zlayer_storage::LayerStorageConfig>,
 }
 
 impl Default for DaemonConfig {
@@ -74,6 +77,7 @@ impl Default for DaemonConfig {
             data_dir,
             log_dir,
             run_dir,
+            s3_storage: None,
         }
     }
 }
@@ -112,10 +116,10 @@ pub struct DaemonState {
     /// Service manager wired to all subsystems.
     pub manager: Arc<ServiceManager>,
 
-    /// Persistent deployment storage (SQLite).
+    /// Persistent deployment storage (`SQLite`).
     pub storage: Arc<SqlxStorage>,
 
-    /// Persistent encrypted secrets store (SQLite + XChaCha20-Poly1305).
+    /// Persistent encrypted secrets store (`SQLite` + XChaCha20-Poly1305).
     pub secrets: Arc<PersistentSecretsStore>,
 
     /// Credential store for API key authentication.
@@ -133,7 +137,7 @@ pub struct DaemonState {
     /// Background task for L4 stream backend health checking.
     pub health_checker_handle: Option<tokio::task::JoinHandle<()>>,
 
-    /// Node configuration (identity, networking, WireGuard keys).
+    /// Node configuration (identity, networking, `WireGuard` keys).
     pub(crate) node_config: NodeConfig,
 
     /// Raft coordinator for distributed consensus.
@@ -155,6 +159,10 @@ pub struct DaemonState {
     /// Internal authentication token shared between the scheduler and the API.
     /// Needed by serve.rs to create `InternalState` with the same token.
     pub internal_token: String,
+
+    /// `SQLite` replicator for deployment DB backup to S3.
+    /// `None` when S3 storage is not configured.
+    pub replicator: Option<Arc<zlayer_storage::SqliteReplicator>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +174,7 @@ pub struct DaemonState {
 /// Checks for `{data_dir}/node_config.json`.
 /// - If present: loads and returns it.
 /// - If absent: generates a new UUID `node_id`, sets `raft_node_id = 1`,
-///   auto-detects the machine IP, generates a WireGuard keypair, sets
+///   auto-detects the machine IP, generates a `WireGuard` keypair, sets
 ///   `is_leader = true`, writes the file and returns the config.
 pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Result<NodeConfig> {
     let config_path = data_dir.join("node_config.json");
@@ -197,7 +205,7 @@ pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Resu
 
     let (private_key, public_key) = OverlayTransport::generate_keys()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to generate overlay keys: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Failed to generate overlay keys: {e}"))?;
 
     let cfg = NodeConfig {
         node_id: node_id.clone(),
@@ -238,10 +246,10 @@ pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Resu
 ///  4. Start DNS server for service discovery
 ///  5. Create proxy manager
 ///  6. Create stream registry + service registry (L4/L7 proxy)
-///  7. Create container supervisor + spawn run_loop
+///  7. Create container supervisor + spawn `run_loop`
 ///  8. Wire service manager with all subsystems
-///  9. Open persistent deployment storage (SQLite)
-/// 10. Open persistent secrets store (SQLite + encryption key)
+///  9. Open persistent deployment storage (`SQLite`)
+/// 10. Open persistent secrets store (`SQLite` + encryption key)
 pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
     // Phase 1: Create directories
@@ -335,7 +343,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // Phase 4: DNS server
     // -----------------------------------------------------------------------
     let (dns, dns_handle) = {
-        let dns_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), config.dns_port);
+        let dns_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), config.dns_port);
         let zone = format!("{}.local.", config.deployment_name);
         match DnsServer::new(dns_addr, &zone) {
             Ok(dns) => {
@@ -436,6 +444,44 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     info!(path = %db_path.display(), "Deployment storage opened");
 
     // -----------------------------------------------------------------------
+    // Phase 9b: SQLite replication to S3
+    // -----------------------------------------------------------------------
+    let replicator = if let Some(ref s3_config) = config.s3_storage {
+        let replicator_config = zlayer_storage::SqliteReplicatorConfig::new(
+            &db_path,
+            &s3_config.bucket,
+            format!("{}/deployments/", config.deployment_name),
+        )
+        .with_auto_restore(true)
+        .with_cache_dir(config.data_dir.join("replicator-cache"));
+
+        match zlayer_storage::SqliteReplicator::new(replicator_config, s3_config).await {
+            Ok(replicator) => {
+                // Auto-restore on startup if backup exists
+                match replicator.restore().await {
+                    Ok(true) => info!("Deployment DB restored from S3 backup"),
+                    Ok(false) => info!("No S3 backup found, starting fresh"),
+                    Err(e) => warn!("S3 restore failed (non-fatal): {e}"),
+                }
+                // Start background WAL monitoring
+                if let Err(e) = replicator.start().await {
+                    warn!("Failed to start SQLite replicator (non-fatal): {e}");
+                    None
+                } else {
+                    info!("SQLite replication to S3 started");
+                    Some(Arc::new(replicator))
+                }
+            }
+            Err(e) => {
+                warn!("Failed to create SQLite replicator (non-fatal): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // -----------------------------------------------------------------------
     // Phase 10: Persistent secrets store
     // -----------------------------------------------------------------------
     let key_manager = KeyManager::with_base_dir(&config.data_dir);
@@ -495,7 +541,16 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     let node_config = load_or_init_node_config(&config.data_dir).await?;
 
     // -----------------------------------------------------------------------
-    // Phase 14: Raft distributed consensus
+    // Phase 14: Internal token (generated early for Raft auth + Scheduler)
+    // -----------------------------------------------------------------------
+
+    // Generate the internal token up-front so the Raft RPC layer, the
+    // Scheduler (for dispatching scale requests), and the API InternalState
+    // (for validating them) all share the same secret.
+    let internal_token = generate_internal_token();
+
+    // -----------------------------------------------------------------------
+    // Phase 15: Raft distributed consensus
     // -----------------------------------------------------------------------
     let (raft, raft_server_handle) = {
         let _raft_db_path = config.data_dir.join("raft.db");
@@ -506,7 +561,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             ..Default::default()
         };
 
-        match RaftCoordinator::new(raft_cfg).await {
+        match RaftCoordinator::with_auth(raft_cfg, Some(internal_token.clone())).await {
             Ok(coordinator) => {
                 // Bootstrap as single-node cluster if this is the leader (first node)
                 if node_config.is_leader {
@@ -545,11 +600,22 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
 
                 let coordinator = Arc::new(coordinator);
 
-                // Start Raft RPC server in the background
-                let raft_service = RaftService::new(Arc::clone(&coordinator));
-                let raft_addr: std::net::SocketAddr = format!("0.0.0.0:{}", node_config.raft_port)
-                    .parse()
-                    .context("Invalid raft bind address")?;
+                // Start Raft RPC server in the background.
+                // Bind to the overlay IP when available so Raft traffic stays on
+                // the encrypted WireGuard mesh. Fall back to 127.0.0.1 (loopback)
+                // in host-networking mode -- never bind to 0.0.0.0.
+                let raft_service =
+                    RaftService::with_auth(Arc::clone(&coordinator), Some(internal_token.clone()));
+
+                let raft_bind_ip: std::net::IpAddr = if let Some(om) = &overlay {
+                    om.read().await.node_ip().map_or(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                        std::net::IpAddr::V4,
+                    )
+                } else {
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+                };
+                let raft_addr = std::net::SocketAddr::new(raft_bind_ip, node_config.raft_port);
 
                 let raft_handle = {
                     let svc = raft_service;
@@ -576,19 +642,14 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     };
 
     // -----------------------------------------------------------------------
-    // Phase 15: Internal token + Scheduler + Heartbeat & dead-node detection
+    // Phase 16: Scheduler + Heartbeat & dead-node detection
     // -----------------------------------------------------------------------
-
-    // Generate the internal token up-front so both the Scheduler (for
-    // dispatching scale requests) and the API InternalState (for validating
-    // them) share the same secret.
-    let internal_token = generate_internal_token();
 
     // Create the Scheduler (with raft if available) for rescheduling on
     // node death.  On leader nodes the scheduler is passed to the
     // dead-node detection loop so it can call `handle_node_death()`.
     let api_port = node_config.api_port;
-    let agent_base_url = format!("http://127.0.0.1:{}", api_port);
+    let agent_base_url = format!("http://127.0.0.1:{api_port}");
 
     let scheduler: Option<Arc<Scheduler>> = raft.as_ref().map(|raft_ref| {
         let sched_config = SchedulerConfig {
@@ -670,6 +731,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         dead_node_detection_handle,
         scheduler,
         internal_token,
+        replicator,
     })
 }
 
@@ -695,12 +757,11 @@ async fn heartbeat_loop(
         tokio::time::sleep(interval).await;
 
         // Resolve the current leader's API address from Raft cluster state.
-        let leader_url = match resolve_leader_api_url(&raft).await {
-            Some(url) => url,
-            None => {
-                warn!("Heartbeat: no leader address available, will retry next cycle");
-                continue;
-            }
+        let leader_url = if let Some(url) = resolve_leader_api_url(&raft).await {
+            url
+        } else {
+            warn!("Heartbeat: no leader address available, will retry next cycle");
+            continue;
         };
 
         let usage = crate::resources::detect_current_usage(&data_dir);
@@ -713,7 +774,7 @@ async fn heartbeat_loop(
         });
 
         match client
-            .post(format!("{}/api/v1/cluster/heartbeat", leader_url))
+            .post(format!("{leader_url}/api/v1/cluster/heartbeat"))
             .json(&body)
             .timeout(std::time::Duration::from_secs(5))
             .send()
@@ -806,7 +867,7 @@ fn generate_internal_token() -> String {
     let mut buf = String::with_capacity(64);
     for _ in 0..32 {
         let byte: u8 = rand::random();
-        let _ = write!(buf, "{:02x}", byte);
+        let _ = write!(buf, "{byte:02x}");
     }
     buf
 }
@@ -1310,7 +1371,7 @@ fn generate_admin_password() -> String {
     let mut buf = String::with_capacity(32);
     for _ in 0..16 {
         let byte: u8 = rand::random();
-        let _ = write!(buf, "{:02x}", byte);
+        let _ = write!(buf, "{byte:02x}");
     }
     buf
 }

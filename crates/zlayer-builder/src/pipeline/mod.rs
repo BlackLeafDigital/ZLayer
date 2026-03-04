@@ -1,12 +1,12 @@
 //! Pipeline build support for building multiple images from a manifest
 //!
 //! This module provides types and execution for ZPipeline.yaml files,
-//! which coordinate building multiple ZImagefiles with dependency ordering,
+//! which coordinate building multiple `ZImagefiles` with dependency ordering,
 //! shared caches, and coordinated pushing.
 //!
 //! # Overview
 //!
-//! A ZPipeline defines:
+//! A `ZPipeline` defines:
 //! - **Global variables** for template substitution (`${VAR}` syntax)
 //! - **Default settings** inherited by all image builds
 //! - **Multiple images** with optional dependency relationships
@@ -78,7 +78,7 @@ pub use types::{PipelineDefaults, PipelineImage, PushConfig, ZPipeline};
 
 use crate::error::{BuildError, Result};
 
-/// Parse a ZPipeline YAML file from its contents.
+/// Parse a `ZPipeline` YAML file from its contents.
 ///
 /// # Arguments
 ///
@@ -103,7 +103,7 @@ use crate::error::{BuildError, Result};
 /// assert!(pipeline.images.contains_key("app"));
 /// ```
 pub fn parse_pipeline(content: &str) -> Result<ZPipeline> {
-    serde_yaml::from_str(content)
+    serde_yml::from_str(content)
         .map_err(|e| BuildError::zimagefile_parse(format!("Pipeline parse error: {e}")))
 }
 
@@ -274,7 +274,7 @@ images:
       - "myapp:latest"
 "#;
         let pipeline = parse_pipeline(yaml).unwrap();
-        let serialized = serde_yaml::to_string(&pipeline).unwrap();
+        let serialized = serde_yml::to_string(&pipeline).unwrap();
         let pipeline2 = parse_pipeline(&serialized).unwrap();
 
         assert_eq!(pipeline.version, pipeline2.version);

@@ -64,7 +64,7 @@ impl Default for AuthConfig {
     }
 }
 
-/// Authentication resolver that converts AuthConfig to oci_client RegistryAuth
+/// Authentication resolver that converts `AuthConfig` to `oci_client` `RegistryAuth`
 pub struct AuthResolver {
     config: AuthConfig,
     docker_config: Option<DockerConfigAuth>,
@@ -73,6 +73,7 @@ pub struct AuthResolver {
 
 impl AuthResolver {
     /// Create a new authentication resolver
+    #[must_use]
     pub fn new(config: AuthConfig) -> Self {
         // Build a map for fast registry lookups
         let registry_map: HashMap<String, AuthSource> = config
@@ -103,7 +104,8 @@ impl AuthResolver {
     /// Resolve authentication for an image reference
     ///
     /// Extracts the registry from the image reference and returns the appropriate
-    /// oci_client::secrets::RegistryAuth.
+    /// `oci_client::secrets::RegistryAuth`.
+    #[must_use]
     pub fn resolve(&self, image: &str) -> oci_client::secrets::RegistryAuth {
         let registry = Self::extract_registry(image);
         let source = self
@@ -114,7 +116,7 @@ impl AuthResolver {
         self.resolve_source(source, &registry)
     }
 
-    /// Resolve a specific AuthSource to RegistryAuth
+    /// Resolve a specific `AuthSource` to `RegistryAuth`
     fn resolve_source(
         &self,
         source: &AuthSource,

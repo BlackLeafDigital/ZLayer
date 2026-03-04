@@ -19,11 +19,13 @@ zlayer-spec.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-trust-dns-client.workspace = true
-trust-dns-server.workspace = true
+hickory-client.workspace = true
+hickory-server.workspace = true
 x25519-dalek.workspace = true
 zlayer-core.workspace = true
 base64.workspace = true
-rand.workspace = true
 hex.workspace = true
 boringtun = { version = "0.7.0", features = ["device"] }
+
+[lints]
+workspace = true

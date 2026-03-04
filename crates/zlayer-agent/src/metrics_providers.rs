@@ -1,8 +1,8 @@
 //! Metrics provider implementations for autoscaling
 //!
 //! This module provides implementations of the scheduler's metrics traits
-//! that bridge the agent crate's ServiceManager and Runtime with the
-//! scheduler crate's CgroupsMetricsSource.
+//! that bridge the agent crate's `ServiceManager` and Runtime with the
+//! scheduler crate's `CgroupsMetricsSource`.
 
 use crate::cgroups_stats::ContainerStats;
 use crate::runtime::{ContainerId, Runtime};
@@ -14,10 +14,10 @@ use zlayer_scheduler::metrics::{
     ContainerStatsProvider, MetricsContainerId, RawContainerStats, ServiceContainerProvider,
 };
 
-/// Provides container IDs for services from ServiceManager
+/// Provides container IDs for services from `ServiceManager`
 ///
 /// Implements the scheduler's `ServiceContainerProvider` trait to
-/// bridge ServiceManager with CgroupsMetricsSource.
+/// bridge `ServiceManager` with `CgroupsMetricsSource`.
 ///
 /// # Example
 ///
@@ -39,7 +39,7 @@ pub struct ServiceManagerContainerProvider {
 }
 
 impl ServiceManagerContainerProvider {
-    /// Create a new provider wrapping a ServiceManager
+    /// Create a new provider wrapping a `ServiceManager`
     pub fn new(manager: Arc<ServiceManager>) -> Self {
         Self { manager }
     }
@@ -80,7 +80,7 @@ impl ServiceContainerProvider for ServiceManagerContainerProvider {
 /// Provides container statistics from the Runtime
 ///
 /// Implements the scheduler's `ContainerStatsProvider` trait to
-/// bridge the Runtime's `get_container_stats` with CgroupsMetricsSource.
+/// bridge the Runtime's `get_container_stats` with `CgroupsMetricsSource`.
 ///
 /// # Example
 ///
@@ -125,7 +125,7 @@ impl ContainerStatsProvider for RuntimeStatsProvider {
     }
 }
 
-/// Convert agent's ContainerStats to scheduler's RawContainerStats
+/// Convert agent's `ContainerStats` to scheduler's `RawContainerStats`
 ///
 /// This function bridges the two stats types, allowing the agent crate
 /// to not depend on scheduler for its core types while still providing
@@ -147,7 +147,7 @@ mod tests {
     use std::sync::Arc;
 
     fn mock_spec() -> zlayer_spec::ServiceSpec {
-        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test

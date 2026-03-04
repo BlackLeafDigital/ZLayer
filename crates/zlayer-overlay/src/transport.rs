@@ -1,7 +1,7 @@
 //! Encrypted overlay transport layer
 //!
-//! Uses boringtun (userspace WireGuard) to create TUN-based encrypted tunnels.
-//! No kernel WireGuard module or `wg` binary required.
+//! Uses boringtun (userspace `WireGuard`) to create TUN-based encrypted tunnels.
+//! No kernel `WireGuard` module or `wg` binary required.
 
 use crate::{config::OverlayConfig, PeerInfo};
 use boringtun::device::{DeviceConfig, DeviceHandle};
@@ -13,7 +13,7 @@ use tokio::process::Command;
 // UAPI helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a base64-encoded WireGuard key to hex (UAPI requires hex-encoded keys).
+/// Convert a base64-encoded `WireGuard` key to hex (UAPI requires hex-encoded keys).
 fn key_to_hex(base64_key: &str) -> Result<String, Box<dyn std::error::Error>> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let bytes = STANDARD.decode(base64_key)?;
@@ -29,7 +29,7 @@ fn key_to_hex(base64_key: &str) -> Result<String, Box<dyn std::error::Error>> {
 /// leading `set=1\n` — that is prepended automatically).
 async fn uapi_set(sock_path: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(sock_path).await?;
-    let msg = format!("set=1\n{}\n", body);
+    let msg = format!("set=1\n{body}\n");
     stream.write_all(msg.as_bytes()).await?;
     stream.shutdown().await?;
     let mut response = String::new();
@@ -57,8 +57,8 @@ async fn uapi_get(sock_path: &str) -> Result<String, Box<dyn std::error::Error>>
 
 /// Encrypted overlay transport layer.
 ///
-/// Uses boringtun (userspace WireGuard) to create TUN-based encrypted tunnels.
-/// No kernel WireGuard module required.
+/// Uses boringtun (userspace `WireGuard`) to create TUN-based encrypted tunnels.
+/// No kernel `WireGuard` module required.
 ///
 /// **Important:** This struct holds the boringtun [`DeviceHandle`]. The TUN
 /// device is destroyed when the handle is dropped. Callers **must** keep this
@@ -71,6 +71,7 @@ pub struct OverlayTransport {
 
 impl OverlayTransport {
     /// Create a new overlay transport (device is not started yet).
+    #[must_use]
     pub fn new(config: OverlayConfig, interface_name: String) -> Self {
         Self {
             config,
@@ -163,7 +164,7 @@ impl OverlayTransport {
 
     /// Configure the transport with private key, listen port, and peers.
     ///
-    /// After setting the WireGuard parameters via UAPI, this also assigns the
+    /// After setting the `WireGuard` parameters via UAPI, this also assigns the
     /// overlay IP address and brings the interface up using standard `ip`
     /// commands.
     pub async fn configure(&self, peers: &[PeerInfo]) -> Result<(), Box<dyn std::error::Error>> {
@@ -179,7 +180,7 @@ impl OverlayTransport {
 
         for peer in peers {
             let pub_hex = key_to_hex(&peer.public_key)?;
-            body.push_str(&format!("public_key={}\n", pub_hex));
+            body.push_str(&format!("public_key={pub_hex}\n"));
             body.push_str(&format!("endpoint={}\n", peer.endpoint));
             body.push_str(&format!("allowed_ip={}\n", peer.allowed_ips));
             body.push_str(&format!(
@@ -207,7 +208,7 @@ impl OverlayTransport {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Ignore "already exists" — idempotent
             if !stderr.contains("RTNETLINK answers: File exists") {
-                return Err(format!("Failed to assign IP: {}", stderr).into());
+                return Err(format!("Failed to assign IP: {stderr}").into());
             }
         }
 
@@ -256,7 +257,7 @@ impl OverlayTransport {
         let sock = self.uapi_sock_path();
         let pub_hex = key_to_hex(public_key)?;
 
-        let body = format!("public_key={}\nremove=true\n", pub_hex);
+        let body = format!("public_key={pub_hex}\nremove=true\n");
 
         uapi_set(&sock, &body).await?;
         tracing::debug!(
@@ -280,10 +281,9 @@ impl OverlayTransport {
     /// base64 encoding.
     pub async fn generate_keys() -> Result<(String, String), Box<dyn std::error::Error>> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
-        use rand::rngs::OsRng;
         use x25519_dalek::{PublicKey, StaticSecret};
 
-        let secret = StaticSecret::random_from_rng(OsRng);
+        let secret = StaticSecret::random();
         let public = PublicKey::from(&secret);
 
         let private_key = STANDARD.encode(secret.to_bytes());

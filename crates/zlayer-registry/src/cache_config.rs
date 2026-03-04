@@ -26,7 +26,7 @@ pub enum CacheType {
     /// In-memory cache (non-persistent, cleared on restart)
     Memory,
 
-    /// Persistent disk-based cache using SQLite
+    /// Persistent disk-based cache using `SQLite`
     #[cfg(feature = "persistent")]
     Persistent {
         /// Path to the cache database file
@@ -136,8 +136,7 @@ impl CacheType {
             }
 
             unknown => Err(CacheError::Database(format!(
-                "unknown cache type '{}', expected 'memory', 'persistent', or 's3'",
-                unknown
+                "unknown cache type '{unknown}', expected 'memory', 'persistent', or 's3'"
             ))),
         }
     }
@@ -169,12 +168,14 @@ impl CacheType {
     }
 
     /// Create a memory cache configuration
+    #[must_use]
     pub fn memory() -> Self {
         CacheType::Memory
     }
 
     /// Create a persistent cache configuration with default path
     #[cfg(feature = "persistent")]
+    #[must_use]
     pub fn persistent() -> Self {
         CacheType::Persistent {
             path: PathBuf::from(DEFAULT_CACHE_DIR).join(DEFAULT_CACHE_DB),
@@ -189,23 +190,27 @@ impl CacheType {
 
     /// Create an S3 cache configuration
     #[cfg(feature = "s3")]
+    #[must_use]
     pub fn s3(config: S3CacheConfig) -> Self {
         CacheType::S3(config)
     }
 
     /// Check if this is a memory cache
+    #[must_use]
     pub fn is_memory(&self) -> bool {
         matches!(self, CacheType::Memory)
     }
 
     /// Check if this is a persistent cache
     #[cfg(feature = "persistent")]
+    #[must_use]
     pub fn is_persistent(&self) -> bool {
         matches!(self, CacheType::Persistent { .. })
     }
 
     /// Check if this is an S3 cache
     #[cfg(feature = "s3")]
+    #[must_use]
     pub fn is_s3(&self) -> bool {
         matches!(self, CacheType::S3(_))
     }

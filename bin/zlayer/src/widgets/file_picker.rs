@@ -1,7 +1,7 @@
 //! Simple file/directory browser widget
 //!
 //! Provides a navigable filesystem view for selecting Dockerfiles,
-//! ZImagefiles, or directories.
+//! `ZImagefiles`, or directories.
 
 use std::path::PathBuf;
 
@@ -76,7 +76,7 @@ impl FilePickerState {
 
                 if path.is_dir() {
                     dirs.push(FileEntry {
-                        name: format!("{}/", name),
+                        name: format!("{name}/"),
                         path,
                         is_dir: true,
                     });
@@ -169,7 +169,7 @@ impl FilePickerState {
 /// Render the file picker into the given area
 pub fn render(area: Rect, buf: &mut Buffer, state: &FilePickerState, title: &str) {
     let block = Block::default()
-        .title(format!(" {} ", title))
+        .title(format!(" {title} "))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Blue));
 
@@ -241,7 +241,7 @@ pub fn render(area: Rect, buf: &mut Buffer, state: &FilePickerState, title: &str
     Widget::render(list, list_area, buf);
 }
 
-/// Check if a filename looks like a Dockerfile or ZImagefile
+/// Check if a filename looks like a Dockerfile or `ZImagefile`
 fn is_buildfile(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.contains("dockerfile")

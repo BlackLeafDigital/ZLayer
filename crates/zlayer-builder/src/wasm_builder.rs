@@ -7,10 +7,10 @@
 //! # Supported Languages
 //!
 //! - **Rust**: `cargo build --target wasm32-wasip1` or `cargo component build`
-//! - **Go**: TinyGo compiler with WASI target
+//! - **Go**: `TinyGo` compiler with WASI target
 //! - **Python**: componentize-py for component model
 //! - **TypeScript/JavaScript**: jco/componentize-js
-//! - **AssemblyScript**: asc compiler
+//! - **`AssemblyScript`**: asc compiler
 //! - **C**: Clang with WASI SDK
 //! - **Zig**: Native WASI support
 //!
@@ -108,13 +108,13 @@ pub enum WasmLanguage {
     Rust,
     /// Rust with cargo-component for WASI Preview 2 components
     RustComponent,
-    /// Go using TinyGo compiler
+    /// Go using `TinyGo` compiler
     Go,
     /// Python using componentize-py
     Python,
     /// TypeScript using jco/componentize-js
     TypeScript,
-    /// AssemblyScript using asc compiler
+    /// `AssemblyScript` using asc compiler
     AssemblyScript,
     /// C using WASI SDK (clang)
     C,
@@ -124,6 +124,7 @@ pub enum WasmLanguage {
 
 impl WasmLanguage {
     /// Get all supported languages
+    #[must_use]
     pub fn all() -> &'static [WasmLanguage] {
         &[
             WasmLanguage::Rust,
@@ -138,6 +139,7 @@ impl WasmLanguage {
     }
 
     /// Get the display name for this language
+    #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
             WasmLanguage::Rust => "Rust",
@@ -152,6 +154,7 @@ impl WasmLanguage {
     }
 
     /// Check if this language produces component model output by default
+    #[must_use]
     pub fn is_component_native(&self) -> bool {
         matches!(
             self,
@@ -178,6 +181,7 @@ pub enum WasiTarget {
 
 impl WasiTarget {
     /// Get the Rust target triple for this WASI version
+    #[must_use]
     pub fn rust_target(&self) -> &'static str {
         match self {
             WasiTarget::Preview1 => "wasm32-wasip1",
@@ -186,6 +190,7 @@ impl WasiTarget {
     }
 
     /// Get the display name
+    #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
             WasiTarget::Preview1 => "WASI Preview 1",
@@ -221,23 +226,27 @@ pub struct WasmBuildConfig {
 
 impl WasmBuildConfig {
     /// Create a new default configuration
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Set the source language
+    #[must_use]
     pub fn language(mut self, lang: WasmLanguage) -> Self {
         self.language = Some(lang);
         self
     }
 
     /// Set the WASI target
+    #[must_use]
     pub fn target(mut self, target: WasiTarget) -> Self {
         self.target = target;
         self
     }
 
     /// Enable optimization
+    #[must_use]
     pub fn optimize(mut self, optimize: bool) -> Self {
         self.optimize = optimize;
         self
@@ -279,11 +288,11 @@ pub struct WasmBuildResult {
 ///
 /// # Detection Order
 ///
-/// 1. Cargo.toml with cargo-component -> RustComponent
+/// 1. Cargo.toml with cargo-component -> `RustComponent`
 /// 2. Cargo.toml -> Rust
-/// 3. go.mod -> Go (TinyGo)
+/// 3. go.mod -> Go (`TinyGo`)
 /// 4. pyproject.toml or requirements.txt -> Python
-/// 5. package.json with assemblyscript -> AssemblyScript
+/// 5. package.json with assemblyscript -> `AssemblyScript`
 /// 6. package.json -> TypeScript
 /// 7. build.zig -> Zig
 /// 8. Makefile with *.c files -> C
@@ -366,7 +375,7 @@ pub fn detect_language(context: impl AsRef<Path>) -> Result<WasmLanguage> {
 fn is_cargo_component_project(cargo_toml: &Path) -> Result<bool> {
     let content =
         std::fs::read_to_string(cargo_toml).map_err(|e| WasmBuildError::ProjectConfigError {
-            message: format!("Failed to read Cargo.toml: {}", e),
+            message: format!("Failed to read Cargo.toml: {e}"),
         })?;
 
     // Check for cargo-component specific configuration
@@ -392,23 +401,22 @@ fn is_cargo_component_project(cargo_toml: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// Check if a package.json indicates an AssemblyScript project
+/// Check if a package.json indicates an `AssemblyScript` project
 fn is_assemblyscript_project(package_json: &Path) -> Result<bool> {
     let content =
         std::fs::read_to_string(package_json).map_err(|e| WasmBuildError::ProjectConfigError {
-            message: format!("Failed to read package.json: {}", e),
+            message: format!("Failed to read package.json: {e}"),
         })?;
 
     let json: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| WasmBuildError::ProjectConfigError {
-            message: format!("Invalid package.json: {}", e),
+            message: format!("Invalid package.json: {e}"),
         })?;
 
     // Check dependencies and devDependencies for assemblyscript
     let has_assemblyscript = |deps: Option<&serde_json::Value>| -> bool {
         deps.and_then(|d| d.as_object())
-            .map(|d| d.contains_key("assemblyscript"))
-            .unwrap_or(false)
+            .is_some_and(|d| d.contains_key("assemblyscript"))
     };
 
     if has_assemblyscript(json.get("dependencies"))
@@ -463,6 +471,7 @@ fn has_c_source_files(path: &Path) -> bool {
 }
 
 /// Get the build command for a specific language and target
+#[must_use]
 pub fn get_build_command(language: WasmLanguage, target: WasiTarget, release: bool) -> Vec<String> {
     match language {
         WasmLanguage::Rust => {
@@ -609,16 +618,13 @@ pub async fn build_wasm(
     info!("Building WASM component");
 
     // Detect language if not specified
-    let language = match config.language {
-        Some(lang) => {
-            debug!("Using specified language: {}", lang);
-            lang
-        }
-        None => {
-            let detected = detect_language(context)?;
-            info!("Auto-detected language: {}", detected);
-            detected
-        }
+    let language = if let Some(lang) = config.language {
+        debug!("Using specified language: {}", lang);
+        lang
+    } else {
+        let detected = detect_language(context)?;
+        info!("Auto-detected language: {}", detected);
+        detected
     };
 
     // Verify build tool is available
@@ -702,12 +708,12 @@ async fn verify_build_tool(language: WasmLanguage) -> Result<()> {
             let stderr = String::from_utf8_lossy(&output.stderr);
             Err(WasmBuildError::ToolNotFound {
                 tool: tool.to_string(),
-                message: format!("Command failed: {}", stderr),
+                message: format!("Command failed: {stderr}"),
             })
         }
         Err(e) => Err(WasmBuildError::ToolNotFound {
             tool: tool.to_string(),
-            message: format!("Not found in PATH: {}", e),
+            message: format!("Not found in PATH: {e}"),
         }),
     }
 }
@@ -748,7 +754,7 @@ fn find_wasm_output(
                     .join("target")
                     .join(target_name)
                     .join(profile)
-                    .join(format!("{}.wasm", package_name)),
+                    .join(format!("{package_name}.wasm")),
                 context
                     .join("target")
                     .join(target_name)
@@ -768,17 +774,17 @@ fn find_wasm_output(
                     .join("target")
                     .join("wasm32-wasip1")
                     .join(profile)
-                    .join(format!("{}.wasm", package_name)),
+                    .join(format!("{package_name}.wasm")),
                 context
                     .join("target")
                     .join("wasm32-wasip2")
                     .join(profile)
-                    .join(format!("{}.wasm", package_name)),
+                    .join(format!("{package_name}.wasm")),
                 context
                     .join("target")
                     .join("wasm32-wasi")
                     .join(profile)
-                    .join(format!("{}.wasm", package_name)),
+                    .join(format!("{package_name}.wasm")),
             ]
         }
 
@@ -843,7 +849,7 @@ fn get_rust_package_name(context: &Path) -> Result<String> {
     let cargo_toml = context.join("Cargo.toml");
     let content =
         std::fs::read_to_string(&cargo_toml).map_err(|e| WasmBuildError::ProjectConfigError {
-            message: format!("Failed to read Cargo.toml: {}", e),
+            message: format!("Failed to read Cargo.toml: {e}"),
         })?;
 
     // Simple TOML parsing for package name

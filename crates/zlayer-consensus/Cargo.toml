@@ -42,3 +42,6 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 default = ["mem-store"]
 mem-store = []
 redb-store = ["dep:redb"]
+
+[lints]
+workspace = true

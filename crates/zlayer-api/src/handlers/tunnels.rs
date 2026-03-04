@@ -375,10 +375,10 @@ pub async fn revoke_tunnel(
     if tunnels.remove(&id).is_some() {
         tracing::info!(tunnel_id = %id, "Revoked tunnel");
         Ok(Json(SuccessResponse {
-            message: format!("Tunnel '{}' revoked successfully", id),
+            message: format!("Tunnel '{id}' revoked successfully"),
         }))
     } else {
-        Err(ApiError::NotFound(format!("Tunnel '{}' not found", id)))
+        Err(ApiError::NotFound(format!("Tunnel '{id}' not found")))
     }
 }
 
@@ -426,7 +426,7 @@ pub async fn get_tunnel_status(
                 active_connections: 0, // Would come from TunnelRegistry
             }))
         }
-        None => Err(ApiError::NotFound(format!("Tunnel '{}' not found", id))),
+        None => Err(ApiError::NotFound(format!("Tunnel '{id}' not found"))),
     }
 }
 
@@ -521,12 +521,11 @@ pub async fn remove_node_tunnel(
     if node_tunnels.remove(&name).is_some() {
         tracing::info!(tunnel_name = %name, "Removed node tunnel");
         Ok(Json(SuccessResponse {
-            message: format!("Node tunnel '{}' removed successfully", name),
+            message: format!("Node tunnel '{name}' removed successfully"),
         }))
     } else {
         Err(ApiError::NotFound(format!(
-            "Node tunnel '{}' not found",
-            name
+            "Node tunnel '{name}' not found"
         )))
     }
 }

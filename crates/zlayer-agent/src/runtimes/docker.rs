@@ -49,13 +49,13 @@ impl DockerRuntime {
     /// - The ping to verify connectivity fails
     pub async fn new() -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()
-            .map_err(|e| AgentError::Internal(format!("Failed to connect to Docker: {}", e)))?;
+            .map_err(|e| AgentError::Internal(format!("Failed to connect to Docker: {e}")))?;
 
         // Verify connection by pinging the daemon
         docker
             .ping()
             .await
-            .map_err(|e| AgentError::Internal(format!("Docker ping failed: {}", e)))?;
+            .map_err(|e| AgentError::Internal(format!("Docker ping failed: {e}")))?;
 
         tracing::info!("Connected to Docker daemon");
         Ok(Self { docker })
@@ -66,12 +66,13 @@ impl DockerRuntime {
     /// # Arguments
     ///
     /// * `docker` - A pre-configured bollard Docker client
+    #[must_use]
     pub fn with_client(docker: Docker) -> Self {
         Self { docker }
     }
 }
 
-/// Generate a container name from a ContainerId
+/// Generate a container name from a `ContainerId`
 fn container_name(id: &ContainerId) -> String {
     format!("zlayer-{}-{}", id.service, id.replica)
 }
@@ -159,7 +160,7 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
                 // NVIDIA Container Toolkit handles this via device_requests
                 device_requests = Some(vec![DeviceRequest {
                     driver: Some("nvidia".into()),
-                    count: Some(gpu.count as i64),
+                    count: Some(i64::from(gpu.count)),
                     capabilities: Some(vec![vec!["gpu".into()]]),
                     ..Default::default()
                 }]);
@@ -178,7 +179,7 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
                         path_in_container: Some(render_path),
                         cgroup_permissions: Some("rwm".into()),
                     });
-                    let card_path = format!("/dev/dri/card{}", i);
+                    let card_path = format!("/dev/dri/card{i}");
                     devices.push(DeviceMapping {
                         path_on_host: Some(card_path.clone()),
                         path_in_container: Some(card_path),
@@ -195,7 +196,7 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
                         path_in_container: Some(render_path),
                         cgroup_permissions: Some("rwm".into()),
                     });
-                    let card_path = format!("/dev/dri/card{}", i);
+                    let card_path = format!("/dev/dri/card{i}");
                     devices.push(DeviceMapping {
                         path_on_host: Some(card_path.clone()),
                         path_in_container: Some(card_path),
@@ -278,7 +279,7 @@ fn parse_memory(memory: &str) -> Option<i64> {
 
 #[async_trait::async_trait]
 impl Runtime for DockerRuntime {
-    /// Pull an image to local storage with default policy (IfNotPresent)
+    /// Pull an image to local storage with default policy (`IfNotPresent`)
     #[instrument(
         skip(self),
         fields(
@@ -393,20 +394,13 @@ impl Runtime for DockerRuntime {
                 )
                 .await
                 .map_err(|e| {
-                    AgentError::Internal(format!(
-                        "failed to remove stale container {}: {}",
-                        name, e
-                    ))
+                    AgentError::Internal(format!("failed to remove stale container {name}: {e}"))
                 })?;
             tracing::info!(container = %name, "stale container removed");
         }
 
         // Build environment variables
-        let env: Vec<String> = spec
-            .env
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect();
+        let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         // Build exposed ports
         let exposed_ports = build_exposed_ports(spec);
@@ -504,7 +498,7 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to stop container: {}", e),
+                reason: format!("failed to stop container: {e}"),
             })?;
 
         tracing::info!(container = %name, "container stopped successfully");
@@ -535,7 +529,7 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to remove container: {}", e),
+                reason: format!("failed to remove container: {e}"),
             })?;
 
         tracing::info!(container = %name, "container removed successfully");
@@ -560,12 +554,12 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to inspect container: {}", e),
+                reason: format!("failed to inspect container: {e}"),
             })?;
 
         // Extract the state from the inspection result
         let state = inspect.state.ok_or_else(|| {
-            AgentError::Internal(format!("Container {} has no state information", name))
+            AgentError::Internal(format!("Container {name} has no state information"))
         })?;
 
         // Map Docker state to our ContainerState enum
@@ -628,7 +622,7 @@ impl Runtime for DockerRuntime {
                 Err(e) => {
                     return Err(AgentError::NotFound {
                         container: name.clone(),
-                        reason: format!("failed to get logs: {}", e),
+                        reason: format!("failed to get logs: {e}"),
                     });
                 }
             }
@@ -640,7 +634,7 @@ impl Runtime for DockerRuntime {
 
     /// Execute a command inside a container
     ///
-    /// Returns a tuple of (exit_code, stdout, stderr)
+    /// Returns a tuple of (`exit_code`, stdout, stderr)
     #[instrument(
         skip(self, cmd),
         fields(
@@ -667,7 +661,7 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to create exec: {}", e),
+                reason: format!("failed to create exec: {e}"),
             })?;
 
         // Start the exec and collect output
@@ -675,7 +669,7 @@ impl Runtime for DockerRuntime {
             .docker
             .start_exec(&exec_created.id, None)
             .await
-            .map_err(|e| AgentError::Internal(format!("failed to start exec: {}", e)))?;
+            .map_err(|e| AgentError::Internal(format!("failed to start exec: {e}")))?;
 
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -708,7 +702,7 @@ impl Runtime for DockerRuntime {
             .docker
             .inspect_exec(&exec_created.id)
             .await
-            .map_err(|e| AgentError::Internal(format!("failed to inspect exec: {}", e)))?;
+            .map_err(|e| AgentError::Internal(format!("failed to inspect exec: {e}")))?;
 
         let exit_code = exec_inspect.exit_code.unwrap_or(0) as i32;
 
@@ -752,7 +746,7 @@ impl Runtime for DockerRuntime {
             })?
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to get stats: {}", e),
+                reason: format!("failed to get stats: {e}"),
             })?;
 
         // Extract CPU usage from Docker stats
@@ -823,7 +817,7 @@ impl Runtime for DockerRuntime {
             })?
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to wait for container: {}", e),
+                reason: format!("failed to wait for container: {e}"),
             })?;
 
         let exit_code = wait_response.status_code as i32;
@@ -868,7 +862,7 @@ impl Runtime for DockerRuntime {
                 Err(e) => {
                     return Err(AgentError::NotFound {
                         container: name.clone(),
-                        reason: format!("failed to get logs: {}", e),
+                        reason: format!("failed to get logs: {e}"),
                     });
                 }
             }
@@ -896,7 +890,7 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to inspect container: {}", e),
+                reason: format!("failed to inspect container: {e}"),
             })?;
 
         // Extract the PID from the state - only return it if the container is running
@@ -929,7 +923,7 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to inspect container: {}", e),
+                reason: format!("failed to inspect container: {e}"),
             })?;
 
         // Extract bridge IP from network settings

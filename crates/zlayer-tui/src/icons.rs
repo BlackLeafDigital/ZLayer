@@ -13,6 +13,7 @@ pub const ARROW_DOWN: char = '\u{2193}';
 
 pub const SPINNER_FRAMES: &[char] = &['|', '/', '-', '\\'];
 
+#[must_use]
 pub fn status_icon(done: bool, running: bool, failed: bool) -> (char, Style) {
     if failed {
         (FAILED, Style::default().fg(Color::Red))

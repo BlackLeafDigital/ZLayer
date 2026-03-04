@@ -35,6 +35,7 @@ pub struct UdpStreamService {
 
 impl UdpStreamService {
     /// Create a new UDP stream service
+    #[must_use]
     pub fn new(
         registry: Arc<StreamRegistry>,
         listen_port: u16,
@@ -48,16 +49,19 @@ impl UdpStreamService {
     }
 
     /// Get the listen port
+    #[must_use]
     pub fn port(&self) -> u16 {
         self.listen_port
     }
 
     /// Get the session timeout
+    #[must_use]
     pub fn session_timeout(&self) -> Duration {
         self.session_timeout
     }
 
     /// Get a reference to the registry
+    #[must_use]
     pub fn registry(&self) -> &Arc<StreamRegistry> {
         &self.registry
     }
@@ -148,29 +152,27 @@ impl UdpStreamService {
                 existing.backend
             } else {
                 // Create new session
-                let service = match self.registry.resolve_udp(self.listen_port) {
-                    Some(s) => s,
-                    None => {
-                        tracing::warn!(
-                            port = self.listen_port,
-                            client = %client_addr,
-                            "No service registered for UDP port"
-                        );
-                        continue;
-                    }
+                let service = if let Some(s) = self.registry.resolve_udp(self.listen_port) {
+                    s
+                } else {
+                    tracing::warn!(
+                        port = self.listen_port,
+                        client = %client_addr,
+                        "No service registered for UDP port"
+                    );
+                    continue;
                 };
 
-                let backend = match service.select_backend() {
-                    Some(b) => b,
-                    None => {
-                        tracing::warn!(
-                            port = self.listen_port,
-                            service = %service.name,
-                            client = %client_addr,
-                            "No backends available for UDP service"
-                        );
-                        continue;
-                    }
+                let backend = if let Some(b) = service.select_backend() {
+                    b
+                } else {
+                    tracing::warn!(
+                        port = self.listen_port,
+                        service = %service.name,
+                        client = %client_addr,
+                        "No backends available for UDP service"
+                    );
+                    continue;
                 };
 
                 // Create dedicated socket for this session's backend communication

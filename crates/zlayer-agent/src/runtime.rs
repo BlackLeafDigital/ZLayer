@@ -144,6 +144,17 @@ pub trait Runtime: Send + Sync {
     async fn get_container_port_override(&self, _id: &ContainerId) -> Result<Option<u16>> {
         Ok(None)
     }
+
+    /// Sync all named volumes associated with this container to S3.
+    ///
+    /// Called after a container is stopped but before it is removed, giving
+    /// the runtime a chance to flush persistent volume data to remote storage.
+    ///
+    /// The default implementation is a no-op. Runtimes that support S3-backed
+    /// volume sync (e.g., Youki with the `s3` feature) override this.
+    async fn sync_container_volumes(&self, _id: &ContainerId) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// In-memory mock runtime for testing and development
@@ -152,6 +163,7 @@ pub struct MockRuntime {
 }
 
 impl MockRuntime {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             containers: tokio::sync::RwLock::new(std::collections::HashMap::new()),
@@ -230,11 +242,11 @@ impl Runtime for MockRuntime {
     }
 
     async fn container_logs(&self, id: &ContainerId, _tail: usize) -> Result<String> {
-        Ok(format!("Mock logs for {}", id))
+        Ok(format!("Mock logs for {id}"))
     }
 
     async fn exec(&self, _id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)> {
-        Ok((0, cmd.join(" "), "".to_string()))
+        Ok((0, cmd.join(" "), String::new()))
     }
 
     async fn get_container_stats(&self, id: &ContainerId) -> Result<ContainerStats> {
@@ -348,7 +360,7 @@ mod tests {
 
     fn mock_spec() -> ServiceSpec {
         use zlayer_spec::*;
-        serde_yaml::from_str::<DeploymentSpec>(
+        serde_yml::from_str::<DeploymentSpec>(
             r#"
 version: v1
 deployment: test

@@ -34,12 +34,11 @@ impl std::fmt::Display for DependencyError {
             DependencyError::MissingService { service, missing } => {
                 write!(
                     f,
-                    "Service '{}' depends on non-existent service '{}'",
-                    service, missing
+                    "Service '{service}' depends on non-existent service '{missing}'"
                 )
             }
             DependencyError::SelfDependency { service } => {
-                write!(f, "Service '{}' has a self-dependency", service)
+                write!(f, "Service '{service}' has a self-dependency")
             }
         }
     }
@@ -164,6 +163,7 @@ impl DependencyGraph {
     /// - Black (2): Completely visited
     ///
     /// Returns the cycle path if found, None otherwise
+    #[must_use]
     pub fn detect_cycle(&self) -> Option<Vec<String>> {
         let mut color: HashMap<&String, u8> = HashMap::new();
         let mut parent: HashMap<&String, Option<&String>> = HashMap::new();
@@ -239,6 +239,7 @@ impl DependencyGraph {
     ///
     /// Services with no dependencies come first (they can start immediately).
     /// Returns services in order they should be started.
+    #[must_use]
     pub fn topological_order(&self) -> Vec<String> {
         self.startup_order.clone()
     }
@@ -251,7 +252,7 @@ impl DependencyGraph {
 
         // Calculate in-degrees (number of dependencies)
         for name in self.nodes.keys() {
-            let degree = self.adjacency.get(name).map(|deps| deps.len()).unwrap_or(0);
+            let degree = self.adjacency.get(name).map_or(0, std::vec::Vec::len);
             in_degree.insert(name, degree);
             if degree == 0 {
                 queue.push_back(name);
@@ -286,26 +287,31 @@ impl DependencyGraph {
     }
 
     /// Get the startup order (services with no deps first)
+    #[must_use]
     pub fn startup_order(&self) -> &[String] {
         &self.startup_order
     }
 
     /// Get dependencies for a specific service
+    #[must_use]
     pub fn dependencies(&self, service: &str) -> Option<&[DependsSpec]> {
         self.nodes.get(service).map(|n| n.depends_on.as_slice())
     }
 
     /// Get the number of services in the graph
+    #[must_use]
     pub fn len(&self) -> usize {
         self.nodes.len()
     }
 
     /// Check if the graph is empty
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
 
     /// Check if service A depends on service B (directly or transitively)
+    #[must_use]
     pub fn depends_on(&self, a: &str, b: &str) -> bool {
         if a == b {
             return false;
@@ -336,6 +342,7 @@ impl DependencyGraph {
     }
 
     /// Get services that directly depend on the given service
+    #[must_use]
     pub fn dependents(&self, service: &str) -> Vec<String> {
         self.reverse_adjacency
             .get(service)
@@ -434,37 +441,34 @@ impl DependencyConditionChecker {
     ///
     /// Falls back to healthy check if no service registry is configured.
     pub async fn check_ready(&self, service: &str) -> Result<bool> {
-        match &self.service_registry {
-            Some(registry) => {
-                // Check if service has registered routes with healthy backends
-                // We need to check if the service is registered and has backends
-                let services = registry.list_services().await;
-                if !services.contains(&service.to_string()) {
-                    return Ok(false);
-                }
+        if let Some(registry) = &self.service_registry {
+            // Check if service has registered routes with healthy backends
+            // We need to check if the service is registered and has backends
+            let services = registry.list_services().await;
+            if !services.contains(&service.to_string()) {
+                return Ok(false);
+            }
 
-                // Try to resolve a route for this service
-                // Use a generic host pattern that should match
-                let host = format!("{}.default", service);
-                match registry.resolve(Some(&host), "/").await {
-                    Some(resolved) => {
-                        // Service is registered, check if it has backends
-                        Ok(!resolved.backends.is_empty())
-                    }
-                    None => {
-                        // Service not found in routes, not ready
-                        Ok(false)
-                    }
+            // Try to resolve a route for this service
+            // Use a generic host pattern that should match
+            let host = format!("{service}.default");
+            match registry.resolve(Some(&host), "/").await {
+                Some(resolved) => {
+                    // Service is registered, check if it has backends
+                    Ok(!resolved.backends.is_empty())
+                }
+                None => {
+                    // Service not found in routes, not ready
+                    Ok(false)
                 }
             }
-            None => {
-                // No proxy configured, fall back to healthy check with warning
-                tracing::warn!(
-                    service = %service,
-                    "No proxy configured for 'ready' condition check, falling back to 'healthy'"
-                );
-                self.check_healthy(service).await
-            }
+        } else {
+            // No proxy configured, fall back to healthy check with warning
+            tracing::warn!(
+                service = %service,
+                "No proxy configured for 'ready' condition check, falling back to 'healthy'"
+            );
+            self.check_healthy(service).await
         }
     }
 }
@@ -493,11 +497,13 @@ pub enum WaitResult {
 
 impl WaitResult {
     /// Returns true if the wait was successful (condition satisfied)
+    #[must_use]
     pub fn is_satisfied(&self) -> bool {
         matches!(self, WaitResult::Satisfied)
     }
 
     /// Returns true if the wait timed out but should continue
+    #[must_use]
     pub fn should_continue(&self) -> bool {
         matches!(
             self,
@@ -506,6 +512,7 @@ impl WaitResult {
     }
 
     /// Returns true if the wait failed and should not continue
+    #[must_use]
     pub fn is_failure(&self) -> bool {
         matches!(self, WaitResult::TimedOutFail { .. })
     }
@@ -524,6 +531,7 @@ pub struct DependencyWaiter {
 
 impl DependencyWaiter {
     /// Create a new dependency waiter with default poll interval (1 second)
+    #[must_use]
     pub fn new(condition_checker: DependencyConditionChecker) -> Self {
         Self {
             condition_checker,
@@ -532,12 +540,14 @@ impl DependencyWaiter {
     }
 
     /// Set the polling interval
+    #[must_use]
     pub fn with_poll_interval(mut self, interval: Duration) -> Self {
         self.poll_interval = interval;
         self
     }
 
     /// Get the polling interval
+    #[must_use]
     pub fn poll_interval(&self) -> Duration {
         self.poll_interval
     }
@@ -549,9 +559,9 @@ impl DependencyWaiter {
     ///
     /// # Returns
     /// * `WaitResult::Satisfied` if the condition was met
-    /// * `WaitResult::TimedOutContinue` if timed out with on_timeout: continue
-    /// * `WaitResult::TimedOutWarn` if timed out with on_timeout: warn
-    /// * `WaitResult::TimedOutFail` if timed out with on_timeout: fail
+    /// * `WaitResult::TimedOutContinue` if timed out with `on_timeout`: continue
+    /// * `WaitResult::TimedOutWarn` if timed out with `on_timeout`: warn
+    /// * `WaitResult::TimedOutFail` if timed out with `on_timeout`: fail
     pub async fn wait_for_dependency(&self, dep: &DependsSpec) -> Result<WaitResult> {
         let timeout = dep.timeout.unwrap_or(Duration::from_secs(300)); // Default 5 minutes
         let start = std::time::Instant::now();
@@ -604,7 +614,7 @@ impl DependencyWaiter {
         }
     }
 
-    /// Handle timeout based on the on_timeout action
+    /// Handle timeout based on the `on_timeout` action
     fn handle_timeout(&self, dep: &DependsSpec, timeout: Duration) -> WaitResult {
         match dep.on_timeout {
             TimeoutAction::Fail => {
@@ -647,7 +657,7 @@ impl DependencyWaiter {
     /// Wait for all dependencies to be satisfied
     ///
     /// Waits for each dependency in order. Returns early on first failure
-    /// (if on_timeout: fail).
+    /// (if `on_timeout`: fail).
     ///
     /// # Arguments
     /// * `deps` - Slice of dependency specifications to wait for
@@ -696,7 +706,7 @@ services:
         protocol: http
         port: 8080
 "#;
-        let mut spec = serde_yaml::from_str::<DeploymentSpec>(yaml)
+        let mut spec = serde_yml::from_str::<DeploymentSpec>(yaml)
             .unwrap()
             .services
             .remove("test")

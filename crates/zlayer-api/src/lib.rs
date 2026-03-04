@@ -1,9 +1,9 @@
-//! ZLayer API - REST API for container orchestration
+//! `ZLayer` API - REST API for container orchestration
 //!
 //! Provides:
 //! - JWT authentication
-//! - RESTful endpoints for deployments and services
-//! - OpenAPI documentation with Swagger UI
+//! - `RESTful` endpoints for deployments and services
+//! - `OpenAPI` documentation with Swagger UI
 //! - Rate limiting
 //!
 //! # Quick Start
@@ -42,7 +42,7 @@ pub use router::{
     build_router_with_builds, build_router_with_deployment_state, build_router_with_internal,
     build_router_with_internal_and_secrets, build_router_with_jobs, build_router_with_secrets,
     build_router_with_services, build_router_with_services_and_secrets, build_router_with_storage,
-    build_router_with_tunnels, build_secrets_routes, build_tunnel_routes,
+    build_router_with_tunnels, build_secrets_routes, build_storage_routes, build_tunnel_routes,
 };
 pub use server::ApiServer;
 
@@ -54,11 +54,13 @@ pub use handlers::cluster::{
 pub use handlers::cron::CronState;
 pub use handlers::deployments::{DeploymentState, ServiceHealthInfo};
 pub use handlers::internal::{
-    InternalScaleRequest, InternalScaleResponse, InternalState, INTERNAL_AUTH_HEADER,
+    InternalAddPeerRequest, InternalAddPeerResponse, InternalScaleRequest, InternalScaleResponse,
+    InternalState, INTERNAL_AUTH_HEADER,
 };
 pub use handlers::jobs::JobState;
 pub use handlers::secrets::{CreateSecretRequest, SecretMetadataResponse, SecretsState};
 pub use handlers::services::ServiceState;
+pub use handlers::storage::{ReplicationInfo, StorageState, StorageStatusResponse};
 pub use handlers::tunnels::{
     CreateNodeTunnelRequest, CreateNodeTunnelResponse, CreateTunnelRequest, CreateTunnelResponse,
     TunnelApiState, TunnelStatus, TunnelSummary,

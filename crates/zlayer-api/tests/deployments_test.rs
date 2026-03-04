@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tower::ServiceExt;
 
+use secrecy::{ExposeSecret, SecretString};
 use zlayer_api::{
     build_router_with_storage, create_token, storage::InMemoryStorage, ApiConfig,
     DeploymentStorage, StoredDeployment,
@@ -26,7 +27,7 @@ use zlayer_api::{
 fn test_config() -> ApiConfig {
     ApiConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
-        jwt_secret: "test-secret-for-deployments-tests".to_string(),
+        jwt_secret: SecretString::from("test-secret-for-deployments-tests".to_string()),
         swagger_enabled: false,
         ..Default::default()
     }
@@ -35,7 +36,7 @@ fn test_config() -> ApiConfig {
 /// Create a valid JWT token for testing
 fn create_test_token(config: &ApiConfig) -> String {
     create_token(
-        &config.jwt_secret,
+        config.jwt_secret.expose_secret(),
         "test-user",
         std::time::Duration::from_secs(3600),
         vec!["admin".to_string()],

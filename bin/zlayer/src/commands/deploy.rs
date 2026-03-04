@@ -33,9 +33,9 @@ fn emit(tx: &mpsc::Sender<DeployEvent>, event: DeployEvent) {
 /// Build a `ServicePlan` from a spec entry for the `PlanReady` event
 fn build_service_plan(name: &str, service: &zlayer_spec::ServiceSpec) -> ServicePlan {
     let scale_mode = match &service.scale {
-        zlayer_spec::ScaleSpec::Fixed { replicas } => format!("fixed({})", replicas),
+        zlayer_spec::ScaleSpec::Fixed { replicas } => format!("fixed({replicas})"),
         zlayer_spec::ScaleSpec::Adaptive { min, max, .. } => {
-            format!("adaptive({}-{})", min, max)
+            format!("adaptive({min}-{max})")
         }
         zlayer_spec::ScaleSpec::Manual => "manual".to_string(),
     };
@@ -187,8 +187,7 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                         DeployEvent::Log {
                             level: LogLevel::Info,
                             message: format!(
-                                "Deployment '{}': {} -> {}",
-                                deployment_name, last_status, current_status
+                                "Deployment '{deployment_name}': {last_status} -> {current_status}"
                             ),
                         },
                     );
@@ -210,11 +209,11 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                 .filter(|s| {
                                     let running = s
                                         .get("replicas_running")
-                                        .and_then(|v| v.as_u64())
+                                        .and_then(serde_json::Value::as_u64)
                                         .unwrap_or(0);
                                     let desired = s
                                         .get("replicas_desired")
-                                        .and_then(|v| v.as_u64())
+                                        .and_then(serde_json::Value::as_u64)
                                         .unwrap_or(0);
                                     running >= desired
                                 })
@@ -226,8 +225,7 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                         // Print enhanced success output
                         println!();
                         println!(
-                            "Deployment '{}' ready ({}/{} services healthy):",
-                            deployment_name, healthy_count, total_services
+                            "Deployment '{deployment_name}' ready ({healthy_count}/{total_services} services healthy):"
                         );
 
                         if let Some(health_arr) = service_health {
@@ -235,11 +233,11 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                 let name = svc.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                                 let running = svc
                                     .get("replicas_running")
-                                    .and_then(|v| v.as_u64())
+                                    .and_then(serde_json::Value::as_u64)
                                     .unwrap_or(0);
                                 let desired = svc
                                     .get("replicas_desired")
-                                    .and_then(|v| v.as_u64())
+                                    .and_then(serde_json::Value::as_u64)
                                     .unwrap_or(0);
                                 let endpoints = svc
                                     .get("endpoints")
@@ -253,11 +251,10 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                     .unwrap_or_default();
 
                                 if endpoints.is_empty() {
-                                    println!("  {}: {}/{} replicas", name, running, desired);
+                                    println!("  {name}: {running}/{desired} replicas");
                                 } else {
                                     println!(
-                                        "  {}: {} ({}/{} replicas)",
-                                        name, endpoints, running, desired
+                                        "  {name}: {endpoints} ({running}/{desired} replicas)"
                                     );
                                 }
                             }
@@ -281,7 +278,7 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                     })
                                     .collect();
                                 if endpoints.is_empty() {
-                                    println!("  {}: {}/{} replicas", name, replicas, replicas);
+                                    println!("  {name}: {replicas}/{replicas} replicas");
                                 } else {
                                     println!(
                                         "  {}: {} ({}/{} replicas)",
@@ -332,7 +329,7 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                     s if s.starts_with("failed") || s == "error" => {
                         // Print enhanced failure output
                         eprintln!();
-                        eprintln!("Deployment '{}' failed:", deployment_name);
+                        eprintln!("Deployment '{deployment_name}' failed:");
 
                         if let Some(health_arr) =
                             deployment.get("service_health").and_then(|v| v.as_array())
@@ -341,19 +338,18 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                 let name = svc.get("name").and_then(|v| v.as_str()).unwrap_or("?");
                                 let running = svc
                                     .get("replicas_running")
-                                    .and_then(|v| v.as_u64())
+                                    .and_then(serde_json::Value::as_u64)
                                     .unwrap_or(0);
                                 let desired = svc
                                     .get("replicas_desired")
-                                    .and_then(|v| v.as_u64())
+                                    .and_then(serde_json::Value::as_u64)
                                     .unwrap_or(0);
                                 let health = svc
                                     .get("health")
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("unknown");
                                 eprintln!(
-                                    "  {}: {}/{} replicas ready ({})",
-                                    name, running, desired, health
+                                    "  {name}: {running}/{desired} replicas ready ({health})"
                                 );
                             }
                         } else {
@@ -364,14 +360,14 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                     zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
                                     zlayer_spec::ScaleSpec::Manual => 0,
                                 };
-                                eprintln!("  {}: 0/{} replicas ready", name, desired);
+                                eprintln!("  {name}: 0/{desired} replicas ready");
                             }
                         }
                         eprintln!(
                             "Use 'zlayer logs SERVICE' for full logs, 'zlayer down' to clean up"
                         );
 
-                        anyhow::bail!("Deployment '{}' failed", deployment_name,);
+                        anyhow::bail!("Deployment '{deployment_name}' failed",);
                     }
                     _ => {
                         // Still in progress -- keep polling
@@ -430,17 +426,16 @@ pub(crate) async fn up(cli: &Cli, spec_path: &Path) -> Result<()> {
 /// container teardown, overlay cleanup, and state removal.
 pub(crate) async fn down(deployment: Option<String>) -> Result<()> {
     // Resolve deployment name from spec if not provided explicitly
-    let deployment_name = match deployment {
-        Some(name) => name,
-        None => {
-            let spec_path = discover_spec_path(None)?;
-            let spec = parse_spec(&spec_path)?;
-            spec.deployment.clone()
-        }
+    let deployment_name = if let Some(name) = deployment {
+        name
+    } else {
+        let spec_path = discover_spec_path(None)?;
+        let spec = parse_spec(&spec_path)?;
+        spec.deployment.clone()
     };
 
     info!(deployment = %deployment_name, "Requesting deployment teardown");
-    println!("Tearing down deployment: {}...", deployment_name);
+    println!("Tearing down deployment: {deployment_name}...");
 
     // Connect to daemon
     let client = DaemonClient::connect().await?;
@@ -448,9 +443,9 @@ pub(crate) async fn down(deployment: Option<String>) -> Result<()> {
     client
         .delete_deployment(&deployment_name)
         .await
-        .with_context(|| format!("Failed to delete deployment '{}'", deployment_name))?;
+        .with_context(|| format!("Failed to delete deployment '{deployment_name}'"))?;
 
-    println!("Deployment '{}' stopped.", deployment_name);
+    println!("Deployment '{deployment_name}' stopped.");
     Ok(())
 }
 
@@ -500,8 +495,7 @@ async fn wait_for_ctrl_c_or_status(
                             emit(tx, DeployEvent::Log {
                                 level: LogLevel::Warn,
                                 message: format!(
-                                    "Deployment '{}' is now '{}'. Exiting watch.",
-                                    deployment_name, current_status
+                                    "Deployment '{deployment_name}' is now '{current_status}'. Exiting watch."
                                 ),
                             });
                             break;
@@ -516,8 +510,8 @@ async fn wait_for_ctrl_c_or_status(
                                 .iter()
                                 .map(|svc| {
                                     let name = svc.get("name").and_then(|v| v.as_str()).unwrap_or("?").to_string();
-                                    let running = svc.get("replicas_running").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-                                    let desired = svc.get("replicas_desired").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                                    let running = svc.get("replicas_running").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
+                                    let desired = svc.get("replicas_desired").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
                                     let health_str = svc.get("health").and_then(|v| v.as_str()).unwrap_or("unknown");
                                     let health = match health_str {
                                         "healthy" => ServiceHealth::Healthy,

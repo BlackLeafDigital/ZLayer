@@ -30,6 +30,7 @@ pub struct SystemResources {
 /// Detect system resources on the local machine.
 ///
 /// `data_dir` is the directory whose filesystem is measured for disk capacity.
+#[must_use]
 pub fn detect_system_resources(data_dir: &Path) -> SystemResources {
     SystemResources {
         cpu_total: detect_cpu_total(),
@@ -42,6 +43,7 @@ pub fn detect_system_resources(data_dir: &Path) -> SystemResources {
 }
 
 /// Detect current resource usage (for heartbeat updates).
+#[must_use]
 pub fn detect_current_usage(data_dir: &Path) -> ResourceUsage {
     ResourceUsage {
         cpu_used: detect_cpu_used(),
