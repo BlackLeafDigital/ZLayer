@@ -25,6 +25,7 @@ use tracing::{debug, info};
 ///
 /// On macOS: `~/.local/share/zlayer/run/zlayer.sock`.
 /// On Linux: `/var/run/zlayer.sock`.
+#[must_use]
 pub fn default_socket_path() -> String {
     crate::cli::default_socket_path(&crate::cli::default_data_dir())
 }
@@ -83,6 +84,7 @@ pub struct DaemonClient {
     socket_path: PathBuf,
 }
 
+#[allow(clippy::missing_errors_doc)]
 impl DaemonClient {
     // ------------------------------------------------------------------
     // Construction / connection
@@ -252,7 +254,7 @@ impl DaemonClient {
         let log_dir = crate::cli::default_log_dir(&crate::cli::default_data_dir());
         let log_path = log_dir.join("daemon.log");
         let timeout_secs = 10;
-        eprintln!("Failed to start ZLayer daemon after {}s.", timeout_secs);
+        eprintln!("Failed to start ZLayer daemon after {timeout_secs}s.");
         eprintln!("  Check logs: {}", log_path.display());
         eprintln!("  Start manually: zlayer serve");
         bail!(
@@ -383,10 +385,7 @@ impl DaemonClient {
         };
 
         match status.as_u16() {
-            404 => bail!(
-                "404 Not Found: {}. Check deployment name with 'zlayer ps'.",
-                msg
-            ),
+            404 => bail!("404 Not Found: {msg}. Check deployment name with 'zlayer ps'."),
             500 => {
                 let log_dir = crate::cli::default_log_dir(&crate::cli::default_data_dir());
                 let log_path = log_dir.join("daemon.log");
@@ -396,7 +395,7 @@ impl DaemonClient {
                     log_path.display()
                 )
             }
-            _ => bail!("Daemon returned {} -- {}", status, msg),
+            _ => bail!("Daemon returned {status} -- {msg}"),
         }
     }
 
@@ -544,7 +543,8 @@ impl DaemonClient {
             follow,
         );
         if let Some(inst) = instance {
-            path.push_str(&format!("&instance={}", urlencoding(inst)));
+            use std::fmt::Write;
+            let _ = write!(path, "&instance={}", urlencoding(inst));
         }
         let (status, body) = self.get(&path).await?;
         Self::check_status(status, &body)?;
@@ -573,7 +573,8 @@ impl DaemonClient {
             lines,
         );
         if let Some(inst) = instance {
-            path.push_str(&format!("&instance={}", urlencoding(inst)));
+            use std::fmt::Write;
+            let _ = write!(path, "&instance={}", urlencoding(inst));
         }
 
         let uri: Uri = format!("http://localhost{path}")
@@ -732,6 +733,7 @@ impl DaemonClient {
     }
 
     /// Get the socket path this client is connected to.
+    #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
     }
@@ -754,8 +756,8 @@ fn urlencoding(s: &str) -> String {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(ch),
             _ => {
                 for byte in ch.to_string().as_bytes() {
-                    out.push('%');
-                    out.push_str(&format!("{byte:02X}"));
+                    use std::fmt::Write;
+                    let _ = write!(out, "%{byte:02X}");
                 }
             }
         }

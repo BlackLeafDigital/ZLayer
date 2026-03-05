@@ -15,6 +15,8 @@ pub struct WaitTcp {
 }
 
 impl WaitTcp {
+    /// # Errors
+    /// Returns `InitError::TcpFailed` if the connection times out.
     pub async fn execute(&self) -> Result<()> {
         let start = std::time::Instant::now();
 
@@ -48,6 +50,8 @@ pub struct WaitHttp {
 }
 
 impl WaitHttp {
+    /// # Errors
+    /// Returns `InitError::HttpFailed` if the request times out or the expected status is not received.
     pub async fn execute(&self) -> Result<()> {
         let start = std::time::Instant::now();
         let client = reqwest::Client::builder()
@@ -55,7 +59,7 @@ impl WaitHttp {
             .build()
             .map_err(|e| InitError::HttpFailed {
                 url: self.url.clone(),
-                reason: format!("failed to create client: {}", e),
+                reason: format!("failed to create client: {e}"),
             })?;
 
         loop {
@@ -92,6 +96,8 @@ pub struct RunCommand {
 }
 
 impl RunCommand {
+    /// # Errors
+    /// Returns an error if the command fails, exits non-zero, or times out.
     pub async fn execute(&self) -> Result<()> {
         match timeout(
             self.timeout,
@@ -143,6 +149,12 @@ pub struct S3Push {
 
 #[cfg(feature = "s3")]
 impl S3Push {
+    /// Execute the S3 push action, uploading files to the configured bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the AWS SDK configuration fails, the S3 client
+    /// cannot be created, or any file upload fails.
     pub async fn execute(&self) -> Result<()> {
         use aws_sdk_s3::Client;
 
@@ -201,7 +213,7 @@ impl S3Push {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: key.to_string(),
-                reason: format!("failed to read file: {}", e),
+                reason: format!("failed to read file: {e}"),
             })?;
 
         tokio::time::timeout(
@@ -221,7 +233,7 @@ impl S3Push {
         .map_err(|e| InitError::S3Failed {
             bucket: self.bucket.clone(),
             key: key.to_string(),
-            reason: format!("put_object failed: {}", e),
+            reason: format!("put_object failed: {e}"),
         })?;
 
         tracing::info!(bucket = %self.bucket, key = %key, "S3 push complete");
@@ -240,7 +252,7 @@ impl S3Push {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: prefix.to_string(),
-                reason: format!("failed to read directory: {}", e),
+                reason: format!("failed to read directory: {e}"),
             })?;
 
         while let Some(entry) = entries
@@ -249,7 +261,7 @@ impl S3Push {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: prefix.to_string(),
-                reason: format!("failed to read directory entry: {}", e),
+                reason: format!("failed to read directory entry: {e}"),
             })?
         {
             let path = entry.path();
@@ -291,6 +303,12 @@ pub struct S3Pull {
 
 #[cfg(feature = "s3")]
 impl S3Pull {
+    /// Execute the S3 pull action, downloading files from the configured bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the AWS SDK configuration fails, the S3 client
+    /// cannot be created, or any file download fails.
     pub async fn execute(&self) -> Result<()> {
         use aws_sdk_s3::Client;
         use tokio::io::AsyncWriteExt;
@@ -332,7 +350,7 @@ impl S3Pull {
         .map_err(|e| InitError::S3Failed {
             bucket: self.bucket.clone(),
             key: self.key.clone(),
-            reason: format!("get_object failed: {}", e),
+            reason: format!("get_object failed: {e}"),
         })?;
 
         // Read body
@@ -343,7 +361,7 @@ impl S3Pull {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: self.key.clone(),
-                reason: format!("failed to read body: {}", e),
+                reason: format!("failed to read body: {e}"),
             })?
             .into_bytes();
 
@@ -355,7 +373,7 @@ impl S3Pull {
                 .map_err(|e| InitError::S3Failed {
                     bucket: self.bucket.clone(),
                     key: self.key.clone(),
-                    reason: format!("failed to create destination directory: {}", e),
+                    reason: format!("failed to create destination directory: {e}"),
                 })?;
         }
 
@@ -364,7 +382,7 @@ impl S3Pull {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: self.key.clone(),
-                reason: format!("failed to create file: {}", e),
+                reason: format!("failed to create file: {e}"),
             })?;
 
         file.write_all(&data)
@@ -372,7 +390,7 @@ impl S3Pull {
             .map_err(|e| InitError::S3Failed {
                 bucket: self.bucket.clone(),
                 key: self.key.clone(),
-                reason: format!("failed to write file: {}", e),
+                reason: format!("failed to write file: {e}"),
             })?;
 
         tracing::info!(
@@ -387,6 +405,11 @@ impl S3Pull {
 }
 
 /// Create an init action from the spec
+///
+/// # Errors
+/// Returns `InitError::InvalidParams` if required parameters are missing or invalid,
+/// or `InitError::UnknownAction` if the action type is not recognized.
+#[allow(clippy::too_many_lines, clippy::implicit_hasher)]
 pub fn from_spec(
     action: &str,
     params: &HashMap<String, serde_json::Value>,
@@ -403,14 +426,19 @@ pub fn from_spec(
                 })?
                 .to_string();
 
-            let port = params.get("port").and_then(|v| v.as_u64()).ok_or_else(|| {
-                InitError::InvalidParams {
+            #[allow(clippy::cast_possible_truncation)]
+            let port = params
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .ok_or_else(|| InitError::InvalidParams {
                     action: action.to_string(),
                     reason: "missing or invalid 'port' parameter".to_string(),
-                }
-            })? as u16;
+                })? as u16;
 
-            let timeout_secs = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+            let timeout_secs = params
+                .get("timeout")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(30);
 
             Ok(InitAction::WaitTcp(WaitTcp {
                 host,
@@ -430,12 +458,16 @@ pub fn from_spec(
                 })?
                 .to_string();
 
+            #[allow(clippy::cast_possible_truncation)]
             let expect_status = params
                 .get("expect_status")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .map(|v| v as u16);
 
-            let timeout_secs = params.get("timeout").and_then(|v| v.as_u64()).unwrap_or(30);
+            let timeout_secs = params
+                .get("timeout")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(30);
 
             Ok(InitAction::WaitHttp(WaitHttp {
                 url,
@@ -457,7 +489,7 @@ pub fn from_spec(
 
             let timeout_secs = params
                 .get("timeout")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(300);
 
             Ok(InitAction::Run(RunCommand {
@@ -505,7 +537,7 @@ pub fn from_spec(
                 .map(String::from);
             let timeout_secs = params
                 .get("timeout")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(300);
 
             Ok(InitAction::S3Push(S3Push {
@@ -557,7 +589,7 @@ pub fn from_spec(
                 .map(String::from);
             let timeout_secs = params
                 .get("timeout")
-                .and_then(|v| v.as_u64())
+                .and_then(serde_json::Value::as_u64)
                 .unwrap_or(300);
 
             Ok(InitAction::S3Pull(S3Pull {
@@ -586,6 +618,8 @@ pub enum InitAction {
 }
 
 impl InitAction {
+    /// # Errors
+    /// Returns an error if the underlying action fails.
     pub async fn execute(&self) -> Result<()> {
         match self {
             InitAction::WaitTcp(a) => a.execute().await,

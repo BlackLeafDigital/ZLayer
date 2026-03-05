@@ -36,6 +36,7 @@ pub enum DeployStep {
 // ---------------------------------------------------------------------------
 
 /// Render the deploy view
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 pub fn render(frame: &mut Frame, state: &DeployState) {
     let area = frame.area();
 
@@ -82,6 +83,7 @@ pub fn render(frame: &mut Frame, state: &DeployState) {
 }
 
 /// Render step progress
+#[allow(clippy::comparison_chain, clippy::cast_possible_truncation)]
 fn render_step_indicator(area: Rect, buf: &mut Buffer, current: DeployStep) {
     let steps = [
         ("Select", DeployStep::SelectFile),
@@ -121,7 +123,7 @@ fn render_step_indicator(area: Rect, buf: &mut Buffer, current: DeployStep) {
             zlayer_tui::icons::PENDING
         };
 
-        let text = format!("{} {}", icon, label);
+        let text = format!("{icon} {label}");
         let width = text.len() as u16;
 
         if x + width < area.x + area.width {
@@ -137,6 +139,7 @@ fn render_step_indicator(area: Rect, buf: &mut Buffer, current: DeployStep) {
 }
 
 /// Step 1: Select a spec file
+#[allow(clippy::cast_possible_truncation)]
 fn render_select_file(area: Rect, frame: &mut Frame, state: &DeployState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -192,13 +195,14 @@ fn render_select_file(area: Rect, frame: &mut Frame, state: &DeployState) {
         buf.set_string(
             inner.x + 1,
             y,
-            format!("{}{}", indicator, file_name),
+            format!("{indicator}{file_name}"),
             label_style,
         );
     }
 }
 
 /// Step 2: Preview parsed spec
+#[allow(clippy::too_many_lines)]
 fn render_preview(area: Rect, buf: &mut Buffer, state: &DeployState) {
     let (title, border_color) = if state.parse_error.is_some() {
         (" Parse Error ", Color::Red)
@@ -276,9 +280,9 @@ fn render_preview(area: Rect, buf: &mut Buffer, state: &DeployState) {
 
         for (name, svc) in &spec.services {
             let replicas = match &svc.scale {
-                zlayer_spec::ScaleSpec::Fixed { replicas } => format!("{} replicas", replicas),
+                zlayer_spec::ScaleSpec::Fixed { replicas } => format!("{replicas} replicas"),
                 zlayer_spec::ScaleSpec::Adaptive { min, max, .. } => {
-                    format!("{}-{} replicas (adaptive)", min, max)
+                    format!("{min}-{max} replicas (adaptive)")
                 }
                 zlayer_spec::ScaleSpec::Manual => "manual".to_string(),
             };
@@ -306,7 +310,7 @@ fn render_preview(area: Rect, buf: &mut Buffer, state: &DeployState) {
                 Span::styled("    ", Style::default()),
                 Span::styled(&svc.image.name, Style::default().fg(Color::Yellow)),
                 Span::styled(
-                    format!(" | {}{}", replicas, endpoints_str),
+                    format!(" | {replicas}{endpoints_str}"),
                     Style::default().fg(Color::DarkGray),
                 ),
             ]));
@@ -448,13 +452,13 @@ pub fn parse_spec_file(state: &mut DeployState) {
                 state.parse_error = None;
             }
             Err(e) => {
-                state.parse_error = Some(format!("{}", e));
+                state.parse_error = Some(format!("{e}"));
                 state.parsed_spec = None;
                 state.spec_yaml = None;
             }
         },
         Err(e) => {
-            state.parse_error = Some(format!("Failed to read file: {}", e));
+            state.parse_error = Some(format!("Failed to read file: {e}"));
             state.parsed_spec = None;
             state.spec_yaml = None;
         }
@@ -463,13 +467,12 @@ pub fn parse_spec_file(state: &mut DeployState) {
 
 /// Submit the deployment to the daemon
 pub fn submit_deployment(rt: &tokio::runtime::Runtime, state: &mut DeployState) {
-    let yaml = match &state.spec_yaml {
-        Some(y) => y.clone(),
-        None => {
-            state.deploy_error = Some("No spec YAML available".to_string());
-            state.step = DeployStep::Result;
-            return;
-        }
+    let yaml = if let Some(y) = &state.spec_yaml {
+        y.clone()
+    } else {
+        state.deploy_error = Some("No spec YAML available".to_string());
+        state.step = DeployStep::Result;
+        return;
     };
 
     state.step = DeployStep::Deploying;
@@ -482,13 +485,13 @@ pub fn submit_deployment(rt: &tokio::runtime::Runtime, state: &mut DeployState) 
         .await
         {
             Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(format!("Failed to connect to daemon: {:#}", e)),
+            Ok(Err(e)) => return Err(format!("Failed to connect to daemon: {e:#}")),
             Err(_) => return Err("Connection to daemon timed out".to_string()),
         };
 
         match client.create_deployment(&yaml).await {
             Ok(_) => Ok(()),
-            Err(e) => Err(format!("{:#}", e)),
+            Err(e) => Err(format!("{e:#}")),
         }
     });
 
@@ -518,6 +521,7 @@ pub enum DeployAction {
     Dashboard,
 }
 
+#[allow(clippy::comparison_chain)]
 pub fn handle_key(
     key: KeyEvent,
     state: &mut DeployState,

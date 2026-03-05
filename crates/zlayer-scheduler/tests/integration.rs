@@ -403,7 +403,7 @@ async fn test_single_node_raft() {
     // In single-node mode, should become leader
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let is_leader = scheduler.is_leader().await;
+    let is_leader = scheduler.is_leader();
     println!("Is leader: {}", is_leader);
 
     // Cluster state should be available
@@ -454,7 +454,7 @@ async fn test_standalone_is_leader() {
     );
 
     // Standalone mode should always be leader
-    assert!(scheduler.is_leader().await);
+    assert!(scheduler.is_leader());
 
     // Cluster state should be None in standalone mode
     assert!(scheduler.cluster_state().await.is_none());

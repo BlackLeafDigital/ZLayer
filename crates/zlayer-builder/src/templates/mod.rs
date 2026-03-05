@@ -1,4 +1,4 @@
-//! Runtime templates for ZLayer builder
+//! Runtime templates for `ZLayer` builder
 //!
 //! This module provides pre-built Dockerfile templates for common runtimes,
 //! allowing users to build container images without writing Dockerfiles.
@@ -69,6 +69,7 @@ pub enum Runtime {
 
 impl Runtime {
     /// Get all available runtimes
+    #[must_use]
     pub fn all() -> &'static [RuntimeInfo] {
         &[
             RuntimeInfo {
@@ -123,6 +124,7 @@ impl Runtime {
     }
 
     /// Parse a runtime from its name
+    #[must_use]
     pub fn from_name(name: &str) -> Option<Runtime> {
         let name_lower = name.to_lowercase();
         match name_lower.as_str() {
@@ -139,6 +141,11 @@ impl Runtime {
     }
 
     /// Get information about this runtime
+    ///
+    /// # Panics
+    ///
+    /// Panics if the runtime variant is missing from the static info table (internal invariant).
+    #[must_use]
     pub fn info(&self) -> &'static RuntimeInfo {
         Runtime::all()
             .iter()
@@ -147,6 +154,7 @@ impl Runtime {
     }
 
     /// Get the Dockerfile template for this runtime
+    #[must_use]
     pub fn template(&self) -> &'static str {
         match self {
             Runtime::Node20 => include_str!("dockerfiles/node20.Dockerfile"),
@@ -161,6 +169,7 @@ impl Runtime {
     }
 
     /// Get the canonical name for this runtime
+    #[must_use]
     pub fn name(&self) -> &'static str {
         self.info().name
     }
@@ -176,7 +185,7 @@ impl FromStr for Runtime {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Runtime::from_name(s).ok_or_else(|| format!("Unknown runtime: {}", s))
+        Runtime::from_name(s).ok_or_else(|| format!("Unknown runtime: {s}"))
     }
 }
 
@@ -194,16 +203,19 @@ pub struct RuntimeInfo {
 }
 
 /// List all available templates
+#[must_use]
 pub fn list_templates() -> Vec<&'static RuntimeInfo> {
     Runtime::all().iter().collect()
 }
 
 /// Get template content for a runtime
+#[must_use]
 pub fn get_template(runtime: Runtime) -> &'static str {
     runtime.template()
 }
 
 /// Get template content by runtime name
+#[must_use]
 pub fn get_template_by_name(name: &str) -> Option<&'static str> {
     Runtime::from_name(name).map(|r| r.template())
 }

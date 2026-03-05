@@ -1,4 +1,4 @@
-//! ZLayer Agent - Container Runtime
+//! `ZLayer` Agent - Container Runtime
 //!
 //! Manages container lifecycle, health checking, init actions, and proxy integration.
 
@@ -167,6 +167,7 @@ pub async fn is_docker_available() -> bool {
 
 /// Check if Docker daemon is available (stub when docker feature is disabled)
 #[cfg(not(feature = "docker"))]
+#[allow(clippy::unused_async)]
 pub async fn is_docker_available() -> bool {
     false
 }
@@ -188,12 +189,14 @@ pub async fn is_docker_available() -> bool {
 /// }
 /// ```
 #[cfg(feature = "wasm")]
+#[must_use]
 pub fn is_wasm_available() -> bool {
     true
 }
 
 /// Check if the WASM runtime is available (stub when wasm feature is disabled)
 #[cfg(not(feature = "wasm"))]
+#[must_use]
 pub fn is_wasm_available() -> bool {
     false
 }
@@ -259,7 +262,7 @@ pub async fn create_runtime(config: RuntimeConfig) -> Result<Arc<dyn Runtime + S
 ///
 /// Selection logic:
 /// - On Linux: Uses bundled libcontainer runtime directly (no external binary needed), falls back to Docker
-/// - On macOS: SandboxRuntime (native Metal/MPS) → VmRuntime (libkrun Linux compat with GPU) → Docker
+/// - On macOS: `SandboxRuntime` (native Metal/MPS) → `VmRuntime` (libkrun Linux compat with GPU) → Docker
 /// - On Windows: Use Docker directly
 /// - Returns an error if no runtime can be initialized
 async fn create_auto_runtime() -> Result<Arc<dyn Runtime + Send + Sync>> {

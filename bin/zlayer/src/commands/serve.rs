@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -40,6 +41,12 @@ struct StaleDaemonMeta {
 /// Clean up a stale daemon process and leftover network state from a previous run.
 ///
 /// This is best-effort: all errors are logged as warnings but never prevent startup.
+#[allow(
+    unsafe_code,
+    clippy::too_many_lines,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind: &str) {
     let metadata_path = config.data_dir.join("daemon.json");
     let my_pid = std::process::id();
@@ -186,7 +193,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                                 info!("All stale zlayer processes exited");
                                 break;
                             }
-                            _ => continue,
+                            _ => {}
                         }
                     }
                 } else {
@@ -221,9 +228,8 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 // `ip -br link` format: "NAME  STATE  ..."
-                let iface = match line.split_whitespace().next() {
-                    Some(name) => name,
-                    None => continue,
+                let Some(iface) = line.split_whitespace().next() else {
+                    continue;
                 };
 
                 if iface.starts_with("veth-") || iface.starts_with("zl-") {
@@ -267,25 +273,21 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
         let bind_addr: std::net::SocketAddr = ([0, 0, 0, 0], api_port).into();
         let mut port_free = false;
         for attempt in 1..=50 {
-            match std::net::TcpListener::bind(bind_addr) {
-                Ok(_listener) => {
-                    // Listener is dropped immediately, port is free.
-                    if attempt > 1 {
-                        info!(port = api_port, attempts = attempt, "API port is now free");
-                    }
-                    port_free = true;
-                    break;
+            if let Ok(_listener) = std::net::TcpListener::bind(bind_addr) {
+                // Listener is dropped immediately, port is free.
+                if attempt > 1 {
+                    info!(port = api_port, attempts = attempt, "API port is now free");
                 }
-                Err(_) => {
-                    if attempt == 1 {
-                        warn!(
-                            port = api_port,
-                            "API port still in use, waiting for it to be released"
-                        );
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
+                port_free = true;
+                break;
             }
+            if attempt == 1 {
+                warn!(
+                    port = api_port,
+                    "API port still in use, waiting for it to be released"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         if !port_free {
             warn!(
@@ -313,6 +315,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 /// Check whether a process with the given PID is still alive.
 ///
 /// Uses `kill(pid, 0)` which checks for existence without sending a signal.
+#[allow(unsafe_code)]
 fn process_alive(pid: i32) -> bool {
     // SAFETY: signal 0 is a null signal used purely for existence checking.
     unsafe { libc::kill(pid, 0) == 0 }
@@ -325,6 +328,7 @@ fn parse_port_from_bind(bind: &str) -> Option<u16> {
 }
 
 /// Start the daemon API server with full infrastructure.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn serve(
     bind: &str,
     jwt_secret: Option<String>,
@@ -333,25 +337,40 @@ pub(crate) async fn serve(
     host_network: bool,
     data_dir: std::path::PathBuf,
 ) -> Result<()> {
-    let jwt_secret = jwt_secret.unwrap_or_else(|| {
+    let jwt_secret = SecretString::from(jwt_secret.unwrap_or_else(|| {
         warn!("Using default JWT secret - NOT SAFE FOR PRODUCTION");
         "CHANGE_ME_IN_PRODUCTION".to_string()
-    });
+    }));
 
     let bind_addr: std::net::SocketAddr = bind
         .parse()
-        .context(format!("Invalid bind address: {}", bind))?;
+        .context(format!("Invalid bind address: {bind}"))?;
 
     // -----------------------------------------------------------------------
     // 1. Create DaemonConfig
     // -----------------------------------------------------------------------
     let log_dir = crate::cli::default_log_dir(&data_dir);
     let run_dir = crate::cli::default_run_dir(&data_dir);
+    let s3_storage = std::env::var("ZLAYER_S3_BUCKET").ok().map(|bucket| {
+        let mut config = zlayer_storage::LayerStorageConfig::new(&bucket);
+        if let Ok(region) = std::env::var("ZLAYER_S3_REGION") {
+            config = config.with_region(&region);
+        }
+        if let Ok(endpoint) = std::env::var("ZLAYER_S3_ENDPOINT") {
+            config = config.with_endpoint_url(&endpoint);
+        }
+        config = config
+            .with_staging_dir(data_dir.join("layer-staging"))
+            .with_state_db_path(data_dir.join("layer-sync-state.sqlite"));
+        config
+    });
+
     let config = DaemonConfig {
         host_network,
         data_dir,
         log_dir,
         run_dir,
+        s3_storage,
         ..Default::default()
     };
 
@@ -375,6 +394,7 @@ pub(crate) async fn serve(
 
     // Destructure the state so we can rewrap the ServiceManager for the router
     // while keeping shutdown-relevant handles separate.
+    #[allow(clippy::used_underscore_binding)]
     let crate::daemon::DaemonState {
         runtime: _runtime,
         overlay,
@@ -398,6 +418,7 @@ pub(crate) async fn serve(
         dead_node_detection_handle,
         scheduler: _scheduler,
         internal_token: daemon_internal_token,
+        replicator,
     } = state;
 
     // -----------------------------------------------------------------------
@@ -424,6 +445,61 @@ pub(crate) async fn serve(
             )
         })?;
     info!(path = %metadata_path.display(), "Daemon metadata written");
+
+    // -----------------------------------------------------------------------
+    // 3b. Generate or load the cluster join secret
+    // -----------------------------------------------------------------------
+    let join_secret = {
+        let join_secret_path = config.data_dir.join("join_secret");
+        if join_secret_path.exists() {
+            match tokio::fs::read_to_string(&join_secret_path).await {
+                Ok(secret) => {
+                    let secret = secret.trim().to_string();
+                    info!(
+                        path = %join_secret_path.display(),
+                        "Loaded existing cluster join secret"
+                    );
+                    Some(secret)
+                }
+                Err(e) => {
+                    warn!(
+                        path = %join_secret_path.display(),
+                        error = %e,
+                        "Failed to load join secret, generating new one"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    let join_secret = if let Some(s) = join_secret {
+        s
+    } else {
+        // Generate a random 32-byte secret and hex-encode it
+        use rand::Rng;
+        let secret_bytes: [u8; 32] = rand::rng().random();
+        let secret = hex::encode(secret_bytes);
+
+        // Persist it so it survives restarts
+        let join_secret_path = config.data_dir.join("join_secret");
+        if let Err(e) = tokio::fs::write(&join_secret_path, &secret).await {
+            warn!(
+                path = %join_secret_path.display(),
+                error = %e,
+                "Failed to persist join secret (token validation will not work across restarts)"
+            );
+        } else {
+            info!(
+                path = %join_secret_path.display(),
+                "Generated and persisted new cluster join secret"
+            );
+        }
+
+        secret
+    };
 
     // -----------------------------------------------------------------------
     // 4. Build the full API router
@@ -473,8 +549,19 @@ pub(crate) async fn serve(
         storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
     );
 
-    // Add internal routes for scheduler-to-agent communication
-    let internal_state = zlayer_api::InternalState::new(service_manager, internal_token);
+    // Add internal routes for scheduler-to-agent communication.
+    // Include the overlay interface name so the add-peer endpoint can manage
+    // WireGuard peers on this node.
+    let overlay_interface = if config.host_network {
+        None
+    } else {
+        Some(zlayer_overlay::DEFAULT_INTERFACE_NAME.to_string())
+    };
+    let internal_state = zlayer_api::InternalState::with_overlay(
+        service_manager,
+        internal_token.clone(),
+        overlay_interface,
+    );
     let internal_routes = zlayer_api::build_internal_routes(internal_state);
     let base_router = base_router.nest("/api/v1/internal", internal_routes);
 
@@ -497,6 +584,14 @@ pub(crate) async fn serve(
     let tunnel_state = TunnelApiState::new();
     let tunnel_routes = build_tunnel_routes(tunnel_state);
     router = router.nest("/api/v1/tunnels", tunnel_routes);
+
+    // Merge storage replication status routes
+    let storage_api_state = match replicator.as_ref() {
+        Some(r) => zlayer_api::StorageState::with_replicator(Arc::clone(r)),
+        None => zlayer_api::StorageState::new(),
+    };
+    let storage_routes = zlayer_api::build_storage_routes(storage_api_state);
+    router = router.nest("/api/v1/storage", storage_routes);
 
     // Merge cluster routes (join, node listing)
     // Initialize CIDR-aware IP allocator for overlay address assignment
@@ -544,8 +639,13 @@ pub(crate) async fn serve(
     }
 
     let ip_allocator = Arc::new(RwLock::new(ip_allocator));
-    let cluster_state =
-        ClusterApiState::new(_raft.clone(), None, ip_allocator, Some(ip_allocator_path));
+    let cluster_state = ClusterApiState::with_internal_token(
+        _raft.clone(),
+        Some(join_secret),
+        ip_allocator,
+        Some(ip_allocator_path),
+        internal_token,
+    );
     let cluster_routes = build_cluster_routes(cluster_state);
     router = router.nest("/api/v1/cluster", cluster_routes);
 
@@ -584,8 +684,8 @@ pub(crate) async fn serve(
         let terminate = std::future::pending::<()>();
 
         tokio::select! {
-            _ = ctrl_c => {},
-            _ = terminate => {},
+            () = ctrl_c => {},
+            () = terminate => {},
         }
 
         info!("Shutdown signal received, starting graceful shutdown");
@@ -598,7 +698,7 @@ pub(crate) async fn serve(
         bind_addr,
         socket_path,
         router,
-        &api_config.jwt_secret,
+        api_config.jwt_secret.expose_secret(),
         shutdown,
     )
     .await?;
@@ -607,6 +707,13 @@ pub(crate) async fn serve(
     // 7. Post-shutdown cleanup: tear down infrastructure in reverse order
     // -----------------------------------------------------------------------
     info!("API server stopped, shutting down daemon infrastructure");
+
+    // Flush SQLite replicator before tearing down infrastructure
+    if let Some(ref replicator) = replicator {
+        if let Err(e) = replicator.flush().await {
+            warn!("Failed to flush SQLite replicator: {e}");
+        }
+    }
 
     // Stop heartbeat / dead-node detection background tasks
     if let Some(handle) = heartbeat_handle {

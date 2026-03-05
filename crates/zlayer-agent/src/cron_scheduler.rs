@@ -1,6 +1,6 @@
 //! Cron scheduler - triggers jobs on time-based schedules
 //!
-//! This module provides the CronScheduler which manages scheduled job executions.
+//! This module provides the `CronScheduler` which manages scheduled job executions.
 //! Jobs are triggered based on cron expressions (e.g., "0 0 * * * * *" for hourly).
 
 use crate::error::{AgentError, Result};
@@ -87,7 +87,7 @@ impl CronScheduler {
         })?;
 
         let schedule = Schedule::from_str(schedule_str).map_err(|e| {
-            AgentError::InvalidSpec(format!("Invalid cron schedule '{}': {}", schedule_str, e))
+            AgentError::InvalidSpec(format!("Invalid cron schedule '{schedule_str}': {e}"))
         })?;
 
         let next_run = schedule.upcoming(Utc).next();
@@ -204,7 +204,7 @@ impl CronScheduler {
                 _ = interval.tick() => {
                     self.check_and_trigger().await;
                 }
-                _ = self.shutdown.notified() => {
+                () = self.shutdown.notified() => {
                     info!("Cron scheduler received shutdown signal");
                     break;
                 }
@@ -348,7 +348,7 @@ services:
             schedule
         );
 
-        serde_yaml::from_str::<DeploymentSpec>(&yaml)
+        serde_yml::from_str::<DeploymentSpec>(&yaml)
             .unwrap()
             .services
             .remove("cleanup")

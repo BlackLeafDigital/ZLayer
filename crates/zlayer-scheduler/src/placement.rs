@@ -1,4 +1,4 @@
-//! Node placement logic for ZLayer scheduler
+//! Node placement logic for `ZLayer` scheduler
 //!
 //! This module provides placement algorithms for distributing service replicas
 //! across nodes based on different node allocation modes:
@@ -56,7 +56,7 @@ pub struct NodeResources {
     pub gpu_total: u32,
     /// GPUs currently allocated to containers
     pub gpu_used: u32,
-    /// GPU model names (e.g., ["NVIDIA A100-SXM4-80GB"])
+    /// GPU model names (e.g., `["NVIDIA A100-SXM4-80GB"]`)
     pub gpu_models: Vec<String>,
     /// Total GPU VRAM in MB across all GPUs.
     ///
@@ -72,6 +72,7 @@ pub struct NodeResources {
 
 impl NodeResources {
     /// Create new node resources
+    #[must_use]
     pub fn new(cpu_total: f64, memory_total: u64) -> Self {
         Self {
             cpu_total,
@@ -87,16 +88,19 @@ impl NodeResources {
     }
 
     /// Get available CPU cores
+    #[must_use]
     pub fn cpu_available(&self) -> f64 {
         (self.cpu_total - self.cpu_used).max(0.0)
     }
 
     /// Get available memory in bytes
+    #[must_use]
     pub fn memory_available(&self) -> u64 {
         self.memory_total.saturating_sub(self.memory_used)
     }
 
     /// Calculate CPU utilization as a percentage
+    #[must_use]
     pub fn cpu_utilization(&self) -> f64 {
         if self.cpu_total > 0.0 {
             (self.cpu_used / self.cpu_total) * 100.0
@@ -106,6 +110,8 @@ impl NodeResources {
     }
 
     /// Calculate memory utilization as a percentage
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn memory_utilization(&self) -> f64 {
         if self.memory_total > 0 {
             (self.memory_used as f64 / self.memory_total as f64) * 100.0
@@ -115,11 +121,13 @@ impl NodeResources {
     }
 
     /// Calculate overall utilization (average of CPU and memory)
+    #[must_use]
     pub fn utilization(&self) -> f64 {
-        (self.cpu_utilization() + self.memory_utilization()) / 2.0
+        f64::midpoint(self.cpu_utilization(), self.memory_utilization())
     }
 
     /// Get number of GPUs available for allocation
+    #[must_use]
     pub fn gpu_available(&self) -> u32 {
         self.gpu_total.saturating_sub(self.gpu_used)
     }
@@ -130,6 +138,7 @@ impl NodeResources {
     /// This means `gpu_memory_mb` is NOT additive with `memory_total` -- they overlap.
     /// Callers must not double-count memory when both CPU and GPU resources are requested
     /// on a unified-memory node.
+    #[must_use]
     pub fn is_unified_memory(&self) -> bool {
         self.gpu_vendor.eq_ignore_ascii_case("apple")
     }
@@ -138,6 +147,7 @@ impl NodeResources {
     ///
     /// - **Discrete GPU nodes** (NVIDIA, AMD, Intel): system RAM + GPU VRAM
     /// - **Unified memory nodes** (Apple Silicon): system RAM only (GPU VRAM is a subset)
+    #[must_use]
     pub fn total_effective_memory_mb(&self) -> u64 {
         let system_mb = self.memory_total / (1024 * 1024);
         if self.is_unified_memory() {
@@ -178,23 +188,27 @@ impl NodeState {
     }
 
     /// Add a label to the node
+    #[must_use]
     pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.labels.insert(key.into(), value.into());
         self
     }
 
     /// Set resources for the node
+    #[must_use]
     pub fn with_resources(mut self, resources: NodeResources) -> Self {
         self.resources = resources;
         self
     }
 
     /// Get overall utilization percentage
+    #[must_use]
     pub fn utilization(&self) -> f64 {
         self.resources.utilization()
     }
 
-    /// Check if this node matches the required labels in a NodeSelector
+    /// Check if this node matches the required labels in a `NodeSelector`
+    #[must_use]
     pub fn matches_required_labels(&self, selector: &NodeSelector) -> bool {
         selector
             .labels
@@ -203,6 +217,7 @@ impl NodeState {
     }
 
     /// Count how many preferred labels this node matches
+    #[must_use]
     pub fn preferred_label_score(&self, selector: &NodeSelector) -> usize {
         selector
             .prefer_labels
@@ -225,6 +240,7 @@ pub struct PlacementDecision {
 
 impl PlacementDecision {
     /// Check if placement was successful
+    #[must_use]
     pub fn is_success(&self) -> bool {
         self.node_id.is_some()
     }
@@ -265,6 +281,7 @@ pub struct PlacementState {
 
 impl PlacementState {
     /// Create a new empty placement state
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -279,19 +296,21 @@ impl PlacementState {
     }
 
     /// Get containers on a specific node
+    #[must_use]
     pub fn containers_on_node(&self, node_id: NodeId) -> &[ContainerId] {
         self.node_containers
             .get(&node_id)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
+            .map_or(&[], std::vec::Vec::as_slice)
     }
 
     /// Get the node for a specific container
+    #[must_use]
     pub fn node_for_container(&self, container_id: &ContainerId) -> Option<NodeId> {
         self.container_nodes.get(container_id).copied()
     }
 
     /// Check if a node has any containers from a specific service
+    #[must_use]
     pub fn has_service_on_node(&self, node_id: NodeId, service_name: &str) -> bool {
         self.containers_on_node(node_id)
             .iter()
@@ -299,11 +318,13 @@ impl PlacementState {
     }
 
     /// Check if a node has any containers at all
+    #[must_use]
     pub fn has_any_containers(&self, node_id: NodeId) -> bool {
         !self.containers_on_node(node_id).is_empty()
     }
 
     /// Get the count of containers on a node
+    #[must_use]
     pub fn container_count(&self, node_id: NodeId) -> usize {
         self.containers_on_node(node_id).len()
     }
@@ -351,7 +372,7 @@ impl PlacementState {
     }
 }
 
-/// Check if a node can accept a service based on node_mode, constraints, and resource availability
+/// Check if a node can accept a service based on `node_mode`, constraints, and resource availability
 ///
 /// # Arguments
 /// * `node` - The node to check
@@ -443,11 +464,11 @@ pub fn can_place_on_node(
     }
 }
 
-/// Place replicas of a service according to its node_mode
+/// Place replicas of a service according to its `node_mode`
 ///
 /// # Arguments
 /// * `service_name` - Name of the service
-/// * `service_spec` - Service specification containing node_mode and node_selector
+/// * `service_spec` - Service specification containing `node_mode` and `node_selector`
 /// * `replicas` - Number of replicas to place
 /// * `nodes` - Available nodes in the cluster
 /// * `placements` - Current placement state (will be mutated)
@@ -463,12 +484,7 @@ pub fn place_service_replicas(
 ) -> Vec<PlacementDecision> {
     let mut decisions = Vec::with_capacity(replicas as usize);
 
-    let gpu_count_requested = service_spec
-        .resources
-        .gpu
-        .as_ref()
-        .map(|g| g.count)
-        .unwrap_or(0);
+    let gpu_count_requested = service_spec.resources.gpu.as_ref().map_or(0, |g| g.count);
 
     for replica in 0..replicas {
         let container_id = ContainerId::new(service_name, replica);
@@ -586,13 +602,15 @@ fn select_for_bin_packing<'a>(
                         let b_util_score = 100.0 - b.utilization();
 
                         let a_gpu_score = if a.resources.gpu_total > 0 {
-                            (a.resources.gpu_available() as f64 / a.resources.gpu_total as f64)
+                            (f64::from(a.resources.gpu_available())
+                                / f64::from(a.resources.gpu_total))
                                 * 100.0
                         } else {
                             0.0
                         };
                         let b_gpu_score = if b.resources.gpu_total > 0 {
-                            (b.resources.gpu_available() as f64 / b.resources.gpu_total as f64)
+                            (f64::from(b.resources.gpu_available())
+                                / f64::from(b.resources.gpu_total))
                                 * 100.0
                         } else {
                             0.0
@@ -644,14 +662,17 @@ fn select_for_isolation<'a>(
         .expect("nodes should not be empty")
 }
 
-/// Validate that there are enough nodes for services with dedicated/exclusive modes
+/// Validate that there are enough nodes for services with dedicated/exclusive modes.
 ///
 /// # Arguments
-/// * `services` - Map of service name to (node_mode, replicas) pairs
+/// * `services` - Map of service name to (`node_mode`, replicas) pairs
 /// * `available_nodes` - Number of available nodes in the cluster
 ///
-/// # Returns
-/// `Ok(())` if placement is feasible, or an error describing why it's not
+/// # Errors
+///
+/// Returns `SchedulerError::InvalidConfig` if there are not enough nodes
+/// to satisfy the placement requirements.
+#[allow(clippy::implicit_hasher)]
 pub fn validate_placement_feasibility(
     services: &HashMap<String, (NodeMode, u32)>,
     available_nodes: usize,
@@ -684,12 +705,12 @@ pub fn validate_placement_feasibility(
     if required_nodes > available_nodes {
         let mut details = Vec::new();
         if dedicated_replicas > 0 {
-            details.push(format!("{} dedicated replicas", dedicated_replicas));
+            details.push(format!("{dedicated_replicas} dedicated replicas"));
         }
         if !exclusive_services.is_empty() {
             let exclusive_detail: Vec<String> = exclusive_services
                 .iter()
-                .map(|(name, replicas)| format!("{}({})", name, replicas))
+                .map(|(name, replicas)| format!("{name}({replicas})"))
                 .collect();
             details.push(format!(
                 "exclusive services: {}",

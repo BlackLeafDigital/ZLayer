@@ -22,7 +22,7 @@ pub struct S3CacheConfig {
     pub prefix: String,
     /// AWS region (optional, uses SDK default if not set)
     pub region: Option<String>,
-    /// Custom S3 endpoint (for S3-compatible services like R2, B2, MinIO)
+    /// Custom S3 endpoint (for S3-compatible services like R2, B2, `MinIO`)
     pub endpoint: Option<String>,
     /// Use path-style URLs (required for some S3-compatible services)
     pub path_style: bool,
@@ -65,7 +65,7 @@ impl S3CacheConfig {
             bucket: bucket.into(),
             prefix: "zlayer/blobs/".to_string(),
             region: Some(region.clone()),
-            endpoint: Some(format!("https://s3.{}.backblazeb2.com", region)),
+            endpoint: Some(format!("https://s3.{region}.backblazeb2.com")),
             path_style: false,
             local_cache_dir: None,
         }
@@ -78,43 +78,49 @@ impl S3CacheConfig {
             bucket: bucket.into(),
             prefix: "zlayer/blobs/".to_string(),
             region: Some(region.clone()),
-            endpoint: Some(format!("https://s3.{}.wasabisys.com", region)),
+            endpoint: Some(format!("https://s3.{region}.wasabisys.com")),
             path_style: false,
             local_cache_dir: None,
         }
     }
 
     /// Set custom prefix
+    #[must_use]
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
         self
     }
 
     /// Set region
+    #[must_use]
     pub fn with_region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
         self
     }
 
     /// Set custom endpoint
+    #[must_use]
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = Some(endpoint.into());
         self
     }
 
     /// Enable path-style URLs
+    #[must_use]
     pub fn with_path_style(mut self) -> Self {
         self.path_style = true;
         self
     }
 
     /// Enable local cache read-through
+    #[must_use]
     pub fn with_local_cache(mut self, dir: impl Into<PathBuf>) -> Self {
         self.local_cache_dir = Some(dir.into());
         self
     }
 
     /// Get the full key for a digest
+    #[must_use]
     pub fn key_for_digest(&self, digest: &str) -> String {
         format!("{}{}", self.prefix, digest.replace(':', "/"))
     }
@@ -138,6 +144,10 @@ pub struct S3BlobCache {
 
 impl S3BlobCache {
     /// Create a new S3 blob cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the AWS SDK configuration cannot be built.
     pub async fn new(config: S3CacheConfig) -> Result<Self> {
         let sdk_config = Self::build_sdk_config(&config).await?;
 
@@ -181,6 +191,10 @@ impl S3BlobCache {
     }
 
     /// Get a blob by digest
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the digest is invalid or the S3 operation fails.
     pub async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>> {
         crate::cache::validate_digest(digest)?;
 
@@ -213,8 +227,7 @@ impl S3BlobCache {
                     .await
                     .map_err(|e| {
                         CacheError::Io(std::io::Error::other(format!(
-                            "failed to read S3 response body: {}",
-                            e
+                            "failed to read S3 response body: {e}"
                         )))
                     })?
                     .into_bytes()
@@ -224,8 +237,7 @@ impl S3BlobCache {
                 let actual_digest = crate::cache::compute_digest(&data);
                 if actual_digest != digest {
                     return Err(CacheError::Corrupted(format!(
-                        "S3 blob digest mismatch: expected {}, got {}",
-                        digest, actual_digest
+                        "S3 blob digest mismatch: expected {digest}, got {actual_digest}"
                     )));
                 }
 
@@ -248,14 +260,17 @@ impl S3BlobCache {
                     }
                 }
                 Err(CacheError::Io(std::io::Error::other(format!(
-                    "S3 get failed: {}",
-                    e
+                    "S3 get failed: {e}"
                 ))))
             }
         }
     }
 
     /// Put a blob into the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the digest is invalid, mismatches the data, or the S3 upload fails.
     pub async fn put(&self, digest: &str, data: &[u8]) -> Result<()> {
         crate::cache::validate_digest(digest)?;
 
@@ -263,8 +278,7 @@ impl S3BlobCache {
         let actual_digest = crate::cache::compute_digest(data);
         if actual_digest != digest {
             return Err(CacheError::Corrupted(format!(
-                "digest mismatch: expected {}, got {}",
-                digest, actual_digest
+                "digest mismatch: expected {digest}, got {actual_digest}"
             )));
         }
 
@@ -278,7 +292,7 @@ impl S3BlobCache {
             .content_type("application/octet-stream")
             .send()
             .await
-            .map_err(|e| CacheError::Io(std::io::Error::other(format!("S3 put failed: {}", e))))?;
+            .map_err(|e| CacheError::Io(std::io::Error::other(format!("S3 put failed: {e}"))))?;
 
         // Update local cache
         if let Some(ref local) = self.local_cache {
@@ -292,6 +306,10 @@ impl S3BlobCache {
     }
 
     /// Check if a blob exists in the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the digest is invalid or the S3 operation fails.
     pub async fn contains(&self, digest: &str) -> Result<bool> {
         crate::cache::validate_digest(digest)?;
 
@@ -324,8 +342,7 @@ impl S3BlobCache {
                     }
                 }
                 Err(CacheError::Io(std::io::Error::other(format!(
-                    "S3 head failed: {}",
-                    e
+                    "S3 head failed: {e}"
                 ))))
             }
         }

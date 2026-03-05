@@ -6,7 +6,11 @@ use std::sync::mpsc;
 use tracing::{info, warn};
 
 /// Build a container image from a Dockerfile or runtime template
-#[allow(clippy::too_many_arguments)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::too_many_lines
+)]
 pub(crate) async fn handle_build(
     context: PathBuf,
     file: Option<PathBuf>,
@@ -36,20 +40,17 @@ pub(crate) async fn handle_build(
         info!("Auto-detecting runtime from project files");
         detect_runtime(&context)
     } else if let Some(name) = runtime {
-        match Runtime::from_name(&name) {
-            Some(rt) => {
-                info!(runtime = %rt, "Using specified runtime template");
-                Some(rt)
-            }
-            None => {
-                // List available runtimes in error message
-                let available: Vec<_> = Runtime::all().iter().map(|r| r.name).collect();
-                anyhow::bail!(
-                    "Unknown runtime: '{}'. Available runtimes: {}",
-                    name,
-                    available.join(", ")
-                );
-            }
+        if let Some(rt) = Runtime::from_name(&name) {
+            info!(runtime = %rt, "Using specified runtime template");
+            Some(rt)
+        } else {
+            // List available runtimes in error message
+            let available: Vec<_> = Runtime::all().iter().map(|r| r.name).collect();
+            anyhow::bail!(
+                "Unknown runtime: '{}'. Available runtimes: {}",
+                name,
+                available.join(", ")
+            );
         }
     } else {
         None
@@ -64,7 +65,7 @@ pub(crate) async fn handle_build(
                 Some((parts[0].to_string(), parts[1].to_string()))
             } else {
                 warn!(arg = %arg, "Invalid build-arg format, expected KEY=VALUE");
-                eprintln!("Warning: invalid build-arg '{}', expected KEY=VALUE", arg);
+                eprintln!("Warning: invalid build-arg '{arg}', expected KEY=VALUE");
                 None
             }
         })
@@ -148,7 +149,7 @@ pub(crate) async fn handle_build(
 
         println!("\nBuilt image: {}", result.image_id);
         for tag in &result.tags {
-            println!("  Tagged: {}", tag);
+            println!("  Tagged: {tag}");
         }
         println!("Build time: {}ms", result.build_time_ms);
     } else {
@@ -178,7 +179,7 @@ pub(crate) async fn handle_build(
 
         println!("\nBuilt image: {}", result.image_id);
         for tag in &result.tags {
-            println!("  Tagged: {}", tag);
+            println!("  Tagged: {tag}");
         }
         println!("Build time: {}ms", result.build_time_ms);
     }
@@ -187,7 +188,8 @@ pub(crate) async fn handle_build(
 }
 
 /// List available runtime templates
-pub(crate) async fn handle_runtimes() -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_runtimes() -> Result<()> {
     use zlayer_builder::{list_templates, Runtime};
 
     println!("Available runtime templates:\n");

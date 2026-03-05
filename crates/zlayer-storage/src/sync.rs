@@ -31,6 +31,11 @@ pub struct LayerSyncManager {
 
 impl LayerSyncManager {
     /// Create a new sync manager
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directories cannot be created, the database cannot
+    /// be opened, or the AWS SDK fails to initialize.
     pub async fn new(config: LayerStorageConfig) -> Result<Self> {
         // Ensure directories exist
         tokio::fs::create_dir_all(&config.staging_dir).await?;
@@ -79,13 +84,13 @@ impl LayerSyncManager {
 
         // Create sync_state table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS sync_state (
                 container_key TEXT PRIMARY KEY NOT NULL,
                 state_json TEXT NOT NULL,
                 updated_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
-            "#,
+            ",
         )
         .execute(&pool)
         .await
@@ -123,10 +128,10 @@ impl LayerSyncManager {
         let value = serde_json::to_string(state)?;
 
         sqlx::query(
-            r#"
+            r"
             INSERT OR REPLACE INTO sync_state (container_key, state_json, updated_at)
             VALUES (?, ?, CURRENT_TIMESTAMP)
-            "#,
+            ",
         )
         .bind(&key)
         .bind(&value)
@@ -138,6 +143,10 @@ impl LayerSyncManager {
     }
 
     /// Register a container for layer sync tracking
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the sync state to the database fails.
     #[instrument(skip(self))]
     pub async fn register_container(&self, container_id: ContainerLayerId) -> Result<()> {
         let key = container_id.to_key();
@@ -154,6 +163,11 @@ impl LayerSyncManager {
     }
 
     /// Check if a container's layer has changed and needs sync
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not registered or if calculating the
+    /// directory digest fails.
     #[instrument(skip(self, upper_layer_path))]
     pub async fn check_for_changes(
         &self,
@@ -175,6 +189,10 @@ impl LayerSyncManager {
     }
 
     /// Create a snapshot and upload it to S3
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if snapshot creation, S3 upload, or state persistence fails.
     #[instrument(skip(self, upper_layer_path), fields(container = %container_id))]
     pub async fn sync_layer(
         &self,
@@ -213,7 +231,7 @@ impl LayerSyncManager {
         let tarball_path = self
             .config
             .staging_dir
-            .join(format!("{}.tar.zst", current_digest));
+            .join(format!("{current_digest}.tar.zst"));
 
         let snapshot = tokio::task::spawn_blocking({
             let source = upper_layer_path.to_path_buf();
@@ -247,6 +265,7 @@ impl LayerSyncManager {
     }
 
     /// Upload a snapshot to S3 using multipart upload
+    #[allow(clippy::cast_possible_wrap)]
     #[instrument(skip(self, tarball_path, snapshot))]
     async fn upload_snapshot(
         &self,
@@ -257,6 +276,7 @@ impl LayerSyncManager {
         let object_key = self.config.object_key(&snapshot.digest);
         let file_size = tokio::fs::metadata(tarball_path).await?.len();
         let part_size = self.config.part_size_bytes;
+        #[allow(clippy::cast_possible_truncation)]
         let total_parts = file_size.div_ceil(part_size) as u32;
 
         info!(
@@ -356,6 +376,7 @@ impl LayerSyncManager {
     }
 
     /// Upload individual parts with progress tracking
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     async fn upload_parts(
         &self,
         tarball_path: &Path,
@@ -367,7 +388,7 @@ impl LayerSyncManager {
         let mut completed = Vec::new();
 
         for part_number in 1..=total_parts {
-            let offset = (part_number as u64 - 1) * part_size;
+            let offset = (u64::from(part_number) - 1) * part_size;
 
             // Read part data
             let mut file = File::open(tarball_path).await?;
@@ -403,6 +424,7 @@ impl LayerSyncManager {
     }
 
     /// Resume an interrupted upload
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     #[instrument(skip(self, pending))]
     async fn resume_upload(
         &self,
@@ -436,7 +458,7 @@ impl LayerSyncManager {
 
             // Upload missing parts
             for part_number in missing {
-                let offset = (part_number as u64 - 1) * pending.part_size;
+                let offset = (u64::from(part_number) - 1) * pending.part_size;
 
                 let mut file = File::open(&pending.local_tarball_path).await?;
                 file.seek(std::io::SeekFrom::Start(offset)).await?;
@@ -540,6 +562,11 @@ impl LayerSyncManager {
     }
 
     /// Download and restore a layer from S3
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the remote layer is not found, download fails,
+    /// digest verification fails, or extraction fails.
     #[instrument(skip(self, target_path))]
     pub async fn restore_layer(
         &self,
@@ -555,9 +582,7 @@ impl LayerSyncManager {
             states
                 .get(&key)
                 .and_then(|s| s.remote_digest.clone())
-                .ok_or_else(|| {
-                    LayerStorageError::NotFound(format!("No remote layer for {}", key))
-                })?
+                .ok_or_else(|| LayerStorageError::NotFound(format!("No remote layer for {key}")))?
         };
 
         info!("Restoring layer {} from S3", remote_digest);
@@ -566,7 +591,7 @@ impl LayerSyncManager {
         let tarball_path = self
             .config
             .staging_dir
-            .join(format!("{}.tar.zst", remote_digest));
+            .join(format!("{remote_digest}.tar.zst"));
 
         let object_key = self.config.object_key(&remote_digest);
         let response = self

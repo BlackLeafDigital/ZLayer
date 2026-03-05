@@ -96,6 +96,7 @@ impl<T: StatusItem> Widget for StatusList<'_, T> {
 // Vertical rendering
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::cast_possible_truncation)]
 fn render_vertical<T: StatusItem>(items: &[T], current: usize, area: Rect, buf: &mut Buffer) {
     let visible_count = area.height as usize;
     let total = items.len();
@@ -170,6 +171,7 @@ fn render_vertical<T: StatusItem>(items: &[T], current: usize, area: Rect, buf: 
 // Horizontal rendering
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::cast_possible_truncation)]
 fn render_horizontal<T: StatusItem>(items: &[T], current: usize, area: Rect, buf: &mut Buffer) {
     let separator = " -> ";
     let mut x = area.x;
@@ -183,7 +185,7 @@ fn render_horizontal<T: StatusItem>(items: &[T], current: usize, area: Rect, buf
 
         // Icon
         let (icon_ch, icon_style) = horizontal_icon(status, i, current);
-        let icon_str = format!("{} ", icon_ch);
+        let icon_str = format!("{icon_ch} ");
         let icon_len = icon_str.len() as u16;
 
         if x + icon_len > area.x + area.width {

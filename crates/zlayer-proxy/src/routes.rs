@@ -61,6 +61,7 @@ impl RouteEntry {
     ///
     /// Fields that cannot be derived from the spec alone (host, backends, TLS,
     /// SNI) are given sensible defaults and can be overridden after construction.
+    #[must_use]
     pub fn from_endpoint(service_name: &str, endpoint: &EndpointSpec) -> Self {
         let path_prefix = endpoint.path.clone().unwrap_or_else(|| "/".to_string());
         let target_port = endpoint.target_port();
@@ -85,6 +86,7 @@ impl RouteEntry {
     }
 
     /// Check whether this route matches the given host and path.
+    #[must_use]
     pub fn matches(&self, host: Option<&str>, path: &str) -> bool {
         // If the route specifies a host pattern the request must supply a
         // host that satisfies it.
@@ -107,7 +109,7 @@ impl RouteEntry {
 // ServiceRegistry
 // ---------------------------------------------------------------------------
 
-/// Production-ready service registry for the ZLayer reverse proxy.
+/// Production-ready service registry for the `ZLayer` reverse proxy.
 ///
 /// Routes are stored as a `Vec<RouteEntry>` behind a `tokio::sync::RwLock`,
 /// kept in **longest-prefix-first** order so that `resolve()` always returns
@@ -125,6 +127,7 @@ impl Default for ServiceRegistry {
 
 impl ServiceRegistry {
     /// Create an empty registry.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             routes: RwLock::new(Vec::new()),
@@ -170,7 +173,7 @@ impl ServiceRegistry {
         let mut routes = self.routes.write().await;
         for entry in routes.iter_mut() {
             if entry.service_name == service_name {
-                entry.resolved.backends = backends.clone();
+                entry.resolved.backends.clone_from(&backends);
             }
         }
     }
@@ -221,6 +224,7 @@ impl ServiceRegistry {
 ///
 /// When `strip` is `true` the leading `prefix` is removed.  If the result
 /// would be empty, `"/"` is returned instead.
+#[must_use]
 pub fn transform_path(prefix: &str, path: &str, strip: bool) -> String {
     if !strip || prefix == "/" {
         return path.to_string();

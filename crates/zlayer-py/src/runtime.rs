@@ -59,16 +59,16 @@ struct RuntimeInner {
     deployment_name: Option<String>,
 }
 
-/// The ZLayer container runtime
+/// The `ZLayer` container runtime
 ///
 /// This class provides high-level orchestration capabilities for managing
-/// containers based on ZLayer deployment specifications.
+/// containers based on `ZLayer` deployment specifications.
 ///
 /// Example:
-///     >>> runtime = Runtime()
-///     >>> await runtime.deploy_spec("deployment.yaml")
+///     >>> runtime = `Runtime()`
+///     >>> await `runtime.deploy_spec("deployment.yaml`")
 ///     >>> await runtime.scale("my-deployment", "api", 3)
-///     >>> print(await runtime.status())
+///     >>> print(await `runtime.status()`)
 #[pyclass]
 pub struct Runtime {
     inner: Arc<RwLock<RuntimeInner>>,
@@ -79,15 +79,16 @@ impl Runtime {
     /// Create a new Runtime instance
     ///
     /// Args:
-    ///     options: Optional RuntimeOptions for configuration
+    ///     options: Optional `RuntimeOptions` for configuration
     ///
     /// Returns:
     ///     A new Runtime instance
     ///
     /// Raises:
-    ///     RuntimeError: If runtime initialization fails
+    ///     `RuntimeError`: If runtime initialization fails
     #[new]
     #[pyo3(signature = (options=None))]
+    #[allow(clippy::unnecessary_wraps)]
     fn new(options: Option<RuntimeOptions>) -> PyResult<Self> {
         let opts = options.unwrap_or_default();
 
@@ -117,16 +118,13 @@ impl Runtime {
     /// container runtime, as it requires async initialization.
     ///
     /// Args:
-    ///     options: Optional RuntimeOptions for configuration
+    ///     options: Optional `RuntimeOptions` for configuration
     ///
     /// Returns:
     ///     A fully initialized Runtime instance
     #[staticmethod]
     #[pyo3(signature = (options=None))]
-    fn create<'py>(
-        py: Python<'py>,
-        options: Option<RuntimeOptions>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn create(py: Python<'_>, options: Option<RuntimeOptions>) -> PyResult<Bound<'_, PyAny>> {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let opts = options.unwrap_or_default();
 
@@ -171,15 +169,15 @@ impl Runtime {
 
     /// Deploy services from a YAML specification file
     ///
-    /// This method reads a ZLayer deployment spec and starts all services
+    /// This method reads a `ZLayer` deployment spec and starts all services
     /// defined in it, respecting their dependencies.
     ///
     /// Args:
     ///     path: Path to the YAML specification file
     ///
     /// Raises:
-    ///     ValueError: If the spec file is invalid
-    ///     RuntimeError: If deployment fails
+    ///     `ValueError`: If the spec file is invalid
+    ///     `RuntimeError`: If deployment fails
     fn deploy_spec<'py>(&self, py: Python<'py>, path: &str) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let path = PathBuf::from(path);
@@ -207,15 +205,15 @@ impl Runtime {
 
     /// Deploy services from a YAML string
     ///
-    /// This method parses a ZLayer deployment spec from a string and starts
+    /// This method parses a `ZLayer` deployment spec from a string and starts
     /// all services defined in it, respecting their dependencies.
     ///
     /// Args:
     ///     yaml: The YAML specification as a string
     ///
     /// Raises:
-    ///     ValueError: If the spec is invalid
-    ///     RuntimeError: If deployment fails
+    ///     `ValueError`: If the spec is invalid
+    ///     `RuntimeError`: If deployment fails
     fn deploy_yaml<'py>(&self, py: Python<'py>, yaml: &str) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let yaml = yaml.to_string();
@@ -249,8 +247,8 @@ impl Runtime {
     ///     replicas: The desired number of replicas
     ///
     /// Raises:
-    ///     ValueError: If the service doesn't exist
-    ///     RuntimeError: If scaling fails
+    ///     `ValueError`: If the service doesn't exist
+    ///     `RuntimeError`: If scaling fails
     fn scale<'py>(
         &self,
         py: Python<'py>,
@@ -288,7 +286,7 @@ impl Runtime {
         deployment: Option<&str>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
-        let _deployment = deployment.map(|s| s.to_string());
+        let _deployment = deployment.map(std::string::ToString::to_string);
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let inner = inner.read().await;
@@ -364,21 +362,21 @@ impl Runtime {
             // Create a minimal spec for the container wrapper
             // In a real implementation, we'd fetch this from the service manager
             let yaml = format!(
-                r#"version: v1
+                r"version: v1
 deployment: runtime
 services:
-  {}:
+  {service}:
     rtype: service
     image:
       name: placeholder:latest
-"#,
-                service
+"
             );
-            let spec: DeploymentSpec = serde_yaml::from_str(&yaml).map_err(ZLayerError::from)?;
-            let service_spec =
-                spec.services.get(&service).cloned().ok_or_else(|| {
-                    ZLayerError::NotFound(format!("Service {} not found", service))
-                })?;
+            let spec: DeploymentSpec = serde_yml::from_str(&yaml).map_err(ZLayerError::from)?;
+            let service_spec = spec
+                .services
+                .get(&service)
+                .cloned()
+                .ok_or_else(|| ZLayerError::NotFound(format!("Service {service} not found")))?;
 
             to_py_result(Ok(Container::new(
                 container_id,
@@ -394,8 +392,8 @@ services:
     ///     service: The service name to remove
     ///
     /// Raises:
-    ///     ValueError: If the service doesn't exist
-    ///     RuntimeError: If removal fails
+    ///     `ValueError`: If the service doesn't exist
+    ///     `RuntimeError`: If removal fails
     fn remove_service<'py>(&self, py: Python<'py>, service: &str) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         let service = service.to_string();
@@ -442,6 +440,7 @@ services:
         })
     }
 
+    #[allow(clippy::unused_self)]
     fn __repr__(&self) -> String {
         "Runtime()".to_string()
     }
@@ -458,7 +457,7 @@ services:
 ///     A dict representation of the parsed spec
 ///
 /// Raises:
-///     ValueError: If the YAML is invalid
+///     `ValueError`: If the YAML is invalid
 #[pyfunction]
 pub fn parse_spec<'py>(py: Python<'py>, yaml: &str) -> PyResult<Bound<'py, PyDict>> {
     let spec = zlayer_spec::from_yaml_str(yaml).map_err(ZLayerError::from)?;
@@ -487,7 +486,7 @@ pub fn parse_spec<'py>(py: Python<'py>, yaml: &str) -> PyResult<Bound<'py, PyDic
 ///     True if valid
 ///
 /// Raises:
-///     ValueError: If the spec is invalid
+///     `ValueError`: If the spec is invalid
 #[pyfunction]
 pub fn validate_spec(yaml: &str) -> PyResult<bool> {
     zlayer_spec::from_yaml_str(yaml).map_err(ZLayerError::from)?;

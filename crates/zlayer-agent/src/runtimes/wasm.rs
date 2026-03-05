@@ -76,8 +76,8 @@ struct ExecutionResult {
 /// directories for supported mount types (Bind and Named volumes).
 ///
 /// # Arguments
-/// * `wasi_builder` - The WasiCtxBuilder to configure
-/// * `mounts` - Slice of StorageSpec defining the mounts
+/// * `wasi_builder` - The `WasiCtxBuilder` to configure
+/// * `mounts` - Slice of `StorageSpec` defining the mounts
 ///
 /// # Returns
 /// * `Ok(())` if all supported mounts were configured successfully
@@ -111,10 +111,7 @@ fn configure_wasi_mounts(
                 wasi_builder
                     .preopened_dir(source, target, dir_perms, file_perms)
                     .map_err(|e| {
-                        format!(
-                            "failed to preopen bind mount '{}' -> '{}': {}",
-                            source, target, e
-                        )
+                        format!("failed to preopen bind mount '{source}' -> '{target}': {e}")
                     })?;
 
                 tracing::debug!(
@@ -131,7 +128,7 @@ fn configure_wasi_mounts(
                 ..
             } => {
                 // Named volumes are stored under the volumes directory
-                let volume_path = format!("{}/{}", DEFAULT_VOLUMES_DIR, name);
+                let volume_path = format!("{DEFAULT_VOLUMES_DIR}/{name}");
 
                 let (dir_perms, file_perms) = if *readonly {
                     (DirPerms::READ, FilePerms::READ)
@@ -142,10 +139,7 @@ fn configure_wasi_mounts(
                 wasi_builder
                     .preopened_dir(&volume_path, target, dir_perms, file_perms)
                     .map_err(|e| {
-                        format!(
-                            "failed to preopen named volume '{}' at '{}': {}",
-                            name, target, e
-                        )
+                        format!("failed to preopen named volume '{name}' at '{target}': {e}")
                     })?;
 
                 tracing::debug!(
@@ -181,7 +175,7 @@ fn configure_wasi_mounts(
     Ok(())
 }
 
-/// Configuration for WasmRuntime
+/// Configuration for `WasmRuntime`
 #[derive(Debug, Clone)]
 pub struct WasmConfig {
     /// Directory for caching pulled WASM modules
@@ -193,7 +187,7 @@ pub struct WasmConfig {
     /// Maximum execution time for WASM modules
     pub max_execution_time: Duration,
     /// Optional cache type configuration for blob storage
-    /// If None, uses CacheType::from_env() with path override from cache_dir
+    /// If None, uses `CacheType::from_env()` with path override from `cache_dir`
     pub cache_type: Option<zlayer_registry::CacheType>,
 }
 
@@ -201,8 +195,7 @@ impl Default for WasmConfig {
     fn default() -> Self {
         Self {
             cache_dir: std::env::var("ZLAYER_WASM_CACHE_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(DEFAULT_WASM_CACHE_DIR)),
+                .map_or_else(|_| PathBuf::from(DEFAULT_WASM_CACHE_DIR), PathBuf::from),
             enable_epochs: true,
             epoch_deadline: 1_000_000, // 1M instructions before yield check
             max_execution_time: Duration::from_secs(3600), // 1 hour default
@@ -248,7 +241,7 @@ struct WasmInstance {
     args: Vec<String>,
     /// Filesystem mounts for WASI preopens
     mounts: Vec<StorageSpec>,
-    /// Execution handle (if running) - returns ExecutionResult with captured stdout/stderr
+    /// Execution handle (if running) - returns `ExecutionResult` with captured stdout/stderr
     execution_handle: Option<tokio::task::JoinHandle<std::result::Result<ExecutionResult, String>>>,
 }
 
@@ -290,14 +283,19 @@ impl std::fmt::Debug for WasmRuntime {
 }
 
 impl WasmRuntime {
-    /// Create a new WasmRuntime with the given configuration
+    /// Create a new `WasmRuntime` with the given configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache directory cannot be created, the wasmtime engine
+    /// cannot be initialized, or the blob cache cannot be opened.
     pub async fn new(config: WasmConfig) -> Result<Self> {
         // Create cache directory
         tokio::fs::create_dir_all(&config.cache_dir)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: "wasm-runtime".to_string(),
-                reason: format!("failed to create cache directory: {}", e),
+                reason: format!("failed to create cache directory: {e}"),
             })?;
 
         // Configure wasmtime engine
@@ -311,40 +309,38 @@ impl WasmRuntime {
 
         let engine = Engine::new(&engine_config).map_err(|e| AgentError::CreateFailed {
             id: "wasm-runtime".to_string(),
-            reason: format!("failed to create wasmtime engine: {}", e),
+            reason: format!("failed to create wasmtime engine: {e}"),
         })?;
 
         // Create blob cache for registry using new CacheType configuration
-        let blob_cache = match &config.cache_type {
-            Some(cache_type) => cache_type
+        let blob_cache = if let Some(cache_type) = &config.cache_type {
+            cache_type
                 .build()
                 .await
                 .map_err(|e| AgentError::CreateFailed {
                     id: "wasm-runtime".to_string(),
-                    reason: format!("failed to open blob cache: {}", e),
-                })?,
-            None => {
-                // Use environment-based configuration, but override path if Persistent
-                let cache_type = zlayer_registry::CacheType::from_env().map_err(|e| {
-                    AgentError::CreateFailed {
-                        id: "wasm-runtime".to_string(),
-                        reason: format!("failed to configure blob cache from env: {}", e),
-                    }
+                    reason: format!("failed to open blob cache: {e}"),
+                })?
+        } else {
+            // Use environment-based configuration, but override path if Persistent
+            let cache_type =
+                zlayer_registry::CacheType::from_env().map_err(|e| AgentError::CreateFailed {
+                    id: "wasm-runtime".to_string(),
+                    reason: format!("failed to configure blob cache from env: {e}"),
                 })?;
-                let cache_type = match cache_type {
-                    zlayer_registry::CacheType::Persistent { .. } => {
-                        zlayer_registry::CacheType::persistent_at(config.cache_dir.clone())
-                    }
-                    other => other,
-                };
-                cache_type
-                    .build()
-                    .await
-                    .map_err(|e| AgentError::CreateFailed {
-                        id: "wasm-runtime".to_string(),
-                        reason: format!("failed to open blob cache: {}", e),
-                    })?
-            }
+            let cache_type = match cache_type {
+                zlayer_registry::CacheType::Persistent { .. } => {
+                    zlayer_registry::CacheType::persistent_at(config.cache_dir.clone())
+                }
+                other => other,
+            };
+            cache_type
+                .build()
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: "wasm-runtime".to_string(),
+                    reason: format!("failed to open blob cache: {e}"),
+                })?
         };
 
         let registry = Arc::new(zlayer_registry::ImagePuller::with_cache(blob_cache));
@@ -360,12 +356,20 @@ impl WasmRuntime {
         })
     }
 
-    /// Create a new WasmRuntime with default configuration
+    /// Create a new `WasmRuntime` with default configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime cannot be initialized.
     pub async fn with_defaults() -> Result<Self> {
         Self::new(WasmConfig::default()).await
     }
 
-    /// Create a new WasmRuntime with custom auth configuration
+    /// Create a new `WasmRuntime` with custom auth configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime cannot be initialized.
     pub async fn with_auth(
         config: WasmConfig,
         auth_config: zlayer_core::AuthConfig,
@@ -375,12 +379,14 @@ impl WasmRuntime {
         Ok(runtime)
     }
 
-    /// Get the instance ID string from a ContainerId
+    /// Get the instance ID string from a `ContainerId`
+    #[allow(clippy::unused_self)]
     fn instance_id(&self, id: &ContainerId) -> String {
         format!("wasm-{}-{}", id.service, id.replica)
     }
 
-    /// Build environment variables from ServiceSpec
+    /// Build environment variables from `ServiceSpec`
+    #[allow(clippy::unused_self)]
     fn build_env_vars(&self, spec: &ServiceSpec) -> Vec<(String, String)> {
         let mut env = Vec::new();
 
@@ -411,7 +417,8 @@ impl WasmRuntime {
         env
     }
 
-    /// Build command arguments from ServiceSpec
+    /// Build command arguments from `ServiceSpec`
+    #[allow(clippy::unused_self)]
     fn build_args(&self, spec: &ServiceSpec) -> Vec<String> {
         let mut args = Vec::new();
 
@@ -457,7 +464,7 @@ impl WasmRuntime {
         tokio::task::spawn_blocking(move || {
             // Compile module
             let module = Module::new(&engine, &module_bytes)
-                .map_err(|e| format!("failed to compile module: {}", e))?;
+                .map_err(|e| format!("failed to compile module: {e}"))?;
 
             // Build WASI context with environment and args
             let mut wasi_builder = WasiCtxBuilder::new();
@@ -499,12 +506,12 @@ impl WasmRuntime {
             // Create linker and add WASI
             let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
             p1::add_to_linker_sync(&mut linker, |ctx| ctx)
-                .map_err(|e| format!("failed to add WASI to linker: {}", e))?;
+                .map_err(|e| format!("failed to add WASI to linker: {e}"))?;
 
             // Instantiate the module
             let instance = linker
                 .instantiate(&mut store, &module)
-                .map_err(|e| format!("failed to instantiate module: {}", e))?;
+                .map_err(|e| format!("failed to instantiate module: {e}"))?;
 
             // Look for _start (WASI command) or main function
             let start_func = instance
@@ -548,12 +555,12 @@ impl WasmRuntime {
             })
         })
         .await
-        .map_err(|e| format!("task join error: {}", e))?
+        .map_err(|e| format!("task join error: {e}"))?
     }
 
-    /// Execute a WASIp2 component
+    /// Execute a `WASIp2` component
     ///
-    /// WASIp2 components use the WebAssembly Component Model and provide richer
+    /// `WASIp2` components use the WebAssembly Component Model and provide richer
     /// WASI interfaces compared to Preview 1 modules. This method handles:
     /// - Component compilation and instantiation
     /// - WASI Preview 2 interface linking (wasi:cli, wasi:io, etc.)
@@ -592,7 +599,7 @@ impl WasmRuntime {
         tokio::task::spawn_blocking(move || {
             // Compile the component
             let component = Component::from_binary(&engine, &component_bytes)
-                .map_err(|e| format!("failed to compile component: {}", e))?;
+                .map_err(|e| format!("failed to compile component: {e}"))?;
 
             // Build WASIp2 context with environment and args
             let mut wasi_builder = WasiCtxBuilder::new();
@@ -644,13 +651,13 @@ impl WasmRuntime {
             // Create component linker and add WASIp2 interfaces
             let mut linker: ComponentLinker<WasiState> = ComponentLinker::new(&engine);
             wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
-                .map_err(|e| format!("failed to add WASIp2 to linker: {}", e))?;
+                .map_err(|e| format!("failed to add WASIp2 to linker: {e}"))?;
 
             // Try to instantiate as a wasi:cli/command component
             // This is the standard entry point for CLI-style WASM components
             let instance = linker
                 .instantiate(&mut store, &component)
-                .map_err(|e| format!("failed to instantiate component: {}", e))?;
+                .map_err(|e| format!("failed to instantiate component: {e}"))?;
 
             // Helper to create result with captured output
             let make_result = |exit_code: i32| ExecutionResult {
@@ -670,7 +677,7 @@ impl WasmRuntime {
                         if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
                             return Ok(make_result(exit.0));
                         }
-                        return Err(format!("wasi:cli/run execution error: {}", e));
+                        return Err(format!("wasi:cli/run execution error: {e}"));
                     }
                 }
             }
@@ -684,7 +691,7 @@ impl WasmRuntime {
                         if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
                             return Ok(make_result(exit.0));
                         }
-                        return Err(format!("_start execution error: {}", e));
+                        return Err(format!("_start execution error: {e}"));
                     }
                 }
             }
@@ -697,7 +704,7 @@ impl WasmRuntime {
                         if let Some(exit) = e.downcast_ref::<wasmtime_wasi::I32Exit>() {
                             return Ok(make_result(exit.0));
                         }
-                        return Err(format!("main execution error: {}", e));
+                        return Err(format!("main execution error: {e}"));
                     }
                 }
             }
@@ -705,14 +712,14 @@ impl WasmRuntime {
             Err("no wasi:cli/run, _start, or main function found in component".to_string())
         })
         .await
-        .map_err(|e| format!("task join error: {}", e))?
+        .map_err(|e| format!("task join error: {e}"))?
     }
 }
 
-/// WASIp2 state for the component model
+/// `WASIp2` state for the component model
 ///
 /// This struct holds the WASI context and resource table required
-/// for executing WASIp2 components. It implements [`WasiView`] to
+/// for executing `WASIp2` components. It implements [`WasiView`] to
 /// provide access to these resources during component execution.
 struct WasiState {
     /// WASI Preview 2 context with environment, args, and capabilities
@@ -765,7 +772,7 @@ impl Runtime for WasmRuntime {
 
         // For IfNotPresent, check if we have the WASM cached
         let cache_key = image.replace(['/', ':', '@'], "_");
-        let cache_path = self.config.cache_dir.join(format!("{}.wasm", cache_key));
+        let cache_path = self.config.cache_dir.join(format!("{cache_key}.wasm"));
 
         if matches!(policy, PullPolicy::IfNotPresent) && cache_path.exists() {
             tracing::debug!(image = %image, "WASM module already cached");
@@ -783,7 +790,7 @@ impl Runtime for WasmRuntime {
                 .await
                 .map_err(|e| AgentError::PullFailed {
                     image: image.to_string(),
-                    reason: format!("failed to pull WASM artifact: {}", e),
+                    reason: format!("failed to pull WASM artifact: {e}"),
                 })?;
 
         // Cache the WASM binary
@@ -791,7 +798,7 @@ impl Runtime for WasmRuntime {
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
-                reason: format!("failed to cache WASM binary: {}", e),
+                reason: format!("failed to cache WASM binary: {e}"),
             })?;
 
         tracing::info!(
@@ -826,7 +833,7 @@ impl Runtime for WasmRuntime {
 
         // Load WASM binary from cache or pull
         let cache_key = image.replace(['/', ':', '@'], "_");
-        let cache_path = self.config.cache_dir.join(format!("{}.wasm", cache_key));
+        let cache_path = self.config.cache_dir.join(format!("{cache_key}.wasm"));
 
         // Track whether we loaded from local cache (vs pulled from registry)
         let loaded_from_cache = cache_path.exists();
@@ -838,7 +845,7 @@ impl Runtime for WasmRuntime {
                     .await
                     .map_err(|e| AgentError::CreateFailed {
                         id: instance_id.clone(),
-                        reason: format!("failed to read cached WASM: {}", e),
+                        reason: format!("failed to read cached WASM: {e}"),
                     })?;
             // Detect WASI version from the binary itself
             let detected_version = detect_wasm_version_from_binary(&bytes);
@@ -855,7 +862,7 @@ impl Runtime for WasmRuntime {
                 self.registry.pull_wasm(image, &auth).await.map_err(|e| {
                     AgentError::CreateFailed {
                         id: instance_id.clone(),
-                        reason: format!("failed to pull WASM: {}", e),
+                        reason: format!("failed to pull WASM: {e}"),
                     }
                 })?;
 
@@ -863,7 +870,7 @@ impl Runtime for WasmRuntime {
                 .await
                 .map_err(|e| AgentError::CreateFailed {
                     id: instance_id.clone(),
-                    reason: format!("failed to cache WASM: {}", e),
+                    reason: format!("failed to cache WASM: {e}"),
                 })?;
 
             (wasm_bytes, wasm_info.wasi_version)
@@ -1084,7 +1091,7 @@ impl Runtime for WasmRuntime {
                     let mut instances = self.instances.write().await;
                     if let Some(instance) = instances.get_mut(&instance_id) {
                         instance.state = InstanceState::Failed {
-                            reason: format!("task join error: {}", join_error),
+                            reason: format!("task join error: {join_error}"),
                         };
                     }
                 }
@@ -1210,8 +1217,7 @@ impl Runtime for WasmRuntime {
         let instance_id = self.instance_id(id);
 
         Err(AgentError::Internal(format!(
-            "exec not supported for WASM instance '{}': WASM modules are single-process and don't support exec",
-            instance_id
+            "exec not supported for WASM instance '{instance_id}': WASM modules are single-process and don't support exec"
         )))
     }
 
@@ -1295,7 +1301,7 @@ impl Runtime for WasmRuntime {
                                 }
                                 Err(e) => {
                                     instance.state = InstanceState::Failed {
-                                        reason: format!("task join error: {}", e),
+                                        reason: format!("task join error: {e}"),
                                     };
                                 }
                             }
@@ -1309,8 +1315,7 @@ impl Runtime for WasmRuntime {
                         }
                         InstanceState::Failed { reason } => {
                             return Err(AgentError::Internal(format!(
-                                "WASM execution failed: {}",
-                                reason
+                                "WASM execution failed: {reason}"
                             )));
                         }
                         InstanceState::Pending | InstanceState::Running { .. } => {
@@ -1345,12 +1350,12 @@ impl Runtime for WasmRuntime {
 
         // Add stdout lines
         for line in String::from_utf8_lossy(&instance.stdout).lines() {
-            logs.push(format!("[stdout] {}", line));
+            logs.push(format!("[stdout] {line}"));
         }
 
         // Add stderr lines
         for line in String::from_utf8_lossy(&instance.stderr).lines() {
-            logs.push(format!("[stderr] {}", line));
+            logs.push(format!("[stderr] {line}"));
         }
 
         Ok(logs)

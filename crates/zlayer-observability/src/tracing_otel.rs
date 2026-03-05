@@ -16,12 +16,12 @@ use crate::error::{ObservabilityError, Result};
 
 /// Guard that shuts down the tracer provider when dropped
 pub struct TracingGuard {
-    _provider: Option<SdkTracerProvider>,
+    provider: Option<SdkTracerProvider>,
 }
 
 impl Drop for TracingGuard {
     fn drop(&mut self) {
-        if let Some(ref provider) = self._provider {
+        if let Some(ref provider) = self.provider {
             // Use the provider's shutdown method directly (0.31+ API)
             if let Err(e) = provider.shutdown() {
                 tracing::warn!("Error shutting down tracer provider: {:?}", e);
@@ -38,10 +38,14 @@ impl Drop for TracingGuard {
 /// Note: This function does NOT set a global tracing subscriber. It only
 /// initializes the OpenTelemetry provider. Use `create_otel_layer()` to get
 /// a layer that can be combined with other tracing-subscriber layers.
+///
+/// # Errors
+/// Returns an error if tracing is enabled but no OTLP endpoint is configured,
+/// or if the OTLP exporter or tracer provider fails to initialize.
 pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
     if !config.enabled {
         tracing::info!("OpenTelemetry tracing disabled");
-        return Ok(TracingGuard { _provider: None });
+        return Ok(TracingGuard { provider: None });
     }
 
     let endpoint = config.otlp_endpoint.as_ref().ok_or_else(|| {
@@ -90,7 +94,7 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
     );
 
     Ok(TracingGuard {
-        _provider: Some(provider),
+        provider: Some(provider),
     })
 }
 
@@ -100,6 +104,10 @@ pub fn init_tracing(config: &TracingConfig) -> Result<TracingGuard> {
 /// The returned layer can be combined with other layers using `Registry::with()`.
 ///
 /// Returns `None` if tracing is disabled in the configuration.
+///
+/// # Errors
+/// Returns an error if tracing is enabled but no OTLP endpoint is configured,
+/// or if the OTLP exporter fails to build.
 pub fn create_otel_layer(
     config: &TracingConfig,
 ) -> Result<Option<OpenTelemetryLayer<Registry, opentelemetry_sdk::trace::Tracer>>> {
@@ -156,7 +164,7 @@ mod tests {
         };
 
         let guard = init_tracing(&config).unwrap();
-        assert!(guard._provider.is_none());
+        assert!(guard.provider.is_none());
     }
 
     #[test]

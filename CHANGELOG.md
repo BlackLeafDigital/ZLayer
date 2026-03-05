@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Storage replication status API endpoint (`GET /api/v1/storage/status`): returns
+  SQLite-to-S3 replication state including enabled flag, active/disabled/error status,
+  last sync timestamp, and pending change count. Requires authentication (read-only).
+- S3-backed volume sync for container named volumes (`zlayer-agent`, `s3` feature):
+  `StorageManager` now accepts an optional `LayerSyncManager` for automatic backup/restore
+  of named volumes to S3. Volumes are registered and restored from S3 on first creation,
+  and synced on container stop via the new `Runtime::sync_container_volumes()` trait method.
+  New methods: `set_layer_sync()`, `ensure_volume_with_sync()`, `sync_volume()`,
+  `sync_all_volumes()`.
+
 ## [0.9.990]
 
 ### Added

@@ -1,6 +1,6 @@
-//! SQLite WAL-based replication to S3
+//! `SQLite` WAL-based replication to S3
 //!
-//! Provides automatic backup and restore of SQLite databases to S3, using WAL
+//! Provides automatic backup and restore of `SQLite` databases to S3, using WAL
 //! (Write-Ahead Logging) for incremental replication. This enables crash-tolerant
 //! persistence and cross-node database restoration.
 //!
@@ -99,9 +99,9 @@ pub struct ReplicationStatus {
     pub wal_frame_count: u64,
 }
 
-/// SQLite WAL-based replicator to S3
+/// `SQLite` WAL-based replicator to S3
 ///
-/// Monitors a SQLite database's WAL file and replicates changes to S3 for
+/// Monitors a `SQLite` database's WAL file and replicates changes to S3 for
 /// persistence and disaster recovery.
 pub struct SqliteReplicator {
     config: SqliteReplicatorConfig,
@@ -124,7 +124,7 @@ pub struct SqliteReplicator {
 }
 
 impl SqliteReplicator {
-    /// Create a new SQLite replicator
+    /// Create a new `SQLite` replicator
     ///
     /// # Arguments
     ///
@@ -244,13 +244,13 @@ impl SqliteReplicator {
         *self.wal_monitor.lock().await = Some(wal_monitor);
 
         // Start WAL monitoring task
-        self.spawn_wal_monitor_task().await;
+        self.spawn_wal_monitor_task();
 
         // Start cache upload worker
-        self.spawn_upload_worker().await;
+        self.spawn_upload_worker();
 
         // Start periodic snapshot task
-        self.spawn_snapshot_task().await;
+        self.spawn_snapshot_task();
 
         info!("SQLite replicator started");
         Ok(())
@@ -306,11 +306,17 @@ impl SqliteReplicator {
     /// - `Ok(true)` if a backup was found and restored
     /// - `Ok(false)` if no backup was found in S3
     /// - `Err(_)` if restore failed
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if downloading the snapshot or WAL segments fails, or
+    /// if applying them to reconstruct the database fails.
     pub async fn restore(&self) -> Result<bool> {
         self.restore_manager.restore().await
     }
 
     /// Get current replication status
+    #[must_use]
     pub fn status(&self) -> ReplicationStatus {
         let cache = self.cache.clone();
 
@@ -366,7 +372,7 @@ impl SqliteReplicator {
     }
 
     /// Spawn the WAL monitoring task
-    async fn spawn_wal_monitor_task(&self) {
+    fn spawn_wal_monitor_task(&self) {
         let running = self.running.clone();
         let wal_monitor = self.wal_monitor.clone();
         let cache = self.cache.clone();
@@ -414,7 +420,7 @@ impl SqliteReplicator {
     }
 
     /// Spawn the cache upload worker
-    async fn spawn_upload_worker(&self) {
+    fn spawn_upload_worker(&self) {
         let running = self.running.clone();
         let cache = self.cache.clone();
         let s3_backend = self.s3_backend.clone();
@@ -467,7 +473,7 @@ impl SqliteReplicator {
     }
 
     /// Spawn the periodic snapshot task
-    async fn spawn_snapshot_task(&self) {
+    fn spawn_snapshot_task(&self) {
         let running = self.running.clone();
         let interval = tokio::time::Duration::from_secs(self.config.snapshot_interval_secs);
         let db_path = self.config.db_path.clone();

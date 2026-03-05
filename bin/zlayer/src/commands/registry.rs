@@ -6,6 +6,7 @@ use crate::cli::Cli;
 use crate::util::parse_image_reference;
 
 /// Handle export command - export image to OCI tar archive
+#[allow(clippy::cast_precision_loss)]
 pub(crate) async fn handle_export(cli: &Cli, image: &str, output: &Path, gzip: bool) -> Result<()> {
     use zlayer_registry::{export_image, LocalRegistry};
 
@@ -38,6 +39,7 @@ pub(crate) async fn handle_export(cli: &Cli, image: &str, output: &Path, gzip: b
 }
 
 /// Handle import command - import image from OCI tar archive
+#[allow(clippy::cast_precision_loss)]
 pub(crate) async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) -> Result<()> {
     use zlayer_registry::{import_image, LocalRegistry};
 
@@ -57,18 +59,19 @@ pub(crate) async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) 
     println!("  Digest: {}", import_info.digest);
     println!("  Layers: {}", import_info.layers);
     if let Some(tag) = import_info.tag {
-        println!("  Tagged as: {}", tag);
+        println!("  Tagged as: {tag}");
     }
 
     Ok(())
 }
 
 /// Handle pull command - pull an image from a remote registry to local cache
+#[allow(clippy::cast_precision_loss)]
 pub(crate) async fn handle_pull(image: &str, cli_data_dir: &std::path::Path) -> Result<()> {
     use zlayer_registry::{BlobCache, ImagePuller, LocalRegistry, RegistryAuth};
 
     info!(image = %image, "Pulling image from registry");
-    println!("Pulling {}...", image);
+    println!("Pulling {image}...");
 
     // Set up directories
     let data_dir = cli_data_dir.to_path_buf();
@@ -103,7 +106,7 @@ pub(crate) async fn handle_pull(image: &str, cli_data_dir: &std::path::Path) -> 
     // Calculate total size
     let total_size: i64 = manifest.layers.iter().map(|l| l.size).sum();
     let total_mb = total_size as f64 / 1024.0 / 1024.0;
-    println!("  Total size: {:.2} MB", total_mb);
+    println!("  Total size: {total_mb:.2} MB");
 
     // Pull all layers
     println!("\nPulling layers...");
@@ -154,8 +157,8 @@ pub(crate) async fn handle_pull(image: &str, cli_data_dir: &std::path::Path) -> 
         .context("Failed to store manifest")?;
 
     println!("\nPull complete!");
-    println!("  Image: {}:{}", name, tag);
-    println!("  Digest: {}", manifest_digest);
+    println!("  Image: {name}:{tag}");
+    println!("  Digest: {manifest_digest}");
     println!("  Layers: {}", layers.len());
 
     Ok(())

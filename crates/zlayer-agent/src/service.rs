@@ -33,6 +33,8 @@ pub struct ServiceInstance {
     proxy_manager: Option<Arc<ProxyManager>>,
     /// DNS server for service discovery (optional)
     dns_server: Option<Arc<DnsServer>>,
+    /// Shared health states map so callbacks can update ServiceManager-level health
+    health_states: Option<Arc<RwLock<HashMap<String, HealthState>>>>,
 }
 
 impl ServiceInstance {
@@ -51,6 +53,7 @@ impl ServiceInstance {
             overlay_manager,
             proxy_manager: None,
             dns_server: None,
+            health_states: None,
         }
     }
 
@@ -70,10 +73,12 @@ impl ServiceInstance {
             overlay_manager,
             proxy_manager: Some(proxy_manager),
             dns_server: None,
+            health_states: None,
         }
     }
 
     /// Builder method to add DNS server for service discovery
+    #[must_use]
     pub fn with_dns(mut self, dns_server: Arc<DnsServer>) -> Self {
         self.dns_server = Some(dns_server);
         self
@@ -89,11 +94,20 @@ impl ServiceInstance {
         self.proxy_manager = Some(proxy_manager);
     }
 
+    /// Set the shared health states map so health callbacks can bridge state back to `ServiceManager`
+    pub fn set_health_states(&mut self, states: Arc<RwLock<HashMap<String, HealthState>>>) {
+        self.health_states = Some(states);
+    }
+
     /// Scale to the desired number of replicas
     ///
     /// This method uses short-lived locks to avoid blocking concurrent operations.
     /// I/O operations (pull, create, start, stop, remove) are performed without
     /// holding the containers lock to allow other operations to proceed.
+    ///
+    /// # Errors
+    /// Returns an error if image pull, container creation, or container lifecycle operations fail.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     pub async fn scale_to(&self, replicas: u32) -> Result<()> {
         // Phase 1: Determine current state (short read lock)
         let current_replicas = { self.containers.read().await.len() as u32 }; // Lock released here
@@ -324,17 +338,24 @@ impl ServiceInstance {
                                             Protocol::Http | Protocol::Https | Protocol::Websocket
                                         )
                                     })
-                                    .map(|ep| ep.target_port())
-                                    .unwrap_or(8080)
+                                    .map_or(8080, zlayer_spec::EndpointSpec::target_port)
                             });
                         }
                     }
 
+                    let start_grace = self
+                        .spec
+                        .health
+                        .start_grace
+                        .unwrap_or(Duration::from_secs(5));
+                    let check_timeout = self.spec.health.timeout.unwrap_or(Duration::from_secs(5));
                     let interval = self.spec.health.interval.unwrap_or(Duration::from_secs(10));
                     let retries = self.spec.health.retries;
 
                     let checker = HealthChecker::new(check, effective_ip);
-                    let mut monitor = HealthMonitor::new(id.clone(), checker, interval, retries);
+                    let mut monitor = HealthMonitor::new(id.clone(), checker, interval, retries)
+                        .with_start_grace(start_grace)
+                        .with_check_timeout(check_timeout);
 
                     // Create health callback to update proxy backend health if proxy is configured
                     // and we have an overlay IP for this container
@@ -354,8 +375,7 @@ impl ServiceInstance {
                                         Protocol::Http | Protocol::Https | Protocol::Websocket
                                     )
                                 })
-                                .map(|ep| ep.target_port())
-                                .unwrap_or(8080)
+                                .map_or(8080, zlayer_spec::EndpointSpec::target_port)
                         });
 
                         let backend_addr = SocketAddr::new(ip, port);
@@ -364,6 +384,9 @@ impl ServiceInstance {
                         // This must happen before the health callback is created, because
                         // update_backend_health only updates *existing* backends.
                         proxy.add_backend(&self.service_name, backend_addr).await;
+
+                        let health_states_opt = self.health_states.clone();
+                        let svc_name_for_states = self.service_name.clone();
 
                         let health_callback: HealthCallback =
                             Arc::new(move |container_id: ContainerId, is_healthy: bool| {
@@ -386,6 +409,22 @@ impl ServiceInstance {
                                         )
                                         .await;
                                 });
+                                // Bridge health state back to ServiceManager's health_states map
+                                if let Some(ref health_states) = health_states_opt {
+                                    let states = Arc::clone(health_states);
+                                    let svc = svc_name_for_states.clone();
+                                    tokio::spawn(async move {
+                                        let state = if is_healthy {
+                                            HealthState::Healthy
+                                        } else {
+                                            HealthState::Unhealthy {
+                                                failures: 0,
+                                                reason: "health check failed".into(),
+                                            }
+                                        };
+                                        states.write().await.insert(svc, state);
+                                    });
+                                }
                             });
 
                         monitor = monitor.with_callback(health_callback);
@@ -461,6 +500,15 @@ impl ServiceInstance {
                     self.runtime
                         .stop_container(&id, Duration::from_secs(30))
                         .await?;
+
+                    // Sync volumes to S3 before removal (no-op if not configured)
+                    if let Err(e) = self.runtime.sync_container_volumes(&id).await {
+                        tracing::warn!(
+                            container = %id,
+                            error = %e,
+                            "failed to sync volumes before removal"
+                        );
+                    }
 
                     // Remove container
                     self.runtime.remove_container(&id).await?;
@@ -578,48 +626,56 @@ impl ServiceManagerBuilder {
     }
 
     /// Set the overlay network manager for container networking.
+    #[must_use]
     pub fn overlay_manager(mut self, om: Arc<RwLock<OverlayManager>>) -> Self {
         self.overlay_manager = Some(om);
         self
     }
 
     /// Set the proxy manager for health-aware load balancing.
+    #[must_use]
     pub fn proxy_manager(mut self, pm: Arc<ProxyManager>) -> Self {
         self.proxy_manager = Some(pm);
         self
     }
 
     /// Set the stream registry for TCP/UDP L4 proxy route registration.
+    #[must_use]
     pub fn stream_registry(mut self, sr: Arc<StreamRegistry>) -> Self {
         self.stream_registry = Some(sr);
         self
     }
 
     /// Set the DNS server for service discovery.
+    #[must_use]
     pub fn dns_server(mut self, dns: Arc<DnsServer>) -> Self {
         self.dns_server = Some(dns);
         self
     }
 
     /// Set the deployment name (used for hostname generation).
+    #[must_use]
     pub fn deployment_name(mut self, name: impl Into<String>) -> Self {
         self.deployment_name = Some(name.into());
         self
     }
 
     /// Set the job executor for run-to-completion workloads.
+    #[must_use]
     pub fn job_executor(mut self, je: Arc<JobExecutor>) -> Self {
         self.job_executor = Some(je);
         self
     }
 
     /// Set the cron scheduler for time-based job triggers.
+    #[must_use]
     pub fn cron_scheduler(mut self, cs: Arc<CronScheduler>) -> Self {
         self.cron_scheduler = Some(cs);
         self
     }
 
     /// Set the container supervisor for crash/panic policy enforcement.
+    #[must_use]
     pub fn container_supervisor(mut self, cs: Arc<ContainerSupervisor>) -> Self {
         self.container_supervisor = Some(cs);
         self
@@ -628,7 +684,7 @@ impl ServiceManagerBuilder {
     /// Consume the builder and produce a fully-wired [`ServiceManager`].
     ///
     /// Logs warnings for missing recommended subsystems (proxy,
-    /// stream_registry, container_supervisor, deployment_name).
+    /// `stream_registry`, `container_supervisor`, `deployment_name`).
     pub fn build(self) -> ServiceManager {
         if self.proxy_manager.is_none() {
             tracing::warn!("ServiceManager built without proxy_manager");
@@ -766,6 +822,7 @@ impl ServiceManager {
 
     /// Builder pattern: add stream registry for L4 proxy integration
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_stream_registry(mut self, registry: Arc<StreamRegistry>) -> Self {
         self.stream_registry = Some(registry);
         self
@@ -790,6 +847,7 @@ impl ServiceManager {
 
     /// Builder pattern: add proxy manager for health-aware load balancing
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_proxy_manager(mut self, proxy: Arc<ProxyManager>) -> Self {
         self.proxy_manager = Some(proxy);
         self
@@ -808,6 +866,7 @@ impl ServiceManager {
 
     /// Builder pattern: add DNS server for service discovery
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_dns_server(mut self, dns: Arc<DnsServer>) -> Self {
         self.dns_server = Some(dns);
         self
@@ -832,6 +891,7 @@ impl ServiceManager {
 
     /// Builder pattern: add job executor
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_job_executor(mut self, executor: Arc<JobExecutor>) -> Self {
         self.job_executor = Some(executor);
         self
@@ -839,6 +899,7 @@ impl ServiceManager {
 
     /// Builder pattern: add cron scheduler
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_cron_scheduler(mut self, scheduler: Arc<CronScheduler>) -> Self {
         self.cron_scheduler = Some(scheduler);
         self
@@ -862,6 +923,7 @@ impl ServiceManager {
 
     /// Builder pattern: add container supervisor
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_container_supervisor(mut self, supervisor: Arc<ContainerSupervisor>) -> Self {
         self.container_supervisor = Some(supervisor);
         self
@@ -877,8 +939,11 @@ impl ServiceManager {
     /// This spawns a background task that monitors containers for crashes
     /// and enforces the `on_panic` error policy.
     ///
+    /// # Errors
+    /// Returns an error if no container supervisor is configured.
+    ///
     /// # Returns
-    /// A JoinHandle for the supervisor task, or an error if no supervisor is configured
+    /// A `JoinHandle` for the supervisor task.
     pub fn start_container_supervisor(&self) -> Result<tokio::task::JoinHandle<()>> {
         let supervisor = self.container_supervisor.as_ref().ok_or_else(|| {
             AgentError::Configuration("Container supervisor not configured".to_string())
@@ -937,7 +1002,7 @@ impl ServiceManager {
     ///
     /// # Errors
     /// - Returns `AgentError::InvalidSpec` if there are cyclic dependencies
-    /// - Returns `AgentError::DependencyTimeout` if a dependency times out with on_timeout: fail
+    /// - Returns `AgentError::DependencyTimeout` if a dependency times out with `on_timeout`: fail
     pub async fn deploy_with_dependencies(
         &self,
         services: HashMap<String, ServiceSpec>,
@@ -960,9 +1025,9 @@ impl ServiceManager {
 
         // Start services in dependency order
         for service_name in order {
-            let service_spec = services.get(service_name).ok_or_else(|| {
-                AgentError::Internal(format!("Service {} not found", service_name))
-            })?;
+            let service_spec = services
+                .get(service_name)
+                .ok_or_else(|| AgentError::Internal(format!("Service {service_name} not found")))?;
 
             // Wait for dependencies first
             if !service_spec.depends.is_empty() {
@@ -1011,7 +1076,7 @@ impl ServiceManager {
     /// * `deps` - Slice of dependency specifications
     ///
     /// # Errors
-    /// Returns `AgentError::DependencyTimeout` if any dependency with on_timeout: fail times out
+    /// Returns `AgentError::DependencyTimeout` if any dependency with `on_timeout`: fail times out
     async fn wait_for_dependencies(&self, service: &str, deps: &[DependsSpec]) -> Result<()> {
         let condition_checker = DependencyConditionChecker::new(
             Arc::clone(&self.runtime),
@@ -1033,7 +1098,7 @@ impl ServiceManager {
                     return Err(AgentError::DependencyTimeout {
                         service: service.to_string(),
                         dependency: dep_service,
-                        condition: format!("{:?}", condition),
+                        condition: format!("{condition:?}"),
                         timeout,
                     });
                 }
@@ -1048,11 +1113,8 @@ impl ServiceManager {
                         "Dependency timed out but continuing"
                     );
                 }
-                WaitResult::TimedOutContinue => {
-                    // Silently continue
-                }
-                WaitResult::Satisfied => {
-                    // Good, dependency is satisfied
+                WaitResult::TimedOutContinue | WaitResult::Satisfied => {
+                    // Continue silently
                 }
             }
         }
@@ -1063,6 +1125,9 @@ impl ServiceManager {
     /// Check if all dependencies for a service are currently satisfied
     ///
     /// This is a one-shot check (no waiting). Useful for pre-flight validation.
+    ///
+    /// # Errors
+    /// Returns an error if a dependency check fails unexpectedly.
     pub async fn check_dependencies(&self, deps: &[DependsSpec]) -> Result<bool> {
         let condition_checker = DependencyConditionChecker::new(
             Arc::clone(&self.runtime),
@@ -1085,6 +1150,9 @@ impl ServiceManager {
     /// - **Service**: Traditional long-running containers with scaling and health checks
     /// - **Job**: Run-to-completion workloads triggered on-demand (stores spec for later)
     /// - **Cron**: Scheduled run-to-completion workloads (registers with cron scheduler)
+    ///
+    /// # Errors
+    /// Returns an error if service creation, scaling, or cron registration fails.
     pub async fn upsert_service(&self, name: String, spec: ServiceSpec) -> Result<()> {
         match spec.rtype {
             ResourceType::Service => {
@@ -1116,6 +1184,8 @@ impl ServiceManager {
                     if let Some(dns) = &self.dns_server {
                         instance.set_dns_server(Arc::clone(dns));
                     }
+                    // Wire shared health states so callbacks bridge back to ServiceManager
+                    instance.set_health_states(Arc::clone(&self.health_states));
                     // Register HTTP routes via proxy manager
                     if let Some(proxy) = &self.proxy_manager {
                         proxy.add_service(&name, &instance.spec).await;
@@ -1190,8 +1260,7 @@ impl ServiceManager {
                     tracing::info!(cron = %name, "Registered cron job with scheduler");
                 } else {
                     return Err(AgentError::Configuration(format!(
-                        "Cron scheduler not configured for cron job '{}'",
-                        name
+                        "Cron scheduler not configured for cron job '{name}'"
                     )));
                 }
             }
@@ -1200,14 +1269,14 @@ impl ServiceManager {
         Ok(())
     }
 
-    /// Update backend addresses via ProxyManager after scaling
+    /// Update backend addresses via `ProxyManager` after scaling
     async fn update_proxy_backends(&self, service_name: &str, addrs: Vec<SocketAddr>) {
         if let Some(proxy) = &self.proxy_manager {
             proxy.update_backends(service_name, addrs).await;
         }
     }
 
-    /// Update backend addresses in the StreamRegistry for TCP/UDP endpoints after scaling
+    /// Update backend addresses in the `StreamRegistry` for TCP/UDP endpoints after scaling
     ///
     /// For containers with a port override (macOS sandbox), the addresses already
     /// carry the runtime-assigned port. In that case, the container listens on the
@@ -1232,8 +1301,7 @@ impl ServiceManager {
                     Protocol::Http | Protocol::Https | Protocol::Websocket
                 )
             })
-            .map(|ep| ep.target_port())
-            .unwrap_or(8080);
+            .map_or(8080, zlayer_spec::EndpointSpec::target_port);
 
         let has_port_overrides = addrs.iter().any(|addr| addr.port() != primary_spec_port);
 
@@ -1287,6 +1355,10 @@ impl ServiceManager {
     }
 
     /// Scale a service to desired replica count
+    ///
+    /// # Errors
+    /// Returns an error if the service is not found or scaling fails.
+    #[allow(clippy::cast_possible_truncation)]
     pub async fn scale_service(&self, name: &str, replicas: u32) -> Result<()> {
         let _permit = self.scale_semaphore.acquire().await;
 
@@ -1374,8 +1446,7 @@ impl ServiceManager {
                     Protocol::Http | Protocol::Https | Protocol::Websocket
                 )
             })
-            .map(|ep| ep.target_port())
-            .unwrap_or(8080);
+            .map_or(8080, zlayer_spec::EndpointSpec::target_port);
 
         // Collect backend addresses from containers with overlay IPs
         let containers = instance.containers().read().await;
@@ -1403,6 +1474,9 @@ impl ServiceManager {
     }
 
     /// Get service replica count
+    ///
+    /// # Errors
+    /// Returns an error if the service is not found.
     pub async fn service_replica_count(&self, name: &str) -> Result<usize> {
         let services = self.services.read().await;
         let instance = services.get(name).ok_or_else(|| AgentError::NotFound {
@@ -1419,6 +1493,9 @@ impl ServiceManager {
     /// - **Service**: Unregisters proxy routes, supervisor, and removes from service map
     /// - **Job**: Unregisters from job executor
     /// - **Cron**: Unregisters from cron scheduler
+    ///
+    /// # Errors
+    /// Returns an error if the service cannot be removed or scale-down fails.
     pub async fn remove_service(&self, name: &str) -> Result<()> {
         // Try to unregister from cron scheduler first
         if let Some(scheduler) = &self.cron_scheduler {
@@ -1438,7 +1515,7 @@ impl ServiceManager {
                 for endpoint in &instance.spec.endpoints {
                     match endpoint.protocol {
                         Protocol::Tcp => {
-                            stream_registry.unregister_tcp(endpoint.port);
+                            let _ = stream_registry.unregister_tcp(endpoint.port);
                             tracing::debug!(
                                 service = %name,
                                 port = endpoint.port,
@@ -1446,7 +1523,7 @@ impl ServiceManager {
                             );
                         }
                         Protocol::Udp => {
-                            stream_registry.unregister_udp(endpoint.port);
+                            let _ = stream_registry.unregister_udp(endpoint.port);
                             tracing::debug!(
                                 service = %name,
                                 port = endpoint.port,
@@ -1472,7 +1549,7 @@ impl ServiceManager {
         // Clean up DNS records for the service
         if let Some(dns) = &self.dns_server {
             // Remove the service-level DNS entry
-            let service_hostname = format!("{}.service.local", name);
+            let service_hostname = format!("{name}.service.local");
             if let Err(e) = dns.remove_record(&service_hostname).await {
                 tracing::warn!(
                     hostname = %service_hostname,
@@ -1514,7 +1591,7 @@ impl ServiceManager {
     }
 
     /// Introspect service infrastructure wiring.
-    /// Returns (has_overlay, has_proxy, has_dns), or None if service not found.
+    /// Returns (`has_overlay`, `has_proxy`, `has_dns`), or None if service not found.
     pub async fn service_infrastructure(&self, name: &str) -> Option<(bool, bool, bool)> {
         let services = self.services.read().await;
         services.get(name).map(|i| {
@@ -1537,6 +1614,9 @@ impl ServiceManager {
     /// * `service_name` - Name of the service to fetch logs for
     /// * `tail` - Number of lines to return (0 = all)
     /// * `instance` - Optional specific instance (container ID suffix like "1", "2")
+    ///
+    /// # Errors
+    /// Returns an error if the service or instance is not found.
     ///
     /// # Returns
     /// Combined log output from all (or specific) container replicas as a string.
@@ -1584,7 +1664,7 @@ impl ServiceManager {
 
         for id in &target_ids {
             let header = if target_ids.len() > 1 {
-                format!("==> {} <==\n", id)
+                format!("==> {id} <==\n")
             } else {
                 String::new()
             };
@@ -1600,8 +1680,9 @@ impl ServiceManager {
                     }
                 }
                 Err(e) => {
+                    use std::fmt::Write;
                     combined.push_str(&header);
-                    combined.push_str(&format!("[error reading logs: {}]\n", e));
+                    let _ = writeln!(combined, "[error reading logs: {e}]");
                 }
             }
         }
@@ -1626,7 +1707,7 @@ impl ServiceManager {
     /// * `service_name` - Name of the service to query
     ///
     /// # Returns
-    /// Vector of ContainerIds for all replicas of the service
+    /// Vector of `ContainerIds` for all replicas of the service
     pub async fn get_service_containers(&self, service_name: &str) -> Vec<ContainerId> {
         let services = self.services.read().await;
         if let Some(instance) = services.get(service_name) {
@@ -1645,8 +1726,15 @@ impl ServiceManager {
     /// * `replica` - Optional replica number to target
     /// * `cmd` - Command and arguments to execute
     ///
+    /// # Errors
+    /// Returns an error if the service or replica is not found, or if exec fails.
+    ///
+    /// # Panics
+    /// Panics if no replica is specified and the container list is unexpectedly empty
+    /// after the emptiness check (should not happen in practice).
+    ///
     /// # Returns
-    /// Tuple of (exit_code, stdout, stderr)
+    /// Tuple of (`exit_code`, stdout, stderr)
     pub async fn exec_in_container(
         &self,
         service_name: &str,
@@ -1668,8 +1756,8 @@ impl ServiceManager {
                 .into_iter()
                 .find(|cid| cid.replica == rep)
                 .ok_or_else(|| AgentError::NotFound {
-                    container: format!("{}-rep-{}", service_name, rep),
-                    reason: format!("replica {} not found for service", rep),
+                    container: format!("{service_name}-rep-{rep}"),
+                    reason: format!("replica {rep} not found for service"),
                 })?
         } else {
             // Use the first container (lowest replica number)
@@ -1799,7 +1887,7 @@ impl ServiceManager {
     /// Start the cron scheduler background task
     ///
     /// This spawns a background task that checks for due cron jobs every second.
-    /// Returns a JoinHandle that can be used to wait for the scheduler to stop.
+    /// Returns a `JoinHandle` that can be used to wait for the scheduler to stop.
     ///
     /// # Errors
     /// Returns error if cron scheduler is not configured
@@ -1908,7 +1996,7 @@ mod tests {
     }
 
     fn mock_spec() -> ServiceSpec {
-        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2186,7 +2274,7 @@ services:
     // ==================== Job/Cron Integration Tests ====================
 
     fn mock_job_spec() -> ServiceSpec {
-        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2204,7 +2292,7 @@ services:
     }
 
     fn mock_cron_spec() -> ServiceSpec {
-        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2528,7 +2616,7 @@ services:
     // ==================== Stream Registry Integration Tests ====================
 
     fn mock_tcp_spec() -> ServiceSpec {
-        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2553,7 +2641,7 @@ services:
     }
 
     fn mock_udp_spec() -> ServiceSpec {
-        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2578,7 +2666,7 @@ services:
     }
 
     fn mock_mixed_spec() -> ServiceSpec {
-        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test

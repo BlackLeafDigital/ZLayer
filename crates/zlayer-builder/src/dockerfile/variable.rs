@@ -28,6 +28,8 @@ use std::collections::HashMap;
 /// # Returns
 ///
 /// The string with all variables expanded
+#[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn expand_variables(
     input: &str,
     args: &HashMap<String, String>,
@@ -130,7 +132,7 @@ fn expand_braced_variable(
                 if let Some(&next) = chars.peek() {
                     if next == '-' || next == '+' {
                         chars.next();
-                        operator = Some(format!(":{}", next));
+                        operator = Some(format!(":{next}"));
                         in_default = true;
                         continue;
                     }
@@ -204,6 +206,8 @@ fn lookup_variable(
 }
 
 /// Expands variables in a list of strings
+#[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn expand_variables_in_list(
     inputs: &[String],
     args: &HashMap<String, String>,
@@ -230,11 +234,13 @@ pub struct VariableContext {
 
 impl VariableContext {
     /// Create a new variable context
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Create with build-time arguments
+    #[must_use]
     pub fn with_build_args(build_args: HashMap<String, String>) -> Self {
         Self {
             build_args,
@@ -256,6 +262,7 @@ impl VariableContext {
     }
 
     /// Get the effective ARG values (build-time overrides defaults)
+    #[must_use]
     pub fn effective_args(&self) -> HashMap<String, String> {
         let mut result = self.arg_defaults.clone();
         for (k, v) in &self.build_args {
@@ -265,11 +272,13 @@ impl VariableContext {
     }
 
     /// Expand variables in a string using the current context
+    #[must_use]
     pub fn expand(&self, input: &str) -> String {
         expand_variables(input, &self.effective_args(), &self.env_vars)
     }
 
     /// Expand variables in a list of strings
+    #[must_use]
     pub fn expand_list(&self, inputs: &[String]) -> Vec<String> {
         expand_variables_in_list(inputs, &self.effective_args(), &self.env_vars)
     }

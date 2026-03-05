@@ -32,7 +32,7 @@ pub struct UdpListenerConfig {
     #[serde(default)]
     pub protocol_hint: Option<String>,
 
-    /// Session timeout override (default uses global udp_session_timeout)
+    /// Session timeout override (default uses global `udp_session_timeout`)
     #[serde(default, with = "optional_duration_serde")]
     pub session_timeout: Option<Duration>,
 }
@@ -45,6 +45,7 @@ mod optional_duration_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::Duration;
 
+    #[allow(clippy::ref_option)]
     pub fn serialize<S>(value: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,

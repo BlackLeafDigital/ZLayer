@@ -31,10 +31,5 @@ check-all = "check --workspace --all-targets"
 test-all = "test --workspace"
 clippy-all = "clippy --workspace --all-targets -- -D warnings"
 
-# Feature-specific builds
-build-agent = "build --package zlayer --no-default-features --features join"
-build-server = "build --package zlayer --no-default-features --features serve"
-build-deploy = "build --package zlayer --no-default-features --features deploy"
-
 [patch.crates-io]
 # You can add patches here if needed for development

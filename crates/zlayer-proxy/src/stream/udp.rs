@@ -35,6 +35,7 @@ pub struct UdpStreamService {
 
 impl UdpStreamService {
     /// Create a new UDP stream service
+    #[must_use]
     pub fn new(
         registry: Arc<StreamRegistry>,
         listen_port: u16,
@@ -48,16 +49,19 @@ impl UdpStreamService {
     }
 
     /// Get the listen port
+    #[must_use]
     pub fn port(&self) -> u16 {
         self.listen_port
     }
 
     /// Get the session timeout
+    #[must_use]
     pub fn session_timeout(&self) -> Duration {
         self.session_timeout
     }
 
     /// Get a reference to the registry
+    #[must_use]
     pub fn registry(&self) -> &Arc<StreamRegistry> {
         &self.registry
     }
@@ -66,6 +70,11 @@ impl UdpStreamService {
     ///
     /// This method runs indefinitely, proxying UDP datagrams between
     /// clients and backends. Each client address gets its own session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding to the listen port fails or if the
+    /// main receive loop encounters a fatal IO error.
     pub async fn run(self: Arc<Self>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Bind to listen port
         let listen_addr = format!("0.0.0.0:{}", self.listen_port);
@@ -83,6 +92,12 @@ impl UdpStreamService {
     ///
     /// Runs indefinitely, proxying UDP datagrams between clients and backends.
     /// Each client address gets its own session with a dedicated backend socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the main receive loop encounters a fatal IO error
+    /// or if creating a backend session socket fails.
+    #[allow(clippy::too_many_lines)]
     pub async fn serve(
         self: Arc<Self>,
         socket: UdpSocket,
@@ -148,29 +163,23 @@ impl UdpStreamService {
                 existing.backend
             } else {
                 // Create new session
-                let service = match self.registry.resolve_udp(self.listen_port) {
-                    Some(s) => s,
-                    None => {
-                        tracing::warn!(
-                            port = self.listen_port,
-                            client = %client_addr,
-                            "No service registered for UDP port"
-                        );
-                        continue;
-                    }
+                let Some(service) = self.registry.resolve_udp(self.listen_port) else {
+                    tracing::warn!(
+                        port = self.listen_port,
+                        client = %client_addr,
+                        "No service registered for UDP port"
+                    );
+                    continue;
                 };
 
-                let backend = match service.select_backend() {
-                    Some(b) => b,
-                    None => {
-                        tracing::warn!(
-                            port = self.listen_port,
-                            service = %service.name,
-                            client = %client_addr,
-                            "No backends available for UDP service"
-                        );
-                        continue;
-                    }
+                let Some(backend) = service.select_backend() else {
+                    tracing::warn!(
+                        port = self.listen_port,
+                        service = %service.name,
+                        client = %client_addr,
+                        "No backends available for UDP service"
+                    );
+                    continue;
                 };
 
                 // Create dedicated socket for this session's backend communication

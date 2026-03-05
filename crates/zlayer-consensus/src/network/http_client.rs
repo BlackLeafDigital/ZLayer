@@ -33,18 +33,35 @@ use crate::types::NodeId;
 /// HTTP client for Raft RPCs using **bincode** serialization.
 ///
 /// Maintains separate timeout configurations for regular RPCs and
-/// snapshot transfers.
+/// snapshot transfers.  Optionally attaches a bearer token to every
+/// outgoing request for authentication against the Raft service.
 #[derive(Clone)]
 pub struct RaftHttpClient {
-    /// Client for regular RPCs (vote, append_entries).
+    /// Client for regular RPCs (vote, `append_entries`).
     rpc_client: Client,
     /// Client for snapshot transfers (longer timeout).
     snapshot_client: Client,
+    /// Optional bearer token for Raft RPC authentication.
+    auth_token: Option<String>,
 }
 
 impl RaftHttpClient {
-    /// Create a new client with the specified timeouts.
+    /// Create a new client with the specified timeouts and no auth token.
+    #[must_use]
     pub fn new(rpc_timeout: Duration, snapshot_timeout: Duration) -> Self {
+        Self::with_auth(rpc_timeout, snapshot_timeout, None)
+    }
+
+    /// Create a new client with the specified timeouts and an optional auth token.
+    ///
+    /// # Panics
+    /// Panics if the HTTP client builders fail to build (should not happen in practice).
+    #[must_use]
+    pub fn with_auth(
+        rpc_timeout: Duration,
+        snapshot_timeout: Duration,
+        auth_token: Option<String>,
+    ) -> Self {
         let rpc_client = Client::builder()
             .timeout(rpc_timeout)
             .pool_max_idle_per_host(10)
@@ -62,6 +79,7 @@ impl RaftHttpClient {
         Self {
             rpc_client,
             snapshot_client,
+            auth_token,
         }
     }
 
@@ -70,6 +88,7 @@ impl RaftHttpClient {
         client: &Client,
         url: &str,
         request: &Req,
+        auth_token: Option<&str>,
     ) -> Result<Resp, String>
     where
         Req: serde::Serialize,
@@ -78,21 +97,23 @@ impl RaftHttpClient {
         let body =
             bincode::serialize(request).map_err(|e| format!("bincode serialize error: {e}"))?;
 
-        let response = client
+        let mut builder = client
             .post(url)
-            .header("Content-Type", "application/octet-stream")
-            .body(body)
-            .send()
-            .await
-            .map_err(|e| {
-                if e.is_timeout() {
-                    format!("timeout: {e}")
-                } else if e.is_connect() {
-                    format!("unreachable: {e}")
-                } else {
-                    format!("http error: {e}")
-                }
-            })?;
+            .header("Content-Type", "application/octet-stream");
+
+        if let Some(token) = auth_token {
+            builder = builder.header("Authorization", format!("Bearer {token}"));
+        }
+
+        let response = builder.body(body).send().await.map_err(|e| {
+            if e.is_timeout() {
+                format!("timeout: {e}")
+            } else if e.is_connect() {
+                format!("unreachable: {e}")
+            } else {
+                format!("http error: {e}")
+            }
+        })?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -131,11 +152,13 @@ pub struct HttpNetwork<C: RaftTypeConfig<NodeId = NodeId>> {
 
 impl<C: RaftTypeConfig<NodeId = NodeId>> HttpNetwork<C> {
     /// Create a new network layer with default timeouts (5s RPC, 60s snapshot).
+    #[must_use]
     pub fn new() -> Self {
         Self::with_client(RaftHttpClient::default())
     }
 
     /// Create a new network layer with a custom client.
+    #[must_use]
     pub fn with_client(client: RaftHttpClient) -> Self {
         Self {
             peers: Arc::new(RwLock::new(HashMap::new())),
@@ -145,8 +168,23 @@ impl<C: RaftTypeConfig<NodeId = NodeId>> HttpNetwork<C> {
     }
 
     /// Create a new network layer with custom timeouts.
+    #[must_use]
     pub fn with_timeouts(rpc_timeout: Duration, snapshot_timeout: Duration) -> Self {
         Self::with_client(RaftHttpClient::new(rpc_timeout, snapshot_timeout))
+    }
+
+    /// Create a new network layer with custom timeouts and an optional auth token.
+    #[must_use]
+    pub fn with_timeouts_and_auth(
+        rpc_timeout: Duration,
+        snapshot_timeout: Duration,
+        auth_token: Option<String>,
+    ) -> Self {
+        Self::with_client(RaftHttpClient::with_auth(
+            rpc_timeout,
+            snapshot_timeout,
+            auth_token,
+        ))
     }
 
     /// Add a peer address.
@@ -194,6 +232,7 @@ where
         HttpConnection {
             target_addr: node.addr.clone(),
             client: Arc::clone(&self.client),
+            auth_token: self.client.auth_token.clone(),
             _phantom: std::marker::PhantomData,
         }
     }
@@ -203,6 +242,8 @@ where
 pub struct HttpConnection<C: RaftTypeConfig<NodeId = NodeId>> {
     target_addr: String,
     client: Arc<RaftHttpClient>,
+    /// Optional bearer token for authenticating outgoing RPCs.
+    auth_token: Option<String>,
     _phantom: std::marker::PhantomData<C>,
 }
 
@@ -215,7 +256,7 @@ fn normalize_addr(addr: &str) -> String {
     }
 }
 
-/// Convert a string error to an RPCError::Unreachable.
+/// Convert a string error to an `RPCError::Unreachable`.
 fn to_unreachable<E: std::error::Error>(msg: String) -> RPCError<NodeId, BasicNode, E> {
     RPCError::Unreachable(Unreachable::new(&std::io::Error::other(msg)))
 }
@@ -235,9 +276,14 @@ where
         let url = format!("{}/raft/append", normalize_addr(&self.target_addr));
         debug!(target_addr = %self.target_addr, "Sending append_entries RPC");
 
-        RaftHttpClient::bincode_post(&self.client.rpc_client, &url, &rpc)
-            .await
-            .map_err(to_unreachable)
+        RaftHttpClient::bincode_post(
+            &self.client.rpc_client,
+            &url,
+            &rpc,
+            self.auth_token.as_deref(),
+        )
+        .await
+        .map_err(to_unreachable)
     }
 
     async fn install_snapshot(
@@ -251,9 +297,14 @@ where
         let url = format!("{}/raft/snapshot", normalize_addr(&self.target_addr));
         debug!(target_addr = %self.target_addr, "Sending install_snapshot RPC");
 
-        RaftHttpClient::bincode_post(&self.client.snapshot_client, &url, &rpc)
-            .await
-            .map_err(to_unreachable)
+        RaftHttpClient::bincode_post(
+            &self.client.snapshot_client,
+            &url,
+            &rpc,
+            self.auth_token.as_deref(),
+        )
+        .await
+        .map_err(to_unreachable)
     }
 
     async fn vote(
@@ -264,9 +315,14 @@ where
         let url = format!("{}/raft/vote", normalize_addr(&self.target_addr));
         debug!(target_addr = %self.target_addr, "Sending vote RPC");
 
-        RaftHttpClient::bincode_post(&self.client.rpc_client, &url, &rpc)
-            .await
-            .map_err(to_unreachable)
+        RaftHttpClient::bincode_post(
+            &self.client.rpc_client,
+            &url,
+            &rpc,
+            self.auth_token.as_deref(),
+        )
+        .await
+        .map_err(to_unreachable)
     }
 
     async fn full_snapshot(
@@ -276,17 +332,17 @@ where
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<NodeId>, StreamingError<C, Fatal<NodeId>>> {
-        let url = format!("{}/raft/full-snapshot", normalize_addr(&self.target_addr));
-        debug!(target_addr = %self.target_addr, "Sending full_snapshot RPC");
-
-        let snapshot_data = snapshot.snapshot.into_inner();
-
         #[derive(serde::Serialize)]
         struct FullSnapshotReq {
             vote: Vote<NodeId>,
             meta: SnapshotMeta<NodeId, BasicNode>,
             snapshot_data: Vec<u8>,
         }
+
+        let url = format!("{}/raft/full-snapshot", normalize_addr(&self.target_addr));
+        debug!(target_addr = %self.target_addr, "Sending full_snapshot RPC");
+
+        let snapshot_data = snapshot.snapshot.into_inner();
 
         let req = FullSnapshotReq {
             vote,
@@ -298,6 +354,7 @@ where
             &self.client.snapshot_client,
             &url,
             &req,
+            self.auth_token.as_deref(),
         )
         .await
         .map_err(|e| StreamingError::Unreachable(Unreachable::new(&std::io::Error::other(e))))

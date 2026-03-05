@@ -32,7 +32,7 @@ pub const DEFAULT_BUNDLE_DIR: &str = "/var/lib/zlayer/bundles";
 /// Default cache directory for image blobs
 pub const DEFAULT_CACHE_DIR: &str = "/var/lib/zlayer/cache";
 
-/// Configuration for YoukiRuntime
+/// Configuration for `YoukiRuntime`
 #[derive(Debug, Clone)]
 pub struct YoukiConfig {
     /// State directory for libcontainer container state
@@ -68,20 +68,15 @@ impl Default for YoukiConfig {
     fn default() -> Self {
         Self {
             state_dir: std::env::var("ZLAYER_STATE_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(DEFAULT_STATE_DIR)),
+                .map_or_else(|_| PathBuf::from(DEFAULT_STATE_DIR), PathBuf::from),
             rootfs_dir: std::env::var("ZLAYER_ROOTFS_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(DEFAULT_ROOTFS_DIR)),
+                .map_or_else(|_| PathBuf::from(DEFAULT_ROOTFS_DIR), PathBuf::from),
             bundle_dir: std::env::var("ZLAYER_BUNDLE_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(DEFAULT_BUNDLE_DIR)),
+                .map_or_else(|_| PathBuf::from(DEFAULT_BUNDLE_DIR), PathBuf::from),
             cache_dir: std::env::var("ZLAYER_CACHE_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from(DEFAULT_CACHE_DIR)),
+                .map_or_else(|_| PathBuf::from(DEFAULT_CACHE_DIR), PathBuf::from),
             volume_dir: std::env::var("ZLAYER_VOLUME_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| PathBuf::from("/var/lib/zlayer/volumes")),
+                .map_or_else(|_| PathBuf::from("/var/lib/zlayer/volumes"), PathBuf::from),
             use_systemd: std::env::var("ZLAYER_USE_SYSTEMD")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(false),
@@ -93,7 +88,7 @@ impl Default for YoukiConfig {
 }
 
 /// Process-global mutex to serialize libcontainer operations.
-/// libcontainer uses chdir() internally for notify socket operations
+/// libcontainer uses `chdir()` internally for notify socket operations
 /// (to work around Unix socket 108-char path limit), which affects the
 /// entire process. Concurrent container operations race on the CWD.
 /// This must be process-global, not per-runtime, since chdir affects all threads.
@@ -149,7 +144,10 @@ impl std::fmt::Debug for YoukiRuntime {
 }
 
 impl YoukiRuntime {
-    /// Create a new YoukiRuntime with the given configuration
+    /// Create a new `YoukiRuntime` with the given configuration
+    ///
+    /// # Errors
+    /// Returns an error if the required directories cannot be created.
     pub async fn new(config: YoukiConfig) -> Result<Self> {
         // Ensure directories exist
         for dir in [
@@ -170,44 +168,41 @@ impl YoukiRuntime {
         let storage_manager =
             StorageManager::new(&config.volume_dir).map_err(|e| AgentError::CreateFailed {
                 id: "runtime".to_string(),
-                reason: format!("failed to create storage manager: {}", e),
+                reason: format!("failed to create storage manager: {e}"),
             })?;
 
         // Initialize shared blob cache using CacheType configuration
         // If cache_type is provided, use it directly; otherwise use environment-based config
         // but override the path for Persistent variant to use config.cache_dir
-        let blob_cache = match &config.cache_type {
-            Some(cache_type) => cache_type
+        let blob_cache = if let Some(cache_type) = &config.cache_type {
+            cache_type
                 .build()
                 .await
                 .map_err(|e| AgentError::CreateFailed {
                     id: "runtime".to_string(),
-                    reason: format!("failed to build blob cache: {}", e),
-                })?,
-            None => {
-                let cache_type = zlayer_registry::CacheType::from_env().map_err(|e| {
-                    AgentError::CreateFailed {
-                        id: "runtime".to_string(),
-                        reason: format!("failed to read cache config from env: {}", e),
-                    }
+                    reason: format!("failed to build blob cache: {e}"),
+                })?
+        } else {
+            let cache_type =
+                zlayer_registry::CacheType::from_env().map_err(|e| AgentError::CreateFailed {
+                    id: "runtime".to_string(),
+                    reason: format!("failed to read cache config from env: {e}"),
                 })?;
-                // Override persistent path to use config.cache_dir
-                let cache_type = match cache_type {
-                    zlayer_registry::CacheType::Persistent { .. } => {
-                        zlayer_registry::CacheType::persistent_at(
-                            config.cache_dir.join("blobs.redb"),
-                        )
-                    }
-                    other => other,
-                };
-                cache_type
-                    .build()
-                    .await
-                    .map_err(|e| AgentError::CreateFailed {
-                        id: "runtime".to_string(),
-                        reason: format!("failed to build blob cache: {}", e),
-                    })?
-            }
+            // Override persistent path to use config.cache_dir
+            #[allow(clippy::match_wildcard_for_single_variants)]
+            let cache_type = match cache_type {
+                zlayer_registry::CacheType::Persistent { .. } => {
+                    zlayer_registry::CacheType::persistent_at(config.cache_dir.join("blobs.redb"))
+                }
+                other => other,
+            };
+            cache_type
+                .build()
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: "runtime".to_string(),
+                    reason: format!("failed to build blob cache: {e}"),
+                })?
         };
 
         Ok(Self {
@@ -220,12 +215,18 @@ impl YoukiRuntime {
         })
     }
 
-    /// Create a new YoukiRuntime with default configuration
+    /// Create a new `YoukiRuntime` with default configuration
+    ///
+    /// # Errors
+    /// Returns an error if the runtime cannot be initialized.
     pub async fn with_defaults() -> Result<Self> {
         Self::new(YoukiConfig::default()).await
     }
 
-    /// Create a new YoukiRuntime with custom auth configuration
+    /// Create a new `YoukiRuntime` with custom auth configuration
+    ///
+    /// # Errors
+    /// Returns an error if the runtime cannot be initialized.
     pub async fn with_auth(
         config: YoukiConfig,
         auth_config: zlayer_core::AuthConfig,
@@ -249,44 +250,41 @@ impl YoukiRuntime {
         let storage_manager =
             StorageManager::new(&config.volume_dir).map_err(|e| AgentError::CreateFailed {
                 id: "runtime".to_string(),
-                reason: format!("failed to create storage manager: {}", e),
+                reason: format!("failed to create storage manager: {e}"),
             })?;
 
         // Initialize shared blob cache using CacheType configuration
         // If cache_type is provided, use it directly; otherwise use environment-based config
         // but override the path for Persistent variant to use config.cache_dir
-        let blob_cache = match &config.cache_type {
-            Some(cache_type) => cache_type
+        let blob_cache = if let Some(cache_type) = &config.cache_type {
+            cache_type
                 .build()
                 .await
                 .map_err(|e| AgentError::CreateFailed {
                     id: "runtime".to_string(),
-                    reason: format!("failed to build blob cache: {}", e),
-                })?,
-            None => {
-                let cache_type = zlayer_registry::CacheType::from_env().map_err(|e| {
-                    AgentError::CreateFailed {
-                        id: "runtime".to_string(),
-                        reason: format!("failed to read cache config from env: {}", e),
-                    }
+                    reason: format!("failed to build blob cache: {e}"),
+                })?
+        } else {
+            let cache_type =
+                zlayer_registry::CacheType::from_env().map_err(|e| AgentError::CreateFailed {
+                    id: "runtime".to_string(),
+                    reason: format!("failed to read cache config from env: {e}"),
                 })?;
-                // Override persistent path to use config.cache_dir
-                let cache_type = match cache_type {
-                    zlayer_registry::CacheType::Persistent { .. } => {
-                        zlayer_registry::CacheType::persistent_at(
-                            config.cache_dir.join("blobs.redb"),
-                        )
-                    }
-                    other => other,
-                };
-                cache_type
-                    .build()
-                    .await
-                    .map_err(|e| AgentError::CreateFailed {
-                        id: "runtime".to_string(),
-                        reason: format!("failed to build blob cache: {}", e),
-                    })?
-            }
+            // Override persistent path to use config.cache_dir
+            #[allow(clippy::match_wildcard_for_single_variants)]
+            let cache_type = match cache_type {
+                zlayer_registry::CacheType::Persistent { .. } => {
+                    zlayer_registry::CacheType::persistent_at(config.cache_dir.join("blobs.redb"))
+                }
+                other => other,
+            };
+            cache_type
+                .build()
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: "runtime".to_string(),
+                    reason: format!("failed to build blob cache: {e}"),
+                })?
         };
 
         Ok(Self {
@@ -299,7 +297,24 @@ impl YoukiRuntime {
         })
     }
 
+    /// Configure S3-backed volume sync on the internal storage manager.
+    ///
+    /// When set, named volumes will be automatically registered with the
+    /// `LayerSyncManager` on creation and restored from S3 if a backup
+    /// exists. Volumes are synced to S3 when containers are stopped via
+    /// the `sync_container_volumes` trait method.
+    #[cfg(feature = "s3")]
+    pub async fn set_layer_sync(
+        &self,
+        sync: std::sync::Arc<zlayer_storage::sync::LayerSyncManager>,
+        service_name: impl Into<String>,
+    ) {
+        let mut storage_manager = self.storage_manager.write().await;
+        storage_manager.set_layer_sync(sync, service_name);
+    }
+
     /// Get the container ID string
+    #[allow(clippy::unused_self)]
     fn container_id_str(&self, id: &ContainerId) -> String {
         format!("{}-{}", id.service, id.replica)
     }
@@ -340,19 +355,19 @@ impl YoukiRuntime {
         if self.config.log_base_dir.is_some() {
             let container_id = self.container_id_str(id);
             (
-                log_dir.join(format!("{}.stdout.log", container_id)),
-                log_dir.join(format!("{}.stderr.log", container_id)),
+                log_dir.join(format!("{container_id}.stdout.log")),
+                log_dir.join(format!("{container_id}.stderr.log")),
             )
         } else {
             (log_dir.join("stdout.log"), log_dir.join("stderr.log"))
         }
     }
 
-    /// Map libcontainer status to our ContainerState
+    /// Map libcontainer status to our `ContainerState`
+    #[allow(clippy::unused_self)]
     fn map_status(&self, status: ContainerStatus) -> ContainerState {
         match status {
-            ContainerStatus::Creating => ContainerState::Pending,
-            ContainerStatus::Created => ContainerState::Pending,
+            ContainerStatus::Creating | ContainerStatus::Created => ContainerState::Pending,
             ContainerStatus::Running => ContainerState::Running,
             ContainerStatus::Stopped => ContainerState::Exited { code: 0 },
             ContainerStatus::Paused => ContainerState::Stopping,
@@ -365,6 +380,7 @@ impl YoukiRuntime {
     /// directory (`/var/log/zlayer/{deployment}/{service}/`) and places
     /// symlinks in the bundle's `logs/` directory so that existing code
     /// reading from the bundle still works.
+    #[allow(unsafe_code)]
     async fn create_log_files(
         &self,
         id: &ContainerId,
@@ -374,7 +390,7 @@ impl YoukiRuntime {
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: id.to_string(),
-                reason: format!("failed to create log dir: {}", e),
+                reason: format!("failed to create log dir: {e}"),
             })?;
 
         let (stdout_path, stderr_path) = self.log_paths(id);
@@ -383,14 +399,14 @@ impl YoukiRuntime {
         let stdout_file =
             std::fs::File::create(&stdout_path).map_err(|e| AgentError::CreateFailed {
                 id: id.to_string(),
-                reason: format!("failed to create stdout log: {}", e),
+                reason: format!("failed to create stdout log: {e}"),
             })?;
 
         // Create stderr file
         let stderr_file =
             std::fs::File::create(&stderr_path).map_err(|e| AgentError::CreateFailed {
                 id: id.to_string(),
-                reason: format!("failed to create stderr log: {}", e),
+                reason: format!("failed to create stderr log: {e}"),
             })?;
 
         // When using structured logging, also create symlinks from the bundle
@@ -423,9 +439,16 @@ impl YoukiRuntime {
         }
 
         // Convert to OwnedFd
-        use std::os::unix::io::IntoRawFd;
-        let stdout_fd = unsafe { OwnedFd::from_raw_fd(stdout_file.into_raw_fd()) };
-        let stderr_fd = unsafe { OwnedFd::from_raw_fd(stderr_file.into_raw_fd()) };
+        // SAFETY: `into_raw_fd()` transfers ownership of the fd, and
+        // `OwnedFd::from_raw_fd` takes ownership. No double-close.
+        let stdout_fd = unsafe {
+            use std::os::unix::io::IntoRawFd;
+            OwnedFd::from_raw_fd(stdout_file.into_raw_fd())
+        };
+        let stderr_fd = unsafe {
+            use std::os::unix::io::IntoRawFd;
+            OwnedFd::from_raw_fd(stderr_file.into_raw_fd())
+        };
 
         Ok((stdout_path, stderr_path, stdout_fd, stderr_fd))
     }
@@ -438,7 +461,7 @@ impl YoukiRuntime {
                 .await
                 .map_err(|e| AgentError::CreateFailed {
                     id: id.to_string(),
-                    reason: format!("failed to remove bundle: {}", e),
+                    reason: format!("failed to remove bundle: {e}"),
                 })?;
         }
         Ok(())
@@ -457,7 +480,7 @@ impl YoukiRuntime {
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
-                reason: format!("failed to pull image: {}", e),
+                reason: format!("failed to pull image: {e}"),
             })
     }
 
@@ -477,17 +500,18 @@ impl YoukiRuntime {
         for storage in &spec.storage {
             match storage {
                 StorageSpec::Named { name, .. } => {
-                    let path = storage_manager.ensure_volume(name).map_err(|e| {
-                        AgentError::CreateFailed {
+                    let path = storage_manager
+                        .ensure_volume_with_sync(name)
+                        .await
+                        .map_err(|e| AgentError::CreateFailed {
                             id: container_id.clone(),
-                            reason: format!("failed to ensure volume '{}': {}", name, e),
-                        }
-                    })?;
+                            reason: format!("failed to ensure volume '{name}': {e}"),
+                        })?;
                     storage_manager
                         .attach_volume(name, &container_id)
                         .map_err(|e| AgentError::CreateFailed {
                             id: container_id.clone(),
-                            reason: format!("failed to attach volume '{}': {}", name, e),
+                            reason: format!("failed to attach volume '{name}': {e}"),
                         })?;
                     volume_paths.insert(name.clone(), path);
                 }
@@ -498,19 +522,15 @@ impl YoukiRuntime {
                         .map_err(|e| AgentError::CreateFailed {
                             id: container_id.clone(),
                             reason: format!(
-                                "failed to create anonymous volume for '{}': {}",
-                                target, e
+                                "failed to create anonymous volume for '{target}': {e}"
                             ),
                         })?;
                     let key = format!("_anon_{}", target.trim_start_matches('/').replace('/', "_"));
                     volume_paths.insert(key, path);
                 }
 
-                // Bind mounts don't need preparation - source path is used directly
-                StorageSpec::Bind { .. } => {}
-
-                // Tmpfs mounts don't need preparation
-                StorageSpec::Tmpfs { .. } => {}
+                // Bind and tmpfs mounts don't need preparation
+                StorageSpec::Bind { .. } | StorageSpec::Tmpfs { .. } => {}
 
                 StorageSpec::S3 {
                     bucket,
@@ -527,7 +547,7 @@ impl YoukiRuntime {
                         )
                         .map_err(|e| AgentError::CreateFailed {
                             id: container_id.clone(),
-                            reason: format!("failed to mount S3 bucket '{}': {}", bucket, e),
+                            reason: format!("failed to mount S3 bucket '{bucket}': {e}"),
                         })?;
                     let key = format!("_s3_{}_{}", bucket, prefix.as_deref().unwrap_or(""));
                     volume_paths.insert(key, path);
@@ -540,8 +560,8 @@ impl YoukiRuntime {
 
     /// Clean up storage volumes for a container
     ///
-    /// Note: This method requires the ServiceSpec to know which volumes to clean up.
-    /// For now, remove_container uses a simpler approach that only cleans up anonymous volumes.
+    /// Note: This method requires the `ServiceSpec` to know which volumes to clean up.
+    /// For now, `remove_container` uses a simpler approach that only cleans up anonymous volumes.
     /// This method is available for future use when the spec is stored/available at removal time.
     #[allow(dead_code)]
     async fn cleanup_storage_volumes(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
@@ -621,7 +641,7 @@ impl Runtime for YoukiRuntime {
     /// Pull an image to local storage with a specific pull policy
     ///
     /// This downloads image layers to the blob cache. Layers are extracted
-    /// per-container in create_container to avoid race conditions.
+    /// per-container in `create_container` to avoid race conditions.
     #[instrument(
         skip(self),
         fields(
@@ -657,7 +677,7 @@ impl Runtime for YoukiRuntime {
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
-                reason: format!("failed to pull image: {}", e),
+                reason: format!("failed to pull image: {e}"),
             })?;
 
         tracing::info!(
@@ -761,7 +781,7 @@ impl Runtime for YoukiRuntime {
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: container_id.clone(),
-                reason: format!("failed to create bundle directory: {}", e),
+                reason: format!("failed to create bundle directory: {e}"),
             })?;
 
         // Pull image layers (from cache if available)
@@ -780,7 +800,7 @@ impl Runtime for YoukiRuntime {
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: container_id.clone(),
-                reason: format!("failed to extract rootfs: {}", e),
+                reason: format!("failed to extract rootfs: {e}"),
             })?;
 
         // Get cached image config (entrypoint, cmd, env, workdir, user)
@@ -816,7 +836,7 @@ impl Runtime for YoukiRuntime {
                 .lock()
                 .map_err(|e| AgentError::CreateFailed {
                     id: container_id_clone.clone(),
-                    reason: format!("failed to acquire libcontainer lock: {}", e),
+                    reason: format!("failed to acquire libcontainer lock: {e}"),
                 })?;
 
             // Create container using libcontainer
@@ -832,7 +852,7 @@ impl Runtime for YoukiRuntime {
                     .with_root_path(&state_dir_clone)
                     .map_err(|e| AgentError::CreateFailed {
                         id: container_id_clone.clone(),
-                        reason: format!("failed to set root path: {}", e),
+                        reason: format!("failed to set root path: {e}"),
                     })?;
 
             // Configure as init container (creates new namespaces)
@@ -844,7 +864,7 @@ impl Runtime for YoukiRuntime {
             // Build the container (creates it but doesn't start)
             let container = init_builder.build().map_err(|e| AgentError::CreateFailed {
                 id: container_id_clone.clone(),
-                reason: format!("failed to create container: {}", e),
+                reason: format!("failed to create container: {e}"),
             })?;
 
             Ok::<Container, AgentError>(container)
@@ -852,7 +872,7 @@ impl Runtime for YoukiRuntime {
         .await
         .map_err(|e| AgentError::CreateFailed {
             id: container_id.clone(),
-            reason: format!("task join error: {}", e),
+            reason: format!("task join error: {e}"),
         })??;
 
         // Store container info
@@ -901,22 +921,23 @@ impl Runtime for YoukiRuntime {
                 .lock()
                 .map_err(|e| AgentError::StartFailed {
                     id: container_id.clone(),
-                    reason: format!("failed to acquire libcontainer lock: {}", e),
+                    reason: format!("failed to acquire libcontainer lock: {e}"),
                 })?;
 
             let mut container =
                 Container::load(container_root).map_err(|e| AgentError::StartFailed {
                     id: container_id.clone(),
-                    reason: format!("failed to load container: {}", e),
+                    reason: format!("failed to load container: {e}"),
                 })?;
 
             // Start the container
             container.start().map_err(|e| AgentError::StartFailed {
                 id: container_id.clone(),
-                reason: format!("failed to start container: {}", e),
+                reason: format!("failed to start container: {e}"),
             })?;
 
             // Get the PID after starting - access through state
+            #[allow(clippy::cast_sign_loss)]
             let pid = container.pid().map(|p| p.as_raw() as u32);
 
             Ok::<Option<u32>, AgentError>(pid)
@@ -924,7 +945,7 @@ impl Runtime for YoukiRuntime {
         .await
         .map_err(|e| AgentError::StartFailed {
             id: id.to_string(),
-            reason: format!("task join error: {}", e),
+            reason: format!("task join error: {e}"),
         })??;
 
         // Update container info with PID
@@ -973,7 +994,7 @@ impl Runtime for YoukiRuntime {
             let mut container =
                 Container::load(container_root_clone).map_err(|e| AgentError::NotFound {
                     container: container_id_clone.clone(),
-                    reason: format!("failed to load container: {}", e),
+                    reason: format!("failed to load container: {e}"),
                 })?;
 
             // Check if container can be killed
@@ -982,7 +1003,7 @@ impl Runtime for YoukiRuntime {
                 use std::convert::TryFrom;
                 let signal = Signal::try_from("SIGTERM").map_err(|e| AgentError::NotFound {
                     container: container_id_clone.clone(),
-                    reason: format!("invalid signal: {:?}", e),
+                    reason: format!("invalid signal: {e:?}"),
                 })?;
 
                 if let Err(e) = container.kill(signal, true) {
@@ -995,7 +1016,7 @@ impl Runtime for YoukiRuntime {
         .await
         .map_err(|e| AgentError::NotFound {
             container: container_id.clone(),
-            reason: format!("task join error: {}", e),
+            reason: format!("task join error: {e}"),
         })??;
 
         // Wait for container to stop
@@ -1031,14 +1052,14 @@ impl Runtime for YoukiRuntime {
             let mut container =
                 Container::load(container_root_clone).map_err(|e| AgentError::NotFound {
                     container: container_id_clone.clone(),
-                    reason: format!("failed to load container: {}", e),
+                    reason: format!("failed to load container: {e}"),
                 })?;
 
             if container.status().can_kill() {
                 use std::convert::TryFrom;
                 let signal = Signal::try_from("SIGKILL").map_err(|e| AgentError::NotFound {
                     container: container_id_clone.clone(),
-                    reason: format!("invalid signal: {:?}", e),
+                    reason: format!("invalid signal: {e:?}"),
                 })?;
 
                 if let Err(e) = container.kill(signal, true) {
@@ -1051,7 +1072,7 @@ impl Runtime for YoukiRuntime {
         .await
         .map_err(|e| AgentError::NotFound {
             container: container_id.clone(),
-            reason: format!("task join error: {}", e),
+            reason: format!("task join error: {e}"),
         })??;
 
         tracing::info!("Container {} killed", container_id);
@@ -1172,7 +1193,7 @@ impl Runtime for YoukiRuntime {
             let mut container =
                 Container::load(container_root).map_err(|e| AgentError::NotFound {
                     container: container_id_clone.clone(),
-                    reason: format!("failed to load container: {}", e),
+                    reason: format!("failed to load container: {e}"),
                 })?;
 
             // Refresh status to get current state
@@ -1183,7 +1204,7 @@ impl Runtime for YoukiRuntime {
         .await
         .map_err(|e| AgentError::NotFound {
             container: container_id.clone(),
-            reason: format!("task join error: {}", e),
+            reason: format!("task join error: {e}"),
         })??;
 
         Ok(self.map_status(status))
@@ -1246,6 +1267,7 @@ impl Runtime for YoukiRuntime {
     /// Execute a command in a running container
     ///
     /// Uses libcontainer's tenant builder to exec into the container's namespaces.
+    #[allow(unsafe_code)]
     #[instrument(
         skip(self),
         fields(
@@ -1267,12 +1289,12 @@ impl Runtime for YoukiRuntime {
 
         // Create temporary files for exec output
         let exec_id = uuid::Uuid::new_v4().to_string();
-        let exec_dir = self.config.state_dir.join(format!("exec-{}", exec_id));
+        let exec_dir = self.config.state_dir.join(format!("exec-{exec_id}"));
         fs::create_dir_all(&exec_dir)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: exec_id.clone(),
-                reason: format!("failed to create exec dir: {}", e),
+                reason: format!("failed to create exec dir: {e}"),
             })?;
 
         let stdout_path = exec_dir.join("stdout");
@@ -1282,18 +1304,25 @@ impl Runtime for YoukiRuntime {
         let stdout_file =
             std::fs::File::create(&stdout_path).map_err(|e| AgentError::CreateFailed {
                 id: exec_id.clone(),
-                reason: format!("failed to create stdout file: {}", e),
+                reason: format!("failed to create stdout file: {e}"),
             })?;
 
         let stderr_file =
             std::fs::File::create(&stderr_path).map_err(|e| AgentError::CreateFailed {
                 id: exec_id.clone(),
-                reason: format!("failed to create stderr file: {}", e),
+                reason: format!("failed to create stderr file: {e}"),
             })?;
 
-        use std::os::unix::io::IntoRawFd;
-        let stdout_fd = unsafe { OwnedFd::from_raw_fd(stdout_file.into_raw_fd()) };
-        let stderr_fd = unsafe { OwnedFd::from_raw_fd(stderr_file.into_raw_fd()) };
+        // SAFETY: `into_raw_fd()` transfers ownership of the fd, and
+        // `OwnedFd::from_raw_fd` takes ownership. No double-close.
+        let stdout_fd = unsafe {
+            use std::os::unix::io::IntoRawFd;
+            OwnedFd::from_raw_fd(stdout_file.into_raw_fd())
+        };
+        let stderr_fd = unsafe {
+            use std::os::unix::io::IntoRawFd;
+            OwnedFd::from_raw_fd(stderr_file.into_raw_fd())
+        };
 
         let cmd_clone = cmd.to_vec();
         let container_id_clone = container_id.clone();
@@ -1314,7 +1343,7 @@ impl Runtime for YoukiRuntime {
                     .with_root_path(&state_dir_clone)
                     .map_err(|e| AgentError::CreateFailed {
                         id: container_id_clone.clone(),
-                        reason: format!("failed to set root path: {}", e),
+                        reason: format!("failed to set root path: {e}"),
                     })?;
 
             // Configure as tenant (joins existing namespaces)
@@ -1328,7 +1357,7 @@ impl Runtime for YoukiRuntime {
                 .build()
                 .map_err(|e| AgentError::CreateFailed {
                     id: container_id_clone.clone(),
-                    reason: format!("failed to exec in container: {}", e),
+                    reason: format!("failed to exec in container: {e}"),
                 })?;
 
             // Return raw pid as i32 to avoid nix version conflicts
@@ -1338,7 +1367,7 @@ impl Runtime for YoukiRuntime {
         .await
         .map_err(|e| AgentError::CreateFailed {
             id: container_id.clone(),
-            reason: format!("task join error: {}", e),
+            reason: format!("task join error: {e}"),
         })??;
 
         // Wait for process to complete and get exit status
@@ -1350,8 +1379,7 @@ impl Runtime for YoukiRuntime {
             match waitpid(pid, None) {
                 Ok(WaitStatus::Exited(_, code)) => code,
                 Ok(WaitStatus::Signaled(_, signal, _)) => 128 + signal as i32,
-                Ok(_) => -1,
-                Err(_) => -1,
+                Ok(_) | Err(_) => -1,
             }
         })
         .await
@@ -1378,12 +1406,11 @@ impl Runtime for YoukiRuntime {
         let cgroup_path = if self.config.use_systemd {
             // systemd cgroup driver: /sys/fs/cgroup/system.slice/zlayer-{id}.scope
             PathBuf::from(format!(
-                "/sys/fs/cgroup/system.slice/zlayer-{}.scope",
-                container_id
+                "/sys/fs/cgroup/system.slice/zlayer-{container_id}.scope"
             ))
         } else {
             // cgroupfs driver: /sys/fs/cgroup/zlayer/{id}
-            PathBuf::from(format!("/sys/fs/cgroup/zlayer/{}", container_id))
+            PathBuf::from(format!("/sys/fs/cgroup/zlayer/{container_id}"))
         };
 
         tracing::debug!(
@@ -1396,8 +1423,7 @@ impl Runtime for YoukiRuntime {
             .await
             .map_err(|e| {
                 AgentError::Internal(format!(
-                    "failed to read cgroup stats for container {}: {}",
-                    container_id, e
+                    "failed to read cgroup stats for container {container_id}: {e}"
                 ))
             })
     }
@@ -1437,10 +1463,7 @@ impl Runtime for YoukiRuntime {
                         reason = %reason,
                         "container failed"
                     );
-                    return Err(AgentError::Internal(format!(
-                        "container failed: {}",
-                        reason
-                    )));
+                    return Err(AgentError::Internal(format!("container failed: {reason}")));
                 }
                 Ok(_) => {
                     // Still running, wait and poll again
@@ -1482,7 +1505,7 @@ impl Runtime for YoukiRuntime {
         if stdout_path.exists() {
             if let Ok(content) = fs::read_to_string(&stdout_path).await {
                 for line in content.lines() {
-                    logs.push(format!("[stdout] {}", line));
+                    logs.push(format!("[stdout] {line}"));
                 }
             }
         }
@@ -1491,7 +1514,7 @@ impl Runtime for YoukiRuntime {
         if stderr_path.exists() {
             if let Ok(content) = fs::read_to_string(&stderr_path).await {
                 for line in content.lines() {
-                    logs.push(format!("[stderr] {}", line));
+                    logs.push(format!("[stderr] {line}"));
                 }
             }
         }
@@ -1531,13 +1554,14 @@ impl Runtime for YoukiRuntime {
             let mut container =
                 Container::load(container_root).map_err(|e| AgentError::NotFound {
                     container: container_id_clone.clone(),
-                    reason: format!("failed to load container: {}", e),
+                    reason: format!("failed to load container: {e}"),
                 })?;
 
             // Refresh status to get current state
             let _ = container.refresh_status();
 
             // Get PID - returns None if container is not running
+            #[allow(clippy::cast_sign_loss)]
             let pid = container.pid().map(|p| p.as_raw() as u32);
 
             Ok::<Option<u32>, AgentError>(pid)
@@ -1545,7 +1569,7 @@ impl Runtime for YoukiRuntime {
         .await
         .map_err(|e| AgentError::NotFound {
             container: container_id.clone(),
-            reason: format!("task join error: {}", e),
+            reason: format!("task join error: {e}"),
         })??;
 
         tracing::debug!(
@@ -1561,6 +1585,46 @@ impl Runtime for YoukiRuntime {
         // Youki containers use OCI network namespaces — IP assignment comes
         // from the overlay manager, not the runtime itself.
         Ok(None)
+    }
+
+    /// Sync all named volumes to S3 before container removal.
+    ///
+    /// When the `s3` feature is enabled and a `LayerSyncManager` has been
+    /// configured on the storage manager, this iterates all non-anonymous
+    /// volumes and pushes any changes to S3. Errors are logged but do not
+    /// prevent container removal.
+    #[allow(unused_variables)]
+    async fn sync_container_volumes(&self, id: &ContainerId) -> Result<()> {
+        #[cfg(feature = "s3")]
+        {
+            let storage_manager = self.storage_manager.read().await;
+            if storage_manager.layer_sync().is_some() {
+                let container_id = self.container_id_str(id);
+                tracing::info!(
+                    container = %container_id,
+                    "syncing volumes to S3 before container removal"
+                );
+                match storage_manager.sync_all_volumes().await {
+                    Ok(synced) => {
+                        if synced > 0 {
+                            tracing::info!(
+                                container = %container_id,
+                                synced_count = synced,
+                                "volume sync complete"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            container = %container_id,
+                            error = %e,
+                            "volume sync failed, data may not be persisted"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 

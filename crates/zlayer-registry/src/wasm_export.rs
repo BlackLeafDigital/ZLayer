@@ -8,8 +8,8 @@
 //! WASM artifacts in OCI registries follow a specific format:
 //! - Config blob: Empty JSON object with media type `application/vnd.wasm.config.v0+json`
 //! - Layer: The WASM binary with media type `application/wasm`
-//! - Artifact type: `application/vnd.wasm.component.v1+wasm` (WASIp2) or
-//!   `application/vnd.wasm.module.v1+wasm` (WASIp1)
+//! - Artifact type: `application/vnd.wasm.component.v1+wasm` (`WASIp2`) or
+//!   `application/vnd.wasm.module.v1+wasm` (`WASIp1`)
 //!
 //! ## Usage
 //!
@@ -201,7 +201,7 @@ fn validate_wasm_magic(data: &[u8]) -> Result<(), WasmExportError> {
 /// Detect WASI version from WASM binary structure
 ///
 /// This function analyzes the binary structure to determine if it's a
-/// WASIp1 (core module) or WASIp2 (component model) binary.
+/// `WASIp1` (core module) or `WASIp2` (component model) binary.
 ///
 /// The detection is based on:
 /// - Core modules (WASIp1): Start with `\0asm` followed by version `0x01 0x00 0x00 0x00`
@@ -277,9 +277,8 @@ fn contains_component_indicator(data: &[u8]) -> bool {
 /// Get the artifact type media type for a WASI version
 fn artifact_type_for_wasi_version(version: &WasiVersion) -> String {
     match version {
-        WasiVersion::Preview1 => WASM_MODULE_ARTIFACT_TYPE.to_string(),
+        WasiVersion::Preview1 | WasiVersion::Unknown => WASM_MODULE_ARTIFACT_TYPE.to_string(),
         WasiVersion::Preview2 => WASM_COMPONENT_ARTIFACT_TYPE.to_string(),
-        WasiVersion::Unknown => WASM_MODULE_ARTIFACT_TYPE.to_string(),
     }
 }
 

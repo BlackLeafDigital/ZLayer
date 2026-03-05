@@ -42,6 +42,7 @@ pub enum CompressionType {
 impl CompressionType {
     /// Detect compression type from media type string
     /// Returns None if media type is unrecognized (caller should use magic bytes)
+    #[must_use]
     pub fn from_media_type(media_type: &str) -> Option<Self> {
         match media_type {
             media_types::TAR_GZIP | media_types::DOCKER_TAR_GZIP => Some(Self::Gzip),
@@ -104,6 +105,7 @@ pub struct LayerUnpacker {
 
 impl LayerUnpacker {
     /// Create a new layer unpacker targeting the specified rootfs directory
+    #[must_use]
     pub fn new(rootfs_dir: PathBuf) -> Self {
         Self {
             rootfs_dir,
@@ -112,6 +114,7 @@ impl LayerUnpacker {
     }
 
     /// Get the rootfs directory
+    #[must_use]
     pub fn rootfs_dir(&self) -> &Path {
         &self.rootfs_dir
     }
@@ -124,12 +127,13 @@ impl LayerUnpacker {
     ///
     /// # Errors
     /// Returns an error if decompression or extraction fails
+    #[allow(clippy::unused_async)]
     pub async fn unpack_layer(&mut self, layer_data: &[u8], media_type: &str) -> Result<()> {
         // Ensure rootfs directory exists
         fs::create_dir_all(&self.rootfs_dir).map_err(|e| {
             RegistryError::Cache(CacheError::Io(std::io::Error::new(
                 e.kind(),
-                format!("failed to create rootfs directory: {}", e),
+                format!("failed to create rootfs directory: {e}"),
             )))
         })?;
 
@@ -138,13 +142,17 @@ impl LayerUnpacker {
 
         // Decompress and extract
         match compression {
-            CompressionType::Gzip => self.unpack_gzip(layer_data).await,
-            CompressionType::Zstd => self.unpack_zstd(layer_data).await,
-            CompressionType::None => self.unpack_tar(layer_data).await,
+            CompressionType::Gzip => self.unpack_gzip(layer_data),
+            CompressionType::Zstd => self.unpack_zstd(layer_data),
+            CompressionType::None => self.unpack_tar(layer_data),
         }
     }
 
     /// Unpack multiple layers in order (base layer first)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any layer is empty, decompression fails, or extraction fails.
     pub async fn unpack_layers(&mut self, layers: &[(Vec<u8>, String)]) -> Result<()> {
         if layers.is_empty() {
             return Err(RegistryError::Cache(CacheError::Corrupted(
@@ -156,8 +164,7 @@ impl LayerUnpacker {
             // Validate layer data is not empty
             if data.is_empty() {
                 return Err(RegistryError::Cache(CacheError::Corrupted(format!(
-                    "layer {} is empty",
-                    i
+                    "layer {i} is empty"
                 ))));
             }
 
@@ -189,7 +196,7 @@ impl LayerUnpacker {
     }
 
     /// Unpack a gzip-compressed tar archive
-    async fn unpack_gzip(&mut self, data: &[u8]) -> Result<()> {
+    fn unpack_gzip(&mut self, data: &[u8]) -> Result<()> {
         let cursor = Cursor::new(data);
         let decoder = GzDecoder::new(cursor);
         let mut archive = Archive::new(decoder);
@@ -197,12 +204,12 @@ impl LayerUnpacker {
     }
 
     /// Unpack a zstd-compressed tar archive
-    async fn unpack_zstd(&mut self, data: &[u8]) -> Result<()> {
+    fn unpack_zstd(&mut self, data: &[u8]) -> Result<()> {
         let cursor = Cursor::new(data);
         let decoder = zstd::stream::Decoder::new(cursor).map_err(|e| {
             RegistryError::Cache(CacheError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("zstd decompression failed: {}", e),
+                format!("zstd decompression failed: {e}"),
             )))
         })?;
         let mut archive = Archive::new(decoder);
@@ -210,7 +217,7 @@ impl LayerUnpacker {
     }
 
     /// Unpack an uncompressed tar archive
-    async fn unpack_tar(&mut self, data: &[u8]) -> Result<()> {
+    fn unpack_tar(&mut self, data: &[u8]) -> Result<()> {
         let cursor = Cursor::new(data);
         let mut archive = Archive::new(cursor);
         self.extract_archive(&mut archive)
@@ -221,7 +228,7 @@ impl LayerUnpacker {
         let entries = archive.entries().map_err(|e| {
             RegistryError::Cache(CacheError::Io(std::io::Error::new(
                 e.kind(),
-                format!("failed to read tar entries: {}", e),
+                format!("failed to read tar entries: {e}"),
             )))
         })?;
 
@@ -229,14 +236,14 @@ impl LayerUnpacker {
             let mut entry = entry.map_err(|e| {
                 RegistryError::Cache(CacheError::Io(std::io::Error::new(
                     e.kind(),
-                    format!("failed to read tar entry: {}", e),
+                    format!("failed to read tar entry: {e}"),
                 )))
             })?;
 
             let path = entry.path().map_err(|e| {
                 RegistryError::Cache(CacheError::Io(std::io::Error::new(
                     e.kind(),
-                    format!("failed to get entry path: {}", e),
+                    format!("failed to get entry path: {e}"),
                 )))
             })?;
             let path = path.to_path_buf();
@@ -283,6 +290,7 @@ impl LayerUnpacker {
     }
 
     /// Validate that a path doesn't escape the rootfs directory
+    #[allow(clippy::unused_self)]
     fn is_safe_path(&self, path: &Path) -> bool {
         // Reject absolute paths
         if path.is_absolute() {
@@ -355,7 +363,7 @@ impl LayerUnpacker {
                 let entry = entry.map_err(|e| {
                     RegistryError::Cache(CacheError::Io(std::io::Error::new(
                         e.kind(),
-                        format!("failed to read directory entry: {}", e),
+                        format!("failed to read directory entry: {e}"),
                     )))
                 })?;
                 let entry_path = entry.path();
@@ -398,7 +406,7 @@ impl LayerUnpacker {
             fs::create_dir_all(parent).map_err(|e| {
                 RegistryError::Cache(CacheError::Io(std::io::Error::new(
                     e.kind(),
-                    format!("failed to create parent directory: {}", e),
+                    format!("failed to create parent directory: {e}"),
                 )))
             })?;
         }
@@ -508,6 +516,7 @@ impl LayerUnpacker {
     }
 
     /// Set file permissions from tar entry
+    #[allow(clippy::unused_self)]
     fn set_permissions<R: Read>(&self, entry: &tar::Entry<'_, R>, full_path: &Path) -> Result<()> {
         #[cfg(unix)]
         {

@@ -8,7 +8,7 @@ use tokio::time::timeout;
 use zlayer_spec::HealthCheck;
 
 /// Callback type for health state changes.
-/// Called with (container_id, is_healthy) when health state transitions.
+/// Called with (`container_id`, `is_healthy`) when health state transitions.
 pub type HealthCallback = Arc<dyn Fn(ContainerId, bool) + Send + Sync>;
 
 /// Health checker for containers
@@ -25,11 +25,15 @@ impl HealthChecker {
     /// `target_addr` is the IP address to connect to for TCP/HTTP checks.
     /// Pass `Some(ip)` when the container has an overlay IP, or `None` to
     /// fall back to `127.0.0.1` / localhost.
+    #[must_use]
     pub fn new(check: HealthCheck, target_addr: Option<std::net::IpAddr>) -> Self {
         Self { check, target_addr }
     }
 
     /// Perform the health check
+    ///
+    /// # Errors
+    /// Returns an error if the health check fails or times out.
     pub async fn check(&self, id: &ContainerId, timeout: Duration) -> Result<()> {
         match &self.check {
             HealthCheck::Tcp { port } => self.check_tcp(id, *port, timeout).await,
@@ -44,14 +48,13 @@ impl HealthChecker {
         // Connect to the target address (overlay IP if set, otherwise localhost)
         let host = self
             .target_addr
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        let addr = format!("{}:{}", host, port);
+            .map_or_else(|| "127.0.0.1".to_string(), |ip| ip.to_string());
+        let addr = format!("{host}:{port}");
         match timeout(timeout_dur, tokio::net::TcpStream::connect(&addr)).await {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => Err(AgentError::HealthCheckFailed {
                 id: id.to_string(),
-                reason: format!("TCP connection failed: {}", e),
+                reason: format!("TCP connection failed: {e}"),
             }),
             Err(_) => Err(AgentError::Timeout {
                 timeout: timeout_dur,
@@ -81,7 +84,7 @@ impl HealthChecker {
             .build()
             .map_err(|e| AgentError::HealthCheckFailed {
                 id: id.to_string(),
-                reason: format!("failed to create HTTP client: {}", e),
+                reason: format!("failed to create HTTP client: {e}"),
             })?;
 
         match timeout(timeout_dur, client.get(&url).send()).await {
@@ -92,16 +95,13 @@ impl HealthChecker {
                 } else {
                     Err(AgentError::HealthCheckFailed {
                         id: id.to_string(),
-                        reason: format!(
-                            "unexpected status: {} (expected {})",
-                            status, expect_status
-                        ),
+                        reason: format!("unexpected status: {status} (expected {expect_status})"),
                     })
                 }
             }
             Ok(Err(e)) => Err(AgentError::HealthCheckFailed {
                 id: id.to_string(),
-                reason: format!("HTTP request failed: {}", e),
+                reason: format!("HTTP request failed: {e}"),
             }),
             Err(_) => Err(AgentError::Timeout {
                 timeout: timeout_dur,
@@ -140,7 +140,7 @@ impl HealthChecker {
             }
             Ok(Err(e)) => Err(AgentError::HealthCheckFailed {
                 id: id.to_string(),
-                reason: format!("command execution failed: {}", e),
+                reason: format!("command execution failed: {e}"),
             }),
             Err(_) => Err(AgentError::Timeout {
                 timeout: timeout_dur,
@@ -149,12 +149,17 @@ impl HealthChecker {
     }
 }
 
+/// Maximum backoff interval when retries are exhausted (60 seconds).
+const MAX_BACKOFF: Duration = Duration::from_secs(60);
+
 /// Continuous health monitor
 pub struct HealthMonitor {
     id: ContainerId,
     checker: HealthChecker,
     interval: Duration,
     retries: u32,
+    check_timeout: Duration,
+    start_grace: Duration,
     state: tokio::sync::RwLock<HealthState>,
     on_health_change: Option<HealthCallback>,
 }
@@ -168,36 +173,63 @@ pub enum HealthState {
 }
 
 impl HealthMonitor {
+    #[must_use]
     pub fn new(id: ContainerId, checker: HealthChecker, interval: Duration, retries: u32) -> Self {
         Self {
             id,
             checker,
             interval,
             retries,
+            check_timeout: Duration::from_secs(5),
+            start_grace: Duration::ZERO,
             state: tokio::sync::RwLock::new(HealthState::Unknown),
             on_health_change: None,
         }
     }
 
     /// Set a callback to be invoked when health state changes (healthy <-> unhealthy).
+    #[must_use]
     pub fn with_callback(mut self, callback: HealthCallback) -> Self {
         self.on_health_change = Some(callback);
+        self
+    }
+
+    /// Set a startup grace period. The monitor will sleep for this duration
+    /// before performing the first health check, giving the container time
+    /// to initialize.
+    #[must_use]
+    pub fn with_start_grace(mut self, grace: Duration) -> Self {
+        self.start_grace = grace;
+        self
+    }
+
+    /// Set the timeout applied to each individual health check. Defaults to 5 seconds.
+    #[must_use]
+    pub fn with_check_timeout(mut self, timeout: Duration) -> Self {
+        self.check_timeout = timeout;
         self
     }
 
     /// Start monitoring (spawns background task)
     pub fn start(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
+            // Startup grace period — let the container initialize before checking
+            if !self.start_grace.is_zero() {
+                tokio::time::sleep(self.start_grace).await;
+            }
+
             let mut failures = 0u32;
             let mut was_healthy: Option<bool> = None;
+            let mut current_interval = self.interval;
 
             loop {
                 // Update state to checking
                 *self.state.write().await = HealthState::Checking;
 
-                match self.checker.check(&self.id, self.interval).await {
+                match self.checker.check(&self.id, self.check_timeout).await {
                     Ok(()) => {
                         failures = 0;
+                        current_interval = self.interval;
                         *self.state.write().await = HealthState::Healthy;
 
                         // Check for state transition to healthy
@@ -224,13 +256,15 @@ impl HealthMonitor {
                             was_healthy = Some(false);
                         }
 
+                        // After exhausting retries, apply exponential backoff
+                        // instead of terminating the monitor
                         if failures >= self.retries {
-                            break;
+                            current_interval = (current_interval * 2).min(MAX_BACKOFF);
                         }
                     }
                 }
 
-                tokio::time::sleep(self.interval).await;
+                tokio::time::sleep(current_interval).await;
             }
         })
     }

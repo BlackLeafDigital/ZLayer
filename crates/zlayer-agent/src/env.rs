@@ -1,6 +1,6 @@
 //! Environment variable resolution for $E: and $S: prefix syntax
 //!
-//! Per V1_SPEC.md Section 7, values prefixed with `$E:` are resolved
+//! Per `V1_SPEC.md` Section 7, values prefixed with `$E:` are resolved
 //! from the runtime environment at container start time.
 //!
 //! Additionally, values prefixed with `$S:` are resolved from the secrets
@@ -48,34 +48,39 @@ pub struct ResolvedEnv {
 /// # Returns
 /// * `Ok(String)` - The resolved value
 /// * `Err(EnvResolutionError)` - If a $E: reference cannot be resolved
+///
+/// # Errors
+/// Returns an error if a `$E:` referenced environment variable is not set.
 pub fn resolve_env_value(value: &str) -> Result<String, EnvResolutionError> {
     if let Some(var_name) = value.strip_prefix(ENV_REF_PREFIX) {
         match std::env::var(var_name) {
             Ok(val) => Ok(val),
-            Err(std::env::VarError::NotPresent) => Err(EnvResolutionError::MissingEnvVar {
-                var: var_name.to_string(),
-            }),
-            Err(std::env::VarError::NotUnicode(_)) => Err(EnvResolutionError::MissingEnvVar {
-                var: var_name.to_string(),
-            }),
+            Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => {
+                Err(EnvResolutionError::MissingEnvVar {
+                    var: var_name.to_string(),
+                })
+            }
         }
     } else {
         Ok(value.to_string())
     }
 }
 
-/// Resolve environment variables from a ServiceSpec env HashMap
+/// Resolve environment variables from a `ServiceSpec` env `HashMap`
 ///
 /// For each entry:
 /// - If value starts with `$E:`, look up the remainder in `std::env::var()`
 /// - Otherwise, pass the value through unchanged
 ///
 /// # Arguments
-/// * `env` - HashMap of environment variable names to values (possibly with $E: prefix)
+/// * `env` - `HashMap` of environment variable names to values (possibly with $E: prefix)
 ///
 /// # Returns
 /// * `Ok(HashMap<String, String>)` - Resolved key-value pairs
 /// * `Err(EnvResolutionError)` - If a required $E: reference cannot be resolved
+///
+/// # Errors
+/// Returns an error if a `$E:` referenced environment variable is not set.
 ///
 /// # Example
 /// ```
@@ -94,6 +99,7 @@ pub fn resolve_env_value(value: &str) -> Result<String, EnvResolutionError> {
 ///
 /// std::env::remove_var("MY_SECRET");
 /// ```
+#[allow(clippy::implicit_hasher)]
 pub fn resolve_env_vars(
     env: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, EnvResolutionError> {
@@ -112,11 +118,15 @@ pub fn resolve_env_vars(
 /// This is the full resolution function that also tracks warnings for empty values.
 ///
 /// # Arguments
-/// * `env` - HashMap of environment variable names to values (possibly with $E: prefix)
+/// * `env` - `HashMap` of environment variable names to values (possibly with $E: prefix)
 ///
 /// # Returns
 /// * `Ok(ResolvedEnv)` - Resolved variables in KEY=VALUE format and any warnings
 /// * `Err(EnvResolutionError)` - If a required $E: reference cannot be resolved
+///
+/// # Errors
+/// Returns an error if a `$E:` referenced environment variable is not set.
+#[allow(clippy::implicit_hasher)]
 pub fn resolve_env_vars_with_warnings(
     env: &HashMap<String, String>,
 ) -> Result<ResolvedEnv, EnvResolutionError> {
@@ -129,18 +139,12 @@ pub fn resolve_env_vars_with_warnings(
                 Ok(val) => {
                     if val.is_empty() {
                         warnings.push(format!(
-                            "environment variable '{}' is set but empty",
-                            var_name
+                            "environment variable '{var_name}' is set but empty"
                         ));
                     }
                     val
                 }
-                Err(std::env::VarError::NotPresent) => {
-                    return Err(EnvResolutionError::MissingEnvVar {
-                        var: var_name.to_string(),
-                    });
-                }
-                Err(std::env::VarError::NotUnicode(_)) => {
+                Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => {
                     return Err(EnvResolutionError::MissingEnvVar {
                         var: var_name.to_string(),
                     });
@@ -150,7 +154,7 @@ pub fn resolve_env_vars_with_warnings(
             value.clone()
         };
 
-        vars.push(format!("{}={}", key, resolved_value));
+        vars.push(format!("{key}={resolved_value}"));
     }
 
     Ok(ResolvedEnv { vars, warnings })
@@ -159,6 +163,8 @@ pub fn resolve_env_vars_with_warnings(
 /// Check if any environment variables use $E: references
 ///
 /// Useful for validation and debugging to see which vars will be resolved at runtime.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn has_env_references(env: &HashMap<String, String>) -> bool {
     env.values().any(|v| v.starts_with(ENV_REF_PREFIX))
 }
@@ -166,6 +172,8 @@ pub fn has_env_references(env: &HashMap<String, String>) -> bool {
 /// Get list of $E: referenced variable names
 ///
 /// Returns the names of host environment variables that will be looked up.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn get_env_references(env: &HashMap<String, String>) -> Vec<&str> {
     env.values()
         .filter_map(|v| v.strip_prefix(ENV_REF_PREFIX))
@@ -175,6 +183,8 @@ pub fn get_env_references(env: &HashMap<String, String>) -> Vec<&str> {
 /// Check if any environment variables use $S: secret references
 ///
 /// Useful for validation and debugging to see which vars will be resolved from secrets.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn has_secret_references(env: &HashMap<String, String>) -> bool {
     env.values().any(|v| v.starts_with(SECRET_REF_PREFIX))
 }
@@ -182,6 +192,8 @@ pub fn has_secret_references(env: &HashMap<String, String>) -> bool {
 /// Get list of $S: referenced secret names
 ///
 /// Returns the raw secret reference strings (without the $S: prefix) that will be looked up.
+#[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn get_secret_references(env: &HashMap<String, String>) -> Vec<&str> {
     env.values()
         .filter_map(|v| v.strip_prefix(SECRET_REF_PREFIX))
@@ -196,13 +208,16 @@ pub fn get_secret_references(env: &HashMap<String, String>) -> Vec<&str> {
 /// - Other values are returned as-is
 ///
 /// # Arguments
-/// * `env` - HashMap of environment variable names to values (possibly with $S: or $E: prefix)
+/// * `env` - `HashMap` of environment variable names to values (possibly with $S: or $E: prefix)
 /// * `secrets_provider` - The secrets provider to use for $S: lookups
 /// * `scope` - The scope identifier (e.g., deployment name) for secret lookups
 ///
 /// # Returns
 /// * `Ok(HashMap<String, String>)` - Resolved key-value pairs
 /// * `Err(EnvResolutionError)` - If a required $S: or $E: reference cannot be resolved
+///
+/// # Errors
+/// Returns an error if a `$S:` or `$E:` referenced value cannot be resolved.
 ///
 /// # Example
 /// ```rust,ignore
@@ -219,6 +234,7 @@ pub fn get_secret_references(env: &HashMap<String, String>) -> Vec<&str> {
 ///     let resolved = resolve_env_with_secrets(&env, provider, "my-deployment").await.unwrap();
 /// }
 /// ```
+#[allow(clippy::implicit_hasher)]
 pub async fn resolve_env_with_secrets<P: SecretsProvider + ?Sized>(
     env: &HashMap<String, String>,
     secrets_provider: &P,
@@ -248,6 +264,9 @@ pub async fn resolve_env_with_secrets<P: SecretsProvider + ?Sized>(
 /// # Returns
 /// * `Ok(String)` - The resolved value
 /// * `Err(EnvResolutionError)` - If a $S: or $E: reference cannot be resolved
+///
+/// # Errors
+/// Returns an error if a `$S:` or `$E:` referenced value cannot be resolved.
 pub async fn resolve_value_with_secrets<P: SecretsProvider + ?Sized>(
     value: &str,
     secrets_provider: &P,
@@ -257,12 +276,12 @@ pub async fn resolve_value_with_secrets<P: SecretsProvider + ?Sized>(
     if SecretRef::is_secret_ref(value) {
         let secret_ref =
             SecretRef::parse(value).ok_or_else(|| EnvResolutionError::SecretResolution {
-                message: format!("invalid secret reference syntax: {}", value),
+                message: format!("invalid secret reference syntax: {value}"),
             })?;
 
         // Determine the scope based on service qualifier
         let effective_scope = match &secret_ref.service {
-            Some(service) => format!("{}/{}", scope, service),
+            Some(service) => format!("{scope}/{service}"),
             None => scope.to_string(),
         };
 
@@ -288,12 +307,11 @@ pub async fn resolve_value_with_secrets<P: SecretsProvider + ?Sized>(
         // Host environment variable reference
         match std::env::var(var_name) {
             Ok(val) => Ok(val),
-            Err(std::env::VarError::NotPresent) => Err(EnvResolutionError::MissingEnvVar {
-                var: var_name.to_string(),
-            }),
-            Err(std::env::VarError::NotUnicode(_)) => Err(EnvResolutionError::MissingEnvVar {
-                var: var_name.to_string(),
-            }),
+            Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => {
+                Err(EnvResolutionError::MissingEnvVar {
+                    var: var_name.to_string(),
+                })
+            }
         }
     } else {
         // Plain value, return as-is
@@ -305,7 +323,7 @@ pub async fn resolve_value_with_secrets<P: SecretsProvider + ?Sized>(
 fn extract_json_field(secret_value: &str, field: &str) -> Result<String, EnvResolutionError> {
     let json: serde_json::Value =
         serde_json::from_str(secret_value).map_err(|e| EnvResolutionError::SecretResolution {
-            message: format!("failed to parse secret as JSON: {}", e),
+            message: format!("failed to parse secret as JSON: {e}"),
         })?;
 
     match json.get(field) {
@@ -315,7 +333,7 @@ fn extract_json_field(secret_value: &str, field: &str) -> Result<String, EnvReso
         Some(serde_json::Value::Null) => Ok(String::new()),
         Some(v) => Ok(v.to_string()), // For arrays/objects, return JSON string
         None => Err(EnvResolutionError::SecretNotFound {
-            name: format!("field '{}' in secret", field),
+            name: format!("field '{field}' in secret"),
         }),
     }
 }

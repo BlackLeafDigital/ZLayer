@@ -99,6 +99,7 @@ impl ImagePuller {
     }
 
     /// Create a new image puller with boxed cache backend
+    #[must_use]
     pub fn with_cache(cache: Arc<Box<dyn BlobCacheBackend>>) -> Self {
         let config = ClientConfig {
             protocol: ClientProtocol::Https,
@@ -144,6 +145,14 @@ impl ImagePuller {
     /// Pull a single blob and cache it
     ///
     /// Uses the provided authentication credentials to pull blobs from the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blob cannot be pulled from the registry or cached.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the concurrency semaphore is closed.
     pub async fn pull_blob(
         &self,
         image: &str,
@@ -200,13 +209,17 @@ impl ImagePuller {
     ///
     /// Returns the manifest and its digest. Manifests are cached to avoid
     /// repeated network requests for the same image reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be pulled or the image reference is invalid.
     pub async fn pull_manifest(
         &self,
         image: &str,
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
         // Cache key: use "manifest:" prefix + image reference
-        let cache_key = format!("manifest:{}", image);
+        let cache_key = format!("manifest:{image}");
 
         // Check cache first
         if let Ok(Some(data)) = self.cache.get(&cache_key).await {
@@ -304,7 +317,7 @@ impl ImagePuller {
             has_cmd = config.cmd.is_some(),
             has_working_dir = config.working_dir.is_some(),
             has_user = config.user.is_some(),
-            env_count = config.env.as_ref().map_or(0, |e| e.len()),
+            env_count = config.env.as_ref().map_or(0, std::vec::Vec::len),
             "image config parsed successfully"
         );
 
@@ -324,6 +337,10 @@ impl ImagePuller {
     /// # Returns
     ///
     /// Returns the detected `ArtifactType` along with the manifest and digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be pulled.
     pub async fn detect_artifact_type(
         &self,
         image: &str,
@@ -354,6 +371,10 @@ impl ImagePuller {
     /// # Returns
     ///
     /// Returns `Some(WasmArtifactInfo)` if this is a WASM artifact, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be pulled.
     pub async fn get_wasm_info(
         &self,
         image: &str,
@@ -422,7 +443,11 @@ impl ImagePuller {
 
     /// Pull a complete image (manifest + all layers)
     ///
-    /// Returns a vector of (layer_data, media_type) tuples in order (base layer first).
+    /// Returns a vector of (`layer_data`, `media_type`) tuples in order (base layer first).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest or any layer cannot be pulled.
     pub async fn pull_image(
         &self,
         image: &str,
@@ -687,6 +712,7 @@ impl ImagePuller {
     /// # }
     /// ```
     #[cfg(feature = "local")]
+    #[allow(clippy::too_many_lines)]
     #[instrument(
         name = "push_wasm",
         skip(self, export_result, auth),
@@ -766,6 +792,7 @@ impl ImagePuller {
         blobs_pushed.push(export_result.wasm_layer_digest.clone());
 
         // Build the manifest from the export result
+        #[allow(clippy::cast_possible_wrap)]
         let manifest = OciImageManifest {
             schema_version: 2,
             media_type: Some("application/vnd.oci.image.manifest.v1+json".to_string()),

@@ -46,6 +46,7 @@ pub(crate) fn parse_join_token(token: &str) -> Result<JoinToken> {
 }
 
 /// Join an existing deployment
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn join(
     cli: &Cli,
     token: &str,
@@ -89,7 +90,7 @@ pub(crate) async fn join(
     if !auth_response.status().is_success() {
         let status = auth_response.status();
         let body = auth_response.text().await.unwrap_or_default();
-        anyhow::bail!("Authentication failed: {} - {}", status, body);
+        anyhow::bail!("Authentication failed: {status} - {body}");
     }
     info!("Authentication successful");
     println!("Authentication successful");
@@ -109,7 +110,7 @@ pub(crate) async fn join(
     if !spec_response.status().is_success() {
         let status = spec_response.status();
         let body = spec_response.text().await.unwrap_or_default();
-        anyhow::bail!("Failed to fetch deployment spec: {} - {}", status, body);
+        anyhow::bail!("Failed to fetch deployment spec: {status} - {body}");
     }
 
     let spec: DeploymentSpec = spec_response
@@ -130,7 +131,7 @@ pub(crate) async fn join(
         if let Some(svc) = target_service {
             // Join specific service
             if !spec.services.contains_key(svc) {
-                anyhow::bail!("Service '{}' not found in deployment", svc);
+                anyhow::bail!("Service '{svc}' not found in deployment");
             }
             vec![(svc.to_string(), spec.services.get(svc).unwrap().clone())]
         } else {
@@ -161,7 +162,7 @@ pub(crate) async fn join(
             // Setup global overlay
             if let Err(e) = om.setup_global_overlay().await {
                 warn!("Failed to setup global overlay (non-fatal): {}", e);
-                println!("Warning: Overlay network setup failed: {}", e);
+                println!("Warning: Overlay network setup failed: {e}");
             } else {
                 info!("Global overlay network created");
                 println!("Global overlay network created");
@@ -170,7 +171,7 @@ pub(crate) async fn join(
         }
         Err(e) => {
             warn!("Overlay networks disabled: {}", e);
-            println!("Warning: Overlay networks disabled: {}", e);
+            println!("Warning: Overlay networks disabled: {e}");
             None
         }
     };
@@ -187,17 +188,14 @@ pub(crate) async fn join(
     // Step 8: For each service, pull image, run init, register and scale
     for (service_name, service_spec) in services_to_join {
         info!(service = %service_name, "Joining service");
-        println!("Joining service: {}", service_name);
+        println!("Joining service: {service_name}");
 
         // Pull image
         println!("  Pulling image: {}...", service_spec.image.name);
         runtime
             .pull_image(&service_spec.image.name)
             .await
-            .context(format!(
-                "Failed to pull image for service '{}'",
-                service_name
-            ))?;
+            .context(format!("Failed to pull image for service '{service_name}'"))?;
         info!(service = %service_name, image = %service_spec.image.name, "Image pulled");
         println!("  Image pulled successfully");
 
@@ -231,7 +229,7 @@ pub(crate) async fn join(
         manager
             .upsert_service(service_name.clone(), service_spec.clone())
             .await
-            .context(format!("Failed to register service '{}'", service_name))?;
+            .context(format!("Failed to register service '{service_name}'"))?;
         info!(service = %service_name, "Service registered");
 
         // Determine replica count
@@ -246,21 +244,18 @@ pub(crate) async fn join(
         };
 
         // Scale service
-        println!("  Scaling to {} replica(s)...", target_replicas);
+        println!("  Scaling to {target_replicas} replica(s)...");
         manager
             .scale_service(&service_name, target_replicas)
             .await
-            .context(format!("Failed to scale service '{}'", service_name))?;
+            .context(format!("Failed to scale service '{service_name}'"))?;
 
         info!(
             service = %service_name,
             replicas = target_replicas,
             "Service joined"
         );
-        println!(
-            "  Service '{}' joined with {} replica(s)",
-            service_name, target_replicas
-        );
+        println!("  Service '{service_name}' joined with {target_replicas} replica(s)");
     }
 
     // Step 9: Wait for Ctrl+C

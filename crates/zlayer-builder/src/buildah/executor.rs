@@ -29,11 +29,13 @@ pub struct CommandOutput {
 
 impl CommandOutput {
     /// Returns true if the command succeeded (exit code 0)
+    #[must_use]
     pub fn success(&self) -> bool {
         self.exit_code == 0
     }
 
     /// Returns the combined stdout and stderr
+    #[must_use]
     pub fn combined_output(&self) -> String {
         if self.stderr.is_empty() {
             self.stdout.clone()
@@ -73,10 +75,14 @@ impl Default for BuildahExecutor {
 }
 
 impl BuildahExecutor {
-    /// Create a new BuildahExecutor, locating the buildah binary (sync version)
+    /// Create a new `BuildahExecutor`, locating the buildah binary (sync version)
     ///
     /// This will search for buildah in common system locations and PATH.
     /// For more comprehensive discovery with version checking, use [`new_async`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if buildah is not found in common system locations or PATH.
     pub fn new() -> Result<Self> {
         let buildah_path = which_buildah()?;
         Ok(Self {
@@ -87,7 +93,7 @@ impl BuildahExecutor {
         })
     }
 
-    /// Create a new BuildahExecutor using the BuildahInstaller
+    /// Create a new `BuildahExecutor` using the `BuildahInstaller`
     ///
     /// This async version uses [`BuildahInstaller`] to find buildah and verify
     /// it meets minimum version requirements. If buildah is not found, it returns
@@ -105,6 +111,10 @@ impl BuildahExecutor {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if buildah is not installed or does not meet the minimum version.
     pub async fn new_async() -> Result<Self> {
         use super::install::BuildahInstaller;
 
@@ -124,7 +134,7 @@ impl BuildahExecutor {
         })
     }
 
-    /// Create a BuildahExecutor with a specific path to the buildah binary
+    /// Create a `BuildahExecutor` with a specific path to the buildah binary
     pub fn with_path(path: impl Into<PathBuf>) -> Self {
         Self {
             buildah_path: path.into(),
@@ -135,24 +145,28 @@ impl BuildahExecutor {
     }
 
     /// Set the storage driver
+    #[must_use]
     pub fn storage_driver(mut self, driver: impl Into<String>) -> Self {
         self.storage_driver = Some(driver.into());
         self
     }
 
     /// Set the root directory for buildah storage
+    #[must_use]
     pub fn root(mut self, root: impl Into<PathBuf>) -> Self {
         self.root = Some(root.into());
         self
     }
 
     /// Set the runroot directory for buildah state
+    #[must_use]
     pub fn runroot(mut self, runroot: impl Into<PathBuf>) -> Self {
         self.runroot = Some(runroot.into());
         self
     }
 
     /// Get the path to the buildah binary
+    #[must_use]
     pub fn buildah_path(&self) -> &PathBuf {
         &self.buildah_path
     }
@@ -186,6 +200,10 @@ impl BuildahExecutor {
     }
 
     /// Execute a buildah command and wait for completion
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the buildah process fails to spawn.
     #[instrument(skip(self), fields(command = %cmd.to_command_string()))]
     pub async fn execute(&self, cmd: &BuildahCommand) -> Result<CommandOutput> {
         debug!("Executing buildah command");
@@ -219,6 +237,10 @@ impl BuildahExecutor {
     }
 
     /// Execute a buildah command and return an error if it fails
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process fails to spawn or exits with a non-zero code.
     pub async fn execute_checked(&self, cmd: &BuildahCommand) -> Result<CommandOutput> {
         let output = self.execute(cmd).await?;
 
@@ -237,6 +259,15 @@ impl BuildahExecutor {
     ///
     /// The callback is called for each line of output (both stdout and stderr).
     /// The first parameter indicates whether it's stdout (true) or stderr (false).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the process fails to spawn or an I/O error occurs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if stdout or stderr pipes are unexpectedly missing (should not happen
+    /// since they are explicitly configured as piped).
     #[instrument(skip(self, on_output), fields(command = %cmd.to_command_string()))]
     pub async fn execute_streaming<F>(
         &self,
@@ -330,6 +361,10 @@ impl BuildahExecutor {
     }
 
     /// Get buildah version information
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the version command fails to execute.
     pub async fn version(&self) -> Result<String> {
         let cmd = BuildahCommand::new("version");
         let output = self.execute_checked(&cmd).await?;

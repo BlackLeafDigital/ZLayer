@@ -1,10 +1,11 @@
 //! Encrypted overlay transport layer
 //!
-//! Uses boringtun (userspace WireGuard) to create TUN-based encrypted tunnels.
-//! No kernel WireGuard module or `wg` binary required.
+//! Uses boringtun (userspace `WireGuard`) to create TUN-based encrypted tunnels.
+//! No kernel `WireGuard` module or `wg` binary required.
 
 use crate::{config::OverlayConfig, PeerInfo};
 use boringtun::device::{DeviceConfig, DeviceHandle};
+use std::fmt::Write;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::Command;
@@ -13,7 +14,7 @@ use tokio::process::Command;
 // UAPI helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a base64-encoded WireGuard key to hex (UAPI requires hex-encoded keys).
+/// Convert a base64-encoded `WireGuard` key to hex (UAPI requires hex-encoded keys).
 fn key_to_hex(base64_key: &str) -> Result<String, Box<dyn std::error::Error>> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let bytes = STANDARD.decode(base64_key)?;
@@ -29,7 +30,7 @@ fn key_to_hex(base64_key: &str) -> Result<String, Box<dyn std::error::Error>> {
 /// leading `set=1\n` — that is prepended automatically).
 async fn uapi_set(sock_path: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(sock_path).await?;
-    let msg = format!("set=1\n{}\n", body);
+    let msg = format!("set=1\n{body}\n");
     stream.write_all(msg.as_bytes()).await?;
     stream.shutdown().await?;
     let mut response = String::new();
@@ -57,8 +58,8 @@ async fn uapi_get(sock_path: &str) -> Result<String, Box<dyn std::error::Error>>
 
 /// Encrypted overlay transport layer.
 ///
-/// Uses boringtun (userspace WireGuard) to create TUN-based encrypted tunnels.
-/// No kernel WireGuard module required.
+/// Uses boringtun (userspace `WireGuard`) to create TUN-based encrypted tunnels.
+/// No kernel `WireGuard` module required.
 ///
 /// **Important:** This struct holds the boringtun [`DeviceHandle`]. The TUN
 /// device is destroyed when the handle is dropped. Callers **must** keep this
@@ -71,6 +72,7 @@ pub struct OverlayTransport {
 
 impl OverlayTransport {
     /// Create a new overlay transport (device is not started yet).
+    #[must_use]
     pub fn new(config: OverlayConfig, interface_name: String) -> Self {
         Self {
             config,
@@ -89,6 +91,11 @@ impl OverlayTransport {
     /// This spawns boringtun worker threads that manage the TUN device.  The
     /// device is torn down when this struct is dropped (or [`shutdown`] is
     /// called).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the interface name exceeds 15 characters, the TUN device
+    /// cannot be created, or `CAP_NET_ADMIN` is unavailable.
     pub async fn create_interface(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Validate interface name (kernel limit is 15 chars for IFNAMSIZ)
         if self.interface_name.len() > 15 {
@@ -163,9 +170,13 @@ impl OverlayTransport {
 
     /// Configure the transport with private key, listen port, and peers.
     ///
-    /// After setting the WireGuard parameters via UAPI, this also assigns the
+    /// After setting the `WireGuard` parameters via UAPI, this also assigns the
     /// overlay IP address and brings the interface up using standard `ip`
     /// commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if UAPI configuration fails or IP assignment commands fail.
     pub async fn configure(&self, peers: &[PeerInfo]) -> Result<(), Box<dyn std::error::Error>> {
         let sock = self.uapi_sock_path();
 
@@ -179,13 +190,14 @@ impl OverlayTransport {
 
         for peer in peers {
             let pub_hex = key_to_hex(&peer.public_key)?;
-            body.push_str(&format!("public_key={}\n", pub_hex));
-            body.push_str(&format!("endpoint={}\n", peer.endpoint));
-            body.push_str(&format!("allowed_ip={}\n", peer.allowed_ips));
-            body.push_str(&format!(
-                "persistent_keepalive_interval={}\n",
+            let _ = writeln!(body, "public_key={pub_hex}");
+            let _ = writeln!(body, "endpoint={}", peer.endpoint);
+            let _ = writeln!(body, "allowed_ip={}", peer.allowed_ips);
+            let _ = writeln!(
+                body,
+                "persistent_keepalive_interval={}",
                 peer.persistent_keepalive_interval.as_secs()
-            ));
+            );
         }
 
         uapi_set(&sock, &body).await?;
@@ -207,7 +219,7 @@ impl OverlayTransport {
             let stderr = String::from_utf8_lossy(&output.stderr);
             // Ignore "already exists" — idempotent
             if !stderr.contains("RTNETLINK answers: File exists") {
-                return Err(format!("Failed to assign IP: {}", stderr).into());
+                return Err(format!("Failed to assign IP: {stderr}").into());
             }
         }
 
@@ -230,6 +242,10 @@ impl OverlayTransport {
     }
 
     /// Add a peer dynamically via UAPI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key conversion or UAPI command fails.
     pub async fn add_peer(&self, peer: &PeerInfo) -> Result<(), Box<dyn std::error::Error>> {
         let sock = self.uapi_sock_path();
         let pub_hex = key_to_hex(&peer.public_key)?;
@@ -252,11 +268,15 @@ impl OverlayTransport {
     }
 
     /// Remove a peer via UAPI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key conversion or UAPI command fails.
     pub async fn remove_peer(&self, public_key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let sock = self.uapi_sock_path();
         let pub_hex = key_to_hex(public_key)?;
 
-        let body = format!("public_key={}\nremove=true\n", pub_hex);
+        let body = format!("public_key={pub_hex}\nremove=true\n");
 
         uapi_set(&sock, &body).await?;
         tracing::debug!(
@@ -268,6 +288,10 @@ impl OverlayTransport {
     }
 
     /// Query interface status via UAPI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the UAPI query fails.
     pub async fn status(&self) -> Result<String, Box<dyn std::error::Error>> {
         let sock = self.uapi_sock_path();
         let response = uapi_get(&sock).await?;
@@ -278,12 +302,16 @@ impl OverlayTransport {
     ///
     /// No external binary is required. Returns `(private_key, public_key)` in
     /// base64 encoding.
+    ///
+    /// # Errors
+    ///
+    /// This method currently always succeeds but returns `Result` for API consistency.
+    #[allow(clippy::unused_async)]
     pub async fn generate_keys() -> Result<(String, String), Box<dyn std::error::Error>> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
-        use rand::rngs::OsRng;
         use x25519_dalek::{PublicKey, StaticSecret};
 
-        let secret = StaticSecret::random_from_rng(OsRng);
+        let secret = StaticSecret::random();
         let public = PublicKey::from(&secret);
 
         let private_key = STANDARD.encode(secret.to_bytes());

@@ -60,7 +60,7 @@ pub struct Backend {
     pub addr: SocketAddr,
     /// Number of in-flight connections (incremented/decremented atomically).
     active_connections: AtomicU64,
-    /// Current health status (behind a std RwLock for interior mutability).
+    /// Current health status (behind a std `RwLock` for interior mutability).
     health: std::sync::RwLock<HealthStatus>,
     /// Number of consecutive health-check failures.
     consecutive_failures: AtomicU64,
@@ -85,6 +85,7 @@ impl std::fmt::Debug for Backend {
 
 impl Backend {
     /// Create a new backend that starts healthy with zero active connections.
+    #[must_use]
     pub fn new(addr: SocketAddr) -> Self {
         Self {
             addr,
@@ -109,16 +110,28 @@ impl Backend {
     }
 
     /// Returns `true` if the backend is currently marked healthy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the health `RwLock` is poisoned.
     pub fn is_healthy(&self) -> bool {
         *self.health.read().unwrap() == HealthStatus::Healthy
     }
 
     /// Mark this backend as healthy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the health `RwLock` is poisoned.
     pub fn set_healthy(&self) {
         *self.health.write().unwrap() = HealthStatus::Healthy;
     }
 
     /// Mark this backend as unhealthy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the health `RwLock` is poisoned.
     pub fn set_unhealthy(&self) {
         *self.health.write().unwrap() = HealthStatus::Unhealthy;
     }
@@ -172,6 +185,7 @@ pub struct BackendGroup {
 
 impl BackendGroup {
     /// Create an empty group with the given strategy.
+    #[must_use]
     pub fn new(strategy: LbStrategy) -> Self {
         Self {
             backends: Vec::new(),
@@ -271,6 +285,7 @@ impl Default for LoadBalancer {
 
 impl LoadBalancer {
     /// Create an empty load balancer.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             groups: DashMap::new(),
@@ -289,6 +304,7 @@ impl LoadBalancer {
 
     /// Select a healthy backend for `service`, delegating to the group's
     /// configured strategy.
+    #[must_use]
     pub fn select(&self, service: &str) -> Option<Arc<Backend>> {
         self.groups.get(service).and_then(|g| g.select())
     }
@@ -325,20 +341,18 @@ impl LoadBalancer {
 
     /// Return the number of backends registered for `service`, or 0 if
     /// the service is not registered.
+    #[must_use]
     pub fn backend_count(&self, service: &str) -> usize {
-        self.groups
-            .get(service)
-            .map(|g| g.backends.len())
-            .unwrap_or(0)
+        self.groups.get(service).map_or(0, |g| g.backends.len())
     }
 
     /// Return the number of *healthy* backends for `service`, or 0 if the
     /// service is not registered.
+    #[must_use]
     pub fn healthy_count(&self, service: &str) -> usize {
         self.groups
             .get(service)
-            .map(|g| g.backends.iter().filter(|b| b.is_healthy()).count())
-            .unwrap_or(0)
+            .map_or(0, |g| g.backends.iter().filter(|b| b.is_healthy()).count())
     }
 
     /// Update the health status of a specific backend in a service group.
@@ -368,6 +382,12 @@ impl LoadBalancer {
     /// On success the backend is marked healthy and its failure counter is
     /// reset. On failure it is marked unhealthy and the failure counter is
     /// incremented.
+    ///
+    /// # Panics
+    ///
+    /// The spawned task panics if the internal concurrency semaphore is
+    /// unexpectedly closed.
+    #[must_use]
     pub fn spawn_health_checker(
         self: &Arc<Self>,
         interval: Duration,

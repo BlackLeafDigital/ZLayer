@@ -49,13 +49,13 @@ impl DockerRuntime {
     /// - The ping to verify connectivity fails
     pub async fn new() -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()
-            .map_err(|e| AgentError::Internal(format!("Failed to connect to Docker: {}", e)))?;
+            .map_err(|e| AgentError::Internal(format!("Failed to connect to Docker: {e}")))?;
 
         // Verify connection by pinging the daemon
         docker
             .ping()
             .await
-            .map_err(|e| AgentError::Internal(format!("Docker ping failed: {}", e)))?;
+            .map_err(|e| AgentError::Internal(format!("Docker ping failed: {e}")))?;
 
         tracing::info!("Connected to Docker daemon");
         Ok(Self { docker })
@@ -66,12 +66,13 @@ impl DockerRuntime {
     /// # Arguments
     ///
     /// * `docker` - A pre-configured bollard Docker client
+    #[must_use]
     pub fn with_client(docker: Docker) -> Self {
         Self { docker }
     }
 }
 
-/// Generate a container name from a ContainerId
+/// Generate a container name from a `ContainerId`
 fn container_name(id: &ContainerId) -> String {
     format!("zlayer-{}-{}", id.service, id.replica)
 }
@@ -105,6 +106,7 @@ fn build_exposed_ports(spec: &ServiceSpec) -> Vec<String> {
 }
 
 /// Build host configuration for Docker container
+#[allow(clippy::too_many_lines)]
 fn build_host_config(spec: &ServiceSpec) -> HostConfig {
     let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
 
@@ -121,6 +123,7 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
     let memory = spec.resources.memory.as_ref().and_then(|m| parse_memory(m));
 
     // Build CPU limit (Docker uses nano-CPUs: 1 CPU = 1e9 nano-CPUs)
+    #[allow(clippy::cast_possible_truncation)]
     let nano_cpus = spec.resources.cpu.map(|c| (c * 1_000_000_000.0) as i64);
 
     // Build device mappings from spec.devices
@@ -159,7 +162,7 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
                 // NVIDIA Container Toolkit handles this via device_requests
                 device_requests = Some(vec![DeviceRequest {
                     driver: Some("nvidia".into()),
-                    count: Some(gpu.count as i64),
+                    count: Some(i64::from(gpu.count)),
                     capabilities: Some(vec![vec!["gpu".into()]]),
                     ..Default::default()
                 }]);
@@ -178,7 +181,7 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
                         path_in_container: Some(render_path),
                         cgroup_permissions: Some("rwm".into()),
                     });
-                    let card_path = format!("/dev/dri/card{}", i);
+                    let card_path = format!("/dev/dri/card{i}");
                     devices.push(DeviceMapping {
                         path_on_host: Some(card_path.clone()),
                         path_in_container: Some(card_path),
@@ -195,7 +198,7 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
                         path_in_container: Some(render_path),
                         cgroup_permissions: Some("rwm".into()),
                     });
-                    let card_path = format!("/dev/dri/card{}", i);
+                    let card_path = format!("/dev/dri/card{i}");
                     devices.push(DeviceMapping {
                         path_on_host: Some(card_path.clone()),
                         path_in_container: Some(card_path),
@@ -273,12 +276,13 @@ fn parse_memory(memory: &str) -> Option<i64> {
         _ => return None,
     };
 
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     Some((num * multiplier as f64) as i64)
 }
 
 #[async_trait::async_trait]
 impl Runtime for DockerRuntime {
-    /// Pull an image to local storage with default policy (IfNotPresent)
+    /// Pull an image to local storage with default policy (`IfNotPresent`)
     #[instrument(
         skip(self),
         fields(
@@ -393,20 +397,13 @@ impl Runtime for DockerRuntime {
                 )
                 .await
                 .map_err(|e| {
-                    AgentError::Internal(format!(
-                        "failed to remove stale container {}: {}",
-                        name, e
-                    ))
+                    AgentError::Internal(format!("failed to remove stale container {name}: {e}"))
                 })?;
             tracing::info!(container = %name, "stale container removed");
         }
 
         // Build environment variables
-        let env: Vec<String> = spec
-            .env
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect();
+        let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         // Build exposed ports
         let exposed_ports = build_exposed_ports(spec);
@@ -494,6 +491,7 @@ impl Runtime for DockerRuntime {
 
         tracing::info!(container = %name, timeout = ?timeout, "stopping container");
 
+        #[allow(clippy::cast_possible_truncation)]
         let options = StopContainerOptions {
             t: Some(timeout.as_secs() as i32),
             signal: None,
@@ -504,7 +502,7 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to stop container: {}", e),
+                reason: format!("failed to stop container: {e}"),
             })?;
 
         tracing::info!(container = %name, "container stopped successfully");
@@ -535,7 +533,7 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to remove container: {}", e),
+                reason: format!("failed to remove container: {e}"),
             })?;
 
         tracing::info!(container = %name, "container removed successfully");
@@ -560,24 +558,27 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to inspect container: {}", e),
+                reason: format!("failed to inspect container: {e}"),
             })?;
 
         // Extract the state from the inspection result
         let state = inspect.state.ok_or_else(|| {
-            AgentError::Internal(format!("Container {} has no state information", name))
+            AgentError::Internal(format!("Container {name} has no state information"))
         })?;
 
         // Map Docker state to our ContainerState enum
         let container_state = match state.status {
             Some(bollard::models::ContainerStateStatusEnum::CREATED) => ContainerState::Pending,
-            Some(bollard::models::ContainerStateStatusEnum::RUNNING) => ContainerState::Running,
-            Some(bollard::models::ContainerStateStatusEnum::PAUSED) => ContainerState::Running, // Treat paused as running
+            Some(
+                bollard::models::ContainerStateStatusEnum::RUNNING
+                | bollard::models::ContainerStateStatusEnum::PAUSED,
+            ) => ContainerState::Running, // Treat paused as running
             Some(bollard::models::ContainerStateStatusEnum::RESTARTING) => {
                 ContainerState::Initializing
             }
             Some(bollard::models::ContainerStateStatusEnum::REMOVING) => ContainerState::Stopping,
             Some(bollard::models::ContainerStateStatusEnum::EXITED) => {
+                #[allow(clippy::cast_possible_truncation)]
                 let code = state.exit_code.unwrap_or(0) as i32;
                 ContainerState::Exited { code }
             }
@@ -628,7 +629,7 @@ impl Runtime for DockerRuntime {
                 Err(e) => {
                     return Err(AgentError::NotFound {
                         container: name.clone(),
-                        reason: format!("failed to get logs: {}", e),
+                        reason: format!("failed to get logs: {e}"),
                     });
                 }
             }
@@ -640,7 +641,7 @@ impl Runtime for DockerRuntime {
 
     /// Execute a command inside a container
     ///
-    /// Returns a tuple of (exit_code, stdout, stderr)
+    /// Returns a tuple of (`exit_code`, stdout, stderr)
     #[instrument(
         skip(self, cmd),
         fields(
@@ -667,7 +668,7 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to create exec: {}", e),
+                reason: format!("failed to create exec: {e}"),
             })?;
 
         // Start the exec and collect output
@@ -675,7 +676,7 @@ impl Runtime for DockerRuntime {
             .docker
             .start_exec(&exec_created.id, None)
             .await
-            .map_err(|e| AgentError::Internal(format!("failed to start exec: {}", e)))?;
+            .map_err(|e| AgentError::Internal(format!("failed to start exec: {e}")))?;
 
         let mut stdout = String::new();
         let mut stderr = String::new();
@@ -708,8 +709,9 @@ impl Runtime for DockerRuntime {
             .docker
             .inspect_exec(&exec_created.id)
             .await
-            .map_err(|e| AgentError::Internal(format!("failed to inspect exec: {}", e)))?;
+            .map_err(|e| AgentError::Internal(format!("failed to inspect exec: {e}")))?;
 
+        #[allow(clippy::cast_possible_truncation)]
         let exit_code = exec_inspect.exit_code.unwrap_or(0) as i32;
 
         tracing::debug!(
@@ -752,7 +754,7 @@ impl Runtime for DockerRuntime {
             })?
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to get stats: {}", e),
+                reason: format!("failed to get stats: {e}"),
             })?;
 
         // Extract CPU usage from Docker stats
@@ -823,9 +825,10 @@ impl Runtime for DockerRuntime {
             })?
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to wait for container: {}", e),
+                reason: format!("failed to wait for container: {e}"),
             })?;
 
+        #[allow(clippy::cast_possible_truncation)]
         let exit_code = wait_response.status_code as i32;
 
         tracing::info!(container = %name, exit_code = exit_code, "container exited");
@@ -868,7 +871,7 @@ impl Runtime for DockerRuntime {
                 Err(e) => {
                     return Err(AgentError::NotFound {
                         container: name.clone(),
-                        reason: format!("failed to get logs: {}", e),
+                        reason: format!("failed to get logs: {e}"),
                     });
                 }
             }
@@ -896,11 +899,12 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to inspect container: {}", e),
+                reason: format!("failed to inspect container: {e}"),
             })?;
 
         // Extract the PID from the state - only return it if the container is running
         // A PID of 0 means the container is not running
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pid =
             inspect
                 .state
@@ -929,7 +933,7 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::NotFound {
                 container: name.clone(),
-                reason: format!("failed to inspect container: {}", e),
+                reason: format!("failed to inspect container: {e}"),
             })?;
 
         // Extract bridge IP from network settings

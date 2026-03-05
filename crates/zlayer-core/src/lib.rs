@@ -1,7 +1,7 @@
-//! ZLayer Core Types
+//! `ZLayer` Core Types
 //!
 //! This crate provides shared types, error handling, and configuration structures
-//! used across all ZLayer crates.
+//! used across all `ZLayer` crates.
 
 pub mod auth;
 pub mod config;

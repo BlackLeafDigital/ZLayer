@@ -66,12 +66,14 @@ pub type Result<T, E = ProxyError> = std::result::Result<T, E>;
 
 impl ProxyError {
     /// Returns the HTTP status code for this error
+    #[must_use]
     pub fn status_code(&self) -> http::StatusCode {
         match self {
             ProxyError::RouteNotFound { .. } => http::StatusCode::NOT_FOUND,
             ProxyError::NoHealthyBackends { .. } => http::StatusCode::SERVICE_UNAVAILABLE,
-            ProxyError::BackendConnectionFailed { .. } => http::StatusCode::BAD_GATEWAY,
-            ProxyError::BackendRequestFailed(_) => http::StatusCode::BAD_GATEWAY,
+            ProxyError::BackendConnectionFailed { .. } | ProxyError::BackendRequestFailed(_) => {
+                http::StatusCode::BAD_GATEWAY
+            }
             ProxyError::Forbidden(_) => http::StatusCode::FORBIDDEN,
             ProxyError::InvalidRequest(_) => http::StatusCode::BAD_REQUEST,
             ProxyError::Timeout(_) => http::StatusCode::GATEWAY_TIMEOUT,

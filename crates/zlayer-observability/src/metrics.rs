@@ -10,9 +10,9 @@ use tracing::info;
 use crate::config::MetricsConfig;
 use crate::error::{ObservabilityError, Result};
 
-/// ZLayer metrics collection
+/// `ZLayer` metrics collection
 ///
-/// Pre-defined metrics for the ZLayer system.
+/// Pre-defined metrics for the `ZLayer` system.
 pub struct ZLayerMetrics {
     registry: Registry,
 
@@ -53,6 +53,9 @@ pub struct ZLayerMetrics {
 
 impl ZLayerMetrics {
     /// Create a new metrics collection
+    ///
+    /// # Errors
+    /// Returns an error if Prometheus metric creation or registration fails.
     pub fn new() -> Result<Self> {
         let registry = Registry::new();
 
@@ -167,11 +170,15 @@ impl ZLayerMetrics {
     }
 
     /// Get the Prometheus registry
+    #[must_use]
     pub fn registry(&self) -> &Registry {
         &self.registry
     }
 
     /// Encode metrics in Prometheus text format
+    ///
+    /// # Errors
+    /// Returns an error if metric encoding fails.
     pub fn encode(&self) -> Result<String> {
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
@@ -199,14 +206,14 @@ impl ZLayerMetrics {
     pub fn set_replicas(&self, service: &str, count: u32) {
         self.service_replicas
             .with_label_values(&[service])
-            .set(count as f64);
+            .set(f64::from(count));
     }
 
     /// Update service health status
     pub fn set_health(&self, service: &str, health: HealthStatus) {
         self.service_health
             .with_label_values(&[service])
-            .set(health as i32 as f64);
+            .set(f64::from(health as i32));
     }
 
     /// Record an HTTP request
@@ -226,11 +233,13 @@ impl ZLayerMetrics {
     }
 
     /// Update Raft term
+    #[allow(clippy::cast_precision_loss)]
     pub fn set_raft_term(&self, term: u64) {
         self.raft_term.set(term as f64);
     }
 
     /// Update Raft commit index
+    #[allow(clippy::cast_precision_loss)]
     pub fn set_raft_commit_index(&self, index: u64) {
         self.raft_commit_index.set(index as f64);
     }
@@ -265,6 +274,13 @@ pub enum HealthStatus {
 static METRICS: std::sync::OnceLock<ZLayerMetrics> = std::sync::OnceLock::new();
 
 /// Initialize global metrics
+///
+/// # Errors
+/// This function currently never fails but returns `Result` for API consistency.
+///
+/// # Panics
+/// Panics if `ZLayerMetrics::new()` fails during first initialization.
+#[allow(clippy::unnecessary_wraps)]
 pub fn init_metrics(config: &MetricsConfig) -> Result<&'static ZLayerMetrics> {
     if !config.enabled {
         info!("Metrics disabled by configuration");
@@ -282,13 +298,14 @@ pub fn metrics() -> Option<&'static ZLayerMetrics> {
 
 /// Axum handler for Prometheus metrics endpoint
 #[cfg(feature = "axum")]
+#[allow(clippy::unused_async)]
 pub async fn metrics_handler() -> impl axum::response::IntoResponse {
     use axum::http::StatusCode;
 
     match metrics() {
         Some(m) => match m.encode() {
             Ok(body) => (StatusCode::OK, body),
-            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {}", e)),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("Error: {e}")),
         },
         None => (
             StatusCode::SERVICE_UNAVAILABLE,

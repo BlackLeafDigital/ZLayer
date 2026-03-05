@@ -55,6 +55,7 @@ impl PlainLogger {
     ///
     /// * `verbose` - If true, shows all output lines. If false, only shows
     ///   stage and instruction transitions.
+    #[must_use]
     pub fn new(verbose: bool) -> Self {
         Self {
             verbose,
@@ -63,6 +64,7 @@ impl PlainLogger {
     }
 
     /// Create a new plain logger with explicit color setting
+    #[must_use]
     pub fn with_color(verbose: bool, color: bool) -> Self {
         Self { verbose, color }
     }
@@ -89,7 +91,7 @@ impl PlainLogger {
             }
 
             BuildEvent::InstructionStarted { instruction, .. } => {
-                let line = format!("  -> {}", instruction);
+                let line = format!("  -> {instruction}");
                 println!("{}", self.colorize(&line, ansi::YELLOW));
             }
 
@@ -97,7 +99,7 @@ impl PlainLogger {
                 if *is_stderr {
                     eprintln!("     {}", self.colorize(line, ansi::DIM));
                 } else {
-                    println!("     {}", line);
+                    println!("     {line}");
                 }
             }
 
@@ -120,13 +122,13 @@ impl PlainLogger {
 
             BuildEvent::BuildComplete { image_id } => {
                 println!();
-                let success = format!("Build complete: {}", image_id);
+                let success = format!("Build complete: {image_id}");
                 println!("{}", self.colorize(&success, ansi::GREEN));
             }
 
             BuildEvent::BuildFailed { error } => {
                 println!();
-                let failure = format!("Build failed: {}", error);
+                let failure = format!("Build failed: {error}");
                 eprintln!("{}", self.colorize(&failure, ansi::RED));
             }
         }

@@ -1,4 +1,4 @@
-//! ZLayer Scheduler - Distributed autoscaling with OpenRaft
+//! `ZLayer` Scheduler - Distributed autoscaling with `OpenRaft`
 //!
 //! This crate provides:
 //! - **Metrics collection** from container runtimes
@@ -107,7 +107,7 @@ pub struct Scheduler {
     agent_base_url: String,
     /// Placement state tracking where containers are placed across nodes
     placement_state: Arc<RwLock<PlacementState>>,
-    /// Service specs for placement decisions (service_name -> ServiceSpec)
+    /// Service specs for placement decisions (`service_name` -> `ServiceSpec`)
     service_specs: Arc<RwLock<HashMap<String, ServiceSpec>>>,
 }
 
@@ -117,7 +117,8 @@ impl Scheduler {
     /// # Arguments
     /// * `config` - Scheduler configuration
     /// * `internal_token` - Token for authenticating with agent internal endpoints
-    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:3669")
+    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "<http://localhost:3669>")
+    #[must_use]
     pub fn new_standalone(
         config: SchedulerConfig,
         internal_token: String,
@@ -137,12 +138,16 @@ impl Scheduler {
         }
     }
 
-    /// Create a new scheduler with Raft coordination
+    /// Create a new scheduler with Raft coordination.
     ///
     /// # Arguments
     /// * `config` - Scheduler configuration
     /// * `internal_token` - Token for authenticating with agent internal endpoints
-    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:3669")
+    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "<http://localhost:3669>")
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Raft coordinator fails to initialize or bootstrap.
     pub async fn new_distributed(
         config: SchedulerConfig,
         internal_token: String,
@@ -177,7 +182,8 @@ impl Scheduler {
     /// * `config` - Scheduler configuration
     /// * `raft` - Pre-existing Raft coordinator
     /// * `internal_token` - Token for authenticating with agent internal endpoints
-    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "http://localhost:3669")
+    /// * `agent_base_url` - Base URL of the agent HTTP API (e.g., "<http://localhost:3669>")
+    #[must_use]
     pub fn with_raft(
         config: SchedulerConfig,
         raft: Arc<RaftCoordinator>,
@@ -204,13 +210,17 @@ impl Scheduler {
         metrics.add_source(source);
     }
 
-    /// Register a service for scheduling
+    /// Register a service for scheduling.
     ///
     /// # Arguments
     /// * `name` - Service name
     /// * `scale_spec` - Scaling specification (fixed, adaptive, manual)
     /// * `initial_replicas` - Starting replica count
     /// * `service_spec` - Optional full service spec for placement decisions
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Raft proposal to register the service fails.
     pub async fn register_service(
         &self,
         name: impl Into<String>,
@@ -266,7 +276,11 @@ impl Scheduler {
         info!(service = name, "Unregistered service");
     }
 
-    /// Evaluate scaling for a specific service
+    /// Evaluate scaling for a specific service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if metrics collection or autoscaler evaluation fails.
     pub async fn evaluate_service(&self, service_name: &str) -> Result<ScalingDecision> {
         // Collect metrics
         let aggregated = {
@@ -336,8 +350,7 @@ impl Scheduler {
                     .await
                     .unwrap_or_else(|_| "unknown".to_string());
                 return Err(SchedulerError::AgentCommunication(format!(
-                    "agent returned status {}: {}",
-                    status, body
+                    "agent returned status {status}: {body}"
                 )));
             }
 
@@ -370,11 +383,13 @@ impl Scheduler {
                 resources.cpu_used = n.cpu_used;
                 resources.memory_used = n.memory_used;
                 // Map GPU info from the Raft node info
-                resources.gpu_total = n.gpus.len() as u32;
+                #[allow(clippy::cast_possible_truncation)]
+                let gpu_count = n.gpus.len() as u32;
+                resources.gpu_total = gpu_count;
                 resources.gpu_models = n.gpus.iter().map(|g| g.model.clone()).collect();
                 resources.gpu_memory_mb = n.gpus.iter().map(|g| g.memory_mb).sum();
                 if let Some(first_gpu) = n.gpus.first() {
-                    resources.gpu_vendor = first_gpu.vendor.clone();
+                    resources.gpu_vendor.clone_from(&first_gpu.vendor);
                 }
 
                 placement::NodeState {
@@ -393,7 +408,8 @@ impl Scheduler {
     /// Uses the placement module's `place_service_replicas` to run bin-packing,
     /// dedicated, or exclusive placement depending on the service's `node_mode`.
     ///
-    /// Returns a map of node_id -> list of container IDs assigned to that node.
+    /// Returns a map of `node_id` -> list of container IDs assigned to that node.
+    #[allow(clippy::unused_self)]
     fn compute_placement(
         &self,
         service_name: &str,
@@ -401,7 +417,7 @@ impl Scheduler {
         nodes: &mut [placement::NodeState],
         placement_state: &mut placement::PlacementState,
         spec: Option<&ServiceSpec>,
-    ) -> Result<HashMap<NodeId, Vec<placement::ContainerId>>> {
+    ) -> HashMap<NodeId, Vec<placement::ContainerId>> {
         // Build a default ServiceSpec if none provided, using Shared mode
         let default_spec = ServiceSpec {
             rtype: zlayer_spec::ResourceType::Service,
@@ -410,12 +426,12 @@ impl Scheduler {
                 name: "unknown:latest".to_string(),
                 pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
             },
-            resources: Default::default(),
-            env: Default::default(),
-            command: Default::default(),
-            network: Default::default(),
+            resources: zlayer_spec::ResourcesSpec::default(),
+            env: HashMap::default(),
+            command: zlayer_spec::CommandSpec::default(),
+            network: zlayer_spec::NetworkSpec::default(),
             endpoints: vec![],
-            scale: Default::default(),
+            scale: zlayer_spec::ScaleSpec::default(),
             depends: vec![],
             health: zlayer_spec::HealthSpec {
                 start_grace: None,
@@ -424,15 +440,15 @@ impl Scheduler {
                 retries: 3,
                 check: zlayer_spec::HealthCheck::Tcp { port: 0 },
             },
-            init: Default::default(),
-            errors: Default::default(),
+            init: zlayer_spec::InitSpec::default(),
+            errors: zlayer_spec::ErrorsSpec::default(),
             devices: vec![],
             storage: vec![],
             capabilities: vec![],
             privileged: false,
             node_mode: zlayer_spec::NodeMode::Shared,
             node_selector: None,
-            service_type: Default::default(),
+            service_type: zlayer_spec::ServiceType::default(),
             wasm_http: None,
             host_network: false,
         };
@@ -472,7 +488,7 @@ impl Scheduler {
             }
         }
 
-        Ok(node_assignments)
+        node_assignments
     }
 
     /// Execute scaling across multiple nodes by calling each node's internal API.
@@ -480,6 +496,7 @@ impl Scheduler {
     /// The leader dispatches scale requests to each node that has been assigned
     /// containers for this service. Uses the same internal API endpoint and
     /// authentication as local scaling.
+    #[allow(clippy::too_many_lines)]
     async fn execute_distributed_scaling(
         &self,
         service_name: &str,
@@ -499,6 +516,7 @@ impl Scheduler {
                 continue;
             };
 
+            #[allow(clippy::cast_possible_truncation)]
             let replicas = containers.len() as u32;
 
             // Determine the target URL for this node's internal API
@@ -520,7 +538,7 @@ impl Scheduler {
                 3669 // Default ZLayer API port
             };
 
-            let url = format!("http://{}:{}/api/v1/internal/scale", addr, port);
+            let url = format!("http://{addr}:{port}/api/v1/internal/scale");
 
             info!(
                 service = service_name,
@@ -601,7 +619,7 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Apply a scaling decision
+    /// Apply a scaling decision.
     ///
     /// This records the decision, updates state, and executes the scaling.
     ///
@@ -611,6 +629,11 @@ impl Scheduler {
     ///
     /// In standalone mode or single-node clusters, this falls back to calling
     /// the local agent directly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if recording the scale action, executing scaling on
+    /// the agent, or recording the Raft scale event fails.
     pub async fn apply_scaling(
         &self,
         service_name: &str,
@@ -655,7 +678,7 @@ impl Scheduler {
                             &mut nodes,
                             &mut ps,
                             spec.as_ref(),
-                        )?
+                        )
                     };
 
                     if node_assignments.is_empty() {
@@ -690,8 +713,8 @@ impl Scheduler {
             // If using Raft, record the event
             if let Some(raft) = &self.raft {
                 let (from, reason) = match decision {
-                    ScalingDecision::ScaleUp { from, reason, .. } => (*from, reason.clone()),
-                    ScalingDecision::ScaleDown { from, reason, .. } => (*from, reason.clone()),
+                    ScalingDecision::ScaleUp { from, reason, .. }
+                    | ScalingDecision::ScaleDown { from, reason, .. } => (*from, reason.clone()),
                     _ => return Ok(()),
                 };
 
@@ -709,10 +732,14 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Run the scheduling loop
+    /// Run the scheduling loop.
     ///
     /// This continuously collects metrics and makes scaling decisions.
     /// Returns when shutdown is signaled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Raft shutdown fails.
     pub async fn run(&self, services: Vec<String>) -> Result<()> {
         let mut ticker = interval(self.config.metrics_interval);
 
@@ -748,7 +775,7 @@ impl Scheduler {
                         }
                     }
                 }
-                _ = self.shutdown.notified() => {
+                () = self.shutdown.notified() => {
                     info!("Scheduler shutdown requested");
                     break;
                 }
@@ -769,7 +796,8 @@ impl Scheduler {
     }
 
     /// Check if this node is the leader (always true for standalone)
-    pub async fn is_leader(&self) -> bool {
+    #[must_use]
+    pub fn is_leader(&self) -> bool {
         match &self.raft {
             Some(raft) => raft.is_leader(),
             None => true, // Standalone is always "leader"
@@ -802,6 +830,11 @@ impl Scheduler {
     /// Finds all services that had replicas on the dead node, clears their
     /// stale placements, recomputes placement across remaining live nodes,
     /// and dispatches scaling requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::NotLeader` if Raft is not configured, or
+    /// an error if distributed scaling dispatch fails.
     pub async fn handle_node_death(&self, dead_node_id: NodeId) -> Result<()> {
         let raft = self.raft.as_ref().ok_or(SchedulerError::NotLeader)?;
         let state = raft.read_state().await;
@@ -853,23 +886,13 @@ impl Scheduler {
                     );
                 }
 
-                match self.compute_placement(
+                self.compute_placement(
                     &service_name,
                     desired_replicas,
                     &mut nodes.clone(),
                     &mut placement_state,
                     spec.as_ref(),
-                ) {
-                    Ok(assignments) => assignments,
-                    Err(e) => {
-                        error!(
-                            service = %service_name,
-                            error = %e,
-                            "Failed to compute placement for rescheduling"
-                        );
-                        continue;
-                    }
-                }
+                )
             };
 
             if node_assignments.is_empty() {
@@ -918,7 +941,7 @@ mod tests {
         );
 
         // Should always be leader in standalone
-        assert!(scheduler.is_leader().await);
+        assert!(scheduler.is_leader());
 
         // No cluster state in standalone
         assert!(scheduler.cluster_state().await.is_none());

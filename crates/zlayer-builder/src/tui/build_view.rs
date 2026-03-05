@@ -20,11 +20,13 @@ pub struct BuildView<'a> {
 
 impl<'a> BuildView<'a> {
     /// Create a new build view
+    #[must_use]
     pub fn new(state: &'a BuildState) -> Self {
         Self { state }
     }
 
     /// Calculate the layout for the view
+    #[allow(clippy::unused_self)]
     fn layout(&self, area: Rect) -> (Rect, Rect, Rect, Rect) {
         // Main layout:
         // - Header: Stage info + progress bar (3 lines)
@@ -100,7 +102,7 @@ impl BuildView<'_> {
         let completed = self.state.completed_instructions();
 
         let progress = ProgressBar::new(completed, total)
-            .with_label(format!("{}/{} instructions", completed, total));
+            .with_label(format!("{completed}/{total} instructions"));
         progress.render(chunks[1], buf);
     }
 
@@ -119,7 +121,7 @@ impl BuildView<'_> {
     fn render_instructions(&self, area: Rect, buf: &mut Buffer) {
         let title = if let Some(stage) = self.state.stages.get(self.state.current_stage) {
             if let Some(ref name) = stage.name {
-                format!(" Stage: {} ", name)
+                format!(" Stage: {name} ")
             } else {
                 format!(" Stage {} ", self.state.current_stage + 1)
             }
@@ -160,7 +162,7 @@ impl BuildView<'_> {
             let inner = block.inner(area);
             block.render(area, buf);
 
-            let error_text = format!("Build failed: {}", error);
+            let error_text = format!("Build failed: {error}");
             Paragraph::new(error_text)
                 .style(Style::default().fg(color::ERROR))
                 .wrap(Wrap { trim: false })
@@ -174,7 +176,7 @@ impl BuildView<'_> {
             let inner = block.inner(area);
             block.render(area, buf);
 
-            let success_text = format!("Build complete!\n\nImage: {}", image_id);
+            let success_text = format!("Build complete!\n\nImage: {image_id}");
             Paragraph::new(success_text)
                 .style(Style::default().fg(color::SUCCESS))
                 .render(inner, buf);

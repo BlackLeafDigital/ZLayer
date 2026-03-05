@@ -36,6 +36,7 @@ pub enum ImageRef {
 
 impl ImageRef {
     /// Parse an image reference string
+    #[must_use]
     pub fn parse(s: &str) -> Self {
         let s = s.trim();
 
@@ -77,6 +78,7 @@ impl ImageRef {
     }
 
     /// Convert to a full image string
+    #[must_use]
     pub fn to_string_ref(&self) -> String {
         match self {
             Self::Registry { image, tag, digest } => {
@@ -97,11 +99,13 @@ impl ImageRef {
     }
 
     /// Returns true if this is a reference to a build stage
+    #[must_use]
     pub fn is_stage(&self) -> bool {
         matches!(self, Self::Stage(_))
     }
 
     /// Returns true if this is the scratch base
+    #[must_use]
     pub fn is_scratch(&self) -> bool {
         matches!(self, Self::Scratch)
     }
@@ -117,6 +121,7 @@ impl ImageRef {
     /// - `ghcr.io/org/image:tag` → unchanged (already qualified)
     /// - `localhost:5000/image:tag` → unchanged (already qualified)
     /// - `scratch` / stage refs → unchanged
+    #[must_use]
     pub fn qualify(&self) -> Self {
         match self {
             Self::Scratch | Self::Stage(_) => self.clone(),
@@ -142,7 +147,7 @@ fn qualify_image_name(image: &str) -> String {
     let parts: Vec<&str> = image.split('/').collect();
 
     if parts.is_empty() {
-        return format!("docker.io/library/{}", image);
+        return format!("docker.io/library/{image}");
     }
 
     let first = parts[0];
@@ -151,9 +156,9 @@ fn qualify_image_name(image: &str) -> String {
     }
 
     if parts.len() == 1 {
-        format!("docker.io/library/{}", image)
+        format!("docker.io/library/{image}")
     } else {
-        format!("docker.io/{}", image)
+        format!("docker.io/{image}")
     }
 }
 
@@ -178,11 +183,13 @@ pub struct Stage {
 
 impl Stage {
     /// Returns the stage identifier (name if present, otherwise index as string)
+    #[must_use]
     pub fn identifier(&self) -> String {
         self.name.clone().unwrap_or_else(|| self.index.to_string())
     }
 
     /// Returns true if this stage matches the given name or index
+    #[must_use]
     pub fn matches(&self, name_or_index: &str) -> bool {
         if let Some(ref name) = self.name {
             if name == name_or_index {
@@ -210,6 +217,10 @@ pub struct Dockerfile {
 
 impl Dockerfile {
     /// Parse a Dockerfile from a string
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Dockerfile content is malformed or contains invalid instructions.
     pub fn parse(content: &str) -> Result<Self> {
         let raw = RawDockerfile::parse(content).map_err(|e| BuildError::DockerfileParse {
             message: e.to_string(),
@@ -220,6 +231,10 @@ impl Dockerfile {
     }
 
     /// Parse a Dockerfile from a file
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or the Dockerfile is malformed.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let content =
             std::fs::read_to_string(path.as_ref()).map_err(|e| BuildError::ContextRead {
@@ -272,7 +287,7 @@ impl Dockerfile {
                 RawInstruction::Arg(arg) => {
                     let arg_inst = ArgInstruction {
                         name: arg.name.to_string(),
-                        default: arg.value.as_ref().map(|v| v.to_string()),
+                        default: arg.value.as_ref().map(std::string::ToString::to_string),
                     };
 
                     if current_stage.is_none() {
@@ -313,6 +328,7 @@ impl Dockerfile {
     }
 
     /// Convert a raw instruction to our internal representation
+    #[allow(clippy::too_many_lines)]
     fn convert_instruction(raw: &RawInstruction) -> Result<Option<Instruction>> {
         let instruction = match raw {
             RawInstruction::From(_) => {
@@ -359,7 +375,11 @@ impl Dockerfile {
                 let link = copy.flags.iter().any(|f| f.name.content.as_str() == "link");
 
                 // Get all paths
-                let all_paths: Vec<String> = copy.sources.iter().map(|s| s.to_string()).collect();
+                let all_paths: Vec<String> = copy
+                    .sources
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect();
 
                 if all_paths.is_empty() {
                     return Err(BuildError::InvalidInstruction {
@@ -424,7 +444,7 @@ impl Dockerfile {
 
             RawInstruction::Arg(arg) => Instruction::Arg(ArgInstruction {
                 name: arg.name.to_string(),
-                default: arg.value.as_ref().map(|v| v.to_string()),
+                default: arg.value.as_ref().map(std::string::ToString::to_string),
             }),
 
             RawInstruction::Misc(misc) => {
@@ -459,7 +479,7 @@ impl Dockerfile {
                         let port: u16 = port_str.trim().parse().map_err(|_| {
                             BuildError::InvalidInstruction {
                                 instruction: "EXPOSE".to_string(),
-                                reason: format!("Invalid port number: {}", port_str),
+                                reason: format!("Invalid port number: {port_str}"),
                             }
                         })?;
 
@@ -543,26 +563,31 @@ impl Dockerfile {
     }
 
     /// Get a stage by name or index
+    #[must_use]
     pub fn get_stage(&self, name_or_index: &str) -> Option<&Stage> {
         self.stages.iter().find(|s| s.matches(name_or_index))
     }
 
     /// Get the final stage (last one in the Dockerfile)
+    #[must_use]
     pub fn final_stage(&self) -> Option<&Stage> {
         self.stages.last()
     }
 
     /// Get all stage names/identifiers
+    #[must_use]
     pub fn stage_names(&self) -> Vec<String> {
-        self.stages.iter().map(|s| s.identifier()).collect()
+        self.stages.iter().map(Stage::identifier).collect()
     }
 
     /// Check if a stage exists
+    #[must_use]
     pub fn has_stage(&self, name_or_index: &str) -> bool {
         self.get_stage(name_or_index).is_some()
     }
 
     /// Returns the number of stages
+    #[must_use]
     pub fn stage_count(&self) -> usize {
         self.stages.len()
     }

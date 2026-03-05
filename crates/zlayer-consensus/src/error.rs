@@ -5,23 +5,23 @@ use crate::types::NodeId;
 /// Errors that can occur in the consensus layer.
 #[derive(Debug, thiserror::Error)]
 pub enum ConsensusError {
-    /// OpenRaft configuration error.
+    /// `OpenRaft` configuration error.
     #[error("invalid raft config: {0}")]
     Config(#[from] openraft::ConfigError),
 
-    /// OpenRaft fatal error.
+    /// `OpenRaft` fatal error.
     #[error("raft fatal error: {0}")]
     Fatal(String),
 
-    /// OpenRaft client write error (forwarded as string to avoid generic explosion).
+    /// `OpenRaft` client write error (forwarded as string to avoid generic explosion).
     #[error("raft write error: {0}")]
     Write(String),
 
-    /// OpenRaft initialization error.
+    /// `OpenRaft` initialization error.
     #[error("raft init error: {0}")]
     Init(String),
 
-    /// OpenRaft membership change error.
+    /// `OpenRaft` membership change error.
     #[error("membership change error: {0}")]
     Membership(String),
 

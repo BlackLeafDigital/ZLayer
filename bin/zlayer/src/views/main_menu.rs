@@ -1,6 +1,6 @@
 //! Main menu view
 //!
-//! Shows the ZLayer logo, subtitle, and a navigable list of actions.
+//! Shows the `ZLayer` logo, subtitle, and a navigable list of actions.
 
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -19,6 +19,7 @@ const MENU_ITEMS: &[(&str, &str)] = &[
 ];
 
 /// Render the main menu
+#[allow(clippy::cast_possible_truncation)]
 pub fn render(frame: &mut Frame, state: &MainMenuState) {
     let area = frame.area();
 
@@ -72,6 +73,7 @@ pub fn render(frame: &mut Frame, state: &MainMenuState) {
 }
 
 /// Render the menu items with selection highlight
+#[allow(clippy::cast_possible_truncation)]
 fn render_menu_items(area: Rect, buf: &mut Buffer, state: &MainMenuState) {
     if area.height == 0 {
         return;
@@ -95,12 +97,7 @@ fn render_menu_items(area: Rect, buf: &mut Buffer, state: &MainMenuState) {
             Style::default().fg(Color::White)
         };
 
-        buf.set_string(
-            area.x + 2,
-            y,
-            format!("{}{}", indicator, label),
-            label_style,
-        );
+        buf.set_string(area.x + 2, y, format!("{indicator}{label}"), label_style);
 
         // Description on the next line (if room)
         if y + 1 < area.y + area.height {

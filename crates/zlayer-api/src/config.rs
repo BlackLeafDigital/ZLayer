@@ -1,5 +1,6 @@
 //! API configuration
 
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -12,7 +13,8 @@ pub struct ApiConfig {
     pub bind: SocketAddr,
 
     /// JWT secret key (should be at least 32 bytes)
-    pub jwt_secret: String,
+    #[serde(skip_serializing)]
+    pub jwt_secret: SecretString,
 
     /// JWT token expiration
     #[serde(default = "default_token_expiry")]
@@ -55,7 +57,7 @@ impl Default for ApiConfig {
     fn default() -> Self {
         Self {
             bind: default_bind(),
-            jwt_secret: "CHANGE_ME_IN_PRODUCTION".to_string(),
+            jwt_secret: SecretString::from("CHANGE_ME_IN_PRODUCTION".to_string()),
             token_expiry: default_token_expiry(),
             swagger_enabled: true,
             rate_limit: RateLimitConfig::default(),

@@ -10,7 +10,7 @@ use thiserror::Error;
 pub enum SpecError {
     /// YAML parsing error
     #[error("YAML parse error: {0}")]
-    YamlError(#[from] serde_yaml::Error),
+    YamlError(#[from] serde_yml::Error),
 
     /// Validation error
     #[error("Validation error: {0}")]
@@ -124,40 +124,39 @@ pub enum ValidationErrorKind {
 impl fmt::Display for ValidationErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidVersion { found } => write!(f, "invalid version (found: {})", found),
+            Self::InvalidVersion { found } => write!(f, "invalid version (found: {found})"),
             Self::EmptyDeploymentName => write!(f, "deployment name is empty"),
             Self::EmptyServiceName => write!(f, "service name is empty"),
             Self::EmptyImageName => write!(f, "image name is empty"),
             Self::InvalidPort { port } => {
-                write!(f, "port {} is out of valid range (1-65535)", port)
+                write!(f, "port {port} is out of valid range (1-65535)")
             }
-            Self::InvalidCpu { cpu } => write!(f, "CPU limit {} is invalid (must be > 0)", cpu),
+            Self::InvalidCpu { cpu } => write!(f, "CPU limit {cpu} is invalid (must be > 0)"),
             Self::InvalidMemoryFormat { value } => {
-                write!(f, "memory format '{}' is invalid", value)
+                write!(f, "memory format '{value}' is invalid")
             }
-            Self::InvalidDuration { value } => write!(f, "duration format '{}' is invalid", value),
-            Self::DuplicateEndpoint { name } => write!(f, "duplicate endpoint '{}'", name),
-            Self::UnknownInitAction { action } => write!(f, "unknown init action '{}'", action),
+            Self::InvalidDuration { value } => write!(f, "duration format '{value}' is invalid"),
+            Self::DuplicateEndpoint { name } => write!(f, "duplicate endpoint '{name}'"),
+            Self::UnknownInitAction { action } => write!(f, "unknown init action '{action}'"),
             Self::UnknownDependency { service } => {
-                write!(f, "dependency references unknown service '{}'", service)
+                write!(f, "dependency references unknown service '{service}'")
             }
             Self::CircularDependency {
                 service,
                 depends_on,
             } => write!(
                 f,
-                "circular dependency detected: '{}' depends on '{}'",
-                service, depends_on
+                "circular dependency detected: '{service}' depends on '{depends_on}'"
             ),
             Self::InvalidScaleRange { min, max } => {
-                write!(f, "invalid scale range: min {} > max {}", min, max)
+                write!(f, "invalid scale range: min {min} > max {max}")
             }
             Self::EmptyScaleTargets => write!(f, "scale targets are empty in adaptive mode"),
             Self::InvalidEnvVar { key, reason } => {
-                write!(f, "invalid environment variable '{}': {}", key, reason)
+                write!(f, "invalid environment variable '{key}': {reason}")
             }
             Self::InvalidCronSchedule { schedule, reason } => {
-                write!(f, "invalid cron schedule '{}': {}", schedule, reason)
+                write!(f, "invalid cron schedule '{schedule}': {reason}")
             }
             Self::ScheduleOnlyForCron => {
                 write!(f, "schedule field is only valid for rtype: cron")
@@ -165,30 +164,27 @@ impl fmt::Display for ValidationErrorKind {
             Self::CronRequiresSchedule => {
                 write!(f, "rtype: cron requires a schedule field")
             }
-            Self::Generic { message } => write!(f, "{}", message),
+            Self::Generic { message } => write!(f, "{message}"),
             Self::InsufficientNodes {
                 required,
                 available,
                 message,
             } => write!(
                 f,
-                "insufficient nodes: need {} but only {} available - {}",
-                required, available, message
+                "insufficient nodes: need {required} but only {available} available - {message}"
             ),
             Self::InvalidTunnelProtocol { protocol } => write!(
                 f,
-                "invalid tunnel protocol '{}' (must be tcp or udp)",
-                protocol
+                "invalid tunnel protocol '{protocol}' (must be tcp or udp)"
             ),
             Self::InvalidTunnelPort { port, field } => {
                 write!(
                     f,
-                    "invalid tunnel {} port: {} (must be 0 or 1-65535)",
-                    field, port
+                    "invalid tunnel {field} port: {port} (must be 0 or 1-65535)"
                 )
             }
             Self::InvalidTunnelTtl { value, reason } => {
-                write!(f, "invalid tunnel max_ttl '{}': {}", value, reason)
+                write!(f, "invalid tunnel max_ttl '{value}': {reason}")
             }
         }
     }

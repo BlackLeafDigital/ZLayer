@@ -6,21 +6,22 @@ use tracing::info;
 use crate::cli::ManagerCommands;
 
 /// Handle zlayer-manager commands
-pub(crate) async fn handle_manager(cmd: &ManagerCommands) -> Result<()> {
+pub(crate) fn handle_manager(cmd: &ManagerCommands) -> Result<()> {
     match cmd {
         ManagerCommands::Init {
             output,
             port,
             deploy,
             version,
-        } => handle_manager_init(output.clone(), *port, *deploy, version.clone()).await,
-        ManagerCommands::Status => handle_manager_status().await,
-        ManagerCommands::Stop { force } => handle_manager_stop(*force).await,
+        } => handle_manager_init(output.clone(), *port, *deploy, version.clone()),
+        ManagerCommands::Status => handle_manager_status(),
+        ManagerCommands::Stop { force } => handle_manager_stop(*force),
     }
 }
 
 /// Initialize zlayer-manager deployment spec
-pub(crate) async fn handle_manager_init(
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn handle_manager_init(
     output: PathBuf,
     port: u16,
     deploy: bool,
@@ -34,7 +35,7 @@ pub(crate) async fn handle_manager_init(
     // We use target_port to tell the proxy where the container actually listens,
     // while `port` is the external-facing proxy listen port.
     let spec = format!(
-        r#"version: v1
+        r"version: v1
 deployment: zlayer-manager
 
 services:
@@ -59,9 +60,7 @@ services:
       check:
         type: http
         url: http://localhost:9120/health
-"#,
-        version = version,
-        port = port
+"
     );
 
     // Ensure output directory exists
@@ -78,8 +77,8 @@ services:
     println!("Created deployment spec: {}", spec_path.display());
     println!();
     println!("Manager configuration:");
-    println!("  - Image: zachhandley/zlayer-manager:{}", version);
-    println!("  - Port: {}", port);
+    println!("  - Image: zachhandley/zlayer-manager:{version}");
+    println!("  - Port: {port}");
     println!();
 
     if deploy {
@@ -101,7 +100,8 @@ services:
 }
 
 /// Show manager status
-pub(crate) async fn handle_manager_status() -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_manager_status() -> Result<()> {
     info!("Checking zlayer-manager status");
 
     // TODO: Query the actual manager service status
@@ -116,7 +116,8 @@ pub(crate) async fn handle_manager_status() -> Result<()> {
 }
 
 /// Stop the manager
-pub(crate) async fn handle_manager_stop(force: bool) -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_manager_stop(force: bool) -> Result<()> {
     info!(force = force, "Stopping zlayer-manager");
 
     // TODO: Actually stop the manager service

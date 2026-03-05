@@ -1,11 +1,11 @@
-//! Core error types for ZLayer
+//! Core error types for `ZLayer`
 //!
-//! This module defines the global error hierarchy used across all ZLayer crates.
+//! This module defines the global error hierarchy used across all `ZLayer` crates.
 
 use std::path::PathBuf;
 use thiserror::Error;
 
-/// Global ZLayer error type
+/// Global `ZLayer` error type
 #[derive(Debug, Error)]
 pub enum ZLayerError {
     /// Spec-related errors
@@ -172,7 +172,7 @@ pub enum RegistryError {
     NotFound { image: String },
 }
 
-/// Result type alias for ZLayer operations
+/// Result type alias for `ZLayer` operations
 pub type Result<T, E = ZLayerError> = std::result::Result<T, E>;
 
 /// Convenience alias for core Error type

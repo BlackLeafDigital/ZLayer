@@ -1,6 +1,6 @@
 //! Deployment storage implementations
 //!
-//! Provides both persistent (SQLite via sqlx) and in-memory storage backends.
+//! Provides both persistent (`SQLite` via sqlx) and in-memory storage backends.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -72,10 +72,14 @@ pub struct SqlxStorage {
 }
 
 impl SqlxStorage {
-    /// Open or create a SQLite database at the given path
+    /// Open or create a `SQLite` database at the given path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database connection or table creation fails.
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let path_str = path.as_ref().display().to_string();
-        let connection_string = format!("sqlite:{}?mode=rwc", path_str);
+        let connection_string = format!("sqlite:{path_str}?mode=rwc");
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -92,14 +96,14 @@ impl SqlxStorage {
 
         // Create the deployments table if it doesn't exist
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS deployments (
                 name TEXT PRIMARY KEY NOT NULL,
                 data_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
-            "#,
+            ",
         )
         .execute(&pool)
         .await?;
@@ -107,20 +111,24 @@ impl SqlxStorage {
         Ok(Self { pool })
     }
 
-    /// Create an in-memory SQLite database (useful for testing)
+    /// Create an in-memory `SQLite` database (useful for testing).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the in-memory database creation or table creation fails.
     pub async fn in_memory() -> Result<Self, StorageError> {
         let pool = SqlitePool::connect(":memory:").await?;
 
         // Create the deployments table
         sqlx::query(
-            r#"
+            r"
             CREATE TABLE IF NOT EXISTS deployments (
                 name TEXT PRIMARY KEY NOT NULL,
                 data_json TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
-            "#,
+            ",
         )
         .execute(&pool)
         .await?;
@@ -137,10 +145,10 @@ impl DeploymentStorage for SqlxStorage {
         let updated_at = deployment.updated_at.to_rfc3339();
 
         sqlx::query(
-            r#"
+            r"
             INSERT OR REPLACE INTO deployments (name, data_json, created_at, updated_at)
             VALUES (?, ?, ?, ?)
-            "#,
+            ",
         )
         .bind(&deployment.name)
         .bind(&data_json)
@@ -200,6 +208,7 @@ pub struct InMemoryStorage {
 
 impl InMemoryStorage {
     /// Create a new empty in-memory storage
+    #[must_use]
     pub fn new() -> Self {
         Self {
             deployments: Arc::new(RwLock::new(HashMap::new())),

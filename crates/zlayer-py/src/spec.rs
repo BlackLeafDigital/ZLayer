@@ -1,6 +1,6 @@
 //! Spec classes for Python bindings
 //!
-//! Provides Python-friendly wrappers for ZLayer spec types.
+//! Provides Python-friendly wrappers for `ZLayer` spec types.
 
 use crate::error::ZLayerError;
 use pyo3::prelude::*;
@@ -10,7 +10,7 @@ use std::time::Duration;
 
 /// A deployment specification
 ///
-/// This class represents a parsed ZLayer deployment specification,
+/// This class represents a parsed `ZLayer` deployment specification,
 /// providing access to its services and configuration.
 #[pyclass]
 #[derive(Clone)]
@@ -29,7 +29,7 @@ impl Spec {
     ///     A Spec instance
     ///
     /// Raises:
-    ///     ValueError: If the YAML is invalid
+    ///     `ValueError`: If the YAML is invalid
     #[staticmethod]
     fn from_yaml(yaml: &str) -> PyResult<Self> {
         let spec = zlayer_spec::from_yaml_str(yaml).map_err(ZLayerError::from)?;
@@ -45,8 +45,8 @@ impl Spec {
     ///     A Spec instance
     ///
     /// Raises:
-    ///     ValueError: If the file is invalid
-    ///     IOError: If the file cannot be read
+    ///     `ValueError`: If the file is invalid
+    ///     `IOError`: If the file cannot be read
     #[staticmethod]
     fn from_file(path: &str) -> PyResult<Self> {
         let path = std::path::Path::new(path);
@@ -78,7 +78,7 @@ impl Spec {
     ///     name: The service name
     ///
     /// Returns:
-    ///     A ServiceSpec instance, or None if not found
+    ///     A `ServiceSpec` instance, or None if not found
     fn get_service(&self, name: &str) -> Option<ServiceSpec> {
         self.inner
             .services
@@ -107,7 +107,7 @@ impl Spec {
 
     /// Convert to YAML string
     fn to_yaml(&self) -> PyResult<String> {
-        serde_yaml::to_string(&self.inner).map_err(|e| ZLayerError::Spec(e.to_string()).into())
+        serde_yml::to_string(&self.inner).map_err(|e| ZLayerError::Spec(e.to_string()).into())
     }
 
     fn __repr__(&self) -> String {
@@ -346,10 +346,10 @@ impl ScaleSpec {
     fn __repr__(&self) -> String {
         match &self.inner {
             zlayer_spec::ScaleSpec::Adaptive { min, max, .. } => {
-                format!("ScaleSpec(mode='adaptive', min={}, max={})", min, max)
+                format!("ScaleSpec(mode='adaptive', min={min}, max={max})")
             }
             zlayer_spec::ScaleSpec::Fixed { replicas } => {
-                format!("ScaleSpec(mode='fixed', replicas={})", replicas)
+                format!("ScaleSpec(mode='fixed', replicas={replicas})")
             }
             zlayer_spec::ScaleSpec::Manual => "ScaleSpec(mode='manual')".to_string(),
         }
@@ -517,9 +517,10 @@ impl HealthSpec {
 ///     port: Optional port to expose
 ///
 /// Returns:
-///     A ServiceSpec instance
+///     A `ServiceSpec` instance
 #[pyfunction]
 #[pyo3(signature = (name, image, port=None))]
+#[allow(clippy::unnecessary_wraps)]
 pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResult<ServiceSpec> {
     let mut endpoints = Vec::new();
     if let Some(p) = port {

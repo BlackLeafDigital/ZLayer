@@ -30,6 +30,7 @@ pub struct SystemResources {
 /// Detect system resources on the local machine.
 ///
 /// `data_dir` is the directory whose filesystem is measured for disk capacity.
+#[must_use]
 pub fn detect_system_resources(data_dir: &Path) -> SystemResources {
     SystemResources {
         cpu_total: detect_cpu_total(),
@@ -42,6 +43,7 @@ pub fn detect_system_resources(data_dir: &Path) -> SystemResources {
 }
 
 /// Detect current resource usage (for heartbeat updates).
+#[must_use]
 pub fn detect_current_usage(data_dir: &Path) -> ResourceUsage {
     ResourceUsage {
         cpu_used: detect_cpu_used(),
@@ -65,6 +67,7 @@ pub struct ResourceUsage {
 // CPU total
 // =============================================================================
 
+#[allow(clippy::cast_precision_loss)]
 fn detect_cpu_total() -> f64 {
     num_cpus::get() as f64
 }
@@ -153,9 +156,8 @@ fn detect_disk_used(data_dir: &Path) -> u64 {
 /// caller should take two readings and compute the difference.
 #[cfg(target_os = "linux")]
 fn detect_cpu_used() -> f64 {
-    let content = match std::fs::read_to_string("/proc/stat") {
-        Ok(c) => c,
-        Err(_) => return 0.0,
+    let Ok(content) = std::fs::read_to_string("/proc/stat") else {
+        return 0.0;
     };
 
     // First line: "cpu  user nice system idle iowait irq softirq steal guest guest_nice"
@@ -182,7 +184,9 @@ fn detect_cpu_used() -> f64 {
         return 0.0;
     }
 
+    #[allow(clippy::cast_precision_loss)]
     let busy_fraction = 1.0 - (idle as f64 / total as f64);
+    #[allow(clippy::cast_precision_loss)]
     let cores = num_cpus::get() as f64;
     busy_fraction * cores
 }
@@ -207,9 +211,8 @@ fn detect_cpu_used() -> f64 {
 /// Parse a field from /proc/meminfo. Values are in kB, returned as bytes.
 #[cfg(target_os = "linux")]
 fn parse_meminfo_field(field: &str) -> u64 {
-    let content = match std::fs::read_to_string("/proc/meminfo") {
-        Ok(c) => c,
-        Err(_) => return 0,
+    let Ok(content) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
     };
 
     for line in content.lines() {

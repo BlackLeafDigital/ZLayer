@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-/// Default overlay interface name for ZLayer
+/// Default overlay interface name for `ZLayer`
 pub const DEFAULT_INTERFACE_NAME: &str = "zl-overlay0";
 
 /// Default overlay listen port
@@ -59,6 +59,7 @@ pub struct BootstrapConfig {
 
 impl BootstrapConfig {
     /// Get the overlay IP with /32 prefix for allowed IPs
+    #[must_use]
     pub fn allowed_ip(&self) -> String {
         format!("{}/32", self.node_ip)
     }
@@ -92,6 +93,7 @@ pub struct PeerConfig {
 
 impl PeerConfig {
     /// Create a new peer configuration
+    #[must_use]
     pub fn new(
         node_id: String,
         public_key: String,
@@ -109,16 +111,21 @@ impl PeerConfig {
     }
 
     /// Set a custom DNS hostname for this peer
+    #[must_use]
     pub fn with_hostname(mut self, hostname: impl Into<String>) -> Self {
         self.hostname = Some(hostname.into());
         self
     }
 
-    /// Convert to PeerInfo for overlay transport configuration
+    /// Convert to `PeerInfo` for overlay transport configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint address cannot be parsed.
     pub fn to_peer_info(&self) -> std::result::Result<PeerInfo, Box<dyn std::error::Error>> {
         let endpoint: SocketAddr = self.endpoint.parse()?;
         let keepalive =
-            Duration::from_secs(self.keepalive.unwrap_or(DEFAULT_KEEPALIVE_SECS) as u64);
+            Duration::from_secs(u64::from(self.keepalive.unwrap_or(DEFAULT_KEEPALIVE_SECS)));
 
         Ok(PeerInfo::new(
             self.public_key.clone(),
@@ -163,7 +170,7 @@ pub struct OverlayBootstrap {
     /// DNS configuration (opt-in)
     dns_config: Option<DnsConfig>,
 
-    /// DNS handle for managing records (available after start() if DNS enabled)
+    /// DNS handle for managing records (available after `start()` if DNS enabled)
     dns_handle: Option<DnsHandle>,
 
     /// Overlay transport (boringtun device handle).
@@ -192,6 +199,10 @@ impl OverlayBootstrap {
     ///     Path::new("/var/lib/zlayer"),
     /// ).await?;
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if already initialized, key generation fails, or state cannot be saved.
     pub async fn init_leader(cidr: &str, port: u16, data_dir: &Path) -> Result<Self> {
         // Check if already initialized
         let config_path = data_dir.join("overlay_bootstrap.json");
@@ -257,6 +268,10 @@ impl OverlayBootstrap {
     /// * `allocated_ip` - IP address allocated for this node by the leader
     /// * `port` - Overlay listen port for this node
     /// * `data_dir` - Directory for persistent state
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if already initialized, key generation fails, or state cannot be saved.
     pub async fn join(
         leader_cidr: &str,
         leader_endpoint: &str,
@@ -328,6 +343,10 @@ impl OverlayBootstrap {
     }
 
     /// Load existing bootstrap state from disk
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state file is missing, unreadable, or invalid.
     pub async fn load(data_dir: &Path) -> Result<Self> {
         let config_path = data_dir.join("overlay_bootstrap.json");
 
@@ -356,13 +375,20 @@ impl OverlayBootstrap {
     }
 
     /// Save bootstrap state to disk
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if serialization or file writing fails.
     pub async fn save(&self) -> Result<()> {
         let config_path = self.data_dir.join("overlay_bootstrap.json");
 
         let state = BootstrapState {
             config: self.config.clone(),
             peers: self.peers.clone(),
-            allocator_state: self.allocator.as_ref().map(|a| a.to_state()),
+            allocator_state: self
+                .allocator
+                .as_ref()
+                .map(super::allocator::IpAllocator::to_state),
         };
 
         let contents = serde_json::to_string_pretty(&state)?;
@@ -376,7 +402,7 @@ impl OverlayBootstrap {
     ///
     /// When DNS is enabled, peers are automatically registered with both:
     /// - An IP-based hostname: `node-X-Y.zone` (e.g., `node-0-5.overlay.local`)
-    /// - A custom hostname if provided in PeerConfig
+    /// - A custom hostname if provided in `PeerConfig`
     ///
     /// The leader node additionally gets a `leader.zone` alias.
     ///
@@ -391,6 +417,10 @@ impl OverlayBootstrap {
     ///     .with_dns("overlay.local.", 15353)?;
     /// bootstrap.start().await?;
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// This method currently always succeeds but returns `Result` for API consistency.
     pub fn with_dns(mut self, zone: &str, port: u16) -> Result<Self> {
         self.dns_config = Some(DnsConfig {
             zone: zone.to_string(),
@@ -401,18 +431,24 @@ impl OverlayBootstrap {
     }
 
     /// Enable DNS with default port (15353)
+    ///
+    /// # Errors
+    ///
+    /// This method currently always succeeds but returns `Result` for API consistency.
     pub fn with_dns_default(self, zone: &str) -> Result<Self> {
         self.with_dns(zone, DEFAULT_DNS_PORT)
     }
 
     /// Get the DNS handle for managing records
     ///
-    /// Returns None if DNS is not enabled or start() hasn't been called yet.
+    /// Returns None if DNS is not enabled or `start()` hasn't been called yet.
+    #[must_use]
     pub fn dns_handle(&self) -> Option<&DnsHandle> {
         self.dns_handle.as_ref()
     }
 
     /// Check if DNS is enabled
+    #[must_use]
     pub fn dns_enabled(&self) -> bool {
         self.dns_config.is_some()
     }
@@ -421,6 +457,10 @@ impl OverlayBootstrap {
     ///
     /// This creates the boringtun TUN interface, assigns the overlay IP,
     /// configures all known peers, and starts the DNS server if enabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if interface creation, peer configuration, or DNS startup fails.
     pub async fn start(&mut self) -> Result<()> {
         info!(
             interface = %self.config.interface,
@@ -433,7 +473,7 @@ impl OverlayBootstrap {
         // Convert our config to OverlayConfig
         let overlay_config = crate::config::OverlayConfig {
             local_endpoint: SocketAddr::new(
-                std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
                 self.config.port,
             ),
             private_key: self.config.private_key.clone(),
@@ -539,6 +579,11 @@ impl OverlayBootstrap {
     }
 
     /// Stop the overlay network (shut down the boringtun transport)
+    ///
+    /// # Errors
+    ///
+    /// This method currently always succeeds but returns `Result` for API consistency.
+    #[allow(clippy::unused_async)]
     pub async fn stop(&mut self) -> Result<()> {
         info!(interface = %self.config.interface, "Stopping overlay network");
 
@@ -552,6 +597,10 @@ impl OverlayBootstrap {
     /// Add a new peer to the overlay network
     ///
     /// For leader nodes, this also allocates an IP address for the peer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no IPs are available, DNS registration fails, or state cannot be saved.
     pub async fn add_peer(&mut self, mut peer: PeerConfig) -> Result<Ipv4Addr> {
         // If we're the leader, allocate an IP for this peer
         let overlay_ip = if let Some(ref mut allocator) = self.allocator {
@@ -573,7 +622,7 @@ impl OverlayBootstrap {
             } else {
                 let overlay_config = crate::config::OverlayConfig {
                     local_endpoint: SocketAddr::new(
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
                         self.config.port,
                     ),
                     private_key: self.config.private_key.clone(),
@@ -586,9 +635,9 @@ impl OverlayBootstrap {
             };
 
             match result {
-                Ok(_) => debug!(peer = %peer.node_id, "Added peer to overlay"),
+                Ok(()) => debug!(peer = %peer.node_id, "Added peer to overlay"),
                 Err(e) => {
-                    warn!(peer = %peer.node_id, error = %e, "Failed to add peer to overlay (interface may not be up)")
+                    warn!(peer = %peer.node_id, error = %e, "Failed to add peer to overlay (interface may not be up)");
                 }
             }
         }
@@ -624,6 +673,10 @@ impl OverlayBootstrap {
     }
 
     /// Remove a peer from the overlay network
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the peer is not found, DNS removal fails, or state cannot be saved.
     pub async fn remove_peer(&mut self, public_key: &str) -> Result<()> {
         // Find the peer
         let peer_idx = self
@@ -671,7 +724,7 @@ impl OverlayBootstrap {
         } else {
             let overlay_config = crate::config::OverlayConfig {
                 local_endpoint: SocketAddr::new(
-                    std::net::IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)),
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
                     self.config.port,
                 ),
                 private_key: self.config.private_key.clone(),
@@ -684,9 +737,9 @@ impl OverlayBootstrap {
         };
 
         match result {
-            Ok(_) => debug!(public_key = public_key, "Removed peer from overlay"),
+            Ok(()) => debug!(public_key = public_key, "Removed peer from overlay"),
             Err(e) => {
-                warn!(public_key = public_key, error = %e, "Failed to remove peer from overlay")
+                warn!(public_key = public_key, error = %e, "Failed to remove peer from overlay");
             }
         }
 
@@ -701,41 +754,49 @@ impl OverlayBootstrap {
     }
 
     /// Get this node's public key
+    #[must_use]
     pub fn public_key(&self) -> &str {
         &self.config.public_key
     }
 
     /// Get this node's overlay IP
+    #[must_use]
     pub fn node_ip(&self) -> Ipv4Addr {
         self.config.node_ip
     }
 
     /// Get the overlay CIDR
+    #[must_use]
     pub fn cidr(&self) -> &str {
         &self.config.cidr
     }
 
     /// Get the overlay interface name
+    #[must_use]
     pub fn interface(&self) -> &str {
         &self.config.interface
     }
 
     /// Get the overlay listen port
+    #[must_use]
     pub fn port(&self) -> u16 {
         self.config.port
     }
 
     /// Check if this node is the leader
+    #[must_use]
     pub fn is_leader(&self) -> bool {
         self.config.is_leader
     }
 
     /// Get configured peers
+    #[must_use]
     pub fn peers(&self) -> &[PeerConfig] {
         &self.peers
     }
 
     /// Get the bootstrap config
+    #[must_use]
     pub fn config(&self) -> &BootstrapConfig {
         &self.config
     }
@@ -743,6 +804,10 @@ impl OverlayBootstrap {
     /// Allocate an IP for a new peer (leader only)
     ///
     /// This is used by the control plane when processing join requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if this node is not a leader or no IPs are available.
     pub fn allocate_peer_ip(&mut self) -> Result<Ipv4Addr> {
         let allocator = self
             .allocator
@@ -753,6 +818,8 @@ impl OverlayBootstrap {
     }
 
     /// Get IP allocation statistics (leader only)
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn allocation_stats(&self) -> Option<(u32, u32)> {
         self.allocator
             .as_ref()

@@ -93,6 +93,7 @@ pub struct OciIndex {
 
 impl OciIndex {
     /// Create a new OCI Index with a single manifest
+    #[must_use]
     pub fn new(manifest_descriptor: OciDescriptor) -> Self {
         Self {
             schema_version: 2,
@@ -267,8 +268,7 @@ fn parse_image_reference(image: &str) -> Result<(String, String), ExportError> {
         let digest = &image[at_pos + 1..];
         if !digest.starts_with("sha256:") {
             return Err(ExportError::InvalidReference(format!(
-                "digest must start with sha256: in '{}'",
-                image
+                "digest must start with sha256: in '{image}'"
             )));
         }
         return Ok((name.to_string(), digest.to_string()));
@@ -300,6 +300,11 @@ fn parse_image_reference(image: &str) -> Result<(String, String), ExportError> {
 /// # Returns
 ///
 /// Returns `ExportInfo` containing details about the exported image.
+///
+/// # Errors
+///
+/// Returns an error if the image reference is invalid, the manifest or blobs cannot be
+/// read, or the output file cannot be written.
 ///
 /// # Example
 ///
@@ -367,7 +372,7 @@ pub async fn export_image(
     if !reference.starts_with("sha256:") {
         annotations.insert(
             "org.opencontainers.image.ref.name".to_string(),
-            format!("{}:{}", name, reference),
+            format!("{name}:{reference}"),
         );
     }
 
@@ -407,7 +412,7 @@ pub async fn export_image(
         // Add all blobs
         for (digest, data) in &blobs_to_export {
             let hash = digest.strip_prefix("sha256:").unwrap_or(digest);
-            let blob_path = format!("blobs/sha256/{}", hash);
+            let blob_path = format!("blobs/sha256/{hash}");
             add_file_to_tar(&mut tar_builder, &blob_path, data)?;
         }
 
@@ -457,6 +462,11 @@ pub async fn export_image(
 ///
 /// Returns `ImportInfo` containing details about the imported image.
 ///
+/// # Errors
+///
+/// Returns an error if the archive cannot be read, the OCI layout is invalid,
+/// or blobs/manifests cannot be stored in the registry.
+///
 /// # Example
 ///
 /// ```rust,no_run
@@ -471,6 +481,7 @@ pub async fn export_image(
 /// # Ok(())
 /// # }
 /// ```
+#[allow(clippy::too_many_lines)]
 pub async fn import_image(
     registry: &LocalRegistry,
     input: &Path,
@@ -548,7 +559,7 @@ pub async fn import_image(
     let manifest_hash = manifest_digest
         .strip_prefix("sha256:")
         .unwrap_or(manifest_digest);
-    let manifest_path = format!("blobs/sha256/{}", manifest_hash);
+    let manifest_path = format!("blobs/sha256/{manifest_hash}");
     let manifest_data = files
         .get(&manifest_path)
         .ok_or_else(|| ImportError::BlobNotFound(manifest_digest.clone()))?;
@@ -565,7 +576,7 @@ pub async fn import_image(
             .digest
             .strip_prefix("sha256:")
             .unwrap_or(&config.digest);
-        let config_path = format!("blobs/sha256/{}", config_hash);
+        let config_path = format!("blobs/sha256/{config_hash}");
         let config_data = files
             .get(&config_path)
             .ok_or_else(|| ImportError::BlobNotFound(config.digest.clone()))?;
@@ -582,7 +593,7 @@ pub async fn import_image(
             .digest
             .strip_prefix("sha256:")
             .unwrap_or(&layer.digest);
-        let layer_path = format!("blobs/sha256/{}", layer_hash);
+        let layer_path = format!("blobs/sha256/{layer_hash}");
         let layer_data = files
             .get(&layer_path)
             .ok_or_else(|| ImportError::BlobNotFound(layer.digest.clone()))?;
@@ -627,7 +638,7 @@ pub async fn import_image(
     } else {
         // Generate a name from the digest
         let short_digest = &manifest_digest[7..19]; // First 12 chars of hash
-        (format!("imported-{}", short_digest), None)
+        (format!("imported-{short_digest}"), None)
     };
 
     // Store the manifest
@@ -639,7 +650,7 @@ pub async fn import_image(
 
     let import_info = ImportInfo {
         digest: manifest_digest.clone(),
-        tag: final_tag.map(|t| format!("{}:{}", name, t)),
+        tag: final_tag.map(|t| format!("{name}:{t}")),
         layers: layer_count,
     };
 

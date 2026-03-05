@@ -63,18 +63,21 @@ impl<'a, T: PaneEntry> ScrollablePane<'a, T> {
     }
 
     /// Set the block title.
+    #[must_use]
     pub fn with_title(mut self, title: &'a str) -> Self {
         self.title = Some(title);
         self
     }
 
     /// Set the border style.
+    #[must_use]
     pub fn with_border_style(mut self, style: Style) -> Self {
         self.border_style = style;
         self
     }
 
     /// Set the placeholder text shown when there are no entries.
+    #[must_use]
     pub fn with_empty_text(mut self, text: &'a str) -> Self {
         self.empty_text = text;
         self
@@ -82,6 +85,11 @@ impl<'a, T: PaneEntry> ScrollablePane<'a, T> {
 }
 
 impl<T: PaneEntry> Widget for ScrollablePane<'_, T> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.height == 0 || area.width == 0 {
             return;
@@ -93,7 +101,7 @@ impl<T: PaneEntry> Widget for ScrollablePane<'_, T> {
             .border_style(self.border_style);
 
         if let Some(title) = self.title {
-            block = block.title(format!(" {} ", title));
+            block = block.title(format!(" {title} "));
         }
 
         let inner = block.inner(area);
@@ -168,7 +176,7 @@ impl<T: PaneEntry> Widget for ScrollablePane<'_, T> {
             } else {
                 ((end as f64 / total as f64) * 100.0) as usize
             };
-            let indicator = format!(" {}% ", percent);
+            let indicator = format!(" {percent}% ");
             let ind_len = indicator.len() as u16;
 
             let badge_x = inner.x + inner.width.saturating_sub(ind_len + 1);

@@ -43,6 +43,7 @@ where
     C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode, Responder = OneshotResponder<C>>,
 {
     /// Create a `ConsensusNode` directly from an already-constructed `Raft` instance.
+    #[must_use]
     pub fn from_raft(raft: Raft<C>, node_id: NodeId, address: String) -> Self {
         Self {
             raft,
@@ -52,21 +53,25 @@ where
     }
 
     /// This node's ID.
+    #[must_use]
     pub fn node_id(&self) -> NodeId {
         self.node_id
     }
 
     /// This node's address.
+    #[must_use]
     pub fn address(&self) -> &str {
         &self.address
     }
 
     /// Get a reference to the inner `Raft` instance for advanced usage.
+    #[must_use]
     pub fn raft(&self) -> &Raft<C> {
         &self.raft
     }
 
     /// Get a clone of the inner `Raft` instance (cheap, Arc-based).
+    #[must_use]
     pub fn raft_clone(&self) -> Raft<C> {
         self.raft.clone()
     }
@@ -75,6 +80,9 @@ where
     ///
     /// This node must be the leader. The write is replicated to a quorum
     /// before the response is returned.
+    ///
+    /// # Errors
+    /// Returns `ConsensusError::Write` if the write fails (e.g., not the leader).
     pub async fn propose(&self, request: C::D) -> Result<C::R> {
         let result = self
             .raft
@@ -89,6 +97,9 @@ where
     ///
     /// Call this before reading from the state machine to guarantee that the
     /// data is not stale. Implements the "leader lease read" pattern.
+    ///
+    /// # Errors
+    /// Returns `ConsensusError::Write` if the linearizable check fails.
     pub async fn ensure_linearizable(&self) -> Result<()> {
         self.raft
             .ensure_linearizable()
@@ -98,12 +109,14 @@ where
     }
 
     /// Check if this node is the current leader.
+    #[must_use]
     pub fn is_leader(&self) -> bool {
         let metrics = self.raft.metrics().borrow().clone();
         metrics.current_leader == Some(self.node_id)
     }
 
     /// Get the current leader's node ID, if known.
+    #[must_use]
     pub fn leader_id(&self) -> Option<NodeId> {
         self.raft.metrics().borrow().current_leader
     }
@@ -111,6 +124,9 @@ where
     /// Bootstrap a new single-node cluster.
     ///
     /// This must only be called once, on the first node, when creating a new cluster.
+    ///
+    /// # Errors
+    /// Returns `ConsensusError::Init` if bootstrap initialization fails.
     pub async fn bootstrap(&self) -> Result<()> {
         let mut members = BTreeMap::new();
         members.insert(
@@ -135,6 +151,9 @@ where
     /// pre-sync a node before promoting it to a voter.
     ///
     /// If `blocking` is true, waits until the learner has caught up with the log.
+    ///
+    /// # Errors
+    /// Returns `ConsensusError::Membership` if the learner cannot be added.
     pub async fn add_learner(
         &self,
         node_id: NodeId,
@@ -161,6 +180,9 @@ where
     ///
     /// If `retain` is true, nodes not in `voter_ids` are kept as learners
     /// rather than removed entirely.
+    ///
+    /// # Errors
+    /// Returns `ConsensusError::Membership` if the membership change fails.
     pub async fn change_membership(&self, voter_ids: BTreeSet<NodeId>, retain: bool) -> Result<()> {
         self.raft
             .change_membership(voter_ids, retain)
@@ -176,6 +198,9 @@ where
     /// This performs the full two-step process:
     /// 1. Add as learner (blocking, waits for log sync)
     /// 2. Change membership to include the new voter
+    ///
+    /// # Errors
+    /// Returns a `ConsensusError` if either the learner addition or membership change fails.
     pub async fn add_voter(&self, node_id: NodeId, address: String) -> Result<()> {
         // Step 1: add as learner
         self.add_learner(node_id, address, true).await?;
@@ -190,7 +215,7 @@ where
             .get_joint_config()
             .last()
         {
-            for id in membership.iter() {
+            for id in membership {
                 voter_ids.insert(*id);
             }
         }
@@ -204,11 +229,15 @@ where
     }
 
     /// Get current Raft metrics (leader, term, log indices, etc.).
+    #[must_use]
     pub fn metrics(&self) -> RaftMetrics<NodeId, BasicNode> {
         self.raft.metrics().borrow().clone()
     }
 
     /// Gracefully shut down the Raft node.
+    ///
+    /// # Errors
+    /// Returns `ConsensusError::Fatal` if shutdown fails.
     pub async fn shutdown(&self) -> Result<()> {
         self.raft
             .shutdown()
@@ -244,6 +273,7 @@ pub struct ConsensusNodeBuilder {
 
 impl ConsensusNodeBuilder {
     /// Create a new builder for the given node ID and address.
+    #[must_use]
     pub fn new(node_id: NodeId, address: String) -> Self {
         Self {
             node_id,
@@ -253,6 +283,7 @@ impl ConsensusNodeBuilder {
     }
 
     /// Set the consensus configuration.
+    #[must_use]
     pub fn with_config(mut self, config: ConsensusConfig) -> Self {
         self.config = config;
         self
@@ -261,6 +292,10 @@ impl ConsensusNodeBuilder {
     /// Build the `ConsensusNode` with the provided storage and network implementations.
     ///
     /// This is the most flexible build method -- you provide all three components.
+    ///
+    /// # Errors
+    /// Returns `ConsensusError::Fatal` if the Raft instance fails to start, or
+    /// a configuration error if the consensus config is invalid.
     pub async fn build_with<C, LS, SM, N>(
         self,
         log_store: LS,

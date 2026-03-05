@@ -1,4 +1,4 @@
-//! A unified progress bar widget for ZLayer TUI applications.
+//! A unified progress bar widget for `ZLayer` TUI applications.
 //!
 //! Replaces the builder's `BuildProgress` and the deploy TUI's
 //! `render_progress_bar()` with a single configurable widget that supports
@@ -57,6 +57,7 @@ impl ProgressBar {
     ///
     /// Defaults: no label, no percentage, bar styled with [`ACCENT`] foreground,
     /// label styled with [`TEXT`] foreground.
+    #[must_use]
     pub fn new(current: usize, total: usize) -> Self {
         Self {
             current,
@@ -69,12 +70,14 @@ impl ProgressBar {
     }
 
     /// Attach a text label that will be rendered after the bar.
+    #[must_use]
     pub fn with_label(mut self, label: impl Into<String>) -> Self {
         self.label = Some(label.into());
         self
     }
 
     /// Enable a trailing percentage indicator (e.g. `" 30%"`).
+    #[must_use]
     pub fn with_percentage(mut self) -> Self {
         self.show_percentage = true;
         self
@@ -85,6 +88,7 @@ impl ProgressBar {
     // ------------------------------------------------------------------
 
     /// Compute the fill ratio, clamped to `[0.0, 1.0]`.
+    #[allow(clippy::cast_precision_loss)]
     fn ratio(&self) -> f64 {
         if self.total == 0 {
             0.0
@@ -94,6 +98,11 @@ impl ProgressBar {
     }
 
     /// Build the bar characters for a given `width` (in columns).
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     fn bar_string(ratio: f64, width: usize) -> String {
         let filled = (width as f64 * ratio).round() as usize;
         let empty = width.saturating_sub(filled);
@@ -111,7 +120,11 @@ impl ProgressBar {
     /// `width` columns; the suffix is appended after a space.
     ///
     /// If `total` is zero the bar is empty but still occupies `width` columns.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn to_string_compact(&self, width: usize) -> String {
+        use std::fmt::Write;
+
         let ratio = self.ratio();
         let bar = Self::bar_string(ratio, width);
 
@@ -123,15 +136,18 @@ impl ProgressBar {
         if self.show_percentage {
             let percent = (ratio * 100.0) as u32;
             suffix.push(' ');
-            suffix.push_str(&format!("{}%", percent));
+            let _ = write!(suffix, "{percent}%");
         }
 
-        format!("{}{}", bar, suffix)
+        format!("{bar}{suffix}")
     }
 }
 
 impl Widget for ProgressBar {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn render(self, area: Rect, buf: &mut Buffer) {
+        use std::fmt::Write;
+
         if area.width < 3 || area.height < 1 {
             return;
         }
@@ -148,7 +164,7 @@ impl Widget for ProgressBar {
         if self.show_percentage {
             let percent = (ratio * 100.0) as u32;
             suffix.push(' ');
-            suffix.push_str(&format!("{}%", percent));
+            let _ = write!(suffix, "{percent}%");
         }
 
         let suffix_width = suffix.len() as u16;

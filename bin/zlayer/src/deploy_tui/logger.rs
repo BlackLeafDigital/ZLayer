@@ -54,6 +54,7 @@ impl PlainDeployLogger {
     }
 
     /// Handle a deploy event and print appropriate output
+    #[allow(clippy::too_many_lines)]
     pub fn handle_event(&self, event: &DeployEvent) {
         match event {
             DeployEvent::PlanReady {
@@ -64,7 +65,7 @@ impl PlainDeployLogger {
                 let header = "=== Deployment Plan ===".to_string();
                 println!("\n{}", self.colorize(&header, ansi::BOLD));
                 println!("Deployment: {}", self.colorize(deployment_name, ansi::CYAN));
-                println!("Version: {}", version);
+                println!("Version: {version}");
                 println!("Services: {}", services.len());
                 println!();
 
@@ -75,7 +76,7 @@ impl PlainDeployLogger {
                     if !svc.endpoints.is_empty() {
                         println!("    Endpoints:");
                         for ep in &svc.endpoints {
-                            println!("      - {}", ep);
+                            println!("      - {ep}");
                         }
                     }
                     println!();
@@ -83,7 +84,7 @@ impl PlainDeployLogger {
             }
 
             DeployEvent::InfraPhaseStarted { phase } => {
-                let line = format!("-> Starting {}...", phase);
+                let line = format!("-> Starting {phase}...");
                 println!("{}", self.colorize(&line, ansi::DIM));
             }
 
@@ -96,16 +97,16 @@ impl PlainDeployLogger {
                     let check = self.colorize("v", ansi::GREEN);
                     let msg = message
                         .as_deref()
-                        .map(|m| format!(" ({})", m))
+                        .map(|m| format!(" ({m})"))
                         .unwrap_or_default();
-                    println!("  {} {}{}", check, phase, msg);
+                    println!("  {check} {phase}{msg}");
                 } else {
                     let x_mark = self.colorize("x", ansi::RED);
                     let msg = message
                         .as_deref()
-                        .map(|m| format!(": {}", m))
+                        .map(|m| format!(": {m}"))
                         .unwrap_or_default();
-                    let line = format!("  {} {} failed{}", x_mark, phase, msg);
+                    let line = format!("  {x_mark} {phase} failed{msg}");
                     println!("{}", self.colorize(&line, ansi::YELLOW));
                 }
             }
@@ -116,7 +117,7 @@ impl PlainDeployLogger {
                 // Only print the header once (on first service). We use a simple
                 // heuristic: the caller sends ServiceDeployStarted for each service,
                 // so we just print the service name with an arrow.
-                let line = format!("-> Deploying service: {}", name);
+                let line = format!("-> Deploying service: {name}");
                 // Suppress the header here; it's implied by the PlanReady event.
                 let _ = header;
                 println!("{}", self.colorize(&line, ansi::CYAN));
@@ -124,7 +125,7 @@ impl PlainDeployLogger {
 
             DeployEvent::ServiceRegistered { name } => {
                 let check = self.colorize("v", ansi::GREEN);
-                println!("  {} {} registered", check, name);
+                println!("  {check} {name} registered");
             }
 
             DeployEvent::ServiceScaling {
@@ -158,12 +159,12 @@ impl PlainDeployLogger {
 
             DeployEvent::ServiceDeployComplete { name, replicas } => {
                 let check = self.colorize("v", ansi::GREEN);
-                println!("  {} {} running ({} replicas)", check, name, replicas);
+                println!("  {check} {name} running ({replicas} replicas)");
             }
 
             DeployEvent::ServiceDeployFailed { name, error } => {
                 let x_mark = self.colorize("x", ansi::RED);
-                let line = format!("  {} {} FAILED: {}", x_mark, name, error);
+                let line = format!("  {x_mark} {name} FAILED: {error}");
                 eprintln!("{}", self.colorize(&line, ansi::RED));
             }
 
@@ -179,7 +180,7 @@ impl PlainDeployLogger {
                     println!("  Running services:");
                     for (name, replicas) in services {
                         let check = self.colorize("v", ansi::GREEN);
-                        println!("    {} {} ({} replicas)", check, name, replicas);
+                        println!("    {check} {name} ({replicas} replicas)");
                     }
                 }
 
@@ -205,7 +206,7 @@ impl PlainDeployLogger {
 
             DeployEvent::ServiceStopped { name } => {
                 let check = self.colorize("v", ansi::GREEN);
-                println!("  {} {} stopped", check, name);
+                println!("  {check} {name} stopped");
             }
 
             DeployEvent::ShutdownComplete => {
@@ -214,15 +215,15 @@ impl PlainDeployLogger {
 
             DeployEvent::Log { level, message } => match level {
                 LogLevel::Info => {
-                    println!("{}", message);
+                    println!("{message}");
                 }
                 LogLevel::Warn => {
                     let prefix = self.colorize("WARNING:", ansi::YELLOW);
-                    println!("{} {}", prefix, message);
+                    println!("{prefix} {message}");
                 }
                 LogLevel::Error => {
                     let prefix = self.colorize("ERROR:", ansi::RED);
-                    eprintln!("{} {}", prefix, message);
+                    eprintln!("{prefix} {message}");
                 }
             },
         }

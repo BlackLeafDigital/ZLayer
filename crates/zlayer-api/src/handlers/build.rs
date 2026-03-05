@@ -46,6 +46,7 @@ pub struct BuildState {
 
 impl BuildState {
     /// Create a new build state with the given build directory
+    #[must_use]
     pub fn new(build_dir: PathBuf) -> Self {
         Self {
             manager: Arc::new(BuildManager::new(build_dir)),
@@ -65,6 +66,7 @@ pub struct BuildManager {
 
 impl BuildManager {
     /// Create a new build manager
+    #[must_use]
     pub fn new(build_dir: PathBuf) -> Self {
         Self {
             build_dir,
@@ -132,7 +134,9 @@ impl BuildManager {
     /// Subscribe to build events
     pub async fn subscribe(&self, id: &str) -> Option<broadcast::Receiver<BuildEventWrapper>> {
         let channels = self.event_channels.read().await;
-        channels.get(id).map(|tx| tx.subscribe())
+        channels
+            .get(id)
+            .map(tokio::sync::broadcast::Sender::subscribe)
     }
 
     /// Clean up build resources
@@ -226,7 +230,7 @@ impl From<&RuntimeInfo> for TemplateInfo {
         Self {
             name: info.name.to_string(),
             description: info.description.to_string(),
-            detect_files: info.detect_files.iter().map(|s| s.to_string()).collect(),
+            detect_files: info.detect_files.iter().map(|s| (*s).to_string()).collect(),
         }
     }
 }
@@ -328,7 +332,12 @@ impl From<BuildEvent> for BuildEventWrapper {
 /// Accepts a multipart form with:
 /// - `dockerfile`: The Dockerfile content (optional if using runtime)
 /// - `context`: A tarball containing the build context
-/// - `config`: JSON configuration (BuildRequest)
+/// - `config`: JSON configuration (`BuildRequest`)
+///
+/// # Errors
+///
+/// Returns an error if the request is invalid, context extraction fails, or the build
+/// cannot be started.
 #[utoipa::path(
     post,
     path = "/api/v1/build",
@@ -343,17 +352,19 @@ impl From<BuildEvent> for BuildEventWrapper {
     tag = "Build"
 )]
 pub async fn start_build(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<BuildState>,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<TriggerBuildResponse>)> {
+    user.require_role("operator")?;
+
     let build_id = Uuid::new_v4().to_string();
     let context_dir = state.manager.build_dir().join(&build_id);
 
     // Create build context directory
     tokio::fs::create_dir_all(&context_dir).await.map_err(|e| {
         error!("Failed to create build context directory: {}", e);
-        ApiError::Internal(format!("Failed to create build context: {}", e))
+        ApiError::Internal(format!("Failed to create build context: {e}"))
     })?;
 
     let mut config: Option<BuildRequest> = None;
@@ -363,21 +374,19 @@ pub async fn start_build(
     while let Some(field) = multipart
         .next_field()
         .await
-        .map_err(|e| ApiError::BadRequest(format!("Failed to read multipart field: {}", e)))?
+        .map_err(|e| ApiError::BadRequest(format!("Failed to read multipart field: {e}")))?
     {
         let name = field.name().unwrap_or("").to_string();
         let data = field
             .bytes()
             .await
-            .map_err(|e| ApiError::BadRequest(format!("Failed to read field data: {}", e)))?;
+            .map_err(|e| ApiError::BadRequest(format!("Failed to read field data: {e}")))?;
 
         match name.as_str() {
             "dockerfile" => {
                 tokio::fs::write(context_dir.join("Dockerfile"), &data)
                     .await
-                    .map_err(|e| {
-                        ApiError::Internal(format!("Failed to write Dockerfile: {}", e))
-                    })?;
+                    .map_err(|e| ApiError::Internal(format!("Failed to write Dockerfile: {e}")))?;
                 has_dockerfile = true;
                 debug!("Wrote Dockerfile for build {}", build_id);
             }
@@ -388,11 +397,11 @@ pub async fn start_build(
             }
             "config" => {
                 let config_str = std::str::from_utf8(&data)
-                    .map_err(|e| ApiError::BadRequest(format!("Invalid config encoding: {}", e)))?;
-                config =
-                    Some(serde_json::from_str(config_str).map_err(|e| {
-                        ApiError::BadRequest(format!("Invalid config JSON: {}", e))
-                    })?);
+                    .map_err(|e| ApiError::BadRequest(format!("Invalid config encoding: {e}")))?;
+                config = Some(
+                    serde_json::from_str(config_str)
+                        .map_err(|e| ApiError::BadRequest(format!("Invalid config JSON: {e}")))?,
+                );
             }
             _ => {
                 warn!("Ignoring unknown multipart field: {}", name);
@@ -429,13 +438,17 @@ pub async fn start_build(
         StatusCode::ACCEPTED,
         Json(TriggerBuildResponse {
             build_id: build_id.clone(),
-            message: format!("Build {} started", build_id),
+            message: format!("Build {build_id} started"),
         }),
     ))
 }
 
 /// POST /api/v1/build/json
-/// Start a new build from JSON request with a context path on the server
+/// Start a new build from JSON request with a context path on the server.
+///
+/// # Errors
+///
+/// Returns an error if the context path is invalid or the build cannot be started.
 #[utoipa::path(
     post,
     path = "/api/v1/build/json",
@@ -450,10 +463,12 @@ pub async fn start_build(
     tag = "Build"
 )]
 pub async fn start_build_json(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<BuildState>,
     Json(request): Json<BuildRequestWithContext>,
 ) -> Result<(StatusCode, Json<TriggerBuildResponse>)> {
+    user.require_role("operator")?;
+
     let build_id = Uuid::new_v4().to_string();
 
     // Validate context path exists
@@ -461,8 +476,7 @@ pub async fn start_build_json(
     let context_path = PathBuf::from(&context_path_str);
     if !context_path.exists() {
         return Err(ApiError::BadRequest(format!(
-            "Context path does not exist: {}",
-            context_path_str
+            "Context path does not exist: {context_path_str}"
         )));
     }
 
@@ -486,7 +500,7 @@ pub async fn start_build_json(
         StatusCode::ACCEPTED,
         Json(TriggerBuildResponse {
             build_id: build_id.clone(),
-            message: format!("Build {} started", build_id),
+            message: format!("Build {build_id} started"),
         }),
     ))
 }
@@ -530,7 +544,11 @@ impl From<BuildRequestWithContext> for BuildRequest {
 }
 
 /// GET /api/v1/build/{id}
-/// Get build status
+/// Get build status.
+///
+/// # Errors
+///
+/// Returns an error if the build is not found.
 #[utoipa::path(
     get,
     path = "/api/v1/build/{id}",
@@ -554,13 +572,17 @@ pub async fn get_build_status(
         .manager
         .get_status(&build_id)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("Build '{}' not found", build_id)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("Build '{build_id}' not found")))?;
 
     Ok(Json(status))
 }
 
 /// GET /api/v1/build/{id}/stream
-/// Stream build progress via Server-Sent Events
+/// Stream build progress via Server-Sent Events.
+///
+/// # Errors
+///
+/// Returns an error if the build is not found or not active.
 #[utoipa::path(
     get,
     path = "/api/v1/build/{id}/stream",
@@ -580,9 +602,10 @@ pub async fn stream_build(
     State(state): State<BuildState>,
     Path(build_id): Path<String>,
 ) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
-    let rx = state.manager.subscribe(&build_id).await.ok_or_else(|| {
-        ApiError::NotFound(format!("Build '{}' not found or not active", build_id))
-    })?;
+    let rx =
+        state.manager.subscribe(&build_id).await.ok_or_else(|| {
+            ApiError::NotFound(format!("Build '{build_id}' not found or not active"))
+        })?;
 
     let stream = BroadcastStream::new(rx).map(|result| {
         let event = match result {
@@ -603,7 +626,11 @@ pub async fn stream_build(
 }
 
 /// GET /api/v1/build/{id}/logs
-/// Get build logs
+/// Get build logs.
+///
+/// # Errors
+///
+/// Returns an error if the build is not found or logs cannot be read.
 #[utoipa::path(
     get,
     path = "/api/v1/build/{id}/logs",
@@ -628,7 +655,7 @@ pub async fn get_build_logs(
         .manager
         .get_status(&build_id)
         .await
-        .ok_or_else(|| ApiError::NotFound(format!("Build '{}' not found", build_id)))?;
+        .ok_or_else(|| ApiError::NotFound(format!("Build '{build_id}' not found")))?;
 
     let log_path = state.manager.build_dir().join(&build_id).join("build.log");
 
@@ -637,12 +664,16 @@ pub async fn get_build_logs(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Ok(String::new()) // No logs yet
         }
-        Err(e) => Err(ApiError::Internal(format!("Failed to read logs: {}", e))),
+        Err(e) => Err(ApiError::Internal(format!("Failed to read logs: {e}"))),
     }
 }
 
 /// GET /api/v1/builds
-/// List all builds
+/// List all builds.
+///
+/// # Errors
+///
+/// Returns an error if the user is not authenticated.
 #[utoipa::path(
     get,
     path = "/api/v1/builds",
@@ -674,7 +705,7 @@ pub async fn list_builds(
 pub async fn list_runtime_templates() -> Json<Vec<TemplateInfo>> {
     let templates: Vec<TemplateInfo> = list_templates()
         .into_iter()
-        .map(|info| info.into())
+        .map(std::convert::Into::into)
         .collect();
 
     Json(templates)
@@ -700,8 +731,8 @@ async fn extract_tarball(data: &[u8], target_dir: &std::path::Path) -> Result<()
         archive.unpack(&target)
     })
     .await
-    .map_err(|e| ApiError::Internal(format!("Task join error: {}", e)))?
-    .map_err(|e| ApiError::BadRequest(format!("Failed to extract tarball: {}", e)))?;
+    .map_err(|e| ApiError::Internal(format!("Task join error: {e}")))?
+    .map_err(|e| ApiError::BadRequest(format!("Failed to extract tarball: {e}")))?;
 
     Ok(())
 }
@@ -818,7 +849,7 @@ async fn run_build(
         let runtime = Runtime::from_name(runtime_name).ok_or_else(|| {
             zlayer_builder::BuildError::InvalidInstruction {
                 instruction: "runtime".to_string(),
-                reason: format!("Unknown runtime: {}", runtime_name),
+                reason: format!("Unknown runtime: {runtime_name}"),
             }
         })?;
         builder = builder.runtime(runtime);

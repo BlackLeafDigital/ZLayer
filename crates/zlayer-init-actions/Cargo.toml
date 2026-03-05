@@ -22,3 +22,6 @@ tracing.workspace = true
 [features]
 default = []
 s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+
+[lints]
+workspace = true

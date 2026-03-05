@@ -10,11 +10,12 @@ use std::sync::Arc;
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use utoipa::ToSchema;
 use zlayer_overlay::IpAllocator;
 
 use crate::error::{ApiError, Result};
+use crate::handlers::internal::{InternalAddPeerRequest, INTERNAL_AUTH_HEADER};
 use zlayer_scheduler::{AddMemberParams, RaftCoordinator};
 
 // =============================================================================
@@ -24,18 +25,18 @@ use zlayer_scheduler::{AddMemberParams, RaftCoordinator};
 /// Request body for `POST /api/v1/cluster/join`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ClusterJoinRequest {
-    /// Base64-encoded join token (contains auth_secret for validation)
+    /// Base64-encoded join token (contains `auth_secret` for validation)
     pub token: String,
     /// Joining node's advertise address (IP)
     pub advertise_addr: String,
-    /// Joining node's overlay port (WireGuard)
+    /// Joining node's overlay port (`WireGuard`)
     pub overlay_port: u16,
     /// Joining node's Raft RPC port
     pub raft_port: u16,
     /// Joining node's API server port
     #[serde(default = "default_api_port")]
     pub api_port: u16,
-    /// Joining node's WireGuard public key
+    /// Joining node's `WireGuard` public key
     pub wg_public_key: String,
     /// Node mode: "full" or "replicate"
     #[serde(default = "default_mode")]
@@ -90,7 +91,7 @@ pub struct ClusterPeer {
     pub overlay_port: u16,
     /// Raft port
     pub raft_port: u16,
-    /// WireGuard public key
+    /// `WireGuard` public key
     pub wg_public_key: String,
     /// Overlay IP
     pub overlay_ip: String,
@@ -133,13 +134,16 @@ pub struct ClusterApiState {
     pub ip_allocator: Arc<RwLock<IpAllocator>>,
     /// Path for persisting IP allocator state
     ip_allocator_path: Option<std::path::PathBuf>,
+    /// Internal shared secret for authenticating peer-broadcast calls to existing nodes.
+    /// Required for the leader to POST `/api/v1/internal/add-peer` on other nodes.
+    pub internal_token: Option<String>,
 }
 
 impl ClusterApiState {
     /// Create a new cluster API state.
     ///
     /// `raft` may be `None` if the coordinator was not available.
-    /// `join_secret` is the auth_secret that must appear in the join token.
+    /// `join_secret` is the `auth_secret` that must appear in the join token.
     /// `ip_allocator` is a CIDR-aware allocator for overlay IPs.
     /// `ip_allocator_path` is the file path used to persist allocator state.
     pub fn new(
@@ -154,12 +158,36 @@ impl ClusterApiState {
             join_secret,
             ip_allocator,
             ip_allocator_path,
+            internal_token: None,
+        }
+    }
+
+    /// Create a new cluster API state with an internal token for peer broadcasting.
+    pub fn with_internal_token(
+        raft: Option<Arc<RaftCoordinator>>,
+        join_secret: Option<String>,
+        ip_allocator: Arc<RwLock<IpAllocator>>,
+        ip_allocator_path: Option<std::path::PathBuf>,
+        internal_token: String,
+    ) -> Self {
+        Self {
+            raft,
+            next_raft_id: Arc::new(AtomicU64::new(2)),
+            join_secret,
+            ip_allocator,
+            ip_allocator_path,
+            internal_token: Some(internal_token),
         }
     }
 
     /// Create a placeholder state (no Raft).
     ///
     /// Uses the default overlay CIDR `10.200.0.0/16`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the default overlay CIDR is invalid (should never happen).
+    #[must_use]
     pub fn placeholder() -> Self {
         let allocator = IpAllocator::new(zlayer_overlay::DEFAULT_OVERLAY_CIDR)
             .expect("default overlay CIDR must be valid");
@@ -169,6 +197,7 @@ impl ClusterApiState {
             join_secret: None,
             ip_allocator: Arc::new(RwLock::new(allocator)),
             ip_allocator_path: None,
+            internal_token: None,
         }
     }
 
@@ -188,6 +217,12 @@ impl ClusterApiState {
 ///
 /// Validates the join token, assigns a Raft node ID, calls `raft.add_member()`,
 /// and returns the assignment + peer list.
+///
+/// # Errors
+///
+/// Returns an error if the Raft coordinator is unavailable, the join token is
+/// invalid, IP allocation fails, or the Raft membership change fails.
+#[allow(clippy::too_many_lines)]
 pub async fn cluster_join(
     State(state): State<ClusterApiState>,
     Json(req): Json<ClusterJoinRequest>,
@@ -285,6 +320,71 @@ pub async fn cluster_join(
         })
         .collect();
 
+    // 8. Broadcast the new peer's overlay info to all existing nodes (fire-and-forget).
+    //
+    // Without this, existing nodes only learn about the new node when they
+    // reconcile from Raft state or restart.  This sends a POST to each existing
+    // node's `/api/v1/internal/add-peer` endpoint so they add the WireGuard peer
+    // immediately.
+    if let Some(ref internal_token) = state.internal_token {
+        let leader_node_id = raft.node_id();
+        let new_peer_request = InternalAddPeerRequest {
+            wg_public_key: req.wg_public_key.clone(),
+            overlay_ip: overlay_ip.clone(),
+            endpoint: format!("{}:{}", req.advertise_addr, req.overlay_port),
+        };
+
+        // Collect the API endpoints of existing nodes (excluding the joining node
+        // and the current leader — the leader already knows about the new peer
+        // because it processes the join request).
+        let targets: Vec<String> = cluster_state
+            .nodes
+            .values()
+            .filter(|n| n.node_id != raft_node_id && n.node_id != leader_node_id)
+            .filter(|n| !n.advertise_addr.is_empty() && n.api_port > 0)
+            .map(|n| format!("http://{}:{}", n.advertise_addr, n.api_port))
+            .collect();
+
+        if !targets.is_empty() {
+            let token = internal_token.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap_or_default();
+
+                for base_url in &targets {
+                    let url = format!("{base_url}/api/v1/internal/add-peer");
+                    match client
+                        .post(&url)
+                        .header(INTERNAL_AUTH_HEADER, &token)
+                        .json(&new_peer_request)
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            info!(peer_target = %base_url, "Broadcast new peer to existing node");
+                        }
+                        Ok(resp) => {
+                            warn!(
+                                peer_target = %base_url,
+                                status = %resp.status(),
+                                "Failed to broadcast new peer to existing node"
+                            );
+                        }
+                        Err(e) => {
+                            error!(
+                                peer_target = %base_url,
+                                error = %e,
+                                "Failed to reach existing node for peer broadcast"
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     Ok(Json(ClusterJoinResponse {
         node_id: node_uuid,
         raft_node_id,
@@ -296,15 +396,16 @@ pub async fn cluster_join(
 /// List all nodes visible in the Raft cluster state.
 ///
 /// `GET /api/v1/cluster/nodes`
+///
+/// # Errors
+///
+/// Returns an error if the cluster state cannot be read.
 pub async fn cluster_list_nodes(
     State(state): State<ClusterApiState>,
 ) -> Result<Json<Vec<ClusterNodeSummary>>> {
-    let raft = match &state.raft {
-        Some(r) => r,
-        None => {
-            // No Raft -- return empty
-            return Ok(Json(Vec::new()));
-        }
+    let Some(raft) = &state.raft else {
+        // No Raft -- return empty
+        return Ok(Json(Vec::new()));
     };
 
     let cluster_state = raft.read_state().await;
@@ -345,6 +446,11 @@ pub struct HeartbeatRequest {
 ///
 /// Accepts resource usage data from worker nodes and proposes an
 /// `UpdateNodeHeartbeat` to the Raft state machine.
+///
+/// # Panics
+///
+/// Panics if the system clock is before the Unix epoch.
+#[allow(clippy::cast_possible_truncation)]
 pub async fn cluster_heartbeat(
     State(state): State<ClusterApiState>,
     Json(req): Json<HeartbeatRequest>,
@@ -406,7 +512,7 @@ pub async fn cluster_heartbeat(
 // Helpers
 // =============================================================================
 
-/// Validate a join token by decoding the base64 payload and checking auth_secret.
+/// Validate a join token by decoding the base64 payload and checking `auth_secret`.
 fn validate_join_token(token: &str, expected_secret: &str) -> bool {
     use base64::Engine;
 
@@ -414,30 +520,27 @@ fn validate_join_token(token: &str, expected_secret: &str) -> bool {
         Ok(d) => d,
         Err(_) => {
             // Try standard base64 as fallback
-            match base64::engine::general_purpose::STANDARD.decode(token) {
-                Ok(d) => d,
-                Err(_) => {
-                    warn!("Join token is not valid base64");
-                    return false;
-                }
+            if let Ok(d) = base64::engine::general_purpose::STANDARD.decode(token) {
+                d
+            } else {
+                warn!("Join token is not valid base64");
+                return false;
             }
         }
     };
 
-    let value: serde_json::Value = match serde_json::from_slice(&decoded) {
-        Ok(v) => v,
-        Err(_) => {
-            warn!("Join token payload is not valid JSON");
-            return false;
-        }
+    let value: serde_json::Value = if let Ok(v) = serde_json::from_slice(&decoded) {
+        v
+    } else {
+        warn!("Join token payload is not valid JSON");
+        return false;
     };
 
-    match value.get("auth_secret").and_then(|v| v.as_str()) {
-        Some(secret) => secret == expected_secret,
-        None => {
-            warn!("Join token missing auth_secret field");
-            false
-        }
+    if let Some(secret) = value.get("auth_secret").and_then(|v| v.as_str()) {
+        secret == expected_secret
+    } else {
+        warn!("Join token missing auth_secret field");
+        false
     }
 }
 

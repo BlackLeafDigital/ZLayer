@@ -1,6 +1,6 @@
-//! ZPipeline types - YAML-based multi-image build pipeline format
+//! `ZPipeline` types - YAML-based multi-image build pipeline format
 //!
-//! This module defines all serde-deserializable types for the ZPipeline format,
+//! This module defines all serde-deserializable types for the `ZPipeline` format,
 //! which coordinates building multiple container images from a single manifest.
 //! The format supports:
 //!
@@ -69,7 +69,7 @@ pub struct ZPipeline {
     #[serde(default)]
     pub defaults: PipelineDefaults,
 
-    /// Named images to build. Order is preserved (IndexMap).
+    /// Named images to build. Order is preserved (`IndexMap`).
     /// Keys are image names used for `depends_on` references.
     pub images: IndexMap<String, PipelineImage>,
 
@@ -101,7 +101,7 @@ pub struct PipelineDefaults {
     pub no_cache: bool,
 
     /// Default cache mounts applied to all RUN steps in all images.
-    /// Individual ZImagefile step-level cache mounts are additive.
+    /// Individual `ZImagefile` step-level cache mounts are additive.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cache_mounts: Vec<crate::zimage::types::ZCacheMount>,
 
@@ -134,7 +134,7 @@ pub struct PipelineDefaults {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PipelineImage {
-    /// Path to the build file (Dockerfile, ZImagefile, etc.)
+    /// Path to the build file (Dockerfile, `ZImagefile`, etc.)
     pub file: PathBuf,
 
     /// Build context directory. Defaults to "."
@@ -149,7 +149,7 @@ pub struct PipelineImage {
     pub tags: Vec<String>,
 
     /// Build arguments specific to this image.
-    /// Merged with (and overrides) defaults.build_args.
+    /// Merged with (and overrides) `defaults.build_args`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub build_args: HashMap<String, String>,
 
@@ -158,7 +158,7 @@ pub struct PipelineImage {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub depends_on: Vec<String>,
 
-    /// Override no_cache setting for this image.
+    /// Override `no_cache` setting for this image.
     /// If None, inherits from defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub no_cache: Option<bool>,
@@ -206,6 +206,7 @@ fn is_default_context(path: &Path) -> bool {
 }
 
 /// Helper for `skip_serializing_if` on boolean fields.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(v: &bool) -> bool {
     !v
 }
@@ -219,7 +220,7 @@ mod tests {
         let yaml = r#"
 file: Dockerfile
 "#;
-        let img: PipelineImage = serde_yaml::from_str(yaml).unwrap();
+        let img: PipelineImage = serde_yml::from_str(yaml).unwrap();
         assert_eq!(img.file, PathBuf::from("Dockerfile"));
         assert_eq!(img.context, PathBuf::from("."));
         assert!(img.tags.is_empty());
@@ -234,7 +235,7 @@ file: Dockerfile
     #[test]
     fn test_pipeline_defaults_empty() {
         let yaml = "{}";
-        let defaults: PipelineDefaults = serde_yaml::from_str(yaml).unwrap();
+        let defaults: PipelineDefaults = serde_yml::from_str(yaml).unwrap();
         assert!(defaults.format.is_none());
         assert!(defaults.build_args.is_empty());
         assert!(!defaults.no_cache);
@@ -250,7 +251,7 @@ build_args:
   RUST_VERSION: "1.90"
 no_cache: true
 "#;
-        let defaults: PipelineDefaults = serde_yaml::from_str(yaml).unwrap();
+        let defaults: PipelineDefaults = serde_yml::from_str(yaml).unwrap();
         assert_eq!(defaults.format, Some("oci".to_string()));
         assert_eq!(
             defaults.build_args.get("RUST_VERSION"),
@@ -262,14 +263,14 @@ no_cache: true
     #[test]
     fn test_push_config_defaults() {
         let yaml = "{}";
-        let push: PushConfig = serde_yaml::from_str(yaml).unwrap();
+        let push: PushConfig = serde_yml::from_str(yaml).unwrap();
         assert!(!push.after_all);
     }
 
     #[test]
     fn test_push_config_after_all() {
         let yaml = "after_all: true";
-        let push: PushConfig = serde_yaml::from_str(yaml).unwrap();
+        let push: PushConfig = serde_yml::from_str(yaml).unwrap();
         assert!(push.after_all);
     }
 
@@ -279,7 +280,7 @@ no_cache: true
 file: Dockerfile
 unknown_field: "should fail"
 "#;
-        let result: Result<PipelineImage, _> = serde_yaml::from_str(yaml);
+        let result: Result<PipelineImage, _> = serde_yml::from_str(yaml);
         assert!(result.is_err(), "Should reject unknown fields");
     }
 
@@ -289,7 +290,7 @@ unknown_field: "should fail"
 format: oci
 bogus: "nope"
 "#;
-        let result: Result<PipelineDefaults, _> = serde_yaml::from_str(yaml);
+        let result: Result<PipelineDefaults, _> = serde_yml::from_str(yaml);
         assert!(result.is_err(), "Should reject unknown fields");
     }
 
@@ -305,7 +306,7 @@ cache_mounts:
   - target: /root/.cache/pip
 retries: 3
 "#;
-        let defaults: PipelineDefaults = serde_yaml::from_str(yaml).unwrap();
+        let defaults: PipelineDefaults = serde_yml::from_str(yaml).unwrap();
         assert_eq!(defaults.cache_mounts.len(), 2);
         assert_eq!(defaults.cache_mounts[0].target, "/root/.cargo/registry");
         assert_eq!(
@@ -327,7 +328,7 @@ cache_mounts:
     readonly: true
 retries: 5
 "#;
-        let img: PipelineImage = serde_yaml::from_str(yaml).unwrap();
+        let img: PipelineImage = serde_yml::from_str(yaml).unwrap();
         assert_eq!(img.cache_mounts.len(), 1);
         assert_eq!(img.cache_mounts[0].target, "/tmp/build-cache");
         assert!(img.cache_mounts[0].readonly);
@@ -340,7 +341,7 @@ retries: 5
 after_all: true
 extra: "bad"
 "#;
-        let result: Result<PushConfig, _> = serde_yaml::from_str(yaml);
+        let result: Result<PushConfig, _> = serde_yml::from_str(yaml);
         assert!(result.is_err(), "Should reject unknown fields");
     }
 
@@ -357,7 +358,7 @@ extra: "bad"
             cache_mounts: vec![],
             retries: None,
         };
-        let serialized = serde_yaml::to_string(&img).unwrap();
+        let serialized = serde_yml::to_string(&img).unwrap();
         // Should only contain "file" since everything else is default/empty
         assert!(serialized.contains("file:"));
         assert!(!serialized.contains("context:"));
@@ -388,7 +389,7 @@ extra: "bad"
             }],
             retries: Some(3),
         };
-        let serialized = serde_yaml::to_string(&img).unwrap();
+        let serialized = serde_yml::to_string(&img).unwrap();
         assert!(serialized.contains("context:"));
         assert!(serialized.contains("tags:"));
         assert!(serialized.contains("build_args:"));

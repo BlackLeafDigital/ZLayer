@@ -1,4 +1,4 @@
-//! ZLayer -- unified CLI for the ZLayer container orchestration platform.
+//! `ZLayer` -- unified CLI for the `ZLayer` container orchestration platform.
 //!
 //! Without a subcommand (or with `tui`) the interactive Ratatui-based TUI is
 //! launched.  All other subcommands (deploy, serve, build, etc.) are handled
@@ -40,6 +40,7 @@ use zlayer_observability::{
     init_observability, LogFormat, LogLevel, LoggingConfig, ObservabilityConfig,
 };
 
+#[allow(clippy::too_many_lines, unsafe_code)]
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -385,6 +386,7 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
 }
 
 /// Dispatch CLI commands to their handlers.
+#[allow(clippy::too_many_lines)]
 async fn run(cli: Cli) -> Result<()> {
     // command is guaranteed to be Some at this point (TUI handled earlier)
     let command = cli
@@ -434,7 +436,7 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Status => commands::lifecycle::status(&cli).await,
         Commands::Validate { spec_path } => {
             let path = util::discover_spec_path(spec_path.as_deref())?;
-            commands::lifecycle::validate(&path).await
+            commands::lifecycle::validate(&path)
         }
         Commands::Logs {
             deployment,
@@ -495,9 +497,9 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
-        Commands::Runtimes => commands::build::handle_runtimes().await,
+        Commands::Runtimes => commands::build::handle_runtimes(),
         Commands::Token(token_cmd) => commands::token::handle_token(token_cmd),
-        Commands::Spec(spec_cmd) => commands::spec::handle_spec(spec_cmd).await,
+        Commands::Spec(spec_cmd) => commands::spec::handle_spec(spec_cmd),
         Commands::Export {
             image,
             output,
@@ -508,7 +510,7 @@ async fn run(cli: Cli) -> Result<()> {
         }
         Commands::Wasm(wasm_cmd) => commands::wasm::handle_wasm(&cli, wasm_cmd).await,
         Commands::Tunnel(tunnel_cmd) => commands::tunnel::handle_tunnel(&cli, tunnel_cmd).await,
-        Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd).await,
+        Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd),
         Commands::Pull { image } => {
             commands::registry::handle_pull(image, &cli.effective_data_dir()).await
         }

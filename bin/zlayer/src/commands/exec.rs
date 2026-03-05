@@ -44,16 +44,17 @@ pub(crate) async fn exec(
         .context("Exec command failed")?;
 
     // Extract exit code, stdout, stderr from response
+    #[allow(clippy::cast_possible_truncation)]
     let exit_code = result["exit_code"].as_i64().unwrap_or(1) as i32;
     let stdout = result["stdout"].as_str().unwrap_or("");
     let stderr = result["stderr"].as_str().unwrap_or("");
 
     // Print output
     if !stdout.is_empty() {
-        print!("{}", stdout);
+        print!("{stdout}");
     }
     if !stderr.is_empty() {
-        eprint!("{}", stderr);
+        eprint!("{stderr}");
     }
 
     if exit_code != 0 {

@@ -22,6 +22,7 @@ pub struct InstructionList<'a> {
 }
 
 impl Widget for InstructionList<'_> {
+    #[allow(clippy::cast_possible_truncation)]
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.height == 0 {
             return;
@@ -54,7 +55,8 @@ impl Widget for InstructionList<'_> {
             }
 
             let inst = &self.instructions[idx];
-            let y = area.y + display_idx as u16;
+            #[allow(clippy::cast_possible_truncation)]
+            let y = area.y + (display_idx as u16);
 
             // Status indicator
             let (indicator, indicator_style) = match inst.status {
@@ -67,10 +69,7 @@ impl Widget for InstructionList<'_> {
                         .fg(color::WARNING)
                         .add_modifier(Modifier::BOLD),
                 ),
-                InstructionStatus::Complete { cached: false } => {
-                    (icons::COMPLETE, Style::default().fg(color::SUCCESS))
-                }
-                InstructionStatus::Complete { cached: true } => {
+                InstructionStatus::Complete { .. } => {
                     (icons::COMPLETE, Style::default().fg(color::SUCCESS))
                 }
                 InstructionStatus::Failed => (icons::FAILED, Style::default().fg(color::ERROR)),

@@ -133,6 +133,7 @@ pub struct MemLogStore<C: RaftTypeConfig<NodeId = NodeId>> {
 
 impl<C: RaftTypeConfig<NodeId = NodeId>> MemLogStore<C> {
     /// Create a new, empty log store.
+    #[must_use]
     pub fn new() -> Self {
         Self {
             log: Arc::new(RwLock::new(LogData::default())),
@@ -302,6 +303,7 @@ where
     }
 
     /// Get a read handle to the inner state machine data (for reading application state).
+    #[must_use]
     pub fn data(&self) -> Arc<RwLock<SmData<C, S>>> {
         Arc::clone(&self.sm)
     }

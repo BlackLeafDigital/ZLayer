@@ -103,7 +103,7 @@ pub enum DeployEvent {
 
     /// All services are running (deployment summary)
     DeploymentRunning {
-        /// List of (service_name, replica_count) pairs
+        /// List of (`service_name`, `replica_count`) pairs
         services: Vec<(String, u32)>,
     },
 
@@ -149,7 +149,7 @@ pub struct ServicePlan {
     pub image: String,
     /// Scaling mode description (e.g. "fixed(3)", "adaptive(1-10)", "manual")
     pub scale_mode: String,
-    /// Endpoint summaries (e.g. "http:8080 (public)")
+    /// Endpoint summaries (e.g. "<http:8080> (public)")
     pub endpoints: Vec<String>,
 }
 

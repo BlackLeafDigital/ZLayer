@@ -75,8 +75,8 @@ pub struct LoggingConfig {
     #[serde(default = "default_true")]
     pub include_target: bool,
 
-    /// Per-crate tracing filter directives (e.g. "runtime=info,zlayer_agent=warn,warn")
-    /// When set, overrides the global `level` for EnvFilter construction.
+    /// Per-crate tracing filter directives (e.g. "`runtime=info,zlayer_agent=warn,warn`")
+    /// When set, overrides the global `level` for `EnvFilter` construction.
     #[serde(default)]
     pub filter_directives: Option<String>,
 }
@@ -167,7 +167,7 @@ pub struct TracingConfig {
     #[serde(default)]
     pub enabled: bool,
 
-    /// OTLP endpoint (e.g., "http://localhost:4317")
+    /// OTLP endpoint (e.g., "<http://localhost:4317>")
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
 
@@ -254,6 +254,7 @@ impl Default for TracingConfig {
 
 impl TracingConfig {
     /// Load from environment variables with fallback to defaults
+    #[must_use]
     pub fn from_env() -> Self {
         Self {
             enabled: std::env::var("OTEL_TRACES_ENABLED")

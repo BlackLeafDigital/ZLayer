@@ -1,6 +1,6 @@
 //! Auto-restore from S3
 //!
-//! Handles restoring SQLite databases from S3 backups, including both snapshots
+//! Handles restoring `SQLite` databases from S3 backups, including both snapshots
 //! and WAL segments.
 
 use super::s3_backend::S3Backend;
@@ -54,12 +54,9 @@ impl RestoreManager {
         tokio::fs::create_dir_all(&self.temp_dir).await?;
 
         // Download latest snapshot
-        let snapshot_data = match self.s3_backend.download_latest_snapshot().await? {
-            Some(data) => data,
-            None => {
-                info!("No snapshot found in S3");
-                return Ok(false);
-            }
+        let Some(snapshot_data) = self.s3_backend.download_latest_snapshot().await? else {
+            info!("No snapshot found in S3");
+            return Ok(false);
         };
 
         info!("Downloaded snapshot: {} bytes", snapshot_data.len());
@@ -130,7 +127,7 @@ impl RestoreManager {
 
     /// Apply WAL segments to a database
     ///
-    /// This uses SQLite's ability to recover from WAL files by:
+    /// This uses `SQLite`'s ability to recover from WAL files by:
     /// 1. Writing WAL data to the WAL file location
     /// 2. Opening the database to trigger WAL recovery
     async fn apply_wal_segments(

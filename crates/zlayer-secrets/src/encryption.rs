@@ -8,7 +8,7 @@ use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
 };
 use rand::rngs::OsRng;
-use rand::RngCore;
+use rand::TryRngCore;
 use zeroize::Zeroizing;
 
 use crate::{Result, SecretsError};
@@ -63,10 +63,15 @@ impl EncryptionKey {
     /// Generates a random 32-byte encryption key.
     ///
     /// Uses the operating system's cryptographically secure random number generator.
+    ///
+    /// # Panics
+    /// Panics if the OS random number generator fails.
     #[must_use]
     pub fn generate() -> Self {
         let mut key_bytes = Zeroizing::new([0u8; KEY_SIZE]);
-        OsRng.fill_bytes(key_bytes.as_mut());
+        OsRng
+            .try_fill_bytes(key_bytes.as_mut())
+            .expect("OS RNG failed");
         Self { key: key_bytes }
     }
 
@@ -109,13 +114,18 @@ impl EncryptionKey {
     ///
     /// # Errors
     /// Returns `SecretsError::Encryption` if encryption fails.
+    ///
+    /// # Panics
+    /// Panics if the OS random number generator fails to produce nonce bytes.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let cipher = XChaCha20Poly1305::new_from_slice(self.key.as_ref())
             .map_err(|e| SecretsError::Encryption(format!("Failed to create cipher: {e}")))?;
 
         // Generate random nonce
         let mut nonce_bytes = [0u8; NONCE_SIZE];
-        OsRng.fill_bytes(&mut nonce_bytes);
+        OsRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .expect("OS RNG failed");
         let nonce = XNonce::from_slice(&nonce_bytes);
 
         // Encrypt

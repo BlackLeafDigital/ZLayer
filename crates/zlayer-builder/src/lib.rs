@@ -1,8 +1,8 @@
-//! ZLayer Builder - Dockerfile parsing, ZImagefile support, and buildah command generation
+//! `ZLayer` Builder - Dockerfile parsing, `ZImagefile` support, and buildah command generation
 //!
-//! This crate provides functionality for parsing Dockerfiles (and ZImagefiles),
+//! This crate provides functionality for parsing Dockerfiles (and `ZImagefiles`),
 //! converting them into buildah commands for container image building. It is
-//! designed to be used as part of the ZLayer container orchestration platform.
+//! designed to be used as part of the `ZLayer` container orchestration platform.
 //!
 //! # Architecture
 //!
@@ -11,12 +11,12 @@
 //! - [`dockerfile`]: Types and parsing for Dockerfile content
 //! - [`buildah`]: Command generation and execution for buildah
 //! - [`builder`]: High-level [`ImageBuilder`] API for orchestrating builds
-//! - [`zimage`]: ZImagefile (YAML-based) parsing and Dockerfile conversion
+//! - [`zimage`]: `ZImagefile` (YAML-based) parsing and Dockerfile conversion
 //! - [`tui`]: Terminal UI for build progress visualization
 //! - [`templates`]: Runtime templates for common development environments
 //! - [`error`]: Error types for the builder subsystem
 //!
-//! # Quick Start with ImageBuilder
+//! # Quick Start with `ImageBuilder`
 //!
 //! The recommended way to build images is using the [`ImageBuilder`] API:
 //!
@@ -57,9 +57,9 @@
 //! }
 //! ```
 //!
-//! # Building from a ZImagefile
+//! # Building from a `ZImagefile`
 //!
-//! ZImagefiles are a YAML-based alternative to Dockerfiles. The builder
+//! `ZImagefiles` are a YAML-based alternative to Dockerfiles. The builder
 //! auto-detects a file named `ZImagefile` in the context directory, or you
 //! can point to one explicitly with [`ImageBuilder::zimagefile`]:
 //!
@@ -78,7 +78,7 @@
 //! }
 //! ```
 //!
-//! ZImagefiles support four build modes: runtime template shorthand,
+//! `ZImagefiles` support four build modes: runtime template shorthand,
 //! single-stage (`base` + `steps`), multi-stage (`stages` map), and WASM.
 //! See the [`zimage`] module for the full type definitions.
 //!
@@ -133,7 +133,7 @@
 //!
 //! # Features
 //!
-//! ## ImageBuilder (High-Level API)
+//! ## `ImageBuilder` (High-Level API)
 //!
 //! The [`ImageBuilder`] provides a fluent API for:
 //!

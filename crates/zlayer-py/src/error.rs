@@ -6,7 +6,7 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use thiserror::Error;
 
-/// Error type for ZLayer Python bindings
+/// Error type for `ZLayer` Python bindings
 #[derive(Error, Debug)]
 pub enum ZLayerError {
     #[error("Container error: {0}")]
@@ -38,8 +38,8 @@ impl From<ZLayerError> for PyErr {
     fn from(err: ZLayerError) -> PyErr {
         match err {
             ZLayerError::InvalidArgument(msg) => PyValueError::new_err(msg),
-            ZLayerError::NotFound(msg) => PyValueError::new_err(format!("Not found: {}", msg)),
-            ZLayerError::Spec(msg) => PyValueError::new_err(format!("Spec error: {}", msg)),
+            ZLayerError::NotFound(msg) => PyValueError::new_err(format!("Not found: {msg}")),
+            ZLayerError::Spec(msg) => PyValueError::new_err(format!("Spec error: {msg}")),
             _ => PyRuntimeError::new_err(err.to_string()),
         }
     }
@@ -63,8 +63,8 @@ impl From<zlayer_builder::BuildError> for ZLayerError {
     }
 }
 
-impl From<serde_yaml::Error> for ZLayerError {
-    fn from(err: serde_yaml::Error) -> Self {
+impl From<serde_yml::Error> for ZLayerError {
+    fn from(err: serde_yml::Error) -> Self {
         ZLayerError::Spec(err.to_string())
     }
 }
@@ -78,7 +78,7 @@ impl From<serde_json::Error> for ZLayerError {
 /// Result type alias for Python bindings
 pub type Result<T> = std::result::Result<T, ZLayerError>;
 
-/// Convert a Result to a PyResult
+/// Convert a Result to a `PyResult`
 pub fn to_py_result<T>(result: Result<T>) -> PyResult<T> {
-    result.map_err(|e| e.into())
+    result.map_err(std::convert::Into::into)
 }

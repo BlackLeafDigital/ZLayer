@@ -238,7 +238,11 @@ fn current_timestamp() -> u64 {
 // Handlers
 // =============================================================================
 
-/// Create a new tunnel token
+/// Create a new tunnel token.
+///
+/// # Errors
+///
+/// Returns an error if validation fails or authentication is invalid.
 #[utoipa::path(
     post,
     path = "/api/v1/tunnels",
@@ -309,7 +313,11 @@ pub async fn create_tunnel(
     }))
 }
 
-/// List all tunnels
+/// List all tunnels.
+///
+/// # Errors
+///
+/// Returns an error if authentication fails.
 #[utoipa::path(
     get,
     path = "/api/v1/tunnels",
@@ -350,7 +358,11 @@ pub async fn list_tunnels(
     Ok(Json(summaries))
 }
 
-/// Revoke (delete) a tunnel
+/// Revoke (delete) a tunnel.
+///
+/// # Errors
+///
+/// Returns an error if the tunnel is not found.
 #[utoipa::path(
     delete,
     path = "/api/v1/tunnels/{id}",
@@ -375,14 +387,18 @@ pub async fn revoke_tunnel(
     if tunnels.remove(&id).is_some() {
         tracing::info!(tunnel_id = %id, "Revoked tunnel");
         Ok(Json(SuccessResponse {
-            message: format!("Tunnel '{}' revoked successfully", id),
+            message: format!("Tunnel '{id}' revoked successfully"),
         }))
     } else {
-        Err(ApiError::NotFound(format!("Tunnel '{}' not found", id)))
+        Err(ApiError::NotFound(format!("Tunnel '{id}' not found")))
     }
 }
 
-/// Get tunnel status
+/// Get tunnel status.
+///
+/// # Errors
+///
+/// Returns an error if the tunnel is not found.
 #[utoipa::path(
     get,
     path = "/api/v1/tunnels/{id}/status",
@@ -426,11 +442,15 @@ pub async fn get_tunnel_status(
                 active_connections: 0, // Would come from TunnelRegistry
             }))
         }
-        None => Err(ApiError::NotFound(format!("Tunnel '{}' not found", id))),
+        None => Err(ApiError::NotFound(format!("Tunnel '{id}' not found"))),
     }
 }
 
-/// Create a node-to-node tunnel
+/// Create a node-to-node tunnel.
+///
+/// # Errors
+///
+/// Returns an error if validation fails or the user lacks permission.
 #[utoipa::path(
     post,
     path = "/api/v1/tunnels/node",
@@ -492,7 +512,11 @@ pub async fn create_node_tunnel(
     Ok(Json(response))
 }
 
-/// Remove a node-to-node tunnel
+/// Remove a node-to-node tunnel.
+///
+/// # Errors
+///
+/// Returns an error if the tunnel is not found or the user lacks permission.
 #[utoipa::path(
     delete,
     path = "/api/v1/tunnels/node/{name}",
@@ -521,12 +545,11 @@ pub async fn remove_node_tunnel(
     if node_tunnels.remove(&name).is_some() {
         tracing::info!(tunnel_name = %name, "Removed node tunnel");
         Ok(Json(SuccessResponse {
-            message: format!("Node tunnel '{}' removed successfully", name),
+            message: format!("Node tunnel '{name}' removed successfully"),
         }))
     } else {
         Err(ApiError::NotFound(format!(
-            "Node tunnel '{}' not found",
-            name
+            "Node tunnel '{name}' not found"
         )))
     }
 }

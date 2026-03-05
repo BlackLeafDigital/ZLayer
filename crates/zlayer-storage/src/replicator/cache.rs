@@ -28,6 +28,7 @@ pub struct CacheEntry {
 
 impl CacheEntry {
     /// Create a new cache entry
+    #[must_use]
     pub fn new(sequence: u64, data: Vec<u8>) -> Self {
         Self {
             sequence,
@@ -38,6 +39,7 @@ impl CacheEntry {
     }
 
     /// Size of this entry in bytes
+    #[must_use]
     pub fn size(&self) -> u64 {
         self.data.len() as u64
     }

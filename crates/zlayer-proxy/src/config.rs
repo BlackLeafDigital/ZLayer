@@ -190,6 +190,7 @@ impl Default for TimeoutConfig {
 }
 
 /// Header configuration
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeaderConfig {
     /// Add X-Forwarded-For header
@@ -234,7 +235,7 @@ fn default_server_name() -> String {
 }
 
 fn default_hsts_max_age() -> u64 {
-    31536000 // 1 year
+    31_536_000 // 1 year
 }
 
 impl Default for HeaderConfig {

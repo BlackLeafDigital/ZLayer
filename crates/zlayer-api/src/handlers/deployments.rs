@@ -79,8 +79,8 @@ pub struct CreateDeploymentRequest {
 pub struct DeploymentState {
     /// Storage backend for deployments
     pub storage: Arc<dyn DeploymentStorage + Send + Sync>,
-    /// Optional service manager for orchestration (behind RwLock for compatibility
-    /// with the rest of the router, even though ServiceManager uses internal locking)
+    /// Optional service manager for orchestration (behind `RwLock` for compatibility
+    /// with the rest of the router, even though `ServiceManager` uses internal locking)
     pub service_manager: Option<Arc<RwLock<ServiceManager>>>,
     /// Optional overlay manager for network setup
     pub overlay: Option<Arc<RwLock<zlayer_agent::OverlayManager>>>,
@@ -125,6 +125,7 @@ impl DeploymentState {
     ///
     /// If a service manager is available, queries live replica counts and health.
     /// Otherwise, returns static info from the spec.
+    #[allow(clippy::cast_possible_truncation)]
     async fn build_service_health(&self, stored: &StoredDeployment) -> Vec<ServiceHealthInfo> {
         let mut infos = Vec::with_capacity(stored.spec.services.len());
 
@@ -144,7 +145,7 @@ impl DeploymentState {
                 let h = match states.get(name) {
                     Some(zlayer_agent::HealthState::Healthy) => "healthy".to_string(),
                     Some(zlayer_agent::HealthState::Unhealthy { reason, .. }) => {
-                        format!("unhealthy: {}", reason)
+                        format!("unhealthy: {reason}")
                     }
                     Some(zlayer_agent::HealthState::Checking) => "checking".to_string(),
                     _ => "unknown".to_string(),
@@ -256,7 +257,11 @@ impl From<&StoredDeployment> for DeploymentSummary {
     }
 }
 
-/// List all deployments
+/// List all deployments.
+///
+/// # Errors
+///
+/// Returns an error if storage access fails.
 #[utoipa::path(
     get,
     path = "/api/v1/deployments",
@@ -275,14 +280,18 @@ pub async fn list_deployments(
         .storage
         .list()
         .await
-        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?;
 
     let summaries: Vec<DeploymentSummary> =
         deployments.iter().map(DeploymentSummary::from).collect();
     Ok(Json(summaries))
 }
 
-/// Get deployment details (with live per-service health when available)
+/// Get deployment details (with live per-service health when available).
+///
+/// # Errors
+///
+/// Returns an error if the deployment is not found or storage access fails.
 #[utoipa::path(
     get,
     path = "/api/v1/deployments/{name}",
@@ -306,8 +315,8 @@ pub async fn get_deployment(
         .storage
         .get(&name)
         .await
-        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?
-        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{}' not found", name)))?;
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{name}' not found")))?;
 
     let service_health = state.build_service_health(&deployment).await;
     Ok(Json(DeploymentDetails::from_stored(
@@ -328,6 +337,10 @@ pub async fn get_deployment(
 ///  5. The async task updates the stored status to `Running` or `Failed`
 ///
 /// Without orchestration wired, it stores the spec with `Pending` status.
+///
+/// # Errors
+///
+/// Returns an error if the spec is invalid or storage fails.
 #[utoipa::path(
     post,
     path = "/api/v1/deployments",
@@ -341,13 +354,15 @@ pub async fn get_deployment(
     tag = "Deployments"
 )]
 pub async fn create_deployment(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<DeploymentState>,
     Json(request): Json<CreateDeploymentRequest>,
 ) -> Result<(StatusCode, Json<DeploymentDetails>)> {
+    user.require_role("operator")?;
+
     // Validate and parse spec
     let spec: zlayer_spec::DeploymentSpec = zlayer_spec::from_yaml_str(&request.spec)
-        .map_err(|e| ApiError::BadRequest(format!("Invalid spec: {}", e)))?;
+        .map_err(|e| ApiError::BadRequest(format!("Invalid spec: {e}")))?;
 
     let deployment_name = spec.deployment.clone();
 
@@ -360,7 +375,7 @@ pub async fn create_deployment(
             .storage
             .store(&deployment)
             .await
-            .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?;
+            .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?;
 
         let details = DeploymentDetails::from(&deployment);
 
@@ -382,7 +397,7 @@ pub async fn create_deployment(
             .storage
             .store(&deployment)
             .await
-            .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?;
+            .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?;
 
         Ok((
             StatusCode::CREATED,
@@ -393,19 +408,19 @@ pub async fn create_deployment(
 
 /// Background orchestration task for a deployment.
 ///
-/// Registers each service with the ServiceManager, sets up overlay networks,
+/// Registers each service with the `ServiceManager`, sets up overlay networks,
 /// configures proxy routes, scales to desired replicas, then waits for
 /// stabilization. Updates the stored deployment status to Running or Failed.
+#[allow(clippy::too_many_lines)]
 async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::DeploymentSpec) {
     let deployment_name = spec.deployment.clone();
     info!(deployment = %deployment_name, "Starting deployment orchestration");
 
-    let mgr_lock = match &state.service_manager {
-        Some(m) => Arc::clone(m),
-        None => {
-            warn!(deployment = %deployment_name, "No service manager available for orchestration");
-            return;
-        }
+    let mgr_lock = if let Some(m) = &state.service_manager {
+        Arc::clone(m)
+    } else {
+        warn!(deployment = %deployment_name, "No service manager available for orchestration");
+        return;
     };
 
     let mut errors: Vec<String> = Vec::new();
@@ -551,7 +566,12 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
     }
 }
 
-/// Delete a deployment
+/// Delete a deployment.
+///
+/// # Errors
+///
+/// Returns an error if the deployment is not found, storage access fails, or teardown
+/// encounters critical failures.
 #[utoipa::path(
     delete,
     path = "/api/v1/deployments/{name}",
@@ -567,16 +587,18 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
     tag = "Deployments"
 )]
 pub async fn delete_deployment(
-    _user: AuthUser,
+    user: AuthUser,
     State(state): State<DeploymentState>,
     Path(name): Path<String>,
 ) -> Result<StatusCode> {
+    user.require_role("operator")?;
+
     // Load the deployment to get service specs for full teardown
     let stored = state
         .storage
         .get(&name)
         .await
-        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?;
 
     if let Some(stored) = &stored {
         for service_name in stored.spec.services.keys() {
@@ -632,16 +654,13 @@ pub async fn delete_deployment(
         .storage
         .delete(&name)
         .await
-        .map_err(|e| ApiError::Internal(format!("Storage error: {}", e)))?;
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?;
 
     if deleted {
         info!(deployment = %name, "Deployment deleted");
         Ok(StatusCode::NO_CONTENT)
     } else {
-        Err(ApiError::NotFound(format!(
-            "Deployment '{}' not found",
-            name
-        )))
+        Err(ApiError::NotFound(format!("Deployment '{name}' not found")))
     }
 }
 

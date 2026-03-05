@@ -1,6 +1,6 @@
 //! Validation view
 //!
-//! Lets the user pick a file and parses it as a Dockerfile or ZImagefile,
+//! Lets the user pick a file and parses it as a Dockerfile or `ZImagefile`,
 //! displaying the parsed structure or any errors.
 
 use crossterm::event::{KeyCode, KeyEvent};
@@ -11,6 +11,7 @@ use crate::app::{ValidateResult, ValidateStageInfo, ValidateState};
 use crate::widgets::file_picker;
 
 /// Render the validation view
+#[allow(clippy::too_many_lines)]
 pub fn render(frame: &mut Frame, state: &ValidateState) {
     let area = frame.area();
 
@@ -79,6 +80,7 @@ pub fn render(frame: &mut Frame, state: &ValidateState) {
 }
 
 /// Render the validation result
+#[allow(clippy::too_many_lines)]
 fn render_result(area: Rect, frame: &mut Frame, result: &ValidateResult) {
     match result {
         ValidateResult::Dockerfile { path, stages } => {
@@ -275,7 +277,7 @@ fn run_validation(state: &mut ValidateState, path: &std::path::Path) {
         Err(e) => {
             state.result = Some(ValidateResult::Error {
                 path: path_str,
-                message: format!("Failed to read file: {}", e),
+                message: format!("Failed to read file: {e}"),
             });
             return;
         }
@@ -329,7 +331,7 @@ fn run_validation(state: &mut ValidateState, path: &std::path::Path) {
     }
 }
 
-/// Detect whether a file is a ZImagefile (YAML)
+/// Detect whether a file is a `ZImagefile` (YAML)
 fn is_likely_zimagefile(path: &std::path::Path, content: &str) -> bool {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     if name.contains("ZImagefile") {
@@ -351,10 +353,10 @@ fn is_likely_zimagefile(path: &std::path::Path, content: &str) -> bool {
         || trimmed.starts_with("wasm:")
 }
 
-/// Produce a text summary of a ZImagefile
+/// Produce a text summary of a `ZImagefile`
 fn summarize_zimagefile(zimage: &zlayer_builder::zimage::ZImage) -> String {
     if let Some(ref runtime) = zimage.runtime {
-        format!("Mode: runtime template ({})", runtime)
+        format!("Mode: runtime template ({runtime})")
     } else if let Some(ref stages) = zimage.stages {
         let stage_list: Vec<String> = stages
             .iter()

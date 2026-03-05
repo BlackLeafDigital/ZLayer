@@ -57,7 +57,7 @@ pub enum WasmError {
 pub struct WasmBinaryInfo {
     /// Detected WASI version based on binary analysis
     pub wasi_version: WasiVersion,
-    /// Whether this is a component (WASIp2) vs a core module (WASIp1)
+    /// Whether this is a component (`WASIp2`) vs a core module (`WASIp1`)
     pub is_component: bool,
     /// WASM binary format version (typically 1)
     pub binary_version: u32,
@@ -80,17 +80,20 @@ pub enum ArtifactType {
 impl ArtifactType {
     /// Returns true if this is a WASM artifact
     #[inline]
+    #[must_use]
     pub fn is_wasm(&self) -> bool {
         matches!(self, ArtifactType::Wasm { .. })
     }
 
     /// Returns true if this is a container image
     #[inline]
+    #[must_use]
     pub fn is_container(&self) -> bool {
         matches!(self, ArtifactType::Container)
     }
 
     /// Returns the WASI version if this is a WASM artifact
+    #[must_use]
     pub fn wasi_version(&self) -> Option<&WasiVersion> {
         match self {
             ArtifactType::Wasm { wasi_version } => Some(wasi_version),
@@ -103,7 +106,7 @@ impl std::fmt::Display for ArtifactType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ArtifactType::Container => write!(f, "container"),
-            ArtifactType::Wasm { wasi_version } => write!(f, "wasm ({})", wasi_version),
+            ArtifactType::Wasm { wasi_version } => write!(f, "wasm ({wasi_version})"),
         }
     }
 }
@@ -123,17 +126,20 @@ pub enum WasiVersion {
 impl WasiVersion {
     /// Returns true if this is wasip1
     #[inline]
+    #[must_use]
     pub fn is_preview1(&self) -> bool {
         matches!(self, WasiVersion::Preview1)
     }
 
     /// Returns true if this is wasip2 (component model)
     #[inline]
+    #[must_use]
     pub fn is_preview2(&self) -> bool {
         matches!(self, WasiVersion::Preview2)
     }
 
     /// Returns the expected target triple suffix for this WASI version
+    #[must_use]
     pub fn target_triple_suffix(&self) -> &'static str {
         match self {
             WasiVersion::Preview1 => "wasm32-wasip1",
@@ -144,8 +150,9 @@ impl WasiVersion {
 
     /// Returns the OCI artifact type for this WASI version
     ///
-    /// - WASIp1 modules use `application/vnd.wasm.module.v1+wasm`
-    /// - WASIp2 components use `application/vnd.wasm.component.v1+wasm`
+    /// - `WASIp1` modules use `application/vnd.wasm.module.v1+wasm`
+    /// - `WASIp2` components use `application/vnd.wasm.component.v1+wasm`
+    #[must_use]
     pub fn artifact_type(&self) -> &'static str {
         match self {
             WasiVersion::Preview1 | WasiVersion::Unknown => WASM_MODULE_ARTIFACT_TYPE,
@@ -198,6 +205,7 @@ impl std::fmt::Display for WasiVersion {
 /// assert!(!validate_wasm_magic(&short_bytes));
 /// ```
 #[inline]
+#[must_use]
 pub fn validate_wasm_magic(bytes: &[u8]) -> bool {
     bytes.len() >= 4 && bytes[0..4] == WASM_MAGIC_BYTES
 }
@@ -205,9 +213,9 @@ pub fn validate_wasm_magic(bytes: &[u8]) -> bool {
 /// Detect WASI version by analyzing the WASM binary structure
 ///
 /// This function examines the binary to determine if it's a:
-/// - **WASIp2 Component**: Uses the component model with a component section (layer type 0x00
+/// - **`WASIp2` Component**: Uses the component model with a component section (layer type 0x00
 ///   after the 8-byte preamble indicates a component)
-/// - **WASIp1 Module**: A core WebAssembly module with standard section types (0x01-0x0c)
+/// - **`WASIp1` Module**: A core WebAssembly module with standard section types (0x01-0x0c)
 ///
 /// # Binary Format Reference
 ///
@@ -216,8 +224,8 @@ pub fn validate_wasm_magic(bytes: &[u8]) -> bool {
 /// - Bytes 4-7: Version (little-endian u32, typically 1 for modules, varies for components)
 ///
 /// After the preamble:
-/// - **Components (WASIp2)**: First section has type 0x00 (component section)
-/// - **Modules (WASIp1)**: Sections have types 0x01-0x0c (custom, type, import, etc.)
+/// - **Components (`WASIp2`)**: First section has type 0x00 (component section)
+/// - **Modules (`WASIp1`)**: Sections have types 0x01-0x0c (custom, type, import, etc.)
 ///
 /// # Arguments
 ///
@@ -243,6 +251,7 @@ pub fn validate_wasm_magic(bytes: &[u8]) -> bool {
 /// ];
 /// assert_eq!(detect_wasm_version_from_binary(&module_bytes), WasiVersion::Preview1);
 /// ```
+#[must_use]
 pub fn detect_wasm_version_from_binary(bytes: &[u8]) -> WasiVersion {
     // Need at least magic (4) + version (4) + section type (1) = 9 bytes
     if bytes.len() < 9 {
@@ -402,6 +411,7 @@ pub fn extract_wasm_binary_info(bytes: &[u8]) -> Result<WasmBinaryInfo, WasmErro
 /// let artifact_type = detect_artifact_type(&manifest);
 /// assert!(artifact_type.is_container());
 /// ```
+#[must_use]
 pub fn detect_artifact_type(manifest: &OciImageManifest) -> ArtifactType {
     // Strategy 1: Check artifact_type field (most explicit)
     if let Some(artifact_type) = &manifest.artifact_type {
@@ -479,8 +489,7 @@ fn detect_wasi_version_from_layers(layers: &[oci_client::manifest::OciDescriptor
             // Check for component model indicator
             if annotations
                 .get("org.opencontainers.image.title")
-                .map(|t| t.contains("component"))
-                .unwrap_or(false)
+                .is_some_and(|t| t.contains("component"))
             {
                 return WasiVersion::Preview2;
             }
@@ -511,6 +520,7 @@ pub struct WasmArtifactInfo {
 /// Extract detailed WASM artifact information from a manifest
 ///
 /// Returns `None` if this is not a WASM artifact.
+#[must_use]
 pub fn extract_wasm_info(manifest: &OciImageManifest) -> Option<WasmArtifactInfo> {
     let artifact_type = detect_artifact_type(manifest);
     let wasi_version = artifact_type.wasi_version()?.clone();

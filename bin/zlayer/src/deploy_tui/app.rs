@@ -81,7 +81,7 @@ impl DeployTui {
     /// (similar to `docker compose up -d`).
     ///
     /// Returns when:
-    /// - The deployment completes (ShutdownComplete received) and user presses q
+    /// - The deployment completes (`ShutdownComplete` received) and user presses q
     /// - The user presses q/Esc during the Running phase
     /// - The event channel disconnects
     pub fn run(&mut self) -> io::Result<()> {
@@ -132,7 +132,7 @@ impl DeployTui {
     /// behavior depends on the current phase:
     /// - **Running** or **Complete**: The deploy task finished normally
     ///   (background/detach mode or shutdown completed). Auto-exit the TUI.
-    /// - **ShuttingDown**: Shutdown is in progress. Mark complete and auto-exit.
+    /// - **`ShuttingDown`**: Shutdown is in progress. Mark complete and auto-exit.
     /// - **Deploying** / **Stabilizing** / **Initializing**: Unexpected disconnect.
     ///   Show an error message and wait for the user to press q.
     fn process_events(&mut self) {
@@ -180,7 +180,7 @@ impl DeployTui {
     /// Handle a keyboard input event
     ///
     /// Key bindings:
-    /// - `q` / `Esc`: Quit (only after ShutdownComplete or during Running)
+    /// - `q` / `Esc`: Quit (only after `ShutdownComplete` or during Running)
     /// - `Ctrl+C`: Signal shutdown to the deploy task, then wait for completion
     /// - `Up` / `k`: Scroll log up by 1
     /// - `Down` / `j`: Scroll log down by 1
@@ -247,7 +247,7 @@ impl DeployTui {
         }
     }
 
-    /// Render the UI by creating a DeployView widget and rendering it
+    /// Render the UI by creating a `DeployView` widget and rendering it
     fn render(&self, frame: &mut Frame) {
         let view = DeployView::new(&self.state, self.frame_counter);
         frame.render_widget(view, frame.area());
@@ -275,7 +275,7 @@ impl DeployTui {
         };
 
         if self.state.deployment_name.is_empty() {
-            println!("ZLayer Deploy | {}", phase_label);
+            println!("ZLayer Deploy | {phase_label}");
         } else if self.state.version.is_empty() {
             println!(
                 "ZLayer Deploy: {} | {}",
@@ -295,7 +295,7 @@ impl DeployTui {
         if !self.state.services.is_empty() {
             let deployed = self.state.services_deployed_count();
             let total = self.state.services.len();
-            println!("Services: {}/{} deployed", deployed, total);
+            println!("Services: {deployed}/{total} deployed");
 
             for svc in &self.state.services {
                 let icon = match &svc.phase {
@@ -324,7 +324,7 @@ impl DeployTui {
             println!("Running services:");
             for (name, replicas) in &self.state.running_services {
                 let check = c("\u{2713}", ansi::GREEN);
-                println!("  {} {} ({} replicas)", check, name, replicas);
+                println!("  {check} {name} ({replicas} replicas)");
             }
         }
 

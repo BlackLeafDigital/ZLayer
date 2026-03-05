@@ -1,6 +1,6 @@
 //! Job execution engine - run-to-completion container lifecycle
 //!
-//! This module provides the JobExecutor which handles run-to-completion
+//! This module provides the `JobExecutor` which handles run-to-completion
 //! workloads (jobs and cron jobs). Unlike services which run indefinitely,
 //! jobs run to completion and track their exit status.
 
@@ -22,6 +22,7 @@ pub struct JobExecutionId(pub String);
 
 impl JobExecutionId {
     /// Create a new random execution ID
+    #[must_use]
     pub fn new() -> Self {
         Self(Uuid::new_v4().to_string())
     }
@@ -65,10 +66,10 @@ impl std::fmt::Display for JobStatus {
             JobStatus::Pending => write!(f, "pending"),
             JobStatus::Initializing => write!(f, "initializing"),
             JobStatus::Running => write!(f, "running"),
-            JobStatus::Completed { exit_code, .. } => write!(f, "completed({})", exit_code),
+            JobStatus::Completed { exit_code, .. } => write!(f, "completed({exit_code})"),
             JobStatus::Failed { exit_code, .. } => {
                 if let Some(code) = exit_code {
-                    write!(f, "failed({})", code)
+                    write!(f, "failed({code})")
                 } else {
                     write!(f, "failed")
                 }
@@ -96,14 +97,14 @@ impl std::fmt::Display for JobTrigger {
         match self {
             JobTrigger::Endpoint { remote_addr } => {
                 if let Some(addr) = remote_addr {
-                    write!(f, "endpoint({})", addr)
+                    write!(f, "endpoint({addr})")
                 } else {
                     write!(f, "endpoint")
                 }
             }
             JobTrigger::Cli => write!(f, "cli"),
             JobTrigger::Scheduler => write!(f, "scheduler"),
-            JobTrigger::Internal { reason } => write!(f, "internal({})", reason),
+            JobTrigger::Internal { reason } => write!(f, "internal({reason})"),
         }
     }
 }
@@ -195,6 +196,9 @@ impl JobExecutor {
     }
 
     /// Trigger a job execution
+    ///
+    /// # Errors
+    /// Returns an error if the job container cannot be created or started.
     pub async fn trigger(
         &self,
         job_name: &str,
@@ -256,6 +260,7 @@ impl JobExecutor {
     }
 
     /// Internal: Run a job to completion
+    #[allow(clippy::too_many_lines)]
     async fn run_job(
         runtime: Arc<dyn Runtime + Send + Sync>,
         executions: Arc<RwLock<HashMap<JobExecutionId, JobExecution>>>,
@@ -278,7 +283,7 @@ impl JobExecutor {
         let replica = exec_id.0.chars().take(8).collect::<String>();
         let replica_num = u32::from_str_radix(&replica, 16).unwrap_or(0) % 10000;
         let container_id = ContainerId {
-            service: format!("job-{}", job_name),
+            service: format!("job-{job_name}"),
             replica: replica_num,
         };
 
@@ -308,7 +313,7 @@ impl JobExecutor {
             );
             Self::update_status(&executions, &exec_id, |exec| {
                 exec.status = JobStatus::Failed {
-                    reason: format!("Image pull failed: {}", e),
+                    reason: format!("Image pull failed: {e}"),
                     exit_code: None,
                 };
                 exec.completed_at = Some(Instant::now());
@@ -328,7 +333,7 @@ impl JobExecutor {
             );
             Self::update_status(&executions, &exec_id, |exec| {
                 exec.status = JobStatus::Failed {
-                    reason: format!("Container create failed: {}", error_msg),
+                    reason: format!("Container create failed: {error_msg}"),
                     exit_code: None,
                 };
                 exec.completed_at = Some(Instant::now());
@@ -349,7 +354,7 @@ impl JobExecutor {
             );
             Self::update_status(&executions, &exec_id, |exec| {
                 exec.status = JobStatus::Failed {
-                    reason: format!("Init failed: {}", error_msg),
+                    reason: format!("Init failed: {error_msg}"),
                     exit_code: None,
                 };
                 exec.completed_at = Some(Instant::now());
@@ -383,7 +388,7 @@ impl JobExecutor {
             );
             Self::update_status(&executions, &exec_id, |exec| {
                 exec.status = JobStatus::Failed {
-                    reason: format!("Container start failed: {}", error_msg),
+                    reason: format!("Container start failed: {error_msg}"),
                     exit_code: None,
                 };
                 exec.completed_at = Some(Instant::now());
@@ -445,7 +450,7 @@ impl JobExecutor {
                             "Job failed with non-zero exit code"
                         );
                         exec.status = JobStatus::Failed {
-                            reason: format!("Non-zero exit code: {}", code),
+                            reason: format!("Non-zero exit code: {code}"),
                             exit_code: Some(code),
                         };
                     }
@@ -513,6 +518,9 @@ impl JobExecutor {
     }
 
     /// Cancel a running job execution
+    ///
+    /// # Errors
+    /// Returns an error if the execution is not found or not in a cancellable state.
     pub async fn cancel(&self, exec_id: &JobExecutionId) -> Result<()> {
         let mut executions = self.executions.write().await;
         if let Some(execution) = executions.get_mut(exec_id) {
@@ -585,7 +593,7 @@ mod tests {
 
     fn mock_job_spec() -> ServiceSpec {
         use zlayer_spec::*;
-        serde_yaml::from_str::<DeploymentSpec>(
+        serde_yml::from_str::<DeploymentSpec>(
             r#"
 version: v1
 deployment: test

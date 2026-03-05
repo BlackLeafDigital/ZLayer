@@ -85,7 +85,7 @@ pub struct CertMetadata {
 
 /// Certificate manager for TLS certificate provisioning and caching
 ///
-/// The CertManager handles:
+/// The `CertManager` handles:
 /// - Loading existing certificates from disk
 /// - Caching certificates in memory
 /// - Provisioning new certificates via ACME
@@ -96,9 +96,9 @@ pub struct CertManager {
     acme_email: Option<String>,
     /// ACME directory URL (e.g., Let's Encrypt)
     acme_directory: String,
-    /// Certificate cache (domain -> (cert_pem, key_pem))
+    /// Certificate cache (domain -> (`cert_pem`, `key_pem`))
     cache: RwLock<HashMap<String, (String, String)>>,
-    /// ACME HTTP-01 challenge tokens (token -> ChallengeToken)
+    /// ACME HTTP-01 challenge tokens (token -> `ChallengeToken`)
     challenges: DashMap<String, ChallengeToken>,
     /// Cached ACME account metadata (for display/persistence)
     account: RwLock<Option<AcmeAccount>>,
@@ -110,6 +110,11 @@ impl CertManager {
     /// # Arguments
     /// * `storage_path` - Directory to store certificates
     /// * `acme_email` - Optional email for ACME account registration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage directory cannot be created or
+    /// if loading an existing account fails.
     pub async fn new(
         storage_path: String,
         acme_email: Option<String>,
@@ -128,6 +133,10 @@ impl CertManager {
     /// * `storage_path` - Directory to store certificates
     /// * `acme_email` - Optional email for ACME account registration
     /// * `acme_directory` - ACME directory URL (e.g., Let's Encrypt production/staging)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage directory cannot be created.
     pub async fn with_directory(
         storage_path: String,
         acme_email: Option<String>,
@@ -177,7 +186,12 @@ impl CertManager {
     /// * `domain` - The domain to get a certificate for
     ///
     /// # Returns
-    /// Tuple of (certificate_pem, private_key_pem)
+    /// Tuple of (`certificate_pem`, `private_key_pem`)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certificate is not found and ACME
+    /// provisioning fails.
     pub async fn get_cert(
         &self,
         domain: &str,
@@ -191,8 +205,8 @@ impl CertManager {
         }
 
         // Check disk storage
-        let cert_path = self.storage_path.join(format!("{}.crt", domain));
-        let key_path = self.storage_path.join(format!("{}.key", domain));
+        let cert_path = self.storage_path.join(format!("{domain}.crt"));
+        let key_path = self.storage_path.join(format!("{domain}.key"));
 
         if cert_path.exists() && key_path.exists() {
             let cert = tokio::fs::read_to_string(&cert_path).await?;
@@ -220,14 +234,18 @@ impl CertManager {
     /// * `domain` - The domain
     /// * `cert` - Certificate PEM content
     /// * `key` - Private key PEM content
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the certificate or key files to disk fails.
     pub async fn store_cert(
         &self,
         domain: &str,
         cert: &str,
         key: &str,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let cert_path = self.storage_path.join(format!("{}.crt", domain));
-        let key_path = self.storage_path.join(format!("{}.key", domain));
+        let cert_path = self.storage_path.join(format!("{domain}.crt"));
+        let key_path = self.storage_path.join(format!("{domain}.key"));
 
         // Write to disk
         tokio::fs::write(&cert_path, cert).await?;
@@ -278,8 +296,8 @@ impl CertManager {
         }
 
         // Check disk
-        let cert_path = self.storage_path.join(format!("{}.crt", domain));
-        let key_path = self.storage_path.join(format!("{}.key", domain));
+        let cert_path = self.storage_path.join(format!("{domain}.crt"));
+        let key_path = self.storage_path.join(format!("{domain}.key"));
 
         cert_path.exists() && key_path.exists()
     }
@@ -309,7 +327,8 @@ impl CertManager {
     /// * `domain` - The domain to provision a certificate for
     ///
     /// # Returns
-    /// Tuple of (certificate_pem, private_key_pem)
+    /// Tuple of (`certificate_pem`, `private_key_pem`)
+    #[allow(clippy::too_many_lines)]
     async fn provision_cert(
         &self,
         domain: &str,
@@ -338,7 +357,7 @@ impl CertManager {
         };
         let mut order = account.new_order(&new_order).await.map_err(|e| {
             tracing::error!(domain = %domain, error = %e, "Failed to create ACME order");
-            format!("Failed to create ACME order for '{}': {}", domain, e)
+            format!("Failed to create ACME order for '{domain}': {e}")
         })?;
 
         tracing::debug!(domain = %domain, "Created ACME order");
@@ -346,7 +365,7 @@ impl CertManager {
         // Step 3: Get authorizations and process HTTP-01 challenges
         let authorizations = order.authorizations().await.map_err(|e| {
             tracing::error!(domain = %domain, error = %e, "Failed to get authorizations");
-            format!("Failed to get authorizations for '{}': {}", domain, e)
+            format!("Failed to get authorizations for '{domain}': {e}")
         })?;
 
         for auth in authorizations {
@@ -379,8 +398,7 @@ impl CertManager {
 
             // Store challenge for our HTTP server to serve
             let key_auth = order.key_authorization(challenge);
-            self.store_challenge(&challenge.token, domain, key_auth.as_str())
-                .await;
+            self.store_challenge(&challenge.token, domain, key_auth.as_str());
 
             tracing::info!(
                 domain = %domain,
@@ -398,7 +416,7 @@ impl CertManager {
                         error = %e,
                         "Failed to set challenge ready"
                     );
-                    format!("Failed to set challenge ready for '{}': {}", domain, e)
+                    format!("Failed to set challenge ready for '{domain}': {e}")
                 })?;
         }
 
@@ -406,7 +424,7 @@ impl CertManager {
         let start_time = Instant::now();
         loop {
             if start_time.elapsed() > ACME_VALIDATION_TIMEOUT {
-                self.clear_challenges_for_domain(domain).await;
+                self.clear_challenges_for_domain(domain);
                 return Err(format!(
                     "ACME validation timeout for '{}'. Validation did not complete within {} seconds. \
                      Ensure the domain is accessible at http://{}/.well-known/acme-challenge/",
@@ -419,7 +437,7 @@ impl CertManager {
 
             order.refresh().await.map_err(|e| {
                 tracing::error!(domain = %domain, error = %e, "Failed to refresh order status");
-                format!("Failed to refresh order status for '{}': {}", domain, e)
+                format!("Failed to refresh order status for '{domain}': {e}")
             })?;
 
             let status = order.state().status;
@@ -431,18 +449,16 @@ impl CertManager {
                     break;
                 }
                 OrderStatus::Invalid => {
-                    self.clear_challenges_for_domain(domain).await;
+                    self.clear_challenges_for_domain(domain);
                     let error_msg = order
                         .state()
                         .error
                         .as_ref()
-                        .map(|e| format!("{:?}", e))
-                        .unwrap_or_else(|| "Unknown error".to_string());
+                        .map_or_else(|| "Unknown error".to_string(), |e| format!("{e:?}"));
                     return Err(format!(
-                        "ACME order became invalid for '{}': {}. \
+                        "ACME order became invalid for '{domain}': {error_msg}. \
                          This usually means the HTTP-01 challenge failed. \
-                         Ensure the domain is accessible at http://{}/.well-known/acme-challenge/",
-                        domain, error_msg, domain
+                         Ensure the domain is accessible at http://{domain}/.well-known/acme-challenge/"
                     )
                     .into());
                 }
@@ -461,20 +477,17 @@ impl CertManager {
         // Step 5: Generate keypair and CSR with rcgen
         let key_pair = KeyPair::generate().map_err(|e| {
             tracing::error!(domain = %domain, error = %e, "Failed to generate key pair");
-            format!("Failed to generate key pair for '{}': {}", domain, e)
+            format!("Failed to generate key pair for '{domain}': {e}")
         })?;
 
         let params = CertificateParams::new(vec![domain.to_string()]).map_err(|e| {
             tracing::error!(domain = %domain, error = %e, "Failed to create certificate params");
-            format!(
-                "Failed to create certificate params for '{}': {}",
-                domain, e
-            )
+            format!("Failed to create certificate params for '{domain}': {e}")
         })?;
 
         let csr = params.serialize_request(&key_pair).map_err(|e| {
             tracing::error!(domain = %domain, error = %e, "Failed to create CSR");
-            format!("Failed to create CSR for '{}': {}", domain, e)
+            format!("Failed to create CSR for '{domain}': {e}")
         })?;
 
         tracing::debug!(domain = %domain, "Generated CSR");
@@ -483,7 +496,7 @@ impl CertManager {
         if order.state().status != OrderStatus::Valid {
             order.finalize(csr.der()).await.map_err(|e| {
                 tracing::error!(domain = %domain, error = %e, "Failed to finalize order");
-                format!("Failed to finalize order for '{}': {}", domain, e)
+                format!("Failed to finalize order for '{domain}': {e}")
             })?;
 
             tracing::info!(domain = %domain, "Order finalized, waiting for certificate");
@@ -492,7 +505,7 @@ impl CertManager {
         // Step 7: Get certificate (with timeout)
         let cert_chain = loop {
             if start_time.elapsed() > ACME_VALIDATION_TIMEOUT {
-                self.clear_challenges_for_domain(domain).await;
+                self.clear_challenges_for_domain(domain);
                 return Err(format!(
                     "Timeout waiting for certificate for '{}'. \
                      Certificate was not issued within {} seconds.",
@@ -509,8 +522,8 @@ impl CertManager {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 Err(e) => {
-                    self.clear_challenges_for_domain(domain).await;
-                    return Err(format!("Failed to get certificate for '{}': {}", domain, e).into());
+                    self.clear_challenges_for_domain(domain);
+                    return Err(format!("Failed to get certificate for '{domain}': {e}").into());
                 }
             }
         };
@@ -518,7 +531,7 @@ impl CertManager {
         // Step 8: Store and return certificate
         let key_pem = key_pair.serialize_pem();
         self.store_cert(domain, &cert_chain, &key_pem).await?;
-        self.clear_challenges_for_domain(domain).await;
+        self.clear_challenges_for_domain(domain);
 
         tracing::info!(
             domain = %domain,
@@ -550,7 +563,12 @@ impl CertManager {
     /// * `cert_pem` - The PEM-encoded certificate string
     ///
     /// # Returns
-    /// Tuple of (not_before, not_after) as DateTime<Utc>
+    /// Tuple of (`not_before`, `not_after`) as `DateTime`<Utc>
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PEM cannot be parsed or the X.509
+    /// certificate contains invalid timestamps.
     pub fn parse_cert_expiry(
         cert_pem: &str,
     ) -> Result<(DateTime<Utc>, DateTime<Utc>), Box<dyn std::error::Error + Send + Sync>> {
@@ -603,7 +621,7 @@ impl CertManager {
     /// # Returns
     /// The certificate metadata if it exists
     pub async fn load_cert_metadata(&self, domain: &str) -> Option<CertMetadata> {
-        let meta_path = self.storage_path.join(format!("{}.meta.json", domain));
+        let meta_path = self.storage_path.join(format!("{domain}.meta.json"));
         if !meta_path.exists() {
             return None;
         }
@@ -633,7 +651,7 @@ impl CertManager {
 
     /// Get domains with certificates expiring within a threshold
     ///
-    /// Returns domains with certificates that expire within 30 days (RENEWAL_THRESHOLD_DAYS).
+    /// Returns domains with certificates that expire within 30 days (`RENEWAL_THRESHOLD_DAYS`).
     ///
     /// # Returns
     /// Vector of domain names with certificates needing renewal
@@ -717,9 +735,7 @@ impl CertManager {
                             tracing::info!(domain = %domain, "Certificate renewed successfully");
 
                             // Update SNI resolver with new certificate
-                            if let Err(e) = sni_resolver
-                                .refresh_cert(&domain, &cert_pem, &key_pem)
-                                .await
+                            if let Err(e) = sni_resolver.refresh_cert(&domain, &cert_pem, &key_pem)
                             {
                                 tracing::error!(
                                     domain = %domain,
@@ -763,7 +779,6 @@ impl CertManager {
                 Ok((cert_pem, key_pem)) => {
                     if sni_resolver
                         .refresh_cert(&domain, &cert_pem, &key_pem)
-                        .await
                         .is_ok()
                     {
                         renewed.push(domain);
@@ -848,7 +863,7 @@ impl CertManager {
 
     /// Load ACME credentials from disk
     ///
-    /// Since AccountCredentials doesn't implement Clone, we load it fresh
+    /// Since `AccountCredentials` doesn't implement Clone, we load it fresh
     /// each time it's needed.
     async fn load_credentials(&self) -> Option<AccountCredentials> {
         let credentials_path = self.credentials_path();
@@ -889,8 +904,9 @@ impl CertManager {
     /// # Arguments
     /// * `account` - The account to save
     ///
-    /// # Returns
-    /// Ok(()) if successful, Err otherwise
+    /// # Errors
+    ///
+    /// Returns an error if serialization or writing to disk fails.
     pub async fn save_account(
         &self,
         account: &AcmeAccount,
@@ -945,8 +961,9 @@ impl CertManager {
     /// 2. Loads the account from disk if it exists
     /// 3. Creates a new account via ACME
     ///
-    /// # Returns
-    /// The ACME account metadata
+    /// # Errors
+    ///
+    /// Returns an error if ACME account creation or restoration fails.
     pub async fn get_or_create_account(
         &self,
     ) -> Result<AcmeAccount, Box<dyn std::error::Error + Send + Sync>> {
@@ -979,7 +996,7 @@ impl CertManager {
     /// Get or create an instant-acme Account object
     ///
     /// This is the internal method that returns the actual instant-acme Account
-    /// needed for ACME operations. Since AccountCredentials doesn't implement Clone,
+    /// needed for ACME operations. Since `AccountCredentials` doesn't implement Clone,
     /// we load credentials from disk each time.
     async fn get_or_create_acme_account(
         &self,
@@ -990,7 +1007,7 @@ impl CertManager {
 
             let account = Account::from_credentials(credentials)
                 .await
-                .map_err(|e| format!("Failed to restore account from saved credentials: {}", e))?;
+                .map_err(|e| format!("Failed to restore account from saved credentials: {e}"))?;
 
             // Ensure account metadata is cached
             if self.account.read().await.is_none() {
@@ -1014,7 +1031,7 @@ impl CertManager {
             "Creating new ACME account"
         );
 
-        let contact = format!("mailto:{}", email);
+        let contact = format!("mailto:{email}");
         let contact_refs: &[&str] = &[&contact];
         let new_account = NewAccount {
             contact: contact_refs,
@@ -1026,7 +1043,7 @@ impl CertManager {
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "Failed to create ACME account");
-                format!("Failed to create ACME account: {}", e)
+                format!("Failed to create ACME account: {e}")
             })?;
 
         // Create our metadata struct
@@ -1087,7 +1104,7 @@ impl CertManager {
     /// * `token` - The challenge token from the ACME server
     /// * `domain` - The domain being validated
     /// * `key_authorization` - The key authorization response (token.thumbprint)
-    pub async fn store_challenge(&self, token: &str, domain: &str, key_authorization: &str) {
+    pub fn store_challenge(&self, token: &str, domain: &str, key_authorization: &str) {
         let challenge = ChallengeToken {
             token: token.to_string(),
             key_authorization: key_authorization.to_string(),
@@ -1109,7 +1126,7 @@ impl CertManager {
     ///
     /// # Returns
     /// The key authorization string if the token exists and hasn't expired
-    pub async fn get_challenge_response(&self, token: &str) -> Option<String> {
+    pub fn get_challenge_response(&self, token: &str) -> Option<String> {
         self.challenges
             .get(token)
             .filter(|challenge| challenge.created_at.elapsed() < CHALLENGE_EXPIRATION)
@@ -1120,7 +1137,7 @@ impl CertManager {
     ///
     /// # Arguments
     /// * `token` - The challenge token to remove
-    pub async fn remove_challenge(&self, token: &str) {
+    pub fn remove_challenge(&self, token: &str) {
         if self.challenges.remove(token).is_some() {
             tracing::debug!(token = %token, "Removed ACME challenge token");
         }
@@ -1132,7 +1149,7 @@ impl CertManager {
     ///
     /// # Arguments
     /// * `domain` - The domain to clear challenges for
-    pub async fn clear_challenges_for_domain(&self, domain: &str) {
+    pub fn clear_challenges_for_domain(&self, domain: &str) {
         let tokens_to_remove: Vec<String> = self
             .challenges
             .iter()
@@ -1254,15 +1271,15 @@ mod tests {
         let key_auth = "abc123.thumbprint";
 
         // Store a challenge
-        manager.store_challenge(token, domain, key_auth).await;
+        manager.store_challenge(token, domain, key_auth);
         assert_eq!(manager.challenge_count(), 1);
 
         // Retrieve it
-        let response = manager.get_challenge_response(token).await;
+        let response = manager.get_challenge_response(token);
         assert_eq!(response, Some(key_auth.to_string()));
 
         // Non-existent token returns None
-        let missing = manager.get_challenge_response("nonexistent").await;
+        let missing = manager.get_challenge_response("nonexistent");
         assert!(missing.is_none());
     }
 
@@ -1273,16 +1290,14 @@ mod tests {
             .await
             .unwrap();
 
-        manager
-            .store_challenge("token1", "domain.com", "auth1")
-            .await;
+        manager.store_challenge("token1", "domain.com", "auth1");
         assert_eq!(manager.challenge_count(), 1);
 
-        manager.remove_challenge("token1").await;
+        manager.remove_challenge("token1");
         assert_eq!(manager.challenge_count(), 0);
 
         // Removing non-existent token is a no-op
-        manager.remove_challenge("nonexistent").await;
+        manager.remove_challenge("nonexistent");
         assert_eq!(manager.challenge_count(), 0);
     }
 
@@ -1294,23 +1309,17 @@ mod tests {
             .unwrap();
 
         // Store challenges for multiple domains
-        manager
-            .store_challenge("token1", "domain1.com", "auth1")
-            .await;
-        manager
-            .store_challenge("token2", "domain1.com", "auth2")
-            .await;
-        manager
-            .store_challenge("token3", "domain2.com", "auth3")
-            .await;
+        manager.store_challenge("token1", "domain1.com", "auth1");
+        manager.store_challenge("token2", "domain1.com", "auth2");
+        manager.store_challenge("token3", "domain2.com", "auth3");
         assert_eq!(manager.challenge_count(), 3);
 
         // Clear only domain1.com challenges
-        manager.clear_challenges_for_domain("domain1.com").await;
+        manager.clear_challenges_for_domain("domain1.com");
         assert_eq!(manager.challenge_count(), 1);
 
         // domain2.com challenge should still exist
-        let response = manager.get_challenge_response("token3").await;
+        let response = manager.get_challenge_response("token3");
         assert!(response.is_some());
     }
 
@@ -1322,9 +1331,7 @@ mod tests {
             .unwrap();
 
         // Store a challenge
-        manager
-            .store_challenge("token1", "domain.com", "auth1")
-            .await;
+        manager.store_challenge("token1", "domain.com", "auth1");
         assert_eq!(manager.challenge_count(), 1);
 
         // Cleanup should not remove fresh challenges

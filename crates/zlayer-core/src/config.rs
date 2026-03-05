@@ -1,4 +1,4 @@
-//! Configuration structures for ZLayer
+//! Configuration structures for `ZLayer`
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -115,7 +115,7 @@ pub struct OverlayAgentConfig {
     /// Overlay public key (derived from private key)
     pub public_key: Option<String>,
 
-    /// Listen port for overlay network (WireGuard protocol)
+    /// Listen port for overlay network (`WireGuard` protocol)
     #[serde(default = "default_wg_port")]
     pub wg_port: u16,
 
@@ -134,8 +134,8 @@ impl Default for OverlayAgentConfig {
             private_key: String::new(),
             public_key: None,
             wg_port: default_wg_port(),
-            global: Default::default(),
-            dns: Default::default(),
+            global: GlobalOverlayConfig::default(),
+            dns: DnsConfig::default(),
         }
     }
 }

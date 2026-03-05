@@ -1,4 +1,4 @@
-//! Reusable TUI widgets for ZLayer applications
+//! Reusable TUI widgets for `ZLayer` applications
 
 pub mod progress_bar;
 pub mod scrollable_pane;

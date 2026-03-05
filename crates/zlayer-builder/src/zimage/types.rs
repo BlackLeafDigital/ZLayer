@@ -1,12 +1,12 @@
-//! ZImagefile types - YAML-based image build format
+//! `ZImagefile` types - YAML-based image build format
 //!
-//! This module defines all serde-deserializable types for the ZImagefile format,
+//! This module defines all serde-deserializable types for the `ZImagefile` format,
 //! an alternative to Dockerfiles using YAML syntax. The format supports four
 //! mutually exclusive build modes:
 //!
 //! 1. **Runtime template** - shorthand like `runtime: node22`
 //! 2. **Single-stage** - `base:` or `build:` + `steps:` at top level
-//! 3. **Multi-stage** - `stages:` map (IndexMap for insertion order, last = output)
+//! 3. **Multi-stage** - `stages:` map (`IndexMap` for insertion order, last = output)
 //! 4. **WASM** - `wasm:` configuration for WebAssembly builds
 
 use std::collections::HashMap;
@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 // Build context (for `build:` directive)
 // ---------------------------------------------------------------------------
 
-/// Build context for building a base image from a local Dockerfile or ZImagefile.
+/// Build context for building a base image from a local Dockerfile or `ZImagefile`.
 ///
 /// Supports two forms:
 ///
@@ -45,8 +45,8 @@ pub enum ZBuildContext {
         /// `context` is accepted as an alias for Docker Compose compatibility.
         #[serde(alias = "context", default)]
         workdir: Option<String>,
-        /// Path to the build file (Dockerfile or ZImagefile).
-        /// Auto-detected if omitted (prefers ZImagefile over Dockerfile).
+        /// Path to the build file (Dockerfile or `ZImagefile`).
+        /// Auto-detected if omitted (prefers `ZImagefile` over Dockerfile).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         file: Option<String>,
         /// Build arguments passed to the nested build.
@@ -57,6 +57,7 @@ pub enum ZBuildContext {
 
 impl ZBuildContext {
     /// Resolve the build context directory relative to a base path.
+    #[must_use]
     pub fn context_dir(&self, base: &Path) -> PathBuf {
         match self {
             Self::Short(path) => base.join(path),
@@ -68,6 +69,7 @@ impl ZBuildContext {
     }
 
     /// Get the explicit build file path, if specified.
+    #[must_use]
     pub fn file(&self) -> Option<&str> {
         match self {
             Self::Short(_) => None,
@@ -76,6 +78,7 @@ impl ZBuildContext {
     }
 
     /// Get build arguments.
+    #[must_use]
     pub fn args(&self) -> HashMap<String, String> {
         match self {
             Self::Short(_) => HashMap::new(),
@@ -88,7 +91,7 @@ impl ZBuildContext {
 // Top-level ZImage
 // ---------------------------------------------------------------------------
 
-/// Top-level ZImagefile representation.
+/// Top-level `ZImagefile` representation.
 ///
 /// Exactly one of the four mode fields must be set:
 /// - `runtime` for runtime template shorthand
@@ -101,7 +104,7 @@ impl ZBuildContext {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZImage {
-    /// ZImagefile format version (currently must be "1")
+    /// `ZImagefile` format version (currently must be "1")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 
@@ -190,7 +193,7 @@ pub struct ZImage {
 // Stage
 // ---------------------------------------------------------------------------
 
-/// A single build stage in a multi-stage ZImagefile.
+/// A single build stage in a multi-stage `ZImagefile`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZStage {
@@ -397,6 +400,7 @@ pub enum ZCopySources {
 
 impl ZCopySources {
     /// Convert to a vector of source paths regardless of variant.
+    #[must_use]
     pub fn to_vec(&self) -> Vec<String> {
         match self {
             Self::Single(s) => vec![s.clone()],
@@ -545,6 +549,7 @@ fn default_wasm_target() -> String {
 }
 
 /// Helper for `skip_serializing_if` on boolean fields.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(v: &bool) -> bool {
     !v
 }
@@ -559,7 +564,7 @@ mod tests {
 runtime: node22
 cmd: "node server.js"
 "#;
-        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        let img: ZImage = serde_yml::from_str(yaml).unwrap();
         assert_eq!(img.runtime.as_deref(), Some("node22"));
         assert!(matches!(img.cmd, Some(ZCommand::Shell(ref s)) if s == "node server.js"));
     }
@@ -579,7 +584,7 @@ env:
 expose: 8080
 cmd: ["./app.sh"]
 "#;
-        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        let img: ZImage = serde_yml::from_str(yaml).unwrap();
         assert_eq!(img.base.as_deref(), Some("alpine:3.19"));
         assert_eq!(img.steps.len(), 3);
         assert_eq!(img.env.get("NODE_ENV").unwrap(), "production");
@@ -611,7 +616,7 @@ stages:
     cmd: ["node", "dist/index.js"]
 expose: 3000
 "#;
-        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        let img: ZImage = serde_yml::from_str(yaml).unwrap();
         let stages = img.stages.as_ref().unwrap();
         assert_eq!(stages.len(), 2);
 
@@ -638,7 +643,7 @@ wasm:
   wit: "./wit"
   output: "./output.wasm"
 "#;
-        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        let img: ZImage = serde_yml::from_str(yaml).unwrap();
         let wasm = img.wasm.as_ref().unwrap();
         assert_eq!(wasm.target, "preview2");
         assert!(wasm.optimize);
@@ -652,7 +657,7 @@ wasm:
         let yaml = r#"
 wasm: {}
 "#;
-        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        let img: ZImage = serde_yml::from_str(yaml).unwrap();
         let wasm = img.wasm.as_ref().unwrap();
         assert_eq!(wasm.target, "preview2");
         assert!(!wasm.optimize);
@@ -662,35 +667,35 @@ wasm: {}
     #[test]
     fn test_zcommand_shell() {
         let yaml = r#""echo hello""#;
-        let cmd: ZCommand = serde_yaml::from_str(yaml).unwrap();
+        let cmd: ZCommand = serde_yml::from_str(yaml).unwrap();
         assert!(matches!(cmd, ZCommand::Shell(ref s) if s == "echo hello"));
     }
 
     #[test]
     fn test_zcommand_exec() {
         let yaml = r#"["echo", "hello"]"#;
-        let cmd: ZCommand = serde_yaml::from_str(yaml).unwrap();
+        let cmd: ZCommand = serde_yml::from_str(yaml).unwrap();
         assert!(matches!(cmd, ZCommand::Exec(ref v) if v == &["echo", "hello"]));
     }
 
     #[test]
     fn test_zcopy_sources_single() {
         let yaml = r#""package.json""#;
-        let src: ZCopySources = serde_yaml::from_str(yaml).unwrap();
+        let src: ZCopySources = serde_yml::from_str(yaml).unwrap();
         assert_eq!(src.to_vec(), vec!["package.json"]);
     }
 
     #[test]
     fn test_zcopy_sources_multiple() {
         let yaml = r#"["package.json", "tsconfig.json"]"#;
-        let src: ZCopySources = serde_yaml::from_str(yaml).unwrap();
+        let src: ZCopySources = serde_yml::from_str(yaml).unwrap();
         assert_eq!(src.to_vec(), vec!["package.json", "tsconfig.json"]);
     }
 
     #[test]
     fn test_zexpose_single() {
         let yaml = "8080";
-        let exp: ZExpose = serde_yaml::from_str(yaml).unwrap();
+        let exp: ZExpose = serde_yml::from_str(yaml).unwrap();
         assert!(matches!(exp, ZExpose::Single(8080)));
     }
 
@@ -700,7 +705,7 @@ wasm: {}
 - 8080
 - "9090/udp"
 "#;
-        let exp: ZExpose = serde_yaml::from_str(yaml).unwrap();
+        let exp: ZExpose = serde_yml::from_str(yaml).unwrap();
         if let ZExpose::Multiple(ports) = exp {
             assert_eq!(ports.len(), 2);
             assert!(matches!(ports[0], ZPortSpec::Number(8080)));
@@ -719,7 +724,7 @@ timeout: "10s"
 start_period: "5s"
 retries: 3
 "#;
-        let hc: ZHealthcheck = serde_yaml::from_str(yaml).unwrap();
+        let hc: ZHealthcheck = serde_yml::from_str(yaml).unwrap();
         assert!(matches!(hc.cmd, ZCommand::Shell(_)));
         assert_eq!(hc.interval.as_deref(), Some("30s"));
         assert_eq!(hc.timeout.as_deref(), Some("10s"));
@@ -735,7 +740,7 @@ id: apt-cache
 sharing: shared
 readonly: false
 "#;
-        let cm: ZCacheMount = serde_yaml::from_str(yaml).unwrap();
+        let cm: ZCacheMount = serde_yml::from_str(yaml).unwrap();
         assert_eq!(cm.target, "/var/cache/apt");
         assert_eq!(cm.id.as_deref(), Some("apt-cache"));
         assert_eq!(cm.sharing.as_deref(), Some("shared"));
@@ -753,7 +758,7 @@ cache:
   - target: /var/lib/apt
     readonly: true
 "#;
-        let step: ZStep = serde_yaml::from_str(yaml).unwrap();
+        let step: ZStep = serde_yml::from_str(yaml).unwrap();
         assert!(step.run.is_some());
         assert_eq!(step.cache.len(), 2);
         assert_eq!(step.cache[0].target, "/var/cache/apt");
@@ -766,7 +771,7 @@ cache:
 base: "alpine:3.19"
 bogus_field: "should fail"
 "#;
-        let result: Result<ZImage, _> = serde_yaml::from_str(yaml);
+        let result: Result<ZImage, _> = serde_yml::from_str(yaml);
         assert!(result.is_err(), "Should reject unknown fields");
     }
 
@@ -776,7 +781,7 @@ bogus_field: "should fail"
 run: "echo hello"
 bogus: "nope"
 "#;
-        let result: Result<ZStep, _> = serde_yaml::from_str(yaml);
+        let result: Result<ZStep, _> = serde_yml::from_str(yaml);
         assert!(result.is_err(), "Should reject unknown fields on ZStep");
     }
 
@@ -790,9 +795,9 @@ steps:
     to: "/app"
 cmd: "echo done"
 "#;
-        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
-        let serialized = serde_yaml::to_string(&img).unwrap();
-        let img2: ZImage = serde_yaml::from_str(&serialized).unwrap();
+        let img: ZImage = serde_yml::from_str(yaml).unwrap();
+        let serialized = serde_yml::to_string(&img).unwrap();
+        let img2: ZImage = serde_yml::from_str(&serialized).unwrap();
         assert_eq!(img.base, img2.base);
         assert_eq!(img.steps.len(), img2.steps.len());
     }

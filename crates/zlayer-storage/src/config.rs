@@ -7,9 +7,9 @@ use std::path::PathBuf;
 // SQLite Replicator Configuration
 // ============================================================================
 
-/// Configuration for SQLite WAL-based replication to S3
+/// Configuration for `SQLite` WAL-based replication to S3
 ///
-/// This configuration controls how the SQLite replicator monitors database changes
+/// This configuration controls how the `SQLite` replicator monitors database changes
 /// and syncs them to S3 for persistence and disaster recovery.
 ///
 /// # Example
@@ -30,7 +30,7 @@ use std::path::PathBuf;
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SqliteReplicatorConfig {
-    /// Path to the SQLite database file to replicate
+    /// Path to the `SQLite` database file to replicate
     pub db_path: PathBuf,
 
     /// S3 bucket for storing backups
@@ -114,24 +114,28 @@ impl SqliteReplicatorConfig {
     }
 
     /// Set the cache directory
+    #[must_use]
     pub fn with_cache_dir(mut self, cache_dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = cache_dir.into();
         self
     }
 
     /// Set the maximum cache size
+    #[must_use]
     pub fn with_max_cache_size(mut self, size: u64) -> Self {
         self.max_cache_size = size;
         self
     }
 
     /// Set whether to auto-restore on startup
+    #[must_use]
     pub fn with_auto_restore(mut self, auto_restore: bool) -> Self {
         self.auto_restore = auto_restore;
         self
     }
 
     /// Set the snapshot interval
+    #[must_use]
     pub fn with_snapshot_interval(mut self, interval_secs: u64) -> Self {
         self.snapshot_interval_secs = interval_secs;
         self
@@ -155,7 +159,7 @@ pub struct LayerStorageConfig {
     /// AWS region (if not using environment/profile defaults)
     pub region: Option<String>,
 
-    /// Custom S3 endpoint URL (for S3-compatible storage like MinIO)
+    /// Custom S3 endpoint URL (for S3-compatible storage like `MinIO`)
     pub endpoint_url: Option<String>,
 
     /// Local directory for staging tarballs before upload
@@ -228,41 +232,48 @@ impl LayerStorageConfig {
     }
 
     /// Set the S3 key prefix
+    #[must_use]
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
         self
     }
 
     /// Set the AWS region
+    #[must_use]
     pub fn with_region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
         self
     }
 
     /// Set a custom S3 endpoint URL
+    #[must_use]
     pub fn with_endpoint_url(mut self, url: impl Into<String>) -> Self {
         self.endpoint_url = Some(url.into());
         self
     }
 
     /// Set the staging directory
+    #[must_use]
     pub fn with_staging_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.staging_dir = path.into();
         self
     }
 
     /// Set the state database path
+    #[must_use]
     pub fn with_state_db_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.state_db_path = path.into();
         self
     }
 
     /// Build the S3 object key for a given layer digest
+    #[must_use]
     pub fn object_key(&self, digest: &str) -> String {
         format!("{}{}.tar.zst", self.prefix, digest)
     }
 
     /// Build the S3 object key for layer metadata
+    #[must_use]
     pub fn metadata_key(&self, digest: &str) -> String {
         format!("{}{}.meta.json", self.prefix, digest)
     }

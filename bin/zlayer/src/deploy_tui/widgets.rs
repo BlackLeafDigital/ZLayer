@@ -36,6 +36,7 @@ pub struct InfraProgress<'a> {
 }
 
 impl Widget for InfraProgress<'_> {
+    #[allow(clippy::cast_possible_truncation)]
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.height == 0 || area.width < 10 {
             return;
@@ -43,7 +44,7 @@ impl Widget for InfraProgress<'_> {
 
         let done_count = self.phases.iter().filter(|(_, s)| s.is_done()).count();
         let total = self.phases.len();
-        let title = format!(" Infrastructure  {}/{} ", done_count, total);
+        let title = format!(" Infrastructure  {done_count}/{total} ");
 
         let block = Block::default()
             .title(title)
@@ -256,6 +257,7 @@ fn service_indicator(phase: &ServiceDeployPhase) -> (String, Style) {
 }
 
 /// Style for service name based on deploy phase
+#[allow(clippy::match_same_arms)]
 fn service_name_style(phase: &ServiceDeployPhase) -> Style {
     match phase {
         ServiceDeployPhase::Pending => Style::default().fg(color::INACTIVE),
@@ -266,6 +268,7 @@ fn service_name_style(phase: &ServiceDeployPhase) -> Style {
 }
 
 /// Render a health status label with appropriate color
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn health_display(health: &ServiceHealth) -> (String, Style) {
     match health {
         ServiceHealth::Healthy => ("[healthy]".to_string(), Style::default().fg(color::SUCCESS)),

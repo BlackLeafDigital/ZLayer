@@ -37,6 +37,7 @@ impl From<ContainerState> for PyContainerState {
 
 #[pymethods]
 impl PyContainerState {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn __str__(&self) -> &'static str {
         match self {
             PyContainerState::Pending => "pending",
@@ -48,6 +49,7 @@ impl PyContainerState {
         }
     }
 
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn __repr__(&self) -> String {
         format!("ContainerState.{}", self.__str__().to_uppercase())
     }
@@ -60,17 +62,17 @@ struct ContainerInner {
     runtime: Arc<dyn Runtime + Send + Sync>,
 }
 
-/// A container instance managed by ZLayer
+/// A container instance managed by `ZLayer`
 ///
 /// This class provides methods to control the lifecycle of a container,
 /// including starting, stopping, and querying its status.
 ///
 /// Example:
 ///     >>> container = Container.create("nginx:latest", ports={"http": 80})
-///     >>> await container.start()
+///     >>> await `container.start()`
 ///     >>> print(container.status)
 ///     'running'
-///     >>> await container.stop()
+///     >>> await `container.stop()`
 #[pyclass]
 pub struct Container {
     inner: Arc<RwLock<ContainerInner>>,
@@ -103,10 +105,11 @@ impl Container {
     ///     A new Container instance (not yet started)
     ///
     /// Raises:
-    ///     ValueError: If the image name is invalid
-    ///     RuntimeError: If container creation fails
+    ///     `ValueError`: If the image name is invalid
+    ///     `RuntimeError`: If container creation fails
     #[staticmethod]
     #[pyo3(signature = (image, ports=None, env=None, name=None))]
+    #[allow(clippy::needless_pass_by_value)]
     fn create(
         image: &str,
         ports: Option<HashMap<String, u16>>,
@@ -115,8 +118,8 @@ impl Container {
     ) -> PyResult<Self> {
         // Build a minimal ServiceSpec from the provided parameters
         let yaml = build_spec_yaml(image, ports.as_ref(), env.as_ref(), name);
-        let deployment: zlayer_spec::DeploymentSpec = serde_yaml::from_str(&yaml)
-            .map_err(|e| ZLayerError::InvalidArgument(format!("Failed to create spec: {}", e)))?;
+        let deployment: zlayer_spec::DeploymentSpec = serde_yml::from_str(&yaml)
+            .map_err(|e| ZLayerError::InvalidArgument(format!("Failed to create spec: {e}")))?;
 
         let container_name = name.unwrap_or("container").to_string();
         let spec = deployment
@@ -144,7 +147,7 @@ impl Container {
     /// The container must not already be running.
     ///
     /// Raises:
-    ///     RuntimeError: If the container fails to start
+    ///     `RuntimeError`: If the container fails to start
     fn start<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -184,7 +187,7 @@ impl Container {
     ///     timeout: Maximum seconds to wait for graceful shutdown (default: 30)
     ///
     /// Raises:
-    ///     RuntimeError: If the container fails to stop
+    ///     `RuntimeError`: If the container fails to stop
     #[pyo3(signature = (timeout=30))]
     fn stop<'py>(&self, py: Python<'py>, timeout: u64) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -208,7 +211,7 @@ impl Container {
     /// This method removes the container. The container must be stopped first.
     ///
     /// Raises:
-    ///     RuntimeError: If the container fails to be removed
+    ///     `RuntimeError`: If the container fails to be removed
     fn remove<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -235,7 +238,7 @@ impl Container {
     ///     Container logs as a string
     ///
     /// Raises:
-    ///     RuntimeError: If logs cannot be retrieved
+    ///     `RuntimeError`: If logs cannot be retrieved
     #[pyo3(signature = (tail=100))]
     fn logs<'py>(&self, py: Python<'py>, tail: usize) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -263,8 +266,8 @@ impl Container {
     ///     timeout: Maximum seconds to wait (default: 60)
     ///
     /// Raises:
-    ///     TimeoutError: If the container doesn't become healthy in time
-    ///     RuntimeError: If the container fails
+    ///     `TimeoutError`: If the container doesn't become healthy in time
+    ///     `RuntimeError`: If the container fails
     #[pyo3(signature = (timeout=60))]
     fn wait_healthy<'py>(&self, py: Python<'py>, timeout: u64) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
@@ -290,16 +293,13 @@ impl Container {
                         return to_py_result(Ok(()));
                     }
                     ContainerState::Failed { reason } => {
-                        return Err(ZLayerError::Container(format!(
-                            "Container failed: {}",
-                            reason
-                        ))
-                        .into());
+                        return Err(
+                            ZLayerError::Container(format!("Container failed: {reason}")).into(),
+                        );
                     }
                     ContainerState::Exited { code } => {
                         return Err(ZLayerError::Container(format!(
-                            "Container exited with code {}",
-                            code
+                            "Container exited with code {code}"
                         ))
                         .into());
                     }
@@ -323,10 +323,10 @@ impl Container {
     ///     command: The command to execute as a list of strings
     ///
     /// Returns:
-    ///     A tuple of (exit_code, stdout, stderr)
+    ///     A tuple of (`exit_code`, stdout, stderr)
     ///
     /// Raises:
-    ///     RuntimeError: If command execution fails
+    ///     `RuntimeError`: If command execution fails
     fn exec<'py>(&self, py: Python<'py>, command: Vec<String>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -398,7 +398,7 @@ impl Container {
 
     fn __repr__(&self, py: Python<'_>) -> PyResult<String> {
         let id = self.id(py)?;
-        Ok(format!("Container(id='{}')", id))
+        Ok(format!("Container(id='{id}')"))
     }
 }
 
@@ -409,18 +409,19 @@ fn build_spec_yaml(
     env: Option<&HashMap<String, String>>,
     name: Option<&str>,
 ) -> String {
+    use std::fmt::Write;
+
     let service_name = name.unwrap_or("container");
 
     let mut yaml = format!(
-        r#"version: v1
+        r"version: v1
 deployment: python-container
 services:
-  {}:
+  {service_name}:
     rtype: service
     image:
-      name: {}
-"#,
-        service_name, image
+      name: {image}
+"
     );
 
     // Add environment variables
@@ -428,7 +429,7 @@ services:
         if !env_vars.is_empty() {
             yaml.push_str("    env:\n");
             for (key, value) in env_vars {
-                yaml.push_str(&format!("      {}: \"{}\"\n", key, value));
+                let _ = writeln!(yaml, "      {key}: \"{value}\"");
             }
         }
     }
@@ -438,10 +439,10 @@ services:
         if !port_map.is_empty() {
             yaml.push_str("    endpoints:\n");
             for (name, port) in port_map {
-                yaml.push_str(&format!(
-                    "      - name: {}\n        protocol: tcp\n        port: {}\n",
-                    name, port
-                ));
+                let _ = write!(
+                    yaml,
+                    "      - name: {name}\n        protocol: tcp\n        port: {port}\n"
+                );
             }
         }
     }

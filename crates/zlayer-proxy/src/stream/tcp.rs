@@ -20,6 +20,7 @@ pub struct TcpStreamService {
 
 impl TcpStreamService {
     /// Create a new TCP stream service
+    #[must_use]
     pub fn new(registry: Arc<StreamRegistry>, listen_port: u16) -> Self {
         Self {
             registry,
@@ -28,11 +29,13 @@ impl TcpStreamService {
     }
 
     /// Get the listen port
+    #[must_use]
     pub fn port(&self) -> u16 {
         self.listen_port
     }
 
     /// Get a reference to the registry
+    #[must_use]
     pub fn registry(&self) -> &Arc<StreamRegistry> {
         &self.registry
     }
@@ -74,30 +77,24 @@ impl TcpStreamService {
         client_addr: SocketAddr,
     ) {
         // Resolve service for this port
-        let service = match self.registry.resolve_tcp(self.listen_port) {
-            Some(s) => s,
-            None => {
-                tracing::warn!(
-                    port = self.listen_port,
-                    client = %client_addr,
-                    "No service registered for TCP port"
-                );
-                return;
-            }
+        let Some(service) = self.registry.resolve_tcp(self.listen_port) else {
+            tracing::warn!(
+                port = self.listen_port,
+                client = %client_addr,
+                "No service registered for TCP port"
+            );
+            return;
         };
 
         // Select backend using round-robin
-        let backend = match service.select_backend() {
-            Some(b) => b,
-            None => {
-                tracing::warn!(
-                    port = self.listen_port,
-                    service = %service.name,
-                    client = %client_addr,
-                    "No backends available for TCP service"
-                );
-                return;
-            }
+        let Some(backend) = service.select_backend() else {
+            tracing::warn!(
+                port = self.listen_port,
+                service = %service.name,
+                client = %client_addr,
+                "No backends available for TCP service"
+            );
+            return;
         };
 
         tracing::debug!(
@@ -127,7 +124,7 @@ impl TcpStreamService {
         Self::duplex_raw(client_stream, upstream).await;
     }
 
-    /// Bidirectional data copy between two raw TcpStreams.
+    /// Bidirectional data copy between two raw `TcpStreams`.
     ///
     /// Uses `tokio::io::copy_bidirectional` for efficient zero-copy-capable
     /// proxying when the OS supports it (e.g. splice on Linux).

@@ -6,6 +6,7 @@ use zlayer_api::create_token;
 use crate::cli::TokenCommands;
 use crate::util::decode_base64_json;
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn handle_token(action: &TokenCommands) -> Result<()> {
     match action {
         TokenCommands::Create {
@@ -41,18 +42,17 @@ pub(crate) fn handle_token(action: &TokenCommands) -> Result<()> {
                 .context("Failed to create token")?;
 
             if quiet {
-                println!("{}", token);
+                println!("{token}");
             } else {
                 println!("Token created successfully!\n");
-                println!("Subject: {}", subject);
+                println!("Subject: {subject}");
                 println!("Roles: {}", roles.join(", "));
-                println!("Expires in: {} hours", hours);
+                println!("Expires in: {hours} hours");
                 println!("\nToken:");
-                println!("{}", token);
+                println!("{token}");
                 println!("\nUsage:");
                 println!(
-                    "  curl -H 'Authorization: Bearer {}' http://localhost:3669/api/v1/deployments",
-                    token
+                    "  curl -H 'Authorization: Bearer {token}' http://localhost:3669/api/v1/deployments"
                 );
             }
             Ok(())
@@ -82,7 +82,7 @@ pub(crate) fn handle_token(action: &TokenCommands) -> Result<()> {
                 println!("\nToken Claims:");
                 println!("{}", serde_json::to_string_pretty(&claims)?);
 
-                if let Some(exp) = claims.get("exp").and_then(|v| v.as_u64()) {
+                if let Some(exp) = claims.get("exp").and_then(serde_json::Value::as_u64) {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap()
@@ -93,7 +93,7 @@ pub(crate) fn handle_token(action: &TokenCommands) -> Result<()> {
                         let remaining = exp - now;
                         let hours = remaining / 3600;
                         let mins = (remaining % 3600) / 60;
-                        println!("\n[OK] Token expires in {}h {}m", hours, mins);
+                        println!("\n[OK] Token expires in {hours}h {mins}m");
                     }
                 }
             }

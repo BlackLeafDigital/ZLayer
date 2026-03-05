@@ -36,3 +36,6 @@ tempfile = "3.24.0"
 persistent = ["dep:sqlx"]
 s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
 local = []
+
+[lints]
+workspace = true

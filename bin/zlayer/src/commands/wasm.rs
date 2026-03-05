@@ -78,8 +78,7 @@ pub(crate) async fn handle_wasm_build(
         "preview2" | "wasip2" | "p2" => WasiTarget::Preview2,
         _ => {
             anyhow::bail!(
-                "Invalid WASI target '{}'. Valid options: preview1, preview2, wasip1, wasip2, p1, p2",
-                target
+                "Invalid WASI target '{target}'. Valid options: preview1, preview2, wasip1, wasip2, p1, p2"
             );
         }
     };
@@ -99,8 +98,7 @@ pub(crate) async fn handle_wasm_build(
                 "zig" => Some(WasmLanguage::Zig),
                 _ => {
                     anyhow::bail!(
-                        "Unknown language '{}'. Supported: rust, rust-component, go, python, typescript, assemblyscript, c, zig",
-                        lang
+                        "Unknown language '{lang}'. Supported: rust, rust-component, go, python, typescript, assemblyscript, c, zig"
                     );
                 }
             }
@@ -126,9 +124,9 @@ pub(crate) async fn handle_wasm_build(
     }
 
     println!("Building WASM from {}...", context.display());
-    println!("  Target: {}", wasi_target);
+    println!("  Target: {wasi_target}");
     if let Some(lang) = &wasm_language {
-        println!("  Language: {}", lang);
+        println!("  Language: {lang}");
     } else {
         println!("  Language: auto-detect");
     }
@@ -184,7 +182,7 @@ pub(crate) async fn handle_wasm_export(
 
     println!("Exporting WASM as OCI artifact...");
     println!("  Input: {}", wasm_file.display());
-    println!("  Name: {}", name);
+    println!("  Name: {name}");
 
     let result = export_wasm_as_oci(&config)
         .await
@@ -194,7 +192,7 @@ pub(crate) async fn handle_wasm_export(
     let output_dir = output.unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
     // Create OCI layout directory structure
-    let artifact_dir = output_dir.join(format!("{}-oci", module_name));
+    let artifact_dir = output_dir.join(format!("{module_name}-oci"));
     tokio::fs::create_dir_all(&artifact_dir)
         .await
         .context("Failed to create output directory")?;
@@ -310,7 +308,7 @@ pub(crate) async fn handle_wasm_push(
 
     println!("Preparing WASM artifact for push...");
     println!("  Input: {}", wasm_file.display());
-    println!("  Reference: {}", reference);
+    println!("  Reference: {reference}");
 
     let export_result = export_wasm_as_oci(&config)
         .await
@@ -377,7 +375,7 @@ pub(crate) async fn handle_wasm_push(
     println!("  Manifest digest: {}", push_result.manifest_digest);
     println!("  Blobs pushed: {}", push_result.blobs_pushed.len());
     for blob in &push_result.blobs_pushed {
-        println!("    - {}", blob);
+        println!("    - {blob}");
     }
 
     Ok(())
@@ -429,13 +427,14 @@ pub(crate) async fn handle_wasm_validate(wasm_file: &Path) -> Result<()> {
         }
         Err(e) => {
             println!("\nValidation FAILED!");
-            println!("  Error: {}", e);
-            anyhow::bail!("Invalid WASM binary: {}", e);
+            println!("  Error: {e}");
+            anyhow::bail!("Invalid WASM binary: {e}");
         }
     }
 }
 
 /// Show information about a WASM binary
+#[allow(clippy::cast_precision_loss)]
 pub(crate) async fn handle_wasm_info(wasm_file: &Path) -> Result<()> {
     info!(wasm_file = %wasm_file.display(), "Getting WASM info");
 

@@ -1,4 +1,4 @@
-//! ZLayer Reverse Proxy
+//! `ZLayer` Reverse Proxy
 //!
 //! This crate provides a high-performance reverse proxy for routing HTTP/HTTPS
 //! traffic to backend services. It supports:
@@ -87,7 +87,7 @@ fn default_udp_session_timeout() -> Duration {
     stream::DEFAULT_UDP_SESSION_TIMEOUT
 }
 
-/// Configuration for the ZLayer proxy server
+/// Configuration for the `ZLayer` proxy server
 ///
 /// This configuration struct controls the behavior of the proxy,
 /// including listener addresses, ACME/TLS settings, and L4 stream config.
@@ -105,7 +105,7 @@ pub struct ZLayerProxyConfig {
     pub acme_enabled: bool,
     /// Use Let's Encrypt staging environment (for testing)
     pub acme_staging: bool,
-    /// Custom ACME directory URL (for non-LE CAs like ZeroSSL)
+    /// Custom ACME directory URL (for non-LE CAs like `ZeroSSL`)
     pub acme_directory_url: Option<String>,
     /// Domains to auto-provision certificates for on startup
     pub auto_provision_domains: Vec<String>,
@@ -140,6 +140,7 @@ impl ZLayerProxyConfig {
     ///
     /// Returns the custom directory URL if set, otherwise returns the appropriate
     /// Let's Encrypt URL based on whether staging mode is enabled.
+    #[must_use]
     pub fn acme_directory(&self) -> &str {
         match &self.acme_directory_url {
             Some(url) => url.as_str(),
@@ -216,7 +217,7 @@ pub fn discover_certificates(storage_path: &PathBuf) -> Vec<DiscoveredCert> {
             if extension == "crt" {
                 // Extract domain from filename (e.g., "example.com.crt" -> "example.com")
                 if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    let key_path = storage_path.join(format!("{}.key", stem));
+                    let key_path = storage_path.join(format!("{stem}.key"));
 
                     // Check if corresponding key file exists
                     if key_path.exists() {
@@ -256,6 +257,10 @@ pub fn discover_certificates(storage_path: &PathBuf) -> Vec<DiscoveredCert> {
 /// # Returns
 ///
 /// The number of certificates loaded
+///
+/// # Errors
+///
+/// Returns an error if reading certificate files from disk fails.
 pub async fn load_existing_certs_into_resolver(
     cert_manager: &CertManager,
     sni_resolver: &SniCertResolver,
@@ -293,10 +298,7 @@ pub async fn load_existing_certs_into_resolver(
         };
 
         // Load into SNI resolver
-        match sni_resolver
-            .load_cert(&cert_info.domain, &cert_pem, &key_pem)
-            .await
-        {
+        match sni_resolver.load_cert(&cert_info.domain, &cert_pem, &key_pem) {
             Ok(()) => {
                 tracing::info!(
                     domain = %cert_info.domain,

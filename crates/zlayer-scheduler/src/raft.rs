@@ -1,4 +1,4 @@
-//! OpenRaft distributed coordination for ZLayer scheduler
+//! `OpenRaft` distributed coordination for `ZLayer` scheduler
 //!
 //! Provides consensus-based service state management across nodes.
 //! Uses `zlayer-consensus` for storage, network, and Raft RPC plumbing.
@@ -169,13 +169,13 @@ pub struct NodeInfo {
     /// Detected GPUs on this node
     #[serde(default)]
     pub gpus: Vec<GpuInfoSummary>,
-    /// WireGuard public key for overlay networking
+    /// `WireGuard` public key for overlay networking
     #[serde(default)]
     pub wg_public_key: String,
     /// Overlay network IP assigned to this node
     #[serde(default)]
     pub overlay_ip: String,
-    /// WireGuard overlay port
+    /// `WireGuard` overlay port
     #[serde(default)]
     pub overlay_port: u16,
     /// Advertise address (public IP) for this node
@@ -232,11 +232,11 @@ pub struct AddMemberParams {
     pub node_id: u64,
     /// Raft RPC address (e.g., "10.0.0.2:9000")
     pub addr: String,
-    /// WireGuard public key
+    /// `WireGuard` public key
     pub wg_public_key: String,
     /// Assigned overlay IP
     pub overlay_ip: String,
-    /// WireGuard overlay port
+    /// `WireGuard` overlay port
     pub overlay_port: u16,
     /// Public advertise address (IP)
     pub advertise_addr: String,
@@ -254,11 +254,17 @@ pub struct AddMemberParams {
 
 impl ClusterState {
     /// Create a new empty cluster state
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Apply a request to the state machine
+    /// Apply a request to the state machine.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system clock is before the Unix epoch.
+    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, request: &Request) -> Response {
         match request {
             Request::UpdateServiceState {
@@ -310,6 +316,7 @@ impl ClusterState {
                 disk_total,
                 gpus,
             } => {
+                #[allow(clippy::cast_possible_truncation)]
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -357,7 +364,7 @@ impl ClusterState {
             }
             Request::UpdateNodeStatus { node_id, status } => {
                 if let Some(node) = self.nodes.get_mut(node_id) {
-                    node.status = status.clone();
+                    node.status.clone_from(status);
                 }
                 Response::Success { data: None }
             }
@@ -376,11 +383,11 @@ impl ClusterState {
                 node_ids,
             } => {
                 if let Some(svc) = self.services.get_mut(service_name) {
-                    svc.assigned_nodes = node_ids.clone();
+                    svc.assigned_nodes.clone_from(node_ids);
                     Response::Success { data: None }
                 } else {
                     Response::Error {
-                        message: format!("Service not found: {}", service_name),
+                        message: format!("Service not found: {service_name}"),
                     }
                 }
             }
@@ -388,21 +395,25 @@ impl ClusterState {
     }
 
     /// Get service state
+    #[must_use]
     pub fn get_service(&self, name: &str) -> Option<&ServiceState> {
         self.services.get(name)
     }
 
     /// Get all services
+    #[must_use]
     pub fn get_services(&self) -> &HashMap<String, ServiceState> {
         &self.services
     }
 
     /// Get node info
+    #[must_use]
     pub fn get_node(&self, node_id: NodeId) -> Option<&NodeInfo> {
         self.nodes.get(&node_id)
     }
 
     /// Get recent scale events
+    #[must_use]
     pub fn get_scale_events(&self, limit: usize) -> &[ScaleEvent] {
         let start = self.scale_events.len().saturating_sub(limit);
         &self.scale_events[start..]
@@ -412,7 +423,7 @@ impl ClusterState {
 /// Type alias for the configured Raft instance
 pub type ZLayerRaft = Raft<TypeConfig>;
 
-/// The state machine type, parameterized with our ClusterState and apply fn
+/// The state machine type, parameterized with our `ClusterState` and apply fn
 pub type SchedulerStateMachine =
     MemStateMachine<TypeConfig, ClusterState, fn(&mut ClusterState, &Request) -> Response>;
 
@@ -462,7 +473,7 @@ impl Default for RaftConfig {
 /// - Proposing state changes
 /// - Reading cluster state
 pub struct RaftCoordinator {
-    /// ConsensusNode from zlayer-consensus
+    /// `ConsensusNode` from zlayer-consensus
     node: ConsensusNode<TypeConfig>,
     /// Shared state machine data (for reading cluster state)
     sm_data: Arc<RwLock<SmData<TypeConfig, ClusterState>>>,
@@ -472,8 +483,24 @@ pub struct RaftCoordinator {
 }
 
 impl RaftCoordinator {
-    /// Create a new Raft coordinator
+    /// Create a new Raft coordinator without auth.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if the consensus node fails to build.
     pub async fn new(config: RaftConfig) -> Result<Self> {
+        Self::with_auth(config, None).await
+    }
+
+    /// Create a new Raft coordinator with an optional bearer token for RPC auth.
+    ///
+    /// When `auth_token` is `Some`, the HTTP client will attach it to every
+    /// outgoing Raft RPC as an `Authorization: Bearer <token>` header.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if the consensus node fails to build.
+    pub async fn with_auth(config: RaftConfig, auth_token: Option<String>) -> Result<Self> {
         let consensus_config = ConsensusConfig {
             cluster_name: "zlayer".to_string(),
             heartbeat_interval_ms: config.heartbeat_interval_ms,
@@ -490,10 +517,11 @@ impl RaftCoordinator {
         );
         let sm_data = state_machine.data();
 
-        // Create network using zlayer-consensus's HttpNetwork
-        let network = HttpNetwork::<TypeConfig>::with_timeouts(
+        // Create network using zlayer-consensus's HttpNetwork (with optional auth)
+        let network = HttpNetwork::<TypeConfig>::with_timeouts_and_auth(
             Duration::from_millis(config.rpc_timeout_ms),
             Duration::from_secs(60),
+            auth_token,
         );
 
         // Build the consensus node
@@ -512,33 +540,43 @@ impl RaftCoordinator {
         })
     }
 
-    /// Bootstrap a new single-node cluster
+    /// Bootstrap a new single-node cluster.
     ///
     /// This should only be called once when creating a new cluster.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if bootstrapping fails.
     pub async fn bootstrap(&self) -> Result<()> {
         self.node
             .bootstrap()
             .await
-            .map_err(|e| SchedulerError::Raft(format!("Bootstrap failed: {}", e)))?;
+            .map_err(|e| SchedulerError::Raft(format!("Bootstrap failed: {e}")))?;
         Ok(())
     }
 
     /// Check if this node is the current leader
+    #[must_use]
     pub fn is_leader(&self) -> bool {
         self.node.is_leader()
     }
 
     /// Get the current leader's node ID
+    #[must_use]
     pub fn leader_id(&self) -> Option<NodeId> {
         self.node.leader_id()
     }
 
-    /// Propose a state change (must be leader)
+    /// Propose a state change (must be leader).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if the proposal fails.
     pub async fn propose(&self, request: Request) -> Result<Response> {
         self.node
             .propose(request)
             .await
-            .map_err(|e| SchedulerError::Raft(format!("Failed to propose: {}", e)))
+            .map_err(|e| SchedulerError::Raft(format!("Failed to propose: {e}")))
     }
 
     /// Read current cluster state
@@ -553,7 +591,11 @@ impl RaftCoordinator {
         state.services.get(name).cloned()
     }
 
-    /// Update service state (proposes to Raft)
+    /// Update service state (proposes to Raft).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if the proposal fails.
     pub async fn update_service(&self, name: String, state: ServiceState) -> Result<()> {
         self.propose(Request::UpdateServiceState {
             service_name: name,
@@ -563,7 +605,15 @@ impl RaftCoordinator {
         Ok(())
     }
 
-    /// Record a scale event
+    /// Record a scale event.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if the proposal fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system clock is before the Unix epoch.
     pub async fn record_scale_event(
         &self,
         service_name: String,
@@ -571,6 +621,7 @@ impl RaftCoordinator {
         to_replicas: u32,
         reason: String,
     ) -> Result<()> {
+        #[allow(clippy::cast_possible_truncation)]
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -588,6 +639,7 @@ impl RaftCoordinator {
     }
 
     /// Get Raft metrics
+    #[must_use]
     pub fn metrics(&self) -> openraft::RaftMetrics<NodeId, BasicNode> {
         self.node.metrics()
     }
@@ -597,6 +649,11 @@ impl RaftCoordinator {
     /// The caller must be the current leader. This first adds the node as a
     /// **learner** (non-voting) so it can catch up on the log, then promotes
     /// it to a voting member via a membership change.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if adding the voter or proposing
+    /// the node registration fails.
     pub async fn add_member(&self, params: AddMemberParams) -> Result<()> {
         // Use ConsensusNode's add_voter (learner + promote in one call)
         self.node
@@ -632,22 +689,28 @@ impl RaftCoordinator {
     }
 
     /// Get this node's Raft node ID.
+    #[must_use]
     pub fn node_id(&self) -> NodeId {
         self.config.node_id
     }
 
-    /// Shutdown the Raft node
+    /// Shutdown the Raft node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if shutdown fails.
     pub async fn shutdown(&self) -> Result<()> {
         self.node
             .shutdown()
             .await
-            .map_err(|e| SchedulerError::Raft(format!("Shutdown failed: {}", e)))?;
+            .map_err(|e| SchedulerError::Raft(format!("Shutdown failed: {e}")))?;
         Ok(())
     }
 
     /// Get a reference to the underlying Raft instance.
     ///
     /// This is used by the Raft RPC service to forward RPCs to the Raft node.
+    #[must_use]
     pub fn raft_handle(&self) -> &ZLayerRaft {
         self.node.raft()
     }
@@ -655,6 +718,7 @@ impl RaftCoordinator {
     /// Get a clone of the underlying Raft instance (cheap, Arc-based).
     ///
     /// Used to construct the `raft_service_router()` from `zlayer-consensus`.
+    #[must_use]
     pub fn raft_clone(&self) -> ZLayerRaft {
         self.node.raft_clone()
     }

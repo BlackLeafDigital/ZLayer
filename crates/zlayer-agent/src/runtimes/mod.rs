@@ -260,7 +260,7 @@ pub async fn create_runtime_for_image(
         .await
         .map_err(|e| AgentError::PullFailed {
             image: image.to_string(),
-            reason: format!("failed to detect artifact type: {}", e),
+            reason: format!("failed to detect artifact type: {e}"),
         })?;
 
     match artifact_type {
@@ -281,9 +281,8 @@ pub async fn create_runtime_for_image(
             #[cfg(not(feature = "wasm"))]
             {
                 Err(AgentError::Configuration(format!(
-                    "Image '{}' is a WASM artifact (WASI {}) but the 'wasm' feature is not enabled. \
-                     Recompile zlayer-agent with --features wasm to run WASM workloads.",
-                    image, wasi_version
+                    "Image '{image}' is a WASM artifact (WASI {wasi_version}) but the 'wasm' feature is not enabled. \
+                     Recompile zlayer-agent with --features wasm to run WASM workloads."
                 )))
             }
         }
@@ -324,7 +323,7 @@ pub async fn detect_image_artifact_type(
         .await
         .map_err(|e| AgentError::PullFailed {
             image: image.to_string(),
-            reason: format!("failed to detect artifact type: {}", e),
+            reason: format!("failed to detect artifact type: {e}"),
         })?;
 
     Ok(artifact_type)

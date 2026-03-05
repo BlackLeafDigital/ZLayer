@@ -1,4 +1,4 @@
-//! Rate limiting middleware for the ZLayer API
+//! Rate limiting middleware for the `ZLayer` API
 //!
 //! Provides per-IP rate limiting using the governor crate.
 
@@ -29,7 +29,13 @@ pub type GlobalLimiter = RateLimiter<
     governor::middleware::NoOpMiddleware,
 >;
 
-/// Create a global rate limiter
+/// Create a global rate limiter.
+///
+/// # Panics
+///
+/// Panics if the fallback rate limit values cannot be created as `NonZeroU32`
+/// (should never happen since the fallback values are compile-time constants).
+#[must_use]
 pub fn create_global_limiter(config: &RateLimitConfig) -> Arc<GlobalLimiter> {
     let rps = NonZeroU32::new(config.requests_per_second).unwrap_or(NonZeroU32::new(100).unwrap());
     let burst = NonZeroU32::new(config.burst_size).unwrap_or(NonZeroU32::new(50).unwrap());
@@ -47,6 +53,7 @@ pub struct RateLimitState {
 }
 
 impl RateLimitState {
+    #[must_use]
     pub fn new(config: &RateLimitConfig) -> Self {
         Self {
             limiter: create_global_limiter(config),
@@ -54,6 +61,12 @@ impl RateLimitState {
         }
     }
 
+    /// Create a disabled rate limiter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `u32::MAX` cannot be converted to `NonZeroU32` (impossible).
+    #[must_use]
     pub fn disabled() -> Self {
         Self {
             limiter: Arc::new(RateLimiter::direct(Quota::per_second(
@@ -72,14 +85,11 @@ pub async fn rate_limit_middleware(request: Request<Body>, next: Next) -> Respon
     if let Some(state) = state {
         if state.enabled {
             // Check rate limit
-            match state.limiter.check() {
-                Ok(_) => {
-                    // Request allowed
-                }
-                Err(_) => {
-                    warn!("Rate limit exceeded");
-                    return ApiError::RateLimited.into_response();
-                }
+            if let Ok(()) = state.limiter.check() {
+                // Request allowed
+            } else {
+                warn!("Rate limit exceeded");
+                return ApiError::RateLimited.into_response();
             }
         }
     }
@@ -94,6 +104,7 @@ pub struct IpRateLimiter {
 }
 
 impl IpRateLimiter {
+    #[must_use]
     pub fn new(config: RateLimitConfig) -> Self {
         Self {
             limiters: RwLock::new(HashMap::new()),

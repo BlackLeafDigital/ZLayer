@@ -72,6 +72,7 @@ pub struct InstructionState {
 
 impl BuildTui {
     /// Create a new TUI with an event receiver
+    #[must_use]
     pub fn new(event_rx: Receiver<BuildEvent>) -> Self {
         Self {
             event_rx,
@@ -84,6 +85,10 @@ impl BuildTui {
     ///
     /// This will take over the terminal, display the build progress,
     /// and return when the build completes or the user quits (q key).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if terminal setup, rendering, or restoration fails.
     pub fn run(&mut self) -> io::Result<()> {
         let mut terminal = setup_terminal()?;
         let result = self.run_loop(&mut terminal);
@@ -292,11 +297,13 @@ impl BuildTui {
 
 impl BuildState {
     /// Get the total number of instructions across all stages
+    #[must_use]
     pub fn total_instructions(&self) -> usize {
         self.stages.iter().map(|s| s.instructions.len()).sum()
     }
 
     /// Get the number of completed instructions across all stages
+    #[must_use]
     pub fn completed_instructions(&self) -> usize {
         self.stages
             .iter()
@@ -306,12 +313,13 @@ impl BuildState {
     }
 
     /// Get a display string for the current stage
+    #[must_use]
     pub fn current_stage_display(&self) -> String {
         if let Some(stage) = self.stages.get(self.current_stage) {
             let name_part = stage
                 .name
                 .as_ref()
-                .map(|n| format!("{} ", n))
+                .map(|n| format!("{n} "))
                 .unwrap_or_default();
             format!(
                 "Stage {}/{}: {}({})",

@@ -1,4 +1,4 @@
-//! S3 upload/download for SQLite backups
+//! S3 upload/download for `SQLite` backups
 //!
 //! Handles uploading snapshots and WAL segments to S3, and downloading for restore.
 
@@ -40,7 +40,7 @@ impl Default for ReplicationMetadata {
     }
 }
 
-/// S3 backend for SQLite replication
+/// S3 backend for `SQLite` replication
 pub struct S3Backend {
     client: S3Client,
     bucket: String,
@@ -100,11 +100,13 @@ impl S3Backend {
         // Compress the data
         let compressed = self.compress(data)?;
 
+        #[allow(clippy::cast_precision_loss)]
+        let reduction_pct = (1.0 - (compressed.len() as f64 / data.len() as f64)) * 100.0;
         info!(
             "Compressed {} bytes to {} bytes ({:.1}% reduction)",
             data.len(),
             compressed.len(),
-            (1.0 - (compressed.len() as f64 / data.len() as f64)) * 100.0
+            reduction_pct,
         );
 
         // Upload to S3
@@ -161,16 +163,15 @@ impl S3Backend {
         // Get metadata to find latest snapshot
         let metadata = self.get_metadata().await?;
 
-        let snapshot_key = match &metadata.latest_snapshot {
-            Some(key) => key.clone(),
-            None => {
-                // List snapshots to find the latest
-                let snapshots = self.list_snapshots().await?;
-                if snapshots.is_empty() {
-                    return Ok(None);
-                }
-                snapshots.last().unwrap().clone()
+        let snapshot_key = if let Some(key) = &metadata.latest_snapshot {
+            key.clone()
+        } else {
+            // List snapshots to find the latest
+            let snapshots = self.list_snapshots().await?;
+            if snapshots.is_empty() {
+                return Ok(None);
             }
+            snapshots.last().unwrap().clone()
         };
 
         info!("Downloading snapshot: {}", snapshot_key);
@@ -418,6 +419,7 @@ impl S3Backend {
     }
 
     /// Decompress zstd data
+    #[allow(clippy::unused_self)]
     fn decompress(&self, data: &[u8]) -> Result<Vec<u8>> {
         let mut decoder = zstd::stream::Decoder::new(data)?;
         let mut decompressed = Vec::new();

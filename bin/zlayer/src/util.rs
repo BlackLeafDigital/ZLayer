@@ -1,4 +1,4 @@
-//! Shared utility functions for the ZLayer runtime CLI.
+//! Shared utility functions for the `ZLayer` runtime CLI.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -137,7 +137,7 @@ pub(crate) fn parse_duration(s: &str) -> Result<u64> {
         let num: u64 = num_str
             .trim()
             .parse()
-            .with_context(|| format!("Invalid duration number: {}", num_str))?;
+            .with_context(|| format!("Invalid duration number: {num_str}"))?;
         return Ok(num);
     }
 
@@ -145,7 +145,7 @@ pub(crate) fn parse_duration(s: &str) -> Result<u64> {
         let num: u64 = num_str
             .trim()
             .parse()
-            .with_context(|| format!("Invalid duration number: {}", num_str))?;
+            .with_context(|| format!("Invalid duration number: {num_str}"))?;
         return Ok(num * 60);
     }
 
@@ -153,14 +153,11 @@ pub(crate) fn parse_duration(s: &str) -> Result<u64> {
         let num: u64 = num_str
             .trim()
             .parse()
-            .with_context(|| format!("Invalid duration number: {}", num_str))?;
+            .with_context(|| format!("Invalid duration number: {num_str}"))?;
         return Ok(num * 3600);
     }
 
-    anyhow::bail!(
-        "Invalid duration format: {}. Use formats like: 1h, 30m, 3600s",
-        s
-    )
+    anyhow::bail!("Invalid duration format: {s}. Use formats like: 1h, 30m, 3600s")
 }
 
 /// Decode a base64url-encoded JSON string
@@ -174,8 +171,8 @@ pub(crate) fn decode_base64_json(input: &str) -> Result<serde_json::Value> {
         .or_else(|_| {
             // Add padding if needed and try again
             let padded = match input.len() % 4 {
-                2 => format!("{}==", input),
-                3 => format!("{}=", input),
+                2 => format!("{input}=="),
+                3 => format!("{input}="),
                 _ => input.to_string(),
             };
             base64::engine::general_purpose::URL_SAFE.decode(&padded)

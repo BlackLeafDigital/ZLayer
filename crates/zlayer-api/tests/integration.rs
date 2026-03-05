@@ -5,6 +5,7 @@ use axum::{
     body::Body,
     http::{header, Request, StatusCode},
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -19,7 +20,7 @@ use zlayer_api::{
 fn test_config() -> ApiConfig {
     ApiConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
-        jwt_secret: "test-secret-for-integration-tests".to_string(),
+        jwt_secret: SecretString::from("test-secret-for-integration-tests".to_string()),
         swagger_enabled: true,
         ..Default::default()
     }
@@ -27,7 +28,7 @@ fn test_config() -> ApiConfig {
 
 fn create_test_token(config: &ApiConfig) -> String {
     create_token(
-        &config.jwt_secret,
+        config.jwt_secret.expose_secret(),
         "test-user",
         std::time::Duration::from_secs(3600),
         vec!["admin".to_string()],

@@ -42,6 +42,7 @@ fn is_overlay_ip(ip: IpAddr) -> bool {
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, hyper::Error>;
 
 /// Empty body utility
+#[must_use]
 pub fn empty_body() -> BoxBody {
     http_body_util::Empty::<Bytes>::new()
         .map_err(|never| match never {})
@@ -99,29 +100,44 @@ impl ReverseProxyService {
     }
 
     /// Set the remote client address for this request
+    #[must_use]
     pub fn with_remote_addr(mut self, addr: SocketAddr) -> Self {
         self.remote_addr = Some(addr);
         self
     }
 
     /// Mark this connection as being over TLS
+    #[must_use]
     pub fn with_tls(mut self, is_tls: bool) -> Self {
         self.is_tls = is_tls;
         self
     }
 
     /// Set the certificate manager for ACME challenge interception
+    #[must_use]
     pub fn with_cert_manager(mut self, cm: Arc<CertManager>) -> Self {
         self.cert_manager = Some(cm);
         self
     }
 
     /// Check if this connection is over TLS
+    #[must_use]
     pub fn is_tls(&self) -> bool {
         self.is_tls
     }
 
     /// Handle an incoming HTTP request
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if route resolution fails, no healthy backends are
+    /// available, or the backend request fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if building a well-formed HTTP response for an ACME challenge
+    /// or upgrade reply fails (indicates a bug, not a runtime condition).
+    #[allow(clippy::too_many_lines)]
     pub async fn proxy_request(&self, mut req: Request<Incoming>) -> Result<Response<BoxBody>> {
         let start = std::time::Instant::now();
         let method = req.method().clone();
@@ -132,7 +148,7 @@ impl ReverseProxyService {
             .get(header::HOST)
             .and_then(|h| h.to_str().ok())
             .or_else(|| uri.host())
-            .map(|h| h.to_string());
+            .map(std::string::ToString::to_string);
 
         let path = uri.path().to_string();
 
@@ -141,7 +157,7 @@ impl ReverseProxyService {
             if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
                 if !token.is_empty() {
                     if let Some(ref cm) = self.cert_manager {
-                        if let Some(auth) = cm.get_challenge_response(token).await {
+                        if let Some(auth) = cm.get_challenge_response(token) {
                             return Ok(Response::builder()
                                 .status(200)
                                 .header("content-type", "text/plain")
@@ -206,7 +222,7 @@ impl ReverseProxyService {
                 transformed_path,
                 req.uri()
                     .query()
-                    .map(|q| format!("?{}", q))
+                    .map(|q| format!("?{q}"))
                     .unwrap_or_default()
             );
 
@@ -217,7 +233,7 @@ impl ReverseProxyService {
                 .uri(
                     new_uri
                         .parse::<Uri>()
-                        .map_err(|e| ProxyError::InvalidRequest(format!("Invalid URI: {}", e)))?,
+                        .map_err(|e| ProxyError::InvalidRequest(format!("Invalid URI: {e}")))?,
                 )
                 .body(())
                 .unwrap()
@@ -225,7 +241,7 @@ impl ReverseProxyService {
                 .0;
 
             // Copy all original headers first (preserving Host, etc.)
-            for (name, value) in orig_parts.headers.iter() {
+            for (name, value) in &orig_parts.headers {
                 backend_parts.headers.insert(name.clone(), value.clone());
             }
 
@@ -252,7 +268,7 @@ impl ReverseProxyService {
                 .await
                 .map_err(|e| {
                     error!(error = %e, backend = %backend_addr, "Backend upgrade handshake failed");
-                    ProxyError::BackendRequestFailed(format!("Upgrade handshake failed: {}", e))
+                    ProxyError::BackendRequestFailed(format!("Upgrade handshake failed: {e}"))
                 })?;
 
             // Spawn the connection driver
@@ -291,7 +307,7 @@ impl ReverseProxyService {
                 resp_builder = resp_builder.header(header::CONNECTION, "upgrade");
 
                 let client_response = resp_builder.body(empty_body()).map_err(|e| {
-                    ProxyError::Internal(format!("Failed to build 101 response: {}", e))
+                    ProxyError::Internal(format!("Failed to build 101 response: {e}"))
                 })?;
 
                 // Spawn background task to bridge the upgraded connections
@@ -310,33 +326,33 @@ impl ReverseProxyService {
                 }
 
                 return Ok(Response::from_parts(parts, body));
-            } else {
-                // Backend didn't upgrade — stream the response as-is
-                let (mut parts, body) = backend_response.into_parts();
-                let streaming_body: BoxBody = body.map_err(|e: hyper::Error| e).boxed();
-
-                // Add HSTS header for TLS connections
-                if self.is_tls && self.config.headers.hsts {
-                    let value = if self.config.headers.hsts_subdomains {
-                        format!(
-                            "max-age={}; includeSubDomains",
-                            self.config.headers.hsts_max_age
-                        )
-                    } else {
-                        format!("max-age={}", self.config.headers.hsts_max_age)
-                    };
-                    if let Ok(hv) = value.parse() {
-                        parts.headers.insert("strict-transport-security", hv);
-                    }
-                }
-
-                // Add Server-Timing header
-                if let Ok(hv) = format!("proxy;dur={}", start.elapsed().as_millis()).parse() {
-                    parts.headers.insert("server-timing", hv);
-                }
-
-                return Ok(Response::from_parts(parts, streaming_body));
             }
+
+            // Backend didn't upgrade — stream the response as-is
+            let (mut parts, body) = backend_response.into_parts();
+            let streaming_body: BoxBody = body.map_err(|e: hyper::Error| e).boxed();
+
+            // Add HSTS header for TLS connections
+            if self.is_tls && self.config.headers.hsts {
+                let value = if self.config.headers.hsts_subdomains {
+                    format!(
+                        "max-age={}; includeSubDomains",
+                        self.config.headers.hsts_max_age
+                    )
+                } else {
+                    format!("max-age={}", self.config.headers.hsts_max_age)
+                };
+                if let Ok(hv) = value.parse() {
+                    parts.headers.insert("strict-transport-security", hv);
+                }
+            }
+
+            // Add Server-Timing header
+            if let Ok(hv) = format!("proxy;dur={}", start.elapsed().as_millis()).parse() {
+                parts.headers.insert("server-timing", hv);
+            }
+
+            return Ok(Response::from_parts(parts, streaming_body));
         }
 
         debug!(method = %method, host = ?host, path = %path, "Routing request");
@@ -393,9 +409,7 @@ impl ReverseProxyService {
         );
 
         // Build forwarded request
-        let forwarded_req = self
-            .build_forwarded_request(req, &backend_addr, &resolved)
-            .await?;
+        let forwarded_req = self.build_forwarded_request(req, &backend_addr, &resolved)?;
 
         // Forward to backend
         let response = self.client.request(forwarded_req).await.map_err(|e| {
@@ -429,7 +443,7 @@ impl ReverseProxyService {
         Ok(Response::from_parts(parts, streaming_body))
     }
 
-    async fn build_forwarded_request(
+    fn build_forwarded_request(
         &self,
         req: Request<Incoming>,
         backend: &SocketAddr,
@@ -450,13 +464,13 @@ impl ReverseProxyService {
             parts
                 .uri
                 .query()
-                .map(|q| format!("?{}", q))
+                .map(|q| format!("?{q}"))
                 .unwrap_or_default()
         );
 
         parts.uri = new_uri
             .parse::<Uri>()
-            .map_err(|e| ProxyError::InvalidRequest(format!("Invalid URI: {}", e)))?;
+            .map_err(|e| ProxyError::InvalidRequest(format!("Invalid URI: {e}")))?;
 
         // Add forwarding headers
         self.add_forwarding_headers(&mut parts);
@@ -480,8 +494,10 @@ impl ReverseProxyService {
                     .headers
                     .get("x-forwarded-for")
                     .and_then(|h| h.to_str().ok())
-                    .map(|s| format!("{}, {}", s, addr.ip()))
-                    .unwrap_or_else(|| addr.ip().to_string());
+                    .map_or_else(
+                        || addr.ip().to_string(),
+                        |s| format!("{}, {}", s, addr.ip()),
+                    );
 
                 if let Ok(value) = existing.parse() {
                     parts.headers.insert("x-forwarded-for", value);
@@ -522,7 +538,6 @@ impl ReverseProxyService {
             let proto_version = match parts.version {
                 Version::HTTP_09 => "0.9",
                 Version::HTTP_10 => "1.0",
-                Version::HTTP_11 => "1.1",
                 Version::HTTP_2 => "2.0",
                 Version::HTTP_3 => "3.0",
                 _ => "1.1",
@@ -533,7 +548,7 @@ impl ReverseProxyService {
                 .headers
                 .get(header::VIA)
                 .and_then(|h| h.to_str().ok())
-                .map(|s| format!("{}, {}", s, via_value))
+                .map(|s| format!("{s}, {via_value}"))
                 .unwrap_or(via_value);
 
             if let Ok(value) = existing.parse() {
@@ -543,14 +558,6 @@ impl ReverseProxyService {
     }
 
     fn remove_hop_by_hop_headers(parts: &mut http::request::Parts) {
-        // First, collect headers listed in the Connection header before we remove it
-        let connection_headers: Vec<String> = parts
-            .headers
-            .get(header::CONNECTION)
-            .and_then(|h| h.to_str().ok())
-            .map(|value| value.split(',').map(|s| s.trim().to_lowercase()).collect())
-            .unwrap_or_default();
-
         // Standard hop-by-hop headers that should not be forwarded
         const HOP_BY_HOP: &[&str] = &[
             "connection",
@@ -563,6 +570,14 @@ impl ReverseProxyService {
             "upgrade",
         ];
 
+        // First, collect headers listed in the Connection header before we remove it
+        let connection_headers: Vec<String> = parts
+            .headers
+            .get(header::CONNECTION)
+            .and_then(|h| h.to_str().ok())
+            .map(|value| value.split(',').map(|s| s.trim().to_lowercase()).collect())
+            .unwrap_or_default();
+
         for header_name in HOP_BY_HOP {
             parts.headers.remove(*header_name);
         }
@@ -574,9 +589,14 @@ impl ReverseProxyService {
     }
 
     /// Create an error response
+    ///
+    /// # Panics
+    ///
+    /// Panics if building a valid HTTP response with a JSON body fails,
+    /// which should never occur with well-formed status codes.
     pub fn error_response(error: &ProxyError) -> Response<BoxBody> {
         let status = error.status_code();
-        let body = format!("{{\"error\": \"{}\"}}", error);
+        let body = format!("{{\"error\": \"{error}\"}}");
 
         Response::builder()
             .status(status)

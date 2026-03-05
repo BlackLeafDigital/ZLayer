@@ -53,6 +53,7 @@ pub struct BuildahCommand {
 
 impl BuildahCommand {
     /// Create a new buildah command
+    #[must_use]
     pub fn new(subcommand: &str) -> Self {
         Self {
             program: "buildah".to_string(),
@@ -62,18 +63,21 @@ impl BuildahCommand {
     }
 
     /// Add an argument
+    #[must_use]
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
         self
     }
 
     /// Add multiple arguments
+    #[must_use]
     pub fn args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.args.extend(args.into_iter().map(Into::into));
         self
     }
 
     /// Add an optional argument (only added if value is Some)
+    #[must_use]
     pub fn arg_opt(self, flag: &str, value: Option<impl Into<String>>) -> Self {
         if let Some(v) = value {
             self.arg(flag).arg(v)
@@ -83,12 +87,14 @@ impl BuildahCommand {
     }
 
     /// Add an environment variable for command execution
+    #[must_use]
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(key.into(), value.into());
         self
     }
 
     /// Convert to a command line string for display/logging
+    #[must_use]
     pub fn to_command_string(&self) -> String {
         let mut parts = vec![self.program.clone()];
         parts.extend(self.args.iter().map(|a| {
@@ -108,6 +114,7 @@ impl BuildahCommand {
     /// Create a new working container from an image
     ///
     /// `buildah from <image>`
+    #[must_use]
     pub fn from_image(image: &str) -> Self {
         Self::new("from").arg(image)
     }
@@ -115,6 +122,7 @@ impl BuildahCommand {
     /// Create a new working container from an image with a specific name
     ///
     /// `buildah from --name <name> <image>`
+    #[must_use]
     pub fn from_image_named(image: &str, name: &str) -> Self {
         Self::new("from").arg("--name").arg(name).arg(image)
     }
@@ -122,6 +130,7 @@ impl BuildahCommand {
     /// Create a scratch container
     ///
     /// `buildah from scratch`
+    #[must_use]
     pub fn from_scratch() -> Self {
         Self::new("from").arg("scratch")
     }
@@ -129,6 +138,7 @@ impl BuildahCommand {
     /// Remove a working container
     ///
     /// `buildah rm <container>`
+    #[must_use]
     pub fn rm(container: &str) -> Self {
         Self::new("rm").arg(container)
     }
@@ -136,11 +146,13 @@ impl BuildahCommand {
     /// Commit a container to create an image
     ///
     /// `buildah commit <container> <image>`
+    #[must_use]
     pub fn commit(container: &str, image_name: &str) -> Self {
         Self::new("commit").arg(container).arg(image_name)
     }
 
     /// Commit with additional options
+    #[must_use]
     pub fn commit_with_opts(
         container: &str,
         image_name: &str,
@@ -163,6 +175,7 @@ impl BuildahCommand {
     /// Tag an image with a new name
     ///
     /// `buildah tag <image> <new-name>`
+    #[must_use]
     pub fn tag(image: &str, new_name: &str) -> Self {
         Self::new("tag").arg(image).arg(new_name)
     }
@@ -170,6 +183,7 @@ impl BuildahCommand {
     /// Remove an image
     ///
     /// `buildah rmi <image>`
+    #[must_use]
     pub fn rmi(image: &str) -> Self {
         Self::new("rmi").arg(image)
     }
@@ -177,6 +191,7 @@ impl BuildahCommand {
     /// Push an image to a registry
     ///
     /// `buildah push <image>`
+    #[must_use]
     pub fn push(image: &str) -> Self {
         Self::new("push").arg(image)
     }
@@ -184,6 +199,7 @@ impl BuildahCommand {
     /// Push an image to a registry with options
     ///
     /// `buildah push [options] <image> [destination]`
+    #[must_use]
     pub fn push_to(image: &str, destination: &str) -> Self {
         Self::new("push").arg(image).arg(destination)
     }
@@ -191,6 +207,7 @@ impl BuildahCommand {
     /// Inspect an image or container
     ///
     /// `buildah inspect <name>`
+    #[must_use]
     pub fn inspect(name: &str) -> Self {
         Self::new("inspect").arg(name)
     }
@@ -198,6 +215,7 @@ impl BuildahCommand {
     /// Inspect an image or container with format
     ///
     /// `buildah inspect --format <format> <name>`
+    #[must_use]
     pub fn inspect_format(name: &str, format: &str) -> Self {
         Self::new("inspect").arg("--format").arg(format).arg(name)
     }
@@ -205,6 +223,7 @@ impl BuildahCommand {
     /// List images
     ///
     /// `buildah images`
+    #[must_use]
     pub fn images() -> Self {
         Self::new("images")
     }
@@ -212,6 +231,7 @@ impl BuildahCommand {
     /// List containers
     ///
     /// `buildah containers`
+    #[must_use]
     pub fn containers() -> Self {
         Self::new("containers")
     }
@@ -223,6 +243,7 @@ impl BuildahCommand {
     /// Run a command in the container (shell form)
     ///
     /// `buildah run <container> -- /bin/sh -c "<command>"`
+    #[must_use]
     pub fn run_shell(container: &str, command: &str) -> Self {
         Self::new("run")
             .arg(container)
@@ -235,6 +256,7 @@ impl BuildahCommand {
     /// Run a command in the container (exec form)
     ///
     /// `buildah run <container> -- <args...>`
+    #[must_use]
     pub fn run_exec(container: &str, args: &[String]) -> Self {
         let mut cmd = Self::new("run").arg(container).arg("--");
         for arg in args {
@@ -243,7 +265,8 @@ impl BuildahCommand {
         cmd
     }
 
-    /// Run a command based on ShellOrExec
+    /// Run a command based on `ShellOrExec`
+    #[must_use]
     pub fn run(container: &str, command: &ShellOrExec) -> Self {
         match command {
             ShellOrExec::Shell(s) => Self::run_shell(container, s),
@@ -251,12 +274,13 @@ impl BuildahCommand {
         }
     }
 
-    /// Run a command with mount specifications from a RunInstruction.
+    /// Run a command with mount specifications from a `RunInstruction`.
     ///
     /// Buildah requires `--mount` arguments to appear BEFORE the container ID:
     /// `buildah run [--mount=...] <container> -- <command>`
     ///
     /// This method properly orders the arguments to ensure mounts are applied.
+    #[must_use]
     pub fn run_with_mounts(container: &str, run: &RunInstruction) -> Self {
         let mut cmd = Self::new("run");
 
@@ -286,6 +310,7 @@ impl BuildahCommand {
     /// Copy files into the container
     ///
     /// `buildah copy <container> <src...> <dest>`
+    #[must_use]
     pub fn copy(container: &str, sources: &[String], dest: &str) -> Self {
         let mut cmd = Self::new("copy").arg(container);
         for src in sources {
@@ -297,6 +322,7 @@ impl BuildahCommand {
     /// Copy files from another container/image
     ///
     /// `buildah copy --from=<source> <container> <src...> <dest>`
+    #[must_use]
     pub fn copy_from(container: &str, from: &str, sources: &[String], dest: &str) -> Self {
         let mut cmd = Self::new("copy").arg("--from").arg(from).arg(container);
         for src in sources {
@@ -305,7 +331,8 @@ impl BuildahCommand {
         cmd.arg(dest)
     }
 
-    /// Copy with all options from CopyInstruction
+    /// Copy with all options from `CopyInstruction`
+    #[must_use]
     pub fn copy_instruction(container: &str, copy: &CopyInstruction) -> Self {
         let mut cmd = Self::new("copy");
 
@@ -331,6 +358,7 @@ impl BuildahCommand {
     }
 
     /// Add files (like copy but with URL support and extraction)
+    #[must_use]
     pub fn add(container: &str, sources: &[String], dest: &str) -> Self {
         let mut cmd = Self::new("add").arg(container);
         for src in sources {
@@ -339,7 +367,8 @@ impl BuildahCommand {
         cmd.arg(dest)
     }
 
-    /// Add with all options from AddInstruction
+    /// Add with all options from `AddInstruction`
+    #[must_use]
     pub fn add_instruction(container: &str, add: &AddInstruction) -> Self {
         let mut cmd = Self::new("add");
 
@@ -367,14 +396,16 @@ impl BuildahCommand {
     /// Set an environment variable
     ///
     /// `buildah config --env KEY=VALUE <container>`
+    #[must_use]
     pub fn config_env(container: &str, key: &str, value: &str) -> Self {
         Self::new("config")
             .arg("--env")
-            .arg(format!("{}={}", key, value))
+            .arg(format!("{key}={value}"))
             .arg(container)
     }
 
     /// Set multiple environment variables
+    #[must_use]
     pub fn config_envs(container: &str, env: &EnvInstruction) -> Vec<Self> {
         env.vars
             .iter()
@@ -385,6 +416,7 @@ impl BuildahCommand {
     /// Set the working directory
     ///
     /// `buildah config --workingdir <dir> <container>`
+    #[must_use]
     pub fn config_workdir(container: &str, dir: &str) -> Self {
         Self::new("config")
             .arg("--workingdir")
@@ -395,6 +427,7 @@ impl BuildahCommand {
     /// Expose a port
     ///
     /// `buildah config --port <port>/<proto> <container>`
+    #[must_use]
     pub fn config_expose(container: &str, expose: &ExposeInstruction) -> Self {
         let port_spec = format!(
             "{}/{}",
@@ -413,6 +446,7 @@ impl BuildahCommand {
     /// Set the entrypoint (shell form)
     ///
     /// `buildah config --entrypoint '<command>' <container>`
+    #[must_use]
     pub fn config_entrypoint_shell(container: &str, command: &str) -> Self {
         Self::new("config")
             .arg("--entrypoint")
@@ -426,6 +460,7 @@ impl BuildahCommand {
     /// Set the entrypoint (exec form)
     ///
     /// `buildah config --entrypoint '["exe", "arg1"]' <container>`
+    #[must_use]
     pub fn config_entrypoint_exec(container: &str, args: &[String]) -> Self {
         let json_array = format!(
             "[{}]",
@@ -440,7 +475,8 @@ impl BuildahCommand {
             .arg(container)
     }
 
-    /// Set the entrypoint based on ShellOrExec
+    /// Set the entrypoint based on `ShellOrExec`
+    #[must_use]
     pub fn config_entrypoint(container: &str, command: &ShellOrExec) -> Self {
         match command {
             ShellOrExec::Shell(s) => Self::config_entrypoint_shell(container, s),
@@ -449,6 +485,7 @@ impl BuildahCommand {
     }
 
     /// Set the default command (shell form)
+    #[must_use]
     pub fn config_cmd_shell(container: &str, command: &str) -> Self {
         Self::new("config")
             .arg("--cmd")
@@ -457,6 +494,7 @@ impl BuildahCommand {
     }
 
     /// Set the default command (exec form)
+    #[must_use]
     pub fn config_cmd_exec(container: &str, args: &[String]) -> Self {
         let json_array = format!(
             "[{}]",
@@ -471,7 +509,8 @@ impl BuildahCommand {
             .arg(container)
     }
 
-    /// Set the default command based on ShellOrExec
+    /// Set the default command based on `ShellOrExec`
+    #[must_use]
     pub fn config_cmd(container: &str, command: &ShellOrExec) -> Self {
         match command {
             ShellOrExec::Shell(s) => Self::config_cmd_shell(container, s),
@@ -482,6 +521,7 @@ impl BuildahCommand {
     /// Set the user
     ///
     /// `buildah config --user <user> <container>`
+    #[must_use]
     pub fn config_user(container: &str, user: &str) -> Self {
         Self::new("config").arg("--user").arg(user).arg(container)
     }
@@ -489,14 +529,16 @@ impl BuildahCommand {
     /// Set a label
     ///
     /// `buildah config --label KEY=VALUE <container>`
+    #[must_use]
     pub fn config_label(container: &str, key: &str, value: &str) -> Self {
         Self::new("config")
             .arg("--label")
-            .arg(format!("{}={}", key, value))
+            .arg(format!("{key}={value}"))
             .arg(container)
     }
 
     /// Set multiple labels
+    #[must_use]
     pub fn config_labels(container: &str, labels: &HashMap<String, String>) -> Vec<Self> {
         labels
             .iter()
@@ -507,6 +549,7 @@ impl BuildahCommand {
     /// Set volumes
     ///
     /// `buildah config --volume <path> <container>`
+    #[must_use]
     pub fn config_volume(container: &str, path: &str) -> Self {
         Self::new("config").arg("--volume").arg(path).arg(container)
     }
@@ -514,6 +557,7 @@ impl BuildahCommand {
     /// Set the stop signal
     ///
     /// `buildah config --stop-signal <signal> <container>`
+    #[must_use]
     pub fn config_stopsignal(container: &str, signal: &str) -> Self {
         Self::new("config")
             .arg("--stop-signal")
@@ -524,6 +568,7 @@ impl BuildahCommand {
     /// Set the shell
     ///
     /// `buildah config --shell '["shell", "args"]' <container>`
+    #[must_use]
     pub fn config_shell(container: &str, shell: &[String]) -> Self {
         let json_array = format!(
             "[{}]",
@@ -540,6 +585,7 @@ impl BuildahCommand {
     }
 
     /// Set healthcheck
+    #[must_use]
     pub fn config_healthcheck(container: &str, healthcheck: &HealthcheckInstruction) -> Self {
         match healthcheck {
             HealthcheckInstruction::None => Self::new("config")
@@ -557,7 +603,7 @@ impl BuildahCommand {
                 let mut cmd = Self::new("config");
 
                 let cmd_str = match command {
-                    ShellOrExec::Shell(s) => format!("CMD {}", s),
+                    ShellOrExec::Shell(s) => format!("CMD {s}"),
                     ShellOrExec::Exec(args) => {
                         format!(
                             "CMD [{}]",

@@ -27,6 +27,13 @@ impl LogGuard {
 ///
 /// Returns a guard that must be held for the lifetime of the application
 /// to ensure logs are flushed properly.
+///
+/// # Errors
+/// Returns an error if file logging is configured but the log directory cannot be created.
+///
+/// # Panics
+/// Panics if the environment filter directives are malformed (only when `RUST_LOG` is set).
+#[allow(clippy::too_many_lines)]
 pub fn init_logging(config: &LoggingConfig) -> Result<LogGuard> {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if let Some(ref directives) = config.filter_directives {
@@ -177,6 +184,7 @@ fn level_to_string(level: crate::config::LogLevel) -> String {
     .to_string()
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn create_file_writer(
     config: &FileLoggingConfig,
 ) -> Result<(tracing_appender::non_blocking::NonBlocking, WorkerGuard)> {

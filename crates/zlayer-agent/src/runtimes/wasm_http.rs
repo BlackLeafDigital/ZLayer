@@ -148,6 +148,7 @@ impl HttpRequest {
     }
 
     /// Add a header to the request
+    #[must_use]
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
         self
@@ -167,6 +168,7 @@ pub struct HttpResponse {
 
 impl HttpResponse {
     /// Create a new response with the given status
+    #[must_use]
     pub fn new(status: u16) -> Self {
         Self {
             status,
@@ -176,16 +178,19 @@ impl HttpResponse {
     }
 
     /// Create a 200 OK response
+    #[must_use]
     pub fn ok() -> Self {
         Self::new(200)
     }
 
     /// Create a 201 Created response
+    #[must_use]
     pub fn created() -> Self {
         Self::new(201)
     }
 
     /// Create a 204 No Content response
+    #[must_use]
     pub fn no_content() -> Self {
         Self::new(204)
     }
@@ -201,16 +206,19 @@ impl HttpResponse {
     }
 
     /// Create a 401 Unauthorized response
+    #[must_use]
     pub fn unauthorized() -> Self {
         Self::new(401)
     }
 
     /// Create a 403 Forbidden response
+    #[must_use]
     pub fn forbidden() -> Self {
         Self::new(403)
     }
 
     /// Create a 404 Not Found response
+    #[must_use]
     pub fn not_found() -> Self {
         Self::new(404)
     }
@@ -226,12 +234,14 @@ impl HttpResponse {
     }
 
     /// Add a header to the response
+    #[must_use]
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
         self
     }
 
     /// Set the response body
+    #[must_use]
     pub fn with_body(mut self, body: Vec<u8>) -> Self {
         self.body = Some(body);
         self
@@ -546,6 +556,10 @@ impl WasmHttpRuntime {
     /// # Returns
     ///
     /// A new `WasmHttpRuntime` or an error if the engine could not be created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the wasmtime engine cannot be created.
     pub fn new(config: WasmHttpConfig) -> Result<Self, WasmHttpError> {
         let mut engine_config = Config::new();
         engine_config.async_support(true);
@@ -560,12 +574,11 @@ impl WasmHttpRuntime {
 
         // Add WASI bindings
         wasmtime_wasi::p2::add_to_linker_async(&mut linker)
-            .map_err(|e| WasmHttpError::EngineCreation(format!("failed to add WASI: {}", e)))?;
+            .map_err(|e| WasmHttpError::EngineCreation(format!("failed to add WASI: {e}")))?;
 
         // Add WASI HTTP bindings
-        wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker).map_err(|e| {
-            WasmHttpError::EngineCreation(format!("failed to add WASI HTTP: {}", e))
-        })?;
+        wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
+            .map_err(|e| WasmHttpError::EngineCreation(format!("failed to add WASI HTTP: {e}")))?;
 
         info!("WASM HTTP runtime initialized");
 
@@ -595,6 +608,10 @@ impl WasmHttpRuntime {
     /// # Returns
     ///
     /// The HTTP response from the component or an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the component cannot be loaded, instantiated, or the request fails.
     #[instrument(skip(self, wasm_bytes, request), fields(component = %component_ref, method = %request.method, uri = %request.uri))]
     pub async fn handle_request(
         &self,
@@ -642,6 +659,11 @@ impl WasmHttpRuntime {
     /// * `component_ref` - A unique identifier for the component
     /// * `wasm_bytes` - The raw WASM component bytes
     /// * `_count` - Ignored (kept for API compatibility)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the component cannot be compiled.
+    #[allow(clippy::used_underscore_binding)]
     #[instrument(skip(self, wasm_bytes), fields(component = %component_ref))]
     pub async fn prewarm(
         &self,
@@ -736,7 +758,7 @@ impl WasmHttpRuntime {
             })
         })
         .await
-        .map_err(|e| WasmHttpError::Internal(format!("task join error: {}", e)))??;
+        .map_err(|e| WasmHttpError::Internal(format!("task join error: {e}")))??;
 
         // Cache the compiled component
         {
@@ -779,12 +801,12 @@ impl WasmHttpRuntime {
                     .instantiate_pre(component)
                     .map_err(|e| WasmHttpError::Instantiation {
                         component: component_ref_owned.clone(),
-                        reason: format!("failed to create instance pre: {}", e),
+                        reason: format!("failed to create instance pre: {e}"),
                     })?;
 
             ProxyPre::new(instance_pre).map_err(|e| WasmHttpError::Instantiation {
                 component: component_ref_owned,
-                reason: format!("failed to create proxy pre: {}", e),
+                reason: format!("failed to create proxy pre: {e}"),
             })?
         };
 
@@ -799,7 +821,7 @@ impl WasmHttpRuntime {
         let proxy = proxy_pre.instantiate_async(&mut store).await.map_err(|e| {
             WasmHttpError::Instantiation {
                 component: component_ref.to_string(),
-                reason: format!("failed to instantiate proxy: {}", e),
+                reason: format!("failed to instantiate proxy: {e}"),
             }
         })?;
 
@@ -831,7 +853,7 @@ impl WasmHttpRuntime {
     ///
     /// This method implements the full `wasi:http/incoming-handler` protocol:
     /// 1. Convert the `HttpRequest` to a hyper request
-    /// 2. Create WASI HTTP resources (IncomingRequest and ResponseOutparam)
+    /// 2. Create WASI HTTP resources (`IncomingRequest` and `ResponseOutparam`)
     /// 3. Call the guest's `handle` export
     /// 4. Receive the response via the oneshot channel
     /// 5. Convert the response back to `HttpResponse`
@@ -855,7 +877,7 @@ impl WasmHttpRuntime {
         let hyper_request = self.convert_to_hyper_request(&request).map_err(|e| {
             WasmHttpError::HandlerInvocation {
                 component: component_ref.to_string(),
-                reason: format!("failed to convert request: {}", e),
+                reason: format!("failed to convert request: {e}"),
             }
         })?;
 
@@ -869,7 +891,7 @@ impl WasmHttpRuntime {
             .new_incoming_request(Scheme::Http, hyper_request)
             .map_err(|e| WasmHttpError::HandlerInvocation {
                 component: component_ref.to_string(),
-                reason: format!("failed to create incoming request resource: {}", e),
+                reason: format!("failed to create incoming request resource: {e}"),
             })?;
 
         let response_outparam = instance
@@ -878,7 +900,7 @@ impl WasmHttpRuntime {
             .new_response_outparam(response_sender)
             .map_err(|e| WasmHttpError::HandlerInvocation {
                 component: component_ref.to_string(),
-                reason: format!("failed to create response outparam resource: {}", e),
+                reason: format!("failed to create response outparam resource: {e}"),
             })?;
 
         // Step 4: Get the incoming handler and call it
@@ -907,7 +929,7 @@ impl WasmHttpRuntime {
                 // Guest returned an error code via response-outparam.set
                 return Err(WasmHttpError::HandlerInvocation {
                     component: component_ref.to_string(),
-                    reason: format!("guest returned error: {:?}", error_code),
+                    reason: format!("guest returned error: {error_code:?}"),
                 });
             }
             Err(_) => {
@@ -926,19 +948,20 @@ impl WasmHttpRuntime {
             .await
             .map_err(|e| WasmHttpError::HandlerInvocation {
                 component: component_ref.to_string(),
-                reason: format!("failed to convert response: {}", e),
+                reason: format!("failed to convert response: {e}"),
             })?;
 
         debug!(
             "Handler completed successfully: status={}, body_len={}",
             response.status,
-            response.body.as_ref().map(|b| b.len()).unwrap_or(0)
+            response.body.as_ref().map_or(0, std::vec::Vec::len)
         );
 
         Ok(response)
     }
 
     /// Convert an `HttpRequest` to a `hyper::Request` with a body type compatible with WASI HTTP
+    #[allow(clippy::unused_self)]
     fn convert_to_hyper_request(
         &self,
         request: &HttpRequest,
@@ -1025,7 +1048,7 @@ impl WasmHttpRuntime {
         let body_bytes = body
             .collect()
             .await
-            .map_err(|e| anyhow::anyhow!("failed to collect response body: {}", e))?
+            .map_err(|e| anyhow::anyhow!("failed to collect response body: {e}"))?
             .to_bytes();
 
         let body = if body_bytes.is_empty() {

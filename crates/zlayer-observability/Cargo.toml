@@ -50,3 +50,6 @@ config.workspace = true
 
 # HTTP types for propagation
 http = "1"
+
+[lints]
+workspace = true

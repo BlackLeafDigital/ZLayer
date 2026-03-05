@@ -2,7 +2,7 @@
 //!
 //! This module provides the `ProxyManager` struct that integrates the proxy crate
 //! with the agent's service management. It handles:
-//! - Managing proxy routes based on ServiceSpec endpoints (HTTP/HTTPS/WebSocket)
+//! - Managing proxy routes based on `ServiceSpec` endpoints (HTTP/HTTPS/WebSocket)
 //! - Managing L4 stream proxy listeners (TCP/UDP)
 //! - Tracking and updating backend servers for load balancing
 //! - Coordinating proxy server lifecycle
@@ -22,7 +22,7 @@ use zlayer_proxy::{
 };
 use zlayer_spec::{ExposeType, Protocol, ServiceSpec};
 
-/// Configuration for the ProxyManager
+/// Configuration for the `ProxyManager`
 #[derive(Debug, Clone)]
 pub struct ProxyManagerConfig {
     /// HTTP bind address
@@ -45,6 +45,7 @@ impl Default for ProxyManagerConfig {
 
 impl ProxyManagerConfig {
     /// Create a new configuration with the specified HTTP address
+    #[must_use]
     pub fn new(http_addr: SocketAddr) -> Self {
         Self {
             http_addr,
@@ -54,12 +55,14 @@ impl ProxyManagerConfig {
     }
 
     /// Set the HTTPS address
+    #[must_use]
     pub fn with_https(mut self, addr: SocketAddr) -> Self {
         self.https_addr = Some(addr);
         self
     }
 
     /// Set HTTP/2 support
+    #[must_use]
     pub fn with_http2(mut self, enabled: bool) -> Self {
         self.http2_enabled = enabled;
         self
@@ -113,7 +116,7 @@ pub struct ProxyManager {
 }
 
 impl ProxyManager {
-    /// Create a new ProxyManager with the given configuration, service registry,
+    /// Create a new `ProxyManager` with the given configuration, service registry,
     /// and optional certificate manager.
     pub fn new(
         config: ProxyManagerConfig,
@@ -121,14 +124,6 @@ impl ProxyManager {
         cert_manager: Option<Arc<CertManager>>,
     ) -> Self {
         let load_balancer = Arc::new(LoadBalancer::new());
-
-        // Spawn the load balancer's background health checker
-        let lb_clone = load_balancer.clone();
-        tokio::spawn(async move {
-            let handle =
-                lb_clone.spawn_health_checker(Duration::from_secs(5), Duration::from_secs(2));
-            handle.await.ok();
-        });
 
         Self {
             config,
@@ -170,6 +165,7 @@ impl ProxyManager {
     }
 
     /// Builder pattern: add stream registry for L4 proxy integration
+    #[must_use]
     pub fn with_stream_registry(mut self, registry: Arc<StreamRegistry>) -> Self {
         self.stream_registry = Some(registry);
         self
@@ -183,7 +179,10 @@ impl ProxyManager {
     /// Start listening on a specific port bound to the given address.
     ///
     /// If already listening on this port, skip.
-    /// All port listeners share the same ServiceRegistry for request matching.
+    /// All port listeners share the same `ServiceRegistry` for request matching.
+    ///
+    /// # Errors
+    /// Returns an error if the proxy server cannot be started.
     pub async fn listen_on(&self, port: u16, bind_ip: IpAddr) -> Result<()> {
         let mut servers = self.servers.write().await;
 
@@ -217,10 +216,13 @@ impl ProxyManager {
         Ok(())
     }
 
-    /// Start an HTTPS listener on the given port using SniCertResolver for dynamic cert selection.
+    /// Start an HTTPS listener on the given port using `SniCertResolver` for dynamic cert selection.
     ///
     /// If already listening on this port, skip.
     /// Requires a `CertManager` to be configured; logs a warning and returns `Ok(())` if not.
+    ///
+    /// # Errors
+    /// Returns an error if the HTTPS proxy server cannot be started.
     pub async fn listen_on_tls(&self, port: u16, bind_ip: IpAddr) -> Result<()> {
         let mut servers = self.servers.write().await;
 
@@ -229,15 +231,12 @@ impl ProxyManager {
             return Ok(());
         }
 
-        let cert_manager = match &self.cert_manager {
-            Some(cm) => cm,
-            None => {
-                warn!(
-                    port = port,
-                    "Cannot start TLS listener: no CertManager configured"
-                );
-                return Ok(());
-            }
+        let Some(cert_manager) = &self.cert_manager else {
+            warn!(
+                port = port,
+                "Cannot start TLS listener: no CertManager configured"
+            );
+            return Ok(());
         };
 
         // Create SniCertResolver and load existing certs
@@ -321,6 +320,9 @@ impl ProxyManager {
     /// - **Internal** endpoints bind to the overlay IP so they are only
     ///   reachable from within the overlay network.  If no overlay is
     ///   available, internal endpoints bind to `127.0.0.1` (localhost only).
+    ///
+    /// # Errors
+    /// Returns an error if an HTTP/HTTPS listener cannot be started.
     pub async fn ensure_ports_for_service(
         &self,
         spec: &ServiceSpec,
@@ -379,15 +381,14 @@ impl ProxyManager {
             }
         }
 
-        let registry = match &self.stream_registry {
-            Some(r) => Arc::clone(r),
-            None => {
-                warn!(
-                    port = port,
-                    "Cannot start TCP listener: StreamRegistry not configured"
-                );
-                return;
-            }
+        let registry = if let Some(r) = &self.stream_registry {
+            Arc::clone(r)
+        } else {
+            warn!(
+                port = port,
+                "Cannot start TCP listener: StreamRegistry not configured"
+            );
+            return;
         };
 
         let addr = SocketAddr::new(bind_ip, port);
@@ -432,15 +433,14 @@ impl ProxyManager {
             }
         }
 
-        let registry = match &self.stream_registry {
-            Some(r) => Arc::clone(r),
-            None => {
-                warn!(
-                    port = port,
-                    "Cannot start UDP listener: StreamRegistry not configured"
-                );
-                return;
-            }
+        let registry = if let Some(r) = &self.stream_registry {
+            Arc::clone(r)
+        } else {
+            warn!(
+                port = port,
+                "Cannot start UDP listener: StreamRegistry not configured"
+            );
+            return;
         };
 
         let addr = SocketAddr::new(bind_ip, port);
@@ -479,8 +479,8 @@ impl ProxyManager {
 
     /// Add routes for a service based on its specification
     ///
-    /// This creates proxy routes for each endpoint defined in the ServiceSpec.
-    /// HTTP/HTTPS/WebSocket endpoints get L7 routes via the ServiceRegistry.
+    /// This creates proxy routes for each endpoint defined in the `ServiceSpec`.
+    /// HTTP/HTTPS/WebSocket endpoints get L7 routes via the `ServiceRegistry`.
     /// TCP/UDP endpoints are tracked but their L4 registration is handled
     /// by the `ServiceManager::register_service_routes()` method.
     pub async fn add_service(&self, name: &str, spec: &ServiceSpec) {
@@ -555,8 +555,8 @@ impl ProxyManager {
     ///
     /// This performs a full cleanup of all proxy resources associated with the
     /// service:
-    /// - Removes L7 (HTTP/HTTPS/WebSocket) routes from the ServiceRegistry
-    /// - Unregisters TCP/UDP stream services from the StreamRegistry
+    /// - Removes L7 (HTTP/HTTPS/WebSocket) routes from the `ServiceRegistry`
+    /// - Unregisters TCP/UDP stream services from the `StreamRegistry`
     /// - Removes port tracking for TCP/UDP listeners
     /// - Shuts down HTTP proxy server handles that were exclusively owned by
     ///   this service (only if no other service uses the same port)
@@ -575,7 +575,7 @@ impl ProxyManager {
                 let mut tcp_set = self.tcp_listeners.write().await;
                 for port in &tracking.tcp_ports {
                     if let Some(registry) = &self.stream_registry {
-                        registry.unregister_tcp(*port);
+                        let _ = registry.unregister_tcp(*port);
                     }
                     tcp_set.remove(port);
                     debug!(service = name, port = port, "Removed TCP listener tracking");
@@ -587,7 +587,7 @@ impl ProxyManager {
                 let mut udp_set = self.udp_listeners.write().await;
                 for port in &tracking.udp_ports {
                     if let Some(registry) = &self.stream_registry {
-                        registry.unregister_udp(*port);
+                        let _ = registry.unregister_udp(*port);
                     }
                     udp_set.remove(port);
                     debug!(service = name, port = port, "Removed UDP listener tracking");
@@ -639,6 +639,7 @@ impl ProxyManager {
     ///
     /// Delegates to [`LoadBalancer::mark_health`] so that unhealthy backends
     /// are skipped during selection.
+    #[allow(clippy::unused_async)]
     pub async fn update_backend_health(&self, service: &str, addr: SocketAddr, healthy: bool) {
         self.load_balancer.mark_health(service, &addr, healthy);
         debug!(
@@ -681,7 +682,7 @@ mod tests {
 
     fn mock_service_spec_with_endpoints() -> ServiceSpec {
         use zlayer_spec::*;
-        serde_yaml::from_str::<DeploymentSpec>(
+        serde_yml::from_str::<DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -711,7 +712,7 @@ services:
 
     fn mock_service_spec_tcp_only() -> ServiceSpec {
         use zlayer_spec::*;
-        serde_yaml::from_str::<DeploymentSpec>(
+        serde_yml::from_str::<DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -889,7 +890,7 @@ services:
 
     fn mock_mixed_service_spec() -> ServiceSpec {
         use zlayer_spec::*;
-        serde_yaml::from_str::<DeploymentSpec>(
+        serde_yml::from_str::<DeploymentSpec>(
             r#"
 version: v1
 deployment: test

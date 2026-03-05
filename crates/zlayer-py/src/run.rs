@@ -1,4 +1,4 @@
-//! Convenience run() function for quick container execution
+//! Convenience `run()` function for quick container execution
 //!
 //! This module provides a simple, high-level function for running containers
 //! without needing to manage Container or Runtime objects directly.
@@ -19,10 +19,10 @@ use zlayer_spec::DeploymentSpec;
 /// Args:
 ///     image: The container image to run (e.g., "nginx:latest", "redis:alpine")
 ///     name: Optional container name. If not provided, one is auto-generated.
-///     ports: Optional port mappings as {container_port: host_port}.
+///     ports: Optional port mappings as {`container_port`: `host_port`}.
 ///         Example: {80: 8080} maps container port 80 to host port 8080.
 ///     env: Optional environment variables as {name: value}.
-///         Example: {"REDIS_PASSWORD": "secret"}
+///         Example: {"`REDIS_PASSWORD"`: "secret"}
 ///     command: Optional command to run in the container.
 ///         Example: ["python", "-c", "print('hello')"]
 ///     detach: If True (default), run in background and return immediately.
@@ -30,11 +30,11 @@ use zlayer_spec::DeploymentSpec;
 ///
 /// Returns:
 ///     A Container instance that can be used for further operations like
-///     stop(), logs(), exec(), etc.
+///     `stop()`, `logs()`, `exec()`, etc.
 ///
 /// Raises:
-///     ValueError: If the image name is empty or invalid.
-///     RuntimeError: If container creation or startup fails.
+///     `ValueError`: If the image name is empty or invalid.
+///     `RuntimeError`: If container creation or startup fails.
 ///
 /// Example:
 ///     >>> container = await zlayer.run("nginx:latest", ports={80: 8080})
@@ -57,7 +57,7 @@ pub fn run<'py>(
     }
 
     let image = image.to_string();
-    let name = name.map(|s| s.to_string());
+    let name = name.map(std::string::ToString::to_string);
     let ports = ports.unwrap_or_default();
     let env = env.unwrap_or_default();
     let command = command.unwrap_or_default();
@@ -70,8 +70,8 @@ pub fn run<'py>(
         let yaml = build_run_spec_yaml(&image, &container_name, &ports, &env, &command);
 
         // Parse the spec
-        let deployment: DeploymentSpec = serde_yaml::from_str(&yaml).map_err(|e| {
-            ZLayerError::InvalidArgument(format!("Failed to create container spec: {}", e))
+        let deployment: DeploymentSpec = serde_yml::from_str(&yaml).map_err(|e| {
+            ZLayerError::InvalidArgument(format!("Failed to create container spec: {e}"))
         })?;
 
         let spec = deployment
@@ -123,19 +123,16 @@ pub fn run<'py>(
                     ContainerState::Exited { code } => {
                         if code != 0 {
                             return Err(ZLayerError::Container(format!(
-                                "Container exited with code {}",
-                                code
+                                "Container exited with code {code}"
                             ))
                             .into());
                         }
                         break;
                     }
                     ContainerState::Failed { reason } => {
-                        return Err(ZLayerError::Container(format!(
-                            "Container failed: {}",
-                            reason
-                        ))
-                        .into());
+                        return Err(
+                            ZLayerError::Container(format!("Container failed: {reason}")).into(),
+                        );
                     }
                     ContainerState::Running | ContainerState::Initializing => {
                         // Still running, wait a bit
@@ -171,10 +168,10 @@ fn generate_container_name(image: &str) -> String {
     // Generate a short random suffix
     let suffix: u32 = rand::random::<u32>() % 10000;
 
-    format!("{}-{}", base, suffix)
+    format!("{base}-{suffix}")
 }
 
-/// Build a YAML spec from run() parameters
+/// Build a YAML spec from `run()` parameters
 fn build_run_spec_yaml(
     image: &str,
     name: &str,
@@ -182,16 +179,17 @@ fn build_run_spec_yaml(
     env: &HashMap<String, String>,
     command: &[String],
 ) -> String {
+    use std::fmt::Write;
+
     let mut yaml = format!(
-        r#"version: v1
+        r"version: v1
 deployment: zlayer-run
 services:
-  {}:
+  {name}:
     rtype: service
     image:
-      name: {}
-"#,
-        name, image
+      name: {image}
+"
     );
 
     // Add command if provided
@@ -200,7 +198,7 @@ services:
         for arg in command {
             // Escape quotes in the argument
             let escaped = arg.replace('"', "\\\"");
-            yaml.push_str(&format!("      - \"{}\"\n", escaped));
+            let _ = writeln!(yaml, "      - \"{escaped}\"");
         }
     }
 
@@ -210,7 +208,7 @@ services:
         for (key, value) in env {
             // Escape quotes in the value
             let escaped_value = value.replace('"', "\\\"");
-            yaml.push_str(&format!("      {}: \"{}\"\n", key, escaped_value));
+            let _ = writeln!(yaml, "      {key}: \"{escaped_value}\"");
         }
     }
 
@@ -219,10 +217,10 @@ services:
     if !ports.is_empty() {
         yaml.push_str("    endpoints:\n");
         for (container_port, host_port) in ports {
-            yaml.push_str(&format!(
-                "      - name: port-{}\n        protocol: tcp\n        port: {}\n        host_port: {}\n",
-                container_port, container_port, host_port
-            ));
+            let _ = write!(
+                yaml,
+                "      - name: port-{container_port}\n        protocol: tcp\n        port: {container_port}\n        host_port: {host_port}\n"
+            );
         }
     }
 

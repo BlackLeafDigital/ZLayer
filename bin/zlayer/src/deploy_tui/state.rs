@@ -104,13 +104,13 @@ pub struct DeployState {
     pub infra_phases: Vec<(InfraPhase, PhaseStatus)>,
     /// Per-service deployment states
     pub services: Vec<ServiceState>,
-    /// Service plans from the PlanReady event
+    /// Service plans from the `PlanReady` event
     pub service_plans: Vec<ServicePlan>,
     /// Log entries for the log pane
     pub log_entries: Vec<LogEntry>,
     /// Current scroll offset in the log pane
     pub log_scroll_offset: usize,
-    /// Running service summary from DeploymentRunning event
+    /// Running service summary from `DeploymentRunning` event
     pub running_services: Vec<(String, u32)>,
 }
 
@@ -141,6 +141,7 @@ impl DeployState {
     ///
     /// This is the core state machine. Each event variant maps to one or
     /// more field mutations and potentially a phase transition.
+    #[allow(clippy::too_many_lines)]
     pub fn apply_event(&mut self, event: &DeployEvent) {
         match event {
             DeployEvent::PlanReady {
@@ -148,9 +149,9 @@ impl DeployState {
                 version,
                 services,
             } => {
-                self.deployment_name = deployment_name.clone();
-                self.version = version.clone();
-                self.service_plans = services.clone();
+                self.deployment_name.clone_from(deployment_name);
+                self.version.clone_from(version);
+                self.service_plans.clone_from(services);
                 self.phase = DeployPhase::Deploying;
             }
 
@@ -245,7 +246,7 @@ impl DeployState {
 
             DeployEvent::DeploymentRunning { services } => {
                 self.phase = DeployPhase::Running;
-                self.running_services = services.clone();
+                self.running_services.clone_from(services);
             }
 
             DeployEvent::StatusTick { services } => {

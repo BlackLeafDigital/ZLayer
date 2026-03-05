@@ -3,6 +3,10 @@
 //! Provides an Axum router with endpoints for all Raft RPC operations.
 //! Uses **bincode** serialization for request/response bodies.
 //!
+//! When an `auth_token` is provided, every request must include an
+//! `Authorization: Bearer <token>` header matching the expected value.
+//! Requests without a valid token receive HTTP 401.
+//!
 //! ## Endpoints
 //!
 //! | Method | Path | Description |
@@ -17,14 +21,15 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{Request, StatusCode};
+use axum::middleware::{self, Next};
+use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use openraft::raft::{AppendEntriesRequest, InstallSnapshotRequest, VoteRequest};
 use openraft::storage::Snapshot;
 use openraft::{BasicNode, Raft, RaftTypeConfig, SnapshotMeta, Vote};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::types::NodeId;
 
@@ -35,13 +40,17 @@ struct RaftState<C: RaftTypeConfig> {
 
 /// Create an Axum router for Raft RPC endpoints.
 ///
+/// If `auth_token` is `Some`, a middleware layer is added that validates
+/// the `Authorization: Bearer <token>` header on every request.  Requests
+/// that do not carry a matching token are rejected with HTTP 401.
+///
 /// The router uses bincode for serialization. Mount it at any prefix:
 ///
 /// ```ignore
-/// let raft_router = raft_service_router(raft_instance);
+/// let raft_router = raft_service_router(raft_instance, Some("secret".into()));
 /// let app = Router::new().nest("/", raft_router);
 /// ```
-pub fn raft_service_router<C>(raft: Raft<C>) -> Router
+pub fn raft_service_router<C>(raft: Raft<C>, auth_token: Option<String>) -> Router
 where
     C: RaftTypeConfig<NodeId = NodeId, Node = BasicNode, SnapshotData = Cursor<Vec<u8>>>,
     C::D: serde::Serialize + serde::de::DeserializeOwned,
@@ -50,12 +59,50 @@ where
 {
     let state = Arc::new(RaftState { raft });
 
-    Router::new()
+    let router = Router::new()
         .route("/raft/vote", post(handle_vote::<C>))
         .route("/raft/append", post(handle_append::<C>))
         .route("/raft/snapshot", post(handle_snapshot::<C>))
         .route("/raft/full-snapshot", post(handle_full_snapshot::<C>))
-        .with_state(state)
+        .with_state(state);
+
+    if let Some(token) = auth_token {
+        let expected = Arc::new(token);
+        router.layer(middleware::from_fn(move |req, next| {
+            let expected = Arc::clone(&expected);
+            bearer_auth_middleware(expected, req, next)
+        }))
+    } else {
+        router
+    }
+}
+
+/// Middleware that validates `Authorization: Bearer <token>`.
+async fn bearer_auth_middleware(
+    expected_token: Arc<String>,
+    req: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
+    let auth_header = req
+        .headers()
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(value) if value.starts_with("Bearer ") => {
+            let provided = &value["Bearer ".len()..];
+            if provided == expected_token.as_str() {
+                next.run(req).await
+            } else {
+                warn!("Raft RPC rejected: invalid bearer token");
+                StatusCode::UNAUTHORIZED.into_response()
+            }
+        }
+        _ => {
+            warn!("Raft RPC rejected: missing or malformed Authorization header");
+            StatusCode::UNAUTHORIZED.into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

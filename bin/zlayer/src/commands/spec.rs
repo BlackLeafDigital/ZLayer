@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use crate::cli::SpecCommands;
 
 /// Handle spec commands
-pub(crate) async fn handle_spec(action: &SpecCommands) -> Result<()> {
+pub(crate) fn handle_spec(action: &SpecCommands) -> Result<()> {
     match action {
         SpecCommands::Dump { spec, format } => {
             let spec = spec.clone();
@@ -25,7 +25,7 @@ pub(crate) async fn handle_spec(action: &SpecCommands) -> Result<()> {
                 _ => {
                     println!(
                         "{}",
-                        serde_yaml::to_string(&parsed_spec)
+                        serde_yml::to_string(&parsed_spec)
                             .context("Failed to serialize as YAML")?
                     );
                 }
