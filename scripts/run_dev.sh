@@ -242,6 +242,20 @@ cmd_build() {
     info "Building runtime (release)..."
     cargo build --release --package zlayer
 
+    # Install JS dependencies for manager (daisyui for Tailwind CSS)
+    if [ -f crates/zlayer-manager/package.json ]; then
+        if [ ! -d crates/zlayer-manager/node_modules ]; then
+            info "Installing JS dependencies (daisyui)..."
+            if command -v bun &>/dev/null; then
+                (cd crates/zlayer-manager && bun install)
+            elif command -v npm &>/dev/null; then
+                (cd crates/zlayer-manager && npm install)
+            else
+                warn "Neither bun nor npm found — daisyui may be missing"
+            fi
+        fi
+    fi
+
     info "Building manager (SSR + WASM via cargo-leptos)..."
     (cd crates/zlayer-manager && cargo leptos build --release)
 
@@ -338,16 +352,14 @@ cmd_dev() {
         ok "cargo-leptos installed"
     fi
 
-    local port="${PORT:-4321}"
-
     echo ""
-    ok "Manager starting on http://localhost:${port}"
+    ok "Manager starting (port configured in Cargo.toml [package.metadata.leptos])"
     info "Live reload: saves to crates/zlayer-manager/ trigger rebuild"
     info "Press Ctrl+C to stop"
     echo ""
 
     cd crates/zlayer-manager
-    exec cargo leptos watch --port "$port"
+    exec cargo leptos watch
 }
 
 # ============================================================

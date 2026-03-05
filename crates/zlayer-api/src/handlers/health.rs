@@ -14,6 +14,23 @@ pub struct HealthResponse {
     /// Uptime in seconds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_secs: Option<u64>,
+    /// Container runtime name (e.g. "youki", "mac-sandbox", "docker")
+    #[serde(default = "default_runtime_name")]
+    pub runtime_name: String,
+}
+
+/// Platform-based default runtime name.
+///
+/// On Linux the bundled libcontainer runtime ("youki") is preferred;
+/// on macOS the sandbox runtime is tried first; Docker is the common fallback.
+fn default_runtime_name() -> String {
+    if cfg!(target_os = "linux") {
+        "youki".to_string()
+    } else if cfg!(target_os = "macos") {
+        "mac-sandbox".to_string()
+    } else {
+        "auto".to_string()
+    }
 }
 
 /// Liveness probe - basic health check
@@ -30,6 +47,7 @@ pub async fn liveness() -> Json<HealthResponse> {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_secs: None,
+        runtime_name: default_runtime_name(),
     })
 }
 
@@ -49,6 +67,7 @@ pub async fn readiness() -> Json<HealthResponse> {
         status: "ok".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
         uptime_secs: None,
+        runtime_name: default_runtime_name(),
     })
 }
 
@@ -61,11 +80,13 @@ mod tests {
         let response = liveness().await;
         assert_eq!(response.status, "ok");
         assert!(!response.version.is_empty());
+        assert!(!response.runtime_name.is_empty());
     }
 
     #[tokio::test]
     async fn test_readiness() {
         let response = readiness().await;
         assert_eq!(response.status, "ok");
+        assert!(!response.runtime_name.is_empty());
     }
 }

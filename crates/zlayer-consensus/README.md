@@ -1,13 +1,13 @@
 # zlayer-consensus
 
-Shared Raft consensus library built on [openraft 0.9](https://docs.rs/openraft) for ZLayer (container orchestration) and ZDB (database replication).
+Shared Raft consensus library built on [openraft 0.9](https://docs.rs/openraft) for ZLayer (container orchestration) and Zatabase (database replication).
 
 ## Architecture
 
 ```
                      +------------------------------+
                      |       Application Layer       |
-                     |  (ZLayer scheduler / ZDB)     |
+                     |  (ZLayer scheduler / Zatabase) |
                      +------+----------+------------+
                             |          |
                      +------v---+ +----v-----------+

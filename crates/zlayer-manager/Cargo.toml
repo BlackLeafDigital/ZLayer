@@ -97,5 +97,7 @@ lib-features = ["hydrate"]
 bin-target = "zlayer-manager-zql"
 # Environment
 env = "DEV"
+# Assets directory
+assets-dir = "assets"
 # Hash files for cache busting
 hash-files = true
