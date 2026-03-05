@@ -92,9 +92,5 @@ tailwind-input-file = "./tailwind.css"
 # Features
 bin-features = ["ssr"]
 lib-features = ["hydrate"]
-# Targets
-bin-target = "zlayer-manager"
-# Environment
-env = "DEV"
 # Hash files for cache busting
 hash-files = true

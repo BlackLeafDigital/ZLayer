@@ -6,6 +6,15 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+/// Returns `true` when the user explicitly set `--port` on the command line
+/// or via the `PORT` environment variable (i.e. it is *not* just the default).
+pub fn port_explicitly_set(matches: &clap::ArgMatches) -> bool {
+    matches!(
+        matches.value_source("port"),
+        Some(clap::parser::ValueSource::CommandLine | clap::parser::ValueSource::EnvVariable)
+    )
+}
+
 /// Connection mode for `ZLayer` manager
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -123,5 +132,19 @@ mod tests {
             args.config.as_deref(),
             Some(PathBuf::from("/etc/zlayer/config.yaml").as_path())
         );
+    }
+
+    #[test]
+    fn test_port_not_explicitly_set_with_default() {
+        use clap::CommandFactory;
+        let matches = Args::command().get_matches_from(["zlayer-manager"]);
+        assert!(!port_explicitly_set(&matches));
+    }
+
+    #[test]
+    fn test_port_explicitly_set_via_cli() {
+        use clap::CommandFactory;
+        let matches = Args::command().get_matches_from(["zlayer-manager", "--port", "4000"]);
+        assert!(port_explicitly_set(&matches));
     }
 }
