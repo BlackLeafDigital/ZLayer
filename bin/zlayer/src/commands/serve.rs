@@ -41,7 +41,12 @@ struct StaleDaemonMeta {
 /// Clean up a stale daemon process and leftover network state from a previous run.
 ///
 /// This is best-effort: all errors are logged as warnings but never prevent startup.
-#[allow(unsafe_code, clippy::too_many_lines, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[allow(
+    unsafe_code,
+    clippy::too_many_lines,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind: &str) {
     let metadata_path = config.data_dir.join("daemon.json");
     let my_pid = std::process::id();

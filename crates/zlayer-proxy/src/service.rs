@@ -409,8 +409,7 @@ impl ReverseProxyService {
         );
 
         // Build forwarded request
-        let forwarded_req = self
-            .build_forwarded_request(req, &backend_addr, &resolved)?;
+        let forwarded_req = self.build_forwarded_request(req, &backend_addr, &resolved)?;
 
         // Forward to backend
         let response = self.client.request(forwarded_req).await.map_err(|e| {

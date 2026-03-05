@@ -735,8 +735,7 @@ impl CertManager {
                             tracing::info!(domain = %domain, "Certificate renewed successfully");
 
                             // Update SNI resolver with new certificate
-                            if let Err(e) = sni_resolver
-                                .refresh_cert(&domain, &cert_pem, &key_pem)
+                            if let Err(e) = sni_resolver.refresh_cert(&domain, &cert_pem, &key_pem)
                             {
                                 tracing::error!(
                                     domain = %domain,

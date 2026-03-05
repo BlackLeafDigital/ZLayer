@@ -144,9 +144,7 @@ pub fn resolve_env_vars_with_warnings(
                     }
                     val
                 }
-                Err(
-                    std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_),
-                ) => {
+                Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => {
                     return Err(EnvResolutionError::MissingEnvVar {
                         var: var_name.to_string(),
                     });

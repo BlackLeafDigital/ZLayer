@@ -178,7 +178,9 @@ fn create_server_config(
 
     // Configure ALPN
     if !config.alpn_protocols.is_empty() {
-        server_config.alpn_protocols.clone_from(&config.alpn_protocols);
+        server_config
+            .alpn_protocols
+            .clone_from(&config.alpn_protocols);
     }
 
     Ok(server_config)

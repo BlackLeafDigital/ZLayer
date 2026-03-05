@@ -473,7 +473,8 @@ fn convert_healthcheck(hc: &ZHealthcheck) -> Result<Instruction> {
 
     let interval = parse_optional_duration(hc.interval.as_ref(), "healthcheck interval")?;
     let timeout = parse_optional_duration(hc.timeout.as_ref(), "healthcheck timeout")?;
-    let start_period = parse_optional_duration(hc.start_period.as_ref(), "healthcheck start_period")?;
+    let start_period =
+        parse_optional_duration(hc.start_period.as_ref(), "healthcheck start_period")?;
 
     Ok(Instruction::Healthcheck(HealthcheckInstruction::Check {
         command,

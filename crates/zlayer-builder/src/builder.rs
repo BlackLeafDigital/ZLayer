@@ -1393,9 +1393,10 @@ impl ImageBuilder {
                         let RunMount::Cache { target, .. } = default_mount else {
                             continue;
                         };
-                        let already_has = merged.mounts.iter().any(
-                            |m| matches!(m, RunMount::Cache { target: t, .. } if t == target),
-                        );
+                        let already_has = merged
+                            .mounts
+                            .iter()
+                            .any(|m| matches!(m, RunMount::Cache { target: t, .. } if t == target));
                         if !already_has {
                             merged.mounts.push(default_mount.clone());
                         }
@@ -1819,10 +1820,9 @@ impl ImageBuilder {
         // Apply explicit build file if specified.
         if let Some(file) = build_ctx.file() {
             let file_path = context_dir.join(file);
-            if std::path::Path::new(file)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"))
-                || file.starts_with("ZImagefile")
+            if std::path::Path::new(file).extension().is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml")
+            }) || file.starts_with("ZImagefile")
             {
                 nested = nested.zimagefile(file_path);
             } else {

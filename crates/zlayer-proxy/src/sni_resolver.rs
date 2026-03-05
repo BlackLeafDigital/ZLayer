@@ -458,8 +458,7 @@ mod tests {
 
         // Refresh with new cert
         let (new_cert_pem, new_key_pem) = generate_test_cert();
-        let result = resolver
-            .refresh_cert("example.com", &new_cert_pem, &new_key_pem);
+        let result = resolver.refresh_cert("example.com", &new_cert_pem, &new_key_pem);
         assert!(result.is_ok());
         assert_eq!(resolver.cert_count(), 1);
     }
@@ -482,9 +481,7 @@ mod tests {
         assert!(!resolver.has_default_cert());
 
         let (cert_pem, key_pem) = generate_test_cert();
-        resolver
-            .set_default_cert(&cert_pem, &key_pem)
-            .unwrap();
+        resolver.set_default_cert(&cert_pem, &key_pem).unwrap();
 
         assert!(resolver.has_default_cert());
     }
@@ -547,9 +544,7 @@ mod tests {
         let resolver = SniCertResolver::new();
         let (cert_pem, key_pem) = generate_test_cert();
 
-        resolver
-            .set_default_cert(&cert_pem, &key_pem)
-            .unwrap();
+        resolver.set_default_cert(&cert_pem, &key_pem).unwrap();
 
         // Unknown domain should fall back to default
         let result = resolver.resolve_cert(Some("unknown.com"));
