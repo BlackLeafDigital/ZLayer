@@ -31,5 +31,8 @@ check-all = "check --workspace --all-targets"
 test-all = "test --workspace"
 clippy-all = "clippy --workspace --all-targets -- -D warnings"
 
+[registries.forgejo]
+index = "sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/"
+
 [patch.crates-io]
 # You can add patches here if needed for development

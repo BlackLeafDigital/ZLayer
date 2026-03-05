@@ -23,11 +23,11 @@ use std::time::Duration;
 use tempfile::TempDir;
 
 // Import the public API from zlayer-agent
-use zlayer_agent::runtimes::{
+use zlayer_agent_zql::runtimes::{
     DefaultHost, HttpRequest, HttpResponse, KvError, LogLevel, PoolStats, WasmHttpRuntime,
     ZLayerHost,
 };
-use zlayer_spec::WasmHttpConfig;
+use zlayer_spec_zql::WasmHttpConfig;
 
 // Import WASM utilities from zlayer-registry
 use zlayer_registry::{
@@ -1644,7 +1644,7 @@ mod wasm_networking_e2e {
 // =============================================================================
 
 mod wasm_filesystem_e2e {
-    use zlayer_spec::{StorageSpec, StorageTier};
+    use zlayer_spec_zql::{StorageSpec, StorageTier};
 
     /// Test StorageSpec parsing for WASM bind mounts
     #[test]
@@ -1894,7 +1894,7 @@ mod wasm_stdio_capture_e2e {
 
 mod wasm_http_interfaces_e2e {
     use super::*;
-    use zlayer_agent::runtimes::{
+    use zlayer_agent_zql::runtimes::{
         duration_to_ns, ns_to_duration, CacheDecision, CacheEntry, HttpMethod, HttpVersion,
         ImmediateResponse, KeyValue, MessageType, MiddlewareAction, PluginRequest, RedirectInfo,
         RequestMetadata, RoutingDecision, UpgradeDecision, Upstream, WebSocketMessage,

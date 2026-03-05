@@ -1,5 +1,5 @@
 [package]
-name = "zlayer-scheduler"
+name = "zlayer-scheduler-zql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -44,7 +44,7 @@ tower.workspace = true
 tower-http.workspace = true
 
 # Consensus (re-exported via zlayer-consensus, but needed for declare_raft_types! macro)
-openraft.workspace = true
+openraft = { workspace = true, features = ["storage-v2"] }
 
 # Metrics
 metrics.workspace = true
@@ -53,6 +53,12 @@ num_cpus = { workspace = true }
 
 # JSON serialization for snapshots
 serde_json.workspace = true
+
+# Hex encoding for binary data in ZQL
+hex.workspace = true
+
+# Storage (optional, for persistent feature)
+zql = { workspace = true, optional = true }
 
 # OpenAPI schema generation
 utoipa.workspace = true
@@ -64,9 +70,8 @@ wiremock = "0.6"
 
 [features]
 test-skip-http = []
-# Persistent storage is now provided by zlayer-consensus's redb-store feature.
-# This feature flag is kept for backward compatibility with dependents.
-persistent = ["zlayer-consensus/redb-store"]
+# Persistent storage is provided by zlayer-consensus's zql-store feature.
+persistent = ["zlayer-consensus/zql-store", "zql"]
 
 [lints]
 workspace = true

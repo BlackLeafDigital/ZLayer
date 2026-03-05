@@ -21,6 +21,7 @@ env:
   CARGO_BUILD_JOBS: "2"
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: "0"
+  CARGO_REGISTRIES_FORGEJO_TOKEN: ${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
 jobs:
   # ===========================================

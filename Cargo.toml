@@ -123,6 +123,7 @@ hickory-client = "0.24"
 # Storage
 redb = "2.2"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
+zql = { version = "0.3.0", registry = "forgejo", default-features = false, features = ["sql-compat", "native-storage"] }
 
 # Config
 config = "0.15"
@@ -180,23 +181,35 @@ num_cpus = "1.16"
 # Random number generation
 rand = "0.9"
 
-# Internal crates
-zlayer-spec = { version = "0.0.0-dev", path = "crates/zlayer-spec" }
-zlayer-core = { version = "0.0.0-dev", path = "crates/zlayer-core" }
-zlayer-observability = { version = "0.0.0-dev", path = "crates/zlayer-observability" }
-zlayer-overlay = { version = "0.0.0-dev", path = "crates/zlayer-overlay" }
-zlayer-storage = { version = "0.0.0-dev", path = "crates/zlayer-storage" }
-zlayer-init-actions = { version = "0.0.0-dev", path = "crates/zlayer-init-actions" }
-zlayer-registry = { version = "0.0.0-dev", path = "crates/zlayer-registry" }
-zlayer-builder = { version = "0.0.0-dev", path = "crates/zlayer-builder" }
-zlayer-scheduler = { version = "0.0.0-dev", path = "crates/zlayer-scheduler" }
-zlayer-tunnel = { version = "0.0.0-dev", path = "crates/zlayer-tunnel" }
-zlayer-tui = { version = "0.0.0-dev", path = "crates/zlayer-tui" }
-zlayer-consensus = { version = "0.0.0-dev", path = "crates/zlayer-consensus" }
-zlayer-agent = { version = "0.0.0-dev", path = "crates/zlayer-agent" }
-zlayer-api = { version = "0.0.0-dev", path = "crates/zlayer-api" }
-zlayer-proxy = { version = "0.0.0-dev", path = "crates/zlayer-proxy" }
-zlayer-secrets = { version = "0.0.0-dev", path = "crates/zlayer-secrets" }
+# =============================================================================
+# Internal Workspace Crates (aliased with -zql suffix for publishing)
+# =============================================================================
+# The dependency KEY stays as `zlayer-X` so all code (`use zlayer_X::...`) and
+# feature forwarding (`zlayer-X/feature`) works without changes.
+# The `package` field tells Cargo the actual crate name on the registry.
+
+# --- Publishable crates ---
+zlayer-spec = { path = "crates/zlayer-spec", version = "0.0.0-dev", package = "zlayer-spec-zql" }
+zlayer-observability = { path = "crates/zlayer-observability", version = "0.0.0-dev", package = "zlayer-observability-zql" }
+zlayer-overlay = { path = "crates/zlayer-overlay", version = "0.0.0-dev", package = "zlayer-overlay-zql" }
+zlayer-storage = { path = "crates/zlayer-storage", version = "0.0.0-dev", package = "zlayer-storage-zql" }
+zlayer-core = { path = "crates/zlayer-core", version = "0.0.0-dev", package = "zlayer-core-zql" }
+zlayer-builder = { path = "crates/zlayer-builder", version = "0.0.0-dev", package = "zlayer-builder-zql" }
+zlayer-init-actions = { path = "crates/zlayer-init-actions", version = "0.0.0-dev", package = "zlayer-init-actions-zql" }
+zlayer-registry = { path = "crates/zlayer-registry", version = "0.0.0-dev", package = "zlayer-registry-zql" }
+zlayer-scheduler = { path = "crates/zlayer-scheduler", version = "0.0.0-dev", package = "zlayer-scheduler-zql" }
+zlayer-tunnel = { path = "crates/zlayer-tunnel", version = "0.0.0-dev", package = "zlayer-tunnel-zql" }
+
+# --- Non-publishable workspace crates ---
+zlayer-agent = { path = "crates/zlayer-agent", version = "0.0.0-dev", package = "zlayer-agent-zql" }
+zlayer-proxy = { path = "crates/zlayer-proxy", version = "0.0.0-dev", package = "zlayer-proxy-zql" }
+zlayer-api = { path = "crates/zlayer-api", version = "0.0.0-dev", package = "zlayer-api-zql" }
+zlayer-tui = { path = "crates/zlayer-tui", version = "0.0.0-dev", package = "zlayer-tui-zql" }
+zlayer-py = { path = "crates/zlayer-py", version = "0.0.0-dev", package = "zlayer-py-zql" }
+zlayer-web = { path = "crates/zlayer-web", version = "0.0.0-dev", package = "zlayer-web-zql" }
+zlayer-secrets = { path = "crates/zlayer-secrets", version = "0.0.0-dev", package = "zlayer-secrets-zql" }
+zlayer-manager = { path = "crates/zlayer-manager", version = "0.0.0-dev", package = "zlayer-manager-zql" }
+zlayer-consensus = { path = "crates/zlayer-consensus", version = "0.0.0-dev", package = "zlayer-consensus-zql" }
 
 # =============================================================================
 # Build Profiles

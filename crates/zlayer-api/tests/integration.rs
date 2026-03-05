@@ -12,8 +12,8 @@ use tokio::sync::RwLock;
 use tower::ServiceExt;
 
 use zlayer_agent::{MockRuntime, ServiceManager};
-use zlayer_api::storage::InMemoryStorage;
-use zlayer_api::{
+use zlayer_api_zql::storage::InMemoryStorage;
+use zlayer_api_zql::{
     build_router, build_router_with_internal, create_token, ApiConfig, INTERNAL_AUTH_HEADER,
 };
 
@@ -316,7 +316,7 @@ async fn test_malformed_auth_header() {
 
 fn create_app_with_internal() -> (axum::Router, String) {
     let config = test_config();
-    let storage: Arc<dyn zlayer_api::DeploymentStorage + Send + Sync> =
+    let storage: Arc<dyn zlayer_api_zql::DeploymentStorage + Send + Sync> =
         Arc::new(InMemoryStorage::new());
     let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> = Arc::new(MockRuntime::new());
     let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));

@@ -1,6 +1,7 @@
 //! Sync manager for coordinating local/remote layer state
 //!
 //! Handles crash-tolerant uploads with resume capability using S3 multipart uploads.
+//! Uses ZQL for persistent sync state storage.
 
 use crate::config::LayerStorageConfig;
 use crate::error::{LayerStorageError, Result};
@@ -9,11 +10,8 @@ use crate::types::{ContainerLayerId, LayerSnapshot, PendingUpload, SyncState};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart as S3CompletedPart};
 use aws_sdk_s3::Client as S3Client;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::Path;
-use std::str::FromStr;
 use std::sync::Arc;
 use tokio::fs::File;
 use tokio::io::AsyncReadExt;
@@ -24,7 +22,7 @@ use tracing::{debug, info, instrument, warn};
 pub struct LayerSyncManager {
     config: LayerStorageConfig,
     s3_client: S3Client,
-    pool: SqlitePool,
+    db: tokio::sync::Mutex<zql::Database>,
     /// In-memory cache of sync states
     states: Arc<RwLock<HashMap<String, SyncState>>>,
 }
@@ -34,8 +32,8 @@ impl LayerSyncManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if directories cannot be created, the database cannot
-    /// be opened, or the AWS SDK fails to initialize.
+    /// Returns [`LayerStorageError`] if directories cannot be created, AWS
+    /// configuration fails, or the ZQL database cannot be opened.
     pub async fn new(config: LayerStorageConfig) -> Result<Self> {
         // Ensure directories exist
         tokio::fs::create_dir_all(&config.staging_dir).await?;
@@ -64,80 +62,55 @@ impl LayerSyncManager {
 
         let s3_client = S3Client::from_conf(s3_config);
 
-        // Open/create SQLite database
-        let db_url = format!("sqlite:{}?mode=rwc", config.state_db_path.display());
-        let connect_options = SqliteConnectOptions::from_str(&db_url)
-            .map_err(|e| LayerStorageError::Database(e.to_string()))?
-            .create_if_missing(true);
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(connect_options)
+        // Open/create ZQL database
+        let db_path = config.state_db_path.clone();
+        let db = tokio::task::spawn_blocking(move || zql::Database::open(&db_path))
             .await
+            .map_err(|e| LayerStorageError::Database(format!("spawn_blocking failed: {e}")))?
             .map_err(|e| LayerStorageError::Database(e.to_string()))?;
 
-        // Enable WAL mode for better concurrent access
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&pool)
-            .await
-            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-
-        // Create sync_state table
-        sqlx::query(
-            r"
-            CREATE TABLE IF NOT EXISTS sync_state (
-                container_key TEXT PRIMARY KEY NOT NULL,
-                state_json TEXT NOT NULL,
-                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )
-            ",
-        )
-        .execute(&pool)
-        .await
-        .map_err(|e| LayerStorageError::Database(e.to_string()))?;
+        let db = tokio::sync::Mutex::new(db);
 
         // Load existing states into memory
-        let states = Arc::new(RwLock::new(Self::load_all_states(&pool).await?));
+        let states = Arc::new(RwLock::new(Self::load_all_states_from_db(&db).await?));
 
         Ok(Self {
             config,
             s3_client,
-            pool,
+            db,
             states,
         })
     }
 
-    async fn load_all_states(pool: &SqlitePool) -> Result<HashMap<String, SyncState>> {
-        let rows: Vec<(String, String)> =
-            sqlx::query_as("SELECT container_key, state_json FROM sync_state")
-                .fetch_all(pool)
-                .await
-                .map_err(|e| LayerStorageError::Database(e.to_string()))?;
+    async fn load_all_states_from_db(
+        db: &tokio::sync::Mutex<zql::Database>,
+    ) -> Result<HashMap<String, SyncState>> {
+        let mut db = db.lock().await;
+        let result: std::result::Result<Vec<(String, SyncState)>, _> =
+            db.scan_typed("sync_state", "");
 
-        let mut states = HashMap::new();
-        for (key, json) in rows {
-            let state: SyncState = serde_json::from_str(&json)?;
-            states.insert(key, state);
+        match result {
+            Ok(entries) => {
+                let mut states = HashMap::new();
+                for (key, state) in entries {
+                    states.insert(key, state);
+                }
+                Ok(states)
+            }
+            Err(_) => {
+                // Store doesn't exist yet, no states
+                Ok(HashMap::new())
+            }
         }
-
-        Ok(states)
     }
 
     async fn save_state(&self, state: &SyncState) -> Result<()> {
         let key = state.container_id.to_key();
-        let value = serde_json::to_string(state)?;
 
-        sqlx::query(
-            r"
-            INSERT OR REPLACE INTO sync_state (container_key, state_json, updated_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
-            ",
-        )
-        .bind(&key)
-        .bind(&value)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| LayerStorageError::Database(e.to_string()))?;
+        let mut db = self.db.lock().await;
+
+        db.put_typed("sync_state", &key, state)
+            .map_err(|e| LayerStorageError::Database(e.to_string()))?;
 
         Ok(())
     }
@@ -146,7 +119,7 @@ impl LayerSyncManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if persisting the sync state to the database fails.
+    /// Returns [`LayerStorageError`] if persisting the new sync state fails.
     #[instrument(skip(self))]
     pub async fn register_container(&self, container_id: ContainerLayerId) -> Result<()> {
         let key = container_id.to_key();
@@ -166,8 +139,8 @@ impl LayerSyncManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the container is not registered or if calculating the
-    /// directory digest fails.
+    /// Returns [`LayerStorageError`] if the container is not registered or
+    /// the directory digest cannot be calculated.
     #[instrument(skip(self, upper_layer_path))]
     pub async fn check_for_changes(
         &self,
@@ -192,7 +165,8 @@ impl LayerSyncManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if snapshot creation, S3 upload, or state persistence fails.
+    /// Returns [`LayerStorageError`] if snapshot creation, S3 upload, or
+    /// state persistence fails.
     #[instrument(skip(self, upper_layer_path), fields(container = %container_id))]
     pub async fn sync_layer(
         &self,
@@ -265,7 +239,6 @@ impl LayerSyncManager {
     }
 
     /// Upload a snapshot to S3 using multipart upload
-    #[allow(clippy::cast_possible_wrap)]
     #[instrument(skip(self, tarball_path, snapshot))]
     async fn upload_snapshot(
         &self,
@@ -276,8 +249,8 @@ impl LayerSyncManager {
         let object_key = self.config.object_key(&snapshot.digest);
         let file_size = tokio::fs::metadata(tarball_path).await?.len();
         let part_size = self.config.part_size_bytes;
-        #[allow(clippy::cast_possible_truncation)]
-        let total_parts = file_size.div_ceil(part_size) as u32;
+        let total_parts = u32::try_from(file_size.div_ceil(part_size))
+            .expect("file too large: part count exceeds u32::MAX");
 
         info!(
             "Uploading {} ({} bytes) in {} parts",
@@ -339,7 +312,7 @@ impl LayerSyncManager {
                     .into_iter()
                     .map(|(num, etag)| {
                         S3CompletedPart::builder()
-                            .part_number(num as i32)
+                            .part_number(i32::try_from(num).expect("S3 part number fits in i32"))
                             .e_tag(etag)
                             .build()
                     })
@@ -376,7 +349,6 @@ impl LayerSyncManager {
     }
 
     /// Upload individual parts with progress tracking
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     async fn upload_parts(
         &self,
         tarball_path: &Path,
@@ -394,7 +366,9 @@ impl LayerSyncManager {
             let mut file = File::open(tarball_path).await?;
             file.seek(std::io::SeekFrom::Start(offset)).await?;
 
-            let mut buffer = vec![0u8; part_size as usize];
+            let buf_size =
+                usize::try_from(part_size).expect("part_size exceeds usize on this platform");
+            let mut buffer = vec![0u8; buf_size];
             let bytes_read = file.read(&mut buffer).await?;
             buffer.truncate(bytes_read);
 
@@ -405,7 +379,7 @@ impl LayerSyncManager {
                 .bucket(&self.config.bucket)
                 .key(object_key)
                 .upload_id(upload_id)
-                .part_number(part_number as i32)
+                .part_number(i32::try_from(part_number).expect("S3 part number fits in i32"))
                 .body(ByteStream::from(buffer))
                 .send()
                 .await
@@ -424,7 +398,6 @@ impl LayerSyncManager {
     }
 
     /// Resume an interrupted upload
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     #[instrument(skip(self, pending))]
     async fn resume_upload(
         &self,
@@ -463,7 +436,9 @@ impl LayerSyncManager {
                 let mut file = File::open(&pending.local_tarball_path).await?;
                 file.seek(std::io::SeekFrom::Start(offset)).await?;
 
-                let mut buffer = vec![0u8; pending.part_size as usize];
+                let buf_size = usize::try_from(pending.part_size)
+                    .expect("part_size exceeds usize on this platform");
+                let mut buffer = vec![0u8; buf_size];
                 let bytes_read = file.read(&mut buffer).await?;
                 buffer.truncate(bytes_read);
 
@@ -473,7 +448,7 @@ impl LayerSyncManager {
                     .bucket(&self.config.bucket)
                     .key(&pending.object_key)
                     .upload_id(&pending.upload_id)
-                    .part_number(part_number as i32)
+                    .part_number(i32::try_from(part_number).expect("S3 part number fits in i32"))
                     .body(ByteStream::from(buffer))
                     .send()
                     .await
@@ -565,8 +540,8 @@ impl LayerSyncManager {
     ///
     /// # Errors
     ///
-    /// Returns an error if the remote layer is not found, download fails,
-    /// digest verification fails, or extraction fails.
+    /// Returns [`LayerStorageError`] if the container has no remote layer,
+    /// the S3 download fails, or snapshot extraction fails.
     #[instrument(skip(self, target_path))]
     pub async fn restore_layer(
         &self,

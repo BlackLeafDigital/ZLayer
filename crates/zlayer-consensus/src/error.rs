@@ -44,6 +44,11 @@ pub enum ConsensusError {
         leader: Option<NodeId>,
     },
 
+    /// ZQL storage error.
+    #[cfg(feature = "zql-store")]
+    #[error("zql error: {0}")]
+    Zql(String),
+
     /// Redb storage error.
     #[cfg(feature = "redb-store")]
     #[error("redb error: {0}")]

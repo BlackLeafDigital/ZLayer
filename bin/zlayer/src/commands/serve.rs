@@ -41,7 +41,7 @@ struct StaleDaemonMeta {
 /// Clean up a stale daemon process and leftover network state from a previous run.
 ///
 /// This is best-effort: all errors are logged as warnings but never prevent startup.
-#[allow(unsafe_code, clippy::too_many_lines, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+#[allow(clippy::too_many_lines, clippy::cast_possible_wrap, unsafe_code)]
 async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind: &str) {
     let metadata_path = config.data_dir.join("daemon.json");
     let my_pid = std::process::id();
@@ -70,8 +70,12 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                     }
                 }
 
+                // PID values from daemon.json are always positive and fit in i32.
+                #[allow(clippy::cast_possible_wrap)]
                 let old_pid = meta.pid as i32;
                 // Do not kill ourselves (pid file left over from a clean restart).
+                // PID is always positive here, safe to cast back to u32.
+                #[allow(clippy::cast_sign_loss)]
                 if old_pid as u32 == my_pid {
                     info!(
                         pid = old_pid,
@@ -134,18 +138,24 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 
     // -----------------------------------------------------------------------
     // 1b. pkill fallback — if daemon.json was missing or unparseable, use
-    //     pkill to find any orphaned zlayer processes.  Skip our own PID.
+    //     pgrep to find any orphaned zlayer processes.  Skip our own PID
+    //     and the spawner PID (parent process that launched us, e.g.
+    //     `zlayer deploy`).
     // -----------------------------------------------------------------------
     if !pid_kill_conclusive {
         warn!("daemon.json not found or unparseable, attempting targeted kill fallback");
 
-        // Find all zlayer processes EXCEPT ourselves and the process that
-        // spawned us (the `zlayer up` / `zlayer deploy` CLI), then kill them.
+        // Find all zlayer processes EXCEPT ourselves and our spawner, then
+        // kill them.  The spawner PID is passed via ZLAYER_SPAWNER_PID so
+        // that `zlayer deploy` (or any parent CLI command) is never
+        // accidentally killed by the daemon cleanup.
         let my_pid = std::process::id();
         let spawner_pid: Option<u32> = std::env::var("ZLAYER_SPAWNER_PID")
             .ok()
-            .and_then(|s| s.parse().ok());
-        let is_protected = |pid: u32| pid == my_pid || Some(pid) == spawner_pid;
+            .and_then(|v| v.parse().ok());
+
+        let is_protected_pid =
+            |pid: u32| -> bool { pid == my_pid || spawner_pid.is_some_and(|sp| sp == pid) };
 
         if let Ok(output) = tokio::process::Command::new("pgrep")
             .args(["-x", "zlayer"])
@@ -157,7 +167,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                 let mut killed_any = false;
                 for line in stdout.lines() {
                     if let Ok(pid) = line.trim().parse::<u32>() {
-                        if !is_protected(pid) {
+                        if !is_protected_pid(pid) {
                             info!(pid = pid, "Sending SIGTERM to stale zlayer process");
                             unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                             killed_any = true;
@@ -175,9 +185,10 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                             .await;
                         match check {
                             Ok(out) if out.status.success() => {
+                                // Check if the only remaining PIDs are protected
                                 let remaining = String::from_utf8_lossy(&out.stdout);
                                 let foreign = remaining.lines().any(|l| {
-                                    l.trim().parse::<u32>().is_ok_and(|p| !is_protected(p))
+                                    l.trim().parse::<u32>().is_ok_and(|p| !is_protected_pid(p))
                                 });
                                 if !foreign {
                                     info!("All stale zlayer processes exited");
@@ -188,7 +199,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                                 info!("All stale zlayer processes exited");
                                 break;
                             }
-                            _ => {}
+                            Err(_) => {}
                         }
                     }
                 } else {
@@ -389,7 +400,6 @@ pub(crate) async fn serve(
 
     // Destructure the state so we can rewrap the ServiceManager for the router
     // while keeping shutdown-relevant handles separate.
-    #[allow(clippy::used_underscore_binding)]
     let crate::daemon::DaemonState {
         runtime: _runtime,
         overlay,
@@ -407,13 +417,12 @@ pub(crate) async fn serve(
         log_rotator_handle,
         health_checker_handle,
         node_config,
-        raft: _raft,
+        raft,
         raft_server_handle,
         heartbeat_handle,
         dead_node_detection_handle,
         scheduler: _scheduler,
         internal_token: daemon_internal_token,
-        replicator,
     } = state;
 
     // -----------------------------------------------------------------------
@@ -580,11 +589,8 @@ pub(crate) async fn serve(
     let tunnel_routes = build_tunnel_routes(tunnel_state);
     router = router.nest("/api/v1/tunnels", tunnel_routes);
 
-    // Merge storage replication status routes
-    let storage_api_state = match replicator.as_ref() {
-        Some(r) => zlayer_api::StorageState::with_replicator(Arc::clone(r)),
-        None => zlayer_api::StorageState::new(),
-    };
+    // Merge storage replication status routes (always disabled on ZQL)
+    let storage_api_state = zlayer_api::StorageState::new();
     let storage_routes = zlayer_api::build_storage_routes(storage_api_state);
     router = router.nest("/api/v1/storage", storage_routes);
 
@@ -635,7 +641,7 @@ pub(crate) async fn serve(
 
     let ip_allocator = Arc::new(RwLock::new(ip_allocator));
     let cluster_state = ClusterApiState::with_internal_token(
-        _raft.clone(),
+        raft.clone(),
         Some(join_secret),
         ip_allocator,
         Some(ip_allocator_path),
@@ -703,13 +709,6 @@ pub(crate) async fn serve(
     // -----------------------------------------------------------------------
     info!("API server stopped, shutting down daemon infrastructure");
 
-    // Flush SQLite replicator before tearing down infrastructure
-    if let Some(ref replicator) = replicator {
-        if let Err(e) = replicator.flush().await {
-            warn!("Failed to flush SQLite replicator: {e}");
-        }
-    }
-
     // Stop heartbeat / dead-node detection background tasks
     if let Some(handle) = heartbeat_handle {
         handle.abort();
@@ -727,8 +726,8 @@ pub(crate) async fn serve(
         let _ = handle.await;
     }
     // Shut down Raft coordinator
-    if let Some(raft) = _raft {
-        if let Err(e) = raft.shutdown().await {
+    if let Some(raft_coord) = raft {
+        if let Err(e) = raft_coord.shutdown().await {
             warn!("Raft shutdown error: {e}");
         }
     }

@@ -47,7 +47,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the binary
-COPY --from=builder /build/target/release/zlayer-web /app/zlayer-web
+COPY --from=builder /build/target/release/zlayer-web-zql /app/zlayer-web
 
 # Copy the site assets (WASM, CSS, etc.)
 COPY --from=builder /build/target/site /app/target/site

@@ -12,8 +12,8 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 use tokio::process::Command;
 use x25519_dalek::{PublicKey, StaticSecret};
-use zlayer_overlay::config::{OverlayConfig, PeerInfo};
-use zlayer_overlay::transport::OverlayTransport;
+use zlayer_overlay_zql::config::{OverlayConfig, PeerInfo};
+use zlayer_overlay_zql::transport::OverlayTransport;
 
 // ---------------------------------------------------------------------------
 // 1. Key generation test

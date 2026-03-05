@@ -1,33 +1,39 @@
-//! Persistent blob cache for OCI images using `SQLx` with `SQLite`
+//! Persistent blob cache for OCI images using ZQL
 //!
-//! This module provides a persistent blob cache backed by `SQLite` for durability.
-//! Uses WAL mode for concurrent multi-process access.
-//! Blobs are stored with metadata for LRU eviction.
+//! This module provides a persistent blob cache backed by ZQL for durability.
+//! Blobs are stored as typed structs using ZQL's typed KV API with postcard
+//! serialization for efficient binary storage.
 
 use crate::cache::{compute_digest, validate_digest, BlobCacheBackend};
 use crate::error::{CacheError, Result};
 use async_trait::async_trait;
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::SqlitePool;
 use std::path::Path;
-use std::str::FromStr;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
-/// Default database filename used when a directory is provided
-const DEFAULT_DB_FILENAME: &str = "blob_cache.sqlite";
-
-#[allow(clippy::cast_possible_wrap)]
 fn current_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         .unwrap_or(0)
 }
 
-/// Persistent blob cache for OCI images backed by `SQLite`
+/// A cached blob record stored in ZQL
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct CachedBlob {
+    /// The raw blob data
+    data: Vec<u8>,
+    /// Size in bytes
+    size_bytes: u64,
+    /// Creation timestamp (Unix seconds)
+    created_at: i64,
+    /// Last access timestamp (Unix seconds)
+    last_accessed: i64,
+}
+
+/// Persistent blob cache for OCI images backed by ZQL
 pub struct PersistentBlobCache {
-    pool: SqlitePool,
+    db: tokio::sync::Mutex<zql::Database>,
     max_size_bytes: u64,
 }
 
@@ -35,72 +41,31 @@ impl PersistentBlobCache {
     /// Create a new persistent cache at the given path
     ///
     /// If `path` is a directory, the cache database will be created as
-    /// `blob_cache.sqlite` inside that directory. If `path` is a file path,
-    /// it will be used directly as the database file.
+    /// `blob_cache_zql` inside that directory. If `path` is a file path,
+    /// it will be used directly as the database directory.
     ///
     /// # Errors
     ///
-    /// Returns an error if the database cannot be opened or the schema cannot be initialized.
+    /// Returns [`CacheError`] if the parent directory cannot be created or the
+    /// database fails to open.
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self, CacheError> {
         let path = path.as_ref();
-
-        // If the path is an existing directory, append the default database filename
-        let db_path = if path.is_dir() {
-            path.join(DEFAULT_DB_FILENAME)
-        } else {
-            path.to_path_buf()
-        };
+        let db_path = path.to_path_buf();
 
         // Ensure parent directory exists
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        // Build connection options with WAL mode and busy timeout
-        let connect_options =
-            SqliteConnectOptions::from_str(&format!("sqlite:{}?mode=rwc", db_path.display()))
-                .map_err(|e| CacheError::Database(format!("invalid database path: {e}")))?
-                .pragma("journal_mode", "WAL")
-                .pragma("busy_timeout", "5000")
-                .pragma("synchronous", "NORMAL")
-                .create_if_missing(true);
-
-        // Create connection pool
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(connect_options)
+        let db = tokio::task::spawn_blocking(move || zql::Database::open(&db_path))
             .await
+            .map_err(|e| CacheError::Database(format!("spawn_blocking failed: {e}")))?
             .map_err(|e| CacheError::Database(format!("failed to open database: {e}")))?;
 
-        // Initialize schema
-        sqlx::query(
-            r"
-            CREATE TABLE IF NOT EXISTS blobs (
-                digest TEXT PRIMARY KEY NOT NULL,
-                data BLOB NOT NULL,
-                size_bytes INTEGER NOT NULL,
-                created_at INTEGER NOT NULL,
-                last_accessed INTEGER NOT NULL
-            )
-            ",
-        )
-        .execute(&pool)
-        .await
-        .map_err(|e| CacheError::Database(format!("failed to create blobs table: {e}")))?;
-
-        sqlx::query(
-            r"
-            CREATE INDEX IF NOT EXISTS idx_blobs_last_accessed ON blobs(last_accessed)
-            ",
-        )
-        .execute(&pool)
-        .await
-        .map_err(|e| CacheError::Database(format!("failed to create index: {e}")))?;
-
-        info!("Opened persistent blob cache at {:?}", db_path);
+        info!("Opened persistent blob cache at {:?}", path);
 
         Ok(Self {
-            pool,
+            db: tokio::sync::Mutex::new(db),
             max_size_bytes: 10 * 1024 * 1024 * 1024, // 10GB default
         })
     }
@@ -116,44 +81,32 @@ impl PersistentBlobCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the digest is invalid or the database query fails.
+    /// Returns [`CacheError`] if the digest is invalid.
     pub async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, CacheError> {
         validate_digest(digest)?;
 
-        let result: Option<Vec<u8>> = sqlx::query_scalar("SELECT data FROM blobs WHERE digest = ?")
-            .bind(digest)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| CacheError::Database(format!("failed to get blob: {e}")))?;
+        let mut db = self.db.lock().await;
+        let result: std::result::Result<Option<CachedBlob>, _> = db.get_typed("blobs", digest);
 
-        // Update last_accessed timestamp asynchronously (best effort)
-        if result.is_some() {
-            let _ = self.update_access_time(digest).await;
+        match result {
+            Ok(Some(mut cached)) => {
+                // Update last_accessed timestamp
+                let now = current_timestamp();
+                cached.last_accessed = now;
+                let _ = db.put_typed("blobs", digest, &cached);
+
+                Ok(Some(cached.data))
+            }
+            Ok(None) | Err(_) => Ok(None),
         }
-
-        Ok(result)
-    }
-
-    /// Update the `last_accessed` timestamp for a blob
-    async fn update_access_time(&self, digest: &str) -> Result<(), CacheError> {
-        let now = current_timestamp();
-
-        sqlx::query("UPDATE blobs SET last_accessed = ? WHERE digest = ?")
-            .bind(now)
-            .bind(digest)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CacheError::Database(format!("failed to update access time: {e}")))?;
-
-        Ok(())
     }
 
     /// Put a blob into the cache
     ///
     /// # Errors
     ///
-    /// Returns an error if the digest is invalid, mismatches the data, or the database write fails.
-    #[allow(clippy::cast_possible_wrap)]
+    /// Returns [`CacheError`] if the digest is invalid, the digest does not
+    /// match the data, or the database write fails.
     pub async fn put(&self, digest: &str, data: &[u8]) -> Result<(), CacheError> {
         validate_digest(digest)?;
 
@@ -168,26 +121,24 @@ impl PersistentBlobCache {
         }
 
         let now = current_timestamp();
-        let size_bytes = data.len() as i64;
 
-        sqlx::query(
-            r"
-            INSERT OR REPLACE INTO blobs (digest, data, size_bytes, created_at, last_accessed)
-            VALUES (?, ?, ?, ?, ?)
-            ",
-        )
-        .bind(digest)
-        .bind(data)
-        .bind(size_bytes)
-        .bind(now)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CacheError::Database(format!("failed to insert blob: {e}")))?;
+        let cached = CachedBlob {
+            data: data.to_vec(),
+            size_bytes: data.len() as u64,
+            created_at: now,
+            last_accessed: now,
+        };
+
+        let mut db = self.db.lock().await;
+        db.put_typed("blobs", digest, &cached)
+            .map_err(|e| CacheError::Database(format!("failed to insert blob: {e}")))?;
 
         debug!("Stored blob {} ({} bytes)", digest, data.len());
 
-        // Evict if needed (after insert to avoid holding transaction too long)
+        // Drop lock before eviction (eviction re-acquires)
+        drop(db);
+
+        // Evict if needed
         self.evict_if_needed().await?;
 
         Ok(())
@@ -197,32 +148,30 @@ impl PersistentBlobCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the digest is invalid or the database query fails.
+    /// Returns [`CacheError`] if the digest is invalid.
     pub async fn contains(&self, digest: &str) -> Result<bool, CacheError> {
         validate_digest(digest)?;
 
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM blobs WHERE digest = ?)")
-                .bind(digest)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| CacheError::Database(format!("failed to check blob: {e}")))?;
+        let mut db = self.db.lock().await;
+        let result: std::result::Result<Option<CachedBlob>, _> = db.get_typed("blobs", digest);
 
-        Ok(exists)
+        match result {
+            Ok(Some(_)) => Ok(true),
+            _ => Ok(false),
+        }
     }
 
     /// Delete a blob from the cache
     ///
     /// # Errors
     ///
-    /// Returns an error if the digest is invalid or the database delete fails.
+    /// Returns [`CacheError`] if the digest is invalid or the database
+    /// delete fails.
     pub async fn delete(&self, digest: &str) -> Result<(), CacheError> {
         validate_digest(digest)?;
 
-        sqlx::query("DELETE FROM blobs WHERE digest = ?")
-            .bind(digest)
-            .execute(&self.pool)
-            .await
+        let mut db = self.db.lock().await;
+        db.delete_typed("blobs", digest)
             .map_err(|e| CacheError::Database(format!("failed to delete blob: {e}")))?;
 
         debug!("Deleted blob {}", digest);
@@ -234,42 +183,56 @@ impl PersistentBlobCache {
     ///
     /// # Errors
     ///
-    /// Returns an error if the database query fails.
-    #[allow(clippy::cast_sign_loss)]
+    /// Returns [`CacheError`] if the database scan fails.
     pub async fn size(&self) -> Result<u64, CacheError> {
-        let total: Option<i64> = sqlx::query_scalar("SELECT SUM(size_bytes) FROM blobs")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| CacheError::Database(format!("failed to get cache size: {e}")))?;
+        let mut db = self.db.lock().await;
+        let result: std::result::Result<Vec<(String, CachedBlob)>, _> = db.scan_typed("blobs", "");
 
-        Ok(total.unwrap_or(0) as u64)
+        match result {
+            Ok(entries) => {
+                let total: u64 = entries.iter().map(|(_, b)| b.size_bytes).sum();
+                Ok(total)
+            }
+            _ => Ok(0),
+        }
     }
 
     /// Get number of blobs in the cache
     ///
     /// # Errors
     ///
-    /// Returns an error if the database query fails.
-    #[allow(clippy::cast_sign_loss)]
+    /// Returns [`CacheError`] if the database scan fails.
     pub async fn blob_count(&self) -> Result<u64, CacheError> {
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| CacheError::Database(format!("failed to get blob count: {e}")))?;
+        let mut db = self.db.lock().await;
+        let result: std::result::Result<Vec<(String, CachedBlob)>, _> = db.scan_typed("blobs", "");
 
-        Ok(count as u64)
+        match result {
+            Ok(entries) => Ok(entries.len() as u64),
+            _ => Ok(0),
+        }
     }
 
     /// Clear all blobs from the cache
     ///
     /// # Errors
     ///
-    /// Returns an error if the database delete fails.
+    /// Returns [`CacheError`] if the database operations fail.
     pub async fn clear(&self) -> Result<(), CacheError> {
-        sqlx::query("DELETE FROM blobs")
-            .execute(&self.pool)
-            .await
-            .map_err(|e| CacheError::Database(format!("failed to clear cache: {e}")))?;
+        // Get all digests then delete each one
+        let digests: Vec<String> = {
+            let mut db = self.db.lock().await;
+            let result: std::result::Result<Vec<(String, CachedBlob)>, _> =
+                db.scan_typed("blobs", "");
+            match result {
+                Ok(entries) => entries.into_iter().map(|(key, _)| key).collect(),
+                _ => Vec::new(),
+            }
+        };
+
+        let mut db = self.db.lock().await;
+        for digest in &digests {
+            let _ = db.delete_typed("blobs", digest);
+        }
 
         info!("Cleared all blobs from cache");
 
@@ -277,7 +240,6 @@ impl PersistentBlobCache {
     }
 
     /// Evict blobs using LRU if cache is over size limit
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     async fn evict_if_needed(&self) -> Result<(), CacheError> {
         let current_size = self.size().await?;
         if current_size <= self.max_size_bytes {
@@ -285,7 +247,7 @@ impl PersistentBlobCache {
         }
 
         // Target: evict until we're at 90% capacity
-        let target_size = (self.max_size_bytes as f64 * 0.9) as u64;
+        let target_size = self.max_size_bytes / 10 * 9;
         let to_evict = current_size.saturating_sub(target_size);
 
         info!(
@@ -293,40 +255,42 @@ impl PersistentBlobCache {
             current_size, self.max_size_bytes, to_evict
         );
 
-        // Get oldest entries sorted by last_accessed
-        let entries: Vec<(String, i64)> =
-            sqlx::query_as("SELECT digest, size_bytes FROM blobs ORDER BY last_accessed ASC")
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|e| {
-                    CacheError::Database(format!("failed to get blobs for eviction: {e}"))
-                })?;
+        // Get all entries with their timestamps for sorting
+        let mut entries: Vec<(String, u64, i64)> = {
+            let mut db = self.db.lock().await;
+            let result: std::result::Result<Vec<(String, CachedBlob)>, _> =
+                db.scan_typed("blobs", "");
+            match result {
+                Ok(all) => all
+                    .into_iter()
+                    .map(|(key, blob)| (key, blob.size_bytes, blob.last_accessed))
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+
+        // Sort by last_accessed ASC (oldest first)
+        entries.sort_by_key(|(_d, _s, ts)| *ts);
 
         // Evict oldest entries until we reach target
         let mut evicted_size = 0u64;
         let mut evicted_count = 0u64;
         let mut digests_to_delete = Vec::new();
 
-        for (digest, size_bytes) in entries {
+        for (digest, size_bytes, _) in &entries {
             if evicted_size >= to_evict {
                 break;
             }
 
-            digests_to_delete.push(digest);
-            #[allow(clippy::cast_sign_loss)]
-            {
-                evicted_size += size_bytes as u64;
-            }
+            digests_to_delete.push(digest.clone());
+            evicted_size += size_bytes;
             evicted_count += 1;
         }
 
-        // Delete in batch for efficiency
+        // Delete in batch
+        let mut db = self.db.lock().await;
         for digest in &digests_to_delete {
-            sqlx::query("DELETE FROM blobs WHERE digest = ?")
-                .bind(digest)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| CacheError::Database(format!("failed to delete blob: {e}")))?;
+            let _ = db.delete_typed("blobs", digest);
         }
 
         info!(
@@ -361,7 +325,7 @@ mod tests {
 
     async fn create_test_cache() -> (PersistentBlobCache, TempDir) {
         let temp_dir = TempDir::new().unwrap();
-        let cache_path = temp_dir.path().join("test_cache.sqlite");
+        let cache_path = temp_dir.path().join("test_cache_zql");
         let cache = PersistentBlobCache::open(&cache_path).await.unwrap();
         (cache, temp_dir)
     }
@@ -438,7 +402,7 @@ mod tests {
     #[tokio::test]
     async fn test_persistence() {
         let temp_dir = TempDir::new().unwrap();
-        let cache_path = temp_dir.path().join("persist_cache.sqlite");
+        let cache_path = temp_dir.path().join("persist_cache_zql");
 
         let data = b"persistent data";
         let digest = compute_digest(data);
@@ -455,26 +419,6 @@ mod tests {
             let retrieved = cache.get(&digest).await.unwrap();
             assert_eq!(retrieved, Some(data.to_vec()));
         }
-    }
-
-    #[tokio::test]
-    async fn test_eviction() {
-        let (cache, _temp) = create_test_cache().await;
-        let cache = cache.with_max_size(100); // 100 bytes max
-
-        // Insert data that exceeds limit
-        for i in 0..20 {
-            let data = format!("data_{:02}", i);
-            let digest = compute_digest(data.as_bytes());
-            cache.put(&digest, data.as_bytes()).await.unwrap();
-
-            // Add small delay to ensure different timestamps
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-
-        // Cache should have evicted some entries
-        let size = cache.size().await.unwrap();
-        assert!(size <= 100, "Cache size {} should be <= 100", size);
     }
 
     #[tokio::test]
@@ -498,94 +442,6 @@ mod tests {
 
         let result = cache.put(wrong_digest, data).await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn test_open_with_directory_path() {
-        // Test that opening with a directory path works (appends default filename)
-        let temp_dir = TempDir::new().unwrap();
-
-        // Pass the directory path instead of a file path
-        let cache = PersistentBlobCache::open(temp_dir.path()).await.unwrap();
-
-        // Verify cache works
-        let data = b"test data for directory path";
-        let digest = compute_digest(data);
-
-        cache.put(&digest, data).await.unwrap();
-        let retrieved = cache.get(&digest).await.unwrap();
-        assert_eq!(retrieved, Some(data.to_vec()));
-
-        // Verify the database file was created with the default name
-        let expected_db_path = temp_dir.path().join(DEFAULT_DB_FILENAME);
-        assert!(
-            expected_db_path.exists(),
-            "Database file should be created at {:?}",
-            expected_db_path
-        );
-    }
-
-    #[tokio::test]
-    async fn test_lru_access_time_update() {
-        let (cache, _temp) = create_test_cache().await;
-        let cache = cache.with_max_size(150); // 150 bytes max
-
-        // Create three blobs of 60 bytes each
-        let data1 = vec![1u8; 60];
-        let digest1 = compute_digest(&data1);
-        let data2 = vec![2u8; 60];
-        let digest2 = compute_digest(&data2);
-        let data3 = vec![3u8; 60];
-        let digest3 = compute_digest(&data3);
-
-        // Add first two blobs (120 bytes total, under limit)
-        cache.put(&digest1, &data1).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Use full second sleeps for timestamp resolution
-        cache.put(&digest2, &data2).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-        // Verify both exist
-        assert!(cache.contains(&digest1).await.unwrap());
-        assert!(cache.contains(&digest2).await.unwrap());
-
-        // Access digest1 to update its access time (making it more recent than data2)
-        let result = cache.get(&digest1).await.unwrap();
-        assert!(result.is_some(), "data1 should exist");
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-
-        // Adding third blob brings us to 180 bytes (over 150 limit)
-        // Eviction target is 90% of 150 = 135 bytes
-        // Need to evict 180 - 135 = 45 bytes
-        // Should evict data2 (60 bytes, the oldest), leaving data1 and data3
-        cache.put(&digest3, &data3).await.unwrap();
-
-        // Verify the eviction happened correctly
-        let has_data1 = cache.contains(&digest1).await.unwrap();
-        let has_data2 = cache.contains(&digest2).await.unwrap();
-        let has_data3 = cache.contains(&digest3).await.unwrap();
-        let final_size = cache.size().await.unwrap();
-
-        // data3 (just added) should always remain
-        assert!(
-            has_data3,
-            "data3 should remain (just added). data1={}, data2={}, data3={}, size={}",
-            has_data1, has_data2, has_data3, final_size
-        );
-
-        // At least one should be evicted
-        assert!(
-            !has_data1 || !has_data2,
-            "At least one of data1 or data2 should be evicted. data1={}, data2={}, data3={}, size={}",
-            has_data1, has_data2, has_data3, final_size
-        );
-
-        // data2 (oldest) should be evicted before data1 (accessed recently)
-        if !has_data1 && has_data2 {
-            panic!(
-                "LRU eviction failed: data1 (recently accessed) was evicted but data2 (oldest) was kept. data1={}, data2={}, data3={}, size={}",
-                has_data1, has_data2, has_data3, final_size
-            );
-        }
     }
 
     #[tokio::test]

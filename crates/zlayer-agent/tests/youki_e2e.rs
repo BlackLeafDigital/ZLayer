@@ -22,13 +22,13 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use zlayer_agent::{
+use zlayer_agent_zql::{
     AgentError, ContainerId, ContainerState, HealthChecker, OverlayManager, ProxyManager,
     ProxyManagerConfig, Runtime, ServiceInstance, ServiceManager, YoukiConfig, YoukiRuntime,
 };
 use zlayer_overlay::DnsServer;
 use zlayer_proxy::ServiceRegistry;
-use zlayer_spec::{DeploymentSpec, HealthCheck, ServiceSpec};
+use zlayer_spec_zql::{DeploymentSpec, HealthCheck, ServiceSpec};
 
 /// Macro to run async test body with a timeout
 macro_rules! with_timeout {

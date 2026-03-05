@@ -49,7 +49,7 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the binary
-COPY --from=builder /build/target/release/zlayer-manager /app/zlayer-manager
+COPY --from=builder /build/target/release/zlayer-manager-zql /app/zlayer-manager
 
 # Copy the site assets (WASM, CSS, JS, etc.)
 COPY --from=builder /build/target/site /app/target/site

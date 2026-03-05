@@ -1,12 +1,12 @@
 [package]
-name = "zlayer-manager"
+name = "zlayer-manager-zql"
 version.workspace = true
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 rust-version.workspace = true
-publish = false
 
 [dependencies]
 axum = { workspace = true, optional = true }
@@ -38,10 +38,11 @@ zlayer-spec = { workspace = true, optional = true }
 workspace = true
 
 [lib]
+name = "zlayer_manager"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "zlayer-manager"
+name = "zlayer-manager-zql"
 path = "src/main.rs"
 required-features = ["ssr"]
 
@@ -93,7 +94,7 @@ tailwind-input-file = "./tailwind.css"
 bin-features = ["ssr"]
 lib-features = ["hydrate"]
 # Targets
-bin-target = "zlayer-manager"
+bin-target = "zlayer-manager-zql"
 # Environment
 env = "DEV"
 # Hash files for cache busting

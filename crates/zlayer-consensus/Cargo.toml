@@ -1,5 +1,5 @@
 [package]
-name = "zlayer-consensus"
+name = "zlayer-consensus-zql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -15,6 +15,7 @@ openraft = { workspace = true, features = ["serde", "storage-v2"] }
 
 # Serialization
 serde = { workspace = true }
+serde_json = { workspace = true, optional = true }
 bincode = "1"
 
 # Async
@@ -32,15 +33,21 @@ axum = { workspace = true }
 # HTTP client (for Raft RPC client)
 reqwest = { workspace = true }
 
+# Hex encoding for binary data in ZQL
+hex = { workspace = true }
+
 # Persistent storage (optional)
+zql = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"
 
 [features]
 default = ["mem-store"]
 mem-store = []
+zql-store = ["dep:zql", "dep:serde_json"]
 redb-store = ["dep:redb"]
 
 [lints]

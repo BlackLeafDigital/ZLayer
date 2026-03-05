@@ -1,12 +1,12 @@
 [package]
-name = "zlayer-py"
+name = "zlayer-py-zql"
 version.workspace = true
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Python bindings for ZLayer container runtime"
-publish = false
 keywords = ["container", "python", "pyo3", "bindings", "orchestration"]
 categories = ["api-bindings", "development-tools::ffi"]
 readme = "README.md"

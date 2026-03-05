@@ -1,12 +1,12 @@
 [package]
-name = "zlayer-proxy"
+name = "zlayer-proxy-zql"
 version.workspace = true
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "High-performance reverse proxy with TLS termination and L4/L7 routing"
-publish = false
 keywords = ["proxy", "reverse-proxy", "tls", "load-balancer"]
 categories = ["network-programming", "web-programming"]
 readme = "README.md"

@@ -19,7 +19,7 @@ use zlayer_agent::{
     ContainerSupervisor, OverlayManager, ProxyManager, ProxyManagerConfig, Runtime, RuntimeConfig,
     ServiceManager,
 };
-use zlayer_api::{DeploymentStatus, DeploymentStorage, SqlxStorage, StoredDeployment};
+use zlayer_api::{DeploymentStatus, DeploymentStorage, StoredDeployment, ZqlStorage};
 use zlayer_overlay::{DnsHandle, DnsServer, OverlayTransport};
 use zlayer_proxy::{CertManager, ServiceRegistry, StreamRegistry};
 use zlayer_scheduler::{
@@ -60,7 +60,7 @@ pub struct DaemonConfig {
     /// Runtime directory (sockets, PID files).  Default: `{data_dir}/run` on macOS, `/var/run/zlayer` on Linux.
     pub run_dir: PathBuf,
 
-    /// S3 configuration for `SQLite` replication (None = disabled).
+    /// S3 configuration for layer storage (None = disabled).
     pub s3_storage: Option<zlayer_storage::LayerStorageConfig>,
 }
 
@@ -116,8 +116,8 @@ pub struct DaemonState {
     /// Service manager wired to all subsystems.
     pub manager: Arc<ServiceManager>,
 
-    /// Persistent deployment storage (`SQLite`).
-    pub storage: Arc<SqlxStorage>,
+    /// Persistent deployment storage (ZQL).
+    pub storage: Arc<ZqlStorage>,
 
     /// Persistent encrypted secrets store (`SQLite` + XChaCha20-Poly1305).
     pub secrets: Arc<PersistentSecretsStore>,
@@ -159,10 +159,6 @@ pub struct DaemonState {
     /// Internal authentication token shared between the scheduler and the API.
     /// Needed by serve.rs to create `InternalState` with the same token.
     pub internal_token: String,
-
-    /// `SQLite` replicator for deployment DB backup to S3.
-    /// `None` when S3 storage is not configured.
-    pub replicator: Option<Arc<zlayer_storage::SqliteReplicator>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +249,8 @@ pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Resu
 ///
 /// # Errors
 ///
-/// Returns an error if any infrastructure phase fails to initialize.
+/// Returns an error if any critical infrastructure phase fails (e.g. directory
+/// creation, runtime init, storage open, secrets store open, or node config).
 #[allow(clippy::too_many_lines)]
 pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
@@ -439,52 +436,14 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     info!("Service manager initialised");
 
     // -----------------------------------------------------------------------
-    // Phase 9: Persistent deployment storage (SQLite)
+    // Phase 9: Persistent deployment storage (ZQL)
     // -----------------------------------------------------------------------
-    let db_path = config.data_dir.join("deployments.db");
+    let db_path = config.data_dir.join("deployments_zql");
     let storage =
-        Arc::new(SqlxStorage::open(&db_path).await.with_context(|| {
+        Arc::new(ZqlStorage::open(&db_path).await.with_context(|| {
             format!("Failed to open deployment storage at {}", db_path.display())
         })?);
     info!(path = %db_path.display(), "Deployment storage opened");
-
-    // -----------------------------------------------------------------------
-    // Phase 9b: SQLite replication to S3
-    // -----------------------------------------------------------------------
-    let replicator = if let Some(ref s3_config) = config.s3_storage {
-        let replicator_config = zlayer_storage::SqliteReplicatorConfig::new(
-            &db_path,
-            &s3_config.bucket,
-            format!("{}/deployments/", config.deployment_name),
-        )
-        .with_auto_restore(true)
-        .with_cache_dir(config.data_dir.join("replicator-cache"));
-
-        match zlayer_storage::SqliteReplicator::new(replicator_config, s3_config).await {
-            Ok(replicator) => {
-                // Auto-restore on startup if backup exists
-                match replicator.restore().await {
-                    Ok(true) => info!("Deployment DB restored from S3 backup"),
-                    Ok(false) => info!("No S3 backup found, starting fresh"),
-                    Err(e) => warn!("S3 restore failed (non-fatal): {e}"),
-                }
-                // Start background WAL monitoring
-                if let Err(e) = replicator.start().await {
-                    warn!("Failed to start SQLite replicator (non-fatal): {e}");
-                    None
-                } else {
-                    info!("SQLite replication to S3 started");
-                    Some(Arc::new(replicator))
-                }
-            }
-            Err(e) => {
-                warn!("Failed to create SQLite replicator (non-fatal): {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
 
     // -----------------------------------------------------------------------
     // Phase 10: Persistent secrets store
@@ -558,11 +517,11 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // Phase 15: Raft distributed consensus
     // -----------------------------------------------------------------------
     let (raft, raft_server_handle) = {
-        let _raft_db_path = config.data_dir.join("raft.db");
         let raft_cfg = RaftConfig {
             node_id: node_config.raft_node_id,
             address: format!("{}:{}", node_config.advertise_addr, node_config.raft_port),
             raft_port: node_config.raft_port,
+            data_dir: config.data_dir.join("raft"),
             ..Default::default()
         };
 
@@ -736,7 +695,6 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         dead_node_detection_handle,
         scheduler,
         internal_token,
-        replicator,
     })
 }
 
@@ -808,7 +766,6 @@ async fn heartbeat_loop(
 ///
 /// When a scheduler is provided, the loop also triggers rescheduling of the
 /// dead node's containers to remaining live nodes.
-#[allow(clippy::cast_possible_truncation)]
 async fn dead_node_detection_loop(
     raft: Arc<zlayer_scheduler::RaftCoordinator>,
     scheduler: Option<Arc<Scheduler>>,
@@ -823,10 +780,13 @@ async fn dead_node_detection_loop(
         }
 
         let state = raft.read_state().await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64; // milliseconds since epoch fits in u64
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         let self_id = raft.node_id();
 
@@ -836,7 +796,9 @@ async fn dead_node_detection_loop(
                 continue;
             }
 
-            if now.saturating_sub(node_info.last_heartbeat) > timeout.as_millis() as u64 {
+            if now.saturating_sub(node_info.last_heartbeat)
+                > u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
+            {
                 warn!(
                     node_id = id,
                     last_heartbeat_ms = node_info.last_heartbeat,
@@ -1147,7 +1109,7 @@ async fn cleanup_old_logs_walk(
 ///
 /// # Errors
 ///
-/// Returns an error if listing deployments from storage fails.
+/// Returns an error if the deployment list cannot be read from storage.
 pub async fn restore_deployments(state: &DaemonState) -> Result<()> {
     let deployments = state
         .storage

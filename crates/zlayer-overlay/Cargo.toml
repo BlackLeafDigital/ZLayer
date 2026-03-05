@@ -1,5 +1,5 @@
 [package]
-name = "zlayer-overlay"
+name = "zlayer-overlay-zql"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

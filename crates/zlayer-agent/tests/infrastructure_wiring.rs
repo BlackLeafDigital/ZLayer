@@ -15,15 +15,15 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use zlayer_agent::overlay_manager::OverlayManager;
-use zlayer_agent::proxy_manager::{ProxyManager, ProxyManagerConfig};
-use zlayer_agent::runtime::MockRuntime;
-use zlayer_agent::service::ServiceManager;
-use zlayer_agent::ContainerSupervisor;
-use zlayer_agent::Runtime;
+use zlayer_agent_zql::overlay_manager::OverlayManager;
+use zlayer_agent_zql::proxy_manager::{ProxyManager, ProxyManagerConfig};
+use zlayer_agent_zql::runtime::MockRuntime;
+use zlayer_agent_zql::service::ServiceManager;
+use zlayer_agent_zql::ContainerSupervisor;
+use zlayer_agent_zql::Runtime;
 use zlayer_overlay::DnsServer;
 use zlayer_proxy::{ServiceRegistry, StreamRegistry};
-use zlayer_spec::{DeploymentSpec, ServiceSpec};
+use zlayer_spec_zql::{DeploymentSpec, ServiceSpec};
 
 fn mock_http_spec() -> ServiceSpec {
     serde_yml::from_str::<DeploymentSpec>(

@@ -85,7 +85,11 @@ impl<'a, T: PaneEntry> ScrollablePane<'a, T> {
 }
 
 impl<T: PaneEntry> Widget for ScrollablePane<'_, T> {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        clippy::cast_sign_loss
+    )]
     fn render(self, area: Rect, buf: &mut Buffer) {
         if area.height == 0 || area.width == 0 {
             return;

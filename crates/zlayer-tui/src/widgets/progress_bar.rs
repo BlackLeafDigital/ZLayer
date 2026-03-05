@@ -98,7 +98,11 @@ impl ProgressBar {
     }
 
     /// Build the bar characters for a given `width` (in columns).
-    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     fn bar_string(ratio: f64, width: usize) -> String {
         let filled = (width as f64 * ratio).round() as usize;
         let empty = width.saturating_sub(filled);

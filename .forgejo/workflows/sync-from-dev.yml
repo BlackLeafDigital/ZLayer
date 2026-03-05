@@ -1,0 +1,62 @@
+name: Sync from dev
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: zdb
+          fetch-depth: 0
+          token: ${{ secrets.FORGEJO_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "Zach Handley"
+          git config user.email "zachhandley@gmail.com"
+
+      - name: Check for new commits
+        id: check
+        run: |
+          git fetch origin dev
+          BEHIND=$(git rev-list --count zdb..origin/dev)
+          echo "behind=$BEHIND" >> "$GITHUB_OUTPUT"
+          if [ "$BEHIND" = "0" ]; then
+            echo "Already up to date with dev"
+          else
+            echo "$BEHIND new commit(s) on dev"
+          fi
+
+      - name: Sync dev into zdb
+        if: steps.check.outputs.behind != '0'
+        run: |
+          if git merge origin/dev --no-edit; then
+            echo "Clean merge — pushing"
+            git push origin zdb
+          else
+            echo "Conflicts detected — auto-resolving..."
+            FAILED=false
+            for f in $(git diff --name-only --diff-filter=U); do
+              if echo "$f" | grep -qiE 'zql|Cargo\.toml|Cargo\.lock|persistent_cache|persistent_raft'; then
+                echo "  Keeping zdb version: $f"
+                git checkout --ours "$f"
+                git add "$f"
+              else
+                echo "::error::Cannot auto-resolve conflict in: $f"
+                FAILED=true
+              fi
+            done
+
+            if [ "$FAILED" = "true" ]; then
+              git merge --abort
+              exit 1
+            fi
+
+            git commit --no-edit
+            git push origin zdb
+          fi

@@ -298,9 +298,7 @@ pub async fn load_existing_certs_into_resolver(
         };
 
         // Load into SNI resolver
-        match sni_resolver
-            .load_cert(&cert_info.domain, &cert_pem, &key_pem)
-        {
+        match sni_resolver.load_cert(&cert_info.domain, &cert_pem, &key_pem) {
             Ok(()) => {
                 tracing::info!(
                     domain = %cert_info.domain,

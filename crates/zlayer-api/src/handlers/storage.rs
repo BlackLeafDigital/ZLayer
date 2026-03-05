@@ -1,10 +1,8 @@
 //! Storage replication status endpoint
 //!
-//! Provides a read-only endpoint for querying the SQLite-to-S3 replication
-//! status. Returns whether replication is enabled, its current state, the
-//! last sync timestamp, and the number of pending changes.
-
-use std::sync::Arc;
+//! Provides a read-only endpoint for querying the storage replication status.
+//! On the ZQL branch, `SQLite` WAL replication is not used, so this always
+//! returns a "disabled" status while preserving the API contract.
 
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
@@ -12,7 +10,6 @@ use utoipa::ToSchema;
 
 use crate::auth::AuthUser;
 use crate::error::Result;
-use zlayer_storage::SqliteReplicator;
 
 /// Replication detail within the storage status response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -37,10 +34,7 @@ pub struct StorageStatusResponse {
 
 /// State for storage status endpoint
 #[derive(Clone)]
-pub struct StorageState {
-    /// Optional `SQLite` replicator (None when S3 is not configured)
-    pub replicator: Option<Arc<SqliteReplicator>>,
-}
+pub struct StorageState;
 
 impl Default for StorageState {
     fn default() -> Self {
@@ -49,29 +43,21 @@ impl Default for StorageState {
 }
 
 impl StorageState {
-    /// Create a new storage state with no replicator (disabled)
+    /// Create a new storage state (replication is always disabled on ZQL)
     #[must_use]
     pub fn new() -> Self {
-        Self { replicator: None }
-    }
-
-    /// Create a storage state with a replicator
-    #[must_use]
-    pub fn with_replicator(replicator: Arc<SqliteReplicator>) -> Self {
-        Self {
-            replicator: Some(replicator),
-        }
+        Self
     }
 }
 
-/// Get storage replication status.
+/// Get storage replication status
 ///
-/// Returns the current state of SQLite-to-S3 replication including whether
-/// it is enabled, the last sync time, and pending change count.
+/// Returns the current state of storage replication. On the ZQL backend
+/// this always reports "disabled" since `SQLite` WAL replication is not used.
 ///
 /// # Errors
 ///
-/// Returns an error if authentication fails.
+/// Returns an error if the handler fails to build the status response.
 #[utoipa::path(
     get,
     path = "/api/v1/storage/status",
@@ -84,34 +70,13 @@ impl StorageState {
 )]
 pub async fn get_storage_status(
     _user: AuthUser,
-    State(state): State<StorageState>,
+    State(_state): State<StorageState>,
 ) -> Result<Json<StorageStatusResponse>> {
-    let replication = match &state.replicator {
-        Some(replicator) => {
-            let status = replicator.status();
-            let status_str = if status.running {
-                "active"
-            } else if status.failed_uploads > 0 {
-                "error"
-            } else {
-                "disabled"
-            };
-
-            let last_sync = status.last_wal_sync.map(|ts| ts.to_rfc3339());
-
-            ReplicationInfo {
-                enabled: true,
-                status: status_str.to_string(),
-                last_sync,
-                pending_changes: status.pending_segments,
-            }
-        }
-        None => ReplicationInfo {
-            enabled: false,
-            status: "disabled".to_string(),
-            last_sync: None,
-            pending_changes: 0,
-        },
+    let replication = ReplicationInfo {
+        enabled: false,
+        status: "disabled".to_string(),
+        last_sync: None,
+        pending_changes: 0,
     };
 
     Ok(Json(StorageStatusResponse { replication }))
@@ -123,14 +88,12 @@ mod tests {
 
     #[test]
     fn test_storage_state_default() {
-        let state = StorageState::default();
-        assert!(state.replicator.is_none());
+        let _state = StorageState::default();
     }
 
     #[test]
     fn test_storage_state_new() {
-        let state = StorageState::new();
-        assert!(state.replicator.is_none());
+        let _state = StorageState::new();
     }
 
     #[test]

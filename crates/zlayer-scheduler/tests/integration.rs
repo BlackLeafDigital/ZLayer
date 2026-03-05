@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
-use zlayer_scheduler::{
+use zlayer_scheduler_zql::{
     MockMetricsSource, RaftConfig, ScalingDecision, Scheduler, SchedulerConfig, ServiceMetrics,
 };
 use zlayer_spec::{ScaleSpec, ScaleTargets};

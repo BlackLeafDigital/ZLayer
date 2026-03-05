@@ -1,10 +1,14 @@
-//! Persistent secrets storage using `SQLite` (via `SQLx`).
+//! Persistent secrets storage using ZQL.
 //!
-//! Provides encrypted local storage for secrets with a single table combining
-//! secret values and metadata:
-//! - `storage_key`: Primary key in `{scope}:{name}` format
-//! - `encrypted_value`: XChaCha20-Poly1305 encrypted secret bytes
-//! - `name`, `version`, `created_at`, `updated_at`: Metadata fields
+//! Provides encrypted local storage for secrets using ZQL's typed KV API.
+//! Secrets are encrypted with XChaCha20-Poly1305 before storage.
+//!
+//! Each secret is stored as a `StoredSecret` struct containing:
+//! - `encrypted_value`: The encrypted secret bytes
+//! - `name`: The secret name
+//! - `version`: Version number (incremented on each update)
+//! - `created_at`: ISO 8601 creation timestamp
+//! - `updated_at`: ISO 8601 last-update timestamp
 //!
 //! # Example
 //!
@@ -30,64 +34,61 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use async_trait::async_trait;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
-use sqlx::{Row, SqlitePool};
 use tracing::{debug, info};
 
 use crate::{
     EncryptionKey, Result, Secret, SecretMetadata, SecretsError, SecretsProvider, SecretsStore,
 };
 
-/// Default database filename when a directory is provided.
-const DEFAULT_DB_FILENAME: &str = "secrets.sqlite";
+/// Default database directory name when a directory is provided.
+const DEFAULT_DB_DIRNAME: &str = "secrets_zql";
 
-/// SQL schema for the secrets table.
-const SCHEMA: &str = r"
-CREATE TABLE IF NOT EXISTS secrets (
-    storage_key TEXT PRIMARY KEY NOT NULL,
-    encrypted_value BLOB NOT NULL,
-    name TEXT NOT NULL,
-    version INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_secrets_prefix ON secrets(storage_key);
-";
+/// Internal struct stored in ZQL for each secret.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct StoredSecret {
+    /// Encrypted secret value bytes
+    encrypted_value: Vec<u8>,
+    /// Secret name
+    name: String,
+    /// Version number
+    version: u32,
+    /// ISO 8601 creation timestamp
+    created_at: String,
+    /// ISO 8601 last-update timestamp
+    updated_at: String,
+}
 
-/// Persistent secrets store backed by `SQLite` with encryption.
+/// Persistent secrets store backed by ZQL with encryption.
 ///
 /// Secrets are encrypted using XChaCha20-Poly1305 before storage.
 /// Metadata is stored alongside secrets for inspection and auditing.
-///
-/// The store uses `SQLite` with WAL mode for concurrent access.
 pub struct PersistentSecretsStore {
-    pool: SqlitePool,
+    db: tokio::sync::Mutex<zql::Database>,
     key: EncryptionKey,
 }
 
 impl PersistentSecretsStore {
     /// Opens or creates a persistent secrets store at the given path.
     ///
-    /// If `path` is a directory, the database file will be created as
-    /// `secrets.sqlite` inside that directory. If `path` is a file path,
+    /// If `path` is a directory, the database will be created as
+    /// `secrets_zql` inside that directory. If `path` is a file path,
     /// it will be used directly.
     ///
     /// # Arguments
     ///
-    /// * `path` - Path to the database file or directory
+    /// * `path` - Path to the database directory
     /// * `key` - Encryption key for encrypting/decrypting secrets
     ///
     /// # Errors
     ///
     /// Returns `SecretsError::Storage` if:
     /// - The database cannot be created or opened
-    /// - Schema initialization fails
     pub async fn open(path: impl AsRef<Path>, key: EncryptionKey) -> Result<Self> {
         let path = path.as_ref();
 
-        // If the path is an existing directory, append the default database filename
+        // If the path is an existing directory, append the default database dirname
         let db_path = if path.is_dir() {
-            path.join(DEFAULT_DB_FILENAME)
+            path.join(DEFAULT_DB_DIRNAME)
         } else {
             path.to_path_buf()
         };
@@ -98,35 +99,17 @@ impl PersistentSecretsStore {
                 .map_err(|e| SecretsError::Storage(format!("Failed to create directory: {e}")))?;
         }
 
-        // Configure SQLite connection with WAL mode for better concurrency
-        let options = SqliteConnectOptions::new()
-            .filename(&db_path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .synchronous(SqliteSynchronous::Normal)
-            .busy_timeout(std::time::Duration::from_secs(30));
-
-        // Create connection pool
-        let pool = SqlitePoolOptions::new()
-            .max_connections(5)
-            .connect_with(options)
+        let db = tokio::task::spawn_blocking(move || zql::Database::open(&db_path))
             .await
-            .map_err(|e| {
-                SecretsError::Storage(format!(
-                    "Failed to open database at {}: {e}",
-                    db_path.display()
-                ))
-            })?;
+            .map_err(|e| SecretsError::Storage(format!("spawn_blocking failed: {e}")))?
+            .map_err(|e| SecretsError::Storage(format!("Failed to open database: {e}")))?;
 
-        // Initialize schema
-        sqlx::query(SCHEMA)
-            .execute(&pool)
-            .await
-            .map_err(|e| SecretsError::Storage(format!("Failed to initialize schema: {e}")))?;
+        info!("Opened persistent secrets store at {}", path.display());
 
-        info!("Opened persistent secrets store at {}", db_path.display());
-
-        Ok(Self { pool, key })
+        Ok(Self {
+            db: tokio::sync::Mutex::new(db),
+            key,
+        })
     }
 
     /// Constructs a storage key from scope and name.
@@ -144,7 +127,6 @@ impl PersistentSecretsStore {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        // Convert to ISO 8601 format for SQLite TEXT storage
         chrono::DateTime::from_timestamp(now as i64, 0).map_or_else(
             || "1970-01-01T00:00:00Z".to_string(),
             |dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
@@ -157,6 +139,18 @@ impl PersistentSecretsStore {
             .map(|dt| dt.timestamp())
             .unwrap_or(0)
     }
+
+    /// Get a stored secret record by storage key
+    async fn get_record(&self, storage_key: &str) -> Result<Option<StoredSecret>> {
+        let mut db = self.db.lock().await;
+        let result: std::result::Result<Option<StoredSecret>, _> =
+            db.get_typed("secrets", storage_key);
+
+        match result {
+            Ok(record) => Ok(record),
+            Err(_) => Ok(None),
+        }
+    }
 }
 
 #[async_trait]
@@ -164,19 +158,11 @@ impl SecretsProvider for PersistentSecretsStore {
     async fn get_secret(&self, scope: &str, name: &str) -> Result<Secret> {
         let storage_key = Self::make_key(scope, name);
 
-        let row = sqlx::query("SELECT encrypted_value FROM secrets WHERE storage_key = ?")
-            .bind(&storage_key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| SecretsError::Storage(format!("Failed to query secret: {e}")))?;
+        let record = self.get_record(&storage_key).await?;
 
-        match row {
-            Some(row) => {
-                let encrypted_value: Vec<u8> = row
-                    .try_get("encrypted_value")
-                    .map_err(|e| SecretsError::Storage(format!("Failed to read value: {e}")))?;
-
-                let decrypted = self.key.decrypt(&encrypted_value)?;
+        match record {
+            Some(stored) => {
+                let decrypted = self.key.decrypt(&stored.encrypted_value)?;
 
                 let value = String::from_utf8(decrypted)
                     .map_err(|e| SecretsError::Decryption(format!("Invalid UTF-8: {e}")))?;
@@ -194,8 +180,6 @@ impl SecretsProvider for PersistentSecretsStore {
         let mut results = HashMap::with_capacity(names.len());
 
         for name in names {
-            // For batch retrieval, we silently skip missing secrets
-            // rather than returning an error
             if let Ok(secret) = self.get_secret(scope, name).await {
                 results.insert((*name).to_string(), secret);
             }
@@ -205,55 +189,39 @@ impl SecretsProvider for PersistentSecretsStore {
     }
 
     async fn list_secrets(&self, scope: &str) -> Result<Vec<SecretMetadata>> {
-        let prefix = format!("{scope}:%");
+        let prefix = format!("{scope}:");
 
-        let rows = sqlx::query(
-            "SELECT name, version, created_at, updated_at FROM secrets WHERE storage_key LIKE ? ORDER BY name",
-        )
-        .bind(&prefix)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| SecretsError::Storage(format!("Failed to list secrets: {e}")))?;
+        let mut db = self.db.lock().await;
+        let result: std::result::Result<Vec<(String, StoredSecret)>, _> =
+            db.scan_typed("secrets", &prefix);
 
-        let mut results = Vec::with_capacity(rows.len());
+        match result {
+            Ok(entries) => {
+                let mut results = Vec::new();
 
-        for row in rows {
-            let name: String = row
-                .try_get("name")
-                .map_err(|e| SecretsError::Storage(format!("Failed to read name: {e}")))?;
-            let version: i64 = row
-                .try_get("version")
-                .map_err(|e| SecretsError::Storage(format!("Failed to read version: {e}")))?;
-            let created_at: String = row
-                .try_get("created_at")
-                .map_err(|e| SecretsError::Storage(format!("Failed to read created_at: {e}")))?;
-            let updated_at: String = row
-                .try_get("updated_at")
-                .map_err(|e| SecretsError::Storage(format!("Failed to read updated_at: {e}")))?;
+                for (_key, stored) in entries {
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    results.push(SecretMetadata {
+                        name: stored.name,
+                        version: stored.version,
+                        created_at: Self::parse_timestamp(&stored.created_at),
+                        updated_at: Self::parse_timestamp(&stored.updated_at),
+                    });
+                }
 
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            results.push(SecretMetadata {
-                name,
-                version: version as u32,
-                created_at: Self::parse_timestamp(&created_at),
-                updated_at: Self::parse_timestamp(&updated_at),
-            });
+                results.sort_by(|a, b| a.name.cmp(&b.name));
+
+                debug!("Listed {} secrets in scope: {}", results.len(), scope);
+                Ok(results)
+            }
+            _ => Ok(Vec::new()),
         }
-
-        debug!("Listed {} secrets in scope: {}", results.len(), scope);
-        Ok(results)
     }
 
     async fn exists(&self, scope: &str, name: &str) -> Result<bool> {
         let storage_key = Self::make_key(scope, name);
-
-        let row = sqlx::query("SELECT 1 FROM secrets WHERE storage_key = ?")
-            .bind(&storage_key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| SecretsError::Storage(format!("Failed to check existence: {e}")))?;
-
-        Ok(row.is_some())
+        let record = self.get_record(&storage_key).await?;
+        Ok(record.is_some())
     }
 }
 
@@ -268,59 +236,46 @@ impl SecretsStore for PersistentSecretsStore {
         let now = Self::now_iso8601();
 
         // Check if secret exists to determine version
-        let existing = sqlx::query("SELECT version, created_at FROM secrets WHERE storage_key = ?")
-            .bind(&storage_key)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| SecretsError::Storage(format!("Failed to check existing: {e}")))?;
+        let existing = self.get_record(&storage_key).await?;
 
-        if let Some(row) = existing {
-            // Update existing secret
-            let version: i64 = row.try_get("version").unwrap_or(1);
-            let new_version = version + 1;
-
-            sqlx::query(
-                "UPDATE secrets SET encrypted_value = ?, version = ?, updated_at = ? WHERE storage_key = ?",
-            )
-            .bind(&encrypted)
-            .bind(new_version)
-            .bind(&now)
-            .bind(&storage_key)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| SecretsError::Storage(format!("Failed to update secret: {e}")))?;
-
-            debug!("Updated secret: {} (version {})", storage_key, new_version);
+        let stored = if let Some(existing_record) = existing {
+            StoredSecret {
+                encrypted_value: encrypted,
+                name: name.to_string(),
+                version: existing_record.version + 1,
+                created_at: existing_record.created_at,
+                updated_at: now,
+            }
         } else {
-            // Insert new secret
-            sqlx::query(
-                "INSERT INTO secrets (storage_key, encrypted_value, name, version, created_at, updated_at) VALUES (?, ?, ?, 1, ?, ?)",
-            )
-            .bind(&storage_key)
-            .bind(&encrypted)
-            .bind(name)
-            .bind(&now)
-            .bind(&now)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| SecretsError::Storage(format!("Failed to insert secret: {e}")))?;
+            StoredSecret {
+                encrypted_value: encrypted,
+                name: name.to_string(),
+                version: 1,
+                created_at: now.clone(),
+                updated_at: now,
+            }
+        };
 
-            debug!("Stored secret: {} (version 1)", storage_key);
-        }
+        let mut db = self.db.lock().await;
+        db.put_typed("secrets", &storage_key, &stored)
+            .map_err(|e| SecretsError::Storage(format!("Failed to store secret: {e}")))?;
 
+        debug!(
+            "Stored secret: {} (version {})",
+            storage_key, stored.version
+        );
         Ok(())
     }
 
     async fn delete_secret(&self, scope: &str, name: &str) -> Result<()> {
         let storage_key = Self::make_key(scope, name);
 
-        let result = sqlx::query("DELETE FROM secrets WHERE storage_key = ?")
-            .bind(&storage_key)
-            .execute(&self.pool)
-            .await
+        let mut db = self.db.lock().await;
+        let deleted = db
+            .delete_typed("secrets", &storage_key)
             .map_err(|e| SecretsError::Storage(format!("Failed to delete secret: {e}")))?;
 
-        if result.rows_affected() == 0 {
+        if !deleted {
             return Err(SecretsError::NotFound {
                 name: name.to_string(),
             });
@@ -337,7 +292,7 @@ mod tests {
 
     async fn create_test_store() -> (PersistentSecretsStore, tempfile::TempDir) {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("test_secrets.sqlite");
+        let db_path = temp_dir.path().join("test_secrets_zql");
         let key = EncryptionKey::generate();
         let store = PersistentSecretsStore::open(&db_path, key).await.unwrap();
         (store, temp_dir)
@@ -485,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn test_persistence() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("persist_test.sqlite");
+        let db_path = temp_dir.path().join("persist_test_zql");
 
         // Use fixed key for persistence test
         let key_bytes = [42u8; 32];
@@ -513,7 +468,7 @@ mod tests {
     #[tokio::test]
     async fn test_wrong_key_fails_decryption() {
         let temp_dir = tempfile::tempdir().unwrap();
-        let db_path = temp_dir.path().join("wrong_key_test.sqlite");
+        let db_path = temp_dir.path().join("wrong_key_test_zql");
 
         // Write with one key
         let key1 = EncryptionKey::generate();
@@ -549,9 +504,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify database file was created
-        let expected_path = temp_dir.path().join(DEFAULT_DB_FILENAME);
-        assert!(expected_path.exists());
+        // Verify database directory was created
+        let expected_path = temp_dir.path().join(DEFAULT_DB_DIRNAME);
+        assert!(
+            expected_path.exists(),
+            "Database directory should be created at {expected_path:?}"
+        );
     }
 
     #[test]

@@ -1,12 +1,12 @@
 [package]
-name = "zlayer-api"
+name = "zlayer-api-zql"
 version.workspace = true
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "REST API server for ZLayer container orchestration"
-publish = false
 keywords = ["container", "api", "rest", "axum", "orchestration"]
 categories = ["web-programming::http-server"]
 readme = "README.md"
@@ -85,7 +85,7 @@ tar.workspace = true
 flate2.workspace = true
 
 # Embedded database
-sqlx.workspace = true
+zql.workspace = true
 
 # Temp directories for tests
 [dev-dependencies]

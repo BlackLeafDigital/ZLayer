@@ -21,10 +21,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use zlayer_agent::{
+use zlayer_agent_zql::{
     AgentError, ContainerId, ContainerState, MacSandboxConfig, Runtime, SandboxRuntime,
 };
-use zlayer_spec::{DeploymentSpec, ServiceSpec};
+use zlayer_spec_zql::{DeploymentSpec, ServiceSpec};
 
 extern crate libc;
 

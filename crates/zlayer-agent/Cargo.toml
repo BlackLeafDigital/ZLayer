@@ -1,12 +1,12 @@
 [package]
-name = "zlayer-agent"
+name = "zlayer-agent-zql"
 version.workspace = true
+publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Container runtime agent using libcontainer/youki"
-publish = false
 keywords = ["container", "runtime", "youki", "libcontainer", "orchestration"]
 categories = ["os", "virtualization"]
 readme = "README.md"
