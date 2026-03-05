@@ -94,6 +94,7 @@ impl ProxyServer {
     }
 
     /// Set the certificate manager for ACME challenge interception
+    #[must_use]
     pub fn with_cert_manager(mut self, cm: Arc<CertManager>) -> Self {
         self.cert_manager = Some(cm);
         self
@@ -129,6 +130,11 @@ impl ProxyServer {
     }
 
     /// Run the HTTP server
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding to the configured HTTP address fails
+    /// or if the accept loop encounters a fatal error.
     pub async fn run(&self) -> Result<()> {
         let addr = self.config.server.http_addr;
         let listener = TcpListener::bind(addr)
@@ -144,6 +150,11 @@ impl ProxyServer {
     }
 
     /// Run the server on a specific address
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding to the given address fails
+    /// or if the accept loop encounters a fatal error.
     pub async fn run_on(&self, addr: SocketAddr) -> Result<()> {
         let listener = TcpListener::bind(addr)
             .await
@@ -250,6 +261,11 @@ impl ProxyServer {
     /// Run the HTTPS server
     ///
     /// This requires TLS to be configured when creating the `ProxyServer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if TLS is not configured, if binding to the
+    /// configured HTTPS address fails, or if the accept loop encounters a fatal error.
     pub async fn run_https(&self) -> Result<()> {
         let acceptor = self
             .tls_acceptor
@@ -270,6 +286,11 @@ impl ProxyServer {
     }
 
     /// Run the HTTPS server on a specific address
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if TLS is not configured, if binding to the
+    /// given address fails, or if the accept loop encounters a fatal error.
     pub async fn run_https_on(&self, addr: SocketAddr) -> Result<()> {
         let acceptor = self
             .tls_acceptor
@@ -291,6 +312,13 @@ impl ProxyServer {
     /// Run both HTTP and HTTPS servers concurrently
     ///
     /// This requires TLS to be configured when creating the `ProxyServer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if TLS is not configured, if binding to either
+    /// the HTTP or HTTPS address fails, or if either accept loop encounters
+    /// a fatal error.
+    #[allow(clippy::similar_names)]
     pub async fn run_both(&self) -> Result<()> {
         let http_addr = self.config.server.http_addr;
         let https_addr = self.config.server.https_addr;

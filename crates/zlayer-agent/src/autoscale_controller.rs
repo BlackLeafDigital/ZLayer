@@ -279,6 +279,9 @@ impl AutoscaleController {
     /// controller.shutdown();
     /// handle.await.unwrap();
     /// ```
+    /// # Errors
+    /// Returns an error if the autoscale loop encounters an unrecoverable error.
+    #[allow(clippy::cast_possible_truncation)]
     pub async fn run_loop(&self) -> Result<()> {
         let mut ticker = tokio::time::interval(self.interval);
 
@@ -435,6 +438,7 @@ impl AutoscaleController {
 /// This is a helper function to determine if the autoscale controller should
 /// be started for a deployment.
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn has_adaptive_scaling(services: &HashMap<String, zlayer_spec::ServiceSpec>) -> bool {
     services
         .values()

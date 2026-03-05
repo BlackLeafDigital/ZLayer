@@ -33,6 +33,10 @@ pub struct BlobCache {
 
 impl BlobCache {
     /// Create a new in-memory cache
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError` if the cache cannot be initialized.
     pub fn new() -> Result<Self, CacheError> {
         Ok(Self {
             blobs: Arc::new(RwLock::new(std::collections::HashMap::new())),
@@ -41,6 +45,10 @@ impl BlobCache {
     }
 
     /// Open or create a cache at the given path (creates in-memory for now)
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError` if the cache cannot be initialized.
     pub fn open<P: AsRef<Path>>(_path: P) -> Result<Self, CacheError> {
         Self::new()
     }
@@ -53,6 +61,10 @@ impl BlobCache {
     }
 
     /// Get a blob by digest
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError` if the digest is invalid or the lock is poisoned.
     pub fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, CacheError> {
         validate_digest(digest)?;
         let blobs = self
@@ -63,6 +75,10 @@ impl BlobCache {
     }
 
     /// Put a blob into the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError` if the digest is invalid, mismatched, or the lock is poisoned.
     pub fn put(&self, digest: &str, data: &[u8]) -> Result<(), CacheError> {
         validate_digest(digest)?;
 
@@ -91,6 +107,10 @@ impl BlobCache {
     }
 
     /// Check if a blob exists in the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError` if the digest is invalid or the lock is poisoned.
     pub fn contains(&self, digest: &str) -> Result<bool, CacheError> {
         validate_digest(digest)?;
         let blobs = self
@@ -101,6 +121,10 @@ impl BlobCache {
     }
 
     /// Delete a blob from the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError` if the digest is invalid or the lock is poisoned.
     pub fn delete(&self, digest: &str) -> Result<(), CacheError> {
         validate_digest(digest)?;
         let mut blobs = self
@@ -112,6 +136,10 @@ impl BlobCache {
     }
 
     /// Get current cache size in bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError` if the lock is poisoned.
     pub fn size(&self) -> Result<u64, CacheError> {
         let blobs = self
             .blobs
@@ -122,6 +150,10 @@ impl BlobCache {
     }
 
     /// Clear all blobs from the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError` if the lock is poisoned.
     pub fn clear(&self) -> Result<(), CacheError> {
         let mut blobs = self
             .blobs

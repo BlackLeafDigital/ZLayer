@@ -72,7 +72,11 @@ pub struct SqlxStorage {
 }
 
 impl SqlxStorage {
-    /// Open or create a `SQLite` database at the given path
+    /// Open or create a `SQLite` database at the given path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database connection or table creation fails.
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self, StorageError> {
         let path_str = path.as_ref().display().to_string();
         let connection_string = format!("sqlite:{path_str}?mode=rwc");
@@ -107,7 +111,11 @@ impl SqlxStorage {
         Ok(Self { pool })
     }
 
-    /// Create an in-memory `SQLite` database (useful for testing)
+    /// Create an in-memory `SQLite` database (useful for testing).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the in-memory database creation or table creation fails.
     pub async fn in_memory() -> Result<Self, StorageError> {
         let pool = SqlitePool::connect(":memory:").await?;
 

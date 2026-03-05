@@ -284,6 +284,11 @@ impl std::fmt::Debug for WasmRuntime {
 
 impl WasmRuntime {
     /// Create a new `WasmRuntime` with the given configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the cache directory cannot be created, the wasmtime engine
+    /// cannot be initialized, or the blob cache cannot be opened.
     pub async fn new(config: WasmConfig) -> Result<Self> {
         // Create cache directory
         tokio::fs::create_dir_all(&config.cache_dir)
@@ -352,11 +357,19 @@ impl WasmRuntime {
     }
 
     /// Create a new `WasmRuntime` with default configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime cannot be initialized.
     pub async fn with_defaults() -> Result<Self> {
         Self::new(WasmConfig::default()).await
     }
 
     /// Create a new `WasmRuntime` with custom auth configuration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime cannot be initialized.
     pub async fn with_auth(
         config: WasmConfig,
         auth_config: zlayer_core::AuthConfig,
@@ -367,11 +380,13 @@ impl WasmRuntime {
     }
 
     /// Get the instance ID string from a `ContainerId`
+    #[allow(clippy::unused_self)]
     fn instance_id(&self, id: &ContainerId) -> String {
         format!("wasm-{}-{}", id.service, id.replica)
     }
 
     /// Build environment variables from `ServiceSpec`
+    #[allow(clippy::unused_self)]
     fn build_env_vars(&self, spec: &ServiceSpec) -> Vec<(String, String)> {
         let mut env = Vec::new();
 
@@ -403,6 +418,7 @@ impl WasmRuntime {
     }
 
     /// Build command arguments from `ServiceSpec`
+    #[allow(clippy::unused_self)]
     fn build_args(&self, spec: &ServiceSpec) -> Vec<String> {
         let mut args = Vec::new();
 

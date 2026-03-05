@@ -12,11 +12,11 @@
 //! let resolver = SniCertResolver::new();
 //!
 //! // Load certificates for specific domains
-//! resolver.load_cert("example.com", cert_pem, key_pem).await?;
-//! resolver.load_cert("*.example.com", wildcard_cert_pem, wildcard_key_pem).await?;
+//! resolver.load_cert("example.com", cert_pem, key_pem)?;
+//! resolver.load_cert("*.example.com", wildcard_cert_pem, wildcard_key_pem)?;
 //!
 //! // Set a fallback certificate
-//! resolver.set_default_cert(default_cert_pem, default_key_pem).await?;
+//! resolver.set_default_cert(default_cert_pem, default_key_pem)?;
 //! ```
 
 use crate::error::{ProxyError, Result};
@@ -86,9 +86,9 @@ impl SniCertResolver {
     /// # Example
     ///
     /// ```rust,ignore
-    /// resolver.load_cert("example.com", cert_pem, key_pem).await?;
+    /// resolver.load_cert("example.com", cert_pem, key_pem)?;
     /// ```
-    pub async fn load_cert(&self, domain: &str, cert_pem: &str, key_pem: &str) -> Result<()> {
+    pub fn load_cert(&self, domain: &str, cert_pem: &str, key_pem: &str) -> Result<()> {
         let certified_key = create_certified_key(cert_pem, key_pem)?;
         let domain_normalized = normalize_domain(domain);
 
@@ -116,9 +116,12 @@ impl SniCertResolver {
     /// # Example
     ///
     /// ```rust,ignore
-    /// resolver.set_default_cert(default_cert_pem, default_key_pem).await?;
+    /// resolver.set_default_cert(default_cert_pem, default_key_pem)?;
     /// ```
-    pub async fn set_default_cert(&self, cert_pem: &str, key_pem: &str) -> Result<()> {
+    /// # Panics
+    ///
+    /// Panics if the internal `RwLock` is poisoned.
+    pub fn set_default_cert(&self, cert_pem: &str, key_pem: &str) -> Result<()> {
         let certified_key = create_certified_key(cert_pem, key_pem)?;
 
         debug!("Set default TLS certificate");
@@ -164,9 +167,9 @@ impl SniCertResolver {
     /// # Example
     ///
     /// ```rust,ignore
-    /// resolver.refresh_cert("example.com", new_cert_pem, new_key_pem).await?;
+    /// resolver.refresh_cert("example.com", new_cert_pem, new_key_pem)?;
     /// ```
-    pub async fn refresh_cert(&self, domain: &str, cert_pem: &str, key_pem: &str) -> Result<()> {
+    pub fn refresh_cert(&self, domain: &str, cert_pem: &str, key_pem: &str) -> Result<()> {
         let certified_key = create_certified_key(cert_pem, key_pem)?;
         let domain_normalized = normalize_domain(domain);
 
@@ -323,7 +326,6 @@ fn parse_private_key(pem: &str) -> Result<PrivateKeyDer<'static>> {
             }
             Ok(Some(_)) => {
                 // Skip non-key items (like certificates)
-                continue;
             }
             Ok(None) => {
                 return Err(ProxyError::Tls("No private key found in PEM".to_string()));
@@ -411,7 +413,7 @@ mod tests {
         let resolver = SniCertResolver::new();
         let (cert_pem, key_pem) = generate_test_cert();
 
-        let result = resolver.load_cert("example.com", &cert_pem, &key_pem).await;
+        let result = resolver.load_cert("example.com", &cert_pem, &key_pem);
         assert!(result.is_ok());
         assert!(resolver.has_cert("example.com"));
         assert_eq!(resolver.cert_count(), 1);
@@ -424,7 +426,6 @@ mod tests {
 
         resolver
             .load_cert("Example.COM", &cert_pem, &key_pem)
-            .await
             .unwrap();
         assert!(resolver.has_cert("example.com"));
         assert!(resolver.has_cert("EXAMPLE.COM"));
@@ -437,7 +438,6 @@ mod tests {
 
         resolver
             .load_cert("example.com", &cert_pem, &key_pem)
-            .await
             .unwrap();
         assert!(resolver.has_cert("example.com"));
 
@@ -454,14 +454,12 @@ mod tests {
         // Load initial cert
         resolver
             .load_cert("example.com", &cert_pem, &key_pem)
-            .await
             .unwrap();
 
         // Refresh with new cert
         let (new_cert_pem, new_key_pem) = generate_test_cert();
         let result = resolver
-            .refresh_cert("example.com", &new_cert_pem, &new_key_pem)
-            .await;
+            .refresh_cert("example.com", &new_cert_pem, &new_key_pem);
         assert!(result.is_ok());
         assert_eq!(resolver.cert_count(), 1);
     }
@@ -471,7 +469,7 @@ mod tests {
         let resolver = SniCertResolver::new();
         let (cert_pem, key_pem) = generate_test_cert();
 
-        let result = resolver.set_default_cert(&cert_pem, &key_pem).await;
+        let result = resolver.set_default_cert(&cert_pem, &key_pem);
         assert!(result.is_ok());
 
         // Default cert should not show up in cert_count or domains
@@ -486,7 +484,6 @@ mod tests {
         let (cert_pem, key_pem) = generate_test_cert();
         resolver
             .set_default_cert(&cert_pem, &key_pem)
-            .await
             .unwrap();
 
         assert!(resolver.has_default_cert());
@@ -499,11 +496,9 @@ mod tests {
 
         resolver
             .load_cert("api.example.com", &cert_pem, &key_pem)
-            .await
             .unwrap();
         resolver
             .load_cert("web.example.com", &cert_pem, &key_pem)
-            .await
             .unwrap();
 
         let domains = resolver.domains();
@@ -519,7 +514,6 @@ mod tests {
 
         resolver
             .load_cert("example.com", &cert_pem, &key_pem)
-            .await
             .unwrap();
 
         let result = resolver.resolve_cert(Some("example.com"));
@@ -534,7 +528,6 @@ mod tests {
         // Load wildcard cert
         resolver
             .load_cert("*.example.com", &cert_pem, &key_pem)
-            .await
             .unwrap();
 
         // Should match subdomains
@@ -556,7 +549,6 @@ mod tests {
 
         resolver
             .set_default_cert(&cert_pem, &key_pem)
-            .await
             .unwrap();
 
         // Unknown domain should fall back to default
@@ -571,7 +563,6 @@ mod tests {
 
         resolver
             .load_cert("example.com", &cert_pem, &key_pem)
-            .await
             .unwrap();
 
         // No default, different domain

@@ -114,6 +114,7 @@ impl SqliteReplicatorConfig {
     }
 
     /// Set the cache directory
+    #[must_use]
     pub fn with_cache_dir(mut self, cache_dir: impl Into<PathBuf>) -> Self {
         self.cache_dir = cache_dir.into();
         self
@@ -231,30 +232,35 @@ impl LayerStorageConfig {
     }
 
     /// Set the S3 key prefix
+    #[must_use]
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
         self
     }
 
     /// Set the AWS region
+    #[must_use]
     pub fn with_region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
         self
     }
 
     /// Set a custom S3 endpoint URL
+    #[must_use]
     pub fn with_endpoint_url(mut self, url: impl Into<String>) -> Self {
         self.endpoint_url = Some(url.into());
         self
     }
 
     /// Set the staging directory
+    #[must_use]
     pub fn with_staging_dir(mut self, path: impl Into<PathBuf>) -> Self {
         self.staging_dir = path.into();
         self
     }
 
     /// Set the state database path
+    #[must_use]
     pub fn with_state_db_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.state_db_path = path.into();
         self

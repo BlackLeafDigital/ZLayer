@@ -217,6 +217,10 @@ pub struct Dockerfile {
 
 impl Dockerfile {
     /// Parse a Dockerfile from a string
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Dockerfile content is malformed or contains invalid instructions.
     pub fn parse(content: &str) -> Result<Self> {
         let raw = RawDockerfile::parse(content).map_err(|e| BuildError::DockerfileParse {
             message: e.to_string(),
@@ -227,6 +231,10 @@ impl Dockerfile {
     }
 
     /// Parse a Dockerfile from a file
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or the Dockerfile is malformed.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
         let content =
             std::fs::read_to_string(path.as_ref()).map_err(|e| BuildError::ContextRead {
@@ -320,6 +328,7 @@ impl Dockerfile {
     }
 
     /// Convert a raw instruction to our internal representation
+    #[allow(clippy::too_many_lines)]
     fn convert_instruction(raw: &RawInstruction) -> Result<Option<Instruction>> {
         let instruction = match raw {
             RawInstruction::From(_) => {

@@ -106,6 +106,7 @@ fn build_exposed_ports(spec: &ServiceSpec) -> Vec<String> {
 }
 
 /// Build host configuration for Docker container
+#[allow(clippy::too_many_lines)]
 fn build_host_config(spec: &ServiceSpec) -> HostConfig {
     let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
 
@@ -122,6 +123,7 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
     let memory = spec.resources.memory.as_ref().and_then(|m| parse_memory(m));
 
     // Build CPU limit (Docker uses nano-CPUs: 1 CPU = 1e9 nano-CPUs)
+    #[allow(clippy::cast_possible_truncation)]
     let nano_cpus = spec.resources.cpu.map(|c| (c * 1_000_000_000.0) as i64);
 
     // Build device mappings from spec.devices
@@ -274,6 +276,7 @@ fn parse_memory(memory: &str) -> Option<i64> {
         _ => return None,
     };
 
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
     Some((num * multiplier as f64) as i64)
 }
 
@@ -488,6 +491,7 @@ impl Runtime for DockerRuntime {
 
         tracing::info!(container = %name, timeout = ?timeout, "stopping container");
 
+        #[allow(clippy::cast_possible_truncation)]
         let options = StopContainerOptions {
             t: Some(timeout.as_secs() as i32),
             signal: None,
@@ -565,13 +569,16 @@ impl Runtime for DockerRuntime {
         // Map Docker state to our ContainerState enum
         let container_state = match state.status {
             Some(bollard::models::ContainerStateStatusEnum::CREATED) => ContainerState::Pending,
-            Some(bollard::models::ContainerStateStatusEnum::RUNNING) => ContainerState::Running,
-            Some(bollard::models::ContainerStateStatusEnum::PAUSED) => ContainerState::Running, // Treat paused as running
+            Some(
+                bollard::models::ContainerStateStatusEnum::RUNNING
+                | bollard::models::ContainerStateStatusEnum::PAUSED,
+            ) => ContainerState::Running, // Treat paused as running
             Some(bollard::models::ContainerStateStatusEnum::RESTARTING) => {
                 ContainerState::Initializing
             }
             Some(bollard::models::ContainerStateStatusEnum::REMOVING) => ContainerState::Stopping,
             Some(bollard::models::ContainerStateStatusEnum::EXITED) => {
+                #[allow(clippy::cast_possible_truncation)]
                 let code = state.exit_code.unwrap_or(0) as i32;
                 ContainerState::Exited { code }
             }
@@ -704,6 +711,7 @@ impl Runtime for DockerRuntime {
             .await
             .map_err(|e| AgentError::Internal(format!("failed to inspect exec: {e}")))?;
 
+        #[allow(clippy::cast_possible_truncation)]
         let exit_code = exec_inspect.exit_code.unwrap_or(0) as i32;
 
         tracing::debug!(
@@ -820,6 +828,7 @@ impl Runtime for DockerRuntime {
                 reason: format!("failed to wait for container: {e}"),
             })?;
 
+        #[allow(clippy::cast_possible_truncation)]
         let exit_code = wait_response.status_code as i32;
 
         tracing::info!(container = %name, exit_code = exit_code, "container exited");
@@ -895,6 +904,7 @@ impl Runtime for DockerRuntime {
 
         // Extract the PID from the state - only return it if the container is running
         // A PID of 0 means the container is not running
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pid =
             inspect
                 .state

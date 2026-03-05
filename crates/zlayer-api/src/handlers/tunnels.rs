@@ -238,7 +238,11 @@ fn current_timestamp() -> u64 {
 // Handlers
 // =============================================================================
 
-/// Create a new tunnel token
+/// Create a new tunnel token.
+///
+/// # Errors
+///
+/// Returns an error if validation fails or authentication is invalid.
 #[utoipa::path(
     post,
     path = "/api/v1/tunnels",
@@ -309,7 +313,11 @@ pub async fn create_tunnel(
     }))
 }
 
-/// List all tunnels
+/// List all tunnels.
+///
+/// # Errors
+///
+/// Returns an error if authentication fails.
 #[utoipa::path(
     get,
     path = "/api/v1/tunnels",
@@ -350,7 +358,11 @@ pub async fn list_tunnels(
     Ok(Json(summaries))
 }
 
-/// Revoke (delete) a tunnel
+/// Revoke (delete) a tunnel.
+///
+/// # Errors
+///
+/// Returns an error if the tunnel is not found.
 #[utoipa::path(
     delete,
     path = "/api/v1/tunnels/{id}",
@@ -382,7 +394,11 @@ pub async fn revoke_tunnel(
     }
 }
 
-/// Get tunnel status
+/// Get tunnel status.
+///
+/// # Errors
+///
+/// Returns an error if the tunnel is not found.
 #[utoipa::path(
     get,
     path = "/api/v1/tunnels/{id}/status",
@@ -430,7 +446,11 @@ pub async fn get_tunnel_status(
     }
 }
 
-/// Create a node-to-node tunnel
+/// Create a node-to-node tunnel.
+///
+/// # Errors
+///
+/// Returns an error if validation fails or the user lacks permission.
 #[utoipa::path(
     post,
     path = "/api/v1/tunnels/node",
@@ -492,7 +512,11 @@ pub async fn create_node_tunnel(
     Ok(Json(response))
 }
 
-/// Remove a node-to-node tunnel
+/// Remove a node-to-node tunnel.
+///
+/// # Errors
+///
+/// Returns an error if the tunnel is not found or the user lacks permission.
 #[utoipa::path(
     delete,
     path = "/api/v1/tunnels/node/{name}",

@@ -56,7 +56,7 @@ pub struct NodeResources {
     pub gpu_total: u32,
     /// GPUs currently allocated to containers
     pub gpu_used: u32,
-    /// GPU model names (e.g., ["NVIDIA A100-SXM4-80GB"])
+    /// GPU model names (e.g., `["NVIDIA A100-SXM4-80GB"]`)
     pub gpu_models: Vec<String>,
     /// Total GPU VRAM in MB across all GPUs.
     ///
@@ -111,6 +111,7 @@ impl NodeResources {
 
     /// Calculate memory utilization as a percentage
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn memory_utilization(&self) -> f64 {
         if self.memory_total > 0 {
             (self.memory_used as f64 / self.memory_total as f64) * 100.0
@@ -187,6 +188,7 @@ impl NodeState {
     }
 
     /// Add a label to the node
+    #[must_use]
     pub fn with_label(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.labels.insert(key.into(), value.into());
         self
@@ -660,14 +662,17 @@ fn select_for_isolation<'a>(
         .expect("nodes should not be empty")
 }
 
-/// Validate that there are enough nodes for services with dedicated/exclusive modes
+/// Validate that there are enough nodes for services with dedicated/exclusive modes.
 ///
 /// # Arguments
 /// * `services` - Map of service name to (`node_mode`, replicas) pairs
 /// * `available_nodes` - Number of available nodes in the cluster
 ///
-/// # Returns
-/// `Ok(())` if placement is feasible, or an error describing why it's not
+/// # Errors
+///
+/// Returns `SchedulerError::InvalidConfig` if there are not enough nodes
+/// to satisfy the placement requirements.
+#[allow(clippy::implicit_hasher)]
 pub fn validate_placement_feasibility(
     services: &HashMap<String, (NodeMode, u32)>,
     available_nodes: usize,

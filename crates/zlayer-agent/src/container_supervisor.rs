@@ -91,7 +91,9 @@ impl SupervisedContainer {
             .retain(|&t| now.duration_since(t) < window);
 
         // Check if we've exceeded the threshold
-        self.restart_times.len() as u32 > max_restarts
+        #[allow(clippy::cast_possible_truncation)]
+        let count = self.restart_times.len() as u32;
+        count > max_restarts
     }
 
     /// Check if the container is in a state that should be monitored
@@ -339,8 +341,11 @@ impl ContainerSupervisor {
         let state = self.runtime.container_state(container_id).await?;
 
         match state {
-            ContainerState::Running => {
-                // Container is healthy, nothing to do
+            ContainerState::Running
+            | ContainerState::Pending
+            | ContainerState::Initializing
+            | ContainerState::Stopping => {
+                // Container is healthy or in a transitional state, nothing to do
             }
             ContainerState::Exited { code } => {
                 // Container has exited, handle based on exit code
@@ -357,9 +362,6 @@ impl ContainerSupervisor {
                 self.handle_container_exit(container_id, -1, panic_action)
                     .await?;
             }
-            ContainerState::Pending | ContainerState::Initializing | ContainerState::Stopping => {
-                // Container is in a transitional state, skip for now
-            }
         }
 
         Ok(())
@@ -375,9 +377,8 @@ impl ContainerSupervisor {
         // Get container info and update state
         let (service_name, _should_restart, in_crash_loop) = {
             let mut containers = self.containers.write().await;
-            let container = match containers.get_mut(container_id) {
-                Some(c) => c,
-                None => return Ok(()), // Container was unregistered
+            let Some(container) = containers.get_mut(container_id) else {
+                return Ok(()); // Container was unregistered
             };
 
             container.last_exit_code = Some(exit_code);
@@ -401,8 +402,7 @@ impl ContainerSupervisor {
 
             let should_restart = match panic_action {
                 PanicAction::Restart => !in_crash_loop,
-                PanicAction::Shutdown => false,
-                PanicAction::Isolate => false,
+                PanicAction::Shutdown | PanicAction::Isolate => false,
             };
 
             if in_crash_loop && matches!(panic_action, PanicAction::Restart) {

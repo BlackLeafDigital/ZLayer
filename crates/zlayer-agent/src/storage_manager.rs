@@ -83,6 +83,9 @@ pub struct StorageManager {
 
 impl StorageManager {
     /// Create a new `StorageManager` with the given base directory
+    ///
+    /// # Errors
+    /// Returns an error if the base directory cannot be created.
     pub fn new(base_dir: impl AsRef<Path>) -> Result<Self> {
         let volume_dir = base_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&volume_dir)?;
@@ -201,6 +204,11 @@ impl StorageManager {
     ///
     /// Returns `Ok(true)` if a new snapshot was uploaded, `Ok(false)` if
     /// the volume was already up to date, or an error on failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if layer sync is not configured, the volume is not found,
+    /// or the S3 upload fails.
     #[cfg(feature = "s3")]
     pub async fn sync_volume(&self, volume_name: &str) -> Result<bool> {
         let sync = self
@@ -249,6 +257,10 @@ impl StorageManager {
     ///
     /// Skips anonymous volumes (they are ephemeral by nature).
     /// Returns the number of volumes that had new snapshots uploaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any volume sync fails.
     #[cfg(feature = "s3")]
     pub async fn sync_all_volumes(&self) -> Result<usize> {
         if self.layer_sync.is_none() {
@@ -290,6 +302,9 @@ impl StorageManager {
 
     /// Create an anonymous volume for a container
     /// Returns the path to the volume directory
+    ///
+    /// # Errors
+    /// Returns an error if the volume directory cannot be created.
     pub fn create_anonymous(&mut self, container_id: &str, target: &str) -> Result<PathBuf> {
         let ulid = Ulid::new().to_string().to_lowercase();
         // Create a safe name from target path (replace / with _)
@@ -318,6 +333,9 @@ impl StorageManager {
     }
 
     /// Clean up all anonymous volumes for a container
+    ///
+    /// # Errors
+    /// Returns an error if volume directories cannot be removed.
     pub fn cleanup_anonymous(&mut self, container_id: &str) -> Result<()> {
         // Find all anonymous volumes for this container
         let to_remove: Vec<String> = self
@@ -348,6 +366,9 @@ impl StorageManager {
     }
 
     /// Ensure a named volume exists, creating it if necessary
+    ///
+    /// # Errors
+    /// Returns an error if the volume name is invalid or the directory cannot be created.
     pub fn ensure_volume(&mut self, name: &str) -> Result<PathBuf> {
         // Validate name format
         if !Self::is_valid_name(name) {
@@ -379,6 +400,10 @@ impl StorageManager {
     /// This is the async counterpart to [`ensure_volume`] that integrates with
     /// the S3 layer sync. When the `s3` feature is not enabled or no layer sync
     /// is configured, this behaves identically to [`ensure_volume`].
+    ///
+    /// # Errors
+    /// Returns an error if the volume cannot be created or S3 restore fails.
+    #[allow(clippy::unused_async)]
     pub async fn ensure_volume_with_sync(&mut self, name: &str) -> Result<PathBuf> {
         let is_new = !self.volumes.contains_key(name);
         let path = self.ensure_volume(name)?;
@@ -395,6 +420,9 @@ impl StorageManager {
     }
 
     /// Attach a container to a volume (track usage)
+    ///
+    /// # Errors
+    /// Returns an error if the volume does not exist.
     pub fn attach_volume(&mut self, name: &str, container_id: &str) -> Result<()> {
         let volume = self
             .volumes
@@ -406,6 +434,9 @@ impl StorageManager {
     }
 
     /// Detach a container from a volume (untrack usage)
+    ///
+    /// # Errors
+    /// This function currently always succeeds but returns `Result` for future compatibility.
     pub fn detach_volume(&mut self, name: &str, container_id: &str) -> Result<()> {
         if let Some(volume) = self.volumes.get_mut(name) {
             volume.attached.remove(container_id);
@@ -414,6 +445,9 @@ impl StorageManager {
     }
 
     /// Delete a volume if it's not in use
+    ///
+    /// # Errors
+    /// Returns an error if the volume is still in use or cannot be removed.
     pub fn delete_volume(&mut self, name: &str) -> Result<()> {
         let volume = self
             .volumes
@@ -466,6 +500,9 @@ impl StorageManager {
     ///
     /// Requires s3fs-fuse to be installed on the system.
     /// Credentials should be configured via environment or ~/.aws/credentials
+    ///
+    /// # Errors
+    /// Returns an error if the S3 mount point cannot be created or the s3fs command fails.
     pub fn mount_s3(
         &mut self,
         bucket: &str,
@@ -550,6 +587,9 @@ impl StorageManager {
     }
 
     /// Unmount an S3 bucket
+    ///
+    /// # Errors
+    /// Returns an error if the unmount command fails.
     pub fn unmount_s3(
         &mut self,
         bucket: &str,

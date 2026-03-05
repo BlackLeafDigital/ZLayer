@@ -48,16 +48,18 @@ pub struct ResolvedEnv {
 /// # Returns
 /// * `Ok(String)` - The resolved value
 /// * `Err(EnvResolutionError)` - If a $E: reference cannot be resolved
+///
+/// # Errors
+/// Returns an error if a `$E:` referenced environment variable is not set.
 pub fn resolve_env_value(value: &str) -> Result<String, EnvResolutionError> {
     if let Some(var_name) = value.strip_prefix(ENV_REF_PREFIX) {
         match std::env::var(var_name) {
             Ok(val) => Ok(val),
-            Err(std::env::VarError::NotPresent) => Err(EnvResolutionError::MissingEnvVar {
-                var: var_name.to_string(),
-            }),
-            Err(std::env::VarError::NotUnicode(_)) => Err(EnvResolutionError::MissingEnvVar {
-                var: var_name.to_string(),
-            }),
+            Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => {
+                Err(EnvResolutionError::MissingEnvVar {
+                    var: var_name.to_string(),
+                })
+            }
         }
     } else {
         Ok(value.to_string())
@@ -77,6 +79,9 @@ pub fn resolve_env_value(value: &str) -> Result<String, EnvResolutionError> {
 /// * `Ok(HashMap<String, String>)` - Resolved key-value pairs
 /// * `Err(EnvResolutionError)` - If a required $E: reference cannot be resolved
 ///
+/// # Errors
+/// Returns an error if a `$E:` referenced environment variable is not set.
+///
 /// # Example
 /// ```
 /// use std::collections::HashMap;
@@ -94,6 +99,7 @@ pub fn resolve_env_value(value: &str) -> Result<String, EnvResolutionError> {
 ///
 /// std::env::remove_var("MY_SECRET");
 /// ```
+#[allow(clippy::implicit_hasher)]
 pub fn resolve_env_vars(
     env: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, EnvResolutionError> {
@@ -117,6 +123,10 @@ pub fn resolve_env_vars(
 /// # Returns
 /// * `Ok(ResolvedEnv)` - Resolved variables in KEY=VALUE format and any warnings
 /// * `Err(EnvResolutionError)` - If a required $E: reference cannot be resolved
+///
+/// # Errors
+/// Returns an error if a `$E:` referenced environment variable is not set.
+#[allow(clippy::implicit_hasher)]
 pub fn resolve_env_vars_with_warnings(
     env: &HashMap<String, String>,
 ) -> Result<ResolvedEnv, EnvResolutionError> {
@@ -134,12 +144,9 @@ pub fn resolve_env_vars_with_warnings(
                     }
                     val
                 }
-                Err(std::env::VarError::NotPresent) => {
-                    return Err(EnvResolutionError::MissingEnvVar {
-                        var: var_name.to_string(),
-                    });
-                }
-                Err(std::env::VarError::NotUnicode(_)) => {
+                Err(
+                    std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_),
+                ) => {
                     return Err(EnvResolutionError::MissingEnvVar {
                         var: var_name.to_string(),
                     });
@@ -159,6 +166,7 @@ pub fn resolve_env_vars_with_warnings(
 ///
 /// Useful for validation and debugging to see which vars will be resolved at runtime.
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn has_env_references(env: &HashMap<String, String>) -> bool {
     env.values().any(|v| v.starts_with(ENV_REF_PREFIX))
 }
@@ -167,6 +175,7 @@ pub fn has_env_references(env: &HashMap<String, String>) -> bool {
 ///
 /// Returns the names of host environment variables that will be looked up.
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn get_env_references(env: &HashMap<String, String>) -> Vec<&str> {
     env.values()
         .filter_map(|v| v.strip_prefix(ENV_REF_PREFIX))
@@ -177,6 +186,7 @@ pub fn get_env_references(env: &HashMap<String, String>) -> Vec<&str> {
 ///
 /// Useful for validation and debugging to see which vars will be resolved from secrets.
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn has_secret_references(env: &HashMap<String, String>) -> bool {
     env.values().any(|v| v.starts_with(SECRET_REF_PREFIX))
 }
@@ -185,6 +195,7 @@ pub fn has_secret_references(env: &HashMap<String, String>) -> bool {
 ///
 /// Returns the raw secret reference strings (without the $S: prefix) that will be looked up.
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn get_secret_references(env: &HashMap<String, String>) -> Vec<&str> {
     env.values()
         .filter_map(|v| v.strip_prefix(SECRET_REF_PREFIX))
@@ -207,6 +218,9 @@ pub fn get_secret_references(env: &HashMap<String, String>) -> Vec<&str> {
 /// * `Ok(HashMap<String, String>)` - Resolved key-value pairs
 /// * `Err(EnvResolutionError)` - If a required $S: or $E: reference cannot be resolved
 ///
+/// # Errors
+/// Returns an error if a `$S:` or `$E:` referenced value cannot be resolved.
+///
 /// # Example
 /// ```rust,ignore
 /// use std::collections::HashMap;
@@ -222,6 +236,7 @@ pub fn get_secret_references(env: &HashMap<String, String>) -> Vec<&str> {
 ///     let resolved = resolve_env_with_secrets(&env, provider, "my-deployment").await.unwrap();
 /// }
 /// ```
+#[allow(clippy::implicit_hasher)]
 pub async fn resolve_env_with_secrets<P: SecretsProvider + ?Sized>(
     env: &HashMap<String, String>,
     secrets_provider: &P,
@@ -251,6 +266,9 @@ pub async fn resolve_env_with_secrets<P: SecretsProvider + ?Sized>(
 /// # Returns
 /// * `Ok(String)` - The resolved value
 /// * `Err(EnvResolutionError)` - If a $S: or $E: reference cannot be resolved
+///
+/// # Errors
+/// Returns an error if a `$S:` or `$E:` referenced value cannot be resolved.
 pub async fn resolve_value_with_secrets<P: SecretsProvider + ?Sized>(
     value: &str,
     secrets_provider: &P,
@@ -291,12 +309,11 @@ pub async fn resolve_value_with_secrets<P: SecretsProvider + ?Sized>(
         // Host environment variable reference
         match std::env::var(var_name) {
             Ok(val) => Ok(val),
-            Err(std::env::VarError::NotPresent) => Err(EnvResolutionError::MissingEnvVar {
-                var: var_name.to_string(),
-            }),
-            Err(std::env::VarError::NotUnicode(_)) => Err(EnvResolutionError::MissingEnvVar {
-                var: var_name.to_string(),
-            }),
+            Err(std::env::VarError::NotPresent | std::env::VarError::NotUnicode(_)) => {
+                Err(EnvResolutionError::MissingEnvVar {
+                    var: var_name.to_string(),
+                })
+            }
         }
     } else {
         // Plain value, return as-is

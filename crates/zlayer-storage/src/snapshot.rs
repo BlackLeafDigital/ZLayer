@@ -14,6 +14,11 @@ use tracing::{debug, info, instrument};
 /// Create a compressed tarball snapshot from a directory
 ///
 /// Returns the snapshot metadata and path to the compressed tarball.
+///
+/// # Errors
+///
+/// Returns an error if the source directory cannot be read, the tarball cannot
+/// be created, or compression fails.
 #[instrument(skip(source_dir, output_path), fields(source = %source_dir.as_ref().display()))]
 pub fn create_snapshot(
     source_dir: impl AsRef<Path>,
@@ -89,18 +94,22 @@ pub fn create_snapshot(
         file_count,
     };
 
+    #[allow(clippy::cast_precision_loss)]
+    let compression_pct = (1.0 - (compressed_size as f64 / uncompressed_size as f64)) * 100.0;
     info!(
         "Created snapshot: {} bytes -> {} bytes ({:.1}% compression), {} files",
-        uncompressed_size,
-        compressed_size,
-        (1.0 - (compressed_size as f64 / uncompressed_size as f64)) * 100.0,
-        file_count
+        uncompressed_size, compressed_size, compression_pct, file_count
     );
 
     Ok(snapshot)
 }
 
 /// Extract a compressed tarball snapshot to a directory
+///
+/// # Errors
+///
+/// Returns an error if decompression fails, the digest does not match, or
+/// extraction to the target directory fails.
 #[instrument(skip(tarball_path, target_dir), fields(tarball = %tarball_path.as_ref().display()))]
 pub fn extract_snapshot(
     tarball_path: impl AsRef<Path>,
@@ -165,6 +174,10 @@ pub fn extract_snapshot(
 }
 
 /// Calculate the SHA256 digest of a directory's contents (for change detection)
+///
+/// # Errors
+///
+/// Returns an error if any file in the directory cannot be read.
 #[instrument(skip(dir), fields(dir = %dir.as_ref().display()))]
 pub fn calculate_directory_digest(dir: impl AsRef<Path>) -> Result<String> {
     let dir = dir.as_ref();

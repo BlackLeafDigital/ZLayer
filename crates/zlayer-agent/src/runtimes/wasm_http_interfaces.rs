@@ -90,6 +90,7 @@ pub type DurationNs = u64;
 
 /// Convert `std::time::Duration` to nanoseconds
 #[must_use]
+#[allow(clippy::cast_possible_truncation)]
 pub fn duration_to_ns(d: Duration) -> DurationNs {
     d.as_nanos() as u64
 }
@@ -199,6 +200,7 @@ impl RequestMetadata {
     }
 
     /// Set TLS information
+    #[must_use]
     pub fn with_tls(mut self, version: impl Into<String>, cipher: impl Into<String>) -> Self {
         self.tls_version = Some(version.into());
         self.tls_cipher = Some(cipher.into());
@@ -206,6 +208,7 @@ impl RequestMetadata {
     }
 
     /// Set server name (from SNI)
+    #[must_use]
     pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
         self.server_name = Some(name.into());
         self
@@ -420,18 +423,21 @@ impl ImmediateResponse {
     }
 
     /// Add a header
+    #[must_use]
     pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push(KeyValue::new(key, value));
         self
     }
 
     /// Set the body
+    #[must_use]
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = body.into();
         self
     }
 
     /// Set a JSON body
+    #[must_use]
     pub fn with_json_body(mut self, body: impl AsRef<[u8]>) -> Self {
         self.headers
             .push(KeyValue::new("Content-Type", "application/json"));
@@ -440,6 +446,7 @@ impl ImmediateResponse {
     }
 
     /// Set a text body
+    #[must_use]
     pub fn with_text_body(mut self, body: impl Into<String>) -> Self {
         self.headers
             .push(KeyValue::new("Content-Type", "text/plain"));
@@ -856,18 +863,21 @@ impl CacheEntry {
     }
 
     /// Add a cache invalidation tag
+    #[must_use]
     pub fn with_tag(mut self, tag: impl Into<String>) -> Self {
         self.tags.push(tag.into());
         self
     }
 
     /// Add multiple cache invalidation tags
+    #[must_use]
     pub fn with_tags(mut self, tags: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.tags.extend(tags.into_iter().map(Into::into));
         self
     }
 
     /// Add a vary header
+    #[must_use]
     pub fn vary_on(mut self, header: impl Into<String>) -> Self {
         self.vary.push(header.into());
         self
@@ -1053,6 +1063,7 @@ pub struct PluginRequest {
 
 impl PluginRequest {
     /// Create a new request
+    #[allow(clippy::cast_possible_truncation)]
     pub fn new(method: HttpMethod, path: impl Into<String>) -> Self {
         Self {
             request_id: uuid::Uuid::new_v4().to_string(),
@@ -1070,34 +1081,40 @@ impl PluginRequest {
     }
 
     /// Create a GET request
+    #[must_use]
     pub fn get(path: impl Into<String>) -> Self {
         Self::new(HttpMethod::Get, path)
     }
 
     /// Create a POST request
+    #[must_use]
     pub fn post(path: impl Into<String>) -> Self {
         Self::new(HttpMethod::Post, path)
     }
 
     /// Add a query string
+    #[must_use]
     pub fn with_query(mut self, query: impl Into<String>) -> Self {
         self.query = Some(query.into());
         self
     }
 
     /// Add a header
+    #[must_use]
     pub fn with_header(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push(KeyValue::new(key, value));
         self
     }
 
     /// Set the body
+    #[must_use]
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = body.into();
         self
     }
 
     /// Add context
+    #[must_use]
     pub fn with_context(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.context.push(KeyValue::new(key, value));
         self

@@ -26,6 +26,7 @@ impl<'a> BuildView<'a> {
     }
 
     /// Calculate the layout for the view
+    #[allow(clippy::unused_self)]
     fn layout(&self, area: Rect) -> (Rect, Rect, Rect, Rect) {
         // Main layout:
         // - Header: Stage info + progress bar (3 lines)

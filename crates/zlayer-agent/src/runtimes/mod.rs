@@ -281,9 +281,8 @@ pub async fn create_runtime_for_image(
             #[cfg(not(feature = "wasm"))]
             {
                 Err(AgentError::Configuration(format!(
-                    "Image '{}' is a WASM artifact (WASI {}) but the 'wasm' feature is not enabled. \
-                     Recompile zlayer-agent with --features wasm to run WASM workloads.",
-                    image, wasi_version
+                    "Image '{image}' is a WASM artifact (WASI {wasi_version}) but the 'wasm' feature is not enabled. \
+                     Recompile zlayer-agent with --features wasm to run WASM workloads."
                 )))
             }
         }

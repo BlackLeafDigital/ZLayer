@@ -85,18 +85,21 @@ impl S3CacheConfig {
     }
 
     /// Set custom prefix
+    #[must_use]
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = prefix.into();
         self
     }
 
     /// Set region
+    #[must_use]
     pub fn with_region(mut self, region: impl Into<String>) -> Self {
         self.region = Some(region.into());
         self
     }
 
     /// Set custom endpoint
+    #[must_use]
     pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoint = Some(endpoint.into());
         self
@@ -110,6 +113,7 @@ impl S3CacheConfig {
     }
 
     /// Enable local cache read-through
+    #[must_use]
     pub fn with_local_cache(mut self, dir: impl Into<PathBuf>) -> Self {
         self.local_cache_dir = Some(dir.into());
         self
@@ -140,6 +144,10 @@ pub struct S3BlobCache {
 
 impl S3BlobCache {
     /// Create a new S3 blob cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the AWS SDK configuration cannot be built.
     pub async fn new(config: S3CacheConfig) -> Result<Self> {
         let sdk_config = Self::build_sdk_config(&config).await?;
 
@@ -183,6 +191,10 @@ impl S3BlobCache {
     }
 
     /// Get a blob by digest
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the digest is invalid or the S3 operation fails.
     pub async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>> {
         crate::cache::validate_digest(digest)?;
 
@@ -255,6 +267,10 @@ impl S3BlobCache {
     }
 
     /// Put a blob into the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the digest is invalid, mismatches the data, or the S3 upload fails.
     pub async fn put(&self, digest: &str, data: &[u8]) -> Result<()> {
         crate::cache::validate_digest(digest)?;
 
@@ -290,6 +306,10 @@ impl S3BlobCache {
     }
 
     /// Check if a blob exists in the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the digest is invalid or the S3 operation fails.
     pub async fn contains(&self, digest: &str) -> Result<bool> {
         crate::cache::validate_digest(digest)?;
 

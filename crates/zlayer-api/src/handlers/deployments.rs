@@ -125,6 +125,7 @@ impl DeploymentState {
     ///
     /// If a service manager is available, queries live replica counts and health.
     /// Otherwise, returns static info from the spec.
+    #[allow(clippy::cast_possible_truncation)]
     async fn build_service_health(&self, stored: &StoredDeployment) -> Vec<ServiceHealthInfo> {
         let mut infos = Vec::with_capacity(stored.spec.services.len());
 
@@ -256,7 +257,11 @@ impl From<&StoredDeployment> for DeploymentSummary {
     }
 }
 
-/// List all deployments
+/// List all deployments.
+///
+/// # Errors
+///
+/// Returns an error if storage access fails.
 #[utoipa::path(
     get,
     path = "/api/v1/deployments",
@@ -282,7 +287,11 @@ pub async fn list_deployments(
     Ok(Json(summaries))
 }
 
-/// Get deployment details (with live per-service health when available)
+/// Get deployment details (with live per-service health when available).
+///
+/// # Errors
+///
+/// Returns an error if the deployment is not found or storage access fails.
 #[utoipa::path(
     get,
     path = "/api/v1/deployments/{name}",
@@ -328,6 +337,10 @@ pub async fn get_deployment(
 ///  5. The async task updates the stored status to `Running` or `Failed`
 ///
 /// Without orchestration wired, it stores the spec with `Pending` status.
+///
+/// # Errors
+///
+/// Returns an error if the spec is invalid or storage fails.
 #[utoipa::path(
     post,
     path = "/api/v1/deployments",
@@ -398,6 +411,7 @@ pub async fn create_deployment(
 /// Registers each service with the `ServiceManager`, sets up overlay networks,
 /// configures proxy routes, scales to desired replicas, then waits for
 /// stabilization. Updates the stored deployment status to Running or Failed.
+#[allow(clippy::too_many_lines)]
 async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::DeploymentSpec) {
     let deployment_name = spec.deployment.clone();
     info!(deployment = %deployment_name, "Starting deployment orchestration");
@@ -552,7 +566,12 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
     }
 }
 
-/// Delete a deployment
+/// Delete a deployment.
+///
+/// # Errors
+///
+/// Returns an error if the deployment is not found, storage access fails, or teardown
+/// encounters critical failures.
 #[utoipa::path(
     delete,
     path = "/api/v1/deployments/{name}",

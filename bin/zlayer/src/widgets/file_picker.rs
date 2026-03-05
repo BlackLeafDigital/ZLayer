@@ -242,6 +242,7 @@ pub fn render(area: Rect, buf: &mut Buffer, state: &FilePickerState, title: &str
 }
 
 /// Check if a filename looks like a Dockerfile or `ZImagefile`
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
 fn is_buildfile(name: &str) -> bool {
     let lower = name.to_lowercase();
     lower.contains("dockerfile")

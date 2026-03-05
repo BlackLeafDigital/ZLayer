@@ -30,7 +30,11 @@ pub struct TokenResponse {
     pub expires_in: u64,
 }
 
-/// Get an access token
+/// Get an access token.
+///
+/// # Errors
+///
+/// Returns an error if credentials are invalid or token creation fails.
 #[utoipa::path(
     post,
     path = "/auth/token",

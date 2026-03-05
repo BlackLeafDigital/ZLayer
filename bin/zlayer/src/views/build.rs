@@ -10,6 +10,7 @@ use crate::app::{BuildStep, BuildWizardState};
 use crate::widgets::file_picker;
 
 /// Render the build wizard based on the current step
+#[allow(clippy::cast_possible_truncation)]
 pub fn render(frame: &mut Frame, state: &BuildWizardState) {
     let area = frame.area();
 
@@ -61,6 +62,7 @@ pub fn render(frame: &mut Frame, state: &BuildWizardState) {
 }
 
 /// Render the step progress indicator
+#[allow(clippy::cast_possible_truncation, clippy::comparison_chain)]
 fn render_step_indicator(area: Rect, buf: &mut Buffer, current: BuildStep) {
     let steps = [
         ("Source", BuildStep::SelectSource),
@@ -145,6 +147,7 @@ fn render_select_source(area: Rect, frame: &mut Frame, state: &BuildWizardState)
 }
 
 /// Step 2: Configure build options
+#[allow(clippy::cast_possible_truncation)]
 fn render_configure(area: Rect, buf: &mut Buffer, state: &BuildWizardState) {
     let block = Block::default()
         .title(" Configure Build ")
@@ -230,6 +233,7 @@ fn render_configure(area: Rect, buf: &mut Buffer, state: &BuildWizardState) {
 }
 
 /// Step 3: Review before building
+#[allow(clippy::cast_possible_truncation)]
 fn render_review(area: Rect, buf: &mut Buffer, state: &BuildWizardState) {
     let block = Block::default()
         .title(" Review Build Configuration ")
@@ -397,6 +401,7 @@ fn render_complete(area: Rect, buf: &mut Buffer, state: &BuildWizardState) {
 // ---------------------------------------------------------------------------
 
 /// Handle key events for the build wizard
+#[allow(clippy::comparison_chain)]
 pub fn handle_key(key: KeyEvent, state: &mut BuildWizardState) {
     match state.step {
         BuildStep::SelectSource => handle_select_source_key(key, state),

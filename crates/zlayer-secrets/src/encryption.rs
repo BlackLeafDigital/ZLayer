@@ -63,6 +63,9 @@ impl EncryptionKey {
     /// Generates a random 32-byte encryption key.
     ///
     /// Uses the operating system's cryptographically secure random number generator.
+    ///
+    /// # Panics
+    /// Panics if the OS random number generator fails.
     #[must_use]
     pub fn generate() -> Self {
         let mut key_bytes = Zeroizing::new([0u8; KEY_SIZE]);
@@ -111,6 +114,9 @@ impl EncryptionKey {
     ///
     /// # Errors
     /// Returns `SecretsError::Encryption` if encryption fails.
+    ///
+    /// # Panics
+    /// Panics if the OS random number generator fails to produce nonce bytes.
     pub fn encrypt(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
         let cipher = XChaCha20Poly1305::new_from_slice(self.key.as_ref())
             .map_err(|e| SecretsError::Encryption(format!("Failed to create cipher: {e}")))?;

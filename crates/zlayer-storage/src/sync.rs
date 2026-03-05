@@ -31,6 +31,11 @@ pub struct LayerSyncManager {
 
 impl LayerSyncManager {
     /// Create a new sync manager
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directories cannot be created, the database cannot
+    /// be opened, or the AWS SDK fails to initialize.
     pub async fn new(config: LayerStorageConfig) -> Result<Self> {
         // Ensure directories exist
         tokio::fs::create_dir_all(&config.staging_dir).await?;
@@ -138,6 +143,10 @@ impl LayerSyncManager {
     }
 
     /// Register a container for layer sync tracking
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the sync state to the database fails.
     #[instrument(skip(self))]
     pub async fn register_container(&self, container_id: ContainerLayerId) -> Result<()> {
         let key = container_id.to_key();
@@ -154,6 +163,11 @@ impl LayerSyncManager {
     }
 
     /// Check if a container's layer has changed and needs sync
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not registered or if calculating the
+    /// directory digest fails.
     #[instrument(skip(self, upper_layer_path))]
     pub async fn check_for_changes(
         &self,
@@ -175,6 +189,10 @@ impl LayerSyncManager {
     }
 
     /// Create a snapshot and upload it to S3
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if snapshot creation, S3 upload, or state persistence fails.
     #[instrument(skip(self, upper_layer_path), fields(container = %container_id))]
     pub async fn sync_layer(
         &self,
@@ -247,6 +265,7 @@ impl LayerSyncManager {
     }
 
     /// Upload a snapshot to S3 using multipart upload
+    #[allow(clippy::cast_possible_wrap)]
     #[instrument(skip(self, tarball_path, snapshot))]
     async fn upload_snapshot(
         &self,
@@ -257,6 +276,7 @@ impl LayerSyncManager {
         let object_key = self.config.object_key(&snapshot.digest);
         let file_size = tokio::fs::metadata(tarball_path).await?.len();
         let part_size = self.config.part_size_bytes;
+        #[allow(clippy::cast_possible_truncation)]
         let total_parts = file_size.div_ceil(part_size) as u32;
 
         info!(
@@ -356,6 +376,7 @@ impl LayerSyncManager {
     }
 
     /// Upload individual parts with progress tracking
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     async fn upload_parts(
         &self,
         tarball_path: &Path,
@@ -403,6 +424,7 @@ impl LayerSyncManager {
     }
 
     /// Resume an interrupted upload
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     #[instrument(skip(self, pending))]
     async fn resume_upload(
         &self,
@@ -540,6 +562,11 @@ impl LayerSyncManager {
     }
 
     /// Download and restore a layer from S3
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the remote layer is not found, download fails,
+    /// digest verification fails, or extraction fails.
     #[instrument(skip(self, target_path))]
     pub async fn restore_layer(
         &self,

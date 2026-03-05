@@ -153,6 +153,7 @@ impl Instruction {
     /// assert_eq!(key.len(), 16);
     /// ```
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn cache_key(&self) -> String {
         use std::collections::hash_map::DefaultHasher;
         use std::hash::{Hash, Hasher};
@@ -588,12 +589,14 @@ impl CopyInstruction {
     }
 
     /// Set the source stage
+    #[must_use]
     pub fn from_stage(mut self, stage: impl Into<String>) -> Self {
         self.from = Some(stage.into());
         self
     }
 
     /// Set ownership
+    #[must_use]
     pub fn chown(mut self, owner: impl Into<String>) -> Self {
         self.chown = Some(owner.into());
         self

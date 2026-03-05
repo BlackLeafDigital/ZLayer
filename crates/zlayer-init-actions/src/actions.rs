@@ -15,6 +15,8 @@ pub struct WaitTcp {
 }
 
 impl WaitTcp {
+    /// # Errors
+    /// Returns `InitError::TcpFailed` if the connection times out.
     pub async fn execute(&self) -> Result<()> {
         let start = std::time::Instant::now();
 
@@ -48,6 +50,8 @@ pub struct WaitHttp {
 }
 
 impl WaitHttp {
+    /// # Errors
+    /// Returns `InitError::HttpFailed` if the request times out or the expected status is not received.
     pub async fn execute(&self) -> Result<()> {
         let start = std::time::Instant::now();
         let client = reqwest::Client::builder()
@@ -92,6 +96,8 @@ pub struct RunCommand {
 }
 
 impl RunCommand {
+    /// # Errors
+    /// Returns an error if the command fails, exits non-zero, or times out.
     pub async fn execute(&self) -> Result<()> {
         match timeout(
             self.timeout,
@@ -143,6 +149,12 @@ pub struct S3Push {
 
 #[cfg(feature = "s3")]
 impl S3Push {
+    /// Execute the S3 push action, uploading files to the configured bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the AWS SDK configuration fails, the S3 client
+    /// cannot be created, or any file upload fails.
     pub async fn execute(&self) -> Result<()> {
         use aws_sdk_s3::Client;
 
@@ -291,6 +303,12 @@ pub struct S3Pull {
 
 #[cfg(feature = "s3")]
 impl S3Pull {
+    /// Execute the S3 pull action, downloading files from the configured bucket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the AWS SDK configuration fails, the S3 client
+    /// cannot be created, or any file download fails.
     pub async fn execute(&self) -> Result<()> {
         use aws_sdk_s3::Client;
         use tokio::io::AsyncWriteExt;
@@ -387,6 +405,11 @@ impl S3Pull {
 }
 
 /// Create an init action from the spec
+///
+/// # Errors
+/// Returns `InitError::InvalidParams` if required parameters are missing or invalid,
+/// or `InitError::UnknownAction` if the action type is not recognized.
+#[allow(clippy::too_many_lines, clippy::implicit_hasher)]
 pub fn from_spec(
     action: &str,
     params: &HashMap<String, serde_json::Value>,
@@ -403,6 +426,7 @@ pub fn from_spec(
                 })?
                 .to_string();
 
+            #[allow(clippy::cast_possible_truncation)]
             let port = params
                 .get("port")
                 .and_then(serde_json::Value::as_u64)
@@ -434,6 +458,7 @@ pub fn from_spec(
                 })?
                 .to_string();
 
+            #[allow(clippy::cast_possible_truncation)]
             let expect_status = params
                 .get("expect_status")
                 .and_then(serde_json::Value::as_u64)
@@ -593,6 +618,8 @@ pub enum InitAction {
 }
 
 impl InitAction {
+    /// # Errors
+    /// Returns an error if the underlying action fails.
     pub async fn execute(&self) -> Result<()> {
         match self {
             InitAction::WaitTcp(a) => a.execute().await,

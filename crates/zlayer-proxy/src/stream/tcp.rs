@@ -77,9 +77,7 @@ impl TcpStreamService {
         client_addr: SocketAddr,
     ) {
         // Resolve service for this port
-        let service = if let Some(s) = self.registry.resolve_tcp(self.listen_port) {
-            s
-        } else {
+        let Some(service) = self.registry.resolve_tcp(self.listen_port) else {
             tracing::warn!(
                 port = self.listen_port,
                 client = %client_addr,
@@ -89,9 +87,7 @@ impl TcpStreamService {
         };
 
         // Select backend using round-robin
-        let backend = if let Some(b) = service.select_backend() {
-            b
-        } else {
+        let Some(backend) = service.select_backend() else {
             tracing::warn!(
                 port = self.listen_port,
                 service = %service.name,

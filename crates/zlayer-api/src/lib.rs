@@ -23,6 +23,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod handlers;
+#[allow(clippy::needless_for_each)]
 pub mod openapi;
 pub mod ratelimit;
 pub mod router;

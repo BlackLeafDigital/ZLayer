@@ -5,6 +5,7 @@
 
 use crate::{config::OverlayConfig, PeerInfo};
 use boringtun::device::{DeviceConfig, DeviceHandle};
+use std::fmt::Write;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::Command;
@@ -90,6 +91,11 @@ impl OverlayTransport {
     /// This spawns boringtun worker threads that manage the TUN device.  The
     /// device is torn down when this struct is dropped (or [`shutdown`] is
     /// called).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the interface name exceeds 15 characters, the TUN device
+    /// cannot be created, or `CAP_NET_ADMIN` is unavailable.
     pub async fn create_interface(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // Validate interface name (kernel limit is 15 chars for IFNAMSIZ)
         if self.interface_name.len() > 15 {
@@ -167,6 +173,10 @@ impl OverlayTransport {
     /// After setting the `WireGuard` parameters via UAPI, this also assigns the
     /// overlay IP address and brings the interface up using standard `ip`
     /// commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if UAPI configuration fails or IP assignment commands fail.
     pub async fn configure(&self, peers: &[PeerInfo]) -> Result<(), Box<dyn std::error::Error>> {
         let sock = self.uapi_sock_path();
 
@@ -180,13 +190,14 @@ impl OverlayTransport {
 
         for peer in peers {
             let pub_hex = key_to_hex(&peer.public_key)?;
-            body.push_str(&format!("public_key={pub_hex}\n"));
-            body.push_str(&format!("endpoint={}\n", peer.endpoint));
-            body.push_str(&format!("allowed_ip={}\n", peer.allowed_ips));
-            body.push_str(&format!(
-                "persistent_keepalive_interval={}\n",
+            let _ = writeln!(body, "public_key={pub_hex}");
+            let _ = writeln!(body, "endpoint={}", peer.endpoint);
+            let _ = writeln!(body, "allowed_ip={}", peer.allowed_ips);
+            let _ = writeln!(
+                body,
+                "persistent_keepalive_interval={}",
                 peer.persistent_keepalive_interval.as_secs()
-            ));
+            );
         }
 
         uapi_set(&sock, &body).await?;
@@ -231,6 +242,10 @@ impl OverlayTransport {
     }
 
     /// Add a peer dynamically via UAPI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key conversion or UAPI command fails.
     pub async fn add_peer(&self, peer: &PeerInfo) -> Result<(), Box<dyn std::error::Error>> {
         let sock = self.uapi_sock_path();
         let pub_hex = key_to_hex(&peer.public_key)?;
@@ -253,6 +268,10 @@ impl OverlayTransport {
     }
 
     /// Remove a peer via UAPI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key conversion or UAPI command fails.
     pub async fn remove_peer(&self, public_key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let sock = self.uapi_sock_path();
         let pub_hex = key_to_hex(public_key)?;
@@ -269,6 +288,10 @@ impl OverlayTransport {
     }
 
     /// Query interface status via UAPI.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the UAPI query fails.
     pub async fn status(&self) -> Result<String, Box<dyn std::error::Error>> {
         let sock = self.uapi_sock_path();
         let response = uapi_get(&sock).await?;
@@ -279,6 +302,11 @@ impl OverlayTransport {
     ///
     /// No external binary is required. Returns `(private_key, public_key)` in
     /// base64 encoding.
+    ///
+    /// # Errors
+    ///
+    /// This method currently always succeeds but returns `Result` for API consistency.
+    #[allow(clippy::unused_async)]
     pub async fn generate_keys() -> Result<(String, String), Box<dyn std::error::Error>> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
         use x25519_dalek::{PublicKey, StaticSecret};

@@ -30,7 +30,11 @@ impl ApiServer {
         self.config.bind
     }
 
-    /// Run the server
+    /// Run the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding to the address or serving fails.
     pub async fn run(self) -> anyhow::Result<()> {
         let addr = self.config.bind;
         let router = build_router(&self.config);
@@ -53,7 +57,11 @@ impl ApiServer {
         Ok(())
     }
 
-    /// Run the server with graceful shutdown
+    /// Run the server with graceful shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding to the address or serving fails.
     pub async fn run_with_shutdown(
         self,
         shutdown: impl std::future::Future<Output = ()> + Send + 'static,
@@ -95,6 +103,11 @@ impl ApiServer {
     /// * `unix_path` - Path for the Unix domain socket file (e.g. `/run/zlayer/api.sock`)
     /// * `router` - Pre-built axum Router to serve on both listeners
     /// * `shutdown` - Future that completes when shutdown is requested
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding to the TCP address or Unix socket fails,
+    /// or if either server encounters an error during operation.
     #[cfg(unix)]
     pub async fn run_dual(
         tcp_addr: SocketAddr,
@@ -185,6 +198,16 @@ impl ApiServer {
     /// * `router` - Pre-built axum Router
     /// * `jwt_secret` - JWT secret used to mint the local admin token
     /// * `shutdown` - Future that completes when shutdown is requested
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if binding to the TCP address or Unix socket fails,
+    /// token creation fails, or either server encounters an error.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the bearer token header value cannot be parsed (should not
+    /// happen with valid JWT tokens).
     #[cfg(unix)]
     pub async fn run_dual_with_local_auth(
         tcp_addr: SocketAddr,

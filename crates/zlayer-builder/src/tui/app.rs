@@ -85,6 +85,10 @@ impl BuildTui {
     ///
     /// This will take over the terminal, display the build progress,
     /// and return when the build completes or the user quits (q key).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if terminal setup, rendering, or restoration fails.
     pub fn run(&mut self) -> io::Result<()> {
         let mut terminal = setup_terminal()?;
         let result = self.run_loop(&mut terminal);

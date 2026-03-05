@@ -167,6 +167,7 @@ pub async fn is_docker_available() -> bool {
 
 /// Check if Docker daemon is available (stub when docker feature is disabled)
 #[cfg(not(feature = "docker"))]
+#[allow(clippy::unused_async)]
 pub async fn is_docker_available() -> bool {
     false
 }
@@ -195,6 +196,7 @@ pub fn is_wasm_available() -> bool {
 
 /// Check if the WASM runtime is available (stub when wasm feature is disabled)
 #[cfg(not(feature = "wasm"))]
+#[must_use]
 pub fn is_wasm_available() -> bool {
     false
 }

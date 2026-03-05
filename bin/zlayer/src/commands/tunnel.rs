@@ -11,9 +11,9 @@ pub(crate) async fn handle_tunnel(_cli: &Cli, cmd: &TunnelCommands) -> Result<()
             name,
             services,
             ttl_hours,
-        } => handle_tunnel_create(name, services.clone(), *ttl_hours).await,
-        TunnelCommands::List { output } => handle_tunnel_list(output).await,
-        TunnelCommands::Revoke { id } => handle_tunnel_revoke(id).await,
+        } => handle_tunnel_create(name, services.clone(), *ttl_hours),
+        TunnelCommands::List { output } => handle_tunnel_list(output),
+        TunnelCommands::Revoke { id } => handle_tunnel_revoke(id),
         TunnelCommands::Connect {
             server,
             token,
@@ -26,19 +26,20 @@ pub(crate) async fn handle_tunnel(_cli: &Cli, cmd: &TunnelCommands) -> Result<()
             local_port,
             remote_port,
             expose,
-        } => handle_tunnel_add(name, from, to, *local_port, *remote_port, expose).await,
-        TunnelCommands::Remove { name } => handle_tunnel_remove(name).await,
-        TunnelCommands::Status { id } => handle_tunnel_status(id.clone()).await,
+        } => handle_tunnel_add(name, from, to, *local_port, *remote_port, expose),
+        TunnelCommands::Remove { name } => handle_tunnel_remove(name),
+        TunnelCommands::Status { id } => handle_tunnel_status(id.clone()),
         TunnelCommands::Access {
             endpoint,
             local_port,
             ttl,
-        } => handle_tunnel_access(endpoint, *local_port, ttl).await,
+        } => handle_tunnel_access(endpoint, *local_port, ttl),
     }
 }
 
 /// Create a new tunnel token
-pub(crate) async fn handle_tunnel_create(
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_tunnel_create(
     name: &str,
     services: Option<String>,
     ttl_hours: u64,
@@ -82,7 +83,8 @@ pub(crate) async fn handle_tunnel_create(
 }
 
 /// List tunnel tokens
-pub(crate) async fn handle_tunnel_list(output: &str) -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_tunnel_list(output: &str) -> Result<()> {
     info!(output = %output, "Listing tunnels");
 
     // In production, this would query the API
@@ -96,7 +98,8 @@ pub(crate) async fn handle_tunnel_list(output: &str) -> Result<()> {
 }
 
 /// Revoke a tunnel token
-pub(crate) async fn handle_tunnel_revoke(id: &str) -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_tunnel_revoke(id: &str) -> Result<()> {
     info!(id = %id, "Revoking tunnel");
 
     println!("Revoking tunnel: {id}");
@@ -215,7 +218,7 @@ pub(crate) async fn handle_tunnel_connect(
 }
 
 /// Add a node-to-node tunnel
-pub(crate) async fn handle_tunnel_add(
+pub(crate) fn handle_tunnel_add(
     name: &str,
     from: &str,
     to: &str,
@@ -256,7 +259,8 @@ pub(crate) async fn handle_tunnel_add(
 }
 
 /// Remove a node-to-node tunnel
-pub(crate) async fn handle_tunnel_remove(name: &str) -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_tunnel_remove(name: &str) -> Result<()> {
     info!(name = %name, "Removing node-to-node tunnel");
 
     println!("Removing node-to-node tunnel: {name}");
@@ -272,7 +276,8 @@ pub(crate) async fn handle_tunnel_remove(name: &str) -> Result<()> {
 }
 
 /// Show tunnel status
-pub(crate) async fn handle_tunnel_status(id: Option<String>) -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_tunnel_status(id: Option<String>) -> Result<()> {
     info!(id = ?id, "Getting tunnel status");
 
     if let Some(tunnel_id) = id {
@@ -297,7 +302,7 @@ pub(crate) async fn handle_tunnel_status(id: Option<String>) -> Result<()> {
 }
 
 /// Request temporary access to a tunneled service
-pub(crate) async fn handle_tunnel_access(
+pub(crate) fn handle_tunnel_access(
     endpoint: &str,
     local_port: Option<u16>,
     ttl: &str,

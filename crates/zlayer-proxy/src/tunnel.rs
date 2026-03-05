@@ -6,6 +6,7 @@
 use crate::error::{ProxyError, Result};
 use http::{header, Request, Response, StatusCode};
 use hyper::upgrade::OnUpgrade;
+use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, error, info, warn};
 
@@ -54,6 +55,11 @@ pub fn is_upgrade_response<B>(res: &Response<B>) -> bool {
 ///
 /// This function performs bidirectional copying between the client
 /// and server connections after an upgrade.
+///
+/// # Errors
+///
+/// Returns an error if the bidirectional copy fails with a non-reset
+/// IO error.
 pub async fn proxy_tunnel<C, S>(mut client: C, mut server: S) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send,
@@ -85,6 +91,11 @@ where
 ///
 /// This is a higher-level function that takes `OnUpgrade` futures from hyper
 /// and handles the bidirectional copying between them.
+///
+/// # Errors
+///
+/// Returns an error if either upgrade fails or if the bidirectional
+/// tunnel encounters a fatal IO error.
 pub async fn proxy_upgrade(client_upgrade: OnUpgrade, server_upgrade: OnUpgrade) -> Result<()> {
     // Wait for both upgrades to complete
     let (client_result, server_result) = tokio::join!(client_upgrade, server_upgrade);
@@ -102,7 +113,6 @@ pub async fn proxy_upgrade(client_upgrade: OnUpgrade, server_upgrade: OnUpgrade)
     info!("Upgrade successful, starting bidirectional tunnel");
 
     // Use hyper_util's TokioIo wrapper for the upgraded connections
-    use hyper_util::rt::TokioIo;
     let client = TokioIo::new(client_io);
     let server = TokioIo::new(server_io);
 

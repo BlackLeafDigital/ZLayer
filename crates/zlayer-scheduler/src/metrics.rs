@@ -57,6 +57,7 @@ pub struct ServiceMetrics {
 impl ServiceMetrics {
     /// Calculate memory usage as percentage
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn memory_percent(&self) -> f64 {
         if self.memory_limit > 0 {
             (self.memory_bytes as f64 / self.memory_limit as f64) * 100.0
@@ -115,7 +116,11 @@ impl MetricsCollector {
         Self::with_cache_ttl(Duration::from_secs(5))
     }
 
-    /// Create with custom cache TTL
+    /// Create with custom cache TTL.
+    ///
+    /// # Panics
+    ///
+    /// Panics if Prometheus metric creation fails (invalid metric names).
     #[must_use]
     pub fn with_cache_ttl(cache_ttl: Duration) -> Self {
         let registry = Registry::new();
@@ -175,7 +180,12 @@ impl MetricsCollector {
         &self.registry
     }
 
-    /// Collect and aggregate metrics for a service
+    /// Collect and aggregate metrics for a service.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::MetricsCollection` if no metrics sources
+    /// return data for the given service.
     pub async fn collect(&self, service_name: &str) -> Result<AggregatedMetrics> {
         // Check cache first
         {
@@ -231,6 +241,7 @@ impl MetricsCollector {
         if let Some(rps) = aggregated.total_rps {
             self.rps_gauge.with_label_values(&[service_name]).set(rps);
         }
+        #[allow(clippy::cast_precision_loss)]
         self.instance_gauge
             .with_label_values(&[service_name])
             .set(aggregated.instance_count as f64);
@@ -248,6 +259,7 @@ impl MetricsCollector {
     }
 
     /// Aggregate metrics from multiple instances
+    #[allow(clippy::cast_precision_loss)]
     fn aggregate(metrics: &[ServiceMetrics]) -> AggregatedMetrics {
         if metrics.is_empty() {
             return AggregatedMetrics::default();
@@ -452,6 +464,7 @@ pub struct RawContainerStats {
 impl RawContainerStats {
     /// Calculate memory usage as a percentage
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn memory_percent(&self) -> f64 {
         if self.memory_limit == u64::MAX || self.memory_limit == 0 {
             0.0
@@ -556,10 +569,11 @@ where
     /// Calculate CPU percentage from two consecutive samples
     ///
     /// Uses the formula: (`delta_usage` / (`delta_time` * `num_cpus`)) * 100
+    #[allow(clippy::cast_precision_loss)]
     fn calculate_cpu_percent(&self, prev: &RawContainerStats, curr: &RawContainerStats) -> f64 {
         let usage_delta = curr.cpu_usage_usec.saturating_sub(prev.cpu_usage_usec);
         let time_delta = curr.timestamp.duration_since(prev.timestamp);
-        let time_delta_usec = time_delta.as_micros() as u64;
+        let time_delta_usec = u64::try_from(time_delta.as_micros()).unwrap_or(u64::MAX);
 
         if time_delta_usec == 0 || self.num_cpus == 0 {
             return 0.0;
@@ -732,10 +746,14 @@ where
         }
 
         if !cpu_samples.is_empty() {
+            #[allow(clippy::cast_precision_loss)]
+            let avg_cpu = cpu_samples.iter().sum::<f64>() / cpu_samples.len() as f64;
+            #[allow(clippy::cast_precision_loss)]
+            let avg_mem = memory_samples.iter().sum::<f64>() / memory_samples.len() as f64;
             results.push(AutoscaleMetrics {
                 service: service_name,
-                cpu_percent: cpu_samples.iter().sum::<f64>() / cpu_samples.len() as f64,
-                memory_percent: memory_samples.iter().sum::<f64>() / memory_samples.len() as f64,
+                cpu_percent: avg_cpu,
+                memory_percent: avg_mem,
                 rps: if has_rps { Some(rps_sum) } else { None },
                 replica_count: containers.len(),
                 timestamp: SystemTime::now(),

@@ -83,6 +83,7 @@ COMMAND GROUPS:
   Interface:    tui
 
 Run 'zlayer <command> --help' for details on a specific command.")]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct Cli {
     /// Container runtime to use
     #[arg(long, default_value = "auto", value_enum)]

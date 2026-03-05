@@ -196,6 +196,9 @@ impl JobExecutor {
     }
 
     /// Trigger a job execution
+    ///
+    /// # Errors
+    /// Returns an error if the job container cannot be created or started.
     pub async fn trigger(
         &self,
         job_name: &str,
@@ -257,6 +260,7 @@ impl JobExecutor {
     }
 
     /// Internal: Run a job to completion
+    #[allow(clippy::too_many_lines)]
     async fn run_job(
         runtime: Arc<dyn Runtime + Send + Sync>,
         executions: Arc<RwLock<HashMap<JobExecutionId, JobExecution>>>,
@@ -514,6 +518,9 @@ impl JobExecutor {
     }
 
     /// Cancel a running job execution
+    ///
+    /// # Errors
+    /// Returns an error if the execution is not found or not in a cancellable state.
     pub async fn cancel(&self, exec_id: &JobExecutionId) -> Result<()> {
         let mut executions = self.executions.write().await;
         if let Some(execution) = executions.get_mut(exec_id) {

@@ -259,7 +259,12 @@ impl ClusterState {
         Self::default()
     }
 
-    /// Apply a request to the state machine
+    /// Apply a request to the state machine.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system clock is before the Unix epoch.
+    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, request: &Request) -> Response {
         match request {
             Request::UpdateServiceState {
@@ -311,6 +316,7 @@ impl ClusterState {
                 disk_total,
                 gpus,
             } => {
+                #[allow(clippy::cast_possible_truncation)]
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
@@ -358,7 +364,7 @@ impl ClusterState {
             }
             Request::UpdateNodeStatus { node_id, status } => {
                 if let Some(node) = self.nodes.get_mut(node_id) {
-                    node.status = status.clone();
+                    node.status.clone_from(status);
                 }
                 Response::Success { data: None }
             }
@@ -377,7 +383,7 @@ impl ClusterState {
                 node_ids,
             } => {
                 if let Some(svc) = self.services.get_mut(service_name) {
-                    svc.assigned_nodes = node_ids.clone();
+                    svc.assigned_nodes.clone_from(node_ids);
                     Response::Success { data: None }
                 } else {
                     Response::Error {
@@ -478,6 +484,10 @@ pub struct RaftCoordinator {
 
 impl RaftCoordinator {
     /// Create a new Raft coordinator without auth.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if the consensus node fails to build.
     pub async fn new(config: RaftConfig) -> Result<Self> {
         Self::with_auth(config, None).await
     }
@@ -486,6 +496,10 @@ impl RaftCoordinator {
     ///
     /// When `auth_token` is `Some`, the HTTP client will attach it to every
     /// outgoing Raft RPC as an `Authorization: Bearer <token>` header.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if the consensus node fails to build.
     pub async fn with_auth(config: RaftConfig, auth_token: Option<String>) -> Result<Self> {
         let consensus_config = ConsensusConfig {
             cluster_name: "zlayer".to_string(),
@@ -526,9 +540,13 @@ impl RaftCoordinator {
         })
     }
 
-    /// Bootstrap a new single-node cluster
+    /// Bootstrap a new single-node cluster.
     ///
     /// This should only be called once when creating a new cluster.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if bootstrapping fails.
     pub async fn bootstrap(&self) -> Result<()> {
         self.node
             .bootstrap()
@@ -549,7 +567,11 @@ impl RaftCoordinator {
         self.node.leader_id()
     }
 
-    /// Propose a state change (must be leader)
+    /// Propose a state change (must be leader).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if the proposal fails.
     pub async fn propose(&self, request: Request) -> Result<Response> {
         self.node
             .propose(request)
@@ -569,7 +591,11 @@ impl RaftCoordinator {
         state.services.get(name).cloned()
     }
 
-    /// Update service state (proposes to Raft)
+    /// Update service state (proposes to Raft).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if the proposal fails.
     pub async fn update_service(&self, name: String, state: ServiceState) -> Result<()> {
         self.propose(Request::UpdateServiceState {
             service_name: name,
@@ -579,7 +605,15 @@ impl RaftCoordinator {
         Ok(())
     }
 
-    /// Record a scale event
+    /// Record a scale event.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if the proposal fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system clock is before the Unix epoch.
     pub async fn record_scale_event(
         &self,
         service_name: String,
@@ -587,6 +621,7 @@ impl RaftCoordinator {
         to_replicas: u32,
         reason: String,
     ) -> Result<()> {
+        #[allow(clippy::cast_possible_truncation)]
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -614,6 +649,11 @@ impl RaftCoordinator {
     /// The caller must be the current leader. This first adds the node as a
     /// **learner** (non-voting) so it can catch up on the log, then promotes
     /// it to a voting member via a membership change.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if adding the voter or proposing
+    /// the node registration fails.
     pub async fn add_member(&self, params: AddMemberParams) -> Result<()> {
         // Use ConsensusNode's add_voter (learner + promote in one call)
         self.node
@@ -654,7 +694,11 @@ impl RaftCoordinator {
         self.config.node_id
     }
 
-    /// Shutdown the Raft node
+    /// Shutdown the Raft node.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Raft` if shutdown fails.
     pub async fn shutdown(&self) -> Result<()> {
         self.node
             .shutdown()

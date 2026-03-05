@@ -110,6 +110,11 @@ impl CertManager {
     /// # Arguments
     /// * `storage_path` - Directory to store certificates
     /// * `acme_email` - Optional email for ACME account registration
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage directory cannot be created or
+    /// if loading an existing account fails.
     pub async fn new(
         storage_path: String,
         acme_email: Option<String>,
@@ -128,6 +133,10 @@ impl CertManager {
     /// * `storage_path` - Directory to store certificates
     /// * `acme_email` - Optional email for ACME account registration
     /// * `acme_directory` - ACME directory URL (e.g., Let's Encrypt production/staging)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage directory cannot be created.
     pub async fn with_directory(
         storage_path: String,
         acme_email: Option<String>,
@@ -178,6 +187,11 @@ impl CertManager {
     ///
     /// # Returns
     /// Tuple of (`certificate_pem`, `private_key_pem`)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the certificate is not found and ACME
+    /// provisioning fails.
     pub async fn get_cert(
         &self,
         domain: &str,
@@ -220,6 +234,10 @@ impl CertManager {
     /// * `domain` - The domain
     /// * `cert` - Certificate PEM content
     /// * `key` - Private key PEM content
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing the certificate or key files to disk fails.
     pub async fn store_cert(
         &self,
         domain: &str,
@@ -310,6 +328,7 @@ impl CertManager {
     ///
     /// # Returns
     /// Tuple of (`certificate_pem`, `private_key_pem`)
+    #[allow(clippy::too_many_lines)]
     async fn provision_cert(
         &self,
         domain: &str,
@@ -379,8 +398,7 @@ impl CertManager {
 
             // Store challenge for our HTTP server to serve
             let key_auth = order.key_authorization(challenge);
-            self.store_challenge(&challenge.token, domain, key_auth.as_str())
-                .await;
+            self.store_challenge(&challenge.token, domain, key_auth.as_str());
 
             tracing::info!(
                 domain = %domain,
@@ -406,7 +424,7 @@ impl CertManager {
         let start_time = Instant::now();
         loop {
             if start_time.elapsed() > ACME_VALIDATION_TIMEOUT {
-                self.clear_challenges_for_domain(domain).await;
+                self.clear_challenges_for_domain(domain);
                 return Err(format!(
                     "ACME validation timeout for '{}'. Validation did not complete within {} seconds. \
                      Ensure the domain is accessible at http://{}/.well-known/acme-challenge/",
@@ -431,7 +449,7 @@ impl CertManager {
                     break;
                 }
                 OrderStatus::Invalid => {
-                    self.clear_challenges_for_domain(domain).await;
+                    self.clear_challenges_for_domain(domain);
                     let error_msg = order
                         .state()
                         .error
@@ -487,7 +505,7 @@ impl CertManager {
         // Step 7: Get certificate (with timeout)
         let cert_chain = loop {
             if start_time.elapsed() > ACME_VALIDATION_TIMEOUT {
-                self.clear_challenges_for_domain(domain).await;
+                self.clear_challenges_for_domain(domain);
                 return Err(format!(
                     "Timeout waiting for certificate for '{}'. \
                      Certificate was not issued within {} seconds.",
@@ -504,7 +522,7 @@ impl CertManager {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
                 Err(e) => {
-                    self.clear_challenges_for_domain(domain).await;
+                    self.clear_challenges_for_domain(domain);
                     return Err(format!("Failed to get certificate for '{domain}': {e}").into());
                 }
             }
@@ -513,7 +531,7 @@ impl CertManager {
         // Step 8: Store and return certificate
         let key_pem = key_pair.serialize_pem();
         self.store_cert(domain, &cert_chain, &key_pem).await?;
-        self.clear_challenges_for_domain(domain).await;
+        self.clear_challenges_for_domain(domain);
 
         tracing::info!(
             domain = %domain,
@@ -546,6 +564,11 @@ impl CertManager {
     ///
     /// # Returns
     /// Tuple of (`not_before`, `not_after`) as `DateTime`<Utc>
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the PEM cannot be parsed or the X.509
+    /// certificate contains invalid timestamps.
     pub fn parse_cert_expiry(
         cert_pem: &str,
     ) -> Result<(DateTime<Utc>, DateTime<Utc>), Box<dyn std::error::Error + Send + Sync>> {
@@ -714,7 +737,6 @@ impl CertManager {
                             // Update SNI resolver with new certificate
                             if let Err(e) = sni_resolver
                                 .refresh_cert(&domain, &cert_pem, &key_pem)
-                                .await
                             {
                                 tracing::error!(
                                     domain = %domain,
@@ -758,7 +780,6 @@ impl CertManager {
                 Ok((cert_pem, key_pem)) => {
                     if sni_resolver
                         .refresh_cert(&domain, &cert_pem, &key_pem)
-                        .await
                         .is_ok()
                     {
                         renewed.push(domain);
@@ -884,8 +905,9 @@ impl CertManager {
     /// # Arguments
     /// * `account` - The account to save
     ///
-    /// # Returns
-    /// Ok(()) if successful, Err otherwise
+    /// # Errors
+    ///
+    /// Returns an error if serialization or writing to disk fails.
     pub async fn save_account(
         &self,
         account: &AcmeAccount,
@@ -940,8 +962,9 @@ impl CertManager {
     /// 2. Loads the account from disk if it exists
     /// 3. Creates a new account via ACME
     ///
-    /// # Returns
-    /// The ACME account metadata
+    /// # Errors
+    ///
+    /// Returns an error if ACME account creation or restoration fails.
     pub async fn get_or_create_account(
         &self,
     ) -> Result<AcmeAccount, Box<dyn std::error::Error + Send + Sync>> {
@@ -1082,7 +1105,7 @@ impl CertManager {
     /// * `token` - The challenge token from the ACME server
     /// * `domain` - The domain being validated
     /// * `key_authorization` - The key authorization response (token.thumbprint)
-    pub async fn store_challenge(&self, token: &str, domain: &str, key_authorization: &str) {
+    pub fn store_challenge(&self, token: &str, domain: &str, key_authorization: &str) {
         let challenge = ChallengeToken {
             token: token.to_string(),
             key_authorization: key_authorization.to_string(),
@@ -1104,7 +1127,7 @@ impl CertManager {
     ///
     /// # Returns
     /// The key authorization string if the token exists and hasn't expired
-    pub async fn get_challenge_response(&self, token: &str) -> Option<String> {
+    pub fn get_challenge_response(&self, token: &str) -> Option<String> {
         self.challenges
             .get(token)
             .filter(|challenge| challenge.created_at.elapsed() < CHALLENGE_EXPIRATION)
@@ -1115,7 +1138,7 @@ impl CertManager {
     ///
     /// # Arguments
     /// * `token` - The challenge token to remove
-    pub async fn remove_challenge(&self, token: &str) {
+    pub fn remove_challenge(&self, token: &str) {
         if self.challenges.remove(token).is_some() {
             tracing::debug!(token = %token, "Removed ACME challenge token");
         }
@@ -1127,7 +1150,7 @@ impl CertManager {
     ///
     /// # Arguments
     /// * `domain` - The domain to clear challenges for
-    pub async fn clear_challenges_for_domain(&self, domain: &str) {
+    pub fn clear_challenges_for_domain(&self, domain: &str) {
         let tokens_to_remove: Vec<String> = self
             .challenges
             .iter()
@@ -1249,15 +1272,15 @@ mod tests {
         let key_auth = "abc123.thumbprint";
 
         // Store a challenge
-        manager.store_challenge(token, domain, key_auth).await;
+        manager.store_challenge(token, domain, key_auth);
         assert_eq!(manager.challenge_count(), 1);
 
         // Retrieve it
-        let response = manager.get_challenge_response(token).await;
+        let response = manager.get_challenge_response(token);
         assert_eq!(response, Some(key_auth.to_string()));
 
         // Non-existent token returns None
-        let missing = manager.get_challenge_response("nonexistent").await;
+        let missing = manager.get_challenge_response("nonexistent");
         assert!(missing.is_none());
     }
 
@@ -1268,16 +1291,14 @@ mod tests {
             .await
             .unwrap();
 
-        manager
-            .store_challenge("token1", "domain.com", "auth1")
-            .await;
+        manager.store_challenge("token1", "domain.com", "auth1");
         assert_eq!(manager.challenge_count(), 1);
 
-        manager.remove_challenge("token1").await;
+        manager.remove_challenge("token1");
         assert_eq!(manager.challenge_count(), 0);
 
         // Removing non-existent token is a no-op
-        manager.remove_challenge("nonexistent").await;
+        manager.remove_challenge("nonexistent");
         assert_eq!(manager.challenge_count(), 0);
     }
 
@@ -1289,23 +1310,17 @@ mod tests {
             .unwrap();
 
         // Store challenges for multiple domains
-        manager
-            .store_challenge("token1", "domain1.com", "auth1")
-            .await;
-        manager
-            .store_challenge("token2", "domain1.com", "auth2")
-            .await;
-        manager
-            .store_challenge("token3", "domain2.com", "auth3")
-            .await;
+        manager.store_challenge("token1", "domain1.com", "auth1");
+        manager.store_challenge("token2", "domain1.com", "auth2");
+        manager.store_challenge("token3", "domain2.com", "auth3");
         assert_eq!(manager.challenge_count(), 3);
 
         // Clear only domain1.com challenges
-        manager.clear_challenges_for_domain("domain1.com").await;
+        manager.clear_challenges_for_domain("domain1.com");
         assert_eq!(manager.challenge_count(), 1);
 
         // domain2.com challenge should still exist
-        let response = manager.get_challenge_response("token3").await;
+        let response = manager.get_challenge_response("token3");
         assert!(response.is_some());
     }
 
@@ -1317,9 +1332,7 @@ mod tests {
             .unwrap();
 
         // Store a challenge
-        manager
-            .store_challenge("token1", "domain.com", "auth1")
-            .await;
+        manager.store_challenge("token1", "domain.com", "auth1");
         assert_eq!(manager.challenge_count(), 1);
 
         // Cleanup should not remove fresh challenges

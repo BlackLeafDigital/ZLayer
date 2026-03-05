@@ -126,7 +126,11 @@ impl Default for NodeApiState {
     }
 }
 
-/// List all nodes in the cluster
+/// List all nodes in the cluster.
+///
+/// # Errors
+///
+/// Returns an error if authentication fails.
 #[utoipa::path(
     get,
     path = "/api/v1/nodes",
@@ -145,7 +149,11 @@ pub async fn list_nodes(
     Ok(Json(Vec::new()))
 }
 
-/// Get detailed information about a specific node
+/// Get detailed information about a specific node.
+///
+/// # Errors
+///
+/// Returns an error if the node is not found.
 #[utoipa::path(
     get,
     path = "/api/v1/nodes/{id}",
@@ -169,7 +177,11 @@ pub async fn get_node(
     Err(ApiError::NotFound(format!("Node '{id}' not found")))
 }
 
-/// Update labels on a node
+/// Update labels on a node.
+///
+/// # Errors
+///
+/// Returns an error if the node is not found or the user lacks permission.
 #[utoipa::path(
     post,
     path = "/api/v1/nodes/{id}/labels",
@@ -199,7 +211,11 @@ pub async fn update_node_labels(
     Err(ApiError::NotFound(format!("Node '{id}' not found")))
 }
 
-/// Generate a join token for new nodes to join the cluster
+/// Generate a join token for new nodes to join the cluster.
+///
+/// # Errors
+///
+/// Returns an error if cluster management is not available or the user lacks permission.
 #[utoipa::path(
     post,
     path = "/api/v1/nodes/join-token",

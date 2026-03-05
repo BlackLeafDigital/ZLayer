@@ -46,6 +46,7 @@ pub(crate) fn parse_join_token(token: &str) -> Result<JoinToken> {
 }
 
 /// Join an existing deployment
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn join(
     cli: &Cli,
     token: &str,

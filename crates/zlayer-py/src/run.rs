@@ -179,6 +179,8 @@ fn build_run_spec_yaml(
     env: &HashMap<String, String>,
     command: &[String],
 ) -> String {
+    use std::fmt::Write;
+
     let mut yaml = format!(
         r"version: v1
 deployment: zlayer-run
@@ -196,7 +198,7 @@ services:
         for arg in command {
             // Escape quotes in the argument
             let escaped = arg.replace('"', "\\\"");
-            yaml.push_str(&format!("      - \"{escaped}\"\n"));
+            let _ = writeln!(yaml, "      - \"{escaped}\"");
         }
     }
 
@@ -206,7 +208,7 @@ services:
         for (key, value) in env {
             // Escape quotes in the value
             let escaped_value = value.replace('"', "\\\"");
-            yaml.push_str(&format!("      {key}: \"{escaped_value}\"\n"));
+            let _ = writeln!(yaml, "      {key}: \"{escaped_value}\"");
         }
     }
 
@@ -215,9 +217,10 @@ services:
     if !ports.is_empty() {
         yaml.push_str("    endpoints:\n");
         for (container_port, host_port) in ports {
-            yaml.push_str(&format!(
+            let _ = write!(
+                yaml,
                 "      - name: port-{container_port}\n        protocol: tcp\n        port: {container_port}\n        host_port: {host_port}\n"
-            ));
+            );
         }
     }
 

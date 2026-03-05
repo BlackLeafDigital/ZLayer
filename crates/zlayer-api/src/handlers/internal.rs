@@ -122,10 +122,16 @@ pub struct InternalScaleResponse {
     pub message: Option<String>,
 }
 
-/// Scale a service via internal scheduler request
+/// Scale a service via internal scheduler request.
 ///
 /// This endpoint is called by the distributed scheduler leader to trigger
 /// scaling operations on agent nodes. It uses a shared secret for authentication.
+///
+/// # Errors
+///
+/// Returns an error if the service is not found, scaling fails, or authentication
+/// is invalid.
+#[allow(clippy::cast_possible_truncation)]
 #[utoipa::path(
     post,
     path = "/api/v1/internal/scale",
@@ -197,9 +203,14 @@ pub async fn scale_service_internal(
     }))
 }
 
-/// Get the current replica count for a service
+/// Get the current replica count for a service.
 ///
 /// This endpoint allows the scheduler to query the current state of a service.
+///
+/// # Errors
+///
+/// Returns an error if the service is not found or authentication is invalid.
+#[allow(clippy::cast_possible_truncation)]
 #[utoipa::path(
     get,
     path = "/api/v1/internal/replicas/{service}",
@@ -265,6 +276,11 @@ pub struct InternalAddPeerResponse {
 /// can immediately route traffic to the new peer.
 ///
 /// `POST /api/v1/internal/add-peer`
+///
+/// # Errors
+///
+/// Returns an error if overlay networking is not configured, the endpoint
+/// address is invalid, or the `WireGuard` peer cannot be added.
 #[utoipa::path(
     post,
     path = "/api/v1/internal/add-peer",

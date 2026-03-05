@@ -277,9 +277,8 @@ fn contains_component_indicator(data: &[u8]) -> bool {
 /// Get the artifact type media type for a WASI version
 fn artifact_type_for_wasi_version(version: &WasiVersion) -> String {
     match version {
-        WasiVersion::Preview1 => WASM_MODULE_ARTIFACT_TYPE.to_string(),
+        WasiVersion::Preview1 | WasiVersion::Unknown => WASM_MODULE_ARTIFACT_TYPE.to_string(),
         WasiVersion::Preview2 => WASM_COMPONENT_ARTIFACT_TYPE.to_string(),
-        WasiVersion::Unknown => WASM_MODULE_ARTIFACT_TYPE.to_string(),
     }
 }
 

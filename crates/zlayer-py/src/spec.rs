@@ -520,6 +520,7 @@ impl HealthSpec {
 ///     A `ServiceSpec` instance
 #[pyfunction]
 #[pyo3(signature = (name, image, port=None))]
+#[allow(clippy::unnecessary_wraps)]
 pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResult<ServiceSpec> {
     let mut endpoints = Vec::new();
     if let Some(p) = port {

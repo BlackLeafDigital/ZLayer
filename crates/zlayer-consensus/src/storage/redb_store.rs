@@ -91,12 +91,16 @@ impl<C: RaftTypeConfig<NodeId = NodeId>> RedbLogStore<C> {
     ///
     /// The database file is created if it does not exist. Tables are
     /// initialized on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or tables cannot be initialized.
     #[allow(clippy::result_large_err)]
     pub fn new(path: impl AsRef<Path>) -> Result<Self, crate::error::ConsensusError> {
         let db = Database::create(path.as_ref()).map_err(|e| {
             crate::error::ConsensusError::Redb(format!(
-                "Failed to open redb at {:?}: {}",
-                path.as_ref(),
+                "Failed to open redb at {}: {}",
+                path.as_ref().display(),
                 e
             ))
         })?;
@@ -556,12 +560,16 @@ where
     F: Fn(&mut S, &C::D) -> C::R + Send + Sync + 'static,
 {
     /// Open or create a state machine store at the given path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or tables cannot be initialized.
     #[allow(clippy::result_large_err)]
     pub fn new(path: impl AsRef<Path>, apply_fn: F) -> Result<Self, crate::error::ConsensusError> {
         let db = Database::create(path.as_ref()).map_err(|e| {
             crate::error::ConsensusError::Redb(format!(
-                "Failed to open redb SM at {:?}: {}",
-                path.as_ref(),
+                "Failed to open redb SM at {}: {}",
+                path.as_ref().display(),
                 e
             ))
         })?;
@@ -613,18 +621,14 @@ where
     }
 
     fn load_cache(db: &Database) -> RedbSmCache<C, S> {
-        let txn = match db.begin_read() {
-            Ok(t) => t,
-            Err(e) => {
-                warn!("Failed to read SM cache from redb: {e}");
-                return RedbSmCache::default();
-            }
+        let Ok(txn) = db.begin_read() else {
+            warn!("Failed to read SM cache from redb");
+            return RedbSmCache::default();
         };
 
         let state = {
-            let table = match txn.open_table(SM_TABLE) {
-                Ok(t) => t,
-                Err(_) => return RedbSmCache::default(),
+            let Ok(table) = txn.open_table(SM_TABLE) else {
+                return RedbSmCache::default();
             };
             match table.get(SM_STATE) {
                 Ok(Some(v)) => bincode::deserialize(v.value()).unwrap_or_default(),
@@ -633,9 +637,8 @@ where
         };
 
         let last_applied_log = {
-            let meta = match txn.open_table(META_TABLE) {
-                Ok(t) => t,
-                Err(_) => return RedbSmCache::default(),
+            let Ok(meta) = txn.open_table(META_TABLE) else {
+                return RedbSmCache::default();
             };
             match meta.get(META_LAST_APPLIED) {
                 Ok(Some(v)) => bincode::deserialize(v.value()).ok(),
@@ -644,9 +647,8 @@ where
         };
 
         let last_membership = {
-            let meta = match txn.open_table(META_TABLE) {
-                Ok(t) => t,
-                Err(_) => return RedbSmCache::default(),
+            let Ok(meta) = txn.open_table(META_TABLE) else {
+                return RedbSmCache::default();
             };
             match meta.get(META_LAST_MEMBERSHIP) {
                 Ok(Some(v)) => bincode::deserialize(v.value()).unwrap_or_default(),
@@ -743,6 +745,7 @@ where
         Ok((sm.last_applied_log, sm.last_membership.clone()))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn apply<I>(&mut self, entries: I) -> Result<Vec<C::R>, StorageError<NodeId>>
     where
         I: IntoIterator<Item = C::Entry> + OptionalSend,
@@ -869,6 +872,7 @@ where
         Ok(Box::new(Cursor::new(Vec::new())))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn install_snapshot(
         &mut self,
         meta: &SnapshotMeta<NodeId, C::Node>,
@@ -1024,9 +1028,8 @@ where
             )
         })?;
 
-        let table = match txn.open_table(SNAPSHOT_TABLE) {
-            Ok(t) => t,
-            Err(_) => return Ok(None),
+        let Ok(table) = txn.open_table(SNAPSHOT_TABLE) else {
+            return Ok(None);
         };
 
         let data = match table.get(SNAPSHOT_CURRENT) {

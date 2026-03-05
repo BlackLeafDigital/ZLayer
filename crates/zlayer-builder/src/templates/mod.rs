@@ -141,6 +141,10 @@ impl Runtime {
     }
 
     /// Get information about this runtime
+    ///
+    /// # Panics
+    ///
+    /// Panics if the runtime variant is missing from the static info table (internal invariant).
     #[must_use]
     pub fn info(&self) -> &'static RuntimeInfo {
         Runtime::all()

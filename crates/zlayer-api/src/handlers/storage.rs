@@ -64,10 +64,14 @@ impl StorageState {
     }
 }
 
-/// Get storage replication status
+/// Get storage replication status.
 ///
 /// Returns the current state of SQLite-to-S3 replication including whether
 /// it is enabled, the last sync time, and pending change count.
+///
+/// # Errors
+///
+/// Returns an error if authentication fails.
 #[utoipa::path(
     get,
     path = "/api/v1/storage/status",

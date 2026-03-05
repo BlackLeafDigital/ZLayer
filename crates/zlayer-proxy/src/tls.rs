@@ -69,6 +69,11 @@ impl TlsServerConfig {
 }
 
 /// Load certificates from a PEM file
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened, the PEM cannot be parsed,
+/// or no certificates are found.
 pub fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let file = File::open(path)
         .map_err(|e| ProxyError::Tls(format!("Failed to open certificate file '{path}': {e}")))?;
@@ -89,6 +94,11 @@ pub fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 /// Load a private key from a PEM file
+///
+/// # Errors
+///
+/// Returns an error if the file cannot be opened, the PEM cannot be parsed,
+/// or no private key is found.
 pub fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let file = File::open(path)
         .map_err(|e| ProxyError::Tls(format!("Failed to open private key file '{path}': {e}")))?;
@@ -112,7 +122,6 @@ pub fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
             }
             Ok(Some(_)) => {
                 // Skip non-key items (like certificates)
-                continue;
             }
             Ok(None) => {
                 return Err(ProxyError::Tls(format!("No private key found in '{path}'")));
@@ -127,6 +136,11 @@ pub fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
 }
 
 /// Create a TLS acceptor from configuration
+///
+/// # Errors
+///
+/// Returns an error if loading the certificate or private key fails,
+/// or if building the TLS server configuration fails.
 pub fn create_tls_acceptor(config: &TlsServerConfig) -> Result<TlsAcceptor> {
     let certs = load_certs(&config.cert_path)?;
     let key = load_private_key(&config.key_path)?;
@@ -164,13 +178,18 @@ fn create_server_config(
 
     // Configure ALPN
     if !config.alpn_protocols.is_empty() {
-        server_config.alpn_protocols = config.alpn_protocols.clone();
+        server_config.alpn_protocols.clone_from(&config.alpn_protocols);
     }
 
     Ok(server_config)
 }
 
 /// Create a TLS acceptor directly from file paths
+///
+/// # Errors
+///
+/// Returns an error if loading the certificate or key files fails,
+/// or if creating the TLS acceptor fails.
 pub fn create_acceptor_from_files(cert_path: &str, key_path: &str) -> Result<TlsAcceptor> {
     let config = TlsServerConfig::new(cert_path, key_path);
     create_tls_acceptor(&config)

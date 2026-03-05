@@ -54,9 +54,8 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
         return gpus;
     }
 
-    let entries = match std::fs::read_dir(pci_dir) {
-        Ok(entries) => entries,
-        Err(_) => return gpus,
+    let Ok(entries) = std::fs::read_dir(pci_dir) else {
+        return gpus;
     };
 
     // Optionally pre-fetch nvidia-smi data once for all NVIDIA GPUs

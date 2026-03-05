@@ -31,6 +31,9 @@ impl HealthChecker {
     }
 
     /// Perform the health check
+    ///
+    /// # Errors
+    /// Returns an error if the health check fails or times out.
     pub async fn check(&self, id: &ContainerId, timeout: Duration) -> Result<()> {
         match &self.check {
             HealthCheck::Tcp { port } => self.check_tcp(id, *port, timeout).await,
@@ -185,6 +188,7 @@ impl HealthMonitor {
     }
 
     /// Set a callback to be invoked when health state changes (healthy <-> unhealthy).
+    #[must_use]
     pub fn with_callback(mut self, callback: HealthCallback) -> Self {
         self.on_health_change = Some(callback);
         self
@@ -193,12 +197,14 @@ impl HealthMonitor {
     /// Set a startup grace period. The monitor will sleep for this duration
     /// before performing the first health check, giving the container time
     /// to initialize.
+    #[must_use]
     pub fn with_start_grace(mut self, grace: Duration) -> Self {
         self.start_grace = grace;
         self
     }
 
     /// Set the timeout applied to each individual health check. Defaults to 5 seconds.
+    #[must_use]
     pub fn with_check_timeout(mut self, timeout: Duration) -> Self {
         self.check_timeout = timeout;
         self

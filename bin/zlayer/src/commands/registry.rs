@@ -6,6 +6,7 @@ use crate::cli::Cli;
 use crate::util::parse_image_reference;
 
 /// Handle export command - export image to OCI tar archive
+#[allow(clippy::cast_precision_loss)]
 pub(crate) async fn handle_export(cli: &Cli, image: &str, output: &Path, gzip: bool) -> Result<()> {
     use zlayer_registry::{export_image, LocalRegistry};
 
@@ -38,6 +39,7 @@ pub(crate) async fn handle_export(cli: &Cli, image: &str, output: &Path, gzip: b
 }
 
 /// Handle import command - import image from OCI tar archive
+#[allow(clippy::cast_precision_loss)]
 pub(crate) async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) -> Result<()> {
     use zlayer_registry::{import_image, LocalRegistry};
 
@@ -64,6 +66,7 @@ pub(crate) async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) 
 }
 
 /// Handle pull command - pull an image from a remote registry to local cache
+#[allow(clippy::cast_precision_loss)]
 pub(crate) async fn handle_pull(image: &str, cli_data_dir: &std::path::Path) -> Result<()> {
     use zlayer_registry::{BlobCache, ImagePuller, LocalRegistry, RegistryAuth};
 

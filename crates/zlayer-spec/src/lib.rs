@@ -13,6 +13,10 @@ pub use validate::*;
 use validator::Validate;
 
 /// Parse a deployment spec from YAML string
+///
+/// # Errors
+///
+/// Returns `SpecError` if parsing or validation fails.
 pub fn from_yaml_str(yaml: &str) -> Result<DeploymentSpec, SpecError> {
     let spec: DeploymentSpec = serde_yml::from_str(yaml)?;
 
@@ -36,6 +40,10 @@ pub fn from_yaml_str(yaml: &str) -> Result<DeploymentSpec, SpecError> {
 }
 
 /// Parse a deployment spec from YAML file
+///
+/// # Errors
+///
+/// Returns `SpecError` if the file cannot be read, or parsing/validation fails.
 pub fn from_yaml_file(path: &std::path::Path) -> Result<DeploymentSpec, SpecError> {
     let content = std::fs::read_to_string(path)?;
     from_yaml_str(&content)

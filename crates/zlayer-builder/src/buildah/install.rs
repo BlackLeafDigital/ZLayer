@@ -175,6 +175,10 @@ impl BuildahInstaller {
     /// Check if buildah is installed and meets version requirements
     ///
     /// Returns the installation if found and valid, otherwise returns an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if buildah is not found or if the version is below the minimum.
     pub async fn check(&self) -> Result<BuildahInstallation, InstallError> {
         let installation = self.find_existing().await.ok_or(InstallError::NotFound)?;
 
@@ -193,6 +197,10 @@ impl BuildahInstaller {
     ///
     /// Runs `buildah --version` and parses the output.
     /// Expected format: "buildah version 1.33.0 (image-spec 1.0.2-dev, runtime-spec 1.0.2-dev)"
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the binary cannot be executed or the version output cannot be parsed.
     pub async fn get_version(path: &Path) -> Result<String, InstallError> {
         let output = Command::new(path)
             .arg("--version")
@@ -218,6 +226,10 @@ impl BuildahInstaller {
     ///
     /// This is the primary entry point for ensuring buildah is available.
     /// If buildah is not found, it returns an error with installation instructions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if buildah is not found or the version is insufficient.
     pub async fn ensure(&self) -> Result<BuildahInstallation, InstallError> {
         // First try to find existing installation
         match self.check().await {
@@ -248,6 +260,11 @@ impl BuildahInstaller {
     ///
     /// Currently returns an error with installation instructions.
     /// Future versions may download static binaries from GitHub releases.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the platform is unsupported or automatic download is unavailable.
+    #[allow(clippy::unused_async)]
     pub async fn download(&self) -> Result<BuildahInstallation, InstallError> {
         let (os, arch) = current_platform();
 
@@ -462,14 +479,12 @@ fn version_meets_minimum(version: &str, minimum: &str) -> bool {
             .collect::<Option<Vec<_>>>()
     };
 
-    let version_parts = match parse_version(version) {
-        Some(v) => v,
-        None => return false,
+    let Some(version_parts) = parse_version(version) else {
+        return false;
     };
 
-    let minimum_parts = match parse_version(minimum) {
-        Some(v) => v,
-        None => return true, // If we can't parse minimum, assume it's met
+    let Some(minimum_parts) = parse_version(minimum) else {
+        return true; // If we can't parse minimum, assume it's met
     };
 
     // Compare version parts
@@ -477,7 +492,7 @@ fn version_meets_minimum(version: &str, minimum: &str) -> bool {
         match v.cmp(m) {
             std::cmp::Ordering::Greater => return true,
             std::cmp::Ordering::Less => return false,
-            std::cmp::Ordering::Equal => continue,
+            std::cmp::Ordering::Equal => {}
         }
     }
 

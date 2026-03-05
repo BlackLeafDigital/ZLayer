@@ -75,10 +75,15 @@ impl SecretsState {
     }
 }
 
-/// Create or update a secret
+/// Create or update a secret.
 ///
 /// Stores a new secret or updates an existing one. The secret value is encrypted
 /// at rest and the version number is incremented on updates.
+///
+/// # Errors
+///
+/// Returns an error if validation fails, storage operations fail, or the user
+/// lacks permission.
 #[utoipa::path(
     post,
     path = "/api/v1/secrets",
@@ -153,10 +158,14 @@ pub async fn create_secret(
     Ok((status, Json(SecretMetadataResponse::from(metadata))))
 }
 
-/// List all secrets for the authenticated user
+/// List all secrets for the authenticated user.
 ///
 /// Returns metadata for all secrets in the user's scope. Secret values are
 /// never exposed through this endpoint.
+///
+/// # Errors
+///
+/// Returns an error if storage access fails.
 #[utoipa::path(
     get,
     path = "/api/v1/secrets",
@@ -187,10 +196,14 @@ pub async fn list_secrets(
     Ok(Json(response))
 }
 
-/// Get metadata for a specific secret
+/// Get metadata for a specific secret.
 ///
 /// Returns metadata for a single secret. The secret value is never exposed
 /// through this endpoint.
+///
+/// # Errors
+///
+/// Returns an error if the secret is not found or storage access fails.
 #[utoipa::path(
     get,
     path = "/api/v1/secrets/{name}",
@@ -238,9 +251,14 @@ pub async fn get_secret_metadata(
     Ok(Json(SecretMetadataResponse::from(metadata)))
 }
 
-/// Delete a secret
+/// Delete a secret.
 ///
 /// Permanently removes a secret from the store.
+///
+/// # Errors
+///
+/// Returns an error if the secret is not found, storage access fails, or
+/// the user lacks permission.
 #[utoipa::path(
     delete,
     path = "/api/v1/secrets/{name}",

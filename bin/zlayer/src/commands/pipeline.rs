@@ -34,6 +34,7 @@ fn discover_pipeline_file(explicit: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 /// Execute the pipeline build command.
+#[allow(clippy::cast_precision_loss)]
 pub async fn cmd_pipeline(
     file: Option<PathBuf>,
     set: Vec<String>,

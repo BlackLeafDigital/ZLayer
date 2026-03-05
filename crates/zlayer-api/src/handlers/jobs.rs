@@ -78,7 +78,10 @@ fn default_limit() -> usize {
 }
 
 /// Convert internal `JobExecution` to API response
+#[allow(clippy::cast_possible_truncation)]
 fn execution_to_response(exec: &JobExecution) -> JobExecutionResponse {
+    use chrono::Utc;
+
     let (status_str, exit_code, error, duration_ms) = match &exec.status {
         JobStatus::Pending => ("pending".to_string(), None, None, None),
         JobStatus::Initializing => ("initializing".to_string(), None, None, None),
@@ -114,7 +117,6 @@ fn execution_to_response(exec: &JobExecution) -> JobExecutionResponse {
     // Convert Instant to approximate ISO 8601 string
     // Note: Instant doesn't have a direct mapping to calendar time,
     // so we approximate based on elapsed time from now
-    use chrono::Utc;
     let now = Utc::now();
     let started_at = exec.started_at.map(|_| now.to_rfc3339()); // Approximation
     let completed_at = exec.completed_at.map(|_| now.to_rfc3339()); // Approximation
@@ -137,6 +139,10 @@ fn execution_to_response(exec: &JobExecution) -> JobExecutionResponse {
 ///
 /// Starts a new execution of the specified job. Returns immediately with an
 /// execution ID that can be used to track the job's progress.
+///
+/// # Errors
+///
+/// Returns an error if the job is not found or triggering fails.
 #[utoipa::path(
     post,
     path = "/api/v1/jobs/{name}/trigger",
@@ -182,6 +188,10 @@ pub async fn trigger_job(
 /// GET /`api/v1/jobs/{execution_id}/status` - Get execution status
 ///
 /// Returns the current status of a job execution, including logs if available.
+///
+/// # Errors
+///
+/// Returns an error if the execution is not found.
 #[utoipa::path(
     get,
     path = "/api/v1/jobs/{execution_id}/status",
@@ -215,6 +225,10 @@ pub async fn get_execution_status(
 /// GET /api/v1/jobs/{name}/executions - List executions for a job
 ///
 /// Returns a list of recent executions for the specified job.
+///
+/// # Errors
+///
+/// Returns an error if authentication fails.
 #[utoipa::path(
     get,
     path = "/api/v1/jobs/{name}/executions",
@@ -265,6 +279,11 @@ pub async fn list_job_executions(
 /// POST /`api/v1/jobs/{execution_id}/cancel` - Cancel a running execution
 ///
 /// Attempts to cancel a running or pending job execution.
+///
+/// # Errors
+///
+/// Returns an error if the execution is not found, already completed, or
+/// cancellation fails.
 #[utoipa::path(
     post,
     path = "/api/v1/jobs/{execution_id}/cancel",

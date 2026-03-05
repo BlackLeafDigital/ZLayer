@@ -78,6 +78,7 @@ impl ServiceInstance {
     }
 
     /// Builder method to add DNS server for service discovery
+    #[must_use]
     pub fn with_dns(mut self, dns_server: Arc<DnsServer>) -> Self {
         self.dns_server = Some(dns_server);
         self
@@ -103,6 +104,10 @@ impl ServiceInstance {
     /// This method uses short-lived locks to avoid blocking concurrent operations.
     /// I/O operations (pull, create, start, stop, remove) are performed without
     /// holding the containers lock to allow other operations to proceed.
+    ///
+    /// # Errors
+    /// Returns an error if image pull, container creation, or container lifecycle operations fail.
+    #[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
     pub async fn scale_to(&self, replicas: u32) -> Result<()> {
         // Phase 1: Determine current state (short read lock)
         let current_replicas = { self.containers.read().await.len() as u32 }; // Lock released here
@@ -621,12 +626,14 @@ impl ServiceManagerBuilder {
     }
 
     /// Set the overlay network manager for container networking.
+    #[must_use]
     pub fn overlay_manager(mut self, om: Arc<RwLock<OverlayManager>>) -> Self {
         self.overlay_manager = Some(om);
         self
     }
 
     /// Set the proxy manager for health-aware load balancing.
+    #[must_use]
     pub fn proxy_manager(mut self, pm: Arc<ProxyManager>) -> Self {
         self.proxy_manager = Some(pm);
         self
@@ -647,18 +654,21 @@ impl ServiceManagerBuilder {
     }
 
     /// Set the deployment name (used for hostname generation).
+    #[must_use]
     pub fn deployment_name(mut self, name: impl Into<String>) -> Self {
         self.deployment_name = Some(name.into());
         self
     }
 
     /// Set the job executor for run-to-completion workloads.
+    #[must_use]
     pub fn job_executor(mut self, je: Arc<JobExecutor>) -> Self {
         self.job_executor = Some(je);
         self
     }
 
     /// Set the cron scheduler for time-based job triggers.
+    #[must_use]
     pub fn cron_scheduler(mut self, cs: Arc<CronScheduler>) -> Self {
         self.cron_scheduler = Some(cs);
         self
@@ -812,6 +822,7 @@ impl ServiceManager {
 
     /// Builder pattern: add stream registry for L4 proxy integration
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_stream_registry(mut self, registry: Arc<StreamRegistry>) -> Self {
         self.stream_registry = Some(registry);
         self
@@ -836,6 +847,7 @@ impl ServiceManager {
 
     /// Builder pattern: add proxy manager for health-aware load balancing
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_proxy_manager(mut self, proxy: Arc<ProxyManager>) -> Self {
         self.proxy_manager = Some(proxy);
         self
@@ -854,6 +866,7 @@ impl ServiceManager {
 
     /// Builder pattern: add DNS server for service discovery
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_dns_server(mut self, dns: Arc<DnsServer>) -> Self {
         self.dns_server = Some(dns);
         self
@@ -878,6 +891,7 @@ impl ServiceManager {
 
     /// Builder pattern: add job executor
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_job_executor(mut self, executor: Arc<JobExecutor>) -> Self {
         self.job_executor = Some(executor);
         self
@@ -885,6 +899,7 @@ impl ServiceManager {
 
     /// Builder pattern: add cron scheduler
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_cron_scheduler(mut self, scheduler: Arc<CronScheduler>) -> Self {
         self.cron_scheduler = Some(scheduler);
         self
@@ -908,6 +923,7 @@ impl ServiceManager {
 
     /// Builder pattern: add container supervisor
     #[deprecated(since = "0.2.0", note = "use ServiceManager::builder() instead")]
+    #[must_use]
     pub fn with_container_supervisor(mut self, supervisor: Arc<ContainerSupervisor>) -> Self {
         self.container_supervisor = Some(supervisor);
         self
@@ -923,8 +939,11 @@ impl ServiceManager {
     /// This spawns a background task that monitors containers for crashes
     /// and enforces the `on_panic` error policy.
     ///
+    /// # Errors
+    /// Returns an error if no container supervisor is configured.
+    ///
     /// # Returns
-    /// A `JoinHandle` for the supervisor task, or an error if no supervisor is configured
+    /// A `JoinHandle` for the supervisor task.
     pub fn start_container_supervisor(&self) -> Result<tokio::task::JoinHandle<()>> {
         let supervisor = self.container_supervisor.as_ref().ok_or_else(|| {
             AgentError::Configuration("Container supervisor not configured".to_string())
@@ -1094,11 +1113,8 @@ impl ServiceManager {
                         "Dependency timed out but continuing"
                     );
                 }
-                WaitResult::TimedOutContinue => {
-                    // Silently continue
-                }
-                WaitResult::Satisfied => {
-                    // Good, dependency is satisfied
+                WaitResult::TimedOutContinue | WaitResult::Satisfied => {
+                    // Continue silently
                 }
             }
         }
@@ -1109,6 +1125,9 @@ impl ServiceManager {
     /// Check if all dependencies for a service are currently satisfied
     ///
     /// This is a one-shot check (no waiting). Useful for pre-flight validation.
+    ///
+    /// # Errors
+    /// Returns an error if a dependency check fails unexpectedly.
     pub async fn check_dependencies(&self, deps: &[DependsSpec]) -> Result<bool> {
         let condition_checker = DependencyConditionChecker::new(
             Arc::clone(&self.runtime),
@@ -1131,6 +1150,9 @@ impl ServiceManager {
     /// - **Service**: Traditional long-running containers with scaling and health checks
     /// - **Job**: Run-to-completion workloads triggered on-demand (stores spec for later)
     /// - **Cron**: Scheduled run-to-completion workloads (registers with cron scheduler)
+    ///
+    /// # Errors
+    /// Returns an error if service creation, scaling, or cron registration fails.
     pub async fn upsert_service(&self, name: String, spec: ServiceSpec) -> Result<()> {
         match spec.rtype {
             ResourceType::Service => {
@@ -1333,6 +1355,10 @@ impl ServiceManager {
     }
 
     /// Scale a service to desired replica count
+    ///
+    /// # Errors
+    /// Returns an error if the service is not found or scaling fails.
+    #[allow(clippy::cast_possible_truncation)]
     pub async fn scale_service(&self, name: &str, replicas: u32) -> Result<()> {
         let _permit = self.scale_semaphore.acquire().await;
 
@@ -1448,6 +1474,9 @@ impl ServiceManager {
     }
 
     /// Get service replica count
+    ///
+    /// # Errors
+    /// Returns an error if the service is not found.
     pub async fn service_replica_count(&self, name: &str) -> Result<usize> {
         let services = self.services.read().await;
         let instance = services.get(name).ok_or_else(|| AgentError::NotFound {
@@ -1464,6 +1493,9 @@ impl ServiceManager {
     /// - **Service**: Unregisters proxy routes, supervisor, and removes from service map
     /// - **Job**: Unregisters from job executor
     /// - **Cron**: Unregisters from cron scheduler
+    ///
+    /// # Errors
+    /// Returns an error if the service cannot be removed or scale-down fails.
     pub async fn remove_service(&self, name: &str) -> Result<()> {
         // Try to unregister from cron scheduler first
         if let Some(scheduler) = &self.cron_scheduler {
@@ -1483,7 +1515,7 @@ impl ServiceManager {
                 for endpoint in &instance.spec.endpoints {
                     match endpoint.protocol {
                         Protocol::Tcp => {
-                            stream_registry.unregister_tcp(endpoint.port);
+                            let _ = stream_registry.unregister_tcp(endpoint.port);
                             tracing::debug!(
                                 service = %name,
                                 port = endpoint.port,
@@ -1491,7 +1523,7 @@ impl ServiceManager {
                             );
                         }
                         Protocol::Udp => {
-                            stream_registry.unregister_udp(endpoint.port);
+                            let _ = stream_registry.unregister_udp(endpoint.port);
                             tracing::debug!(
                                 service = %name,
                                 port = endpoint.port,
@@ -1583,6 +1615,9 @@ impl ServiceManager {
     /// * `tail` - Number of lines to return (0 = all)
     /// * `instance` - Optional specific instance (container ID suffix like "1", "2")
     ///
+    /// # Errors
+    /// Returns an error if the service or instance is not found.
+    ///
     /// # Returns
     /// Combined log output from all (or specific) container replicas as a string.
     pub async fn get_service_logs(
@@ -1645,8 +1680,9 @@ impl ServiceManager {
                     }
                 }
                 Err(e) => {
+                    use std::fmt::Write;
                     combined.push_str(&header);
-                    combined.push_str(&format!("[error reading logs: {e}]\n"));
+                    let _ = writeln!(combined, "[error reading logs: {e}]");
                 }
             }
         }
@@ -1689,6 +1725,13 @@ impl ServiceManager {
     /// * `service_name` - Name of the service
     /// * `replica` - Optional replica number to target
     /// * `cmd` - Command and arguments to execute
+    ///
+    /// # Errors
+    /// Returns an error if the service or replica is not found, or if exec fails.
+    ///
+    /// # Panics
+    /// Panics if no replica is specified and the container list is unexpectedly empty
+    /// after the emptiness check (should not happen in practice).
     ///
     /// # Returns
     /// Tuple of (`exit_code`, stdout, stderr)

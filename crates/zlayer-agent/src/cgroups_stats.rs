@@ -24,6 +24,7 @@ impl ContainerStats {
     ///
     /// Returns 0.0 if there is no limit (`memory_limit` == `u64::MAX`)
     #[must_use]
+    #[allow(clippy::cast_precision_loss)]
     pub fn memory_percent(&self) -> f64 {
         if self.memory_limit == u64::MAX || self.memory_limit == 0 {
             0.0
@@ -46,6 +47,9 @@ impl ContainerStats {
 /// # Returns
 /// * `Ok(ContainerStats)` - Container statistics on success
 /// * `Err(io::Error)` - If any cgroup file cannot be read
+///
+/// # Errors
+/// Returns an error if any cgroup file cannot be read.
 ///
 /// # Example
 /// ```no_run
@@ -139,6 +143,7 @@ pub async fn read_container_stats(cgroup_path: &Path) -> std::io::Result<Contain
 /// // Result depends on elapsed time and num_cpus
 /// ```
 #[must_use]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 pub fn calculate_cpu_percent(prev: &ContainerStats, curr: &ContainerStats) -> f64 {
     // Calculate CPU usage delta in microseconds
     let usage_delta_usec = curr.cpu_usage_usec.saturating_sub(prev.cpu_usage_usec);
@@ -174,6 +179,7 @@ pub fn calculate_cpu_percent(prev: &ContainerStats, curr: &ContainerStats) -> f6
 /// # Returns
 /// CPU usage percentage
 #[must_use]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 pub fn calculate_cpu_percent_with_cpus(
     prev: &ContainerStats,
     curr: &ContainerStats,

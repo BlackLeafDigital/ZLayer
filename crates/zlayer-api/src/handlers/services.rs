@@ -147,7 +147,12 @@ impl ServiceState {
     }
 }
 
-/// List services in a deployment
+/// List services in a deployment.
+///
+/// # Errors
+///
+/// Returns an error if the deployment is not found or storage access fails.
+#[allow(clippy::cast_possible_truncation)]
 #[utoipa::path(
     get,
     path = "/api/v1/deployments/{deployment}/services",
@@ -227,7 +232,12 @@ pub async fn list_services(
     Ok(Json(summaries))
 }
 
-/// Get service details
+/// Get service details.
+///
+/// # Errors
+///
+/// Returns an error if the deployment or service is not found.
+#[allow(clippy::cast_possible_truncation)]
 #[utoipa::path(
     get,
     path = "/api/v1/deployments/{deployment}/services/{service}",
@@ -316,7 +326,13 @@ pub async fn get_service(
     }))
 }
 
-/// Scale a service
+/// Scale a service.
+///
+/// # Errors
+///
+/// Returns an error if the deployment or service is not found, scaling fails,
+/// or the user lacks permission.
+#[allow(clippy::cast_possible_truncation)]
 #[utoipa::path(
     post,
     path = "/api/v1/deployments/{deployment}/services/{service}/scale",
@@ -449,7 +465,11 @@ pub struct ContainerSummary {
     pub overlay_ip: Option<String>,
 }
 
-/// List containers for a service
+/// List containers for a service.
+///
+/// # Errors
+///
+/// Returns an error if the deployment or service is not found.
 #[utoipa::path(
     get,
     path = "/api/v1/deployments/{deployment}/services/{service}/containers",
@@ -504,12 +524,17 @@ pub async fn list_containers(
     Ok(Json(containers))
 }
 
-/// Get service logs
+/// Get service logs.
 ///
 /// Returns service logs as plain text when `follow=false`, or as a Server-Sent
 /// Events stream when `follow=true`.  In follow mode the server first emits the
 /// last N lines (controlled by the `lines` parameter) and then continuously
 /// polls for new output, emitting each new line as a `data:` SSE event.
+///
+/// # Errors
+///
+/// Returns an error if the deployment or service is not found, or the service
+/// manager is not available.
 #[utoipa::path(
     get,
     path = "/api/v1/deployments/{deployment}/services/{service}/logs",
@@ -703,7 +728,12 @@ pub struct ExecResponse {
     pub stderr: String,
 }
 
-/// Execute a command in a service container
+/// Execute a command in a service container.
+///
+/// # Errors
+///
+/// Returns an error if the service is not found, the command is invalid,
+/// execution fails, or the user lacks permission.
 #[utoipa::path(
     post,
     path = "/api/v1/deployments/{deployment}/services/{service}/exec",

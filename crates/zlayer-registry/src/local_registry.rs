@@ -135,6 +135,10 @@ impl LocalRegistry {
     /// Create a new local registry at the given path
     ///
     /// Creates the directory structure if it doesn't exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory structure cannot be created or the index cannot be loaded.
     pub async fn new(root: PathBuf) -> Result<Self> {
         // Create directory structure
         let blobs_dir = root.join("blobs").join("sha256");
@@ -205,6 +209,10 @@ impl LocalRegistry {
     ///
     /// The digest is computed from the data using SHA-256.
     /// If the blob already exists, this is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blob cannot be written to disk.
     pub async fn put_blob(&self, data: &[u8]) -> Result<String> {
         let digest = compute_digest(data);
 
@@ -228,6 +236,10 @@ impl LocalRegistry {
     /// Get a blob by digest
     ///
     /// Returns the blob data if found, or an error if not found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the digest is invalid, the blob is not found, or integrity check fails.
     pub async fn get_blob(&self, digest: &str) -> Result<Vec<u8>> {
         validate_digest(digest)?;
 
@@ -253,6 +265,7 @@ impl LocalRegistry {
     }
 
     /// Check if a blob exists
+    #[allow(clippy::unused_async)]
     pub async fn has_blob(&self, digest: &str) -> bool {
         if validate_digest(digest).is_err() {
             return false;
@@ -264,6 +277,10 @@ impl LocalRegistry {
     ///
     /// If reference is a tag (not starting with "sha256:"), it creates a tag
     /// pointing to the manifest digest. Returns the manifest digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be written to disk or the index cannot be saved.
     pub async fn put_manifest(
         &self,
         name: &str,
@@ -324,6 +341,10 @@ impl LocalRegistry {
     }
 
     /// Get a manifest by name and reference (tag or digest)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest is not found or integrity check fails.
     pub async fn get_manifest(&self, name: &str, reference: &str) -> Result<Vec<u8>> {
         let digest = if reference.starts_with("sha256:") {
             reference.to_string()
@@ -376,6 +397,10 @@ impl LocalRegistry {
     }
 
     /// List all tags for an image
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the image is not found or the directory cannot be read.
     pub async fn list_tags(&self, name: &str) -> Result<Vec<String>> {
         let tags_dir = self.manifests_dir(name).join("tags");
 
@@ -399,6 +424,10 @@ impl LocalRegistry {
     }
 
     /// List all images in the registry
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the index cannot be read.
     pub async fn list_images(&self) -> Result<Vec<String>> {
         let index = self.index.read().await;
         let mut images: Vec<String> = index.images.keys().cloned().collect();
@@ -407,6 +436,10 @@ impl LocalRegistry {
     }
 
     /// Get image information
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the image is not found.
     pub async fn get_image_info(&self, name: &str) -> Result<ImageEntry> {
         let index = self.index.read().await;
         index
@@ -419,6 +452,10 @@ impl LocalRegistry {
     }
 
     /// Delete a tag from an image
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tag is not found or cannot be deleted.
     pub async fn delete_tag(&self, name: &str, tag: &str) -> Result<()> {
         let tag_path = self.tag_path(name, tag);
 
@@ -449,6 +486,10 @@ impl LocalRegistry {
     }
 
     /// Delete an image and all its tags and manifests
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the image is not found or the directory cannot be deleted.
     pub async fn delete_image(&self, name: &str) -> Result<()> {
         let manifests_dir = self.manifests_dir(name);
 
@@ -477,6 +518,10 @@ impl LocalRegistry {
     ///
     /// This finds all blobs that are not referenced by any manifest
     /// and deletes them. Returns the number of bytes freed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be read or blobs cannot be deleted.
     pub async fn garbage_collect(&self) -> Result<u64> {
         // Collect all referenced digests from manifests
         let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -549,6 +594,10 @@ impl LocalRegistry {
     }
 
     /// Get the total size of the registry in bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the directory cannot be read.
     pub async fn size(&self) -> Result<u64> {
         let mut total: u64 = 0;
 

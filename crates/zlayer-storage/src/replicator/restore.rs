@@ -54,9 +54,7 @@ impl RestoreManager {
         tokio::fs::create_dir_all(&self.temp_dir).await?;
 
         // Download latest snapshot
-        let snapshot_data = if let Some(data) = self.s3_backend.download_latest_snapshot().await? {
-            data
-        } else {
+        let Some(snapshot_data) = self.s3_backend.download_latest_snapshot().await? else {
             info!("No snapshot found in S3");
             return Ok(false);
         };

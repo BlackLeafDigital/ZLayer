@@ -36,6 +36,10 @@ impl IpAllocator {
     /// # Arguments
     /// * `cidr` - Network CIDR notation (e.g., "10.200.0.0/16")
     ///
+    /// # Errors
+    ///
+    /// Returns `OverlayError::InvalidCidr` if the CIDR string cannot be parsed.
+    ///
     /// # Example
     /// ```
     /// use zlayer_overlay::allocator::IpAllocator;
@@ -54,6 +58,10 @@ impl IpAllocator {
     }
 
     /// Create an allocator from persisted state
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the CIDR is invalid or any IP is out of range.
     pub fn from_state(state: IpAllocatorState) -> Result<Self> {
         let mut allocator = Self::new(&state.cidr)?;
         for ip in state.allocated {
@@ -72,6 +80,10 @@ impl IpAllocator {
     }
 
     /// Load allocator state from a file
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or the state is invalid.
     pub async fn load(path: &Path) -> Result<Self> {
         let contents = tokio::fs::read_to_string(path).await?;
         let state: IpAllocatorState = serde_json::from_str(&contents)?;
@@ -79,6 +91,10 @@ impl IpAllocator {
     }
 
     /// Save allocator state to a file
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be written or serialization fails.
     pub async fn save(&self, path: &Path) -> Result<()> {
         let state = self.to_state();
         let contents = serde_json::to_string_pretty(&state)?;
@@ -111,6 +127,8 @@ impl IpAllocator {
 
     /// Allocate a specific IP address
     ///
+    /// # Errors
+    ///
     /// Returns an error if the IP is already allocated or not in the CIDR range.
     pub fn allocate_specific(&mut self, ip: Ipv4Addr) -> Result<()> {
         if !self.network.contains(&ip) {
@@ -135,6 +153,10 @@ impl IpAllocator {
     /// let ip = allocator.allocate_first().unwrap();
     /// assert_eq!(ip.to_string(), "10.200.0.1");
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no IPs are available or the first IP is already allocated.
     pub fn allocate_first(&mut self) -> Result<Ipv4Addr> {
         let first_ip = self
             .network
@@ -151,6 +173,8 @@ impl IpAllocator {
     }
 
     /// Mark an IP address as allocated (for restoring state)
+    ///
+    /// # Errors
     ///
     /// Returns an error if the IP is not in the CIDR range.
     pub fn mark_allocated(&mut self, ip: Ipv4Addr) -> Result<()> {
@@ -188,12 +212,14 @@ impl IpAllocator {
 
     /// Get the total number of usable addresses in the range
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn total_hosts(&self) -> u32 {
         self.network.hosts().count() as u32
     }
 
     /// Get the number of available addresses
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn available_count(&self) -> u32 {
         self.total_hosts()
             .saturating_sub(self.allocated.len() as u32)
@@ -231,6 +257,10 @@ impl IpAllocator {
 }
 
 /// Helper function to get the first usable IP from a CIDR
+///
+/// # Errors
+///
+/// Returns an error if the CIDR is invalid or has no usable hosts.
 pub fn first_ip_from_cidr(cidr: &str) -> Result<Ipv4Addr> {
     let network: Ipv4Net = cidr
         .parse()

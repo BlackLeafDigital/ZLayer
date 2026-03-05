@@ -36,6 +36,7 @@ pub enum DeployStep {
 // ---------------------------------------------------------------------------
 
 /// Render the deploy view
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 pub fn render(frame: &mut Frame, state: &DeployState) {
     let area = frame.area();
 
@@ -82,6 +83,7 @@ pub fn render(frame: &mut Frame, state: &DeployState) {
 }
 
 /// Render step progress
+#[allow(clippy::comparison_chain, clippy::cast_possible_truncation)]
 fn render_step_indicator(area: Rect, buf: &mut Buffer, current: DeployStep) {
     let steps = [
         ("Select", DeployStep::SelectFile),
@@ -137,6 +139,7 @@ fn render_step_indicator(area: Rect, buf: &mut Buffer, current: DeployStep) {
 }
 
 /// Step 1: Select a spec file
+#[allow(clippy::cast_possible_truncation)]
 fn render_select_file(area: Rect, frame: &mut Frame, state: &DeployState) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -199,6 +202,7 @@ fn render_select_file(area: Rect, frame: &mut Frame, state: &DeployState) {
 }
 
 /// Step 2: Preview parsed spec
+#[allow(clippy::too_many_lines)]
 fn render_preview(area: Rect, buf: &mut Buffer, state: &DeployState) {
     let (title, border_color) = if state.parse_error.is_some() {
         (" Parse Error ", Color::Red)
@@ -517,6 +521,7 @@ pub enum DeployAction {
     Dashboard,
 }
 
+#[allow(clippy::comparison_chain)]
 pub fn handle_key(
     key: KeyEvent,
     state: &mut DeployState,

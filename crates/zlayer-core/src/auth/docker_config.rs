@@ -28,13 +28,20 @@ struct AuthEntry {
 }
 
 impl DockerConfigAuth {
-    /// Load Docker config from the default location (~/.docker/config.json)
+    /// Load Docker config from the default location (`~/.docker/config.json`)
+    ///
+    /// # Errors
+    /// Returns an error if the home directory cannot be determined or the config
+    /// file exists but cannot be read or parsed.
     pub fn load() -> Result<Self> {
         let path = Self::default_config_path()?;
         Self::load_from_path(&path)
     }
 
     /// Load Docker config from a specific path
+    ///
+    /// # Errors
+    /// Returns an error if the file exists but cannot be read or parsed.
     pub fn load_from_path(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self {

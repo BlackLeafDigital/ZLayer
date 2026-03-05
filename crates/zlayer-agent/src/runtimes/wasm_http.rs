@@ -148,6 +148,7 @@ impl HttpRequest {
     }
 
     /// Add a header to the request
+    #[must_use]
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
         self
@@ -233,6 +234,7 @@ impl HttpResponse {
     }
 
     /// Add a header to the response
+    #[must_use]
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
         self
@@ -554,6 +556,10 @@ impl WasmHttpRuntime {
     /// # Returns
     ///
     /// A new `WasmHttpRuntime` or an error if the engine could not be created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the wasmtime engine cannot be created.
     pub fn new(config: WasmHttpConfig) -> Result<Self, WasmHttpError> {
         let mut engine_config = Config::new();
         engine_config.async_support(true);
@@ -602,6 +608,10 @@ impl WasmHttpRuntime {
     /// # Returns
     ///
     /// The HTTP response from the component or an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the component cannot be loaded, instantiated, or the request fails.
     #[instrument(skip(self, wasm_bytes, request), fields(component = %component_ref, method = %request.method, uri = %request.uri))]
     pub async fn handle_request(
         &self,
@@ -649,6 +659,11 @@ impl WasmHttpRuntime {
     /// * `component_ref` - A unique identifier for the component
     /// * `wasm_bytes` - The raw WASM component bytes
     /// * `_count` - Ignored (kept for API compatibility)
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the component cannot be compiled.
+    #[allow(clippy::used_underscore_binding)]
     #[instrument(skip(self, wasm_bytes), fields(component = %component_ref))]
     pub async fn prewarm(
         &self,
@@ -946,6 +961,7 @@ impl WasmHttpRuntime {
     }
 
     /// Convert an `HttpRequest` to a `hyper::Request` with a body type compatible with WASI HTTP
+    #[allow(clippy::unused_self)]
     fn convert_to_hyper_request(
         &self,
         request: &HttpRequest,

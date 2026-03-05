@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Row, Table, Wrap};
 use crate::app::DashboardState;
 
 /// Render the dashboard view
+#[allow(clippy::cast_possible_truncation)]
 pub fn render(frame: &mut Frame, state: &DashboardState) {
     let area = frame.area();
 
@@ -302,6 +303,7 @@ pub struct ServiceInfo {
 
 /// Attempt to refresh dashboard data from the daemon.
 /// Call this from the event loop with the tokio runtime.
+#[allow(clippy::cast_possible_truncation)]
 pub fn refresh_data(rt: &tokio::runtime::Runtime, state: &mut DashboardState) {
     state.last_refresh = Some(Instant::now());
     state.daemon_status = DaemonStatus::Connecting;

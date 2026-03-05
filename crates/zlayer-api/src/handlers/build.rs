@@ -333,6 +333,11 @@ impl From<BuildEvent> for BuildEventWrapper {
 /// - `dockerfile`: The Dockerfile content (optional if using runtime)
 /// - `context`: A tarball containing the build context
 /// - `config`: JSON configuration (`BuildRequest`)
+///
+/// # Errors
+///
+/// Returns an error if the request is invalid, context extraction fails, or the build
+/// cannot be started.
 #[utoipa::path(
     post,
     path = "/api/v1/build",
@@ -439,7 +444,11 @@ pub async fn start_build(
 }
 
 /// POST /api/v1/build/json
-/// Start a new build from JSON request with a context path on the server
+/// Start a new build from JSON request with a context path on the server.
+///
+/// # Errors
+///
+/// Returns an error if the context path is invalid or the build cannot be started.
 #[utoipa::path(
     post,
     path = "/api/v1/build/json",
@@ -535,7 +544,11 @@ impl From<BuildRequestWithContext> for BuildRequest {
 }
 
 /// GET /api/v1/build/{id}
-/// Get build status
+/// Get build status.
+///
+/// # Errors
+///
+/// Returns an error if the build is not found.
 #[utoipa::path(
     get,
     path = "/api/v1/build/{id}",
@@ -565,7 +578,11 @@ pub async fn get_build_status(
 }
 
 /// GET /api/v1/build/{id}/stream
-/// Stream build progress via Server-Sent Events
+/// Stream build progress via Server-Sent Events.
+///
+/// # Errors
+///
+/// Returns an error if the build is not found or not active.
 #[utoipa::path(
     get,
     path = "/api/v1/build/{id}/stream",
@@ -609,7 +626,11 @@ pub async fn stream_build(
 }
 
 /// GET /api/v1/build/{id}/logs
-/// Get build logs
+/// Get build logs.
+///
+/// # Errors
+///
+/// Returns an error if the build is not found or logs cannot be read.
 #[utoipa::path(
     get,
     path = "/api/v1/build/{id}/logs",
@@ -648,7 +669,11 @@ pub async fn get_build_logs(
 }
 
 /// GET /api/v1/builds
-/// List all builds
+/// List all builds.
+///
+/// # Errors
+///
+/// Returns an error if the user is not authenticated.
 #[utoipa::path(
     get,
     path = "/api/v1/builds",

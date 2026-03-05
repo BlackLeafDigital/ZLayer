@@ -5,8 +5,10 @@
 
 use crate::cache::{BlobCache, BlobCacheBackend};
 use crate::error::CacheError;
-use std::path::PathBuf;
 use std::sync::Arc;
+
+#[cfg(feature = "persistent")]
+use std::path::PathBuf;
 
 #[cfg(feature = "persistent")]
 use crate::persistent_cache::PersistentBlobCache;
@@ -15,9 +17,11 @@ use crate::persistent_cache::PersistentBlobCache;
 use crate::s3_cache::{S3BlobCache, S3CacheConfig};
 
 /// Default cache directory for persistent cache
+#[cfg(feature = "persistent")]
 const DEFAULT_CACHE_DIR: &str = "/var/lib/zlayer/cache";
 
 /// Default cache database filename
+#[cfg(feature = "persistent")]
 const DEFAULT_CACHE_DB: &str = "blobs.sqlite";
 
 /// Cache type configuration
@@ -38,6 +42,7 @@ pub enum CacheType {
     S3(S3CacheConfig),
 }
 
+#[allow(clippy::derivable_impls)]
 impl Default for CacheType {
     fn default() -> Self {
         #[cfg(feature = "persistent")]
@@ -146,6 +151,7 @@ impl CacheType {
     /// # Errors
     ///
     /// Returns `CacheError` if the cache backend fails to initialize
+    #[allow(clippy::unused_async)]
     pub async fn build(&self) -> Result<Arc<Box<dyn BlobCacheBackend>>, CacheError> {
         match self {
             CacheType::Memory => {

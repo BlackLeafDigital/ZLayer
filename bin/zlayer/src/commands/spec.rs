@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use crate::cli::SpecCommands;
 
 /// Handle spec commands
-pub(crate) async fn handle_spec(action: &SpecCommands) -> Result<()> {
+pub(crate) fn handle_spec(action: &SpecCommands) -> Result<()> {
     match action {
         SpecCommands::Dump { spec, format } => {
             let spec = spec.clone();

@@ -114,6 +114,7 @@ impl ReverseProxyService {
     }
 
     /// Set the certificate manager for ACME challenge interception
+    #[must_use]
     pub fn with_cert_manager(mut self, cm: Arc<CertManager>) -> Self {
         self.cert_manager = Some(cm);
         self
@@ -126,6 +127,17 @@ impl ReverseProxyService {
     }
 
     /// Handle an incoming HTTP request
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if route resolution fails, no healthy backends are
+    /// available, or the backend request fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if building a well-formed HTTP response for an ACME challenge
+    /// or upgrade reply fails (indicates a bug, not a runtime condition).
+    #[allow(clippy::too_many_lines)]
     pub async fn proxy_request(&self, mut req: Request<Incoming>) -> Result<Response<BoxBody>> {
         let start = std::time::Instant::now();
         let method = req.method().clone();
@@ -145,7 +157,7 @@ impl ReverseProxyService {
             if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
                 if !token.is_empty() {
                     if let Some(ref cm) = self.cert_manager {
-                        if let Some(auth) = cm.get_challenge_response(token).await {
+                        if let Some(auth) = cm.get_challenge_response(token) {
                             return Ok(Response::builder()
                                 .status(200)
                                 .header("content-type", "text/plain")
@@ -314,33 +326,33 @@ impl ReverseProxyService {
                 }
 
                 return Ok(Response::from_parts(parts, body));
-            } else {
-                // Backend didn't upgrade — stream the response as-is
-                let (mut parts, body) = backend_response.into_parts();
-                let streaming_body: BoxBody = body.map_err(|e: hyper::Error| e).boxed();
-
-                // Add HSTS header for TLS connections
-                if self.is_tls && self.config.headers.hsts {
-                    let value = if self.config.headers.hsts_subdomains {
-                        format!(
-                            "max-age={}; includeSubDomains",
-                            self.config.headers.hsts_max_age
-                        )
-                    } else {
-                        format!("max-age={}", self.config.headers.hsts_max_age)
-                    };
-                    if let Ok(hv) = value.parse() {
-                        parts.headers.insert("strict-transport-security", hv);
-                    }
-                }
-
-                // Add Server-Timing header
-                if let Ok(hv) = format!("proxy;dur={}", start.elapsed().as_millis()).parse() {
-                    parts.headers.insert("server-timing", hv);
-                }
-
-                return Ok(Response::from_parts(parts, streaming_body));
             }
+
+            // Backend didn't upgrade — stream the response as-is
+            let (mut parts, body) = backend_response.into_parts();
+            let streaming_body: BoxBody = body.map_err(|e: hyper::Error| e).boxed();
+
+            // Add HSTS header for TLS connections
+            if self.is_tls && self.config.headers.hsts {
+                let value = if self.config.headers.hsts_subdomains {
+                    format!(
+                        "max-age={}; includeSubDomains",
+                        self.config.headers.hsts_max_age
+                    )
+                } else {
+                    format!("max-age={}", self.config.headers.hsts_max_age)
+                };
+                if let Ok(hv) = value.parse() {
+                    parts.headers.insert("strict-transport-security", hv);
+                }
+            }
+
+            // Add Server-Timing header
+            if let Ok(hv) = format!("proxy;dur={}", start.elapsed().as_millis()).parse() {
+                parts.headers.insert("server-timing", hv);
+            }
+
+            return Ok(Response::from_parts(parts, streaming_body));
         }
 
         debug!(method = %method, host = ?host, path = %path, "Routing request");
@@ -398,8 +410,7 @@ impl ReverseProxyService {
 
         // Build forwarded request
         let forwarded_req = self
-            .build_forwarded_request(req, &backend_addr, &resolved)
-            .await?;
+            .build_forwarded_request(req, &backend_addr, &resolved)?;
 
         // Forward to backend
         let response = self.client.request(forwarded_req).await.map_err(|e| {
@@ -433,7 +444,7 @@ impl ReverseProxyService {
         Ok(Response::from_parts(parts, streaming_body))
     }
 
-    async fn build_forwarded_request(
+    fn build_forwarded_request(
         &self,
         req: Request<Incoming>,
         backend: &SocketAddr,
@@ -528,7 +539,6 @@ impl ReverseProxyService {
             let proto_version = match parts.version {
                 Version::HTTP_09 => "0.9",
                 Version::HTTP_10 => "1.0",
-                Version::HTTP_11 => "1.1",
                 Version::HTTP_2 => "2.0",
                 Version::HTTP_3 => "3.0",
                 _ => "1.1",
@@ -549,14 +559,6 @@ impl ReverseProxyService {
     }
 
     fn remove_hop_by_hop_headers(parts: &mut http::request::Parts) {
-        // First, collect headers listed in the Connection header before we remove it
-        let connection_headers: Vec<String> = parts
-            .headers
-            .get(header::CONNECTION)
-            .and_then(|h| h.to_str().ok())
-            .map(|value| value.split(',').map(|s| s.trim().to_lowercase()).collect())
-            .unwrap_or_default();
-
         // Standard hop-by-hop headers that should not be forwarded
         const HOP_BY_HOP: &[&str] = &[
             "connection",
@@ -569,6 +571,14 @@ impl ReverseProxyService {
             "upgrade",
         ];
 
+        // First, collect headers listed in the Connection header before we remove it
+        let connection_headers: Vec<String> = parts
+            .headers
+            .get(header::CONNECTION)
+            .and_then(|h| h.to_str().ok())
+            .map(|value| value.split(',').map(|s| s.trim().to_lowercase()).collect())
+            .unwrap_or_default();
+
         for header_name in HOP_BY_HOP {
             parts.headers.remove(*header_name);
         }
@@ -580,6 +590,11 @@ impl ReverseProxyService {
     }
 
     /// Create an error response
+    ///
+    /// # Panics
+    ///
+    /// Panics if building a valid HTTP response with a JSON body fails,
+    /// which should never occur with well-formed status codes.
     pub fn error_response(error: &ProxyError) -> Response<BoxBody> {
         let status = error.status_code();
         let body = format!("{{\"error\": \"{error}\"}}");

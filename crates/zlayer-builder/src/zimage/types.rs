@@ -549,6 +549,7 @@ fn default_wasm_target() -> String {
 }
 
 /// Helper for `skip_serializing_if` on boolean fields.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(v: &bool) -> bool {
     !v
 }

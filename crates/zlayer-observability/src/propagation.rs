@@ -19,6 +19,7 @@ impl Extractor for HeaderExtractor<'_, http::HeaderMap> {
     }
 }
 
+#[allow(clippy::implicit_hasher)]
 impl Extractor for HeaderExtractor<'_, HashMap<String, String>> {
     fn get(&self, key: &str) -> Option<&str> {
         self.0.get(key).map(std::string::String::as_str)
@@ -42,6 +43,7 @@ impl Injector for HeaderInjector<'_, http::HeaderMap> {
     }
 }
 
+#[allow(clippy::implicit_hasher)]
 impl Injector for HeaderInjector<'_, HashMap<String, String>> {
     fn set(&mut self, key: &str, value: String) {
         self.0.insert(key.to_string(), value);
@@ -73,6 +75,7 @@ pub fn inject_context_to_headers(headers: &mut http::HeaderMap) {
 /// Extract trace context from a `HashMap` (useful for gRPC metadata)
 #[cfg(feature = "propagation")]
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn extract_context_from_map(map: &HashMap<String, String>) -> opentelemetry::Context {
     use opentelemetry::global;
     global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(map)))
@@ -80,6 +83,7 @@ pub fn extract_context_from_map(map: &HashMap<String, String>) -> opentelemetry:
 
 /// Inject trace context into a `HashMap`
 #[cfg(feature = "propagation")]
+#[allow(clippy::implicit_hasher)]
 pub fn inject_context_to_map(map: &mut HashMap<String, String>) {
     use opentelemetry::global;
     global::get_text_map_propagator(|propagator| {

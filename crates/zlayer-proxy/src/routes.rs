@@ -173,7 +173,7 @@ impl ServiceRegistry {
         let mut routes = self.routes.write().await;
         for entry in routes.iter_mut() {
             if entry.service_name == service_name {
-                entry.resolved.backends = backends.clone();
+                entry.resolved.backends.clone_from(&backends);
             }
         }
     }

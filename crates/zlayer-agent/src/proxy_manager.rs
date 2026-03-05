@@ -165,6 +165,7 @@ impl ProxyManager {
     }
 
     /// Builder pattern: add stream registry for L4 proxy integration
+    #[must_use]
     pub fn with_stream_registry(mut self, registry: Arc<StreamRegistry>) -> Self {
         self.stream_registry = Some(registry);
         self
@@ -179,6 +180,9 @@ impl ProxyManager {
     ///
     /// If already listening on this port, skip.
     /// All port listeners share the same `ServiceRegistry` for request matching.
+    ///
+    /// # Errors
+    /// Returns an error if the proxy server cannot be started.
     pub async fn listen_on(&self, port: u16, bind_ip: IpAddr) -> Result<()> {
         let mut servers = self.servers.write().await;
 
@@ -216,6 +220,9 @@ impl ProxyManager {
     ///
     /// If already listening on this port, skip.
     /// Requires a `CertManager` to be configured; logs a warning and returns `Ok(())` if not.
+    ///
+    /// # Errors
+    /// Returns an error if the HTTPS proxy server cannot be started.
     pub async fn listen_on_tls(&self, port: u16, bind_ip: IpAddr) -> Result<()> {
         let mut servers = self.servers.write().await;
 
@@ -224,9 +231,7 @@ impl ProxyManager {
             return Ok(());
         }
 
-        let cert_manager = if let Some(cm) = &self.cert_manager {
-            cm
-        } else {
+        let Some(cert_manager) = &self.cert_manager else {
             warn!(
                 port = port,
                 "Cannot start TLS listener: no CertManager configured"
@@ -315,6 +320,9 @@ impl ProxyManager {
     /// - **Internal** endpoints bind to the overlay IP so they are only
     ///   reachable from within the overlay network.  If no overlay is
     ///   available, internal endpoints bind to `127.0.0.1` (localhost only).
+    ///
+    /// # Errors
+    /// Returns an error if an HTTP/HTTPS listener cannot be started.
     pub async fn ensure_ports_for_service(
         &self,
         spec: &ServiceSpec,
@@ -567,7 +575,7 @@ impl ProxyManager {
                 let mut tcp_set = self.tcp_listeners.write().await;
                 for port in &tracking.tcp_ports {
                     if let Some(registry) = &self.stream_registry {
-                        registry.unregister_tcp(*port);
+                        let _ = registry.unregister_tcp(*port);
                     }
                     tcp_set.remove(port);
                     debug!(service = name, port = port, "Removed TCP listener tracking");
@@ -579,7 +587,7 @@ impl ProxyManager {
                 let mut udp_set = self.udp_listeners.write().await;
                 for port in &tracking.udp_ports {
                     if let Some(registry) = &self.stream_registry {
-                        registry.unregister_udp(*port);
+                        let _ = registry.unregister_udp(*port);
                     }
                     udp_set.remove(port);
                     debug!(service = name, port = port, "Removed UDP listener tracking");
@@ -631,6 +639,7 @@ impl ProxyManager {
     ///
     /// Delegates to [`LoadBalancer::mark_health`] so that unhealthy backends
     /// are skipped during selection.
+    #[allow(clippy::unused_async)]
     pub async fn update_backend_health(&self, service: &str, addr: SocketAddr, healthy: bool) {
         self.load_balancer.mark_health(service, &addr, healthy);
         debug!(

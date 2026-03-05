@@ -17,6 +17,7 @@ use tracing::{debug, info};
 /// Default database filename used when a directory is provided
 const DEFAULT_DB_FILENAME: &str = "blob_cache.sqlite";
 
+#[allow(clippy::cast_possible_wrap)]
 fn current_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -36,6 +37,10 @@ impl PersistentBlobCache {
     /// If `path` is a directory, the cache database will be created as
     /// `blob_cache.sqlite` inside that directory. If `path` is a file path,
     /// it will be used directly as the database file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database cannot be opened or the schema cannot be initialized.
     pub async fn open<P: AsRef<Path>>(path: P) -> Result<Self, CacheError> {
         let path = path.as_ref();
 
@@ -108,6 +113,10 @@ impl PersistentBlobCache {
     }
 
     /// Get a blob by digest
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the digest is invalid or the database query fails.
     pub async fn get(&self, digest: &str) -> Result<Option<Vec<u8>>, CacheError> {
         validate_digest(digest)?;
 
@@ -140,6 +149,11 @@ impl PersistentBlobCache {
     }
 
     /// Put a blob into the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the digest is invalid, mismatches the data, or the database write fails.
+    #[allow(clippy::cast_possible_wrap)]
     pub async fn put(&self, digest: &str, data: &[u8]) -> Result<(), CacheError> {
         validate_digest(digest)?;
 
@@ -180,6 +194,10 @@ impl PersistentBlobCache {
     }
 
     /// Check if a blob exists in the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the digest is invalid or the database query fails.
     pub async fn contains(&self, digest: &str) -> Result<bool, CacheError> {
         validate_digest(digest)?;
 
@@ -194,6 +212,10 @@ impl PersistentBlobCache {
     }
 
     /// Delete a blob from the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the digest is invalid or the database delete fails.
     pub async fn delete(&self, digest: &str) -> Result<(), CacheError> {
         validate_digest(digest)?;
 
@@ -209,6 +231,11 @@ impl PersistentBlobCache {
     }
 
     /// Get current cache size in bytes
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    #[allow(clippy::cast_sign_loss)]
     pub async fn size(&self) -> Result<u64, CacheError> {
         let total: Option<i64> = sqlx::query_scalar("SELECT SUM(size_bytes) FROM blobs")
             .fetch_one(&self.pool)
@@ -219,6 +246,11 @@ impl PersistentBlobCache {
     }
 
     /// Get number of blobs in the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database query fails.
+    #[allow(clippy::cast_sign_loss)]
     pub async fn blob_count(&self) -> Result<u64, CacheError> {
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM blobs")
             .fetch_one(&self.pool)
@@ -229,6 +261,10 @@ impl PersistentBlobCache {
     }
 
     /// Clear all blobs from the cache
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the database delete fails.
     pub async fn clear(&self) -> Result<(), CacheError> {
         sqlx::query("DELETE FROM blobs")
             .execute(&self.pool)
@@ -241,6 +277,7 @@ impl PersistentBlobCache {
     }
 
     /// Evict blobs using LRU if cache is over size limit
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     async fn evict_if_needed(&self) -> Result<(), CacheError> {
         let current_size = self.size().await?;
         if current_size <= self.max_size_bytes {
@@ -276,7 +313,10 @@ impl PersistentBlobCache {
             }
 
             digests_to_delete.push(digest);
-            evicted_size += size_bytes as u64;
+            #[allow(clippy::cast_sign_loss)]
+            {
+                evicted_size += size_bytes as u64;
+            }
             evicted_count += 1;
         }
 

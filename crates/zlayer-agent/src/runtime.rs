@@ -322,12 +322,10 @@ impl Runtime for MockRuntime {
         let containers = self.containers.read().await;
         if containers.contains_key(id) {
             // Mock: deterministic IP based on replica number (172.17.0.{replica+2})
-            let last_octet = id.replica + 2;
+            #[allow(clippy::cast_possible_truncation)]
+            let last_octet = (id.replica + 2) as u8;
             Ok(Some(IpAddr::V4(std::net::Ipv4Addr::new(
-                172,
-                17,
-                0,
-                last_octet as u8,
+                172, 17, 0, last_octet,
             ))))
         } else {
             Err(AgentError::NotFound {

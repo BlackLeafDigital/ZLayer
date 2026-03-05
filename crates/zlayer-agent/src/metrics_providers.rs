@@ -121,7 +121,7 @@ impl ContainerStatsProvider for RuntimeStatsProvider {
             .map_err(|e| e.to_string())?;
 
         // Convert ContainerStats to RawContainerStats
-        Ok(container_stats_to_raw(stats))
+        Ok(container_stats_to_raw(&stats))
     }
 }
 
@@ -130,7 +130,7 @@ impl ContainerStatsProvider for RuntimeStatsProvider {
 /// This function bridges the two stats types, allowing the agent crate
 /// to not depend on scheduler for its core types while still providing
 /// the necessary data for metrics collection.
-fn container_stats_to_raw(stats: ContainerStats) -> RawContainerStats {
+fn container_stats_to_raw(stats: &ContainerStats) -> RawContainerStats {
     RawContainerStats {
         cpu_usage_usec: stats.cpu_usage_usec,
         memory_bytes: stats.memory_bytes,
@@ -269,7 +269,7 @@ services:
             timestamp: Instant::now(),
         };
 
-        let raw = container_stats_to_raw(stats.clone());
+        let raw = container_stats_to_raw(&stats);
 
         assert_eq!(raw.cpu_usage_usec, stats.cpu_usage_usec);
         assert_eq!(raw.memory_bytes, stats.memory_bytes);

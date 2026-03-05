@@ -53,6 +53,9 @@ pub struct ZLayerMetrics {
 
 impl ZLayerMetrics {
     /// Create a new metrics collection
+    ///
+    /// # Errors
+    /// Returns an error if Prometheus metric creation or registration fails.
     pub fn new() -> Result<Self> {
         let registry = Registry::new();
 
@@ -173,6 +176,9 @@ impl ZLayerMetrics {
     }
 
     /// Encode metrics in Prometheus text format
+    ///
+    /// # Errors
+    /// Returns an error if metric encoding fails.
     pub fn encode(&self) -> Result<String> {
         let encoder = TextEncoder::new();
         let metric_families = self.registry.gather();
@@ -227,11 +233,13 @@ impl ZLayerMetrics {
     }
 
     /// Update Raft term
+    #[allow(clippy::cast_precision_loss)]
     pub fn set_raft_term(&self, term: u64) {
         self.raft_term.set(term as f64);
     }
 
     /// Update Raft commit index
+    #[allow(clippy::cast_precision_loss)]
     pub fn set_raft_commit_index(&self, index: u64) {
         self.raft_commit_index.set(index as f64);
     }
@@ -266,6 +274,13 @@ pub enum HealthStatus {
 static METRICS: std::sync::OnceLock<ZLayerMetrics> = std::sync::OnceLock::new();
 
 /// Initialize global metrics
+///
+/// # Errors
+/// This function currently never fails but returns `Result` for API consistency.
+///
+/// # Panics
+/// Panics if `ZLayerMetrics::new()` fails during first initialization.
+#[allow(clippy::unnecessary_wraps)]
 pub fn init_metrics(config: &MetricsConfig) -> Result<&'static ZLayerMetrics> {
     if !config.enabled {
         info!("Metrics disabled by configuration");
@@ -283,6 +298,7 @@ pub fn metrics() -> Option<&'static ZLayerMetrics> {
 
 /// Axum handler for Prometheus metrics endpoint
 #[cfg(feature = "axum")]
+#[allow(clippy::unused_async)]
 pub async fn metrics_handler() -> impl axum::response::IntoResponse {
     use axum::http::StatusCode;
 

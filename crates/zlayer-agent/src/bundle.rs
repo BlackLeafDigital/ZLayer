@@ -83,6 +83,9 @@ const ALL_CAPABILITIES: &[Capability] = &[
 /// assert_eq!(parse_memory_string("1Gi").unwrap(), 1024 * 1024 * 1024);
 /// assert_eq!(parse_memory_string("2G").unwrap(), 2 * 1000 * 1000 * 1000);
 /// ```
+///
+/// # Errors
+/// Returns an error if the string cannot be parsed as a memory size.
 pub fn parse_memory_string(s: &str) -> std::result::Result<u64, String> {
     let s = s.trim();
     if s.is_empty() {
@@ -117,6 +120,7 @@ pub fn parse_memory_string(s: &str) -> std::result::Result<u64, String> {
 }
 
 /// Get major and minor device numbers from a device path
+#[allow(clippy::cast_possible_wrap)]
 fn get_device_major_minor(path: &str) -> std::io::Result<(i64, i64)> {
     let metadata = std::fs::metadata(path)?;
     let rdev = metadata.rdev();
@@ -302,6 +306,7 @@ impl BundleBuilder {
     ///
     /// When set, environment variables with `$S:secret-name` syntax will be resolved
     /// from this provider at bundle creation time.
+    #[must_use]
     pub fn with_secrets_provider(mut self, provider: Arc<dyn SecretsProvider>) -> Self {
         self.secrets_provider = Some(provider);
         self
@@ -402,6 +407,7 @@ impl BundleBuilder {
     }
 
     /// Build the OCI runtime spec from `ServiceSpec`
+    #[allow(clippy::too_many_lines)]
     async fn build_oci_spec(
         &self,
         container_id: &ContainerId,
@@ -603,6 +609,7 @@ impl BundleBuilder {
     }
 
     /// Build Linux capabilities configuration
+    #[allow(clippy::unused_self)]
     fn build_capabilities(
         &self,
         spec: &ServiceSpec,
@@ -693,6 +700,7 @@ impl BundleBuilder {
     }
 
     /// Build default filesystem mounts for the container
+    #[allow(clippy::unused_self, clippy::too_many_lines)]
     fn build_default_mounts(&self, spec: &ServiceSpec) -> Result<Vec<Mount>> {
         let mut mounts = Vec::new();
 
@@ -837,6 +845,7 @@ impl BundleBuilder {
     /// Converts `StorageSpec` entries to OCI Mount entries.
     /// Note: Named and Anonymous volumes require `StorageManager` to prepare paths.
     /// S3 volumes require s3fs FUSE mount (handled separately).
+    #[allow(clippy::unused_self, clippy::too_many_lines)]
     fn build_storage_mounts(
         &self,
         spec: &ServiceSpec,
@@ -1108,6 +1117,7 @@ impl BundleBuilder {
     }
 
     /// Build resource limits (CPU, memory, device cgroups)
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn build_resources(
         &self,
         spec: &ServiceSpec,
@@ -1164,6 +1174,7 @@ impl BundleBuilder {
     }
 
     /// Build device cgroup rules
+    #[allow(clippy::unused_self, clippy::too_many_lines)]
     fn build_device_cgroup_rules(
         &self,
         spec: &ServiceSpec,
@@ -1362,6 +1373,7 @@ impl BundleBuilder {
     }
 
     /// Build Linux device entries for passthrough
+    #[allow(clippy::unused_self, clippy::too_many_lines)]
     fn build_devices(&self, spec: &ServiceSpec) -> Result<Vec<oci_spec::runtime::LinuxDevice>> {
         let mut devices = Vec::new();
 
@@ -1613,6 +1625,9 @@ impl BundleBuilder {
     /// Use this when the bundle directory and rootfs already exist (e.g., rootfs was
     /// extracted directly by `LayerUnpacker`).
     ///
+    /// # Errors
+    /// Returns an error if the OCI spec cannot be built or config.json cannot be written.
+    ///
     /// # Returns
     /// The path to the bundle directory on success
     pub async fn write_config(
@@ -1695,7 +1710,10 @@ impl BundleBuilder {
 
     /// Clean up a bundle directory
     ///
-    /// Removes the bundle directory and all its contents
+    /// Removes the bundle directory and all its contents.
+    ///
+    /// # Errors
+    /// Returns an error if the bundle directory cannot be removed.
     pub async fn cleanup(&self) -> Result<()> {
         if self.bundle_dir.exists() {
             fs::remove_dir_all(&self.bundle_dir)
@@ -1715,7 +1733,10 @@ impl BundleBuilder {
 
 /// Create a bundle for a container
 ///
-/// Convenience function that creates a bundle in the default location
+/// Convenience function that creates a bundle in the default location.
+///
+/// # Errors
+/// Returns an error if bundle creation fails.
 pub async fn create_bundle(
     container_id: &ContainerId,
     spec: &ServiceSpec,
@@ -1733,7 +1754,10 @@ pub async fn create_bundle(
 
 /// Clean up a container's bundle
 ///
-/// Convenience function to remove a bundle from the default location
+/// Convenience function to remove a bundle from the default location.
+///
+/// # Errors
+/// Returns an error if cleanup fails.
 pub async fn cleanup_bundle(container_id: &ContainerId) -> Result<()> {
     let builder = BundleBuilder::for_container(container_id);
     builder.cleanup().await

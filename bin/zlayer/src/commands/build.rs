@@ -6,7 +6,7 @@ use std::sync::mpsc;
 use tracing::{info, warn};
 
 /// Build a container image from a Dockerfile or runtime template
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools, clippy::too_many_lines)]
 pub(crate) async fn handle_build(
     context: PathBuf,
     file: Option<PathBuf>,
@@ -184,7 +184,8 @@ pub(crate) async fn handle_build(
 }
 
 /// List available runtime templates
-pub(crate) async fn handle_runtimes() -> Result<()> {
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn handle_runtimes() -> Result<()> {
     use zlayer_builder::{list_templates, Runtime};
 
     println!("Available runtime templates:\n");

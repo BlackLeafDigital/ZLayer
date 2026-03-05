@@ -141,6 +141,7 @@ impl DeployState {
     ///
     /// This is the core state machine. Each event variant maps to one or
     /// more field mutations and potentially a phase transition.
+    #[allow(clippy::too_many_lines)]
     pub fn apply_event(&mut self, event: &DeployEvent) {
         match event {
             DeployEvent::PlanReady {
@@ -148,9 +149,9 @@ impl DeployState {
                 version,
                 services,
             } => {
-                self.deployment_name = deployment_name.clone();
-                self.version = version.clone();
-                self.service_plans = services.clone();
+                self.deployment_name.clone_from(deployment_name);
+                self.version.clone_from(version);
+                self.service_plans.clone_from(services);
                 self.phase = DeployPhase::Deploying;
             }
 
@@ -245,7 +246,7 @@ impl DeployState {
 
             DeployEvent::DeploymentRunning { services } => {
                 self.phase = DeployPhase::Running;
-                self.running_services = services.clone();
+                self.running_services.clone_from(services);
             }
 
             DeployEvent::StatusTick { services } => {

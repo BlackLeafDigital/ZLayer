@@ -63,15 +63,17 @@ impl RaftService {
             .layer(TraceLayer::new_for_http())
     }
 
-    /// Run the Raft service on the specified address
+    /// Run the Raft service on the specified address.
     ///
     /// This starts an HTTP server that listens for Raft RPCs.
     ///
     /// # Arguments
     /// * `addr` - The socket address to bind to (e.g., "0.0.0.0:9000")
     ///
-    /// # Returns
-    /// An error if the server fails to start or encounters a runtime error
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::Network` if the server fails to bind
+    /// or encounters a runtime error.
     pub async fn run(self, addr: SocketAddr) -> Result<()> {
         let app = self.router();
 

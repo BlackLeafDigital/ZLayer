@@ -33,6 +33,7 @@ impl Default for BackoffConfig {
 impl BackoffConfig {
     /// Calculate the delay for a given retry attempt (0-indexed)
     #[must_use]
+    #[allow(clippy::cast_possible_wrap)]
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let delay_secs = self.initial_delay.as_secs_f64() * self.multiplier.powi(attempt as i32);
         let capped_secs = delay_secs.min(self.max_delay.as_secs_f64());
@@ -97,6 +98,9 @@ impl InitOrchestrator {
     /// - `Fail` (default): Stop container creation, return error immediately
     /// - `Restart`: Retry init steps (up to `max_retries`) with immediate retry
     /// - `Backoff`: Retry with exponential backoff (1s, 2s, 4s, 8s, max 60s)
+    ///
+    /// # Errors
+    /// Returns an error if init steps fail and the error policy is `Fail` or all retries are exhausted.
     pub async fn run(&self) -> Result<()> {
         match self.error_policy.on_init_failure.action {
             InitFailureAction::Fail => {

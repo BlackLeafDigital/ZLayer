@@ -250,6 +250,11 @@ pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Resu
 ///  8. Wire service manager with all subsystems
 ///  9. Open persistent deployment storage (`SQLite`)
 /// 10. Open persistent secrets store (`SQLite` + encryption key)
+///
+/// # Errors
+///
+/// Returns an error if any infrastructure phase fails to initialize.
+#[allow(clippy::too_many_lines)]
 pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
     // Phase 1: Create directories
@@ -674,7 +679,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 // Leader: spawn dead-node detection (30-second timeout)
                 let raft_clone = Arc::clone(raft_ref);
                 let scheduler_clone = scheduler.clone();
-                let dnl_handle = Some(tokio::spawn(async move {
+                let dead_node_handle = Some(tokio::spawn(async move {
                     dead_node_detection_loop(
                         raft_clone,
                         scheduler_clone,
@@ -683,7 +688,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                     .await;
                 }));
                 info!("Dead-node detection loop started (30s timeout)");
-                (None, dnl_handle)
+                (None, dead_node_handle)
             } else {
                 // Worker: spawn heartbeat loop (5-second interval)
                 let raft_clone = Arc::clone(raft_ref);
@@ -757,9 +762,7 @@ async fn heartbeat_loop(
         tokio::time::sleep(interval).await;
 
         // Resolve the current leader's API address from Raft cluster state.
-        let leader_url = if let Some(url) = resolve_leader_api_url(&raft).await {
-            url
-        } else {
+        let Some(leader_url) = resolve_leader_api_url(&raft).await else {
             warn!("Heartbeat: no leader address available, will retry next cycle");
             continue;
         };
@@ -805,6 +808,7 @@ async fn heartbeat_loop(
 ///
 /// When a scheduler is provided, the loop also triggers rescheduling of the
 /// dead node's containers to remaining live nodes.
+#[allow(clippy::cast_possible_truncation)]
 async fn dead_node_detection_loop(
     raft: Arc<zlayer_scheduler::RaftCoordinator>,
     scheduler: Option<Arc<Scheduler>>,
@@ -822,7 +826,7 @@ async fn dead_node_detection_loop(
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() as u64;
+            .as_millis() as u64; // milliseconds since epoch fits in u64
 
         let self_id = raft.node_id();
 
@@ -947,9 +951,8 @@ async fn rotate_large_logs(bundle_dir: &std::path::Path) -> Result<()> {
             continue;
         }
 
-        let mut log_entries = match tokio::fs::read_dir(&logs_dir).await {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(mut log_entries) = tokio::fs::read_dir(&logs_dir).await else {
+            continue;
         };
 
         while let Ok(Some(log_entry)) = log_entries.next_entry().await {
@@ -958,9 +961,8 @@ async fn rotate_large_logs(bundle_dir: &std::path::Path) -> Result<()> {
                 continue;
             }
 
-            let metadata = match tokio::fs::metadata(&path).await {
-                Ok(m) => m,
-                Err(_) => continue,
+            let Ok(metadata) = tokio::fs::metadata(&path).await else {
+                continue;
             };
 
             if metadata.len() > LOG_MAX_SIZE_BYTES {
@@ -1007,16 +1009,14 @@ async fn rotate_structured_logs(log_dir: &std::path::Path) -> Result<()> {
     let mut stack = vec![log_dir.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
         };
 
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            let metadata = match tokio::fs::metadata(&path).await {
-                Ok(m) => m,
-                Err(_) => continue,
+            let Ok(metadata) = tokio::fs::metadata(&path).await else {
+                continue;
             };
 
             if metadata.is_dir() {
@@ -1089,16 +1089,14 @@ async fn cleanup_old_logs_walk(
     let mut stack = vec![root.to_path_buf()];
 
     while let Some(dir) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(e) => e,
-            Err(_) => continue,
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
         };
 
         while let Ok(Some(entry)) = entries.next_entry().await {
             let path = entry.path();
-            let metadata = match tokio::fs::metadata(&path).await {
-                Ok(m) => m,
-                Err(_) => continue,
+            let Ok(metadata) = tokio::fs::metadata(&path).await else {
+                continue;
             };
 
             if metadata.is_dir() {
@@ -1146,6 +1144,10 @@ async fn cleanup_old_logs_walk(
 ///
 /// A single deployment failing does **not** abort the rest — errors are logged
 /// and the deployment is marked `Failed` in storage.
+///
+/// # Errors
+///
+/// Returns an error if listing deployments from storage fails.
 pub async fn restore_deployments(state: &DaemonState) -> Result<()> {
     let deployments = state
         .storage
@@ -1231,6 +1233,7 @@ pub async fn restore_deployments(state: &DaemonState) -> Result<()> {
 ///
 /// Returns `Ok(())` if all services in the deployment were successfully
 /// registered and scaled. Returns `Err` with a summary if any service failed.
+#[allow(clippy::too_many_lines)]
 async fn restore_single_deployment(state: &DaemonState, stored: &StoredDeployment) -> Result<()> {
     let spec = &stored.spec;
     let deployment_name = &spec.deployment;

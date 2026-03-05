@@ -118,6 +118,7 @@ impl OverlayHealthChecker {
     }
 
     /// Set the handshake timeout threshold
+    #[must_use]
     pub fn with_handshake_timeout(mut self, timeout: Duration) -> Self {
         self.handshake_timeout = timeout;
         self
@@ -144,7 +145,7 @@ impl OverlayHealthChecker {
                         let mut cache = self.peer_status.write().await;
                         let changed = cache
                             .get(&peer.public_key)
-                            .map_or(true, |prev| prev.healthy != peer.healthy);
+                            .is_none_or(|prev| prev.healthy != peer.healthy);
 
                         if changed {
                             on_status_change(&peer.public_key, peer.healthy);
@@ -163,6 +164,11 @@ impl OverlayHealthChecker {
     }
 
     /// Check all peer connections once
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if overlay peer stats cannot be retrieved.
+    #[allow(clippy::similar_names)]
     pub async fn check_all(&self) -> Result<OverlayHealth> {
         let now = current_timestamp();
         let stats = self.get_wg_stats().await?;
@@ -223,6 +229,10 @@ impl OverlayHealthChecker {
     /// Ping a specific peer via its overlay IP
     ///
     /// Returns the RTT on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OverlayError::PeerUnreachable` if the ping fails or times out.
     pub async fn ping_peer(&self, overlay_ip: Ipv4Addr) -> Result<Duration> {
         let start = Instant::now();
 
@@ -261,6 +271,10 @@ impl OverlayHealthChecker {
     /// TCP connect test to a specific peer and port
     ///
     /// Returns the connection time on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OverlayError::PeerUnreachable` if the connection fails or times out.
     pub async fn tcp_check(&self, overlay_ip: Ipv4Addr, port: u16) -> Result<Duration> {
         let start = Instant::now();
 

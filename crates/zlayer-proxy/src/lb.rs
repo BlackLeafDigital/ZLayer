@@ -110,16 +110,28 @@ impl Backend {
     }
 
     /// Returns `true` if the backend is currently marked healthy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the health `RwLock` is poisoned.
     pub fn is_healthy(&self) -> bool {
         *self.health.read().unwrap() == HealthStatus::Healthy
     }
 
     /// Mark this backend as healthy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the health `RwLock` is poisoned.
     pub fn set_healthy(&self) {
         *self.health.write().unwrap() = HealthStatus::Healthy;
     }
 
     /// Mark this backend as unhealthy.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the health `RwLock` is poisoned.
     pub fn set_unhealthy(&self) {
         *self.health.write().unwrap() = HealthStatus::Unhealthy;
     }
@@ -370,6 +382,11 @@ impl LoadBalancer {
     /// On success the backend is marked healthy and its failure counter is
     /// reset. On failure it is marked unhealthy and the failure counter is
     /// incremented.
+    ///
+    /// # Panics
+    ///
+    /// The spawned task panics if the internal concurrency semaphore is
+    /// unexpectedly closed.
     #[must_use]
     pub fn spawn_health_checker(
         self: &Arc<Self>,

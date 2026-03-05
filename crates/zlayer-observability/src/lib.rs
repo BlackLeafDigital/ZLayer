@@ -65,6 +65,9 @@ pub struct ObservabilityGuards {
 ///     // guards are dropped when main exits, flushing logs and traces
 /// }
 /// ```
+///
+/// # Errors
+/// Returns an error if any observability component fails to initialize.
 pub fn init_observability(config: &ObservabilityConfig) -> Result<ObservabilityGuards> {
     // Initialize logging first so we can log from other init functions
     let log_guard = init_logging(&config.logging)?;

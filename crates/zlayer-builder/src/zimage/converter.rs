@@ -167,6 +167,7 @@ fn convert_single_stage(zimage: &ZImage, base: &str) -> Result<Stage> {
 // Multi-stage conversion
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn convert_multi_stage(
     zimage: &ZImage,
     stage_map: &indexmap::IndexMap<String, ZStage>,
@@ -470,9 +471,9 @@ fn convert_port_spec(spec: &ZPortSpec) -> Result<Instruction> {
 fn convert_healthcheck(hc: &ZHealthcheck) -> Result<Instruction> {
     let command = convert_command(&hc.cmd);
 
-    let interval = parse_optional_duration(&hc.interval, "healthcheck interval")?;
-    let timeout = parse_optional_duration(&hc.timeout, "healthcheck timeout")?;
-    let start_period = parse_optional_duration(&hc.start_period, "healthcheck start_period")?;
+    let interval = parse_optional_duration(hc.interval.as_ref(), "healthcheck interval")?;
+    let timeout = parse_optional_duration(hc.timeout.as_ref(), "healthcheck timeout")?;
+    let start_period = parse_optional_duration(hc.start_period.as_ref(), "healthcheck start_period")?;
 
     Ok(Instruction::Healthcheck(HealthcheckInstruction::Check {
         command,
@@ -485,7 +486,7 @@ fn convert_healthcheck(hc: &ZHealthcheck) -> Result<Instruction> {
 }
 
 fn parse_optional_duration(
-    value: &Option<String>,
+    value: Option<&String>,
     label: &str,
 ) -> Result<Option<std::time::Duration>> {
     match value {
@@ -508,9 +509,8 @@ pub fn convert_cache_mount(cm: &ZCacheMount) -> RunMount {
     let sharing = match cm.sharing.as_deref() {
         Some("shared") => CacheSharing::Shared,
         Some("private") => CacheSharing::Private,
-        Some("locked") | None => CacheSharing::Locked,
-        // Unknown value falls back to the default.
-        Some(_) => CacheSharing::Locked,
+        // "locked", unknown values, or None all fall back to the default.
+        Some(_) | None => CacheSharing::Locked,
     };
 
     RunMount::Cache {

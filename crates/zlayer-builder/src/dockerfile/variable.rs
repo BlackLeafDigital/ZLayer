@@ -29,6 +29,7 @@ use std::collections::HashMap;
 ///
 /// The string with all variables expanded
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn expand_variables(
     input: &str,
     args: &HashMap<String, String>,
@@ -206,6 +207,7 @@ fn lookup_variable(
 
 /// Expands variables in a list of strings
 #[must_use]
+#[allow(clippy::implicit_hasher)]
 pub fn expand_variables_in_list(
     inputs: &[String],
     args: &HashMap<String, String>,

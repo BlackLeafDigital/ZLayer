@@ -269,10 +269,13 @@ impl PipelineExecutor {
             }
         }
 
+        #[allow(clippy::cast_possible_truncation)]
+        let total_time_ms = start.elapsed().as_millis() as u64;
+
         Ok(PipelineResult {
             succeeded,
             failed,
-            total_time_ms: start.elapsed().as_millis() as u64,
+            total_time_ms,
         })
     }
 

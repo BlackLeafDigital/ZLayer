@@ -44,8 +44,9 @@ impl ScalingDecision {
     #[must_use]
     pub fn target_replicas(&self) -> Option<u32> {
         match self {
-            ScalingDecision::ScaleUp { to, .. } => Some(*to),
-            ScalingDecision::ScaleDown { to, .. } => Some(*to),
+            ScalingDecision::ScaleUp { to, .. } | ScalingDecision::ScaleDown { to, .. } => {
+                Some(*to)
+            }
             _ => None,
         }
     }
@@ -201,7 +202,16 @@ impl Autoscaler {
         self.services.remove(name);
     }
 
-    /// Update metrics and compute scaling decision
+    /// Update metrics and compute scaling decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::ServiceNotFound` if the service is not registered.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `last_scale_time` is `Some` but the elapsed duration underflows
+    /// (should not happen in practice).
     pub fn evaluate(
         &mut self,
         service_name: &str,
@@ -358,7 +368,11 @@ impl Autoscaler {
         }
     }
 
-    /// Record that a scaling action was taken
+    /// Record that a scaling action was taken.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SchedulerError::ServiceNotFound` if the service is not registered.
     pub fn record_scale_action(&mut self, service_name: &str, new_replicas: u32) -> Result<()> {
         let state = self
             .services

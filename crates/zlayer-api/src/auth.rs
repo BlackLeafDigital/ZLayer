@@ -31,7 +31,11 @@ pub struct Claims {
 }
 
 impl Claims {
-    /// Create new claims
+    /// Create new claims.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system clock is before the Unix epoch.
     pub fn new(subject: impl Into<String>, expiry: Duration, roles: Vec<String>) -> Self {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -47,7 +51,11 @@ impl Claims {
         }
     }
 
-    /// Check if token is expired
+    /// Check if token is expired.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system clock is before the Unix epoch.
     #[must_use]
     pub fn is_expired(&self) -> bool {
         let now = SystemTime::now()
@@ -64,7 +72,11 @@ impl Claims {
     }
 }
 
-/// Create a JWT token
+/// Create a JWT token.
+///
+/// # Errors
+///
+/// Returns an error if token encoding fails.
 pub fn create_token(
     secret: &str,
     subject: impl Into<String>,
@@ -81,7 +93,11 @@ pub fn create_token(
     .map_err(|e| ApiError::Internal(format!("Failed to create token: {e}")))
 }
 
-/// Verify and decode a JWT token
+/// Verify and decode a JWT token.
+///
+/// # Errors
+///
+/// Returns an error if token verification or decoding fails.
 pub fn verify_token(secret: &str, token: &str) -> Result<Claims, ApiError> {
     let mut validation = Validation::default();
     validation.set_issuer(&["zlayer"]);
@@ -123,7 +139,11 @@ impl AuthUser {
         self.claims.has_role(role)
     }
 
-    /// Require a specific role, returning Forbidden if not present
+    /// Require a specific role, returning Forbidden if not present.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ApiError::Forbidden` if the user does not have the required role.
     pub fn require_role(&self, role: &str) -> Result<(), ApiError> {
         if self.has_role(role) {
             Ok(())

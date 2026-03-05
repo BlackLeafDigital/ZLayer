@@ -103,7 +103,7 @@ pub struct WalMonitor {
     /// Last known file size
     last_file_size: Arc<AtomicU64>,
     /// File watcher
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
     /// Event receiver
     event_rx: mpsc::Receiver<notify::Result<Event>>,
 }
@@ -141,7 +141,7 @@ impl WalMonitor {
             wal_path,
             last_frame_count: Arc::new(AtomicU64::new(initial_frames)),
             last_file_size: Arc::new(AtomicU64::new(initial_size)),
-            _watcher: watcher,
+            watcher,
             event_rx: rx,
         };
 
@@ -184,7 +184,7 @@ impl WalMonitor {
                         LayerStorageError::Io(std::io::Error::other(format!("Watch error: {e}")))
                     })?;
 
-                self._watcher = watcher;
+                self.watcher = watcher;
                 self.event_rx = rx;
             }
         }

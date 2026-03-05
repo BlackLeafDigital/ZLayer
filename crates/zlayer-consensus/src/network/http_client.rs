@@ -53,6 +53,9 @@ impl RaftHttpClient {
     }
 
     /// Create a new client with the specified timeouts and an optional auth token.
+    ///
+    /// # Panics
+    /// Panics if the HTTP client builders fail to build (should not happen in practice).
     #[must_use]
     pub fn with_auth(
         rpc_timeout: Duration,
@@ -329,17 +332,17 @@ where
         _cancel: impl Future<Output = ReplicationClosed> + OptionalSend + 'static,
         _option: RPCOption,
     ) -> Result<SnapshotResponse<NodeId>, StreamingError<C, Fatal<NodeId>>> {
-        let url = format!("{}/raft/full-snapshot", normalize_addr(&self.target_addr));
-        debug!(target_addr = %self.target_addr, "Sending full_snapshot RPC");
-
-        let snapshot_data = snapshot.snapshot.into_inner();
-
         #[derive(serde::Serialize)]
         struct FullSnapshotReq {
             vote: Vote<NodeId>,
             meta: SnapshotMeta<NodeId, BasicNode>,
             snapshot_data: Vec<u8>,
         }
+
+        let url = format!("{}/raft/full-snapshot", normalize_addr(&self.target_addr));
+        debug!(target_addr = %self.target_addr, "Sending full_snapshot RPC");
+
+        let snapshot_data = snapshot.snapshot.into_inner();
 
         let req = FullSnapshotReq {
             vote,

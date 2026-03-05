@@ -15,11 +15,11 @@ use zlayer_spec::DeploymentSpec;
 /// When the daemon is running, displays PID, API bind address, socket path,
 /// runtime type, and a summary of active deployments.  When the daemon is
 /// not running, shows helpful instructions for starting it.
-pub(crate) async fn status(_cli: &Cli) -> Result<()> {
+pub(crate) async fn status(cli: &Cli) -> Result<()> {
     info!("Checking daemon status");
 
-    let data_dir = _cli.effective_data_dir();
-    let socket_path = _cli.effective_socket_path();
+    let data_dir = cli.effective_data_dir();
+    let socket_path = cli.effective_socket_path();
 
     // Try reading daemon.json for metadata (PID, bind address, etc.)
     let metadata = read_daemon_metadata(&data_dir).await;
@@ -126,6 +126,7 @@ async fn read_daemon_metadata(data_dir: &std::path::Path) -> Option<serde_json::
 }
 
 /// Extract service count and total replica count from a deployment JSON value.
+#[allow(clippy::cast_possible_truncation)]
 fn extract_deployment_counts(dep: &serde_json::Value) -> (usize, u32) {
     // The deployment response may include a nested "spec" with services
     let services = dep
@@ -172,7 +173,7 @@ fn detect_runtime_name() -> &'static str {
 }
 
 /// Validate a spec file without deploying
-pub(crate) async fn validate(spec_path: &Path) -> Result<()> {
+pub(crate) fn validate(spec_path: &Path) -> Result<()> {
     info!(path = %spec_path.display(), "Validating spec file");
 
     match parse_spec(spec_path) {

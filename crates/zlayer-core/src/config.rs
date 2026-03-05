@@ -134,8 +134,8 @@ impl Default for OverlayAgentConfig {
             private_key: String::new(),
             public_key: None,
             wg_port: default_wg_port(),
-            global: Default::default(),
-            dns: Default::default(),
+            global: GlobalOverlayConfig::default(),
+            dns: DnsConfig::default(),
         }
     }
 }

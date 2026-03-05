@@ -120,7 +120,11 @@ impl OverlayApiState {
     }
 }
 
-/// Get overlay network status
+/// Get overlay network status.
+///
+/// # Errors
+///
+/// Returns an error if the overlay network is not initialized.
 #[utoipa::path(
     get,
     path = "/api/v1/overlay/status",
@@ -137,7 +141,11 @@ pub async fn get_overlay_status() -> Result<Json<OverlayStatusResponse>> {
     ))
 }
 
-/// Get list of overlay peers
+/// Get list of overlay peers.
+///
+/// # Errors
+///
+/// Returns an error if the overlay network is not initialized.
 #[utoipa::path(
     get,
     path = "/api/v1/overlay/peers",
@@ -154,7 +162,11 @@ pub async fn get_overlay_peers() -> Result<Json<PeerListResponse>> {
     ))
 }
 
-/// Get IP allocation status
+/// Get IP allocation status.
+///
+/// # Errors
+///
+/// Returns an error if this is not a leader node or the overlay is not initialized.
 #[utoipa::path(
     get,
     path = "/api/v1/overlay/ip-alloc",

@@ -88,6 +88,7 @@ impl Runtime {
     ///     `RuntimeError`: If runtime initialization fails
     #[new]
     #[pyo3(signature = (options=None))]
+    #[allow(clippy::unnecessary_wraps)]
     fn new(options: Option<RuntimeOptions>) -> PyResult<Self> {
         let opts = options.unwrap_or_default();
 
@@ -439,6 +440,7 @@ services:
         })
     }
 
+    #[allow(clippy::unused_self)]
     fn __repr__(&self) -> String {
         "Runtime()".to_string()
     }

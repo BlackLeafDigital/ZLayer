@@ -20,6 +20,9 @@ pub const POLL_DURATION: Duration = Duration::from_millis(50);
 ///
 /// Enables raw mode, switches to the alternate screen buffer, and returns
 /// a ready-to-use [`Terminal`] backed by crossterm.
+///
+/// # Errors
+/// Returns an I/O error if enabling raw mode or switching to the alternate screen fails.
 pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -32,6 +35,9 @@ pub fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<Stdout>>> {
 ///
 /// Disables raw mode, leaves the alternate screen, and re-enables the cursor.
 /// Call this before exiting the TUI or when an error requires early termination.
+///
+/// # Errors
+/// Returns an I/O error if disabling raw mode or leaving the alternate screen fails.
 pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> io::Result<()> {
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;

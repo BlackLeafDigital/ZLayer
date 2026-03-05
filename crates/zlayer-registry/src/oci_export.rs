@@ -301,6 +301,11 @@ fn parse_image_reference(image: &str) -> Result<(String, String), ExportError> {
 ///
 /// Returns `ExportInfo` containing details about the exported image.
 ///
+/// # Errors
+///
+/// Returns an error if the image reference is invalid, the manifest or blobs cannot be
+/// read, or the output file cannot be written.
+///
 /// # Example
 ///
 /// ```rust,no_run
@@ -457,6 +462,11 @@ pub async fn export_image(
 ///
 /// Returns `ImportInfo` containing details about the imported image.
 ///
+/// # Errors
+///
+/// Returns an error if the archive cannot be read, the OCI layout is invalid,
+/// or blobs/manifests cannot be stored in the registry.
+///
 /// # Example
 ///
 /// ```rust,no_run
@@ -471,6 +481,7 @@ pub async fn export_image(
 /// # Ok(())
 /// # }
 /// ```
+#[allow(clippy::too_many_lines)]
 pub async fn import_image(
     registry: &LocalRegistry,
     input: &Path,

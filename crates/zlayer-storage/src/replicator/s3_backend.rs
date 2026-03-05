@@ -100,11 +100,13 @@ impl S3Backend {
         // Compress the data
         let compressed = self.compress(data)?;
 
+        #[allow(clippy::cast_precision_loss)]
+        let reduction_pct = (1.0 - (compressed.len() as f64 / data.len() as f64)) * 100.0;
         info!(
             "Compressed {} bytes to {} bytes ({:.1}% reduction)",
             data.len(),
             compressed.len(),
-            (1.0 - (compressed.len() as f64 / data.len() as f64)) * 100.0
+            reduction_pct,
         );
 
         // Upload to S3
@@ -417,6 +419,7 @@ impl S3Backend {
     }
 
     /// Decompress zstd data
+    #[allow(clippy::unused_self)]
     fn decompress(&self, data: &[u8]) -> Result<Vec<u8>> {
         let mut decoder = zstd::stream::Decoder::new(data)?;
         let mut decompressed = Vec::new();

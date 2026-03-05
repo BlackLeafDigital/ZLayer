@@ -11,6 +11,7 @@ use crate::app::{ValidateResult, ValidateStageInfo, ValidateState};
 use crate::widgets::file_picker;
 
 /// Render the validation view
+#[allow(clippy::too_many_lines)]
 pub fn render(frame: &mut Frame, state: &ValidateState) {
     let area = frame.area();
 
@@ -79,6 +80,7 @@ pub fn render(frame: &mut Frame, state: &ValidateState) {
 }
 
 /// Render the validation result
+#[allow(clippy::too_many_lines)]
 fn render_result(area: Rect, frame: &mut Frame, result: &ValidateResult) {
     match result {
         ValidateResult::Dockerfile { path, stages } => {

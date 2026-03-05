@@ -54,6 +54,7 @@ impl PlainDeployLogger {
     }
 
     /// Handle a deploy event and print appropriate output
+    #[allow(clippy::too_many_lines)]
     pub fn handle_event(&self, event: &DeployEvent) {
         match event {
             DeployEvent::PlanReady {

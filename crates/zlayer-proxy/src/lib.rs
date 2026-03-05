@@ -257,6 +257,10 @@ pub fn discover_certificates(storage_path: &PathBuf) -> Vec<DiscoveredCert> {
 /// # Returns
 ///
 /// The number of certificates loaded
+///
+/// # Errors
+///
+/// Returns an error if reading certificate files from disk fails.
 pub async fn load_existing_certs_into_resolver(
     cert_manager: &CertManager,
     sni_resolver: &SniCertResolver,
@@ -296,7 +300,6 @@ pub async fn load_existing_certs_into_resolver(
         // Load into SNI resolver
         match sni_resolver
             .load_cert(&cert_info.domain, &cert_pem, &key_pem)
-            .await
         {
             Ok(()) => {
                 tracing::info!(

@@ -84,6 +84,7 @@ pub struct DaemonClient {
     socket_path: PathBuf,
 }
 
+#[allow(clippy::missing_errors_doc)]
 impl DaemonClient {
     // ------------------------------------------------------------------
     // Construction / connection
@@ -542,7 +543,8 @@ impl DaemonClient {
             follow,
         );
         if let Some(inst) = instance {
-            path.push_str(&format!("&instance={}", urlencoding(inst)));
+            use std::fmt::Write;
+            let _ = write!(path, "&instance={}", urlencoding(inst));
         }
         let (status, body) = self.get(&path).await?;
         Self::check_status(status, &body)?;
@@ -571,7 +573,8 @@ impl DaemonClient {
             lines,
         );
         if let Some(inst) = instance {
-            path.push_str(&format!("&instance={}", urlencoding(inst)));
+            use std::fmt::Write;
+            let _ = write!(path, "&instance={}", urlencoding(inst));
         }
 
         let uri: Uri = format!("http://localhost{path}")
@@ -753,8 +756,8 @@ fn urlencoding(s: &str) -> String {
             'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => out.push(ch),
             _ => {
                 for byte in ch.to_string().as_bytes() {
-                    out.push('%');
-                    out.push_str(&format!("{byte:02X}"));
+                    use std::fmt::Write;
+                    let _ = write!(out, "%{byte:02X}");
                 }
             }
         }

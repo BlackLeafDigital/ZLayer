@@ -147,6 +147,10 @@ pub trait ZLayerHost: Send {
     fn config_get(&self, key: &str) -> Option<String>;
 
     /// Get a configuration value, returning error if not found
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key is not found.
     fn config_get_required(&self, key: &str) -> Result<String, String> {
         self.config_get(key)
             .ok_or_else(|| format!("required config key '{key}' not found"))
@@ -201,9 +205,17 @@ pub trait ZLayerHost: Send {
     // =========================================================================
 
     /// Get a value by key
+    ///
+    /// # Errors
+    ///
+    /// Returns a `KvError` if the storage backend fails.
     fn kv_get(&self, key: &str) -> Result<Option<Vec<u8>>, KvError>;
 
     /// Get a value as a string
+    ///
+    /// # Errors
+    ///
+    /// Returns a `KvError` if the storage backend fails or the value is not valid UTF-8.
     fn kv_get_string(&self, key: &str) -> Result<Option<String>, KvError> {
         match self.kv_get(key)? {
             Some(bytes) => String::from_utf8(bytes)
@@ -214,35 +226,63 @@ pub trait ZLayerHost: Send {
     }
 
     /// Set a value
+    ///
+    /// # Errors
+    ///
+    /// Returns a `KvError` if the storage backend fails.
     fn kv_set(&mut self, key: &str, value: &[u8]) -> Result<(), KvError>;
 
     /// Set a string value
+    ///
+    /// # Errors
+    ///
+    /// Returns a `KvError` if the storage backend fails.
     fn kv_set_string(&mut self, key: &str, value: &str) -> Result<(), KvError> {
         self.kv_set(key, value.as_bytes())
     }
 
     /// Set a value with TTL in nanoseconds
+    ///
+    /// # Errors
+    ///
+    /// Returns a `KvError` if the storage backend fails.
     fn kv_set_with_ttl(&mut self, key: &str, value: &[u8], ttl_ns: u64) -> Result<(), KvError>;
 
     /// Delete a key
     ///
     /// Returns `true` if the key existed and was deleted.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `KvError` if the storage backend fails.
     fn kv_delete(&mut self, key: &str) -> Result<bool, KvError>;
 
     /// Check if a key exists
     fn kv_exists(&self, key: &str) -> bool;
 
     /// List all keys with a given prefix
+    ///
+    /// # Errors
+    ///
+    /// Returns a `KvError` if the storage backend fails.
     fn kv_list_keys(&self, prefix: &str) -> Result<Vec<String>, KvError>;
 
     /// Increment a numeric value atomically
     ///
     /// Returns the new value after increment.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `KvError` if the storage backend fails or the value is not numeric.
     fn kv_increment(&mut self, key: &str, delta: i64) -> Result<i64, KvError>;
 
     /// Compare and swap - set value only if current value matches expected
     ///
     /// Returns `true` if swap succeeded, `false` if current value didn't match.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `KvError` if the storage backend fails.
     fn kv_compare_and_swap(
         &mut self,
         key: &str,
@@ -268,9 +308,17 @@ pub trait ZLayerHost: Send {
     // =========================================================================
 
     /// Get a secret by name
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string if the secret store cannot be accessed.
     fn secret_get(&self, name: &str) -> Result<Option<String>, String>;
 
     /// Get a required secret, error if not found
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the secret is not found or the store cannot be accessed.
     fn secret_get_required(&self, name: &str) -> Result<String, String> {
         self.secret_get(name)?
             .ok_or_else(|| format!("required secret '{name}' not found"))
@@ -833,12 +881,14 @@ impl ZLayerHost for DefaultHost {
         metrics.histograms.entry(key).or_default().push(value);
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn record_duration(&self, name: &str, duration_ns: u64) {
         // Convert to seconds for histogram
         let seconds = duration_ns as f64 / 1_000_000_000.0;
         self.histogram_observe(name, seconds);
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn record_duration_labeled(&self, name: &str, duration_ns: u64, labels: &[(String, String)]) {
         let seconds = duration_ns as f64 / 1_000_000_000.0;
         self.histogram_observe_labeled(name, seconds, labels);
@@ -876,6 +926,10 @@ impl ZLayerHost for DefaultHost {
 /// let host = DefaultHost::new();
 /// let mut store = Store::new(&engine, host);
 /// ```
+///
+/// # Errors
+///
+/// Returns a `wasmtime::Error` if any interface fails to register with the linker.
 pub fn add_to_linker<T>(linker: &mut wasmtime::component::Linker<T>) -> Result<(), wasmtime::Error>
 where
     T: ZLayerHost + wasmtime_wasi::WasiView + 'static,
@@ -978,6 +1032,7 @@ where
 }
 
 /// Register keyvalue interface functions
+#[allow(clippy::too_many_lines)]
 fn add_keyvalue_to_linker<T>(
     linker: &mut wasmtime::component::Linker<T>,
 ) -> Result<(), wasmtime::Error>

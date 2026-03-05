@@ -31,6 +31,7 @@ struct ContainerRow {
 }
 
 /// Execute the `ps` command.
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 pub(crate) async fn ps(
     deployment_filter: Option<String>,
     show_containers: bool,
@@ -149,6 +150,7 @@ pub(crate) async fn ps(
 // Output formatters
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_lines)]
 fn print_table(rows: &[PsRow], container_rows: &[ContainerRow], show_containers: bool) {
     if rows.is_empty() {
         println!("No deployments found.");

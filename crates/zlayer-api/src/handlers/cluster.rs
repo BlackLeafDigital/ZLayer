@@ -183,6 +183,10 @@ impl ClusterApiState {
     /// Create a placeholder state (no Raft).
     ///
     /// Uses the default overlay CIDR `10.200.0.0/16`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the default overlay CIDR is invalid (should never happen).
     #[must_use]
     pub fn placeholder() -> Self {
         let allocator = IpAllocator::new(zlayer_overlay::DEFAULT_OVERLAY_CIDR)
@@ -213,6 +217,12 @@ impl ClusterApiState {
 ///
 /// Validates the join token, assigns a Raft node ID, calls `raft.add_member()`,
 /// and returns the assignment + peer list.
+///
+/// # Errors
+///
+/// Returns an error if the Raft coordinator is unavailable, the join token is
+/// invalid, IP allocation fails, or the Raft membership change fails.
+#[allow(clippy::too_many_lines)]
 pub async fn cluster_join(
     State(state): State<ClusterApiState>,
     Json(req): Json<ClusterJoinRequest>,
@@ -386,15 +396,16 @@ pub async fn cluster_join(
 /// List all nodes visible in the Raft cluster state.
 ///
 /// `GET /api/v1/cluster/nodes`
+///
+/// # Errors
+///
+/// Returns an error if the cluster state cannot be read.
 pub async fn cluster_list_nodes(
     State(state): State<ClusterApiState>,
 ) -> Result<Json<Vec<ClusterNodeSummary>>> {
-    let raft = match &state.raft {
-        Some(r) => r,
-        None => {
-            // No Raft -- return empty
-            return Ok(Json(Vec::new()));
-        }
+    let Some(raft) = &state.raft else {
+        // No Raft -- return empty
+        return Ok(Json(Vec::new()));
     };
 
     let cluster_state = raft.read_state().await;
@@ -435,6 +446,11 @@ pub struct HeartbeatRequest {
 ///
 /// Accepts resource usage data from worker nodes and proposes an
 /// `UpdateNodeHeartbeat` to the Raft state machine.
+///
+/// # Panics
+///
+/// Panics if the system clock is before the Unix epoch.
+#[allow(clippy::cast_possible_truncation)]
 pub async fn cluster_heartbeat(
     State(state): State<ClusterApiState>,
     Json(req): Json<HeartbeatRequest>,

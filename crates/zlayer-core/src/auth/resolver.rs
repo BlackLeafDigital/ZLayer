@@ -89,7 +89,7 @@ impl AuthResolver {
                 .any(|s| matches!(s, AuthSource::DockerConfig));
 
         let docker_config = if needs_docker_config {
-            Self::load_docker_config(&config.docker_config_path)
+            Self::load_docker_config(config.docker_config_path.as_ref())
         } else {
             None
         };
@@ -184,7 +184,7 @@ impl AuthResolver {
     }
 
     /// Load Docker config from path or default location
-    fn load_docker_config(path: &Option<PathBuf>) -> Option<DockerConfigAuth> {
+    fn load_docker_config(path: Option<&PathBuf>) -> Option<DockerConfigAuth> {
         let config = if let Some(path) = path {
             DockerConfigAuth::load_from_path(path).ok()
         } else {

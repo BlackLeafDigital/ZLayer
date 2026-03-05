@@ -74,6 +74,13 @@ pub struct OverlayManager {
 
 impl OverlayManager {
     /// Create a new overlay manager for a deployment
+    ///
+    /// # Errors
+    /// Returns an error if the overlay manager cannot be initialized.
+    ///
+    /// # Panics
+    /// Panics if the default CIDR `10.200.0.0/16` cannot be parsed (this is a compile-time constant).
+    #[allow(clippy::unused_async)]
     pub async fn new(deployment: String) -> Result<Self, AgentError> {
         Ok(Self {
             deployment,
@@ -87,6 +94,9 @@ impl OverlayManager {
     }
 
     /// Setup the global overlay network for the deployment
+    ///
+    /// # Errors
+    /// Returns an error if key generation or interface creation fails.
     pub async fn setup_global_overlay(&mut self) -> Result<(), AgentError> {
         let interface_name = make_interface_name(&[&self.deployment], "g");
 
@@ -114,6 +124,9 @@ impl OverlayManager {
     }
 
     /// Setup a service-scoped overlay network
+    ///
+    /// # Errors
+    /// Returns an error if the overlay interface cannot be created.
     pub async fn setup_service_overlay(&self, service_name: &str) -> Result<String, AgentError> {
         let interface_name = make_interface_name(&[&self.deployment, service_name], "s");
 
@@ -180,6 +193,9 @@ impl OverlayManager {
     /// relies on Linux network namespaces (veth pairs + `nsenter`).  On macOS,
     /// containers share the host network, so the node's overlay IP is returned
     /// directly and the proxy differentiates traffic by port.
+    ///
+    /// # Errors
+    /// Returns an error if the container cannot be attached to the overlay network.
     pub async fn attach_container(
         &self,
         container_pid: u32,
@@ -334,6 +350,9 @@ impl OverlayManager {
     }
 
     /// Cleanup all overlay networks
+    ///
+    /// # Errors
+    /// Returns an error if cleanup operations fail.
     pub async fn cleanup(&mut self) -> Result<(), AgentError> {
         // Drop service transports (destroys TUN devices)
         let mut transports = self.service_transports.write().await;
@@ -363,6 +382,7 @@ impl OverlayManager {
         self.node_ip
     }
 
+    #[allow(clippy::unused_self)]
     fn build_config(
         &self,
         private_key: String,
@@ -413,6 +433,7 @@ impl IpAllocator {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::unnecessary_wraps)]
     fn allocate(&self) -> Result<Ipv4Addr, AgentError> {
         let offset = self
             .next_offset

@@ -89,6 +89,10 @@ pub struct DnsHandle {
 
 impl DnsHandle {
     /// Add a DNS A record for a hostname to IP mapping
+    ///
+    /// # Errors
+    ///
+    /// Returns `DnsError::InvalidName` if the hostname is invalid.
     pub async fn add_record(&self, hostname: &str, ip: Ipv4Addr) -> Result<(), DnsError> {
         // Create the fully qualified domain name
         let fqdn = if hostname.ends_with('.') {
@@ -122,6 +126,10 @@ impl DnsHandle {
     }
 
     /// Remove a DNS record for a hostname
+    ///
+    /// # Errors
+    ///
+    /// Returns `DnsError::InvalidName` if the hostname is invalid.
     pub async fn remove_record(&self, hostname: &str) -> Result<bool, DnsError> {
         let fqdn = if hostname.ends_with('.') {
             Name::from_str(hostname)
@@ -165,6 +173,10 @@ pub struct DnsServer {
 
 impl DnsServer {
     /// Create a new DNS server for the given zone
+    ///
+    /// # Errors
+    ///
+    /// Returns `DnsError::InvalidName` if the zone name is invalid.
     pub fn new(listen_addr: SocketAddr, zone: &str) -> Result<Self, DnsError> {
         let zone_origin =
             Name::from_str(zone).map_err(|e| DnsError::InvalidName(format!("{zone}: {e}")))?;
@@ -186,6 +198,10 @@ impl DnsServer {
     }
 
     /// Create from a `DnsConfig`
+    ///
+    /// # Errors
+    ///
+    /// Returns `DnsError::InvalidName` if the zone name is invalid.
     pub fn from_config(config: &DnsConfig) -> Result<Self, DnsError> {
         let listen_addr = SocketAddr::new(config.bind_addr, config.port);
         Self::new(listen_addr, &config.zone)
@@ -205,11 +221,19 @@ impl DnsServer {
     }
 
     /// Add a DNS A record for a hostname to IP mapping
+    ///
+    /// # Errors
+    ///
+    /// Returns `DnsError::InvalidName` if the hostname is invalid.
     pub async fn add_record(&self, hostname: &str, ip: Ipv4Addr) -> Result<(), DnsError> {
         self.handle().add_record(hostname, ip).await
     }
 
     /// Remove a DNS record for a hostname
+    ///
+    /// # Errors
+    ///
+    /// Returns `DnsError::InvalidName` if the hostname is invalid.
     pub async fn remove_record(&self, hostname: &str) -> Result<bool, DnsError> {
         self.handle().remove_record(hostname).await
     }
@@ -218,6 +242,11 @@ impl DnsServer {
     ///
     /// This spawns the DNS server in a background task and returns a handle
     /// that can be used to add/remove records while the server is running.
+    ///
+    /// # Errors
+    ///
+    /// This method currently always succeeds but returns `Result` for API consistency.
+    #[allow(clippy::unused_async)]
     pub async fn start(self) -> Result<DnsHandle, DnsError> {
         let handle = self.handle();
         let listen_addr = self.listen_addr;
@@ -239,6 +268,11 @@ impl DnsServer {
     /// Unlike `start(self)`, this method borrows self, allowing the `DnsServer`
     /// to be wrapped in an Arc and shared (e.g., with `ServiceManager`) while
     /// the server runs in the background.
+    ///
+    /// # Errors
+    ///
+    /// This method currently always succeeds but returns `Result` for API consistency.
+    #[allow(clippy::unused_async)]
     pub async fn start_background(&self) -> Result<DnsHandle, DnsError> {
         let handle = self.handle();
         let listen_addr = self.listen_addr;
@@ -314,6 +348,10 @@ impl DnsClient {
     }
 
     /// Query for an A record
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DnsError` if the query fails or the hostname is invalid.
     pub fn query_a(&self, hostname: &str) -> Result<Option<Ipv4Addr>, DnsError> {
         let name = Name::from_str(hostname)
             .map_err(|e| DnsError::InvalidName(format!("{hostname}: {e}")))?;

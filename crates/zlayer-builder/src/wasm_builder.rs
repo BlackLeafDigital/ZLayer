@@ -253,12 +253,14 @@ impl WasmBuildConfig {
     }
 
     /// Set the WIT path
+    #[must_use]
     pub fn wit_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.wit_path = Some(path.into());
         self
     }
 
     /// Set the output path
+    #[must_use]
     pub fn output_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.output_path = Some(path.into());
         self
@@ -296,6 +298,9 @@ pub struct WasmBuildResult {
 /// 6. package.json -> TypeScript
 /// 7. build.zig -> Zig
 /// 8. Makefile with *.c files -> C
+/// # Errors
+///
+/// Returns an error if no supported WASM language project is detected in the context directory.
 #[instrument(level = "debug", skip_all, fields(path = %context.as_ref().display()))]
 pub fn detect_language(context: impl AsRef<Path>) -> Result<WasmLanguage> {
     let path = context.as_ref();
@@ -472,6 +477,7 @@ fn has_c_source_files(path: &Path) -> bool {
 
 /// Get the build command for a specific language and target
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn get_build_command(language: WasmLanguage, target: WasiTarget, release: bool) -> Vec<String> {
     match language {
         WasmLanguage::Rust => {
@@ -605,6 +611,10 @@ pub fn get_build_command(language: WasmLanguage, target: WasiTarget, release: bo
 /// It will detect the source language if not specified, run the
 /// appropriate build command, and return information about the
 /// built artifact.
+///
+/// # Errors
+///
+/// Returns an error if language detection fails, the build command fails, or no output artifact is found.
 #[instrument(level = "info", skip_all, fields(
     context = %context.as_ref().display(),
     language = ?config.language,
@@ -788,7 +798,7 @@ fn find_wasm_output(
             ]
         }
 
-        WasmLanguage::Go => {
+        WasmLanguage::Go | WasmLanguage::C => {
             vec![context.join("main.wasm")]
         }
 
@@ -808,10 +818,6 @@ fn find_wasm_output(
                 context.join("build").join("release.wasm"),
                 context.join("build").join("debug.wasm"),
             ]
-        }
-
-        WasmLanguage::C => {
-            vec![context.join("main.wasm")]
         }
 
         WasmLanguage::Zig => {
@@ -845,6 +851,7 @@ fn find_wasm_output(
 }
 
 /// Get the package name from Cargo.toml
+#[allow(clippy::similar_names)]
 fn get_rust_package_name(context: &Path) -> Result<String> {
     let cargo_toml = context.join("Cargo.toml");
     let content =

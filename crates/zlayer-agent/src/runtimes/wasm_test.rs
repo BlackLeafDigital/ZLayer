@@ -441,6 +441,7 @@ impl ZLayerHost for TestHostState {
         );
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn record_duration(&self, name: &str, duration_ns: u64) {
         let seconds = duration_ns as f64 / 1_000_000_000.0;
         self.log(
@@ -449,6 +450,7 @@ impl ZLayerHost for TestHostState {
         );
     }
 
+    #[allow(clippy::cast_precision_loss)]
     fn record_duration_labeled(&self, name: &str, duration_ns: u64, labels: &[(String, String)]) {
         let seconds = duration_ns as f64 / 1_000_000_000.0;
         let labels_str = labels
@@ -560,6 +562,7 @@ impl TestHost {
     }
 
     /// Set the plugin identifier for logging context
+    #[must_use]
     pub fn with_plugin_id(mut self, id: impl Into<String>) -> Self {
         self.plugin_id = id.into();
         self
@@ -591,6 +594,7 @@ impl TestHost {
     ///         ("key2", "value2"),
     ///     ]);
     /// ```
+    #[must_use]
     pub fn with_configs<'a>(
         mut self,
         configs: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -754,17 +758,29 @@ impl TestHost {
     ///
     /// Returns a copy of all log messages captured since the host was created
     /// or since the last call to [`clear_logs`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn logs(&self) -> Vec<(LogLevel, String)> {
         self.logs.lock().unwrap().clone()
     }
 
     /// Clear all captured logs
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn clear_logs(&self) {
         self.logs.lock().unwrap().clear();
     }
 
     /// Get logs filtered by level
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn logs_at_level(&self, level: LogLevel) -> Vec<String> {
         self.logs
@@ -777,6 +793,10 @@ impl TestHost {
     }
 
     /// Check if any log message contains the given substring
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn has_log_containing(&self, substring: &str) -> bool {
         self.logs
@@ -787,6 +807,10 @@ impl TestHost {
     }
 
     /// Get the number of captured log messages
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn log_count(&self) -> usize {
         self.logs.lock().unwrap().len()
@@ -903,6 +927,7 @@ impl TestPlugin {
     ///
     /// Returns [`TestError::FunctionNotFound`] if the plugin doesn't export `handle`.
     /// Returns [`TestError::FunctionCall`] if the function call fails.
+    #[allow(clippy::unused_async)]
     pub async fn handle(&mut self, event_type: &str, payload: &[u8]) -> Result<Vec<u8>, String> {
         // Look for handle function
         let handle_func = self
@@ -943,6 +968,7 @@ impl TestPlugin {
     ///
     /// Returns [`TestError::FunctionNotFound`] if the plugin doesn't export `info`.
     /// Returns [`TestError::FunctionCall`] if the function call fails.
+    #[allow(clippy::unused_async)]
     pub async fn info(&mut self) -> Result<PluginInfo, TestError> {
         // Look for info function
         let info_func = self
@@ -962,6 +988,10 @@ impl TestPlugin {
     /// Call the plugin's `shutdown` function
     ///
     /// This signals the plugin to clean up resources before being unloaded.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `TestError` if the shutdown function call fails.
     pub async fn shutdown(&mut self) -> Result<(), TestError> {
         let shutdown_func = self
             .instance
@@ -1010,12 +1040,20 @@ impl TestPlugin {
     }
 
     /// Get all logs from the plugin's execution
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     #[must_use]
     pub fn logs(&self) -> Vec<(LogLevel, String)> {
         self.store.data().logs.lock().unwrap().clone()
     }
 
     /// Clear all logs
+    ///
+    /// # Panics
+    ///
+    /// Panics if the internal mutex is poisoned.
     pub fn clear_logs(&self) {
         self.store.data().logs.lock().unwrap().clear();
     }

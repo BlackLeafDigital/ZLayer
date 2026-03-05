@@ -41,6 +41,7 @@ struct StaleDaemonMeta {
 /// Clean up a stale daemon process and leftover network state from a previous run.
 ///
 /// This is best-effort: all errors are logged as warnings but never prevent startup.
+#[allow(unsafe_code, clippy::too_many_lines, clippy::cast_possible_wrap, clippy::cast_sign_loss)]
 async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind: &str) {
     let metadata_path = config.data_dir.join("daemon.json");
     let my_pid = std::process::id();
@@ -187,7 +188,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                                 info!("All stale zlayer processes exited");
                                 break;
                             }
-                            _ => continue,
+                            _ => {}
                         }
                     }
                 } else {
@@ -222,9 +223,8 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
             let stdout = String::from_utf8_lossy(&output.stdout);
             for line in stdout.lines() {
                 // `ip -br link` format: "NAME  STATE  ..."
-                let iface = match line.split_whitespace().next() {
-                    Some(name) => name,
-                    None => continue,
+                let Some(iface) = line.split_whitespace().next() else {
+                    continue;
                 };
 
                 if iface.starts_with("veth-") || iface.starts_with("zl-") {
@@ -310,6 +310,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 /// Check whether a process with the given PID is still alive.
 ///
 /// Uses `kill(pid, 0)` which checks for existence without sending a signal.
+#[allow(unsafe_code)]
 fn process_alive(pid: i32) -> bool {
     // SAFETY: signal 0 is a null signal used purely for existence checking.
     unsafe { libc::kill(pid, 0) == 0 }
@@ -322,6 +323,7 @@ fn parse_port_from_bind(bind: &str) -> Option<u16> {
 }
 
 /// Start the daemon API server with full infrastructure.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn serve(
     bind: &str,
     jwt_secret: Option<String>,
@@ -387,6 +389,7 @@ pub(crate) async fn serve(
 
     // Destructure the state so we can rewrap the ServiceManager for the router
     // while keeping shutdown-relevant handles separate.
+    #[allow(clippy::used_underscore_binding)]
     let crate::daemon::DaemonState {
         runtime: _runtime,
         overlay,

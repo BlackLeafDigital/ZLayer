@@ -29,7 +29,12 @@ pub type GlobalLimiter = RateLimiter<
     governor::middleware::NoOpMiddleware,
 >;
 
-/// Create a global rate limiter
+/// Create a global rate limiter.
+///
+/// # Panics
+///
+/// Panics if the fallback rate limit values cannot be created as `NonZeroU32`
+/// (should never happen since the fallback values are compile-time constants).
 #[must_use]
 pub fn create_global_limiter(config: &RateLimitConfig) -> Arc<GlobalLimiter> {
     let rps = NonZeroU32::new(config.requests_per_second).unwrap_or(NonZeroU32::new(100).unwrap());
@@ -56,6 +61,11 @@ impl RateLimitState {
         }
     }
 
+    /// Create a disabled rate limiter.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `u32::MAX` cannot be converted to `NonZeroU32` (impossible).
     #[must_use]
     pub fn disabled() -> Self {
         Self {

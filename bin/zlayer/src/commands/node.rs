@@ -304,6 +304,7 @@ pub(crate) async fn handle_node(
 }
 
 /// Initialize this node as cluster leader
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn handle_node_init(
     advertise_addr: String,
     api_port: u16,
@@ -474,6 +475,7 @@ pub(crate) async fn handle_node_init(
 }
 
 /// Join an existing cluster as a worker node
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn handle_node_join(
     leader_addr: String,
     token: String,
@@ -1082,6 +1084,7 @@ pub(crate) async fn handle_node_set_mode(
         .build()
         .context("Failed to create HTTP client")?;
 
+    #[allow(clippy::items_after_statements)]
     #[derive(Serialize)]
     struct SetModeRequest {
         mode: String,
@@ -1148,6 +1151,7 @@ pub(crate) async fn handle_node_label(
         .build()
         .context("Failed to create HTTP client")?;
 
+    #[allow(clippy::items_after_statements)]
     #[derive(Serialize)]
     struct AddLabelRequest {
         key: String,

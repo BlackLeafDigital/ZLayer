@@ -293,7 +293,7 @@ impl LayerCacheTracker {
     /// - Execution time (cached layers typically commit in < 100ms)
     /// - Output analysis (look for "Using cache" or similar messages)
     /// - Layer digest comparison with existing images
-    #[allow(dead_code)]
+    #[allow(dead_code, clippy::unused_self)]
     fn detect_cache_hit(
         &self,
         _instruction: &Instruction,
@@ -354,6 +354,7 @@ impl RegistryAuth {
 
 /// Build options for customizing the image build process
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct BuildOptions {
     /// Dockerfile path (default: Dockerfile in context)
     pub dockerfile: Option<PathBuf>,
@@ -594,6 +595,10 @@ impl ImageBuilder {
     ///
     /// This is useful for testing or when you need to configure
     /// the executor with specific storage options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context directory does not exist.
     pub fn with_executor(context: impl AsRef<Path>, executor: BuildahExecutor) -> Result<Self> {
         let context = context.as_ref().to_path_buf();
 
@@ -634,6 +639,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn dockerfile(mut self, path: impl AsRef<Path>) -> Self {
         self.options.dockerfile = Some(path.as_ref().to_path_buf());
         self
@@ -655,6 +661,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn zimagefile(mut self, path: impl AsRef<Path>) -> Self {
         self.options.zimagefile = Some(path.as_ref().to_path_buf());
         self
@@ -698,6 +705,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn build_arg(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.options.build_args.insert(key.into(), value.into());
         self
@@ -732,6 +740,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn target(mut self, stage: impl Into<String>) -> Self {
         self.options.target = Some(stage.into());
         self
@@ -754,6 +763,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn tag(mut self, tag: impl Into<String>) -> Self {
         self.options.tags.push(tag.into());
         self
@@ -825,6 +835,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn cache_from(mut self, registry: impl Into<String>) -> Self {
         self.options.cache_from = Some(registry.into());
         self
@@ -854,6 +865,7 @@ impl ImageBuilder {
     /// # Ok(())
     /// # }
     /// ```
+    #[must_use]
     pub fn cache_to(mut self, registry: impl Into<String>) -> Self {
         self.options.cache_to = Some(registry.into());
         self
@@ -932,6 +944,7 @@ impl ImageBuilder {
     /// before qualifying them to `docker.io`. For example, if set to
     /// `"git.example.com:5000"` and the `ZImagefile` uses `base: "myapp:latest"`,
     /// the builder will check `git.example.com:5000/myapp:latest` first.
+    #[must_use]
     pub fn default_registry(mut self, registry: impl Into<String>) -> Self {
         self.options.default_registry = Some(registry.into());
         self
@@ -959,6 +972,7 @@ impl ImageBuilder {
     /// Set the image format
     ///
     /// Valid values are "oci" (default) or "docker".
+    #[must_use]
     pub fn format(mut self, format: impl Into<String>) -> Self {
         self.options.format = Some(format.into());
         self
@@ -1243,6 +1257,11 @@ impl ImageBuilder {
     /// - A buildah command fails
     /// - Target stage is not found
     /// - Registry push fails
+    ///
+    /// # Panics
+    ///
+    /// Panics if an instruction output is missing after all retry attempts (internal invariant).
+    #[allow(clippy::too_many_lines)]
     #[instrument(skip(self), fields(context = %self.context.display()))]
     pub async fn build(self) -> Result<BuiltImage> {
         let start_time = std::time::Instant::now();
@@ -1367,27 +1386,24 @@ impl ImageBuilder {
                 let instruction_with_defaults;
                 let instruction_ref = if self.options.default_cache_mounts.is_empty() {
                     instruction_ref
-                } else {
-                    if let Instruction::Run(run) = instruction_ref {
-                        let mut merged = run.clone();
-                        for default_mount in &self.options.default_cache_mounts {
-                            // Deduplicate by target path
-                            let target = match default_mount {
-                                RunMount::Cache { target, .. } => target,
-                                _ => continue,
-                            };
-                            let already_has = merged.mounts.iter().any(
-                                |m| matches!(m, RunMount::Cache { target: t, .. } if t == target),
-                            );
-                            if !already_has {
-                                merged.mounts.push(default_mount.clone());
-                            }
+                } else if let Instruction::Run(run) = instruction_ref {
+                    let mut merged = run.clone();
+                    for default_mount in &self.options.default_cache_mounts {
+                        // Deduplicate by target path
+                        let RunMount::Cache { target, .. } = default_mount else {
+                            continue;
+                        };
+                        let already_has = merged.mounts.iter().any(
+                            |m| matches!(m, RunMount::Cache { target: t, .. } if t == target),
+                        );
+                        if !already_has {
+                            merged.mounts.push(default_mount.clone());
                         }
-                        instruction_with_defaults = Instruction::Run(merged);
-                        &instruction_with_defaults
-                    } else {
-                        instruction_ref
                     }
+                    instruction_with_defaults = Instruction::Run(merged);
+                    &instruction_with_defaults
+                } else {
+                    instruction_ref
                 };
 
                 let is_run_instruction = matches!(instruction_ref, Instruction::Run(_));
@@ -1460,13 +1476,14 @@ impl ImageBuilder {
                     }
                 }
 
+                #[allow(clippy::cast_possible_truncation)]
                 let instruction_elapsed_ms = instruction_start.elapsed().as_millis() as u64;
 
                 // Track WORKDIR changes for later COPY --from resolution.
                 // We need to know the final WORKDIR of each stage so we can resolve
                 // relative paths when copying from that stage.
                 if let Instruction::Workdir(dir) = instruction {
-                    current_workdir = dir.clone();
+                    current_workdir.clone_from(dir);
                 }
 
                 // Attempt to detect if this was a cache hit.
@@ -1596,6 +1613,7 @@ impl ImageBuilder {
             }
         }
 
+        #[allow(clippy::cast_possible_truncation)]
         let build_time_ms = start_time.elapsed().as_millis() as u64;
 
         self.send_event(BuildEvent::BuildComplete {
@@ -1801,7 +1819,11 @@ impl ImageBuilder {
         // Apply explicit build file if specified.
         if let Some(file) = build_ctx.file() {
             let file_path = context_dir.join(file);
-            if file.ends_with(".yml") || file.ends_with(".yaml") || file.starts_with("ZImagefile") {
+            if std::path::Path::new(file)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("yml") || ext.eq_ignore_ascii_case("yaml"))
+                || file.starts_with("ZImagefile")
+            {
                 nested = nested.zimagefile(file_path);
             } else {
                 nested = nested.dockerfile(file_path);
@@ -1840,6 +1862,7 @@ impl ImageBuilder {
     }
 
     /// Resolve stages needed for a specific target
+    #[allow(clippy::unused_self)]
     fn resolve_target_stages<'a>(
         &self,
         dockerfile: &'a Dockerfile,
@@ -1930,6 +1953,7 @@ impl ImageBuilder {
     /// Try to resolve an unqualified image from local registry or default registry.
     ///
     /// Returns `Some(fully_qualified_name)` if found, `None` to fall back to docker.io.
+    #[allow(clippy::unused_async)]
     async fn try_resolve_from_sources(&self, image_ref: &ImageRef) -> Option<String> {
         let (name, tag_str) = match image_ref {
             ImageRef::Registry { image, tag, .. } => {
@@ -2043,14 +2067,15 @@ fn generate_build_id() -> String {
     use sha2::{Digest, Sha256};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // Use a monotonic counter to guarantee uniqueness even within the same
+    // nanosecond on the same process (e.g. tests or very fast sequential calls).
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let pid = std::process::id();
-    // Use a monotonic counter to guarantee uniqueness even within the same
-    // nanosecond on the same process (e.g. tests or very fast sequential calls).
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let count = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     let mut hasher = Sha256::new();

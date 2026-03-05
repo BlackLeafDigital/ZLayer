@@ -298,9 +298,6 @@ impl App {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         self.handle_key(key);
                     }
-                    Event::Resize(_, _) => {
-                        // Ratatui handles resize automatically on next draw
-                    }
                     _ => {}
                 }
             }
@@ -329,6 +326,7 @@ impl App {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn render_help_overlay(&self, frame: &mut Frame) {
         use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
@@ -490,6 +488,7 @@ General:
     // Build event polling
     // ------------------------------------------------------------------
 
+    #[allow(clippy::too_many_lines)]
     fn poll_build_events(&mut self) {
         if let Screen::BuildWizard(ref mut state) = self.screen {
             if state.step != BuildStep::Building {

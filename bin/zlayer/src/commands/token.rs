@@ -6,6 +6,7 @@ use zlayer_api::create_token;
 use crate::cli::TokenCommands;
 use crate::util::decode_base64_json;
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn handle_token(action: &TokenCommands) -> Result<()> {
     match action {
         TokenCommands::Create {

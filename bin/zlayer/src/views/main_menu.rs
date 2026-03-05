@@ -19,6 +19,7 @@ const MENU_ITEMS: &[(&str, &str)] = &[
 ];
 
 /// Render the main menu
+#[allow(clippy::cast_possible_truncation)]
 pub fn render(frame: &mut Frame, state: &MainMenuState) {
     let area = frame.area();
 
@@ -72,6 +73,7 @@ pub fn render(frame: &mut Frame, state: &MainMenuState) {
 }
 
 /// Render the menu items with selection highlight
+#[allow(clippy::cast_possible_truncation)]
 fn render_menu_items(area: Rect, buf: &mut Buffer, state: &MainMenuState) {
     if area.height == 0 {
         return;

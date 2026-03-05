@@ -420,6 +420,7 @@ impl ImageBuilder {
         })
     }
 
+    #[allow(clippy::unused_self)]
     fn __repr__(&self) -> String {
         "ImageBuilder(...)".to_string()
     }
@@ -436,6 +437,7 @@ impl ImageBuilder {
 /// Returns:
 ///     The detected runtime info, or None if no runtime is detected
 #[pyfunction]
+#[allow(clippy::unnecessary_wraps)]
 pub fn detect_runtime(path: &str) -> PyResult<Option<DetectedRuntime>> {
     let path = std::path::Path::new(path);
     let detected = zlayer_builder::detect_runtime(path);

@@ -90,6 +90,9 @@ impl DependencyGraph {
     /// - `DependencyError::CyclicDependency` if a cycle is detected
     /// - `DependencyError::MissingService` if a dependency references a non-existent service
     /// - `DependencyError::SelfDependency` if a service depends on itself
+    ///
+    /// # Panics
+    /// Panics if internal adjacency map state is inconsistent (should never happen).
     pub fn build(services: &HashMap<String, ServiceSpec>) -> Result<Self> {
         let mut nodes = HashMap::new();
         let mut adjacency: HashMap<String, Vec<String>> = HashMap::new();
@@ -392,6 +395,9 @@ impl DependencyConditionChecker {
     ///
     /// # Returns
     /// `true` if the condition is satisfied, `false` otherwise
+    ///
+    /// # Errors
+    /// Returns an error if the dependency condition cannot be evaluated.
     pub async fn check(&self, dep: &DependsSpec) -> Result<bool> {
         match dep.condition {
             DependencyCondition::Started => self.check_started(&dep.service).await,
@@ -403,6 +409,9 @@ impl DependencyConditionChecker {
     /// Check "started" condition - container exists and is running
     ///
     /// Returns true if at least one replica of the service is in the Running state.
+    ///
+    /// # Errors
+    /// Returns an error if the container state cannot be queried.
     pub async fn check_started(&self, service: &str) -> Result<bool> {
         // Try to get state for replica 1 (primary replica)
         // In practice, we might need to check all replicas
@@ -413,9 +422,8 @@ impl DependencyConditionChecker {
 
         match self.runtime.container_state(&id).await {
             Ok(ContainerState::Running) => Ok(true),
-            Ok(_) => Ok(false), // Container exists but not running
-            Err(AgentError::NotFound { .. }) => Ok(false), // Container doesn't exist yet
-            Err(e) => Err(e),   // Propagate other errors
+            Ok(_) | Err(AgentError::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e), // Propagate other errors
         }
     }
 
@@ -423,13 +431,15 @@ impl DependencyConditionChecker {
     ///
     /// Returns true only if the service health state is `HealthState::Healthy`.
     /// Returns false for `Unknown`, `Checking`, or `Unhealthy`.
+    ///
+    /// # Errors
+    /// Returns an error if the health state cannot be queried.
     pub async fn check_healthy(&self, service: &str) -> Result<bool> {
         let health_states = self.health_states.read().await;
 
         match health_states.get(service) {
             Some(HealthState::Healthy) => Ok(true),
-            Some(_) => Ok(false), // Unknown, Checking, or Unhealthy
-            None => Ok(false),    // No health state recorded yet
+            Some(_) | None => Ok(false),
         }
     }
 
@@ -440,6 +450,9 @@ impl DependencyConditionChecker {
     /// 2. Has at least one healthy backend
     ///
     /// Falls back to healthy check if no service registry is configured.
+    ///
+    /// # Errors
+    /// Returns an error if the readiness condition cannot be checked.
     pub async fn check_ready(&self, service: &str) -> Result<bool> {
         if let Some(registry) = &self.service_registry {
             // Check if service has registered routes with healthy backends
@@ -562,6 +575,9 @@ impl DependencyWaiter {
     /// * `WaitResult::TimedOutContinue` if timed out with `on_timeout`: continue
     /// * `WaitResult::TimedOutWarn` if timed out with `on_timeout`: warn
     /// * `WaitResult::TimedOutFail` if timed out with `on_timeout`: fail
+    ///
+    /// # Errors
+    /// Returns an error if the condition check itself encounters an unrecoverable error.
     pub async fn wait_for_dependency(&self, dep: &DependsSpec) -> Result<WaitResult> {
         let timeout = dep.timeout.unwrap_or(Duration::from_secs(300)); // Default 5 minutes
         let start = std::time::Instant::now();
@@ -615,6 +631,7 @@ impl DependencyWaiter {
     }
 
     /// Handle timeout based on the `on_timeout` action
+    #[allow(clippy::unused_self)]
     fn handle_timeout(&self, dep: &DependsSpec, timeout: Duration) -> WaitResult {
         match dep.on_timeout {
             TimeoutAction::Fail => {
@@ -664,6 +681,9 @@ impl DependencyWaiter {
     ///
     /// # Returns
     /// Vector of wait results for each dependency
+    ///
+    /// # Errors
+    /// Returns an error if a condition check encounters an unrecoverable error.
     pub async fn wait_for_all(&self, deps: &[DependsSpec]) -> Result<Vec<WaitResult>> {
         let mut results = Vec::with_capacity(deps.len());
 

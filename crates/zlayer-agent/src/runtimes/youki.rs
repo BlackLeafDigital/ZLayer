@@ -145,6 +145,9 @@ impl std::fmt::Debug for YoukiRuntime {
 
 impl YoukiRuntime {
     /// Create a new `YoukiRuntime` with the given configuration
+    ///
+    /// # Errors
+    /// Returns an error if the required directories cannot be created.
     pub async fn new(config: YoukiConfig) -> Result<Self> {
         // Ensure directories exist
         for dir in [
@@ -186,6 +189,7 @@ impl YoukiRuntime {
                     reason: format!("failed to read cache config from env: {e}"),
                 })?;
             // Override persistent path to use config.cache_dir
+            #[allow(clippy::match_wildcard_for_single_variants)]
             let cache_type = match cache_type {
                 zlayer_registry::CacheType::Persistent { .. } => {
                     zlayer_registry::CacheType::persistent_at(config.cache_dir.join("blobs.redb"))
@@ -212,11 +216,17 @@ impl YoukiRuntime {
     }
 
     /// Create a new `YoukiRuntime` with default configuration
+    ///
+    /// # Errors
+    /// Returns an error if the runtime cannot be initialized.
     pub async fn with_defaults() -> Result<Self> {
         Self::new(YoukiConfig::default()).await
     }
 
     /// Create a new `YoukiRuntime` with custom auth configuration
+    ///
+    /// # Errors
+    /// Returns an error if the runtime cannot be initialized.
     pub async fn with_auth(
         config: YoukiConfig,
         auth_config: zlayer_core::AuthConfig,
@@ -261,6 +271,7 @@ impl YoukiRuntime {
                     reason: format!("failed to read cache config from env: {e}"),
                 })?;
             // Override persistent path to use config.cache_dir
+            #[allow(clippy::match_wildcard_for_single_variants)]
             let cache_type = match cache_type {
                 zlayer_registry::CacheType::Persistent { .. } => {
                     zlayer_registry::CacheType::persistent_at(config.cache_dir.join("blobs.redb"))
@@ -303,6 +314,7 @@ impl YoukiRuntime {
     }
 
     /// Get the container ID string
+    #[allow(clippy::unused_self)]
     fn container_id_str(&self, id: &ContainerId) -> String {
         format!("{}-{}", id.service, id.replica)
     }
@@ -352,10 +364,10 @@ impl YoukiRuntime {
     }
 
     /// Map libcontainer status to our `ContainerState`
+    #[allow(clippy::unused_self)]
     fn map_status(&self, status: ContainerStatus) -> ContainerState {
         match status {
-            ContainerStatus::Creating => ContainerState::Pending,
-            ContainerStatus::Created => ContainerState::Pending,
+            ContainerStatus::Creating | ContainerStatus::Created => ContainerState::Pending,
             ContainerStatus::Running => ContainerState::Running,
             ContainerStatus::Stopped => ContainerState::Exited { code: 0 },
             ContainerStatus::Paused => ContainerState::Stopping,
@@ -368,6 +380,7 @@ impl YoukiRuntime {
     /// directory (`/var/log/zlayer/{deployment}/{service}/`) and places
     /// symlinks in the bundle's `logs/` directory so that existing code
     /// reading from the bundle still works.
+    #[allow(unsafe_code)]
     async fn create_log_files(
         &self,
         id: &ContainerId,
@@ -426,9 +439,16 @@ impl YoukiRuntime {
         }
 
         // Convert to OwnedFd
-        use std::os::unix::io::IntoRawFd;
-        let stdout_fd = unsafe { OwnedFd::from_raw_fd(stdout_file.into_raw_fd()) };
-        let stderr_fd = unsafe { OwnedFd::from_raw_fd(stderr_file.into_raw_fd()) };
+        // SAFETY: `into_raw_fd()` transfers ownership of the fd, and
+        // `OwnedFd::from_raw_fd` takes ownership. No double-close.
+        let stdout_fd = unsafe {
+            use std::os::unix::io::IntoRawFd;
+            OwnedFd::from_raw_fd(stdout_file.into_raw_fd())
+        };
+        let stderr_fd = unsafe {
+            use std::os::unix::io::IntoRawFd;
+            OwnedFd::from_raw_fd(stderr_file.into_raw_fd())
+        };
 
         Ok((stdout_path, stderr_path, stdout_fd, stderr_fd))
     }
@@ -509,11 +529,8 @@ impl YoukiRuntime {
                     volume_paths.insert(key, path);
                 }
 
-                // Bind mounts don't need preparation - source path is used directly
-                StorageSpec::Bind { .. } => {}
-
-                // Tmpfs mounts don't need preparation
-                StorageSpec::Tmpfs { .. } => {}
+                // Bind and tmpfs mounts don't need preparation
+                StorageSpec::Bind { .. } | StorageSpec::Tmpfs { .. } => {}
 
                 StorageSpec::S3 {
                     bucket,
@@ -920,6 +937,7 @@ impl Runtime for YoukiRuntime {
             })?;
 
             // Get the PID after starting - access through state
+            #[allow(clippy::cast_sign_loss)]
             let pid = container.pid().map(|p| p.as_raw() as u32);
 
             Ok::<Option<u32>, AgentError>(pid)
@@ -1249,6 +1267,7 @@ impl Runtime for YoukiRuntime {
     /// Execute a command in a running container
     ///
     /// Uses libcontainer's tenant builder to exec into the container's namespaces.
+    #[allow(unsafe_code)]
     #[instrument(
         skip(self),
         fields(
@@ -1294,9 +1313,16 @@ impl Runtime for YoukiRuntime {
                 reason: format!("failed to create stderr file: {e}"),
             })?;
 
-        use std::os::unix::io::IntoRawFd;
-        let stdout_fd = unsafe { OwnedFd::from_raw_fd(stdout_file.into_raw_fd()) };
-        let stderr_fd = unsafe { OwnedFd::from_raw_fd(stderr_file.into_raw_fd()) };
+        // SAFETY: `into_raw_fd()` transfers ownership of the fd, and
+        // `OwnedFd::from_raw_fd` takes ownership. No double-close.
+        let stdout_fd = unsafe {
+            use std::os::unix::io::IntoRawFd;
+            OwnedFd::from_raw_fd(stdout_file.into_raw_fd())
+        };
+        let stderr_fd = unsafe {
+            use std::os::unix::io::IntoRawFd;
+            OwnedFd::from_raw_fd(stderr_file.into_raw_fd())
+        };
 
         let cmd_clone = cmd.to_vec();
         let container_id_clone = container_id.clone();
@@ -1353,8 +1379,7 @@ impl Runtime for YoukiRuntime {
             match waitpid(pid, None) {
                 Ok(WaitStatus::Exited(_, code)) => code,
                 Ok(WaitStatus::Signaled(_, signal, _)) => 128 + signal as i32,
-                Ok(_) => -1,
-                Err(_) => -1,
+                Ok(_) | Err(_) => -1,
             }
         })
         .await
@@ -1536,6 +1561,7 @@ impl Runtime for YoukiRuntime {
             let _ = container.refresh_status();
 
             // Get PID - returns None if container is not running
+            #[allow(clippy::cast_sign_loss)]
             let pid = container.pid().map(|p| p.as_raw() as u32);
 
             Ok::<Option<u32>, AgentError>(pid)
@@ -1567,6 +1593,7 @@ impl Runtime for YoukiRuntime {
     /// configured on the storage manager, this iterates all non-anonymous
     /// volumes and pushes any changes to S3. Errors are logged but do not
     /// prevent container removal.
+    #[allow(unused_variables)]
     async fn sync_container_volumes(&self, id: &ContainerId) -> Result<()> {
         #[cfg(feature = "s3")]
         {

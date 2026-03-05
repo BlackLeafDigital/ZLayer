@@ -63,18 +63,21 @@ impl BuildahCommand {
     }
 
     /// Add an argument
+    #[must_use]
     pub fn arg(mut self, arg: impl Into<String>) -> Self {
         self.args.push(arg.into());
         self
     }
 
     /// Add multiple arguments
+    #[must_use]
     pub fn args(mut self, args: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.args.extend(args.into_iter().map(Into::into));
         self
     }
 
     /// Add an optional argument (only added if value is Some)
+    #[must_use]
     pub fn arg_opt(self, flag: &str, value: Option<impl Into<String>>) -> Self {
         if let Some(v) = value {
             self.arg(flag).arg(v)
@@ -84,6 +87,7 @@ impl BuildahCommand {
     }
 
     /// Add an environment variable for command execution
+    #[must_use]
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.insert(key.into(), value.into());
         self

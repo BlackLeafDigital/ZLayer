@@ -73,6 +73,10 @@ fn cron_info_to_response(info: &CronJobInfo) -> CronJobResponse {
 /// GET /api/v1/cron - List all cron jobs
 ///
 /// Returns a list of all registered cron jobs with their schedule information.
+///
+/// # Errors
+///
+/// Returns an error if the user is not authenticated.
 #[utoipa::path(
     get,
     path = "/api/v1/cron",
@@ -95,6 +99,10 @@ pub async fn list_cron_jobs(
 /// GET /api/v1/cron/{name} - Get cron job details
 ///
 /// Returns detailed information about a specific cron job.
+///
+/// # Errors
+///
+/// Returns an error if the cron job is not found.
 #[utoipa::path(
     get,
     path = "/api/v1/cron/{name}",
@@ -126,6 +134,10 @@ pub async fn get_cron_job(
 /// POST /api/v1/cron/{name}/trigger - Manually trigger a cron job
 ///
 /// Triggers an immediate execution of the cron job, regardless of its schedule.
+///
+/// # Errors
+///
+/// Returns an error if the cron job is not found or triggering fails.
 #[utoipa::path(
     post,
     path = "/api/v1/cron/{name}/trigger",
@@ -171,6 +183,10 @@ pub async fn trigger_cron_job(
 /// PUT /api/v1/cron/{name}/enable - Enable a cron job
 ///
 /// Enables a disabled cron job, allowing it to run on schedule.
+///
+/// # Errors
+///
+/// Returns an error if the cron job is not found or the user lacks permission.
 #[utoipa::path(
     put,
     path = "/api/v1/cron/{name}/enable",
@@ -214,6 +230,10 @@ pub async fn enable_cron_job(
 ///
 /// Disables a cron job, preventing it from running on schedule.
 /// The job can still be manually triggered.
+///
+/// # Errors
+///
+/// Returns an error if the cron job is not found or the user lacks permission.
 #[utoipa::path(
     put,
     path = "/api/v1/cron/{name}/disable",

@@ -37,6 +37,7 @@ impl From<ContainerState> for PyContainerState {
 
 #[pymethods]
 impl PyContainerState {
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn __str__(&self) -> &'static str {
         match self {
             PyContainerState::Pending => "pending",
@@ -48,6 +49,7 @@ impl PyContainerState {
         }
     }
 
+    #[allow(clippy::trivially_copy_pass_by_ref)]
     fn __repr__(&self) -> String {
         format!("ContainerState.{}", self.__str__().to_uppercase())
     }
@@ -107,6 +109,7 @@ impl Container {
     ///     `RuntimeError`: If container creation fails
     #[staticmethod]
     #[pyo3(signature = (image, ports=None, env=None, name=None))]
+    #[allow(clippy::needless_pass_by_value)]
     fn create(
         image: &str,
         ports: Option<HashMap<String, u16>>,
@@ -406,6 +409,8 @@ fn build_spec_yaml(
     env: Option<&HashMap<String, String>>,
     name: Option<&str>,
 ) -> String {
+    use std::fmt::Write;
+
     let service_name = name.unwrap_or("container");
 
     let mut yaml = format!(
@@ -424,7 +429,7 @@ services:
         if !env_vars.is_empty() {
             yaml.push_str("    env:\n");
             for (key, value) in env_vars {
-                yaml.push_str(&format!("      {key}: \"{value}\"\n"));
+                let _ = writeln!(yaml, "      {key}: \"{value}\"");
             }
         }
     }
@@ -434,9 +439,10 @@ services:
         if !port_map.is_empty() {
             yaml.push_str("    endpoints:\n");
             for (name, port) in port_map {
-                yaml.push_str(&format!(
+                let _ = write!(
+                    yaml,
                     "      - name: {name}\n        protocol: tcp\n        port: {port}\n"
-                ));
+                );
             }
         }
     }

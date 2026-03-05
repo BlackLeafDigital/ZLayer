@@ -78,6 +78,7 @@ pub async fn wait_for_stabilization(
                 ScaleSpec::Manual => 0,
             };
 
+            #[allow(clippy::cast_possible_truncation)]
             let running = match manager.service_replica_count(name).await {
                 Ok(count) => count as u32,
                 Err(_) => 0,

@@ -434,6 +434,7 @@ pub(crate) async fn handle_wasm_validate(wasm_file: &Path) -> Result<()> {
 }
 
 /// Show information about a WASM binary
+#[allow(clippy::cast_precision_loss)]
 pub(crate) async fn handle_wasm_info(wasm_file: &Path) -> Result<()> {
     info!(wasm_file = %wasm_file.display(), "Getting WASM info");
 

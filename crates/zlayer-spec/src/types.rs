@@ -7,6 +7,7 @@ mod duration {
     use serde::{Deserialize, Deserializer, Serializer};
     use std::time::Duration;
 
+    #[allow(clippy::ref_option)]
     pub fn serialize<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -884,7 +885,7 @@ impl Default for ScaleSpec {
             min: 1,
             max: 10,
             cooldown: Some(std::time::Duration::from_secs(30)),
-            targets: Default::default(),
+            targets: ScaleTargets::default(),
         }
     }
 }
@@ -931,6 +932,7 @@ fn default_condition() -> DependencyCondition {
     DependencyCondition::Healthy
 }
 
+#[allow(clippy::unnecessary_wraps)]
 fn default_timeout() -> Option<std::time::Duration> {
     Some(std::time::Duration::from_secs(300))
 }

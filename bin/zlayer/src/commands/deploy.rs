@@ -84,6 +84,7 @@ fn setup_plain_channel() -> mpsc::Sender<DeployEvent> {
 /// service registration, scaling and health-checking.  This function polls
 /// `GET /api/v1/deployments/{name}` until the deployment reaches a terminal
 /// state (running / failed) or a timeout is hit.
+#[allow(clippy::too_many_lines, clippy::assigning_clones, clippy::cast_possible_truncation)]
 pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result<()> {
     let spec = parse_spec(spec_path)?;
 
@@ -460,6 +461,7 @@ pub(crate) async fn down(deployment: Option<String>) -> Result<()> {
 /// running and managing the deployment. This is intentional: the daemon is a
 /// long-lived process, and `deploy`/`up` in foreground mode is just a "watch"
 /// view.
+#[allow(clippy::cast_possible_truncation)]
 async fn wait_for_ctrl_c_or_status(
     client: &DaemonClient,
     deployment_name: &str,
