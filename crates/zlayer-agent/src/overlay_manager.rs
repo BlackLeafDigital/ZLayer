@@ -117,8 +117,11 @@ impl OverlayManager {
             .await
             .map_err(|e| AgentError::Network(format!("Failed to configure global overlay: {e}")))?;
 
+        // Read back the actual interface name (on macOS, the kernel assigns utunN)
+        let actual_name = transport.interface_name().to_string();
+
         self.node_ip = Some(node_ip);
-        self.global_interface = Some(interface_name);
+        self.global_interface = Some(actual_name);
         self.global_transport = Some(transport);
         Ok(())
     }
@@ -179,6 +182,13 @@ impl OverlayManager {
         transport.configure(&[]).await.map_err(|e| {
             AgentError::Network(format!("Failed to configure service overlay: {e}"))
         })?;
+
+        // Update interface tracking with the actual name (on macOS, kernel assigns utunN)
+        let actual_name = transport.interface_name().to_string();
+        self.service_interfaces
+            .write()
+            .await
+            .insert(service_name.to_string(), actual_name);
 
         self.service_transports
             .write()

@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- macOS overlay networking support: boringtun now creates `utun` devices on macOS
+  via kernel control sockets (same mechanism as Tailscale CLI and wireguard-go).
+  Interface configuration uses `ifconfig`/`route` instead of Linux `ip` commands.
+  The kernel auto-assigns `utunN` names, which are discovered after creation via
+  UAPI socket scanning. Requires `sudo` on macOS (equivalent to Linux `CAP_NET_ADMIN`).
+- `OverlayTransport::interface_name()` getter to retrieve the resolved interface name
+  (useful on macOS where the kernel assigns the actual `utunN` name).
+- Platform-appropriate ping timeout args in overlay health checker (macOS `-W` uses
+  milliseconds vs Linux seconds).
 - Storage replication status API endpoint (`GET /api/v1/storage/status`): returns
   SQLite-to-S3 replication state including enabled flag, active/disabled/error status,
   last sync timestamp, and pending change count. Requires authentication (read-only).

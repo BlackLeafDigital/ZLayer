@@ -120,13 +120,14 @@ pub fn detect_gpus() -> Vec<GpuInfo> {
 // macOS GPU detection
 // =============================================================================
 
-/// Detect Apple Silicon GPUs via system_profiler (macOS only)
+/// Detect Apple Silicon GPUs via `system_profiler` (macOS only)
 ///
 /// Runs `system_profiler SPDisplaysDataType -json` to enumerate GPUs, then
 /// queries `sysctl -n hw.memsize` for the unified memory pool size. Apple Silicon
 /// shares system memory between CPU and GPU, so the full physical memory is
 /// reported as the GPU's available memory.
 #[cfg(target_os = "macos")]
+#[must_use]
 pub fn detect_gpus() -> Vec<GpuInfo> {
     detect_apple_gpus()
 }
@@ -153,9 +154,8 @@ fn detect_apple_gpus() -> Vec<GpuInfo> {
     let mut gpus = Vec::new();
 
     // system_profiler returns { "SPDisplaysDataType": [ { ... }, ... ] }
-    let displays = match parsed.get("SPDisplaysDataType").and_then(|v| v.as_array()) {
-        Some(arr) => arr,
-        None => return gpus,
+    let Some(displays) = parsed.get("SPDisplaysDataType").and_then(|v| v.as_array()) else {
+        return gpus;
     };
 
     for (idx, display) in displays.iter().enumerate() {
@@ -173,7 +173,7 @@ fn detect_apple_gpus() -> Vec<GpuInfo> {
 
         // Use chip type in model name if the model doesn't already include it
         let model = if !chip_type.is_empty() && !model.contains(chip_type) {
-            format!("{} ({})", model, chip_type)
+            format!("{model} ({chip_type})")
         } else {
             model
         };
@@ -223,11 +223,11 @@ fn detect_apple_gpus() -> Vec<GpuInfo> {
         };
 
         gpus.push(GpuInfo {
-            pci_bus_id: format!("apple:{}", idx),
+            pci_bus_id: format!("apple:{idx}"),
             vendor,
             model,
             memory_mb,
-            device_path: format!("iokit://AppleGPU/{}", idx),
+            device_path: format!("iokit://AppleGPU/{idx}"),
             render_path: None,
         });
     }

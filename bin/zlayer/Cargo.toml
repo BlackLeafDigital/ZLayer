@@ -87,9 +87,13 @@ tokio-stream = { workspace = true }
 # System resource detection
 num_cpus = { workspace = true }
 
-# Daemonization
+[target.'cfg(unix)'.dependencies]
+# Daemonization (fork, setsid) and signal handling (kill) -- Unix only
 nix = { workspace = true }
 libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+zlayer-wsl = { workspace = true }
 
 [lints]
 workspace = true

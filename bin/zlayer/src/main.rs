@@ -32,7 +32,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 use std::os::unix::io::AsRawFd;
 
 use cli::{Cli, Commands};
@@ -82,7 +82,14 @@ fn main() -> ExitCode {
             }
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            eprintln!("On Windows, use 'zlayer serve' to start the daemon inside WSL2.");
+            eprintln!("The daemon runs automatically inside WSL2 when needed.");
+            return ExitCode::SUCCESS;
+        }
+
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             use std::fs::{self, OpenOptions};
 
@@ -212,6 +219,7 @@ fn main() -> ExitCode {
 
 /// Install and start zlayer as a launchd service on macOS.
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_lines, unsafe_code)]
 fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
     use std::fs;
     use std::process::Command;
@@ -261,7 +269,7 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
 
     if let Some(ref secret) = jwt_secret {
         args.push("        <string>--jwt-secret</string>".to_string());
-        args.push(format!("        <string>{}</string>", secret));
+        args.push(format!("        <string>{secret}</string>"));
     }
 
     if no_swagger {
@@ -285,12 +293,11 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
     // Build EnvironmentVariables section
     let env_xml = if let Ok(home) = std::env::var("HOME") {
         format!(
-            r#"    <key>EnvironmentVariables</key>
+            r"    <key>EnvironmentVariables</key>
     <dict>
         <key>HOME</key>
-        <string>{}</string>
-    </dict>"#,
-            home
+        <string>{home}</string>
+    </dict>"
         )
     } else {
         String::new()
@@ -306,22 +313,21 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
     <string>com.zlayer.daemon</string>
     <key>ProgramArguments</key>
     <array>
-{}
+{args_xml}
     </array>
-{}
+{env_xml}
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
-    <string>{}</string>
+    <string>{log_path_str}</string>
     <key>StandardErrorPath</key>
-    <string>{}</string>
+    <string>{log_path_str}</string>
     <key>WorkingDirectory</key>
     <string>/</string>
 </dict>
-</plist>"#,
-        args_xml, env_xml, log_path_str, log_path_str
+</plist>"#
     );
 
     // Create log directory
@@ -334,13 +340,13 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
         "/Library/LaunchDaemons"
     } else {
         let home = std::env::var("HOME").context("HOME not set")?;
-        let dir = format!("{}/Library/LaunchAgents", home);
+        let dir = format!("{home}/Library/LaunchAgents");
         fs::create_dir_all(&dir).context("Failed to create ~/Library/LaunchAgents")?;
         // Leak the string so we get a &'static str -- only runs once at startup
         Box::leak(dir.into_boxed_str())
     };
 
-    let plist_path = format!("{}/com.zlayer.daemon.plist", plist_dir);
+    let plist_path = format!("{plist_dir}/com.zlayer.daemon.plist");
 
     // Unload any existing service first (ignore errors)
     let _ = Command::new("launchctl")
@@ -352,14 +358,14 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
 
     // Write and load the plist
     fs::write(&plist_path, &plist)
-        .with_context(|| format!("Failed to write plist to {}", plist_path))?;
+        .with_context(|| format!("Failed to write plist to {plist_path}"))?;
 
     let domain = if is_root { "system" } else { "gui" };
     let uid = unsafe { libc::getuid() };
     let target = if is_root {
         domain.to_string()
     } else {
-        format!("{}/{}", domain, uid)
+        format!("{domain}/{uid}")
     };
 
     let status = Command::new("launchctl")
