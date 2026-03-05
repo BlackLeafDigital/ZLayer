@@ -92,5 +92,7 @@ tailwind-input-file = "./tailwind.css"
 # Features
 bin-features = ["ssr"]
 lib-features = ["hydrate"]
+# Assets directory
+assets-dir = "assets"
 # Hash files for cache busting
 hash-files = true

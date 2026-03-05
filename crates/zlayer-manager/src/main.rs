@@ -106,9 +106,13 @@ async fn start_server(
     let pkg_dir = format!("{site_root}/pkg");
     tracing::info!("Serving WASM package from {}", pkg_dir);
 
+    let assets_dir = format!("{site_root}/assets");
+    tracing::info!("Serving static assets from {}", assets_dir);
+
     let app = leptos_router
         .route("/health", get(|| async { "ok" }))
         .nest_service("/pkg", ServeDir::new(&pkg_dir))
+        .nest_service("/assets", ServeDir::new(&assets_dir))
         .with_state(leptos_options);
 
     tracing::info!("Binding TCP listener to {}", addr);
