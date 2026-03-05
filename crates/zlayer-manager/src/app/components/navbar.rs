@@ -4,9 +4,13 @@
 
 use leptos::prelude::*;
 
+use crate::app::server_fns::get_runtime_name;
+
 /// Navbar component for ZLayer Manager
 #[component]
 pub fn Navbar() -> impl IntoView {
+    let runtime = Resource::new(|| (), |()| get_runtime_name());
+
     view! {
         <div class="navbar bg-base-200 border-b border-base-300 sticky top-0 z-30">
             <div class="flex-none lg:hidden">
@@ -20,7 +24,16 @@ pub fn Navbar() -> impl IntoView {
                 <span class="text-lg font-semibold lg:hidden">"ZLayer"</span>
             </div>
             <div class="flex-none gap-2">
-                <div class="badge badge-ghost badge-sm">"mac-sandbox"</div>
+                <Suspense fallback=move || view! { <div class="badge badge-ghost badge-sm">"..."</div> }>
+                    {move || {
+                        runtime
+                            .get()
+                            .map(|result| {
+                                let name = result.unwrap_or_else(|_| "auto".to_string());
+                                view! { <div class="badge badge-ghost badge-sm">{name}</div> }
+                            })
+                    }}
+                </Suspense>
                 <button class="btn btn-square btn-ghost btn-sm" title="Toggle theme">
                     <svg
                         xmlns="http://www.w3.org/2000/svg"

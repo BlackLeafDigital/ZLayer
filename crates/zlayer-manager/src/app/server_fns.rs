@@ -37,11 +37,19 @@ fn api_error_to_server_error(err: &ApiClientError) -> ServerFnError {
 // Response Types
 // ============================================================================
 
+/// Default runtime name when the field is absent from JSON (backwards compat).
+fn default_runtime_name() -> String {
+    "auto".to_string()
+}
+
 /// System statistics for the manager dashboard
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SystemStats {
     /// Version of zlayer-manager
     pub version: String,
+    /// Container runtime name (e.g. "youki", "mac-sandbox", "docker")
+    #[serde(default = "default_runtime_name")]
+    pub runtime_name: String,
     /// Total number of nodes in the cluster
     pub total_nodes: u32,
     /// Number of healthy nodes
@@ -222,6 +230,7 @@ pub async fn get_system_stats() -> Result<SystemStats, ServerFnError> {
 
     Ok(SystemStats {
         version: health.version,
+        runtime_name: health.runtime_name,
         // Nodes are not yet exposed via API, so we default to 0
         total_nodes: 0,
         healthy_nodes: 0,
@@ -232,6 +241,20 @@ pub async fn get_system_stats() -> Result<SystemStats, ServerFnError> {
         memory_percent: 0.0,
         uptime_seconds: health.uptime_secs.unwrap_or(0),
     })
+}
+
+/// Get the runtime name from the API health endpoint.
+///
+/// Lightweight call used by the navbar badge so it doesn't need to fetch
+/// full system stats.
+#[server(prefix = "/api/manager")]
+pub async fn get_runtime_name() -> Result<String, ServerFnError> {
+    let client = get_api_client();
+    let health = client
+        .health()
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    Ok(health.runtime_name)
 }
 
 /// Get all nodes in the cluster
@@ -934,6 +957,7 @@ mod tests {
     fn test_system_stats_serialize() {
         let stats = SystemStats {
             version: "1.0.0".to_string(),
+            runtime_name: "youki".to_string(),
             total_nodes: 5,
             healthy_nodes: 4,
             total_deployments: 10,
@@ -946,6 +970,7 @@ mod tests {
         assert!(json.contains("1.0.0"));
         assert!(json.contains("\"total_nodes\":5"));
         assert!(json.contains("45.5"));
+        assert!(json.contains("\"runtime_name\":\"youki\""));
     }
 
     #[test]
@@ -1503,6 +1528,7 @@ mod tests {
     fn test_system_stats_roundtrip() {
         let original = SystemStats {
             version: "1.0.0".to_string(),
+            runtime_name: "docker".to_string(),
             total_nodes: 5,
             healthy_nodes: 4,
             total_deployments: 10,
@@ -1514,6 +1540,7 @@ mod tests {
         let json = serde_json::to_string(&original).unwrap();
         let restored: SystemStats = serde_json::from_str(&json).unwrap();
         assert_eq!(original.version, restored.version);
+        assert_eq!(original.runtime_name, restored.runtime_name);
         assert_eq!(original.total_nodes, restored.total_nodes);
         assert_eq!(original.uptime_seconds, restored.uptime_seconds);
     }
