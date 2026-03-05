@@ -80,6 +80,10 @@ pub fn build_router_with_storage(
         .route("/", post(handlers::deployments::create_deployment))
         .route("/{name}", get(handlers::deployments::get_deployment))
         .route("/{name}", delete(handlers::deployments::delete_deployment))
+        .route(
+            "/{name}/events",
+            get(handlers::deployments::stream_deployment_events),
+        )
         .with_state(deployment_state);
 
     // Service routes (use ServiceState - read-only in this router)
@@ -308,6 +312,10 @@ pub fn build_router_with_services(
         .route("/", post(handlers::deployments::create_deployment))
         .route("/{name}", get(handlers::deployments::get_deployment))
         .route("/{name}", delete(handlers::deployments::delete_deployment))
+        .route(
+            "/{name}/events",
+            get(handlers::deployments::stream_deployment_events),
+        )
         .with_state(deployment_state);
 
     // Service routes (use ServiceState for scaling operations)
@@ -413,6 +421,10 @@ pub fn build_router_with_deployment_state(
         .route("/", post(handlers::deployments::create_deployment))
         .route("/{name}", get(handlers::deployments::get_deployment))
         .route("/{name}", delete(handlers::deployments::delete_deployment))
+        .route(
+            "/{name}/events",
+            get(handlers::deployments::stream_deployment_events),
+        )
         .with_state(deployment_state);
 
     // Service routes (use ServiceState for scaling operations)

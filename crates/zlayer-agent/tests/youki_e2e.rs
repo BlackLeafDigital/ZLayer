@@ -865,7 +865,7 @@ async fn test_cleanup_state_directory() {
         tokio::time::sleep(Duration::from_millis(500)).await;
 
         // State directory should exist
-        let state_dir = format!("{}/state/{}-{}", E2E_TEST_DIR, id.service, id.replica);
+        let state_dir = format!("{E2E_TEST_DIR}/state/{}-{}", id.service, id.replica);
         let exists_before = tokio::fs::metadata(&state_dir).await.is_ok();
         println!("State directory {state_dir} exists before removal: {exists_before}");
 
@@ -1005,14 +1005,13 @@ async fn test_service_instance_full_integration() {
         {
             let containers = instance.containers().read().await;
             for (id, container) in containers.iter() {
-                println!("Container {}: overlay_ip = {:?}", id, container.overlay_ip);
+                println!("Container {id}: overlay_ip = {:?}", container.overlay_ip);
                 if overlay.is_some() {
                     // Overlay manager was available; check if IP was assigned
                     // Note: IP assignment may fail if overlay setup failed (e.g., missing CAP_NET_ADMIN)
                     if container.overlay_ip.is_some() {
                         println!(
-                            "Container {} has overlay IP: {}",
-                            id,
+                            "Container {id} has overlay IP: {}",
                             container.overlay_ip.unwrap()
                         );
 

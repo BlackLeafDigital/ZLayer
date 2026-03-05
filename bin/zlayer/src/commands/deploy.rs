@@ -14,7 +14,7 @@ use anyhow::{Context, Result};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::cli::Cli;
 use crate::daemon_client::DaemonClient;
@@ -169,14 +169,237 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
         "Deployment submitted"
     );
 
-    // Poll for readiness with a timeout
+    // ------------------------------------------------------------------
+    // Foreground mode: stream SSE events for real-time progress
+    // ------------------------------------------------------------------
+    if !cli.detach && !cli.background {
+        match client.watch_deployment(&deployment_name).await {
+            Ok(mut rx) => {
+                let mut deployment_ready = false;
+                let mut deployment_failed = false;
+                let mut failure_message = String::new();
+
+                while let Some((event_type, data)) = rx.recv().await {
+                    match event_type.as_str() {
+                        "started" => {
+                            let services: Vec<String> = serde_json::from_str(&data)
+                                .ok()
+                                .and_then(|v: serde_json::Value| {
+                                    v.get("services").and_then(|s| s.as_array()).map(|arr| {
+                                        arr.iter()
+                                            .filter_map(|s| s.as_str().map(String::from))
+                                            .collect()
+                                    })
+                                })
+                                .unwrap_or_default();
+                            emit(
+                                &tx,
+                                DeployEvent::Log {
+                                    level: LogLevel::Info,
+                                    message: format!(
+                                        "Orchestrating {} service(s): {}",
+                                        services.len(),
+                                        services.join(", ")
+                                    ),
+                                },
+                            );
+                        }
+                        "service_registered" => {
+                            if let Some(svc) = parse_service_field(&data) {
+                                emit(
+                                    &tx,
+                                    DeployEvent::Log {
+                                        level: LogLevel::Info,
+                                        message: format!("  [{svc}] registered"),
+                                    },
+                                );
+                            }
+                        }
+                        "service_registration_failed" => {
+                            if let Some((svc, err)) = parse_service_error_fields(&data) {
+                                emit(
+                                    &tx,
+                                    DeployEvent::Log {
+                                        level: LogLevel::Warn,
+                                        message: format!("  [{svc}] registration failed: {err}"),
+                                    },
+                                );
+                            }
+                        }
+                        "overlay_created" => {
+                            if let Some(svc) = parse_service_field(&data) {
+                                let iface = serde_json::from_str::<serde_json::Value>(&data)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("interface")
+                                            .and_then(|i| i.as_str())
+                                            .map(String::from)
+                                    })
+                                    .unwrap_or_default();
+                                emit(
+                                    &tx,
+                                    DeployEvent::Log {
+                                        level: LogLevel::Info,
+                                        message: format!("  [{svc}] overlay network: {iface}"),
+                                    },
+                                );
+                            }
+                        }
+                        "overlay_failed" => {
+                            if let Some((svc, err)) = parse_service_error_fields(&data) {
+                                emit(
+                                    &tx,
+                                    DeployEvent::Log {
+                                        level: LogLevel::Warn,
+                                        message: format!(
+                                            "  [{svc}] overlay failed (non-fatal): {err}"
+                                        ),
+                                    },
+                                );
+                            }
+                        }
+                        "proxy_configured" => {
+                            if let Some(svc) = parse_service_field(&data) {
+                                emit(
+                                    &tx,
+                                    DeployEvent::Log {
+                                        level: LogLevel::Info,
+                                        message: format!("  [{svc}] proxy configured"),
+                                    },
+                                );
+                            }
+                        }
+                        "proxy_failed" => {
+                            if let Some((svc, err)) = parse_service_error_fields(&data) {
+                                emit(
+                                    &tx,
+                                    DeployEvent::Log {
+                                        level: LogLevel::Warn,
+                                        message: format!(
+                                            "  [{svc}] proxy failed (non-fatal): {err}"
+                                        ),
+                                    },
+                                );
+                            }
+                        }
+                        "service_scaling" => {
+                            if let Some(svc) = parse_service_field(&data) {
+                                let target = serde_json::from_str::<serde_json::Value>(&data)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("target").and_then(serde_json::Value::as_u64)
+                                    })
+                                    .unwrap_or(0);
+                                emit(
+                                    &tx,
+                                    DeployEvent::Log {
+                                        level: LogLevel::Info,
+                                        message: format!(
+                                            "  [{svc}] scaling to {target} replica(s)..."
+                                        ),
+                                    },
+                                );
+                            }
+                        }
+                        "service_scaled" => {
+                            if let Some(svc) = parse_service_field(&data) {
+                                let replicas = serde_json::from_str::<serde_json::Value>(&data)
+                                    .ok()
+                                    .and_then(|v| {
+                                        v.get("replicas").and_then(serde_json::Value::as_u64)
+                                    })
+                                    .unwrap_or(0);
+                                emit(
+                                    &tx,
+                                    DeployEvent::Log {
+                                        level: LogLevel::Info,
+                                        message: format!(
+                                            "  [{svc}] scaled to {replicas} replica(s)"
+                                        ),
+                                    },
+                                );
+                            }
+                        }
+                        "service_scale_failed" => {
+                            if let Some((svc, err)) = parse_service_error_fields(&data) {
+                                emit(
+                                    &tx,
+                                    DeployEvent::Log {
+                                        level: LogLevel::Warn,
+                                        message: format!("  [{svc}] scaling failed: {err}"),
+                                    },
+                                );
+                            }
+                        }
+                        "stabilizing" => {
+                            emit(
+                                &tx,
+                                DeployEvent::Log {
+                                    level: LogLevel::Info,
+                                    message: "Waiting for stabilization...".to_string(),
+                                },
+                            );
+                        }
+                        "ready" => {
+                            deployment_ready = true;
+                        }
+                        "failed" => {
+                            deployment_failed = true;
+                            failure_message = serde_json::from_str::<serde_json::Value>(&data)
+                                .ok()
+                                .and_then(|v| {
+                                    v.get("message").and_then(|m| m.as_str()).map(String::from)
+                                })
+                                .unwrap_or_else(|| "Unknown failure".to_string());
+                        }
+                        other => {
+                            debug!(event = other, "Unrecognized SSE deployment event");
+                        }
+                    }
+                }
+
+                // Stream ended -- handle terminal state
+                if deployment_ready {
+                    return print_deployment_success(&client, &deployment_name, &spec, &tx, cli)
+                        .await;
+                } else if deployment_failed {
+                    return print_deployment_failure(
+                        &client,
+                        &deployment_name,
+                        &spec,
+                        &failure_message,
+                    );
+                }
+
+                // Stream closed without terminal event -- fall through to poll
+                emit(
+                    &tx,
+                    DeployEvent::Log {
+                        level: LogLevel::Warn,
+                        message:
+                            "SSE stream ended without terminal event, falling back to polling..."
+                                .to_string(),
+                    },
+                );
+            }
+            Err(e) => {
+                debug!(error = %e, "Failed to connect to SSE event stream, falling back to polling");
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Background / detach / fallback: poll for readiness
+    // ------------------------------------------------------------------
     let poll_timeout = Duration::from_secs(120);
     let poll_interval = Duration::from_secs(2);
     let start = std::time::Instant::now();
     let mut last_status = status.to_string();
+    let mut attempt: u32 = 0;
 
     while start.elapsed() < poll_timeout {
         tokio::time::sleep(poll_interval).await;
+        attempt += 1;
 
         match client.get_deployment(&deployment_name).await {
             Ok(deployment) => {
@@ -202,177 +425,22 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                 // Terminal states
                 match current_status.as_str() {
                     "running" | "active" => {
-                        // Use service_health from daemon response if available,
-                        // fall back to spec-based summary
-                        let service_health =
-                            deployment.get("service_health").and_then(|v| v.as_array());
-
-                        let total_services = spec.services.len();
-                        let healthy_count = if let Some(health_arr) = service_health {
-                            health_arr
-                                .iter()
-                                .filter(|s| {
-                                    let running = s
-                                        .get("replicas_running")
-                                        .and_then(serde_json::Value::as_u64)
-                                        .unwrap_or(0);
-                                    let desired = s
-                                        .get("replicas_desired")
-                                        .and_then(serde_json::Value::as_u64)
-                                        .unwrap_or(0);
-                                    running >= desired
-                                })
-                                .count()
-                        } else {
-                            total_services
-                        };
-
-                        // Print enhanced success output
-                        println!();
-                        println!(
-                            "Deployment '{deployment_name}' ready ({healthy_count}/{total_services} services healthy):"
-                        );
-
-                        if let Some(health_arr) = service_health {
-                            for svc in health_arr {
-                                let name = svc.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                                let running = svc
-                                    .get("replicas_running")
-                                    .and_then(serde_json::Value::as_u64)
-                                    .unwrap_or(0);
-                                let desired = svc
-                                    .get("replicas_desired")
-                                    .and_then(serde_json::Value::as_u64)
-                                    .unwrap_or(0);
-                                let endpoints = svc
-                                    .get("endpoints")
-                                    .and_then(|v| v.as_array())
-                                    .map(|arr| {
-                                        arr.iter()
-                                            .filter_map(|e| e.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join(", ")
-                                    })
-                                    .unwrap_or_default();
-
-                                if endpoints.is_empty() {
-                                    println!("  {name}: {running}/{desired} replicas");
-                                } else {
-                                    println!(
-                                        "  {name}: {endpoints} ({running}/{desired} replicas)"
-                                    );
-                                }
-                            }
-                        } else {
-                            // Fall back to spec-based display
-                            for (name, svc) in &spec.services {
-                                let replicas = match &svc.scale {
-                                    zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
-                                    zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
-                                    zlayer_spec::ScaleSpec::Manual => 0,
-                                };
-                                let endpoints: Vec<String> = svc
-                                    .endpoints
-                                    .iter()
-                                    .map(|ep| {
-                                        format!(
-                                            "{}://localhost:{}",
-                                            format!("{:?}", ep.protocol).to_lowercase(),
-                                            ep.port
-                                        )
-                                    })
-                                    .collect();
-                                if endpoints.is_empty() {
-                                    println!("  {name}: {replicas}/{replicas} replicas");
-                                } else {
-                                    println!(
-                                        "  {}: {} ({}/{} replicas)",
-                                        name,
-                                        endpoints.join(", "),
-                                        replicas,
-                                        replicas
-                                    );
-                                }
-                            }
-                        }
-                        println!("Use 'zlayer ps' for details, 'zlayer logs SERVICE' for logs");
-
-                        // Also emit the event for the TUI logger
-                        let summary_services: Vec<(String, u32)> = spec
-                            .services
-                            .iter()
-                            .map(|(name, svc)| {
-                                let replicas = match &svc.scale {
-                                    zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
-                                    zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
-                                    zlayer_spec::ScaleSpec::Manual => 0,
-                                };
-                                (name.clone(), replicas)
-                            })
-                            .collect();
-                        emit(
+                        return print_deployment_success(
+                            &client,
+                            &deployment_name,
+                            &spec,
                             &tx,
-                            DeployEvent::DeploymentRunning {
-                                services: summary_services,
-                            },
-                        );
-
-                        // In foreground mode, wait for Ctrl+C
-                        if !cli.detach && !cli.background {
-                            emit(
-                                &tx,
-                                DeployEvent::Log {
-                                    level: LogLevel::Info,
-                                    message: "Deployment running. Press Ctrl+C to detach (daemon keeps running).".to_string(),
-                                },
-                            );
-                            wait_for_ctrl_c_or_status(&client, &deployment_name, &tx, &spec).await;
-                        }
-
-                        return Ok(());
+                            cli,
+                        )
+                        .await;
                     }
                     s if s.starts_with("failed") || s == "error" => {
-                        // Print enhanced failure output
-                        eprintln!();
-                        eprintln!("Deployment '{deployment_name}' failed:");
-
-                        if let Some(health_arr) =
-                            deployment.get("service_health").and_then(|v| v.as_array())
-                        {
-                            for svc in health_arr {
-                                let name = svc.get("name").and_then(|v| v.as_str()).unwrap_or("?");
-                                let running = svc
-                                    .get("replicas_running")
-                                    .and_then(serde_json::Value::as_u64)
-                                    .unwrap_or(0);
-                                let desired = svc
-                                    .get("replicas_desired")
-                                    .and_then(serde_json::Value::as_u64)
-                                    .unwrap_or(0);
-                                let health = svc
-                                    .get("health")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("unknown");
-                                eprintln!(
-                                    "  {name}: {running}/{desired} replicas ready ({health})"
-                                );
-                            }
-                        } else {
-                            // Fall back to spec-based display
-                            for (name, svc) in &spec.services {
-                                let desired = match &svc.scale {
-                                    zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
-                                    zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
-                                    zlayer_spec::ScaleSpec::Manual => 0,
-                                };
-                                eprintln!("  {name}: 0/{desired} replicas ready");
-                            }
-                        }
-                        eprintln!(
-                            "Use 'zlayer logs SERVICE' for full logs, 'zlayer down' to clean up"
-                        );
-
-                        anyhow::bail!("Deployment '{deployment_name}' failed",);
+                        let msg = deployment
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown failure")
+                            .to_string();
+                        return print_deployment_failure(&client, &deployment_name, &spec, &msg);
                     }
                     _ => {
                         // Still in progress -- keep polling
@@ -380,7 +448,12 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                 }
             }
             Err(e) => {
-                warn!(error = %e, "Failed to poll deployment status");
+                // Use debug for the first 15 attempts, warn after
+                if attempt <= 15 {
+                    debug!(error = %e, attempt, "Failed to poll deployment status");
+                } else {
+                    warn!(error = %e, attempt, "Failed to poll deployment status");
+                }
             }
         }
     }
@@ -457,6 +530,193 @@ pub(crate) async fn down(deployment: Option<String>) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Parse the `service` field from a JSON data payload.
+fn parse_service_field(data: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(data)
+        .ok()
+        .and_then(|v| v.get("service").and_then(|s| s.as_str()).map(String::from))
+}
+
+/// Parse the `service` and `error` fields from a JSON data payload.
+fn parse_service_error_fields(data: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(data).ok()?;
+    let svc = v.get("service").and_then(|s| s.as_str())?.to_string();
+    let err = v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    Some((svc, err))
+}
+
+/// Print deployment success output, fetch final health info from daemon, then
+/// optionally wait for Ctrl+C in foreground mode.
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+async fn print_deployment_success(
+    client: &DaemonClient,
+    deployment_name: &str,
+    spec: &zlayer_spec::DeploymentSpec,
+    tx: &mpsc::Sender<DeployEvent>,
+    cli: &Cli,
+) -> Result<()> {
+    // Fetch final deployment details for health summary
+    let deployment = client.get_deployment(deployment_name).await.ok();
+
+    let service_health = deployment
+        .as_ref()
+        .and_then(|d| d.get("service_health"))
+        .and_then(|v| v.as_array());
+
+    let total_services = spec.services.len();
+    let healthy_count = if let Some(health_arr) = service_health {
+        health_arr
+            .iter()
+            .filter(|s| {
+                let running = s
+                    .get("replicas_running")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let desired = s
+                    .get("replicas_desired")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                running >= desired
+            })
+            .count()
+    } else {
+        total_services
+    };
+
+    println!();
+    println!(
+        "Deployment '{deployment_name}' ready ({healthy_count}/{total_services} services healthy):"
+    );
+
+    if let Some(health_arr) = service_health {
+        for svc in health_arr {
+            let name = svc.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let running = svc
+                .get("replicas_running")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let desired = svc
+                .get("replicas_desired")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let endpoints = svc
+                .get("endpoints")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|e| e.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+
+            if endpoints.is_empty() {
+                println!("  {name}: {running}/{desired} replicas");
+            } else {
+                println!("  {name}: {endpoints} ({running}/{desired} replicas)");
+            }
+        }
+    } else {
+        for (name, svc) in &spec.services {
+            let replicas = match &svc.scale {
+                zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+                zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
+                zlayer_spec::ScaleSpec::Manual => 0,
+            };
+            let endpoints: Vec<String> = svc
+                .endpoints
+                .iter()
+                .map(|ep| {
+                    format!(
+                        "{}://localhost:{}",
+                        format!("{:?}", ep.protocol).to_lowercase(),
+                        ep.port
+                    )
+                })
+                .collect();
+            if endpoints.is_empty() {
+                println!("  {name}: {replicas}/{replicas} replicas");
+            } else {
+                println!(
+                    "  {}: {} ({}/{} replicas)",
+                    name,
+                    endpoints.join(", "),
+                    replicas,
+                    replicas
+                );
+            }
+        }
+    }
+    println!("Use 'zlayer ps' for details, 'zlayer logs SERVICE' for logs");
+
+    let summary_services: Vec<(String, u32)> = spec
+        .services
+        .iter()
+        .map(|(name, svc)| {
+            let replicas = match &svc.scale {
+                zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+                zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
+                zlayer_spec::ScaleSpec::Manual => 0,
+            };
+            (name.clone(), replicas)
+        })
+        .collect();
+    emit(
+        tx,
+        DeployEvent::DeploymentRunning {
+            services: summary_services,
+        },
+    );
+
+    // In foreground mode, wait for Ctrl+C
+    if !cli.detach && !cli.background {
+        emit(
+            tx,
+            DeployEvent::Log {
+                level: LogLevel::Info,
+                message: "Deployment running. Press Ctrl+C to detach (daemon keeps running)."
+                    .to_string(),
+            },
+        );
+        wait_for_ctrl_c_or_status(client, deployment_name, tx, spec).await;
+    }
+
+    Ok(())
+}
+
+/// Print deployment failure output and bail.
+#[allow(clippy::cast_possible_truncation)]
+fn print_deployment_failure(
+    client: &DaemonClient,
+    deployment_name: &str,
+    spec: &zlayer_spec::DeploymentSpec,
+    message: &str,
+) -> Result<()> {
+    // We intentionally don't fetch health info here to avoid blocking on a
+    // potentially unresponsive daemon. The SSE stream already gave us the
+    // failure message.
+    let _ = client; // suppress unused warning
+
+    eprintln!();
+    eprintln!("Deployment '{deployment_name}' failed: {message}");
+
+    for (name, svc) in &spec.services {
+        let desired = match &svc.scale {
+            zlayer_spec::ScaleSpec::Fixed { replicas } => *replicas,
+            zlayer_spec::ScaleSpec::Adaptive { min, .. } => *min,
+            zlayer_spec::ScaleSpec::Manual => 0,
+        };
+        eprintln!("  {name}: 0/{desired} replicas ready");
+    }
+    eprintln!("Use 'zlayer logs SERVICE' for full logs, 'zlayer down' to clean up");
+
+    anyhow::bail!("Deployment '{deployment_name}' failed")
+}
 
 /// Wait for Ctrl+C in foreground mode, periodically polling the daemon for
 /// deployment status and printing updates.

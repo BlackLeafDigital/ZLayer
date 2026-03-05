@@ -480,6 +480,116 @@ cmd_clean() {
 }
 
 # ============================================================
+# smoke — E2E proxy smoke test
+# ============================================================
+cmd_smoke() {
+    header "Smoke test: proxy E2E ($PLATFORM / $ARCH_LABEL)"
+
+    # Build if needed
+    if [ ! -f target/release/zlayer ]; then
+        info "Missing binary, running build first..."
+        cmd_build
+    fi
+
+    local SMOKE_SPEC="/tmp/zlayer-smoke-test.yml"
+    local ZLAYER="./target/release/zlayer"
+
+    # Create a simple nginx deploy spec
+    cat > "$SMOKE_SPEC" << 'YAML'
+version: v1
+deployment: smoke-test
+services:
+  web:
+    rtype: service
+    image:
+      name: docker.io/library/nginx:alpine
+    endpoints:
+      - name: http
+        protocol: http
+        port: 80
+        expose: public
+    scale:
+      mode: fixed
+      replicas: 1
+    health:
+      check:
+        type: tcp
+        port: 80
+      retries: 3
+YAML
+
+    # Stop any existing daemon
+    info "Cleaning up existing daemons..."
+    run_priv pkill -f "zlayer serve" 2>/dev/null || true
+    sleep 1
+    run_priv pkill -9 -f "zlayer serve" 2>/dev/null || true
+    run_priv rm -f "$SOCKET"
+
+    # Start daemon
+    info "Starting daemon..."
+    run_priv "$ZLAYER" serve --daemon --bind "0.0.0.0:3669" --socket "$SOCKET"
+    sleep 3
+
+    # Verify daemon is running
+    if ! run_priv "$ZLAYER" status >/dev/null 2>&1; then
+        fail "Daemon failed to start"
+        rm -f "$SMOKE_SPEC"
+        return 1
+    fi
+    ok "Daemon running"
+
+    # Deploy (foreground — waits via SSE for completion)
+    info "Deploying nginx smoke test service..."
+    if ! run_priv "$ZLAYER" --no-tui -d deploy "$SMOKE_SPEC"; then
+        fail "Deployment failed"
+        run_priv "$ZLAYER" --no-tui down smoke-test 2>/dev/null || true
+        rm -f "$SMOKE_SPEC"
+        return 1
+    fi
+    ok "Deployment ready"
+
+    # Wait for proxy port to be reachable
+    info "Verifying proxy routes traffic on port 80..."
+    local attempts=0
+    local max_attempts=30
+    while [ $attempts -lt $max_attempts ]; do
+        if curl -sf -o /dev/null --max-time 2 http://localhost:80 2>/dev/null; then
+            break
+        fi
+        attempts=$((attempts + 1))
+        sleep 1
+    done
+
+    if [ $attempts -ge $max_attempts ]; then
+        fail "Proxy did not respond on port 80 after ${max_attempts}s"
+        run_priv "$ZLAYER" --no-tui down smoke-test 2>/dev/null || true
+        rm -f "$SMOKE_SPEC"
+        return 1
+    fi
+
+    # Verify HTTP 200
+    local http_code
+    http_code=$(curl -sf -o /dev/null -w "%{http_code}" --max-time 5 http://localhost:80 2>/dev/null)
+    if [ "$http_code" = "200" ]; then
+        ok "HTTP 200 from proxy (nginx welcome page)"
+    else
+        fail "Unexpected HTTP response: $http_code"
+        run_priv "$ZLAYER" --no-tui down smoke-test 2>/dev/null || true
+        rm -f "$SMOKE_SPEC"
+        return 1
+    fi
+
+    # Cleanup
+    info "Cleaning up smoke test..."
+    run_priv "$ZLAYER" --no-tui down smoke-test 2>/dev/null || true
+    run_priv pkill -f "zlayer serve" 2>/dev/null || true
+    rm -f "$SMOKE_SPEC"
+
+    echo ""
+    ok "Proxy smoke test passed"
+}
+
+# ============================================================
 # help
 # ============================================================
 cmd_help() {
@@ -494,6 +604,7 @@ ${BOLD}Commands:${NC}
   test      Run workspace + platform-specific tests
   dev       Run manager with live reload (cargo-leptos watch)
   deploy    Full deploy with overlay networking (macOS: sandbox, Linux: youki)
+  smoke     E2E proxy smoke test (deploy nginx, verify traffic routing)
   clean     Kill daemons, remove sockets/containers/logs
   help      Show this help
 
@@ -518,6 +629,7 @@ case "$CMD" in
     test)    cmd_test ;;
     dev)     cmd_dev ;;
     deploy)  cmd_deploy ;;
+    smoke)   cmd_smoke ;;
     clean)   cmd_clean ;;
     help|-h|--help) cmd_help ;;
     default)

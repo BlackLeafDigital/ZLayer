@@ -240,6 +240,11 @@ impl PersistentBlobCache {
     }
 
     /// Evict blobs using LRU if cache is over size limit
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
     async fn evict_if_needed(&self) -> Result<(), CacheError> {
         let current_size = self.size().await?;
         if current_size <= self.max_size_bytes {
