@@ -567,7 +567,7 @@ cmd: ["./app.sh"]
         ));
 
         // Should contain RUN, COPY, WORKDIR, CMD
-        let names: Vec<&str> = stage.instructions.iter().map(|i| i.name()).collect();
+        let names: Vec<&str> = stage.instructions.iter().map(Instruction::name).collect();
         assert!(names.contains(&"RUN"));
         assert!(names.contains(&"COPY"));
         assert!(names.contains(&"WORKDIR"));

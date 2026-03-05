@@ -971,7 +971,7 @@ mod tests {
 
     #[test]
     fn test_build_storage_routes_default() {
-        let storage_state = StorageState::default();
+        let storage_state = StorageState;
         let _routes = build_storage_routes(storage_state);
         // Routes build without error (disabled replicator)
     }

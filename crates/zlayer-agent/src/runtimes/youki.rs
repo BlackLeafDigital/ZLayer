@@ -1692,8 +1692,7 @@ mod tests {
 
         for (status, expected) in mappings {
             let state = match status {
-                ContainerStatus::Creating => ContainerState::Pending,
-                ContainerStatus::Created => ContainerState::Pending,
+                ContainerStatus::Creating | ContainerStatus::Created => ContainerState::Pending,
                 ContainerStatus::Running => ContainerState::Running,
                 ContainerStatus::Stopped => ContainerState::Exited { code: 0 },
                 ContainerStatus::Paused => ContainerState::Stopping,
@@ -1761,7 +1760,7 @@ mod tests {
         assert_eq!(cloned.deployment_name, config.deployment_name);
     }
 
-    /// Test that YoukiRuntime::new() creates directories
+    /// Test that `YoukiRuntime::new()` creates directories
     #[tokio::test]
     async fn test_youki_runtime_directory_creation() {
         // Use a unique temp directory based on test run

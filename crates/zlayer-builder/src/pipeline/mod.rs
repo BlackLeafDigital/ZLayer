@@ -117,11 +117,11 @@ mod tests {
 
     #[test]
     fn test_parse_minimal_pipeline() {
-        let yaml = r#"
+        let yaml = r"
 images:
   app:
     file: Dockerfile
-"#;
+";
         let pipeline = parse_pipeline(yaml).unwrap();
         assert_eq!(pipeline.images.len(), 1);
         assert!(pipeline.images.contains_key("app"));
@@ -173,7 +173,7 @@ images:
 
     #[test]
     fn test_image_order_preserved() {
-        let yaml = r#"
+        let yaml = r"
 images:
   third:
     file: Dockerfile.third
@@ -181,7 +181,7 @@ images:
     file: Dockerfile.first
   second:
     file: Dockerfile.second
-"#;
+";
         let pipeline = parse_pipeline(yaml).unwrap();
         let keys: Vec<&String> = pipeline.images.keys().collect();
         assert_eq!(keys, vec!["third", "first", "second"]);
@@ -252,11 +252,11 @@ images:
 
     #[test]
     fn test_empty_vars_and_defaults() {
-        let yaml = r#"
+        let yaml = r"
 images:
   app:
     file: Dockerfile
-"#;
+";
         let pipeline = parse_pipeline(yaml).unwrap();
         assert!(pipeline.vars.is_empty());
         assert!(pipeline.defaults.format.is_none());
@@ -288,10 +288,10 @@ images:
 
     #[test]
     fn test_parse_error_message() {
-        let yaml = r#"
+        let yaml = r"
 images:
   - this is invalid yaml structure
-"#;
+";
         let result = parse_pipeline(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();

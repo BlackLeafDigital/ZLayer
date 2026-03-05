@@ -213,6 +213,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_memory_percent_unlimited() {
         let stats = ContainerStats {
             cpu_usage_usec: 0,
@@ -224,6 +225,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_memory_percent_zero_limit() {
         let stats = ContainerStats {
             cpu_usage_usec: 0,
@@ -263,6 +265,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_calculate_cpu_percent_zero_time() {
         let now = Instant::now();
         let stats = ContainerStats {
@@ -278,6 +281,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_calculate_cpu_percent_zero_cpus() {
         let now = Instant::now();
         let prev = ContainerStats {

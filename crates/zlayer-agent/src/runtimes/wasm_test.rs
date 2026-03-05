@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn test_host_builder_new() {
         let host = TestHost::new();
-        assert!(host.is_ok(), "Failed to create TestHost: {:?}", host);
+        assert!(host.is_ok(), "Failed to create TestHost: {host:?}");
     }
 
     #[test]
@@ -1577,7 +1577,7 @@ mod tests {
             .with_config("key", "value")
             .with_plugin_id("my-plugin");
 
-        let debug = format!("{:?}", host);
+        let debug = format!("{host:?}");
         assert!(debug.contains("TestHost"));
         assert!(debug.contains("my-plugin"));
     }
@@ -1597,7 +1597,7 @@ mod tests {
             min_log_level: LogLevel::Trace,
         };
 
-        let debug = format!("{:?}", state);
+        let debug = format!("{state:?}");
         assert!(debug.contains("TestHostState"));
         assert!(debug.contains("test"));
     }

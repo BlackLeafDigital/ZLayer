@@ -616,8 +616,7 @@ mod tests {
         let supported = is_platform_supported();
 
         match (os, arch) {
-            ("linux", "x86_64" | "aarch64") => assert!(supported),
-            ("macos", "x86_64" | "aarch64") => assert!(supported),
+            ("linux" | "macos", "x86_64" | "aarch64") => assert!(supported),
             _ => assert!(!supported),
         }
     }

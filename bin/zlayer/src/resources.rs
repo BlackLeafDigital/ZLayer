@@ -308,7 +308,7 @@ mod tests {
     #[test]
     fn test_detect_cpu_total_is_positive() {
         let cpus = detect_cpu_total();
-        assert!(cpus >= 1.0, "Expected at least 1 CPU, got {}", cpus);
+        assert!(cpus >= 1.0, "Expected at least 1 CPU, got {cpus}");
     }
 
     #[cfg(target_os = "linux")]
@@ -318,8 +318,7 @@ mod tests {
         // Any machine should have at least 64 MB
         assert!(
             mem >= 64 * 1024 * 1024,
-            "Expected at least 64 MB, got {} bytes",
-            mem
+            "Expected at least 64 MB, got {mem} bytes"
         );
     }
 
@@ -330,9 +329,7 @@ mod tests {
         let used = detect_memory_used();
         assert!(
             used <= total,
-            "Used memory ({}) should not exceed total ({})",
-            used,
-            total
+            "Used memory ({used}) should not exceed total ({total})"
         );
     }
 
@@ -351,13 +348,12 @@ mod tests {
         let used = detect_disk_used(&dir);
         assert!(
             used <= total,
-            "Disk used ({}) should not exceed total ({})",
-            used,
-            total
+            "Disk used ({used}) should not exceed total ({total})"
         );
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_detect_system_resources_all_fields() {
         let dir = PathBuf::from("/tmp");
         let res = detect_system_resources(&dir);
@@ -398,12 +394,10 @@ mod tests {
     fn test_cpu_used_bounded() {
         let used = detect_cpu_used();
         let total = detect_cpu_total();
-        assert!(used >= 0.0, "CPU used should be non-negative, got {}", used);
+        assert!(used >= 0.0, "CPU used should be non-negative, got {used}");
         assert!(
             used <= total,
-            "CPU used ({}) should not exceed total ({})",
-            used,
-            total
+            "CPU used ({used}) should not exceed total ({total})"
         );
     }
 

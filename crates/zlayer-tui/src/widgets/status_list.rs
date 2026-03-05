@@ -328,7 +328,10 @@ mod tests {
     }
 
     fn buffer_text(buf: &Buffer) -> String {
-        buf.content().iter().map(|c| c.symbol()).collect()
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     // -- Empty state --
@@ -419,7 +422,7 @@ mod tests {
         let area = Rect::new(0, 0, 40, 3);
 
         let items: Vec<Step> = (0..10)
-            .map(|i| Step::new(&format!("Step {}", i), ItemStatus::Pending))
+            .map(|i| Step::new(&format!("Step {i}"), ItemStatus::Pending))
             .collect();
 
         let list = StatusList::new(&items, 5);
@@ -472,7 +475,7 @@ mod tests {
         let area = Rect::new(0, 0, 40, 3);
 
         let items: Vec<Step> = (0..10)
-            .map(|i| Step::new(&format!("Step {}", i), ItemStatus::Pending))
+            .map(|i| Step::new(&format!("Step {i}"), ItemStatus::Pending))
             .collect();
 
         // Current = 0: window should start at 0
@@ -489,7 +492,7 @@ mod tests {
         let area = Rect::new(0, 0, 40, 3);
 
         let items: Vec<Step> = (0..10)
-            .map(|i| Step::new(&format!("Step {}", i), ItemStatus::Pending))
+            .map(|i| Step::new(&format!("Step {i}"), ItemStatus::Pending))
             .collect();
 
         // Current = 9 (last): window should show the last 3 items

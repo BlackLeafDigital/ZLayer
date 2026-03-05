@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn test_parse_from_yaml_str() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -63,7 +63,7 @@ services:
     rtype: service
     image:
       name: hello-world:latest
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_ok());
         let spec = result.unwrap();
@@ -77,49 +77,47 @@ services:
 
     #[test]
     fn test_invalid_version_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v2
 deployment: my-app
 services:
   hello:
     image:
       name: hello-world:latest
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("version") || err_str.contains("v1"),
-            "Error should mention version: {}",
-            err_str
+            "Error should mention version: {err_str}"
         );
     }
 
     #[test]
     fn test_empty_deployment_name_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: ab
 services:
   hello:
     image:
       name: hello-world:latest
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("deployment") || err_str.contains("3-63"),
-            "Error should mention deployment name: {}",
-            err_str
+            "Error should mention deployment name: {err_str}"
         );
     }
 
     #[test]
     fn test_invalid_port_zero_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -130,21 +128,20 @@ services:
       - name: http
         protocol: http
         port: 0
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("port"),
-            "Error should mention port: {}",
-            err_str
+            "Error should mention port: {err_str}"
         );
     }
 
     #[test]
     fn test_unknown_dependency_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -153,21 +150,20 @@ services:
       name: api:latest
     depends:
       - service: database
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("database") || err_str.contains("unknown"),
-            "Error should mention unknown dependency: {}",
-            err_str
+            "Error should mention unknown dependency: {err_str}"
         );
     }
 
     #[test]
     fn test_duplicate_endpoint_names_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -181,21 +177,20 @@ services:
       - name: http
         protocol: https
         port: 8443
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("http") || err_str.contains("duplicate"),
-            "Error should mention duplicate endpoint: {}",
-            err_str
+            "Error should mention duplicate endpoint: {err_str}"
         );
     }
 
     #[test]
     fn test_invalid_scale_range_min_gt_max_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -206,21 +201,20 @@ services:
       mode: adaptive
       min: 10
       max: 5
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("scale") || err_str.contains("min") || err_str.contains("max"),
-            "Error should mention scale range: {}",
-            err_str
+            "Error should mention scale range: {err_str}"
         );
     }
 
     #[test]
     fn test_invalid_cpu_zero_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -229,21 +223,20 @@ services:
       name: api:latest
     resources:
       cpu: 0
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("cpu") || err_str.contains("CPU"),
-            "Error should mention CPU: {}",
-            err_str
+            "Error should mention CPU: {err_str}"
         );
     }
 
     #[test]
     fn test_invalid_memory_format_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -252,15 +245,14 @@ services:
       name: api:latest
     resources:
       memory: 512MB
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("memory"),
-            "Error should mention memory format: {}",
-            err_str
+            "Error should mention memory format: {err_str}"
         );
     }
 
@@ -280,14 +272,13 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("image") || err_str.contains("empty"),
-            "Error should mention empty image name: {}",
-            err_str
+            "Error should mention empty image name: {err_str}"
         );
     }
 
     #[test]
     fn test_valid_spec_passes_validation() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-production-app
 services:
@@ -325,9 +316,9 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#;
+";
         let result = from_yaml_str(yaml);
-        assert!(result.is_ok(), "Valid spec should pass: {:?}", result);
+        assert!(result.is_ok(), "Valid spec should pass: {result:?}");
         let spec = result.unwrap();
         assert_eq!(spec.version, "v1");
         assert_eq!(spec.deployment, "my-production-app");
@@ -336,7 +327,7 @@ services:
 
     #[test]
     fn test_valid_dependency_passes() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -348,9 +339,9 @@ services:
   database:
     image:
       name: postgres:15
-"#;
+";
         let result = from_yaml_str(yaml);
-        assert!(result.is_ok(), "Valid dependency should pass: {:?}", result);
+        assert!(result.is_ok(), "Valid dependency should pass: {result:?}");
     }
 
     // =========================================================================
@@ -370,7 +361,7 @@ services:
     schedule: "0 0 0 * * * *"
 "#;
         let result = from_yaml_str(yaml);
-        assert!(result.is_ok(), "Valid cron job should pass: {:?}", result);
+        assert!(result.is_ok(), "Valid cron job should pass: {result:?}");
         let spec = result.unwrap();
         let cleanup = spec.services.get("cleanup").unwrap();
         assert_eq!(cleanup.rtype, ResourceType::Cron);
@@ -379,7 +370,7 @@ services:
 
     #[test]
     fn test_cron_without_schedule_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -387,15 +378,14 @@ services:
     rtype: cron
     image:
       name: cleanup:latest
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("schedule") || err_str.contains("cron"),
-            "Error should mention missing schedule: {}",
-            err_str
+            "Error should mention missing schedule: {err_str}"
         );
     }
 
@@ -417,8 +407,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("schedule") || err_str.contains("cron"),
-            "Error should mention schedule/cron mismatch: {}",
-            err_str
+            "Error should mention schedule/cron mismatch: {err_str}"
         );
     }
 
@@ -440,8 +429,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("schedule") || err_str.contains("cron"),
-            "Error should mention schedule/cron mismatch: {}",
-            err_str
+            "Error should mention schedule/cron mismatch: {err_str}"
         );
     }
 
@@ -463,8 +451,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("cron") || err_str.contains("schedule") || err_str.contains("invalid"),
-            "Error should mention invalid cron expression: {}",
-            err_str
+            "Error should mention invalid cron expression: {err_str}"
         );
     }
 
@@ -483,8 +470,7 @@ services:
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "Extended cron expression should be valid: {:?}",
-            result
+            "Extended cron expression should be valid: {result:?}"
         );
     }
 
@@ -515,8 +501,7 @@ services:
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "Mixed service types should be valid: {:?}",
-            result
+            "Mixed service types should be valid: {result:?}"
         );
         let spec = result.unwrap();
         assert_eq!(spec.services.len(), 3);
@@ -531,7 +516,7 @@ services:
 
     #[test]
     fn test_valid_endpoint_tunnel() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -545,18 +530,17 @@ services:
         tunnel:
           enabled: true
           remote_port: 8080
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "Valid endpoint tunnel should pass: {:?}",
-            result
+            "Valid endpoint tunnel should pass: {result:?}"
         );
     }
 
     #[test]
     fn test_valid_top_level_tunnel() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -569,12 +553,11 @@ tunnels:
     to: db-node
     local_port: 5432
     remote_port: 5432
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "Valid top-level tunnel should pass: {:?}",
-            result
+            "Valid top-level tunnel should pass: {result:?}"
         );
         let spec = result.unwrap();
         assert!(spec.tunnels.contains_key("db-access"));
@@ -582,7 +565,7 @@ tunnels:
 
     #[test]
     fn test_invalid_tunnel_ttl_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -598,21 +581,20 @@ services:
           access:
             enabled: true
             max_ttl: invalid
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("ttl") || err_str.contains("TTL") || err_str.contains("invalid"),
-            "Error should mention invalid TTL: {}",
-            err_str
+            "Error should mention invalid TTL: {err_str}"
         );
     }
 
     #[test]
     fn test_invalid_tunnel_local_port_zero_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services: {}
@@ -622,21 +604,20 @@ tunnels:
     to: node-b
     local_port: 0
     remote_port: 8080
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("port") || err_str.contains("local"),
-            "Error should mention invalid port: {}",
-            err_str
+            "Error should mention invalid port: {err_str}"
         );
     }
 
     #[test]
     fn test_invalid_tunnel_remote_port_zero_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services: {}
@@ -646,21 +627,20 @@ tunnels:
     to: node-b
     local_port: 8080
     remote_port: 0
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let err_str = err.to_string();
         assert!(
             err_str.contains("port") || err_str.contains("remote"),
-            "Error should mention invalid port: {}",
-            err_str
+            "Error should mention invalid port: {err_str}"
         );
     }
 
     #[test]
     fn test_valid_tunnel_with_access_config() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -678,12 +658,11 @@ services:
             enabled: true
             max_ttl: 4h
             audit: true
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "Valid tunnel with access config should pass: {:?}",
-            result
+            "Valid tunnel with access config should pass: {result:?}"
         );
         let spec = result.unwrap();
         let tunnel = spec.services["api"].endpoints[0].tunnel.as_ref().unwrap();

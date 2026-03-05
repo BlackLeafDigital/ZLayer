@@ -359,7 +359,7 @@ mod tests {
     fn mock_spec() -> ServiceSpec {
         use zlayer_spec::*;
         serde_yml::from_str::<DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -371,7 +371,7 @@ services:
       - name: http
         protocol: http
         port: 8080
-"#,
+",
         )
         .unwrap()
         .services

@@ -85,6 +85,10 @@ impl ZqlStorage {
     }
 
     /// Create a ZQL database in a temporary directory (useful for testing)
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the temporary directory cannot be created or the database fails to open.
     #[cfg(test)]
     pub async fn in_memory() -> Result<Self, StorageError> {
         let temp_dir = tempfile::tempdir()
@@ -194,7 +198,10 @@ mod tests {
     use super::*;
     use crate::storage::DeploymentStatus;
     use std::collections::HashMap;
-    use zlayer_spec::{DeploymentSpec, ImageSpec, ServiceSpec};
+    use zlayer_spec::{
+        ApiSpec, CommandSpec, DeploymentSpec, ErrorsSpec, ImageSpec, InitSpec, NetworkSpec,
+        NodeMode, ResourcesSpec, ScaleSpec, ServiceSpec, ServiceType,
+    };
 
     fn create_test_spec(name: &str) -> DeploymentSpec {
         let mut services = HashMap::new();
@@ -207,12 +214,12 @@ mod tests {
                     name: "test:latest".to_string(),
                     pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
                 },
-                resources: Default::default(),
-                env: Default::default(),
-                command: Default::default(),
-                network: Default::default(),
+                resources: ResourcesSpec::default(),
+                env: HashMap::default(),
+                command: CommandSpec::default(),
+                network: NetworkSpec::default(),
                 endpoints: vec![],
-                scale: Default::default(),
+                scale: ScaleSpec::default(),
                 depends: vec![],
                 health: zlayer_spec::HealthSpec {
                     start_grace: None,
@@ -221,15 +228,15 @@ mod tests {
                     retries: 3,
                     check: zlayer_spec::HealthCheck::Tcp { port: 8080 },
                 },
-                init: Default::default(),
-                errors: Default::default(),
+                init: InitSpec::default(),
+                errors: ErrorsSpec::default(),
                 devices: vec![],
                 storage: vec![],
                 capabilities: vec![],
                 privileged: false,
-                node_mode: Default::default(),
+                node_mode: NodeMode::default(),
                 node_selector: None,
-                service_type: Default::default(),
+                service_type: ServiceType::default(),
                 wasm_http: None,
                 host_network: false,
             },
@@ -240,7 +247,7 @@ mod tests {
             deployment: name.to_string(),
             services,
             tunnels: HashMap::new(),
-            api: Default::default(),
+            api: ApiSpec::default(),
         }
     }
 

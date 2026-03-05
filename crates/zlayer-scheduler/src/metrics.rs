@@ -937,7 +937,7 @@ mod tests {
             let map = self.stats.read().await;
             map.get(&id.to_string())
                 .cloned()
-                .ok_or_else(|| format!("No stats for container: {}", id))
+                .ok_or_else(|| format!("No stats for container: {id}"))
         }
     }
 
@@ -962,6 +962,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_raw_container_stats_memory_percent_unlimited() {
         let stats = RawContainerStats {
             cpu_usage_usec: 1_000_000,
@@ -985,6 +986,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::float_cmp)]
     async fn test_cgroups_metrics_source_first_sample() {
         let service_provider = Arc::new(MockServiceProvider::new());
         let stats_provider = Arc::new(MockStatsProvider::new());
@@ -1103,8 +1105,8 @@ mod tests {
                 .set_stats(
                     &container_id,
                     RawContainerStats {
-                        cpu_usage_usec: 500_000 * (i as u64),
-                        memory_bytes: 50 * 1024 * 1024 * (i as u64),
+                        cpu_usage_usec: 500_000 * u64::from(i),
+                        memory_bytes: 50 * 1024 * 1024 * u64::from(i),
                         memory_limit: 512 * 1024 * 1024,
                         timestamp: Instant::now(),
                     },
@@ -1165,6 +1167,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::float_cmp)]
     async fn test_cgroups_metrics_source_cache_clear() {
         let service_provider = Arc::new(MockServiceProvider::new());
         let stats_provider = Arc::new(MockStatsProvider::new());

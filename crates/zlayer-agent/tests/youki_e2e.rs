@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 #![allow(deprecated)]
-//! End-to-end integration tests for ZLayer with youki/libcontainer runtime
+//! End-to-end integration tests for `ZLayer` with youki/libcontainer runtime
 //!
 //! These tests verify the complete container lifecycle using the youki-based
 //! runtime via libcontainer. Tests require root privileges for namespace operations.
@@ -28,7 +28,7 @@ use zlayer_agent_zql::{
 };
 use zlayer_overlay::DnsServer;
 use zlayer_proxy::ServiceRegistry;
-use zlayer_spec_zql::{DeploymentSpec, HealthCheck, ServiceSpec};
+use zlayer_spec::{DeploymentSpec, HealthCheck, ServiceSpec};
 
 /// Macro to run async test body with a timeout
 macro_rules! with_timeout {
@@ -56,6 +56,7 @@ const ALPINE_IMAGE: &str = "docker.io/library/alpine:latest";
 // =============================================================================
 
 /// Check if we have root privileges required for container operations
+#[allow(unsafe_code)]
 fn has_root_privileges() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
@@ -77,6 +78,7 @@ macro_rules! skip_without_root {
 /// Generate a unique name with the given prefix for test isolation
 ///
 /// This ensures tests can run in parallel without name collisions.
+#[allow(clippy::cast_possible_truncation)]
 fn unique_name(prefix: &str) -> String {
     use rand::Rng;
     let suffix: u32 = rand::rng().random_range(10000..99999);
@@ -85,7 +87,7 @@ fn unique_name(prefix: &str) -> String {
         .unwrap()
         .as_millis() as u64
         % 1_000_000;
-    format!("{}-{}-{}", prefix, timestamp, suffix)
+    format!("{prefix}-{timestamp}-{suffix}")
 }
 
 /// Wait for a container to reach the expected state with timeout
@@ -121,15 +123,14 @@ async fn wait_for_state(
                 return Ok(());
             }
             Err(e) => {
-                return Err(format!("Error getting container state: {}", e));
+                return Err(format!("Error getting container state: {e}"));
             }
         }
         tokio::time::sleep(poll_interval).await;
     }
 
     Err(format!(
-        "Timeout waiting for container {:?} to reach state {:?}",
-        id, expected
+        "Timeout waiting for container {id:?} to reach state {expected:?}"
     ))
 }
 
@@ -149,12 +150,11 @@ async fn wait_for_port(addr: &str, timeout: Duration) -> Result<(), String> {
     }
 
     Err(format!(
-        "Timeout waiting for port {} to become available",
-        addr
+        "Timeout waiting for port {addr} to become available"
     ))
 }
 
-/// Create a YoukiRuntime configured for E2E testing
+/// Create a `YoukiRuntime` configured for E2E testing
 async fn create_e2e_runtime() -> Result<YoukiRuntime, AgentError> {
     let test_dir = PathBuf::from(E2E_TEST_DIR);
     let config = YoukiConfig {
@@ -171,32 +171,31 @@ async fn create_e2e_runtime() -> Result<YoukiRuntime, AgentError> {
     YoukiRuntime::new(config).await
 }
 
-/// Create a minimal ServiceSpec for testing with the given image
+/// Create a minimal `ServiceSpec` for testing with the given image
 #[allow(dead_code)]
 fn create_test_spec(image: &str, port: u16) -> ServiceSpec {
     let yaml = format!(
-        r#"
+        r"
 version: v1
 deployment: e2e-test
 services:
   test:
     rtype: service
     image:
-      name: {}
+      name: {image}
     endpoints:
       - name: http
         protocol: http
-        port: {}
+        port: {port}
     scale:
       mode: fixed
       replicas: 1
     health:
       check:
         type: tcp
-        port: {}
+        port: {port}
       retries: 3
-"#,
-        image, port, port
+"
     );
 
     serde_yml::from_str::<DeploymentSpec>(&yaml)
@@ -206,9 +205,9 @@ services:
         .expect("Missing test service")
 }
 
-/// Create an alpine ServiceSpec that runs a simple command
+/// Create an alpine `ServiceSpec` that runs a simple command
 fn create_alpine_spec() -> ServiceSpec {
-    let yaml = r#"
+    let yaml = r"
 version: v1
 deployment: e2e-test
 services:
@@ -223,7 +222,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#;
+";
 
     serde_yml::from_str::<DeploymentSpec>(yaml)
         .expect("Failed to parse alpine spec")
@@ -232,9 +231,9 @@ services:
         .expect("Missing alpine service")
 }
 
-/// Create an nginx ServiceSpec for web server testing
+/// Create an nginx `ServiceSpec` for web server testing
 fn create_nginx_spec() -> ServiceSpec {
-    let yaml = r#"
+    let yaml = r"
 version: v1
 deployment: e2e-test
 services:
@@ -255,7 +254,7 @@ services:
         type: tcp
         port: 80
       retries: 3
-"#;
+";
 
     serde_yml::from_str::<DeploymentSpec>(yaml)
         .expect("Failed to parse nginx spec")
@@ -304,7 +303,7 @@ async fn test_container_lifecycle() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -320,35 +319,29 @@ async fn test_container_lifecycle() {
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
         // 1. Pull image (note: youki runtime expects rootfs to be pre-populated)
-        println!("Pulling image: {}", ALPINE_IMAGE);
+        println!("Pulling image: {ALPINE_IMAGE}");
         let pull_result = runtime.pull_image(ALPINE_IMAGE).await;
-        assert!(
-            pull_result.is_ok(),
-            "Failed to pull image: {:?}",
-            pull_result
-        );
+        assert!(pull_result.is_ok(), "Failed to pull image: {pull_result:?}");
 
         // 2. Create container
-        println!("Creating container: {}", id);
+        println!("Creating container: {id}");
         let create_result = runtime.create_container(&id, &spec).await;
         assert!(
             create_result.is_ok(),
-            "Failed to create container: {:?}",
-            create_result
+            "Failed to create container: {create_result:?}"
         );
 
         // Verify container exists and is pending
         let state = runtime.container_state(&id).await;
-        assert!(state.is_ok(), "Failed to get container state: {:?}", state);
+        assert!(state.is_ok(), "Failed to get container state: {state:?}");
         assert_eq!(state.unwrap(), ContainerState::Pending);
 
         // 3. Start container
-        println!("Starting container: {}", id);
+        println!("Starting container: {id}");
         let start_result = runtime.start_container(&id).await;
         assert!(
             start_result.is_ok(),
-            "Failed to start container: {:?}",
-            start_result
+            "Failed to start container: {start_result:?}"
         );
 
         // Wait for running state
@@ -366,21 +359,19 @@ async fn test_container_lifecycle() {
         );
 
         // 4. Stop container
-        println!("Stopping container: {}", id);
+        println!("Stopping container: {id}");
         let stop_result = runtime.stop_container(&id, Duration::from_secs(10)).await;
         assert!(
             stop_result.is_ok(),
-            "Failed to stop container: {:?}",
-            stop_result
+            "Failed to stop container: {stop_result:?}"
         );
 
         // 5. Remove container
-        println!("Removing container: {}", id);
+        println!("Removing container: {id}");
         let remove_result = runtime.remove_container(&id).await;
         assert!(
             remove_result.is_ok(),
-            "Failed to remove container: {:?}",
-            remove_result
+            "Failed to remove container: {remove_result:?}"
         );
 
         // Verify container is gone
@@ -393,7 +384,7 @@ async fn test_container_lifecycle() {
 // Service Scaling Tests
 // =============================================================================
 
-/// Test service scaling up and down with ServiceManager
+/// Test service scaling up and down with `ServiceManager`
 #[tokio::test]
 async fn test_service_scaling() {
     with_timeout!(180, {
@@ -402,7 +393,7 @@ async fn test_service_scaling() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -416,36 +407,30 @@ async fn test_service_scaling() {
         let upsert_result = manager.upsert_service(service_name.clone(), spec).await;
         assert!(
             upsert_result.is_ok(),
-            "Failed to upsert service: {:?}",
-            upsert_result
+            "Failed to upsert service: {upsert_result:?}"
         );
 
         // Scale up to 2 replicas
-        println!("Scaling {} to 2 replicas", service_name);
+        println!("Scaling {service_name} to 2 replicas");
         let scale_result = manager.scale_service(&service_name, 2).await;
-        assert!(
-            scale_result.is_ok(),
-            "Failed to scale up: {:?}",
-            scale_result
-        );
+        assert!(scale_result.is_ok(), "Failed to scale up: {scale_result:?}");
 
         // Verify replica count
         let count = manager.service_replica_count(&service_name).await;
-        assert!(count.is_ok(), "Failed to get replica count: {:?}", count);
+        assert!(count.is_ok(), "Failed to get replica count: {count:?}");
         assert_eq!(count.unwrap(), 2, "Expected 2 replicas after scale up");
 
         // Scale down to 1 replica
-        println!("Scaling {} to 1 replica", service_name);
+        println!("Scaling {service_name} to 1 replica");
         let scale_result = manager.scale_service(&service_name, 1).await;
         assert!(
             scale_result.is_ok(),
-            "Failed to scale down: {:?}",
-            scale_result
+            "Failed to scale down: {scale_result:?}"
         );
 
         // Verify replica count
         let count = manager.service_replica_count(&service_name).await;
-        assert!(count.is_ok(), "Failed to get replica count: {:?}", count);
+        assert!(count.is_ok(), "Failed to get replica count: {count:?}");
         assert_eq!(count.unwrap(), 1, "Expected 1 replica after scale down");
 
         // Cleanup: scale to 0
@@ -466,7 +451,7 @@ async fn test_health_checks_tcp() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -489,7 +474,7 @@ async fn test_health_checks_tcp() {
         // In a real E2E test with proper networking, this would pass
         // For now, we just verify the checker doesn't panic
         let check_result = checker.check(&id, Duration::from_secs(5)).await;
-        println!("Health check result: {:?}", check_result);
+        println!("Health check result: {check_result:?}");
 
         // Cleanup
         let _ = runtime.stop_container(&id, Duration::from_secs(10)).await;
@@ -501,7 +486,7 @@ async fn test_health_checks_tcp() {
 // Proxy Manager Tests
 // =============================================================================
 
-/// Test ProxyManager route and backend management
+/// Test `ProxyManager` route and backend management
 #[tokio::test]
 async fn test_proxy_routing() {
     with_timeout!(180, {
@@ -515,7 +500,7 @@ async fn test_proxy_routing() {
 
         // Create ProxyManager with a random high port
         let port: u16 = 30000 + (rand::random::<u16>() % 10000);
-        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+        let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
         let config = ProxyManagerConfig::new(addr);
         let service_registry = Arc::new(ServiceRegistry::new());
         let manager = ProxyManager::new(config, service_registry, None);
@@ -583,7 +568,7 @@ async fn test_container_logs() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -624,16 +609,16 @@ async fn test_container_logs() {
 
         // Get container logs
         let logs_result = runtime.container_logs(&id, 100).await;
-        println!("Logs result: {:?}", logs_result);
+        println!("Logs result: {logs_result:?}");
 
         // The result depends on whether the container is still tracked
         // Just verify the API doesn't panic
         match logs_result {
             Ok(logs) => {
-                println!("Container logs:\n{}", logs);
+                println!("Container logs:\n{logs}");
             }
             Err(e) => {
-                println!("Could not get logs (expected if container exited): {}", e);
+                println!("Could not get logs (expected if container exited): {e}");
             }
         }
 
@@ -649,7 +634,7 @@ async fn test_container_logs() {
 
 /// Test removing a non-existent container is idempotent (succeeds gracefully)
 ///
-/// Note: remove_container is designed to be idempotent - removing a container
+/// Note: `remove_container` is designed to be idempotent - removing a container
 /// that doesn't exist should succeed (not error) to support cleanup resilience.
 #[tokio::test]
 async fn test_remove_nonexistent_is_idempotent() {
@@ -659,7 +644,7 @@ async fn test_remove_nonexistent_is_idempotent() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -669,21 +654,20 @@ async fn test_remove_nonexistent_is_idempotent() {
             replica: 999,
         };
 
-        println!("Attempting to remove non-existent container: {}", id);
+        println!("Attempting to remove non-existent container: {id}");
         let result = runtime.remove_container(&id).await;
 
         // remove_container should succeed even for non-existent containers
         // This supports idempotent cleanup operations
         assert!(
             result.is_ok(),
-            "remove_container should be idempotent: {:?}",
-            result
+            "remove_container should be idempotent: {result:?}"
         );
         println!("remove_container succeeded (idempotent behavior)");
     });
 }
 
-/// Test getting state of a non-existent container returns NotFound
+/// Test getting state of a non-existent container returns `NotFound`
 #[tokio::test]
 async fn test_error_state_nonexistent() {
     with_timeout!(180, {
@@ -692,7 +676,7 @@ async fn test_error_state_nonexistent() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => r,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -710,12 +694,9 @@ async fn test_error_state_nonexistent() {
                 println!("Got expected NotFound error for container state");
             }
             Err(other) => {
-                println!("Got different error: {:?}", other);
+                println!("Got different error: {other:?}");
             }
-            Ok(state) => panic!(
-                "Should not get state for non-existent container, got: {:?}",
-                state
-            ),
+            Ok(state) => panic!("Should not get state for non-existent container, got: {state:?}"),
         }
     });
 }
@@ -733,7 +714,7 @@ async fn test_concurrent_containers() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -757,7 +738,7 @@ async fn test_concurrent_containers() {
 
             handles.push(tokio::spawn(async move {
                 let id = ContainerId {
-                    service: format!("{}-{}", name, i),
+                    service: format!("{name}-{i}"),
                     replica: 1,
                 };
 
@@ -773,7 +754,7 @@ async fn test_concurrent_containers() {
             if result.is_ok() {
                 created_ids.push(id);
             } else {
-                eprintln!("Failed to create container: {:?}", result);
+                eprintln!("Failed to create container: {result:?}");
             }
         }
 
@@ -790,7 +771,7 @@ async fn test_concurrent_containers() {
 // Service Instance Tests
 // =============================================================================
 
-/// Test ServiceInstance directly for more granular control
+/// Test `ServiceInstance` directly for more granular control
 #[tokio::test]
 async fn test_service_instance_lifecycle() {
     with_timeout!(180, {
@@ -799,7 +780,7 @@ async fn test_service_instance_lifecycle() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -813,27 +794,25 @@ async fn test_service_instance_lifecycle() {
         assert_eq!(instance.replica_count().await, 0);
 
         // Scale up to 1
-        println!("Scaling {} to 1 replica via ServiceInstance", service_name);
+        println!("Scaling {service_name} to 1 replica via ServiceInstance");
         let scale_result = instance.scale_to(1).await;
         assert!(
             scale_result.is_ok(),
-            "Failed to scale to 1: {:?}",
-            scale_result
+            "Failed to scale to 1: {scale_result:?}"
         );
         assert_eq!(instance.replica_count().await, 1);
 
         // Get container IDs
         let ids = instance.container_ids().await;
         assert_eq!(ids.len(), 1, "Should have 1 container ID");
-        println!("Container IDs: {:?}", ids);
+        println!("Container IDs: {ids:?}");
 
         // Scale back to 0
-        println!("Scaling {} to 0 replicas", service_name);
+        println!("Scaling {service_name} to 0 replicas");
         let scale_result = instance.scale_to(0).await;
         assert!(
             scale_result.is_ok(),
-            "Failed to scale to 0: {:?}",
-            scale_result
+            "Failed to scale to 0: {scale_result:?}"
         );
         assert_eq!(instance.replica_count().await, 0);
     });
@@ -852,7 +831,7 @@ async fn test_cleanup_state_directory() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -888,10 +867,7 @@ async fn test_cleanup_state_directory() {
         // State directory should exist
         let state_dir = format!("{}/state/{}-{}", E2E_TEST_DIR, id.service, id.replica);
         let exists_before = tokio::fs::metadata(&state_dir).await.is_ok();
-        println!(
-            "State directory {} exists before removal: {}",
-            state_dir, exists_before
-        );
+        println!("State directory {state_dir} exists before removal: {exists_before}");
 
         // Stop and remove
         let _ = runtime.stop_container(&id, Duration::from_secs(5)).await;
@@ -902,10 +878,7 @@ async fn test_cleanup_state_directory() {
 
         // State directory should be cleaned up
         let exists_after = tokio::fs::metadata(&state_dir).await.is_ok();
-        println!(
-            "State directory {} exists after removal: {}",
-            state_dir, exists_after
-        );
+        println!("State directory {state_dir} exists after removal: {exists_after}");
 
         // Note: The directory might still exist briefly due to async cleanup
         // This is acceptable behavior
@@ -916,7 +889,7 @@ async fn test_cleanup_state_directory() {
 // Integration Tests - Full Data Flow with Overlay, DNS, and Proxy
 // =============================================================================
 
-/// Create a test OverlayManager
+/// Create a test `OverlayManager`
 ///
 /// Note: This requires root privileges for overlay key generation
 /// and network interface operations.
@@ -928,20 +901,20 @@ async fn create_test_overlay_manager() -> Option<Arc<tokio::sync::RwLock<Overlay
     match OverlayManager::new("e2e-test".to_string()).await {
         Ok(manager) => Some(Arc::new(tokio::sync::RwLock::new(manager))),
         Err(e) => {
-            eprintln!("Could not create overlay manager: {}", e);
+            eprintln!("Could not create overlay manager: {e}");
             None
         }
     }
 }
 
-/// Create a test DnsServer on an ephemeral port
+/// Create a test `DnsServer` on an ephemeral port
 ///
 /// Returns the DNS server and its listen address for client queries.
-/// Note: Does not start the server (start() consumes self).
+/// Note: Does not start the server (`start()` consumes self).
 fn create_test_dns_server() -> Option<(Arc<DnsServer>, SocketAddr)> {
     // Use a random high port to avoid conflicts
     let port: u16 = 50000 + (rand::random::<u16>() % 10000);
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 
     match DnsServer::new(addr, "service.local.") {
         Ok(server) => {
@@ -949,22 +922,22 @@ fn create_test_dns_server() -> Option<(Arc<DnsServer>, SocketAddr)> {
             Some((Arc::new(server), listen_addr))
         }
         Err(e) => {
-            eprintln!("Could not create DNS server: {}", e);
+            eprintln!("Could not create DNS server: {e}");
             None
         }
     }
 }
 
-/// Create a test ProxyManager on an ephemeral port
+/// Create a test `ProxyManager` on an ephemeral port
 fn create_test_proxy_manager() -> Arc<ProxyManager> {
     let port: u16 = 30000 + (rand::random::<u16>() % 10000);
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
     let config = ProxyManagerConfig::new(addr);
     let service_registry = Arc::new(ServiceRegistry::new());
     Arc::new(ProxyManager::new(config, service_registry, None))
 }
 
-/// Test ServiceInstance with full integration: overlay, DNS, and proxy
+/// Test `ServiceInstance` with full integration: overlay, DNS, and proxy
 ///
 /// This test verifies the complete data flow:
 /// 1. Container creation with overlay network attachment
@@ -979,7 +952,7 @@ async fn test_service_instance_full_integration() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -1010,14 +983,14 @@ async fn test_service_instance_full_integration() {
         // Set DNS server if available
         if let Some((dns_server, dns_addr)) = &dns {
             instance.set_dns_server(dns_server.clone());
-            println!("DNS server configured at {}", dns_addr);
+            println!("DNS server configured at {dns_addr}");
         }
 
         // Set proxy manager for health-aware load balancing
         instance.set_proxy_manager(proxy.clone());
 
         // Scale up to 1 replica
-        println!("Scaling {} to 1 replica", service_name);
+        println!("Scaling {service_name} to 1 replica");
         let scale_result = instance.scale_to(1).await;
         assert!(
             scale_result.is_ok(),
@@ -1056,11 +1029,11 @@ async fn test_service_instance_full_integration() {
 
         // Verify proxy has the service registered
         let route_count = proxy.route_count().await;
-        println!("Proxy route count: {}", route_count);
+        println!("Proxy route count: {route_count}");
         assert!(route_count > 0, "Should have at least one route");
 
         // Scale up to 2 replicas
-        println!("Scaling {} to 2 replicas", service_name);
+        println!("Scaling {service_name} to 2 replicas");
         let scale_result = instance.scale_to(2).await;
         assert!(
             scale_result.is_ok(),
@@ -1070,7 +1043,7 @@ async fn test_service_instance_full_integration() {
         assert_eq!(instance.replica_count().await, 2, "Should have 2 replicas");
 
         // Scale down and verify cleanup
-        println!("Scaling {} to 0 replicas", service_name);
+        println!("Scaling {service_name} to 0 replicas");
         let scale_result = instance.scale_to(0).await;
         assert!(
             scale_result.is_ok(),
@@ -1097,7 +1070,7 @@ async fn test_health_callback_updates_proxy() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -1127,7 +1100,7 @@ async fn test_health_callback_updates_proxy() {
 
         // Initially healthy (backends start in Unknown/Healthy state)
         let initial_healthy = lb.healthy_count(&service_name);
-        println!("Initial healthy count: {}", initial_healthy);
+        println!("Initial healthy count: {initial_healthy}");
 
         // Simulate health callback marking backend as unhealthy
         proxy
@@ -1136,7 +1109,7 @@ async fn test_health_callback_updates_proxy() {
 
         // Verify backend is now unhealthy
         let unhealthy_count = lb.healthy_count(&service_name);
-        println!("Healthy count after marking unhealthy: {}", unhealthy_count);
+        println!("Healthy count after marking unhealthy: {unhealthy_count}");
         assert_eq!(unhealthy_count, 0, "Backend should be marked as unhealthy");
 
         // Simulate health callback marking backend as healthy again
@@ -1146,7 +1119,7 @@ async fn test_health_callback_updates_proxy() {
 
         // Verify backend is healthy again
         let healthy_count = lb.healthy_count(&service_name);
-        println!("Healthy count after marking healthy: {}", healthy_count);
+        println!("Healthy count after marking healthy: {healthy_count}");
         assert_eq!(healthy_count, 1, "Backend should be marked as healthy");
 
         // Cleanup
@@ -1160,15 +1133,12 @@ async fn test_health_callback_updates_proxy() {
 async fn test_dns_record_lifecycle() {
     with_timeout!(60, {
         // This test doesn't require root - just tests DNS server operations
-        let (dns_server, dns_addr) = match create_test_dns_server() {
-            Some((server, addr)) => (server, addr),
-            None => {
-                eprintln!("Could not create DNS server, skipping test");
-                return;
-            }
+        let Some((dns_server, dns_addr)) = create_test_dns_server() else {
+            eprintln!("Could not create DNS server, skipping test");
+            return;
         };
 
-        println!("DNS server created at {}", dns_addr);
+        println!("DNS server created at {dns_addr}");
 
         // Test adding a record
         let test_ip = Ipv4Addr::new(10, 200, 0, 42);
@@ -1180,7 +1150,7 @@ async fn test_dns_record_lifecycle() {
             "Failed to add DNS record: {:?}",
             add_result.err()
         );
-        println!("Added DNS record: {} -> {}", hostname, test_ip);
+        println!("Added DNS record: {hostname} -> {test_ip}");
 
         // Add another record for a replica
         let replica_hostname = "1.myservice.service.local";
@@ -1191,10 +1161,7 @@ async fn test_dns_record_lifecycle() {
             "Failed to add replica DNS record: {:?}",
             add_result.err()
         );
-        println!(
-            "Added replica DNS record: {} -> {}",
-            replica_hostname, replica_ip
-        );
+        println!("Added replica DNS record: {replica_hostname} -> {replica_ip}");
 
         // Test removing a record
         let remove_result = dns_server.remove_record(replica_hostname).await;
@@ -1203,7 +1170,7 @@ async fn test_dns_record_lifecycle() {
             "Failed to remove DNS record: {:?}",
             remove_result.err()
         );
-        println!("Removed DNS record: {}", replica_hostname);
+        println!("Removed DNS record: {replica_hostname}");
 
         // Remove service-level record
         let remove_result = dns_server.remove_record(hostname).await;
@@ -1212,7 +1179,7 @@ async fn test_dns_record_lifecycle() {
             "Failed to remove service DNS record: {:?}",
             remove_result.err()
         );
-        println!("Removed service DNS record: {}", hostname);
+        println!("Removed service DNS record: {hostname}");
     });
 }
 
@@ -1225,21 +1192,18 @@ async fn test_dns_cleanup_on_scale_down() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
 
         // Create DNS server (but don't start it - we just need record management)
-        let (dns_server, dns_addr) = match create_test_dns_server() {
-            Some((server, addr)) => (server, addr),
-            None => {
-                eprintln!("Could not create DNS server, skipping test");
-                return;
-            }
+        let Some((dns_server, dns_addr)) = create_test_dns_server() else {
+            eprintln!("Could not create DNS server, skipping test");
+            return;
         };
 
-        println!("DNS server created at {}", dns_addr);
+        println!("DNS server created at {dns_addr}");
 
         let service_name = unique_name("dns-cleanup");
         let spec = create_alpine_spec();
@@ -1249,7 +1213,7 @@ async fn test_dns_cleanup_on_scale_down() {
         instance.set_dns_server(dns_server.clone());
 
         // Scale up to 2 replicas
-        println!("Scaling {} to 2 replicas", service_name);
+        println!("Scaling {service_name} to 2 replicas");
         instance.scale_to(2).await.expect("scale_to(2) failed");
         assert_eq!(instance.replica_count().await, 2);
 
@@ -1258,12 +1222,12 @@ async fn test_dns_cleanup_on_scale_down() {
         // path doesn't error even when DNS registration was skipped.
 
         // Scale down to 1 replica
-        println!("Scaling {} to 1 replica", service_name);
+        println!("Scaling {service_name} to 1 replica");
         instance.scale_to(1).await.expect("scale_to(1) failed");
         assert_eq!(instance.replica_count().await, 1);
 
         // Scale down to 0 replicas
-        println!("Scaling {} to 0 replicas", service_name);
+        println!("Scaling {service_name} to 0 replicas");
         instance.scale_to(0).await.expect("scale_to(0) failed");
         assert_eq!(instance.replica_count().await, 0);
 
@@ -1329,7 +1293,7 @@ async fn test_proxy_backend_lifecycle() {
     });
 }
 
-/// Test ServiceManager with all integration components
+/// Test `ServiceManager` with all integration components
 #[tokio::test]
 async fn test_service_manager_full_integration() {
     with_timeout!(300, {
@@ -1338,7 +1302,7 @@ async fn test_service_manager_full_integration() {
         let runtime = match create_e2e_runtime().await {
             Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
             Err(e) => {
-                eprintln!("Failed to create runtime: {}", e);
+                eprintln!("Failed to create runtime: {e}");
                 return;
             }
         };
@@ -1353,7 +1317,7 @@ async fn test_service_manager_full_integration() {
 
         if let Some((dns_server, dns_addr)) = dns {
             manager.set_dns_server(dns_server);
-            println!("DNS server configured at {}", dns_addr);
+            println!("DNS server configured at {dns_addr}");
         }
 
         let service_name = unique_name("mgr-integration");
@@ -1367,7 +1331,7 @@ async fn test_service_manager_full_integration() {
             .expect("upsert_service failed");
 
         // Scale up
-        println!("Scaling {} to 2 replicas via ServiceManager", service_name);
+        println!("Scaling {service_name} to 2 replicas via ServiceManager");
         manager
             .scale_service(&service_name, 2)
             .await
@@ -1383,7 +1347,7 @@ async fn test_service_manager_full_integration() {
         assert!(proxy.has_service(&service_name).await);
 
         // Scale down
-        println!("Scaling {} to 0 replicas", service_name);
+        println!("Scaling {service_name} to 0 replicas");
         manager
             .scale_service(&service_name, 0)
             .await

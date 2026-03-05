@@ -253,7 +253,7 @@ mod tests {
             status: "ready".to_string(),
             role: "worker".to_string(),
             labels: HashMap::from([("zone".to_string(), "us-east-1".to_string())]),
-            last_seen: 1706745600,
+            last_seen: 1_706_745_600,
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("192.168.1.10"));
@@ -269,18 +269,18 @@ mod tests {
             status: "ready".to_string(),
             role: "worker".to_string(),
             labels: HashMap::new(),
-            last_seen: 1706745600,
+            last_seen: 1_706_745_600,
             resources: NodeResourceInfo {
                 cpu_total: 4.0,
                 cpu_used: 1.5,
                 cpu_percent: 37.5,
-                memory_total: 8589934592,
-                memory_used: 4294967296,
+                memory_total: 8_589_934_592,
+                memory_used: 4_294_967_296,
                 memory_percent: 50.0,
             },
             services: vec!["api".to_string(), "worker".to_string()],
-            registered_at: 1706659200,
-            last_heartbeat: 1706745600,
+            registered_at: 1_706_659_200,
+            last_heartbeat: 1_706_745_600,
         };
         let json = serde_json::to_string(&details).unwrap();
         assert!(json.contains("resources"));
@@ -304,7 +304,7 @@ mod tests {
             leader_public_key: "pubkey".to_string(),
             overlay_cidr: "10.0.0.0/16".to_string(),
             allocated_ip: "10.0.1.5".to_string(),
-            expires_at: 1706832000,
+            expires_at: 1_706_832_000,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("abc123"));

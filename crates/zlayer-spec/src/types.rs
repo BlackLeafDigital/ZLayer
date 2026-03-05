@@ -1151,7 +1151,7 @@ mod tests {
 
     #[test]
     fn test_parse_simple_spec() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1164,7 +1164,7 @@ services:
         protocol: http
         port: 8080
         expose: public
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert_eq!(spec.version, "v1");
@@ -1174,7 +1174,7 @@ services:
 
     #[test]
     fn test_parse_duration() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1189,7 +1189,7 @@ services:
       check:
         type: tcp
         port: 8080
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let health = &spec.services["test"].health;
@@ -1204,7 +1204,7 @@ services:
 
     #[test]
     fn test_parse_adaptive_scale() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1220,7 +1220,7 @@ services:
       targets:
         cpu: 70
         rps: 800
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let scale = &spec.services["test"].scale;
@@ -1243,7 +1243,7 @@ services:
 
     #[test]
     fn test_node_mode_default() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1251,7 +1251,7 @@ services:
     rtype: service
     image:
       name: hello-world:latest
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert_eq!(spec.services["hello"].node_mode, NodeMode::Shared);
@@ -1260,7 +1260,7 @@ services:
 
     #[test]
     fn test_node_mode_dedicated() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1269,7 +1269,7 @@ services:
     image:
       name: api:latest
     node_mode: dedicated
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert_eq!(spec.services["api"].node_mode, NodeMode::Dedicated);
@@ -1277,7 +1277,7 @@ services:
 
     #[test]
     fn test_node_mode_exclusive() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1286,7 +1286,7 @@ services:
     image:
       name: postgres:15
     node_mode: exclusive
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert_eq!(spec.services["database"].node_mode, NodeMode::Exclusive);
@@ -1334,16 +1334,16 @@ services:
 
         for (mode, expected) in modes.iter().zip(expected_json.iter()) {
             let json = serde_json::to_string(mode).unwrap();
-            assert_eq!(&json, *expected, "Serialization failed for {:?}", mode);
+            assert_eq!(&json, *expected, "Serialization failed for {mode:?}");
 
             let deserialized: NodeMode = serde_json::from_str(&json).unwrap();
-            assert_eq!(deserialized, *mode, "Roundtrip failed for {:?}", mode);
+            assert_eq!(deserialized, *mode, "Roundtrip failed for {mode:?}");
         }
     }
 
     #[test]
     fn test_node_selector_empty() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1353,7 +1353,7 @@ services:
       name: api:latest
     node_selector:
       labels: {}
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let selector = spec.services["api"].node_selector.as_ref().unwrap();
@@ -1363,7 +1363,7 @@ services:
 
     #[test]
     fn test_mixed_node_modes_in_deployment() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1385,7 +1385,7 @@ services:
     node_selector:
       labels:
         storage: ssd
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert_eq!(spec.services["redis"].node_mode, NodeMode::Shared);
@@ -1398,7 +1398,7 @@ services:
 
     #[test]
     fn test_storage_bind_mount() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1410,7 +1410,7 @@ services:
         source: /host/data
         target: /app/data
         readonly: true
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         assert_eq!(storage.len(), 1);
@@ -1430,7 +1430,7 @@ services:
 
     #[test]
     fn test_storage_named_with_tier() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1442,7 +1442,7 @@ services:
         name: my-data
         target: /app/data
         tier: cached
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
@@ -1459,7 +1459,7 @@ services:
 
     #[test]
     fn test_storage_anonymous() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1469,7 +1469,7 @@ services:
     storage:
       - type: anonymous
         target: /app/cache
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
@@ -1483,7 +1483,7 @@ services:
 
     #[test]
     fn test_storage_tmpfs() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1495,7 +1495,7 @@ services:
         target: /app/tmp
         size: 256Mi
         mode: 1777
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
@@ -1510,7 +1510,7 @@ services:
 
     #[test]
     fn test_storage_s3() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1525,7 +1525,7 @@ services:
         readonly: true
         endpoint: https://s3.us-west-2.amazonaws.com
         credentials: aws-creds
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
@@ -1553,7 +1553,7 @@ services:
 
     #[test]
     fn test_storage_multiple_types() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1570,7 +1570,7 @@ services:
         target: /app/data
       - type: tmpfs
         target: /app/tmp
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         assert_eq!(storage.len(), 3);
@@ -1581,7 +1581,7 @@ services:
 
     #[test]
     fn test_storage_tier_default() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1592,7 +1592,7 @@ services:
       - type: named
         name: data
         target: /data
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         match &spec.services["app"].storage[0] {
             StorageSpec::Named { tier, .. } => {
@@ -1608,7 +1608,7 @@ services:
 
     #[test]
     fn test_endpoint_tunnel_config_basic() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1622,7 +1622,7 @@ services:
         tunnel:
           enabled: true
           remote_port: 8080
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let endpoint = &spec.services["api"].endpoints[0];
         let tunnel = endpoint.tunnel.as_ref().unwrap();
@@ -1634,7 +1634,7 @@ services:
 
     #[test]
     fn test_endpoint_tunnel_config_full() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1655,7 +1655,7 @@ services:
             enabled: true
             max_ttl: 4h
             audit: true
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let endpoint = &spec.services["api"].endpoints[0];
         let tunnel = endpoint.tunnel.as_ref().unwrap();
@@ -1673,7 +1673,7 @@ services:
 
     #[test]
     fn test_top_level_tunnel_definition() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services: {}
@@ -1685,7 +1685,7 @@ tunnels:
     remote_port: 5432
     protocol: tcp
     expose: internal
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let tunnel = spec.tunnels.get("db-tunnel").unwrap();
         assert_eq!(tunnel.from, "app-node");
@@ -1698,7 +1698,7 @@ tunnels:
 
     #[test]
     fn test_top_level_tunnel_defaults() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services: {}
@@ -1708,7 +1708,7 @@ tunnels:
     to: node-b
     local_port: 3000
     remote_port: 3000
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let tunnel = spec.tunnels.get("simple-tunnel").unwrap();
         assert_eq!(tunnel.protocol, TunnelProtocol::Tcp); // default
@@ -1717,7 +1717,7 @@ tunnels:
 
     #[test]
     fn test_tunnel_protocol_udp() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services: {}
@@ -1728,7 +1728,7 @@ tunnels:
     local_port: 5353
     remote_port: 5353
     protocol: udp
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let tunnel = spec.tunnels.get("udp-tunnel").unwrap();
         assert_eq!(tunnel.protocol, TunnelProtocol::Udp);
@@ -1736,7 +1736,7 @@ tunnels:
 
     #[test]
     fn test_endpoint_without_tunnel() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1747,7 +1747,7 @@ services:
       - name: http
         protocol: http
         port: 8080
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let endpoint = &spec.services["api"].endpoints[0];
         assert!(endpoint.tunnel.is_none());
@@ -1755,14 +1755,14 @@ services:
 
     #[test]
     fn test_deployment_without_tunnels() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
   api:
     image:
       name: api:latest
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert!(spec.tunnels.is_empty());
     }
@@ -1773,14 +1773,14 @@ services:
 
     #[test]
     fn test_spec_without_api_block_uses_defaults() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
   hello:
     image:
       name: hello-world:latest
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert!(spec.api.enabled);
         assert_eq!(spec.api.bind, "0.0.0.0:3669");

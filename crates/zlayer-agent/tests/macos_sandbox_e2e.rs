@@ -24,7 +24,7 @@ use std::time::Duration;
 use zlayer_agent_zql::{
     AgentError, ContainerId, ContainerState, MacSandboxConfig, Runtime, SandboxRuntime,
 };
-use zlayer_spec_zql::{DeploymentSpec, ServiceSpec};
+use zlayer_spec::{DeploymentSpec, ServiceSpec};
 
 extern crate libc;
 

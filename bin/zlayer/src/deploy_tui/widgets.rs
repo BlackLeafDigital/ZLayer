@@ -311,8 +311,8 @@ use zlayer_tui::widgets::scrollable_pane::ScrollablePane;
 #[cfg(test)]
 pub fn render_deploy_view(state: &DeployState, tick: usize, area: Rect, buf: &mut Buffer) {
     // Vertical layout: infra, services, logs, footer
-    let infra_height = 2 + state.infra_phases.len().div_ceil(3) as u16; // border + rows
-    let service_count = state.services.len().max(1) as u16;
+    let infra_height = 2 + u16::try_from(state.infra_phases.len().div_ceil(3)).unwrap_or(u16::MAX); // border + rows
+    let service_count = u16::try_from(state.services.len().max(1)).unwrap_or(u16::MAX);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -383,7 +383,11 @@ mod tests {
         };
         widget.render(area, &mut buf);
 
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(content.contains("Infrastructure"));
     }
 
@@ -410,7 +414,11 @@ mod tests {
         };
         widget.render(area, &mut buf);
 
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         // Should contain checkmark and x mark
         assert!(content.contains('\u{2713}') || content.contains("Infrastructure"));
     }
@@ -440,7 +448,11 @@ mod tests {
         };
         widget.render(area, &mut buf);
 
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(content.contains("Services") || content.contains("No services"));
     }
 
@@ -479,7 +491,11 @@ mod tests {
         };
         widget.render(area, &mut buf);
 
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(content.contains("postgres") || content.contains("Services"));
     }
 
@@ -494,7 +510,11 @@ mod tests {
             .with_empty_text("No log output yet");
         widget.render(area, &mut buf);
 
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(content.contains("No log output") || content.contains("Logs"));
     }
 
@@ -521,7 +541,11 @@ mod tests {
         let widget = ScrollablePane::new(&entries, 0).with_title("Logs");
         widget.render(area, &mut buf);
 
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(
             content.contains("[INFO]")
                 || content.contains("[WARN]")
@@ -538,7 +562,7 @@ mod tests {
         let entries: Vec<LogEntry> = (0..20)
             .map(|i| LogEntry {
                 level: LogLevel::Info,
-                message: format!("Log line {}", i),
+                message: format!("Log line {i}"),
             })
             .collect();
 
@@ -546,7 +570,11 @@ mod tests {
         let widget = ScrollablePane::new(&entries, 10).with_title("Logs");
         widget.render(area, &mut buf);
 
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         // Should show a scroll percentage indicator
         assert!(content.contains('%') || content.contains("Logs"));
     }
@@ -624,7 +652,11 @@ mod tests {
 
         render_deploy_view(&state, 0, area, &mut buf);
 
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(content.contains("Infrastructure") || content.contains("Services"));
     }
 }

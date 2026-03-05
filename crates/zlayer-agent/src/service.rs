@@ -1997,7 +1997,7 @@ mod tests {
 
     fn mock_spec() -> ServiceSpec {
         serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -2012,7 +2012,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
+",
         )
         .unwrap()
         .services
@@ -2020,14 +2020,14 @@ services:
         .unwrap()
     }
 
-    /// Helper to create a ServiceSpec with dependencies
+    /// Helper to create a `ServiceSpec` with dependencies
     fn mock_spec_with_deps(deps: Vec<DependsSpec>) -> ServiceSpec {
         let mut spec = mock_spec();
         spec.depends = deps;
         spec
     }
 
-    /// Helper to create a DependsSpec
+    /// Helper to create a `DependsSpec`
     fn dep(
         service: &str,
         condition: zlayer_spec::DependencyCondition,
@@ -2275,7 +2275,7 @@ services:
 
     fn mock_job_spec() -> ServiceSpec {
         serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -2283,7 +2283,7 @@ services:
     rtype: job
     image:
       name: backup:latest
-"#,
+",
         )
         .unwrap()
         .services
@@ -2617,7 +2617,7 @@ services:
 
     fn mock_tcp_spec() -> ServiceSpec {
         serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -2632,7 +2632,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
+",
         )
         .unwrap()
         .services
@@ -2642,7 +2642,7 @@ services:
 
     fn mock_udp_spec() -> ServiceSpec {
         serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -2657,7 +2657,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
+",
         )
         .unwrap()
         .services
@@ -2667,7 +2667,7 @@ services:
 
     fn mock_mixed_spec() -> ServiceSpec {
         serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -2688,7 +2688,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
+",
         )
         .unwrap()
         .services

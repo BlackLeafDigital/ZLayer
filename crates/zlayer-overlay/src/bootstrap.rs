@@ -906,7 +906,7 @@ mod tests {
             private_key: "private".to_string(),
             public_key: "public".to_string(),
             is_leader: true,
-            created_at: 1234567890,
+            created_at: 1_234_567_890,
         };
 
         let state = BootstrapState {

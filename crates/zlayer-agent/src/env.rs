@@ -602,7 +602,7 @@ mod tests {
                 if let Some(scope_secrets) = scope_secrets {
                     for name in names {
                         if let Some(secret) = scope_secrets.get(*name) {
-                            result.insert(name.to_string(), secret.clone());
+                            result.insert((*name).to_string(), secret.clone());
                         }
                     }
                 }
@@ -622,10 +622,7 @@ mod tests {
 
             async fn exists(&self, scope: &str, name: &str) -> zlayer_secrets::Result<bool> {
                 let secrets = self.secrets.lock().unwrap();
-                Ok(secrets
-                    .get(scope)
-                    .map(|s| s.contains_key(name))
-                    .unwrap_or(false))
+                Ok(secrets.get(scope).is_some_and(|s| s.contains_key(name)))
             }
         }
 

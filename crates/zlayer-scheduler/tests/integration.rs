@@ -1,4 +1,4 @@
-//! Integration tests for the ZLayer scheduler
+//! Integration tests for the `ZLayer` scheduler
 //!
 //! These tests verify the full scheduling workflow including:
 //! - Standalone mode operation
@@ -72,8 +72,7 @@ async fn test_standalone_scheduling_workflow() {
     let decision = scheduler.evaluate_service("web-normal").await.unwrap();
     assert!(
         matches!(decision, ScalingDecision::NoChange { .. }),
-        "Expected NoChange at 50% CPU, got {:?}",
-        decision
+        "Expected NoChange at 50% CPU, got {decision:?}"
     );
 
     // Test 2: High CPU should scale up
@@ -112,8 +111,7 @@ async fn test_standalone_scheduling_workflow() {
     let decision = scheduler.evaluate_service("web-high-cpu").await.unwrap();
     assert!(
         matches!(decision, ScalingDecision::ScaleUp { .. }),
-        "Expected ScaleUp at 85% CPU, got {:?}",
-        decision
+        "Expected ScaleUp at 85% CPU, got {decision:?}"
     );
 }
 
@@ -172,8 +170,7 @@ async fn test_multiple_services() {
         let decision = scheduler.evaluate_service(svc).await.unwrap();
         assert!(
             !decision.is_change(),
-            "Service {} should not scale at 50% CPU",
-            svc
+            "Service {svc} should not scale at 50% CPU"
         );
     }
 }
@@ -207,7 +204,7 @@ async fn test_fixed_scaling() {
     let decision = scheduler.evaluate_service("static").await.unwrap();
     match decision {
         ScalingDecision::ScaleUp { from: 2, to: 5, .. } => {}
-        other => panic!("Expected ScaleUp to 5, got {:?}", other),
+        other => panic!("Expected ScaleUp to 5, got {other:?}"),
     }
 }
 
@@ -244,7 +241,7 @@ async fn test_manual_scaling() {
     assert!(matches!(decision, ScalingDecision::Blocked { .. }));
 }
 
-/// Test apply_scaling records state correctly
+/// Test `apply_scaling` records state correctly
 #[tokio::test]
 async fn test_apply_scaling() {
     // Start a mock HTTP server to simulate the zlayer agent
@@ -367,8 +364,11 @@ async fn test_prometheus_metrics() {
     );
 
     // Check for our custom metrics
-    let metric_names: Vec<_> = metrics.iter().map(|m| m.get_name()).collect();
-    println!("Registered metrics: {:?}", metric_names);
+    let metric_names: Vec<_> = metrics
+        .iter()
+        .map(prometheus::proto::MetricFamily::get_name)
+        .collect();
+    println!("Registered metrics: {metric_names:?}");
 }
 
 /// Test single-node Raft bootstrap
@@ -395,7 +395,7 @@ async fn test_single_node_raft() {
         Err(e) => {
             // If Raft fails to initialize, that's okay for this test
             // The important thing is that we tried
-            println!("Raft initialization skipped: {}", e);
+            println!("Raft initialization skipped: {e}");
             return;
         }
     };
@@ -404,7 +404,7 @@ async fn test_single_node_raft() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let is_leader = scheduler.is_leader();
-    println!("Is leader: {}", is_leader);
+    println!("Is leader: {is_leader}");
 
     // Cluster state should be available
     let state = scheduler.cluster_state().await;
@@ -508,8 +508,7 @@ async fn test_scale_down_low_metrics() {
     let decision = scheduler.evaluate_service("scale-down-test").await.unwrap();
     assert!(
         matches!(decision, ScalingDecision::ScaleDown { .. }),
-        "Expected ScaleDown at 20% CPU (below 35% threshold), got {:?}",
-        decision
+        "Expected ScaleDown at 20% CPU (below 35% threshold), got {decision:?}"
     );
 }
 
@@ -560,8 +559,7 @@ async fn test_respects_bounds() {
     let decision = scheduler.evaluate_service("bounded").await.unwrap();
     assert!(
         matches!(decision, ScalingDecision::NoChange { .. }),
-        "Expected NoChange when at max, got {:?}",
-        decision
+        "Expected NoChange when at max, got {decision:?}"
     );
 }
 
@@ -612,7 +610,6 @@ async fn test_memory_scaling() {
     let decision = scheduler.evaluate_service("memory-test").await.unwrap();
     assert!(
         matches!(decision, ScalingDecision::ScaleUp { .. }),
-        "Expected ScaleUp at 80% memory, got {:?}",
-        decision
+        "Expected ScaleUp at 80% memory, got {decision:?}"
     );
 }

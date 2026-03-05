@@ -558,7 +558,7 @@ mod tests {
         for i in 0..20 {
             tui.state.apply_event(&DeployEvent::Log {
                 level: LogLevel::Info,
-                message: format!("line {}", i),
+                message: format!("line {i}"),
             });
         }
 
@@ -589,7 +589,7 @@ mod tests {
         for i in 0..30 {
             tui.state.apply_event(&DeployEvent::Log {
                 level: LogLevel::Info,
-                message: format!("line {}", i),
+                message: format!("line {i}"),
             });
         }
 
@@ -613,7 +613,7 @@ mod tests {
         for i in 0..20 {
             tui.state.apply_event(&DeployEvent::Log {
                 level: LogLevel::Info,
-                message: format!("line {}", i),
+                message: format!("line {i}"),
             });
         }
 

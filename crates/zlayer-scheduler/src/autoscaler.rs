@@ -449,7 +449,7 @@ mod tests {
 
         match decision {
             ScalingDecision::ScaleUp { from: 1, to: 3, .. } => {}
-            other => panic!("Expected ScaleUp, got {:?}", other),
+            other => panic!("Expected ScaleUp, got {other:?}"),
         }
     }
 
@@ -508,7 +508,7 @@ mod tests {
             } => {
                 assert!(reason.contains("CPU"));
             }
-            other => panic!("Expected ScaleUp, got {:?}", other),
+            other => panic!("Expected ScaleUp, got {other:?}"),
         }
     }
 
@@ -543,7 +543,7 @@ mod tests {
 
         match decision {
             ScalingDecision::ScaleDown { from: 5, to: 4, .. } => {}
-            other => panic!("Expected ScaleDown, got {:?}", other),
+            other => panic!("Expected ScaleDown, got {other:?}"),
         }
     }
 
@@ -698,7 +698,7 @@ mod tests {
             } => {
                 assert!(reason.contains("RPS"));
             }
-            other => panic!("Expected ScaleUp due to RPS, got {:?}", other),
+            other => panic!("Expected ScaleUp due to RPS, got {other:?}"),
         }
     }
 
@@ -735,7 +735,7 @@ mod tests {
             ScalingDecision::ScaleUp { reason, .. } => {
                 assert!(reason.contains("CPU"));
             }
-            other => panic!("Expected ScaleUp, got {:?}", other),
+            other => panic!("Expected ScaleUp, got {other:?}"),
         }
     }
 
@@ -832,7 +832,7 @@ mod tests {
         // Due to EMA smoothing, we shouldn't immediately scale down
         // The smoothed value should still be above the scale-down threshold
         // This tests that EMA prevents thrashing
-        println!("Decision after EMA smoothing: {:?}", decision);
+        println!("Decision after EMA smoothing: {decision:?}");
     }
 
     #[test]
@@ -850,7 +850,7 @@ mod tests {
 
         match decision {
             ScalingDecision::ScaleDown { from: 5, to: 2, .. } => {}
-            other => panic!("Expected ScaleDown, got {:?}", other),
+            other => panic!("Expected ScaleDown, got {other:?}"),
         }
     }
 }

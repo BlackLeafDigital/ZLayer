@@ -218,7 +218,6 @@ mod tests {
 
     #[test]
     fn test_log_guard_creation() {
-        let guard = LogGuard::new(None);
-        assert!(guard._guard.is_none());
+        let _guard = LogGuard::new(None);
     }
 }

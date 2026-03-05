@@ -2363,7 +2363,7 @@ mod tests {
         // Should be a valid number
         let parsed: u64 = ts.parse().expect("Should be a valid u64");
         // Should be reasonably recent (after 2024)
-        assert!(parsed > 1700000000);
+        assert!(parsed > 1_700_000_000);
     }
 
     // LayerCacheTracker tests

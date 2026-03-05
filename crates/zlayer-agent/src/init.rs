@@ -313,6 +313,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_backoff_config_default() {
         let config = BackoffConfig::default();
         assert_eq!(config.initial_delay, Duration::from_secs(1));

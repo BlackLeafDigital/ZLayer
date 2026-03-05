@@ -741,7 +741,10 @@ pub fn validate_placement_feasibility(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zlayer_spec::{ImageSpec, PullPolicy};
+    use zlayer_spec::{
+        CommandSpec, ErrorsSpec, ImageSpec, InitSpec, NetworkSpec, PullPolicy, ResourcesSpec,
+        ScaleSpec, ServiceType,
+    };
 
     fn make_node(id: NodeId, address: &str) -> NodeState {
         NodeState::new(id, address)
@@ -755,12 +758,12 @@ mod tests {
                 name: "test:latest".to_string(),
                 pull_policy: PullPolicy::IfNotPresent,
             },
-            resources: Default::default(),
-            env: Default::default(),
-            command: Default::default(),
-            network: Default::default(),
+            resources: ResourcesSpec::default(),
+            env: HashMap::default(),
+            command: CommandSpec::default(),
+            network: NetworkSpec::default(),
             endpoints: vec![],
-            scale: Default::default(),
+            scale: ScaleSpec::default(),
             depends: vec![],
             health: zlayer_spec::HealthSpec {
                 start_grace: None,
@@ -769,15 +772,15 @@ mod tests {
                 retries: 3,
                 check: zlayer_spec::HealthCheck::Tcp { port: 8080 },
             },
-            init: Default::default(),
-            errors: Default::default(),
+            init: InitSpec::default(),
+            errors: ErrorsSpec::default(),
             devices: vec![],
             storage: vec![],
             capabilities: vec![],
             privileged: false,
             node_mode,
             node_selector,
-            service_type: Default::default(),
+            service_type: ServiceType::default(),
             wasm_http: None,
             host_network: false,
         }
@@ -786,10 +789,11 @@ mod tests {
     #[test]
     fn test_container_id_display() {
         let id = ContainerId::new("api", 2);
-        assert_eq!(format!("{}", id), "api-2");
+        assert_eq!(format!("{id}"), "api-2");
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_node_resources_utilization() {
         let mut res = NodeResources::new(4.0, 8 * 1024 * 1024 * 1024);
         assert_eq!(res.utilization(), 0.0);
@@ -1003,7 +1007,7 @@ mod tests {
         let decisions = place_service_replicas("api", &spec, 3, &mut nodes, &mut placements);
 
         assert_eq!(decisions.len(), 3);
-        assert!(decisions.iter().all(|d| d.is_success()));
+        assert!(decisions.iter().all(super::PlacementDecision::is_success));
     }
 
     #[test]
@@ -1019,7 +1023,7 @@ mod tests {
         let decisions = place_service_replicas("api", &spec, 3, &mut nodes, &mut placements);
 
         assert_eq!(decisions.len(), 3);
-        assert!(decisions.iter().all(|d| d.is_success()));
+        assert!(decisions.iter().all(super::PlacementDecision::is_success));
 
         // Each replica should be on a different node
         let assigned_nodes: Vec<NodeId> = decisions.iter().filter_map(|d| d.node_id).collect();
@@ -1063,7 +1067,7 @@ mod tests {
         let decisions = place_service_replicas("db", &spec, 2, &mut nodes, &mut placements);
 
         assert_eq!(decisions.len(), 2);
-        assert!(decisions.iter().all(|d| d.is_success()));
+        assert!(decisions.iter().all(super::PlacementDecision::is_success));
 
         // Now try to place another service - should fail (nodes are exclusive)
         let spec2 = make_service_spec(NodeMode::Exclusive, None);
@@ -1092,7 +1096,7 @@ mod tests {
         let decisions = place_service_replicas("ml", &spec, 2, &mut nodes, &mut placements);
 
         assert_eq!(decisions.len(), 2);
-        assert!(decisions.iter().all(|d| d.is_success()));
+        assert!(decisions.iter().all(super::PlacementDecision::is_success));
 
         // All placements should be on GPU nodes (1 or 3)
         let assigned_nodes: Vec<NodeId> = decisions.iter().filter_map(|d| d.node_id).collect();
@@ -1166,7 +1170,7 @@ mod tests {
         resources.gpu_total = gpu_total;
         resources.gpu_vendor = vendor.to_string();
         resources.gpu_models = vec!["Test GPU".to_string(); gpu_total as usize];
-        resources.gpu_memory_mb = gpu_total as u64 * 16384; // 16GB per GPU
+        resources.gpu_memory_mb = u64::from(gpu_total) * 16384; // 16GB per GPU
         NodeState::new(id, address).with_resources(resources)
     }
 
@@ -1338,6 +1342,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::similar_names)]
     fn test_gpu_scoring_prefers_more_available_gpus() {
         // Node 1: 4 GPUs, 2 used (2 available)
         // Node 2: 4 GPUs, 0 used (4 available)

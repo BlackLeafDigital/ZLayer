@@ -601,6 +601,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_cluster_join_request_deserialize() {
         let json = r#"{
             "token": "abc123",
@@ -621,6 +622,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_cluster_join_request_with_resources() {
         let json = r#"{
             "token": "abc123",
@@ -637,14 +639,15 @@ mod tests {
         }"#;
         let req: ClusterJoinRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.cpu_total, 16.0);
-        assert_eq!(req.memory_total, 68719476736);
-        assert_eq!(req.disk_total, 1099511627776);
+        assert_eq!(req.memory_total, 68_719_476_736);
+        assert_eq!(req.disk_total, 1_099_511_627_776);
         assert_eq!(req.gpus.len(), 1);
         assert_eq!(req.gpus[0].vendor, "nvidia");
         assert_eq!(req.gpus[0].memory_mb, 81920);
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_heartbeat_request_deserialize() {
         let json = r#"{
             "node_id": 2,
@@ -655,8 +658,8 @@ mod tests {
         let req: HeartbeatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.node_id, 2);
         assert_eq!(req.cpu_used, 4.5);
-        assert_eq!(req.memory_used, 8589934592);
-        assert_eq!(req.disk_used, 107374182400);
+        assert_eq!(req.memory_used, 8_589_934_592);
+        assert_eq!(req.disk_used, 107_374_182_400);
     }
 
     #[test]

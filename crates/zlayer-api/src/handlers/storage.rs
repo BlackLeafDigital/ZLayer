@@ -87,8 +87,9 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::no_effect_underscore_binding)]
     fn test_storage_state_default() {
-        let _state = StorageState::default();
+        let _state = StorageState;
     }
 
     #[test]

@@ -1451,8 +1451,7 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("ACME email is required"),
-            "Expected error about ACME email, got: {}",
-            err
+            "Expected error about ACME email, got: {err}"
         );
     }
 
@@ -1751,8 +1750,7 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("ACME email is required"),
-            "Expected error about ACME email, got: {}",
-            err
+            "Expected error about ACME email, got: {err}"
         );
     }
 
@@ -1853,8 +1851,7 @@ mod tests {
         let renewed = manager.run_renewal_check(&sni_resolver).await;
         assert!(
             renewed.is_empty(),
-            "Expected no renewals for fresh cert, got: {:?}",
-            renewed
+            "Expected no renewals for fresh cert, got: {renewed:?}"
         );
     }
 }

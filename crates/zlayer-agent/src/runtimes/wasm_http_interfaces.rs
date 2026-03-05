@@ -1440,7 +1440,7 @@ mod tests {
                 assert_eq!(status, 403);
                 assert_eq!(reason, "Access denied");
             }
-            _ => panic!("Expected Abort"),
+            MiddlewareAction::ContinueWith(_) => panic!("Expected Abort"),
         }
     }
 

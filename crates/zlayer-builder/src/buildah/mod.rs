@@ -815,7 +815,7 @@ mod tests {
         assert!(cmd
             .args
             .iter()
-            .any(|a| a.contains("[") && a.contains("/app")));
+            .any(|a| a.contains('[') && a.contains("/app")));
     }
 
     #[test]
@@ -957,9 +957,7 @@ mod tests {
             if arg.starts_with("--mount=") {
                 assert!(
                     idx < container_idx,
-                    "--mount at index {} should come before container ID at {}",
-                    idx,
-                    container_idx
+                    "--mount at index {idx} should come before container ID at {container_idx}",
                 );
             }
         }

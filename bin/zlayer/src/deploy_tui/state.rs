@@ -589,7 +589,7 @@ mod tests {
         for i in 0..20 {
             state.apply_event(&DeployEvent::Log {
                 level: LogLevel::Info,
-                message: format!("line {}", i),
+                message: format!("line {i}"),
             });
         }
 

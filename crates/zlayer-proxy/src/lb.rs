@@ -500,7 +500,7 @@ mod tests {
     use super::*;
 
     fn addr(port: u16) -> SocketAddr {
-        format!("127.0.0.1:{}", port).parse().unwrap()
+        format!("127.0.0.1:{port}").parse().unwrap()
     }
 
     #[test]

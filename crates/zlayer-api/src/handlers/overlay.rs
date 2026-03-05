@@ -264,7 +264,7 @@ mod tests {
             total_peers: 5,
             healthy_peers: 4,
             unhealthy_peers: 1,
-            last_check: 1706900000,
+            last_check: 1_706_900_000,
         };
         let json = serde_json::to_string(&status).unwrap();
         assert!(json.contains("wg0"));
@@ -280,7 +280,7 @@ mod tests {
             last_handshake_secs: Some(30),
             last_ping_ms: Some(5),
             failure_count: 0,
-            last_check: 1706900000,
+            last_check: 1_706_900_000,
         };
         let json = serde_json::to_string(&peer).unwrap();
         assert!(json.contains("abc123"));

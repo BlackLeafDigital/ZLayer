@@ -1266,7 +1266,7 @@ mod tests {
         #[test]
         fn test_debug_formatting() {
             let config = WasmBuildConfig::new().language(WasmLanguage::Rust);
-            let debug_str = format!("{:?}", config);
+            let debug_str = format!("{config:?}");
 
             assert!(debug_str.contains("WasmBuildConfig"));
             assert!(debug_str.contains("Rust"));
@@ -1329,7 +1329,7 @@ mod tests {
                 size: 2048,
             };
 
-            let debug_str = format!("{:?}", result);
+            let debug_str = format!("{result:?}");
             assert!(debug_str.contains("WasmBuildResult"));
             assert!(debug_str.contains("test.wasm"));
             assert!(debug_str.contains("Go"));
@@ -1482,7 +1482,7 @@ mod tests {
             ];
 
             for err in errors {
-                let debug_str = format!("{:?}", err);
+                let debug_str = format!("{err:?}");
                 assert!(!debug_str.is_empty());
             }
         }
@@ -2106,10 +2106,7 @@ version = "0.1.0"
                         let cmd = get_build_command(*lang, target, release);
                         assert!(
                             !cmd.is_empty(),
-                            "Command for {:?}/{:?}/{} should not be empty",
-                            lang,
-                            target,
-                            release
+                            "Command for {lang:?}/{target:?}/{release} should not be empty",
                         );
                         assert!(
                             !cmd[0].is_empty(),

@@ -1438,10 +1438,10 @@ mod tests {
         };
 
         // Ensure Debug trait is implemented
-        assert!(!format!("{:?}", pending).is_empty());
-        assert!(!format!("{:?}", running).is_empty());
-        assert!(!format!("{:?}", completed).is_empty());
-        assert!(!format!("{:?}", failed).is_empty());
+        assert!(!format!("{pending:?}").is_empty());
+        assert!(!format!("{running:?}").is_empty());
+        assert!(!format!("{completed:?}").is_empty());
+        assert!(!format!("{failed:?}").is_empty());
     }
 
     #[test]

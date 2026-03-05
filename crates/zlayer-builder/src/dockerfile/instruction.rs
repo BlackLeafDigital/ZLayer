@@ -914,7 +914,7 @@ mod tests {
     fn test_run_mount_tmpfs_to_buildah_arg() {
         let mount = RunMount::Tmpfs {
             target: "/tmp".to_string(),
-            size: Some(1048576),
+            size: Some(1_048_576),
         };
         assert_eq!(
             mount.to_buildah_arg(),

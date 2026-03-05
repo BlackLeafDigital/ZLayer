@@ -683,7 +683,7 @@ mod tests {
     fn mock_service_spec_with_endpoints() -> ServiceSpec {
         use zlayer_spec::*;
         serde_yml::from_str::<DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -702,7 +702,7 @@ services:
         port: 8081
         path: /ws
         expose: internal
-"#,
+",
         )
         .unwrap()
         .services
@@ -713,7 +713,7 @@ services:
     fn mock_service_spec_tcp_only() -> ServiceSpec {
         use zlayer_spec::*;
         serde_yml::from_str::<DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -725,7 +725,7 @@ services:
       - name: grpc
         protocol: tcp
         port: 9000
-"#,
+",
         )
         .unwrap()
         .services
@@ -855,7 +855,7 @@ services:
         assert!(!config.http2_enabled);
     }
 
-    /// Test that ensure_ports_for_service correctly differentiates
+    /// Test that `ensure_ports_for_service` correctly differentiates
     /// Public (0.0.0.0) vs Internal (overlay or 127.0.0.1) bind addresses.
     /// We can't actually bind in unit tests, but we verify the function
     /// processes both endpoint types without error.
@@ -891,7 +891,7 @@ services:
     fn mock_mixed_service_spec() -> ServiceSpec {
         use zlayer_spec::*;
         serde_yml::from_str::<DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -913,7 +913,7 @@ services:
         protocol: udp
         port: 27015
         expose: public
-"#,
+",
         )
         .unwrap()
         .services
@@ -938,6 +938,8 @@ services:
 
     #[tokio::test]
     async fn test_ensure_ports_tcp_with_stream_registry() {
+        use zlayer_proxy::StreamService;
+
         let stream_registry = Arc::new(StreamRegistry::new());
         let config = ProxyManagerConfig::default();
         let registry = Arc::new(ServiceRegistry::new());
@@ -947,7 +949,6 @@ services:
         let spec = mock_service_spec_tcp_only();
 
         // Register the TCP service in the stream registry first (as ServiceManager does)
-        use zlayer_proxy::StreamService;
         stream_registry.register_tcp(9000, StreamService::new("grpc-service".to_string(), vec![]));
 
         // Ensure ports -- should bind TCP listener
