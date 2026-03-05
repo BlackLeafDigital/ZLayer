@@ -20,6 +20,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_JOBS: "2"
   CARGO_REGISTRIES_FORGEJO_TOKEN: ${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+  FORGEJO_REGISTRIES: '[{"name":"forgejo","index":"sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/","token":"${{ secrets.FORGEJO_ACTIONS_TOKEN }}"}]'
 
 jobs:
   # ===========================================
@@ -175,6 +176,8 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.ref }}
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          registries: ${{ env.FORGEJO_REGISTRIES }}
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev protobuf-compiler
       - name: Set crate versions
@@ -182,10 +185,11 @@ jobs:
           VERSION="${{ needs.detect.outputs.version }}"
           echo "Setting all crate versions to ${VERSION}"
           sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
+          find crates bin -name Cargo.toml -exec sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" {} +
+          sed -i "s/version = \"0.0.0-dev\", package/version = \"${VERSION}\", package/" Cargo.toml
+          cargo generate-lockfile
       - name: Publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p ${{ needs.detect.outputs.crate_name }} --allow-dirty
+        run: cargo publish --registry forgejo -p ${{ needs.detect.outputs.crate_name }} --allow-dirty
 
   # ===========================================
   # Publish all crates (general release, after merge)
@@ -200,6 +204,8 @@ jobs:
           ref: ${{ inputs.sha || github.ref }}
           fetch-depth: 0
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          registries: ${{ env.FORGEJO_REGISTRIES }}
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev protobuf-compiler
       - name: Set crate versions
@@ -207,9 +213,10 @@ jobs:
           VERSION="${{ needs.detect.outputs.version }}"
           echo "Setting all crate versions to ${VERSION}"
           sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
+          find crates bin -name Cargo.toml -exec sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" {} +
+          sed -i "s/version = \"0.0.0-dev\", package/version = \"${VERSION}\", package/" Cargo.toml
+          cargo generate-lockfile
       - name: Publish crates that need updating
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           INPUT_VERSION="${{ needs.detect.outputs.version }}"
 
@@ -251,7 +258,7 @@ jobs:
 
             if [[ "$latest_tag" == "0.0.0" ]] || version_gt "$INPUT_VERSION" "$latest_tag"; then
               echo "Publishing $crate..."
-              if cargo publish -p "$crate" --allow-dirty; then
+              if cargo publish --registry forgejo -p "$crate" --allow-dirty; then
                 echo "Successfully published $crate"
                 git tag "${prefix}-v${INPUT_VERSION}"
                 git push origin "${prefix}-v${INPUT_VERSION}" || true
@@ -279,16 +286,16 @@ jobs:
           ref: ${{ inputs.sha || github.ref }}
           fetch-depth: 0
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          registries: ${{ env.FORGEJO_REGISTRIES }}
       - name: Check and publish
         working-directory: clients/zlayer-sdk/rust
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           INPUT_VERSION="${{ needs.detect.outputs.version }}"
           LATEST_TAG=$(git tag -l "rust-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
           if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
             echo "Publishing rust-sdk..."
-            cargo publish --allow-dirty || echo "May already exist"
+            cargo publish --registry forgejo --allow-dirty || echo "May already exist"
           else
             echo "Skipping rust-sdk (already at or above $INPUT_VERSION)"
           fi
