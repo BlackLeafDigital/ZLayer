@@ -446,6 +446,118 @@ impl DaemonClient {
         Self::parse_json(&body)
     }
 
+    /// Watch deployment orchestration progress via SSE.
+    ///
+    /// `GET /api/v1/deployments/{name}/events`
+    ///
+    /// Returns a receiver that yields `(event_type, data_json)` tuples as SSE
+    /// events arrive. The receiver closes when the server ends the stream
+    /// (deployment reached terminal state) or the connection drops.
+    pub async fn watch_deployment(
+        &self,
+        name: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<(String, String)>> {
+        let path = format!("/api/v1/deployments/{}/events", urlencoding(name));
+
+        let uri: Uri = format!("http://localhost{path}")
+            .parse()
+            .with_context(|| format!("Invalid request path: {path}"))?;
+
+        let req = hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(uri)
+            .header("Host", "localhost")
+            .header("Accept", "text/event-stream")
+            .body(Full::new(Bytes::new()))
+            .context("Failed to build GET request for deployment event streaming")?;
+
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("GET {path} (SSE) failed"))?;
+
+        let (parts, body) = resp.into_parts();
+
+        if !parts.status.is_success() {
+            let collected = body
+                .collect()
+                .await
+                .context("Failed to read error response body")?
+                .to_bytes();
+            Self::check_status(parts.status, &collected)?;
+            unreachable!();
+        }
+
+        // Spawn a task that parses SSE frames from the byte stream.
+        // Each complete SSE message yields (event_type, data) on the channel.
+        let (tx, rx) = tokio::sync::mpsc::channel::<(String, String)>(256);
+
+        tokio::spawn(async move {
+            use http_body_util::BodyStream;
+            use tokio_stream::StreamExt as _;
+
+            let mut body_stream = BodyStream::new(body);
+            let mut buf = String::new();
+            let mut current_event = String::new();
+            let mut current_data = String::new();
+
+            while let Some(frame_result) = body_stream.next().await {
+                let frame = match frame_result {
+                    Ok(f) => f,
+                    Err(e) => {
+                        debug!("SSE body stream error: {}", e);
+                        break;
+                    }
+                };
+
+                if let Some(data) = frame.data_ref() {
+                    buf.push_str(&String::from_utf8_lossy(data));
+
+                    // Process complete lines from buffer
+                    while let Some(pos) = buf.find('\n') {
+                        let line = buf[..pos].to_string();
+                        buf.drain(..=pos);
+
+                        if line.is_empty() {
+                            // Blank line = end of SSE message
+                            if !current_data.is_empty() {
+                                let event_type = if current_event.is_empty() {
+                                    "message".to_string()
+                                } else {
+                                    std::mem::take(&mut current_event)
+                                };
+                                let data = std::mem::take(&mut current_data);
+                                if tx.send((event_type, data)).await.is_err() {
+                                    return; // receiver dropped
+                                }
+                            }
+                            current_event.clear();
+                            current_data.clear();
+                        } else if let Some(value) = line.strip_prefix("event:") {
+                            current_event = value.trim().to_string();
+                        } else if let Some(value) = line.strip_prefix("data:") {
+                            current_data = value.trim_start().to_string();
+                        }
+                        // Ignore other SSE fields (id:, retry:, comments)
+                    }
+                }
+            }
+
+            // Flush any remaining partial message
+            if !current_data.is_empty() {
+                let event_type = if current_event.is_empty() {
+                    "message".to_string()
+                } else {
+                    current_event
+                };
+                let _ = tx.send((event_type, current_data)).await;
+            }
+        });
+
+        Ok(rx)
+    }
+
     /// Delete a deployment by name.
     ///
     /// `DELETE /api/v1/deployments/{name}` -- returns 204 No Content on success.

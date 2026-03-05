@@ -75,6 +75,7 @@ reqwest.workspace = true
 
 # Synchronization
 parking_lot.workspace = true
+dashmap.workspace = true
 
 # Streaming
 tokio-stream.workspace = true
