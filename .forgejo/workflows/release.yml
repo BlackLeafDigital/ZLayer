@@ -63,31 +63,31 @@ jobs:
           elif [[ "$TAG" == docker-v* ]]; then
             echo "docker=true" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == spec-v* ]]; then
-            echo "crate_name=zlayer-spec" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-spec-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == core-v* ]]; then
-            echo "crate_name=zlayer-core" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-core-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == registry-v* ]]; then
-            echo "crate_name=zlayer-registry" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-registry-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == obs-v* ]]; then
-            echo "crate_name=zlayer-observability" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-observability-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == builder-v* ]]; then
-            echo "crate_name=zlayer-builder" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-builder-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == overlay-v* ]]; then
-            echo "crate_name=zlayer-overlay" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-overlay-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == init-v* ]]; then
-            echo "crate_name=zlayer-init-actions" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-init-actions-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == scheduler-v* ]]; then
-            echo "crate_name=zlayer-scheduler" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-scheduler-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == storage-v* ]]; then
-            echo "crate_name=zlayer-storage" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-storage-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == tunnel-v* ]]; then
-            echo "crate_name=zlayer-tunnel" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-tunnel-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == tui-v* ]]; then
-            echo "crate_name=zlayer-tui" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-tui-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == consensus-v* ]]; then
-            echo "crate_name=zlayer-consensus" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-consensus-zql" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == build-v* ]]; then
-            echo "crate_name=zlayer-builder" >> $GITHUB_OUTPUT
+            echo "crate_name=zlayer-builder-zql" >> $GITHUB_OUTPUT
             echo "binary=true" >> $GITHUB_OUTPUT
           elif [[ "$TAG" == rust-sdk-v* ]]; then
             echo "sdk_name=rust" >> $GITHUB_OUTPUT
@@ -223,25 +223,25 @@ jobs:
           }
 
           declare -A CRATE_TAGS=(
-            ["zlayer-spec"]="spec"
-            ["zlayer-observability"]="obs"
-            ["zlayer-storage"]="storage"
-            ["zlayer-init-actions"]="init"
-            ["zlayer-registry"]="registry"
-            ["zlayer-tui"]="tui"
-            ["zlayer-consensus"]="consensus"
-            ["zlayer-core"]="core"
-            ["zlayer-tunnel"]="tunnel"
-            ["zlayer-overlay"]="overlay"
-            ["zlayer-builder"]="builder"
-            ["zlayer-scheduler"]="scheduler"
+            ["zlayer-spec-zql"]="spec"
+            ["zlayer-observability-zql"]="obs"
+            ["zlayer-storage-zql"]="storage"
+            ["zlayer-init-actions-zql"]="init"
+            ["zlayer-registry-zql"]="registry"
+            ["zlayer-tui-zql"]="tui"
+            ["zlayer-consensus-zql"]="consensus"
+            ["zlayer-core-zql"]="core"
+            ["zlayer-tunnel-zql"]="tunnel"
+            ["zlayer-overlay-zql"]="overlay"
+            ["zlayer-builder-zql"]="builder"
+            ["zlayer-scheduler-zql"]="scheduler"
           )
 
           # Publish order respects dependency graph:
           # Wave 1 (no internal deps): spec, observability, storage, init-actions, registry, tui, consensus
           # Wave 2 (deps on wave 1): core (->spec), tunnel (->spec)
           # Wave 3 (deps on wave 1+2): overlay (->spec,core), builder (->tui, ?registry), scheduler (->spec,core,consensus)
-          CRATES="zlayer-spec zlayer-observability zlayer-storage zlayer-init-actions zlayer-registry zlayer-tui zlayer-consensus zlayer-core zlayer-tunnel zlayer-overlay zlayer-builder zlayer-scheduler"
+          CRATES="zlayer-spec-zql zlayer-observability-zql zlayer-storage-zql zlayer-init-actions-zql zlayer-registry-zql zlayer-tui-zql zlayer-consensus-zql zlayer-core-zql zlayer-tunnel-zql zlayer-overlay-zql zlayer-builder-zql zlayer-scheduler-zql"
 
           for crate in $CRATES; do
             prefix="${CRATE_TAGS[$crate]}"
