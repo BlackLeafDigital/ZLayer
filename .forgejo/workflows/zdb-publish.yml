@@ -109,6 +109,13 @@ jobs:
           sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" Cargo.toml
           find crates bin -name Cargo.toml -exec sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" {} +
           sed -i "s/version = \"0.0.0-dev\", package/version = \"${VERSION}\", package/" Cargo.toml
+      - name: Inject Forgejo registry credentials for buildah containers
+        run: |
+          # When buildah copies the source into the container, cargo needs
+          # credentials for the private forgejo registry. Append the token
+          # to the existing [registries.forgejo] section in .cargo/config.toml.
+          sed -i '/^\[registries\.forgejo\]/a token = "Bearer ${{ secrets.FORGEJO_ACTIONS_TOKEN }}"' .cargo/config.toml
+
       - name: Prepare zlayer binary for node image
         run: |
           mkdir -p target/release
