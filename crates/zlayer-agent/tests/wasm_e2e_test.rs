@@ -27,7 +27,7 @@ use zlayer_agent_zql::runtimes::{
     DefaultHost, HttpRequest, HttpResponse, KvError, LogLevel, PoolStats, WasmHttpRuntime,
     ZLayerHost,
 };
-use zlayer_spec::WasmHttpConfig;
+use zlayer_spec::WasmConfig;
 
 // Import WASM utilities from zlayer-registry
 use zlayer_registry::{
@@ -617,16 +617,17 @@ mod wasm_http_e2e {
     #[tokio::test]
     async fn test_http_runtime_creation() {
         // Default config
-        let default_config = WasmHttpConfig::default();
+        let default_config = WasmConfig::default();
         let runtime = WasmHttpRuntime::new(default_config.clone());
         assert!(runtime.is_ok(), "Should create runtime with default config");
 
         // Custom config
-        let custom_config = WasmHttpConfig {
+        let custom_config = WasmConfig {
             min_instances: 2,
             max_instances: 20,
             idle_timeout: Duration::from_secs(120),
             request_timeout: Duration::from_secs(60),
+            ..Default::default()
         };
         let runtime = WasmHttpRuntime::new(custom_config);
         assert!(runtime.is_ok(), "Should create runtime with custom config");
@@ -748,11 +749,12 @@ mod wasm_http_e2e {
     /// Test pool statistics tracking
     #[tokio::test]
     async fn test_pool_statistics() {
-        let config = WasmHttpConfig {
+        let config = WasmConfig {
             min_instances: 0,
             max_instances: 10,
             idle_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
+            ..Default::default()
         };
 
         let runtime = WasmHttpRuntime::new(config).expect("Failed to create runtime");
@@ -773,7 +775,7 @@ mod wasm_http_e2e {
     /// Test cache clearing
     #[tokio::test]
     async fn test_cache_clearing() {
-        let config = WasmHttpConfig::default();
+        let config = WasmConfig::default();
         let runtime = WasmHttpRuntime::new(config).expect("Failed to create runtime");
 
         // Multiple clears should be safe
@@ -802,10 +804,10 @@ mod wasm_http_e2e {
         assert!(debug.contains("total_requests: 1000"));
     }
 
-    /// Test `WasmHttpConfig` default values
+    /// Test `WasmConfig` default values
     #[test]
     fn test_wasm_http_config_defaults() {
-        let config = WasmHttpConfig::default();
+        let config = WasmConfig::default();
 
         // Verify sensible defaults
         assert!(config.max_instances > 0);
@@ -1545,33 +1547,36 @@ mod kv_error_e2e {
 mod wasm_runtime_config_e2e {
     use super::*;
 
-    /// Test `WasmHttpConfig` validation
+    /// Test `WasmConfig` validation
     #[test]
     fn test_wasm_http_config_validation() {
         // Valid config
-        let valid = WasmHttpConfig {
+        let valid = WasmConfig {
             min_instances: 1,
             max_instances: 10,
             idle_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
+            ..Default::default()
         };
         assert!(valid.max_instances >= valid.min_instances);
 
         // Edge case: min equals max
-        let equal = WasmHttpConfig {
+        let equal = WasmConfig {
             min_instances: 5,
             max_instances: 5,
             idle_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
+            ..Default::default()
         };
         assert_eq!(equal.min_instances, equal.max_instances);
 
         // Zero min instances (cold start)
-        let cold_start = WasmHttpConfig {
+        let cold_start = WasmConfig {
             min_instances: 0,
             max_instances: 10,
             idle_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
+            ..Default::default()
         };
         assert_eq!(cold_start.min_instances, 0);
     }
@@ -1579,19 +1584,21 @@ mod wasm_runtime_config_e2e {
     /// Test timeout configurations
     #[test]
     fn test_timeout_configurations() {
-        let short = WasmHttpConfig {
+        let short = WasmConfig {
             min_instances: 1,
             max_instances: 5,
             idle_timeout: Duration::from_millis(100),
             request_timeout: Duration::from_millis(50),
+            ..Default::default()
         };
         assert!(short.request_timeout < short.idle_timeout);
 
-        let long = WasmHttpConfig {
+        let long = WasmConfig {
             min_instances: 1,
             max_instances: 5,
             idle_timeout: Duration::from_secs(3600), // 1 hour
             request_timeout: Duration::from_secs(300), // 5 minutes
+            ..Default::default()
         };
         assert!(long.idle_timeout > Duration::from_secs(60));
     }
@@ -2698,8 +2705,8 @@ mod wasm_service_type_e2e {
         for st in wasm_types {
             let caps = st
                 .default_wasm_capabilities()
-                .unwrap_or_else(|| panic!("{:?} should have default capabilities", st));
-            assert!(caps.logging, "{:?} should have logging enabled", st);
+                .unwrap_or_else(|| panic!("{st:?} should have default capabilities"));
+            assert!(caps.logging, "{st:?} should have logging enabled");
         }
     }
 
@@ -2719,15 +2726,11 @@ mod wasm_service_type_e2e {
         ];
         for (json, expected) in types {
             let deserialized: ServiceType = serde_json::from_str(json)
-                .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", json, e));
-            assert_eq!(deserialized, expected, "Failed for {}", json);
+                .unwrap_or_else(|e| panic!("Failed to deserialize {json}: {e}"));
+            assert_eq!(deserialized, expected, "Failed for {json}");
 
             let serialized = serde_json::to_string(&expected).unwrap();
-            assert_eq!(
-                serialized, json,
-                "Serialization mismatch for {:?}",
-                expected
-            );
+            assert_eq!(serialized, json, "Serialization mismatch for {expected:?}");
         }
     }
 }
@@ -2859,7 +2862,7 @@ capabilities:
     #[test]
     fn test_wasm_config_backward_compat_alias() {
         // Test that 'wasm_http' key still works via serde alias in ServiceSpec
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test-deploy
 services:
@@ -2876,7 +2879,7 @@ services:
       - name: http
         protocol: http
         port: 8080
-"#;
+";
         let result = zlayer_spec::from_yaml_str(yaml);
         // This should parse without errors - the wasm_http alias works
         assert!(
@@ -2892,7 +2895,7 @@ services:
 // =============================================================================
 
 mod wasm_runtime_dispatcher_e2e {
-    use zlayer_agent::runtimes::{
+    use zlayer_agent_zql::runtimes::{
         create_wasm_runtime_for_service_type, WasmPipelineConfig, WasmPipelineRuntime,
         WasmRuntimeKind,
     };
@@ -2926,11 +2929,10 @@ mod wasm_runtime_dispatcher_e2e {
         ];
         for st in pipeline_types {
             let result = create_wasm_runtime_for_service_type(st, &config);
-            assert!(result.is_ok(), "Failed for {:?}", st);
+            assert!(result.is_ok(), "Failed for {st:?}");
             assert!(
                 matches!(result.unwrap(), WasmRuntimeKind::Pipeline(_)),
-                "Expected Pipeline for {:?}",
-                st
+                "Expected Pipeline for {st:?}"
             );
         }
     }
@@ -2977,9 +2979,8 @@ mod wasm_capability_runtime_e2e {
     use zlayer_spec::WasmCapabilities;
 
     #[test]
-    #[allow(deprecated)]
     fn test_http_runtime_with_capabilities() {
-        let config = WasmHttpConfig::default();
+        let config = WasmConfig::default();
         let caps = WasmCapabilities {
             config: true,
             keyvalue: true,
@@ -3004,9 +3005,8 @@ mod wasm_capability_runtime_e2e {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_http_runtime_with_minimal_capabilities() {
-        let config = WasmHttpConfig::default();
+        let config = WasmConfig::default();
         let caps = WasmCapabilities {
             config: false,
             keyvalue: false,
@@ -3026,9 +3026,8 @@ mod wasm_capability_runtime_e2e {
     }
 
     #[test]
-    #[allow(deprecated)]
     fn test_http_runtime_pool_stats_with_capabilities() {
-        let config = WasmHttpConfig::default();
+        let config = WasmConfig::default();
         let caps = WasmCapabilities::default();
         let runtime = WasmHttpRuntime::new_with_capabilities(config, caps).unwrap();
 

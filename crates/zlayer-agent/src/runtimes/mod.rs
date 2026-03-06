@@ -199,7 +199,7 @@ pub use wasm_http_interfaces::{
 #[cfg(feature = "wasm")]
 pub enum WasmRuntimeKind {
     /// HTTP request handler (wasi:http/incoming-handler)
-    Http(WasmHttpRuntime),
+    Http(Box<WasmHttpRuntime>),
     /// General plugin runtime (zlayer:plugin/handler)
     Plugin(WasmPluginConfig),
     /// Proxy pipeline component (transformer, auth, rate-limiter, middleware, router)
@@ -255,25 +255,16 @@ pub fn create_wasm_runtime_for_service_type(
 
     match service_type {
         ServiceType::WasmHttp => {
-            // Convert WasmConfig to the deprecated WasmHttpConfig that the
-            // HTTP runtime still uses internally
-            #[allow(deprecated)]
-            let http_config = zlayer_spec::WasmHttpConfig {
-                min_instances: wasm_config.min_instances,
-                max_instances: wasm_config.max_instances,
-                idle_timeout: wasm_config.idle_timeout,
-                request_timeout: wasm_config.request_timeout,
-            };
-
             // Use capability-gated constructor if capabilities are configured
             let capabilities = wasm_config
                 .capabilities
                 .clone()
                 .unwrap_or_else(|| service_type.default_wasm_capabilities().unwrap());
-            let mut runtime = WasmHttpRuntime::new_with_capabilities(http_config, capabilities)?;
+            let mut runtime =
+                WasmHttpRuntime::new_with_capabilities(wasm_config.clone(), capabilities)?;
             // Apply resource limits (max_memory, max_fuel) from the spec config
             runtime.set_resource_limits(wasm_config);
-            Ok(WasmRuntimeKind::Http(runtime))
+            Ok(WasmRuntimeKind::Http(Box::new(runtime)))
         }
         ServiceType::WasmPlugin => Ok(WasmRuntimeKind::Plugin(WasmPluginConfig {
             capabilities: wasm_config

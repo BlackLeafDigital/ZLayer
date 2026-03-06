@@ -679,7 +679,7 @@ services:
 
     #[test]
     fn test_wasm_config_on_non_wasm_type_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -690,21 +690,20 @@ services:
     wasm:
       min_instances: 1
       max_instances: 4
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("wasm") || err_str.contains("WASM"),
-            "Error should mention wasm config on non-wasm type: {}",
-            err_str
+            "Error should mention wasm config on non-wasm type: {err_str}"
         );
     }
 
     #[test]
     fn test_wasm_service_without_config_is_ok() {
         // WASM service type without explicit wasm config is fine (defaults will be used)
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -712,18 +711,17 @@ services:
     image:
       name: handler:latest
     service_type: wasm_http
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "WASM service without explicit config should pass: {:?}",
-            result
+            "WASM service without explicit config should pass: {result:?}"
         );
     }
 
     #[test]
     fn test_wasm_min_instances_gt_max_rejected() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -734,20 +732,19 @@ services:
     wasm:
       min_instances: 10
       max_instances: 2
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("min_instances") || err_str.contains("max_instances"),
-            "Error should mention instance range: {}",
-            err_str
+            "Error should mention instance range: {err_str}"
         );
     }
 
     #[test]
     fn test_wasm_valid_instance_range() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -758,12 +755,11 @@ services:
     wasm:
       min_instances: 2
       max_instances: 10
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "Valid WASM instance range should pass: {:?}",
-            result
+            "Valid WASM instance range should pass: {result:?}"
         );
     }
 
@@ -785,8 +781,7 @@ services:
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("memory") || err_str.contains("512MB"),
-            "Error should mention invalid memory format: {}",
-            err_str
+            "Error should mention invalid memory format: {err_str}"
         );
     }
 
@@ -806,15 +801,14 @@ services:
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "Valid WASM max_memory should pass: {:?}",
-            result
+            "Valid WASM max_memory should pass: {result:?}"
         );
     }
 
     #[test]
     fn test_wasm_capability_escalation_rejected() {
         // WasmTransformer defaults: secrets=false, so requesting secrets=true should fail
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -825,14 +819,13 @@ services:
     wasm:
       capabilities:
         secrets: true
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("secrets") || err_str.contains("capability"),
-            "Error should mention capability escalation: {}",
-            err_str
+            "Error should mention capability escalation: {err_str}"
         );
     }
 
@@ -841,7 +834,7 @@ services:
         // WasmHttp defaults: config=true, keyvalue=true, logging=true, http_client=true
         // and metrics=false, secrets=false, cli=false, filesystem=false, sockets=false.
         // Restricting config=false while keeping all others at or below defaults should pass.
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -860,19 +853,18 @@ services:
         cli: false
         filesystem: false
         sockets: false
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "Restricting a default capability should pass: {:?}",
-            result
+            "Restricting a default capability should pass: {result:?}"
         );
     }
 
     #[test]
     fn test_wasm_http_with_tcp_only_endpoints_rejected() {
         // WasmHttp with endpoints but none are HTTP should fail
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -886,20 +878,19 @@ services:
       - name: raw
         protocol: tcp
         port: 9090
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("HTTP") || err_str.contains("http") || err_str.contains("endpoint"),
-            "Error should mention missing HTTP endpoint: {}",
-            err_str
+            "Error should mention missing HTTP endpoint: {err_str}"
         );
     }
 
     #[test]
     fn test_wasm_http_with_http_endpoint_passes() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -913,19 +904,18 @@ services:
       - name: web
         protocol: http
         port: 8080
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "WasmHttp with HTTP endpoint should pass: {:?}",
-            result
+            "WasmHttp with HTTP endpoint should pass: {result:?}"
         );
     }
 
     #[test]
     fn test_wasm_http_with_no_endpoints_passes() {
         // WasmHttp with no endpoints at all is fine (endpoints are optional)
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -935,12 +925,11 @@ services:
     service_type: wasm_http
     wasm:
       min_instances: 1
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "WasmHttp with no endpoints should pass: {:?}",
-            result
+            "WasmHttp with no endpoints should pass: {result:?}"
         );
     }
 
@@ -964,8 +953,7 @@ services:
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("preopen") || err_str.contains("source") || err_str.contains("empty"),
-            "Error should mention empty preopen source: {}",
-            err_str
+            "Error should mention empty preopen source: {err_str}"
         );
     }
 
@@ -989,14 +977,13 @@ services:
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("preopen") || err_str.contains("target") || err_str.contains("empty"),
-            "Error should mention empty preopen target: {}",
-            err_str
+            "Error should mention empty preopen target: {err_str}"
         );
     }
 
     #[test]
     fn test_wasm_valid_preopen_passes() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -1009,19 +996,15 @@ services:
         - source: /host/data
           target: /data
           readonly: true
-"#;
+";
         let result = from_yaml_str(yaml);
-        assert!(
-            result.is_ok(),
-            "Valid WASM preopen should pass: {:?}",
-            result
-        );
+        assert!(result.is_ok(), "Valid WASM preopen should pass: {result:?}");
     }
 
     #[test]
     fn test_wasm_plugin_can_use_all_capabilities() {
         // WasmPlugin has all capabilities except sockets as defaults
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -1039,19 +1022,18 @@ services:
         http_client: true
         cli: true
         filesystem: true
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "WasmPlugin with all its default capabilities should pass: {:?}",
-            result
+            "WasmPlugin with all its default capabilities should pass: {result:?}"
         );
     }
 
     #[test]
     fn test_wasm_plugin_cannot_use_sockets() {
         // WasmPlugin defaults: sockets=false
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -1062,20 +1044,19 @@ services:
     wasm:
       capabilities:
         sockets: true
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(result.is_err());
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("sockets") || err_str.contains("capability"),
-            "Error should mention sockets capability escalation: {}",
-            err_str
+            "Error should mention sockets capability escalation: {err_str}"
         );
     }
 
     #[test]
     fn test_wasm_equal_min_max_instances_passes() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: my-app
 services:
@@ -1086,12 +1067,11 @@ services:
     wasm:
       min_instances: 5
       max_instances: 5
-"#;
+";
         let result = from_yaml_str(yaml);
         assert!(
             result.is_ok(),
-            "Equal min/max instances should pass: {:?}",
-            result
+            "Equal min/max instances should pass: {result:?}"
         );
     }
 }

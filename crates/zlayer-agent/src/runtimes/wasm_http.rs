@@ -36,10 +36,10 @@
 //!
 //! ```no_run,ignore
 //! use zlayer_agent::runtimes::wasm_http::{WasmHttpRuntime, HttpRequest};
-//! use zlayer_spec::WasmHttpConfig;
+//! use zlayer_spec::WasmConfig;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = WasmHttpConfig::default();
+//! let config = WasmConfig::default();
 //! let runtime = WasmHttpRuntime::new(config)?;
 //!
 //! // Pre-warm instances
@@ -79,8 +79,7 @@ use wasmtime_wasi_http::bindings::http::types::Scheme;
 use wasmtime_wasi_http::bindings::{Proxy, ProxyPre};
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
-#[allow(deprecated)]
-use zlayer_spec::{WasmCapabilities, WasmHttpConfig};
+use zlayer_spec::{WasmCapabilities, WasmConfig};
 
 // =============================================================================
 // HTTP Request/Response Types
@@ -588,7 +587,6 @@ pub struct ComponentStats {
 ///
 /// The `prewarm` method compiles components ahead of time but doesn't pre-create
 /// instances since they can't be shared across threads.
-#[allow(deprecated)]
 pub struct WasmHttpRuntime {
     /// Wasmtime engine (shared across all instances)
     engine: Engine,
@@ -597,7 +595,7 @@ pub struct WasmHttpRuntime {
     /// Per-component statistics tracking (thread-safe via atomics)
     instance_pools: Arc<RwLock<HashMap<String, InstancePool>>>,
     /// Runtime configuration
-    config: WasmHttpConfig,
+    config: WasmConfig,
     /// Component linker with WASI HTTP bindings
     linker: Arc<Linker<WasmHttpState>>,
     /// Directory for AOT pre-compiled component disk cache
@@ -639,8 +637,7 @@ impl WasmHttpRuntime {
     /// # Errors
     ///
     /// Returns an error if the wasmtime engine cannot be created.
-    #[allow(deprecated)]
-    pub fn new(config: WasmHttpConfig) -> Result<Self, WasmHttpError> {
+    pub fn new(config: WasmConfig) -> Result<Self, WasmHttpError> {
         let mut engine_config = Config::new();
         engine_config.async_support(true);
         engine_config.wasm_component_model(true);
@@ -708,9 +705,8 @@ impl WasmHttpRuntime {
     /// # Errors
     ///
     /// Returns an error if the wasmtime engine cannot be created.
-    #[allow(deprecated)]
     pub fn new_with_capabilities(
-        config: WasmHttpConfig,
+        config: WasmConfig,
         capabilities: WasmCapabilities,
     ) -> Result<Self, WasmHttpError> {
         let mut engine_config = Config::new();
@@ -834,7 +830,6 @@ impl WasmHttpRuntime {
     /// # Errors
     ///
     /// Returns an error if the component cannot be loaded, instantiated, or the request fails.
-    #[allow(deprecated)]
     #[instrument(skip(self, wasm_bytes, request), fields(component = %component_ref, method = %request.method, uri = %request.uri))]
     pub async fn handle_request(
         &self,
@@ -1131,7 +1126,6 @@ impl WasmHttpRuntime {
     }
 
     /// Create a new instance for a component
-    #[allow(deprecated)]
     async fn create_instance(
         &self,
         component_ref: &str,
@@ -1454,21 +1448,23 @@ mod tests {
     // Test Configuration Helpers
     // =========================================================================
 
-    fn test_config() -> WasmHttpConfig {
-        WasmHttpConfig {
+    fn test_config() -> WasmConfig {
+        WasmConfig {
             min_instances: 0,
             max_instances: 10,
             idle_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
+            ..Default::default()
         }
     }
 
-    fn custom_config(min: u32, max: u32, idle_secs: u64, request_secs: u64) -> WasmHttpConfig {
-        WasmHttpConfig {
+    fn custom_config(min: u32, max: u32, idle_secs: u64, request_secs: u64) -> WasmConfig {
+        WasmConfig {
             min_instances: min,
             max_instances: max,
             idle_timeout: Duration::from_secs(idle_secs),
             request_timeout: Duration::from_secs(request_secs),
+            ..Default::default()
         }
     }
 
@@ -2160,7 +2156,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_runtime_new_with_default_config() {
-        let config = WasmHttpConfig::default();
+        let config = WasmConfig::default();
         let result = WasmHttpRuntime::new(config);
         assert!(result.is_ok(), "Failed to create runtime: {result:?}");
     }
@@ -2247,12 +2243,12 @@ mod tests {
     }
 
     // =========================================================================
-    // WasmHttpConfig Tests (from zlayer_spec)
+    // WasmConfig Tests (from zlayer_spec)
     // =========================================================================
 
     #[test]
-    fn test_wasm_http_config_defaults() {
-        let config = WasmHttpConfig::default();
+    fn test_wasm_config_defaults() {
+        let config = WasmConfig::default();
 
         assert_eq!(config.min_instances, 0);
         assert_eq!(config.max_instances, 10);
@@ -2261,8 +2257,8 @@ mod tests {
     }
 
     #[test]
-    fn test_wasm_http_config_custom_min_instances() {
-        let config = WasmHttpConfig {
+    fn test_wasm_config_custom_min_instances() {
+        let config = WasmConfig {
             min_instances: 5,
             ..Default::default()
         };
@@ -2271,8 +2267,8 @@ mod tests {
     }
 
     #[test]
-    fn test_wasm_http_config_custom_max_instances() {
-        let config = WasmHttpConfig {
+    fn test_wasm_config_custom_max_instances() {
+        let config = WasmConfig {
             max_instances: 100,
             ..Default::default()
         };
@@ -2281,8 +2277,8 @@ mod tests {
     }
 
     #[test]
-    fn test_wasm_http_config_custom_idle_timeout() {
-        let config = WasmHttpConfig {
+    fn test_wasm_config_custom_idle_timeout() {
+        let config = WasmConfig {
             idle_timeout: Duration::from_secs(600),
             ..Default::default()
         };
@@ -2290,8 +2286,8 @@ mod tests {
     }
 
     #[test]
-    fn test_wasm_http_config_custom_request_timeout() {
-        let config = WasmHttpConfig {
+    fn test_wasm_config_custom_request_timeout() {
+        let config = WasmConfig {
             request_timeout: Duration::from_secs(60),
             ..Default::default()
         };
@@ -2299,12 +2295,13 @@ mod tests {
     }
 
     #[test]
-    fn test_wasm_http_config_fully_custom() {
-        let config = WasmHttpConfig {
+    fn test_wasm_config_fully_custom() {
+        let config = WasmConfig {
             min_instances: 2,
             max_instances: 50,
             idle_timeout: Duration::from_secs(180),
             request_timeout: Duration::from_secs(45),
+            ..Default::default()
         };
 
         assert_eq!(config.min_instances, 2);
@@ -2314,12 +2311,13 @@ mod tests {
     }
 
     #[test]
-    fn test_wasm_http_config_clone() {
-        let original = WasmHttpConfig {
+    fn test_wasm_config_clone() {
+        let original = WasmConfig {
             min_instances: 3,
             max_instances: 30,
             idle_timeout: Duration::from_secs(120),
             request_timeout: Duration::from_secs(15),
+            ..Default::default()
         };
 
         let cloned = original.clone();
@@ -2330,35 +2328,38 @@ mod tests {
     }
 
     #[test]
-    fn test_wasm_http_config_debug_formatting() {
-        let config = WasmHttpConfig::default();
+    fn test_wasm_config_debug_formatting() {
+        let config = WasmConfig::default();
         let debug_str = format!("{config:?}");
-        assert!(debug_str.contains("WasmHttpConfig"));
+        assert!(debug_str.contains("WasmConfig"));
         assert!(debug_str.contains("min_instances"));
         assert!(debug_str.contains("max_instances"));
     }
 
     #[test]
-    fn test_wasm_http_config_equality() {
-        let config1 = WasmHttpConfig {
+    fn test_wasm_config_equality() {
+        let config1 = WasmConfig {
             min_instances: 1,
             max_instances: 10,
             idle_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
+            ..Default::default()
         };
 
-        let config2 = WasmHttpConfig {
+        let config2 = WasmConfig {
             min_instances: 1,
             max_instances: 10,
             idle_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
+            ..Default::default()
         };
 
-        let config3 = WasmHttpConfig {
+        let config3 = WasmConfig {
             min_instances: 2, // Different
             max_instances: 10,
             idle_timeout: Duration::from_secs(60),
             request_timeout: Duration::from_secs(30),
+            ..Default::default()
         };
 
         assert_eq!(config1, config2);
@@ -2539,7 +2540,7 @@ mod tests {
     /// which provides the `send_request` implementation for outgoing HTTP calls.
     #[tokio::test]
     async fn test_wasm_http_outgoing_configured() {
-        let config = WasmHttpConfig::default();
+        let config = WasmConfig::default();
         let runtime = WasmHttpRuntime::new(config);
         assert!(
             runtime.is_ok(),
