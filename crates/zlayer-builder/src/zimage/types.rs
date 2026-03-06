@@ -564,7 +564,7 @@ pub struct ZWasmConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
 
-    /// Additional build arguments (language-specific, e.g. CARGO_PROFILE_RELEASE_LTO)
+    /// Additional build arguments (language-specific, e.g. `CARGO_PROFILE_RELEASE_LTO`)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub build_args: HashMap<String, String>,
 
@@ -591,6 +591,7 @@ fn default_wasm_target() -> String {
 }
 
 /// Default WASM optimization level.
+#[allow(clippy::unnecessary_wraps)]
 fn default_wasm_opt_level() -> Option<String> {
     Some("Oz".to_string())
 }

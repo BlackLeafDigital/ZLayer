@@ -79,6 +79,7 @@ use wasmtime_wasi_http::bindings::http::types::Scheme;
 use wasmtime_wasi_http::bindings::{Proxy, ProxyPre};
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+#[allow(deprecated)]
 use zlayer_spec::{WasmCapabilities, WasmHttpConfig};
 
 // =============================================================================
@@ -587,6 +588,7 @@ pub struct ComponentStats {
 ///
 /// The `prewarm` method compiles components ahead of time but doesn't pre-create
 /// instances since they can't be shared across threads.
+#[allow(deprecated)]
 pub struct WasmHttpRuntime {
     /// Wasmtime engine (shared across all instances)
     engine: Engine,
@@ -603,11 +605,11 @@ pub struct WasmHttpRuntime {
     /// Capability grants controlling which host interfaces are available.
     /// When `None`, all interfaces are linked (backward-compatible default).
     capabilities: Option<WasmCapabilities>,
-    /// Optional store limits built from spec-level WasmConfig.max_memory.
+    /// Optional store limits built from spec-level `WasmConfig.max_memory`.
     /// Applied to every per-request Store created in `create_instance`.
     store_limits: Option<StoreLimits>,
     /// Fuel budget per request (0 = unlimited).
-    /// From spec-level WasmConfig.max_fuel.
+    /// From spec-level `WasmConfig.max_fuel`.
     max_fuel: u64,
 }
 
@@ -637,6 +639,7 @@ impl WasmHttpRuntime {
     /// # Errors
     ///
     /// Returns an error if the wasmtime engine cannot be created.
+    #[allow(deprecated)]
     pub fn new(config: WasmHttpConfig) -> Result<Self, WasmHttpError> {
         let mut engine_config = Config::new();
         engine_config.async_support(true);
@@ -692,9 +695,9 @@ impl WasmHttpRuntime {
     /// controlling what the guest can access.
     ///
     /// Gating happens at two levels:
-    /// - **Linker level**: ZLayer custom interfaces (config, KV, logging, secrets,
+    /// - **Linker level**: `ZLayer` custom interfaces (config, KV, logging, secrets,
     ///   metrics) and WASI HTTP are conditionally registered
-    /// - **WasiCtx level**: WASI standard interfaces (CLI, filesystem, sockets)
+    /// - **`WasiCtx` level**: WASI standard interfaces (CLI, filesystem, sockets)
     ///   are configured per-instance via the builder
     ///
     /// # Arguments
@@ -705,6 +708,7 @@ impl WasmHttpRuntime {
     /// # Errors
     ///
     /// Returns an error if the wasmtime engine cannot be created.
+    #[allow(deprecated)]
     pub fn new_with_capabilities(
         config: WasmHttpConfig,
         capabilities: WasmCapabilities,
@@ -781,17 +785,16 @@ impl WasmHttpRuntime {
     /// constructing the runtime to apply limits from the deployment spec.
     ///
     /// # Arguments
-    /// * `spec_wasm` - The spec-level WasmConfig containing `max_memory` and `max_fuel`
+    /// * `spec_wasm` - The spec-level [`WasmConfig`](zlayer_spec::WasmConfig) containing `max_memory` and `max_fuel`
     pub fn set_resource_limits(&mut self, spec_wasm: &zlayer_spec::WasmConfig) {
         // Parse memory limit
         if let Some(ref max_memory) = spec_wasm.max_memory {
             match super::wasm::parse_memory_limit(max_memory) {
                 Ok(max_bytes) => {
-                    self.store_limits = Some(
-                        StoreLimitsBuilder::new()
-                            .memory_size(max_bytes as usize)
-                            .build(),
-                    );
+                    #[allow(clippy::cast_possible_truncation)]
+                    let mem_size = max_bytes as usize;
+                    self.store_limits =
+                        Some(StoreLimitsBuilder::new().memory_size(mem_size).build());
                     info!(
                         max_bytes = max_bytes,
                         "WASM HTTP store memory limit configured"
@@ -831,6 +834,7 @@ impl WasmHttpRuntime {
     /// # Errors
     ///
     /// Returns an error if the component cannot be loaded, instantiated, or the request fails.
+    #[allow(deprecated)]
     #[instrument(skip(self, wasm_bytes, request), fields(component = %component_ref, method = %request.method, uri = %request.uri))]
     pub async fn handle_request(
         &self,
@@ -882,7 +886,7 @@ impl WasmHttpRuntime {
     /// # Errors
     ///
     /// Returns an error if the component cannot be compiled.
-    #[allow(clippy::used_underscore_binding)]
+    #[allow(clippy::used_underscore_binding, deprecated)]
     #[instrument(skip(self, wasm_bytes), fields(component = %component_ref))]
     pub async fn prewarm(
         &self,
@@ -975,6 +979,7 @@ impl WasmHttpRuntime {
     }
 
     /// Get a compiled component from in-memory cache, disk cache, or compile from scratch
+    #[allow(clippy::too_many_lines, unsafe_code)]
     async fn get_or_compile(
         &self,
         component_ref: &str,
@@ -1126,6 +1131,7 @@ impl WasmHttpRuntime {
     }
 
     /// Create a new instance for a component
+    #[allow(deprecated)]
     async fn create_instance(
         &self,
         component_ref: &str,

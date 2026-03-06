@@ -166,11 +166,11 @@ impl WasmLanguage {
     ///
     /// Accepts common names and aliases (case-insensitive):
     /// - "rust" -> Rust
-    /// - "rust-component" / "rust_component" / "cargo-component" -> RustComponent
+    /// - "rust-component" / "`rust_component`" / "cargo-component" -> `RustComponent`
     /// - "go" / "tinygo" -> Go
     /// - "python" / "py" -> Python
     /// - "typescript" / "ts" -> TypeScript
-    /// - "assemblyscript" / "as" -> AssemblyScript
+    /// - "assemblyscript" / "as" -> `AssemblyScript`
     /// - "c" -> C
     /// - "zig" -> Zig
     #[must_use]
@@ -1142,64 +1142,62 @@ pub async fn optimize_wasm(wasm_path: &Path, opt_level: &str) -> Result<PathBuf>
     let flag = match opt_level {
         "O" => "-O",
         "Os" => "-Os",
-        "Oz" => "-Oz",
         "O2" => "-O2",
         "O3" => "-O3",
+        // "Oz" and anything else defaults to -Oz (best size optimization)
         _ => "-Oz",
     };
 
     // Check if wasm-opt is available
     let wasm_opt = which_wasm_opt();
 
-    match wasm_opt {
-        Some(wasm_opt_path) => {
-            let optimized_path = wasm_path.with_extension("opt.wasm");
-            let output = Command::new(&wasm_opt_path)
-                .arg(flag)
-                .arg("-o")
-                .arg(&optimized_path)
-                .arg(wasm_path)
-                .output()
-                .await
-                .map_err(|e| WasmBuildError::ConfigError {
-                    message: format!("Failed to run wasm-opt: {e}"),
-                })?;
+    if let Some(wasm_opt_path) = wasm_opt {
+        let optimized_path = wasm_path.with_extension("opt.wasm");
+        let output = Command::new(&wasm_opt_path)
+            .arg(flag)
+            .arg("-o")
+            .arg(&optimized_path)
+            .arg(wasm_path)
+            .output()
+            .await
+            .map_err(|e| WasmBuildError::ConfigError {
+                message: format!("Failed to run wasm-opt: {e}"),
+            })?;
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(WasmBuildError::ConfigError {
-                    message: format!("wasm-opt failed: {stderr}"),
-                });
-            }
-
-            // Log size reduction
-            if let (Ok(original), Ok(optimized)) = (
-                std::fs::metadata(wasm_path),
-                std::fs::metadata(&optimized_path),
-            ) {
-                let original_size = original.len();
-                let optimized_size = optimized.len();
-                let reduction = if original_size > 0 {
-                    ((original_size.saturating_sub(optimized_size)) as f64 / original_size as f64)
-                        * 100.0
-                } else {
-                    0.0
-                };
-                info!(
-                    "wasm-opt: {:.1}% size reduction ({} -> {} bytes)",
-                    reduction, original_size, optimized_size,
-                );
-            }
-
-            Ok(optimized_path)
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WasmBuildError::ConfigError {
+                message: format!("wasm-opt failed: {stderr}"),
+            });
         }
-        None => {
-            warn!(
-                "wasm-opt not found in PATH; skipping optimization. \
-                 Install binaryen for WASM size optimization."
+
+        // Log size reduction
+        if let (Ok(original), Ok(optimized)) = (
+            std::fs::metadata(wasm_path),
+            std::fs::metadata(&optimized_path),
+        ) {
+            let original_size = original.len();
+            let optimized_size = optimized.len();
+            #[allow(clippy::cast_precision_loss)]
+            let reduction = if original_size > 0 {
+                ((original_size.saturating_sub(optimized_size)) as f64 / original_size as f64)
+                    * 100.0
+            } else {
+                0.0
+            };
+            info!(
+                "wasm-opt: {:.1}% size reduction ({} -> {} bytes)",
+                reduction, original_size, optimized_size,
             );
-            Ok(wasm_path.to_path_buf())
         }
+
+        Ok(optimized_path)
+    } else {
+        warn!(
+            "wasm-opt not found in PATH; skipping optimization. \
+             Install binaryen for WASM size optimization."
+        );
+        Ok(wasm_path.to_path_buf())
     }
 }
 

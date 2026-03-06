@@ -956,7 +956,7 @@ where
 
 /// Add `ZLayer` host functions to a linker, gated by [`WasmCapabilities`].
 ///
-/// Only the ZLayer host interfaces that are enabled in the capabilities struct
+/// Only the `ZLayer` host interfaces that are enabled in the capabilities struct
 /// will be registered with the linker. Components that try to call ungated
 /// interfaces will trap at runtime.
 ///

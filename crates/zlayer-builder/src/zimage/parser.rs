@@ -213,6 +213,7 @@ fn validate_step(step: &ZStep, index: usize, stage: Option<&str>) -> Result<()> 
 // ---------------------------------------------------------------------------
 
 /// Validate WASM-specific configuration fields when the `wasm` mode is active.
+#[allow(clippy::items_after_statements)]
 fn validate_wasm(image: &ZImage) -> Result<()> {
     let Some(ref wasm) = image.wasm else {
         return Ok(());

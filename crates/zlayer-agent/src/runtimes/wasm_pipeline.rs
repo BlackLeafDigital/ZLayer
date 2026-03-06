@@ -23,7 +23,11 @@ pub struct WasmPipelineRuntime {
 }
 
 impl WasmPipelineRuntime {
-    /// Create a new pipeline runtime for the given configuration
+    /// Create a new pipeline runtime for the given configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if runtime initialization fails.
     pub fn new(
         config: WasmPipelineConfig,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
@@ -34,12 +38,14 @@ impl WasmPipelineRuntime {
         Ok(Self { config })
     }
 
-    /// Get the service type this runtime handles
+    /// Get the service type this runtime handles.
+    #[must_use]
     pub fn service_type(&self) -> ServiceType {
         self.config.service_type
     }
 
-    /// Get the pipeline stage name for this service type
+    /// Get the pipeline stage name for this service type.
+    #[must_use]
     pub fn pipeline_stage(&self) -> &'static str {
         match self.config.service_type {
             ServiceType::WasmTransformer => "transform",
@@ -51,7 +57,8 @@ impl WasmPipelineRuntime {
         }
     }
 
-    /// Get the configuration
+    /// Get the configuration.
+    #[must_use]
     pub fn config(&self) -> &WasmPipelineConfig {
         &self.config
     }

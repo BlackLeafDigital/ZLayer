@@ -130,10 +130,10 @@ use zlayer_registry::cache::BlobCacheBackend;
 #[cfg(feature = "local-registry")]
 use zlayer_registry::LocalRegistry;
 
-/// Output from parsing a ZImagefile - either a Dockerfile for container builds
+/// Output from parsing a `ZImagefile` - either a Dockerfile for container builds
 /// or a WASM build result for WebAssembly builds.
 ///
-/// Most ZImagefile modes (runtime, single-stage, multi-stage) produce a
+/// Most `ZImagefile` modes (runtime, single-stage, multi-stage) produce a
 /// [`Dockerfile`] IR that is then built with buildah. WASM mode produces
 /// a compiled artifact directly, bypassing the container build pipeline.
 #[derive(Debug)]
@@ -1310,6 +1310,7 @@ impl ImageBuilder {
             size,
         } = build_output
         {
+            #[allow(clippy::cast_possible_truncation)]
             let build_time_ms = start_time.elapsed().as_millis() as u64;
 
             self.send_event(BuildEvent::BuildComplete {
@@ -1803,7 +1804,7 @@ impl ImageBuilder {
         ))
     }
 
-    /// Build a WASM component from the ZImagefile wasm configuration.
+    /// Build a WASM component from the `ZImagefile` wasm configuration.
     ///
     /// Converts [`ZWasmConfig`](crate::zimage::ZWasmConfig) into a
     /// [`WasmBuildConfig`](crate::wasm_builder::WasmBuildConfig) and invokes

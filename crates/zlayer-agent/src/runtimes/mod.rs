@@ -234,13 +234,18 @@ pub struct WasmPipelineConfig {
 /// Dispatches to specialized runtimes based on the WASM world:
 /// - `WasmHttp` -> [`WasmHttpRuntime`] (existing)
 /// - `WasmPlugin` -> General plugin runtime (uses [`WasmPluginConfig`])
-/// - Proxy-adjacent types (Transformer, Auth, RateLimiter, Middleware, Router)
+/// - Proxy-adjacent types (Transformer, Auth, `RateLimiter`, Middleware, Router)
 ///   -> [`WasmPipelineConfig`] (for use with [`WasmPipelineRuntime`])
 ///
 /// # Errors
 ///
 /// Returns an error if the service type is not a WASM variant, or if runtime
 /// creation fails (e.g., wasmtime engine initialization).
+///
+/// # Panics
+///
+/// Panics if `default_wasm_capabilities()` returns `None` for a known WASM
+/// service type when no explicit capabilities are provided.
 #[cfg(feature = "wasm")]
 pub fn create_wasm_runtime_for_service_type(
     service_type: zlayer_spec::ServiceType,

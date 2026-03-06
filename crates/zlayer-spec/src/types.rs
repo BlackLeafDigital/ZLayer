@@ -132,6 +132,7 @@ pub struct NodeSelector {
 /// Controls which host interfaces are linked and available to the component.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct WasmCapabilities {
     /// Config interface access (zlayer:plugin/config)
     #[serde(default = "default_true")]
@@ -197,6 +198,7 @@ pub struct WasmPreopen {
 /// declarations, networking controls, and storage configuration.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct WasmConfig {
     // --- Instance Management ---
     /// Minimum number of warm instances to keep ready
@@ -362,6 +364,7 @@ impl From<WasmHttpConfig> for WasmConfig {
 
 impl ServiceType {
     /// Returns true if this is any WASM service type
+    #[must_use]
     pub fn is_wasm(&self) -> bool {
         matches!(
             self,
@@ -377,9 +380,10 @@ impl ServiceType {
 
     /// Returns the default capabilities for this WASM service type.
     /// Returns None for non-WASM types.
+    #[must_use]
     pub fn default_wasm_capabilities(&self) -> Option<WasmCapabilities> {
         match self {
-            ServiceType::WasmHttp => Some(WasmCapabilities {
+            ServiceType::WasmHttp | ServiceType::WasmRouter => Some(WasmCapabilities {
                 config: true,
                 keyvalue: true,
                 logging: true,
@@ -437,17 +441,6 @@ impl ServiceType {
             ServiceType::WasmMiddleware => Some(WasmCapabilities {
                 config: true,
                 keyvalue: false,
-                logging: true,
-                secrets: false,
-                metrics: false,
-                http_client: true,
-                cli: false,
-                filesystem: false,
-                sockets: false,
-            }),
-            ServiceType::WasmRouter => Some(WasmCapabilities {
-                config: true,
-                keyvalue: true,
                 logging: true,
                 secrets: false,
                 metrics: false,
@@ -647,11 +640,11 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<NodeSelector>,
 
-    /// Service type (standard, wasm_http, wasm_plugin, etc.)
+    /// Service type (standard, `wasm_http`, `wasm_plugin`, etc.)
     #[serde(default)]
     pub service_type: ServiceType,
 
-    /// WASM configuration (used when service_type is any Wasm* variant)
+    /// WASM configuration (used when `service_type` is any Wasm* variant)
     /// Also accepts the deprecated `wasm_http` key for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "wasm_http")]
     pub wasm: Option<WasmConfig>,

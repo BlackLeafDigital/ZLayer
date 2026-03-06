@@ -217,7 +217,12 @@ fn build_store_limits(spec_wasm: Option<&zlayer_spec::WasmConfig>) -> Option<Sto
     };
 
     let limits = StoreLimitsBuilder::new()
-        .memory_size(max_bytes as usize)
+        .memory_size(
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                max_bytes as usize
+            },
+        )
         .build();
 
     tracing::info!(max_bytes = max_bytes, "WASM store memory limit configured");
@@ -239,7 +244,7 @@ struct ResourceLimits {
 }
 
 impl ResourceLimits {
-    /// Build from the spec-level WasmConfig if present.
+    /// Build from the spec-level `WasmConfig` if present.
     fn from_spec(spec_wasm: Option<&zlayer_spec::WasmConfig>) -> Self {
         let store_limits = build_store_limits(spec_wasm);
         let max_fuel = spec_wasm.map_or(0, |w| w.max_fuel);
@@ -252,19 +257,19 @@ impl ResourceLimits {
     }
 }
 
-/// WASIp1 state wrapper that owns both the WASI context and the resource limiter.
+/// `WASIp1` state wrapper that owns both the WASI context and the resource limiter.
 ///
 /// This is needed because `Store::limiter()` requires the limiter to be accessible
 /// via a closure from the store's state type, and `WasiP1Ctx` is an external type
 /// we cannot modify.
 struct WasiP1State {
-    /// The underlying WASIp1 context
+    /// The underlying `WASIp1` context
     wasi: WasiP1Ctx,
     /// Optional resource limiter for memory/table growth
     limiter: StoreLimits,
 }
 
-/// WASIp2 component state wrapper (extends existing `WasiState`)
+/// `WASIp2` component state wrapper (extends existing `WasiState`)
 ///
 /// Holds the WASI context, resource table, and resource limiter.
 struct WasiP2State {
@@ -351,9 +356,9 @@ struct WasmInstance {
     args: Vec<String>,
     /// Filesystem mounts for WASI preopens
     mounts: Vec<StorageSpec>,
-    /// Resource limits from the spec-level WasmConfig
+    /// Resource limits from the spec-level `WasmConfig`
     resource_limits: ResourceLimits,
-    /// Capability grants from the spec-level WasmConfig (controls WASI context gating)
+    /// Capability grants from the spec-level `WasmConfig` (controls WASI context gating)
     capabilities: Option<WasmCapabilities>,
     /// Execution handle (if running) - returns `ExecutionResult` with captured stdout/stderr
     execution_handle: Option<tokio::task::JoinHandle<std::result::Result<ExecutionResult, String>>>,
@@ -568,7 +573,7 @@ impl WasmRuntime {
     /// * `enable_epochs` - Whether to enable epoch-based interruption
     /// * `resource_limits` - Per-instance resource limits from the spec
     /// * `capabilities` - Optional capability grants controlling WASI context.
-    ///   WASIp1 modules don't support ZLayer custom interfaces, so only
+    ///   `WASIp1` modules don't support `ZLayer` custom interfaces, so only
     ///   WASI-level capabilities (CLI, filesystem, sockets) are relevant.
     ///   When `None`, all capabilities are enabled (backward-compatible).
     ///
@@ -738,8 +743,8 @@ impl WasmRuntime {
     /// * `capabilities` - Optional capability grants for WASI context gating.
     ///   When `None`, all capabilities are enabled (backward-compatible).
     ///   When `Some`, the WASI context is configured based on the capabilities:
-    ///   - CLI, filesystem, sockets gated at WasiCtx level
-    ///   - ZLayer custom interfaces not applicable here (WASIp2 only)
+    ///   - CLI, filesystem, sockets gated at `WasiCtx` level
+    ///   - `ZLayer` custom interfaces not applicable here (`WASIp2` only)
     ///
     /// # Returns
     /// `ExecutionResult` containing the exit code and captured stdout/stderr
