@@ -1,18 +1,18 @@
-//! WASIp2 Component Integration Tests
+//! `WASIp2` Component Integration Tests
 //!
-//! These tests verify the WasmRuntime's handling of WASIp2 (WebAssembly Component Model)
-//! artifacts. Since creating valid WASIp2 component bytes programmatically requires the
+//! These tests verify the `WasmRuntime`'s handling of `WASIp2` (WebAssembly Component Model)
+//! artifacts. Since creating valid `WASIp2` component bytes programmatically requires the
 //! component toolchain (wit-component, wasm-tools), these tests focus on:
 //!
 //! 1. **Component Loading Tests**: Detection and loading of component binaries
 //! 2. **WASI Interface Binding Tests**: Verification that WASI interfaces are linked
 //! 3. **Error Handling Tests**: Proper error responses for invalid/malformed components
-//! 4. **Version Detection Tests**: Correct identification of WASIp2 vs WASIp1 binaries
+//! 4. **Version Detection Tests**: Correct identification of `WASIp2` vs `WASIp1` binaries
 //!
 //! # Test Architecture
 //!
 //! - Tests use programmatically constructed binary headers to test detection logic
-//! - Valid execution tests use WASIp1 modules (via `wat` crate) where component execution
+//! - Valid execution tests use `WASIp1` modules (via `wat` crate) where component execution
 //!   would require pre-built fixtures
 //! - Error paths are tested with malformed/invalid binary data
 //!
@@ -43,13 +43,13 @@ use zlayer_spec::{
 /// WASM magic bytes: `\0asm`
 const WASM_MAGIC: [u8; 4] = [0x00, 0x61, 0x73, 0x6d];
 
-/// Version 1 (little-endian) - used by WASIp1 core modules
+/// Version 1 (little-endian) - used by `WASIp1` core modules
 const MODULE_VERSION: [u8; 4] = [0x01, 0x00, 0x00, 0x00];
 
-/// Version 13 (0x0d, little-endian) - used by WASIp2 components
+/// Version 13 (0x0d, little-endian) - used by `WASIp2` components
 const COMPONENT_VERSION: [u8; 4] = [0x0d, 0x00, 0x00, 0x00];
 
-/// Create a minimal valid WASIp1 module header
+/// Create a minimal valid `WASIp1` module header
 fn make_module_header() -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend_from_slice(&WASM_MAGIC);
@@ -58,7 +58,7 @@ fn make_module_header() -> Vec<u8> {
     bytes
 }
 
-/// Create a minimal WASIp2 component header (binary header only, not fully valid)
+/// Create a minimal `WASIp2` component header (binary header only, not fully valid)
 ///
 /// Note: This creates a binary that will be detected as a component based on its
 /// version number (13), but it is not a fully valid component. It's useful for
@@ -91,7 +91,7 @@ fn create_test_cache_dir() -> TempDir {
     tempfile::tempdir().expect("Failed to create temp directory")
 }
 
-/// Create a WasmConfig for testing with shorter timeouts
+/// Create a `WasmConfig` for testing with shorter timeouts
 fn create_test_config(cache_dir: &TempDir) -> WasmConfig {
     WasmConfig {
         cache_dir: cache_dir.path().to_path_buf(),
@@ -105,15 +105,16 @@ fn create_test_config(cache_dir: &TempDir) -> WasmConfig {
 /// Generate a unique service name to avoid test collisions
 fn unique_service_name(prefix: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
+    #[allow(clippy::cast_possible_truncation)]
+    let timestamp = (SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos() as u64
-        % 1_000_000_000;
-    format!("test-{}-{}", prefix, timestamp)
+        .as_nanos()
+        % 1_000_000_000) as u64;
+    format!("test-{prefix}-{timestamp}")
 }
 
-/// Create a ContainerId with a unique service name
+/// Create a `ContainerId` with a unique service name
 fn unique_container_id(prefix: &str) -> ContainerId {
     ContainerId {
         service: unique_service_name(prefix),
@@ -121,7 +122,7 @@ fn unique_container_id(prefix: &str) -> ContainerId {
     }
 }
 
-/// Create a minimal ServiceSpec for WASM testing
+/// Create a minimal `ServiceSpec` for WASM testing
 fn create_wasm_spec(image: &str) -> ServiceSpec {
     ServiceSpec {
         rtype: ResourceType::Service,
@@ -158,14 +159,14 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
     }
 }
 
-/// Create a ServiceSpec with environment variables
+/// Create a `ServiceSpec` with environment variables
 fn create_wasm_spec_with_env(image: &str, env: HashMap<String, String>) -> ServiceSpec {
     let mut spec = create_wasm_spec(image);
     spec.env = env;
     spec
 }
 
-/// Create a ServiceSpec with command arguments
+/// Create a `ServiceSpec` with command arguments
 fn create_wasm_spec_with_args(image: &str, args: Vec<String>) -> ServiceSpec {
     let mut spec = create_wasm_spec(image);
     spec.command = CommandSpec {
@@ -179,7 +180,7 @@ fn create_wasm_spec_with_args(image: &str, args: Vec<String>) -> ServiceSpec {
 /// Write bytes to the cache directory and return the "image" name
 fn write_wasm_to_cache(cache_dir: &TempDir, name: &str, wasm_bytes: &[u8]) -> String {
     let cache_key = name.replace(['/', ':', '@'], "_");
-    let cache_path = cache_dir.path().join(format!("{}.wasm", cache_key));
+    let cache_path = cache_dir.path().join(format!("{cache_key}.wasm"));
     std::fs::write(&cache_path, wasm_bytes).expect("Failed to write WASM to cache");
     name.to_string()
 }
@@ -215,7 +216,7 @@ impl Drop for InstanceGuard {
 // These are used for comparison and to verify module vs component detection
 // =============================================================================
 
-/// Minimal WASIp1 module that exports _start and exits with code 0
+/// Minimal `WASIp1` module that exports `_start` and exits with code 0
 const MINIMAL_P1_MODULE: &str = r#"
 (module
     (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
@@ -227,7 +228,7 @@ const MINIMAL_P1_MODULE: &str = r#"
 )
 "#;
 
-/// WASIp1 module that exits with code 42
+/// `WASIp1` module that exits with code 42
 const EXIT_42_P1_MODULE: &str = r#"
 (module
     (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
@@ -239,7 +240,7 @@ const EXIT_42_P1_MODULE: &str = r#"
 )
 "#;
 
-/// WASIp1 module without _start or main (should fail)
+/// `WASIp1` module without `_start` or main (should fail)
 const NO_ENTRY_P1_MODULE: &str = r#"
 (module
     (memory (export "memory") 1)
@@ -318,8 +319,7 @@ mod component_loading_tests {
         let result = runtime.create_container(&id, &spec).await;
         assert!(
             result.is_ok(),
-            "Loading valid module should succeed: {:?}",
-            result
+            "Loading valid module should succeed: {result:?}",
         );
 
         // State should be Pending
@@ -352,16 +352,14 @@ mod component_loading_tests {
         let create_result = runtime.create_container(&id, &spec).await;
         assert!(
             create_result.is_ok(),
-            "Create should succeed: {:?}",
-            create_result
+            "Create should succeed: {create_result:?}",
         );
 
         // Starting should also succeed (spawns async task)
         let start_result = runtime.start_container(&id).await;
         assert!(
             start_result.is_ok(),
-            "Start should succeed: {:?}",
-            start_result
+            "Start should succeed: {start_result:?}",
         );
 
         // But waiting should fail because the component is invalid
@@ -636,8 +634,7 @@ mod component_execution_tests {
                 state,
                 ContainerState::Exited { .. } | ContainerState::Failed { .. }
             ),
-            "State should be Exited or Failed after stop, got: {:?}",
-            state
+            "State should be Exited or Failed after stop, got: {state:?}",
         );
     }
 
@@ -718,8 +715,7 @@ mod error_handling_tests {
                 reason.contains("_start")
                     || reason.contains("main")
                     || reason.contains("not found"),
-                "Error should mention missing entry point, got: {}",
-                reason
+                "Error should mention missing entry point, got: {reason}",
             );
         }
     }
@@ -855,9 +851,9 @@ mod error_handling_tests {
             "Waiting for nonexistent container should error"
         );
 
-        let stats_result = runtime.get_container_stats(&id).await;
+        let ctr_stats_result = runtime.get_container_stats(&id).await;
         assert!(
-            stats_result.is_err(),
+            ctr_stats_result.is_err(),
             "Getting stats of nonexistent container should error"
         );
     }
@@ -887,11 +883,11 @@ mod error_handling_tests {
         let exec_result = runtime.exec(&id, &cmd).await;
 
         assert!(exec_result.is_err(), "Exec should fail for WASM");
-        let err_msg = format!("{:?}", exec_result.unwrap_err());
+        let err = exec_result.unwrap_err();
+        let err_msg = format!("{err:?}");
         assert!(
             err_msg.contains("not supported") || err_msg.contains("WASM"),
-            "Error should mention WASM or not supported: {}",
-            err_msg
+            "Error should mention WASM or not supported: {err_msg}",
         );
     }
 }
@@ -995,8 +991,7 @@ mod version_detection_tests {
             assert_eq!(
                 version,
                 WasiVersion::Preview1,
-                "Section type {:02x} should be detected as Preview1",
-                section_type
+                "Section type {section_type:02x} should be detected as Preview1",
             );
         }
     }
@@ -1014,8 +1009,7 @@ mod version_detection_tests {
             assert_eq!(
                 version,
                 WasiVersion::Preview2,
-                "Version {:02x} should be detected as Preview2",
-                ver
+                "Version {ver:02x} should be detected as Preview2",
             );
         }
     }
@@ -1108,7 +1102,7 @@ mod runtime_config_tests {
     #[test]
     fn test_wasm_config_debug() {
         let config = WasmConfig::default();
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
         assert!(debug_str.contains("WasmConfig"));
         assert!(debug_str.contains("cache_dir"));
         assert!(debug_str.contains("enable_epochs"));
@@ -1318,7 +1312,7 @@ mod concurrent_tests {
         // Wait for all to complete
         for handle in handles {
             let result = handle.await.unwrap();
-            assert!(result.is_ok(), "Concurrent instance failed: {:?}", result);
+            assert!(result.is_ok(), "Concurrent instance failed: {result:?}");
             assert_eq!(result.unwrap(), 0);
         }
 
@@ -1352,7 +1346,7 @@ mod concurrent_tests {
             runtime.create_container(&id, &spec).await.unwrap();
             runtime.start_container(&id).await.unwrap();
             let exit_code = runtime.wait_container(&id).await.unwrap();
-            assert_eq!(exit_code, 0, "Iteration {} failed", i);
+            assert_eq!(exit_code, 0, "Iteration {i} failed");
             runtime.remove_container(&id).await.unwrap();
         }
     }

@@ -1,6 +1,6 @@
 //! Docker runtime integration tests
 //!
-//! These tests verify the DockerRuntime implementation against a real Docker daemon.
+//! These tests verify the `DockerRuntime` implementation against a real Docker daemon.
 //! Tests are gated behind the `docker` feature and will be skipped if Docker is not available.
 //!
 //! # Requirements

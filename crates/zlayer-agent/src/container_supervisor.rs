@@ -651,7 +651,7 @@ mod tests {
 
     fn mock_service_spec(panic_action: PanicAction) -> ServiceSpec {
         let mut spec: ServiceSpec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -659,7 +659,7 @@ services:
     rtype: service
     image:
       name: test:latest
-"#,
+",
         )
         .unwrap()
         .services

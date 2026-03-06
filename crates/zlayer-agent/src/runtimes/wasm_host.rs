@@ -1690,7 +1690,7 @@ mod tests {
             "storage error: connection failed"
         );
         assert_eq!(
-            KvError::Storage("".to_string()).to_string(),
+            KvError::Storage(String::new()).to_string(),
             "storage error: "
         );
     }
@@ -1750,7 +1750,7 @@ mod tests {
         assert_eq!(kv_error_to_wit(&KvError::QuotaExceeded), 2);
         assert_eq!(kv_error_to_wit(&KvError::InvalidKey), 3);
         assert_eq!(kv_error_to_wit(&KvError::Storage("test".to_string())), 4);
-        assert_eq!(kv_error_to_wit(&KvError::Storage("".to_string())), 4);
+        assert_eq!(kv_error_to_wit(&KvError::Storage(String::new())), 4);
     }
 
     // =========================================================================
@@ -1888,7 +1888,7 @@ mod tests {
     #[test]
     fn test_default_host_debug_formatting() {
         let host = DefaultHost::new();
-        let debug_str = format!("{:?}", host);
+        let debug_str = format!("{host:?}");
         assert!(debug_str.contains("DefaultHost"));
         assert!(debug_str.contains("plugin_id"));
     }
@@ -2548,7 +2548,7 @@ mod tests {
             LogLevel::Info,
             "message",
             &[
-                ("empty".to_string(), "".to_string()),
+                ("empty".to_string(), String::new()),
                 ("unicode".to_string(), "test".to_string()),
                 ("json".to_string(), "{\"key\": \"value\"}".to_string()),
             ],
@@ -2965,12 +2965,13 @@ mod tests {
 
     #[test]
     fn test_default_host_thread_safety() {
-        // Verify DefaultHost is Send
         fn assert_send<T: Send>() {}
+        fn assert_trait_send<T: ZLayerHost>() {}
+
+        // Verify DefaultHost is Send
         assert_send::<DefaultHost>();
 
         // Verify ZLayerHost requires Send
-        fn assert_trait_send<T: ZLayerHost>() {}
         assert_trait_send::<DefaultHost>();
     }
 }

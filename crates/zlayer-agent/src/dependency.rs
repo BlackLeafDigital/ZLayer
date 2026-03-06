@@ -710,10 +710,10 @@ mod tests {
     use crate::runtime::MockRuntime;
     use zlayer_spec::{DependencyCondition, DependsSpec, TimeoutAction};
 
-    /// Helper to create a minimal ServiceSpec for testing
+    /// Helper to create a minimal `ServiceSpec` for testing
     fn minimal_spec(depends: Vec<DependsSpec>) -> ServiceSpec {
         use zlayer_spec::*;
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -725,7 +725,7 @@ services:
       - name: http
         protocol: http
         port: 8080
-"#;
+";
         let mut spec = serde_yml::from_str::<DeploymentSpec>(yaml)
             .unwrap()
             .services
@@ -735,7 +735,7 @@ services:
         spec
     }
 
-    /// Helper to create a DependsSpec
+    /// Helper to create a `DependsSpec`
     fn dep(service: &str, condition: DependencyCondition) -> DependsSpec {
         DependsSpec {
             service: service.to_string(),
@@ -1243,7 +1243,7 @@ services:
 
     // ==================== DependencyWaiter Tests ====================
 
-    /// Helper to create a DependsSpec with custom timeout action
+    /// Helper to create a `DependsSpec` with custom timeout action
     fn dep_with_timeout(
         service: &str,
         condition: DependencyCondition,
@@ -1437,7 +1437,7 @@ services:
 
         let results = waiter.wait_for_all(&deps).await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results.iter().all(|r| r.is_satisfied()));
+        assert!(results.iter().all(super::WaitResult::is_satisfied));
     }
 
     #[tokio::test]

@@ -594,7 +594,7 @@ mod tests {
     fn mock_job_spec() -> ServiceSpec {
         use zlayer_spec::*;
         serde_yml::from_str::<DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -602,7 +602,7 @@ services:
     rtype: job
     image:
       name: backup:latest
-"#,
+",
         )
         .unwrap()
         .services

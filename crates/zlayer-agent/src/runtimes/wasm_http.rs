@@ -1446,6 +1446,7 @@ impl WasmHttpRuntime {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -1577,7 +1578,7 @@ mod tests {
     fn test_http_request_debug_formatting() {
         let request = HttpRequest::get("/api/test").with_header("Content-Type", "text/plain");
 
-        let debug_str = format!("{:?}", request);
+        let debug_str = format!("{request:?}");
         assert!(debug_str.contains("HttpRequest"));
         assert!(debug_str.contains("GET"));
         assert!(debug_str.contains("/api/test"));
@@ -1703,7 +1704,7 @@ mod tests {
             .with_header("Content-Type", "text/html")
             .with_body(b"<html>".to_vec());
 
-        let debug_str = format!("{:?}", response);
+        let debug_str = format!("{response:?}");
         assert!(debug_str.contains("HttpResponse"));
         assert!(debug_str.contains("200"));
         assert!(debug_str.contains("Content-Type"));
@@ -1847,7 +1848,7 @@ mod tests {
             component: "test".to_string(),
             reason: "error".to_string(),
         };
-        let debug_str = format!("{:?}", error);
+        let debug_str = format!("{error:?}");
         assert!(debug_str.contains("Compilation"));
         assert!(debug_str.contains("test"));
         assert!(debug_str.contains("error"));
@@ -1986,7 +1987,7 @@ mod tests {
         pool.record_created();
         pool.record_request();
 
-        let debug_str = format!("{:?}", pool);
+        let debug_str = format!("{pool:?}");
         assert!(debug_str.contains("InstancePool"));
     }
 
@@ -2031,10 +2032,10 @@ mod tests {
             ..Default::default()
         };
 
-        let debug_str = format!("{:?}", stats);
+        let debug_str = format!("{stats:?}");
         assert!(debug_str.contains("PoolStats"));
         assert!(debug_str.contains("cached_components"));
-        assert!(debug_str.contains("2"));
+        assert!(debug_str.contains('2'));
     }
 
     #[test]
@@ -2132,7 +2133,7 @@ mod tests {
             total_requests: 50,
         };
 
-        let debug_str = format!("{:?}", stats);
+        let debug_str = format!("{stats:?}");
         assert!(debug_str.contains("ComponentStats"));
         assert!(debug_str.contains("idle_instances"));
         assert!(debug_str.contains("total_created"));
@@ -2162,7 +2163,7 @@ mod tests {
     async fn test_runtime_new_with_default_config() {
         let config = WasmHttpConfig::default();
         let result = WasmHttpRuntime::new(config);
-        assert!(result.is_ok(), "Failed to create runtime: {:?}", result);
+        assert!(result.is_ok(), "Failed to create runtime: {result:?}");
     }
 
     #[tokio::test]
@@ -2241,7 +2242,7 @@ mod tests {
         let config = test_config();
         let runtime = WasmHttpRuntime::new(config).unwrap();
 
-        let debug_str = format!("{:?}", runtime);
+        let debug_str = format!("{runtime:?}");
         assert!(debug_str.contains("WasmHttpRuntime"));
         assert!(debug_str.contains("config"));
     }
@@ -2332,7 +2333,7 @@ mod tests {
     #[test]
     fn test_wasm_http_config_debug_formatting() {
         let config = WasmHttpConfig::default();
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
         assert!(debug_str.contains("WasmHttpConfig"));
         assert!(debug_str.contains("min_instances"));
         assert!(debug_str.contains("max_instances"));
@@ -2505,7 +2506,7 @@ mod tests {
     fn test_http_request_many_headers() {
         let mut request = HttpRequest::get("/test");
         for i in 0..1000 {
-            request = request.with_header(format!("X-Header-{}", i), format!("value-{}", i));
+            request = request.with_header(format!("X-Header-{i}"), format!("value-{i}"));
         }
         assert_eq!(request.headers.len(), 1000);
     }
@@ -2514,7 +2515,7 @@ mod tests {
     fn test_http_response_many_headers() {
         let mut response = HttpResponse::ok();
         for i in 0..1000 {
-            response = response.with_header(format!("X-Header-{}", i), format!("value-{}", i));
+            response = response.with_header(format!("X-Header-{i}"), format!("value-{i}"));
         }
         assert_eq!(response.headers.len(), 1000);
     }
@@ -2523,8 +2524,8 @@ mod tests {
     // HTTP Outgoing Support Tests
     // =========================================================================
 
-    /// Verify that WasiHttpView is properly implemented for WasmHttpState
-    /// and that the outgoing HTTP support (send_request) is available via
+    /// Verify that `WasiHttpView` is properly implemented for `WasmHttpState`
+    /// and that the outgoing HTTP support (`send_request`) is available via
     /// the default-send-request feature.
     #[test]
     fn test_wasm_http_state_implements_wasi_http_view() {
@@ -2536,7 +2537,7 @@ mod tests {
 
     /// Verify that the runtime can be created with HTTP outgoing support enabled.
     /// The wasmtime-wasi-http crate's default features include default-send-request,
-    /// which provides the send_request implementation for outgoing HTTP calls.
+    /// which provides the `send_request` implementation for outgoing HTTP calls.
     #[tokio::test]
     async fn test_wasm_http_outgoing_configured() {
         let config = WasmHttpConfig::default();
@@ -2558,7 +2559,7 @@ mod tests {
         );
     }
 
-    /// Test that WasmHttpState can be used with the send_request default implementation.
+    /// Test that `WasmHttpState` can be used with the `send_request` default implementation.
     /// This verifies the default-send-request feature is properly enabled.
     #[test]
     fn test_wasm_http_state_send_request_available() {

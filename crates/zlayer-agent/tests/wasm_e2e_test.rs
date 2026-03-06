@@ -18,6 +18,7 @@
 //! ```
 
 #![cfg(feature = "wasm")]
+#![allow(deprecated)]
 
 use std::time::Duration;
 use tempfile::TempDir;
@@ -39,7 +40,7 @@ use zlayer_registry::{
 // WASM Binary Builders (using WAT - WebAssembly Text Format)
 // =============================================================================
 
-/// Create a minimal valid WASIp1 core module from WAT
+/// Create a minimal valid `WASIp1` core module from WAT
 fn create_wasip1_module_from_wat() -> Vec<u8> {
     wat::parse_str(
         r#"
@@ -59,7 +60,7 @@ fn create_wasip1_module_from_wat() -> Vec<u8> {
     .expect("Failed to parse WAT")
 }
 
-/// Create a WASIp1 module with memory and a start function
+/// Create a `WASIp1` module with memory and a start function
 fn create_wasip1_module_with_start() -> Vec<u8> {
     wat::parse_str(
         r#"
@@ -93,7 +94,7 @@ fn create_wasip1_module_with_start() -> Vec<u8> {
     .expect("Failed to parse WAT")
 }
 
-/// Create a WASIp1 module with table and indirect calls
+/// Create a `WASIp1` module with table and indirect calls
 fn create_wasip1_module_with_table() -> Vec<u8> {
     wat::parse_str(
         r#"
@@ -135,7 +136,7 @@ fn create_wasip1_module_with_table() -> Vec<u8> {
     .expect("Failed to parse WAT")
 }
 
-/// Create a minimal WASIp1 module (just the binary header with minimal sections)
+/// Create a minimal `WASIp1` module (just the binary header with minimal sections)
 fn create_minimal_wasm_module_bytes() -> Vec<u8> {
     vec![
         0x00, 0x61, 0x73, 0x6d, // Magic: \0asm
@@ -144,7 +145,7 @@ fn create_minimal_wasm_module_bytes() -> Vec<u8> {
     ]
 }
 
-/// Create a WASIp1 module with type section for detection testing
+/// Create a `WASIp1` module with type section for detection testing
 fn create_wasm_module_with_type_section() -> Vec<u8> {
     vec![
         0x00, 0x61, 0x73, 0x6d, // Magic: \0asm
@@ -158,7 +159,7 @@ fn create_wasm_module_with_type_section() -> Vec<u8> {
     ]
 }
 
-/// Create a WASIp2 component header (simulated - version 13)
+/// Create a `WASIp2` component header (simulated - version 13)
 fn create_wasip2_component_header() -> Vec<u8> {
     vec![
         0x00, 0x61, 0x73, 0x6d, // Magic: \0asm
@@ -272,7 +273,7 @@ fn create_complex_wasm_module() -> Vec<u8> {
 mod wasm_binary_analysis_e2e {
     use super::*;
 
-    /// Test complete binary analysis for WASIp1 module
+    /// Test complete binary analysis for `WASIp1` module
     #[test]
     fn test_wasip1_binary_analysis() {
         let wasm_bytes = create_wasm_module_with_type_section();
@@ -292,7 +293,7 @@ mod wasm_binary_analysis_e2e {
         assert_eq!(info.size, wasm_bytes.len());
     }
 
-    /// Test binary analysis for WASIp2 component
+    /// Test binary analysis for `WASIp2` component
     #[test]
     fn test_wasip2_binary_analysis() {
         let wasm_bytes = create_wasip2_component_header();
@@ -474,17 +475,17 @@ crate-type = ["cdylib"]
         assert!(cargo_content.contains("cdylib"), "Should be a cdylib crate");
     }
 
-    /// Test language detection for TinyGo project structure
+    /// Test language detection for `TinyGo` project structure
     #[tokio::test]
     async fn test_detect_go_wasm_project() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
 
         // Create a minimal Go project structure
-        let go_mod = r#"
+        let go_mod = r"
 module github.com/example/wasm-test
 
 go 1.21
-"#;
+";
 
         tokio::fs::write(temp_dir.path().join("go.mod"), go_mod)
             .await
@@ -507,7 +508,7 @@ func main() {
         assert!(temp_dir.path().join("main.go").exists());
     }
 
-    /// Test language detection for AssemblyScript project
+    /// Test language detection for `AssemblyScript` project
     #[tokio::test]
     async fn test_detect_assemblyscript_project() {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -550,7 +551,7 @@ func main() {
         );
     }
 
-    /// Test build command construction for Rust WASIp1
+    /// Test build command construction for Rust `WASIp1`
     #[test]
     fn test_rust_wasip1_build_command_structure() {
         let expected_target = "wasm32-wasip1";
@@ -565,7 +566,7 @@ func main() {
         assert!(expected_target.contains("wasip1"));
     }
 
-    /// Test build command construction for Rust WASIp2
+    /// Test build command construction for Rust `WASIp2`
     #[test]
     fn test_rust_wasip2_build_command_structure() {
         let expected_target = "wasm32-wasip2";
@@ -785,7 +786,7 @@ mod wasm_http_e2e {
         assert_eq!(stats.cached_components, 0);
     }
 
-    /// Test PoolStats Debug implementation
+    /// Test `PoolStats` Debug implementation
     #[test]
     fn test_pool_stats_debug() {
         let stats = PoolStats {
@@ -797,12 +798,12 @@ mod wasm_http_e2e {
             components: std::collections::HashMap::new(),
         };
 
-        let debug = format!("{:?}", stats);
+        let debug = format!("{stats:?}");
         assert!(debug.contains("cached_components: 5"));
         assert!(debug.contains("total_requests: 1000"));
     }
 
-    /// Test WasmHttpConfig default values
+    /// Test `WasmHttpConfig` default values
     #[test]
     fn test_wasm_http_config_defaults() {
         let config = WasmHttpConfig::default();
@@ -854,7 +855,7 @@ mod wasm_host_functions_e2e {
         assert!(host.config_get_required("nonexistent").is_err());
     }
 
-    /// Test config get_many operation
+    /// Test config `get_many` operation
     #[test]
     fn test_config_get_many() {
         let mut host = DefaultHost::new();
@@ -1087,7 +1088,7 @@ mod wasm_host_functions_e2e {
         );
     }
 
-    /// Test LogLevel conversions
+    /// Test `LogLevel` conversions
     #[test]
     fn test_log_level_conversions() {
         // WIT level conversions
@@ -1194,7 +1195,7 @@ mod wasm_host_functions_e2e {
         );
     }
 
-    /// Test MetricsStore operations
+    /// Test `MetricsStore` operations
     #[test]
     fn test_metrics_store_operations() {
         let host = DefaultHost::new();
@@ -1248,8 +1249,12 @@ mod wasm_host_functions_e2e {
                 .expect("Secret should exist");
 
             // 5. Store in cache with TTL
-            host.kv_set_with_ttl(cache_key, b"cached_data", ttl as u64 * 1_000_000_000)
-                .expect("KV set should work");
+            host.kv_set_with_ttl(
+                cache_key,
+                b"cached_data",
+                ttl.unsigned_abs() * 1_000_000_000,
+            )
+            .expect("KV set should work");
 
             // 6. Record metrics
             host.counter_inc("cache_misses", 1);
@@ -1272,7 +1277,7 @@ mod wasm_host_functions_e2e {
         );
     }
 
-    /// Test DefaultHost with_plugin_id constructor
+    /// Test `DefaultHost` `with_plugin_id` constructor
     #[test]
     fn test_host_with_plugin_id() {
         let host = DefaultHost::with_plugin_id("my-custom-plugin");
@@ -1281,7 +1286,7 @@ mod wasm_host_functions_e2e {
         assert!(host.config_get("nonexistent").is_none());
     }
 
-    /// Test add_configs batch operation
+    /// Test `add_configs` batch operation
     #[test]
     fn test_add_configs_batch() {
         let mut host = DefaultHost::new();
@@ -1349,12 +1354,12 @@ mod wasm_plugin_lifecycle_e2e {
             host.log(LogLevel::Debug, &format!("Handling event {}", i + 1));
 
             // Simulate caching behavior
-            let cache_key = format!("event:{}", i);
-            host.kv_set_string(&cache_key, &format!("processed-{}", i))
+            let cache_key = format!("event:{i}");
+            host.kv_set_string(&cache_key, &format!("processed-{i}"))
                 .expect("Cache set should work");
 
             host.counter_inc("events_processed", 1);
-            host.histogram_observe("event_processing_time", 0.05 + (i as f64 * 0.01));
+            host.histogram_observe("event_processing_time", 0.05 + (f64::from(i) * 0.01));
         }
 
         // Verify events were processed
@@ -1367,7 +1372,7 @@ mod wasm_plugin_lifecycle_e2e {
 
         // Cleanup KV storage
         for i in 0..3 {
-            let cache_key = format!("event:{}", i);
+            let cache_key = format!("event:{i}");
             host.kv_delete(&cache_key).expect("Delete should work");
         }
 
@@ -1398,14 +1403,14 @@ mod wasm_plugin_lifecycle_e2e {
 
         // Log the error
         if let Err(ref e) = required_secret {
-            host.log(LogLevel::Error, &format!("Init failed: {}", e));
+            host.log(LogLevel::Error, &format!("Init failed: {e}"));
             host.counter_inc("plugin_init_failures", 1);
         }
 
         // Simulate KV error handling with limits
         host.set_max_keys(5);
         for i in 0..5 {
-            let key = format!("key{}", i);
+            let key = format!("key{i}");
             host.kv_set(&key, b"value").expect("Should succeed");
         }
 
@@ -1521,19 +1526,19 @@ mod kv_error_e2e {
     #[test]
     fn test_kv_error_display() {
         let not_found = KvError::NotFound;
-        assert!(format!("{}", not_found).contains("not found"));
+        assert!(format!("{not_found}").contains("not found"));
 
         let too_large = KvError::ValueTooLarge;
-        assert!(format!("{}", too_large).contains("too large"));
+        assert!(format!("{too_large}").contains("too large"));
 
         let quota = KvError::QuotaExceeded;
-        assert!(format!("{}", quota).contains("quota"));
+        assert!(format!("{quota}").contains("quota"));
 
         let invalid = KvError::InvalidKey;
-        assert!(format!("{}", invalid).contains("invalid"));
+        assert!(format!("{invalid}").contains("invalid"));
 
         let storage = KvError::Storage("connection failed".to_string());
-        assert!(format!("{}", storage).contains("connection failed"));
+        assert!(format!("{storage}").contains("connection failed"));
     }
 }
 
@@ -1544,7 +1549,7 @@ mod kv_error_e2e {
 mod wasm_runtime_config_e2e {
     use super::*;
 
-    /// Test WasmHttpConfig validation
+    /// Test `WasmHttpConfig` validation
     #[test]
     fn test_wasm_http_config_validation() {
         // Valid config
@@ -1606,7 +1611,7 @@ mod wasm_networking_e2e {
     /// Test that networking is enabled in WASM context builder
     ///
     /// This verifies that the wasi:sockets interfaces (TCP, UDP, IP name lookup)
-    /// are properly available when inherit_network() is called.
+    /// are properly available when `inherit_network()` is called.
     #[test]
     fn test_wasm_networking_capability_enabled() {
         // Verify WasiCtxBuilder with inherit_network compiles and works
@@ -1646,7 +1651,7 @@ mod wasm_networking_e2e {
 mod wasm_filesystem_e2e {
     use zlayer_spec::{StorageSpec, StorageTier};
 
-    /// Test StorageSpec parsing for WASM bind mounts
+    /// Test `StorageSpec` parsing for WASM bind mounts
     #[test]
     fn test_bind_mount_parsing() {
         let spec = StorageSpec::Bind {
@@ -1825,7 +1830,7 @@ mod wasm_filesystem_e2e {
 mod wasm_stdio_capture_e2e {
     use wasmtime_wasi::p2::pipe::MemoryOutputPipe;
 
-    /// Test that MemoryOutputPipe can be created and cloned
+    /// Test that `MemoryOutputPipe` can be created and cloned
     #[test]
     fn test_memory_output_pipe_creation() {
         let pipe = MemoryOutputPipe::new(1024);
@@ -1833,7 +1838,7 @@ mod wasm_stdio_capture_e2e {
         // Pipes are clonable (Arc<Mutex> internally)
     }
 
-    /// Test that MemoryOutputPipe contents can be read
+    /// Test that `MemoryOutputPipe` contents can be read
     #[test]
     fn test_memory_output_pipe_contents() {
         let pipe = MemoryOutputPipe::new(1024);
@@ -1904,7 +1909,7 @@ mod wasm_http_interfaces_e2e {
     // Routing Decision Tests
     // -------------------------------------------------------------------------
 
-    /// Test RoutingDecision::Forward variant
+    /// Test `RoutingDecision::Forward` variant
     #[test]
     fn test_routing_decision_forward() {
         let upstream = Upstream::new("backend.local", 8080);
@@ -1919,7 +1924,7 @@ mod wasm_http_interfaces_e2e {
         }
     }
 
-    /// Test RoutingDecision::Forward with HTTPS
+    /// Test `RoutingDecision::Forward` with HTTPS
     #[test]
     fn test_routing_decision_forward_https() {
         let upstream = Upstream::https("api.example.com", 443);
@@ -1935,7 +1940,7 @@ mod wasm_http_interfaces_e2e {
         }
     }
 
-    /// Test RoutingDecision::Redirect variant
+    /// Test `RoutingDecision::Redirect` variant
     #[test]
     fn test_routing_decision_redirect() {
         let redirect = RedirectInfo::permanent("https://example.com/new-path");
@@ -1950,7 +1955,7 @@ mod wasm_http_interfaces_e2e {
         }
     }
 
-    /// Test RoutingDecision::RespondImmediate variant
+    /// Test `RoutingDecision::RespondImmediate` variant
     #[test]
     fn test_routing_decision_respond_immediate() {
         let response = ImmediateResponse::forbidden()
@@ -1967,7 +1972,7 @@ mod wasm_http_interfaces_e2e {
         }
     }
 
-    /// Test RoutingDecision::ContinueProcessing variant
+    /// Test `RoutingDecision::ContinueProcessing` variant
     #[test]
     fn test_routing_decision_continue() {
         let decision = RoutingDecision::ContinueProcessing;
@@ -2003,7 +2008,7 @@ mod wasm_http_interfaces_e2e {
     // Middleware Action Tests
     // -------------------------------------------------------------------------
 
-    /// Test MiddlewareAction::ContinueWith variant
+    /// Test `MiddlewareAction::ContinueWith` variant
     #[test]
     fn test_middleware_action_continue_with_headers() {
         let headers = vec![
@@ -2017,11 +2022,11 @@ mod wasm_http_interfaces_e2e {
                 assert_eq!(h[0].key, "X-Custom");
                 assert_eq!(h[0].value, "value");
             }
-            _ => panic!("Expected ContinueWith"),
+            MiddlewareAction::Abort { .. } => panic!("Expected ContinueWith"),
         }
     }
 
-    /// Test MiddlewareAction::Abort variant
+    /// Test `MiddlewareAction::Abort` variant
     #[test]
     fn test_middleware_action_abort() {
         let action = MiddlewareAction::Abort {
@@ -2033,11 +2038,11 @@ mod wasm_http_interfaces_e2e {
                 assert_eq!(status, 403);
                 assert_eq!(reason, "Forbidden");
             }
-            _ => panic!("Expected Abort"),
+            MiddlewareAction::ContinueWith(_) => panic!("Expected Abort"),
         }
     }
 
-    /// Test MiddlewareAction convenience constructors
+    /// Test `MiddlewareAction` convenience constructors
     #[test]
     fn test_middleware_action_constructors() {
         let unchanged = MiddlewareAction::continue_unchanged();
@@ -2057,14 +2062,14 @@ mod wasm_http_interfaces_e2e {
     // WebSocket Tests
     // -------------------------------------------------------------------------
 
-    /// Test UpgradeDecision::Accept variant
+    /// Test `UpgradeDecision::Accept` variant
     #[test]
     fn test_websocket_upgrade_accept() {
         let decision = UpgradeDecision::Accept;
         assert!(decision.is_accepted());
     }
 
-    /// Test UpgradeDecision::AcceptWithHeaders variant
+    /// Test `UpgradeDecision::AcceptWithHeaders` variant
     #[test]
     fn test_websocket_upgrade_accept_with_headers() {
         let headers = vec![KeyValue::new("Sec-WebSocket-Protocol", "graphql-ws")];
@@ -2072,7 +2077,7 @@ mod wasm_http_interfaces_e2e {
         assert!(decision.is_accepted());
     }
 
-    /// Test UpgradeDecision::Reject variant
+    /// Test `UpgradeDecision::Reject` variant
     #[test]
     fn test_websocket_upgrade_reject() {
         let decision = UpgradeDecision::Reject {
@@ -2082,7 +2087,7 @@ mod wasm_http_interfaces_e2e {
         assert!(!decision.is_accepted());
     }
 
-    /// Test WebSocketMessage types
+    /// Test `WebSocketMessage` types
     #[test]
     fn test_websocket_message_types() {
         let text_msg = WebSocketMessage::text("Hello, WebSocket!");
@@ -2098,9 +2103,9 @@ mod wasm_http_interfaces_e2e {
         assert_eq!(ping_msg.msg_type, MessageType::Ping);
         assert!(ping_msg.is_control());
 
-        let pong_msg = WebSocketMessage::pong(vec![1, 2, 3, 4]);
-        assert_eq!(pong_msg.msg_type, MessageType::Pong);
-        assert!(pong_msg.is_control());
+        let pong_message = WebSocketMessage::pong(vec![1, 2, 3, 4]);
+        assert_eq!(pong_message.msg_type, MessageType::Pong);
+        assert!(pong_message.is_control());
 
         let close_msg = WebSocketMessage::close();
         assert_eq!(close_msg.msg_type, MessageType::Close);
@@ -2111,7 +2116,7 @@ mod wasm_http_interfaces_e2e {
     // Caching Tests
     // -------------------------------------------------------------------------
 
-    /// Test CacheDecision::NoCache variant
+    /// Test `CacheDecision::NoCache` variant
     #[test]
     fn test_cache_decision_no_cache() {
         let no_cache = CacheDecision::NoCache;
@@ -2120,7 +2125,7 @@ mod wasm_http_interfaces_e2e {
         assert!(no_cache.ttl().is_none());
     }
 
-    /// Test CacheDecision::CacheFor variant
+    /// Test `CacheDecision::CacheFor` variant
     #[test]
     fn test_cache_decision_cache_for() {
         let cache_for = CacheDecision::cache_for(Duration::from_secs(300));
@@ -2128,7 +2133,7 @@ mod wasm_http_interfaces_e2e {
         assert_eq!(cache_for.ttl(), Some(Duration::from_secs(300)));
     }
 
-    /// Test CacheDecision::CacheWithTags variant
+    /// Test `CacheDecision::CacheWithTags` variant
     #[test]
     fn test_cache_decision_cache_with_tags() {
         let entry = CacheEntry::ttl_secs(600)
@@ -2156,7 +2161,7 @@ mod wasm_http_interfaces_e2e {
     // HTTP Method Tests
     // -------------------------------------------------------------------------
 
-    /// Test HttpMethod enum Display implementation
+    /// Test `HttpMethod` enum Display implementation
     #[test]
     fn test_http_method_display() {
         assert_eq!(HttpMethod::Get.to_string(), "GET");
@@ -2170,7 +2175,7 @@ mod wasm_http_interfaces_e2e {
         assert_eq!(HttpMethod::Trace.to_string(), "TRACE");
     }
 
-    /// Test HttpMethod FromStr implementation
+    /// Test `HttpMethod` `FromStr` implementation
     #[test]
     fn test_http_method_from_str() {
         use std::str::FromStr;
@@ -2186,7 +2191,7 @@ mod wasm_http_interfaces_e2e {
     // HttpVersion Tests
     // -------------------------------------------------------------------------
 
-    /// Test HttpVersion enum
+    /// Test `HttpVersion` enum
     #[test]
     fn test_http_version_enum() {
         assert_eq!(HttpVersion::Http10.to_string(), "HTTP/1.0");
@@ -2200,7 +2205,7 @@ mod wasm_http_interfaces_e2e {
     // RequestMetadata Tests
     // -------------------------------------------------------------------------
 
-    /// Test RequestMetadata construction
+    /// Test `RequestMetadata` construction
     #[test]
     fn test_request_metadata_construction() {
         let metadata = RequestMetadata::with_client("192.168.1.100", 54321)
@@ -2221,7 +2226,7 @@ mod wasm_http_interfaces_e2e {
         assert_eq!(metadata.received_at, 1_234_567_890_000_000_000);
     }
 
-    /// Test RequestMetadata local convenience constructor
+    /// Test `RequestMetadata` local convenience constructor
     #[test]
     fn test_request_metadata_local() {
         let metadata = RequestMetadata::local();
@@ -2234,7 +2239,7 @@ mod wasm_http_interfaces_e2e {
     // PluginRequest Tests
     // -------------------------------------------------------------------------
 
-    /// Test PluginRequest construction
+    /// Test `PluginRequest` construction
     #[test]
     fn test_plugin_request_construction() {
         let request = PluginRequest::get("/api/users")
@@ -2253,7 +2258,7 @@ mod wasm_http_interfaces_e2e {
         assert_eq!(request.uri(), "/api/users?page=1&limit=10");
     }
 
-    /// Test PluginRequest POST with body
+    /// Test `PluginRequest` POST with body
     #[test]
     fn test_plugin_request_post_with_body() {
         let body = r#"{"name": "test", "value": 42}"#.as_bytes().to_vec();
@@ -2300,7 +2305,7 @@ mod wasm_http_interfaces_e2e {
     // KeyValue Tests
     // -------------------------------------------------------------------------
 
-    /// Test KeyValue construction and conversion
+    /// Test `KeyValue` construction and conversion
     #[test]
     fn test_key_value_operations() {
         let kv = KeyValue::new("Content-Type", "application/json");
@@ -2322,7 +2327,7 @@ mod wasm_http_interfaces_e2e {
     // RedirectInfo Tests
     // -------------------------------------------------------------------------
 
-    /// Test RedirectInfo variants
+    /// Test `RedirectInfo` variants
     #[test]
     fn test_redirect_info_variants() {
         let permanent = RedirectInfo::permanent("https://new.example.com");
@@ -2346,7 +2351,7 @@ mod wasm_http_interfaces_e2e {
     // ImmediateResponse Tests
     // -------------------------------------------------------------------------
 
-    /// Test ImmediateResponse construction
+    /// Test `ImmediateResponse` construction
     #[test]
     fn test_immediate_response_construction() {
         let resp = ImmediateResponse::ok()
@@ -2358,7 +2363,7 @@ mod wasm_http_interfaces_e2e {
         assert!(!resp.body.is_empty());
     }
 
-    /// Test ImmediateResponse status code constructors
+    /// Test `ImmediateResponse` status code constructors
     #[test]
     fn test_immediate_response_status_codes() {
         assert_eq!(ImmediateResponse::ok().status, 200);
@@ -2696,8 +2701,8 @@ mod wasm_service_type_e2e {
         for st in wasm_types {
             let caps = st
                 .default_wasm_capabilities()
-                .unwrap_or_else(|| panic!("{:?} should have default capabilities", st));
-            assert!(caps.logging, "{:?} should have logging enabled", st);
+                .unwrap_or_else(|| panic!("{st:?} should have default capabilities"));
+            assert!(caps.logging, "{st:?} should have logging enabled");
         }
     }
 
@@ -2717,15 +2722,11 @@ mod wasm_service_type_e2e {
         ];
         for (json, expected) in types {
             let deserialized: ServiceType = serde_json::from_str(json)
-                .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", json, e));
-            assert_eq!(deserialized, expected, "Failed for {}", json);
+                .unwrap_or_else(|e| panic!("Failed to deserialize {json}: {e}"));
+            assert_eq!(deserialized, expected, "Failed for {json}");
 
             let serialized = serde_json::to_string(&expected).unwrap();
-            assert_eq!(
-                serialized, json,
-                "Serialization mismatch for {:?}",
-                expected
-            );
+            assert_eq!(serialized, json, "Serialization mismatch for {expected:?}");
         }
     }
 }
@@ -2857,7 +2858,7 @@ capabilities:
     #[test]
     fn test_wasm_config_backward_compat_alias() {
         // Test that 'wasm_http' key still works via serde alias in ServiceSpec
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test-deploy
 services:
@@ -2874,7 +2875,7 @@ services:
       - name: http
         protocol: http
         port: 8080
-"#;
+";
         let result = zlayer_spec::from_yaml_str(yaml);
         // This should parse without errors - the wasm_http alias works
         assert!(
@@ -2924,11 +2925,10 @@ mod wasm_runtime_dispatcher_e2e {
         ];
         for st in pipeline_types {
             let result = create_wasm_runtime_for_service_type(st, &config);
-            assert!(result.is_ok(), "Failed for {:?}", st);
+            assert!(result.is_ok(), "Failed for {st:?}");
             assert!(
                 matches!(result.unwrap(), WasmRuntimeKind::Pipeline(_)),
-                "Expected Pipeline for {:?}",
-                st
+                "Expected Pipeline for {st:?}"
             );
         }
     }

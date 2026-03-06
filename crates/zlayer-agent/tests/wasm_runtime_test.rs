@@ -1,6 +1,6 @@
 //! WebAssembly runtime integration tests
 //!
-//! These tests verify the WasmRuntime implementation using wasmtime.
+//! These tests verify the `WasmRuntime` implementation using wasmtime.
 //! Tests are gated behind the `wasm` feature and use inline WASM modules.
 //!
 //! # Requirements
@@ -65,7 +65,7 @@ const EXIT_CODE_WASM: &str = r#"
 )
 "#;
 
-/// WASM module that writes to stdout using fd_write
+/// WASM module that writes to stdout using `fd_write`
 const HELLO_WORLD_WASM: &str = r#"
 (module
     ;; Import WASI functions
@@ -173,7 +173,7 @@ fn create_test_cache_dir() -> TempDir {
     tempfile::tempdir().expect("Failed to create temp directory")
 }
 
-/// Create a WasmConfig for testing
+/// Create a `WasmConfig` for testing
 fn create_test_config(cache_dir: &TempDir) -> WasmConfig {
     WasmConfig {
         cache_dir: cache_dir.path().to_path_buf(),
@@ -187,15 +187,18 @@ fn create_test_config(cache_dir: &TempDir) -> WasmConfig {
 /// Generate a unique instance name
 fn unique_instance_name(prefix: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+    let timestamp = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap_or(0)
         % 1_000_000;
-    format!("test-{}-{}", prefix, timestamp)
+    format!("test-{prefix}-{timestamp}")
 }
 
-/// Create a ContainerId with a unique service name
+/// Create a `ContainerId` with a unique service name
 fn unique_container_id(prefix: &str) -> ContainerId {
     ContainerId {
         service: unique_instance_name(prefix),
@@ -203,7 +206,7 @@ fn unique_container_id(prefix: &str) -> ContainerId {
     }
 }
 
-/// Create a minimal ServiceSpec for WASM testing
+/// Create a minimal `ServiceSpec` for WASM testing
 fn create_wasm_spec(image: &str) -> ServiceSpec {
     ServiceSpec {
         rtype: ResourceType::Service,
@@ -243,7 +246,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
 /// Write a WASM binary to the cache directory and return the "image" path
 fn write_wasm_to_cache(cache_dir: &TempDir, name: &str, wasm_bytes: &[u8]) -> String {
     let cache_key = name.replace(['/', ':', '@'], "_");
-    let cache_path = cache_dir.path().join(format!("{}.wasm", cache_key));
+    let cache_path = cache_dir.path().join(format!("{cache_key}.wasm"));
     std::fs::write(&cache_path, wasm_bytes).expect("Failed to write WASM to cache");
     name.to_string()
 }
@@ -382,14 +385,10 @@ mod runtime_creation_tests {
         let config = create_test_config(&cache_dir);
 
         let runtime = WasmRuntime::new(config).await;
-        assert!(
-            runtime.is_ok(),
-            "Failed to create WasmRuntime: {:?}",
-            runtime
-        );
+        assert!(runtime.is_ok(), "Failed to create WasmRuntime: {runtime:?}",);
 
         let runtime = runtime.unwrap();
-        println!("WasmRuntime created successfully: {:?}", runtime);
+        println!("WasmRuntime created successfully: {runtime:?}");
     }
 
     #[tokio::test]
@@ -407,8 +406,7 @@ mod runtime_creation_tests {
         let runtime = WasmRuntime::new(config).await;
         assert!(
             runtime.is_ok(),
-            "Failed to create WasmRuntime with modified defaults: {:?}",
-            runtime
+            "Failed to create WasmRuntime with modified defaults: {runtime:?}",
         );
     }
 
@@ -459,11 +457,7 @@ mod lifecycle_tests {
 
         // Create instance
         let result = runtime.create_container(&id, &spec).await;
-        assert!(
-            result.is_ok(),
-            "Failed to create WASM instance: {:?}",
-            result
-        );
+        assert!(result.is_ok(), "Failed to create WASM instance: {result:?}",);
 
         // Verify state is Pending
         let state = runtime.container_state(&id).await;
@@ -498,11 +492,7 @@ mod lifecycle_tests {
             .await
             .expect("Failed to create");
         let result = runtime.start_container(&id).await;
-        assert!(
-            result.is_ok(),
-            "Failed to start WASM instance: {:?}",
-            result
-        );
+        assert!(result.is_ok(), "Failed to start WASM instance: {result:?}",);
 
         println!("WASM instance started successfully");
     }
@@ -535,7 +525,7 @@ mod lifecycle_tests {
 
         // Stop instance (short timeout since minimal WASM exits quickly)
         let result = runtime.stop_container(&id, Duration::from_secs(5)).await;
-        assert!(result.is_ok(), "Failed to stop WASM instance: {:?}", result);
+        assert!(result.is_ok(), "Failed to stop WASM instance: {result:?}");
 
         println!("WASM instance stopped successfully");
     }
@@ -565,11 +555,7 @@ mod lifecycle_tests {
 
         // Remove instance
         let result = runtime.remove_container(&id).await;
-        assert!(
-            result.is_ok(),
-            "Failed to remove WASM instance: {:?}",
-            result
-        );
+        assert!(result.is_ok(), "Failed to remove WASM instance: {result:?}",);
 
         // Verify instance is gone
         let state = runtime.container_state(&id).await;
@@ -619,7 +605,7 @@ mod lifecycle_tests {
         let state = runtime.container_state(&id).await.unwrap();
         match state {
             ContainerState::Exited { code } => assert_eq!(code, 0),
-            other => panic!("Expected Exited state, got: {:?}", other),
+            other => panic!("Expected Exited state, got: {other:?}"),
         }
 
         // 5. Remove
@@ -707,8 +693,7 @@ mod state_tests {
                 state,
                 ContainerState::Running | ContainerState::Exited { .. }
             ),
-            "Expected Running or Exited, got: {:?}",
-            state
+            "Expected Running or Exited, got: {state:?}",
         );
     }
 
@@ -1099,7 +1084,7 @@ mod instance_id_tests {
             replica: 1,
         };
 
-        let display = format!("{}", id);
+        let display = format!("{id}");
         assert_eq!(display, "myservice-rep-1");
     }
 
@@ -1117,7 +1102,7 @@ mod instance_id_tests {
 
         for (input, expected) in test_cases {
             let sanitized = input.replace(['/', ':', '@'], "_");
-            assert_eq!(sanitized, expected, "Failed for input: {}", input);
+            assert_eq!(sanitized, expected, "Failed for input: {input}");
         }
     }
 }

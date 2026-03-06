@@ -455,7 +455,7 @@ impl WasmRuntime {
                 zlayer_registry::CacheType::Persistent { .. } => {
                     zlayer_registry::CacheType::persistent_at(config.cache_dir.clone())
                 }
-                other => other,
+                other @ zlayer_registry::CacheType::Memory => other,
             };
             cache_type
                 .build()
@@ -1667,10 +1667,10 @@ mod tests {
         };
 
         // Ensure Debug trait is implemented
-        assert!(!format!("{:?}", pending).is_empty());
-        assert!(!format!("{:?}", running).is_empty());
-        assert!(!format!("{:?}", completed).is_empty());
-        assert!(!format!("{:?}", failed).is_empty());
+        assert!(!format!("{pending:?}").is_empty());
+        assert!(!format!("{running:?}").is_empty());
+        assert!(!format!("{completed:?}").is_empty());
+        assert!(!format!("{failed:?}").is_empty());
     }
 
     #[test]
