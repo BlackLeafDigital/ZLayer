@@ -65,6 +65,17 @@ jobs:
             done
           done
 
+          # Download Windows artifact
+          artifact="zlayer-windows-amd64.zip"
+          output="artifacts/zlayer-${VERSION}-windows-amd64.zip"
+          echo "Downloading ${artifact}..."
+          if curl -fsSL --user "${AUTH}" "${BASE_URL}/${artifact}" -o "${output}"; then
+            echo "  OK ${artifact}"
+          else
+            rm -f "${output}"
+            echo "  SKIP ${artifact} not available"
+          fi
+
           # Download container image archives (OCI format only)
           for img in zlayer-node zlayer-manager; do
             artifact="${img}-${VERSION}-oci.tar"
@@ -115,6 +126,7 @@ jobs:
           | Binary | Description |
           |--------|-------------|
           | `zlayer` | Unified binary — TUI dashboard, full CLI, runtime, and image builder |
+          | `zlayer` (Windows) | Thin CLI with WSL2 backend — auto-manages containers in WSL2 |
 
           ## Container Images
 
@@ -149,7 +161,7 @@ jobs:
 
           # Collect artifact files (nullglob avoids errors when no files match)
           shopt -s nullglob
-          FILES=(artifacts/*.tar.gz artifacts/*.tar)
+          FILES=(artifacts/*.tar.gz artifacts/*.tar artifacts/*.zip)
           shopt -u nullglob
 
           if [ ${#FILES[@]} -eq 0 ]; then

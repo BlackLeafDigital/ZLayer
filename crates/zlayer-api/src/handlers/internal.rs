@@ -416,7 +416,7 @@ mod tests {
     fn test_internal_state_with_overlay() {
         let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> =
             Arc::new(zlayer_agent::MockRuntime::new());
-        let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime)));
+        let service_manager = Arc::new(RwLock::new(ServiceManager::builder(runtime).build()));
         let state = InternalState::with_overlay(
             service_manager,
             "token".to_string(),

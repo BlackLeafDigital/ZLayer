@@ -5,6 +5,7 @@ use std::path::PathBuf;
 ///
 /// - macOS: `~/.local/share/zlayer` (user-writable without root)
 /// - Linux: `/var/lib/zlayer` (traditional, typically runs as root)
+/// - Windows: `%LOCALAPPDATA%\ZLayer` or `C:\ProgramData\ZLayer`
 pub(crate) fn default_data_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
@@ -14,7 +15,15 @@ pub(crate) fn default_data_dir() -> PathBuf {
             PathBuf::from("/var/lib/zlayer")
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            PathBuf::from(local_app_data).join("ZLayer")
+        } else {
+            PathBuf::from(r"C:\ProgramData\ZLayer")
+        }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         PathBuf::from("/var/lib/zlayer")
     }
@@ -24,12 +33,17 @@ pub(crate) fn default_data_dir() -> PathBuf {
 ///
 /// - macOS: `{data_dir}/run` (under the user data dir)
 /// - Linux: `/var/run/zlayer`
+/// - Windows: `{data_dir}\run`
 pub(crate) fn default_run_dir(data_dir: &std::path::Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         data_dir.join("run")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        data_dir.join("run")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = data_dir;
         PathBuf::from("/var/run/zlayer")
@@ -40,12 +54,17 @@ pub(crate) fn default_run_dir(data_dir: &std::path::Path) -> PathBuf {
 ///
 /// - macOS: `{data_dir}/logs` (under the user data dir)
 /// - Linux: `/var/log/zlayer`
+/// - Windows: `{data_dir}\logs`
 pub(crate) fn default_log_dir(data_dir: &std::path::Path) -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         data_dir.join("logs")
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        data_dir.join("logs")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = data_dir;
         PathBuf::from("/var/log/zlayer")
@@ -53,6 +72,9 @@ pub(crate) fn default_log_dir(data_dir: &std::path::Path) -> PathBuf {
 }
 
 /// Return the platform-appropriate default socket path.
+///
+/// On Windows, returns a TCP address instead of a Unix socket path since
+/// Unix domain sockets have limited support on Windows.
 pub(crate) fn default_socket_path(data_dir: &std::path::Path) -> String {
     #[cfg(target_os = "macos")]
     {
@@ -61,7 +83,12 @@ pub(crate) fn default_socket_path(data_dir: &std::path::Path) -> String {
             .to_string_lossy()
             .into_owned()
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = data_dir;
+        "tcp://127.0.0.1:3669".to_string()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         let _ = data_dir;
         "/var/run/zlayer.sock".to_string()

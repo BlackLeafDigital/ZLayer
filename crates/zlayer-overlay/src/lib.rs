@@ -5,7 +5,7 @@
 //! node init/join, IP allocation, and health checking.
 //!
 //! No kernel `WireGuard` module or wireguard-tools required -- uses TUN devices
-//! via `/dev/net/tun` and configures peers via the UAPI protocol.
+//! (Linux `/dev/net/tun`, macOS `utun`) and configures peers via the UAPI protocol.
 //!
 //! # Modules
 //!

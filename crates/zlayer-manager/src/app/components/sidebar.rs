@@ -13,9 +13,7 @@ pub fn Sidebar() -> impl IntoView {
             // Logo / brand header
             <div class="p-4 border-b border-base-300">
                 <a href="/" class="flex items-center gap-3">
-                    <div class="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
-                        <span class="text-primary-content font-bold text-sm">"Z"</span>
-                    </div>
+                    <img src="/assets/zlayer_logo.png" alt="ZLayer" class="w-8 h-8 rounded-lg" />
                     <div>
                         <div class="font-bold text-lg leading-tight">"ZLayer"</div>
                         <div class="text-xs text-base-content/50">"Manager"</div>

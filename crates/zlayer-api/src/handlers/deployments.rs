@@ -1,16 +1,22 @@
 //! Deployment endpoints
 
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{
     extract::{Path, State},
     http::StatusCode,
+    response::sse::{Event, KeepAlive, Sse},
     Json,
 };
+use dashmap::DashMap;
+use futures_util::Stream;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
-use tracing::{info, warn};
+use tokio::sync::{broadcast, RwLock};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
+use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
 use crate::auth::AuthUser;
@@ -70,6 +76,189 @@ pub struct CreateDeploymentRequest {
     pub spec: String,
 }
 
+// ============================================================================
+// SSE Progress Events
+// ============================================================================
+
+/// Deployment progress event sent over SSE during orchestration.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DeploymentProgressEvent {
+    /// Deployment orchestration has started
+    Started {
+        /// Deployment name
+        deployment: String,
+        /// List of services being deployed
+        services: Vec<String>,
+    },
+    /// A service was successfully registered with the service manager
+    ServiceRegistered {
+        /// Service name
+        service: String,
+    },
+    /// A service failed to register
+    ServiceRegistrationFailed {
+        /// Service name
+        service: String,
+        /// Error message
+        error: String,
+    },
+    /// Overlay network created for a service
+    OverlayCreated {
+        /// Service name
+        service: String,
+        /// Network interface name
+        interface: String,
+    },
+    /// Overlay creation failed (non-fatal)
+    OverlayFailed {
+        /// Service name
+        service: String,
+        /// Error message
+        error: String,
+    },
+    /// Proxy routes configured for a service
+    ProxyConfigured {
+        /// Service name
+        service: String,
+    },
+    /// Proxy configuration failed (non-fatal)
+    ProxyFailed {
+        /// Service name
+        service: String,
+        /// Error message
+        error: String,
+    },
+    /// Service scaling has started
+    ServiceScaling {
+        /// Service name
+        service: String,
+        /// Target replica count
+        target: u32,
+    },
+    /// Service successfully scaled
+    ServiceScaled {
+        /// Service name
+        service: String,
+        /// Number of replicas running
+        replicas: u32,
+    },
+    /// Service scaling failed
+    ServiceScaleFailed {
+        /// Service name
+        service: String,
+        /// Error message
+        error: String,
+    },
+    /// Waiting for stabilization
+    Stabilizing,
+    /// Deployment is ready and running
+    Ready,
+    /// Deployment failed
+    Failed {
+        /// Error message describing the failure
+        message: String,
+    },
+}
+
+/// Wrapper for serializing deployment progress events as SSE.
+///
+/// Converts each [`DeploymentProgressEvent`] variant into an `event_type` string
+/// and a JSON `data` payload, following the same pattern as [`super::build::BuildEventWrapper`].
+#[derive(Debug, Clone, Serialize)]
+pub struct DeploymentEventWrapper {
+    /// SSE event type (used as the `event:` field)
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// JSON data payload
+    pub data: serde_json::Value,
+}
+
+impl From<DeploymentProgressEvent> for DeploymentEventWrapper {
+    fn from(event: DeploymentProgressEvent) -> Self {
+        match event {
+            DeploymentProgressEvent::Started {
+                deployment,
+                services,
+            } => DeploymentEventWrapper {
+                event_type: "started".to_string(),
+                data: serde_json::json!({
+                    "deployment": deployment,
+                    "services": services,
+                }),
+            },
+            DeploymentProgressEvent::ServiceRegistered { service } => DeploymentEventWrapper {
+                event_type: "service_registered".to_string(),
+                data: serde_json::json!({ "service": service }),
+            },
+            DeploymentProgressEvent::ServiceRegistrationFailed { service, error } => {
+                DeploymentEventWrapper {
+                    event_type: "service_registration_failed".to_string(),
+                    data: serde_json::json!({ "service": service, "error": error }),
+                }
+            }
+            DeploymentProgressEvent::OverlayCreated { service, interface } => {
+                DeploymentEventWrapper {
+                    event_type: "overlay_created".to_string(),
+                    data: serde_json::json!({ "service": service, "interface": interface }),
+                }
+            }
+            DeploymentProgressEvent::OverlayFailed { service, error } => DeploymentEventWrapper {
+                event_type: "overlay_failed".to_string(),
+                data: serde_json::json!({ "service": service, "error": error }),
+            },
+            DeploymentProgressEvent::ProxyConfigured { service } => DeploymentEventWrapper {
+                event_type: "proxy_configured".to_string(),
+                data: serde_json::json!({ "service": service }),
+            },
+            DeploymentProgressEvent::ProxyFailed { service, error } => DeploymentEventWrapper {
+                event_type: "proxy_failed".to_string(),
+                data: serde_json::json!({ "service": service, "error": error }),
+            },
+            DeploymentProgressEvent::ServiceScaling { service, target } => DeploymentEventWrapper {
+                event_type: "service_scaling".to_string(),
+                data: serde_json::json!({ "service": service, "target": target }),
+            },
+            DeploymentProgressEvent::ServiceScaled { service, replicas } => {
+                DeploymentEventWrapper {
+                    event_type: "service_scaled".to_string(),
+                    data: serde_json::json!({ "service": service, "replicas": replicas }),
+                }
+            }
+            DeploymentProgressEvent::ServiceScaleFailed { service, error } => {
+                DeploymentEventWrapper {
+                    event_type: "service_scale_failed".to_string(),
+                    data: serde_json::json!({ "service": service, "error": error }),
+                }
+            }
+            DeploymentProgressEvent::Stabilizing => DeploymentEventWrapper {
+                event_type: "stabilizing".to_string(),
+                data: serde_json::json!({}),
+            },
+            DeploymentProgressEvent::Ready => DeploymentEventWrapper {
+                event_type: "ready".to_string(),
+                data: serde_json::json!({}),
+            },
+            DeploymentProgressEvent::Failed { message } => DeploymentEventWrapper {
+                event_type: "failed".to_string(),
+                data: serde_json::json!({ "message": message }),
+            },
+        }
+    }
+}
+
+/// Helper to send a deployment progress event on the broadcast channel.
+///
+/// Silently ignores send errors (no subscribers, or channel closed).
+fn emit_progress(
+    tx: Option<&broadcast::Sender<DeploymentEventWrapper>>,
+    event: DeploymentProgressEvent,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.send(DeploymentEventWrapper::from(event));
+    }
+}
+
 /// Deployment state holding storage backend and optional orchestration handles.
 ///
 /// When `service_manager` is `Some`, the `create_deployment` handler will
@@ -90,6 +279,11 @@ pub struct DeploymentState {
     /// Kept here to ensure the handle (and its background listener) stays alive
     /// for the lifetime of the API server.
     pub dns_handle: Option<zlayer_overlay::DnsHandle>,
+    /// Active SSE event channels keyed by deployment name.
+    ///
+    /// A channel is inserted when `create_deployment` spawns orchestration and
+    /// removed when the orchestration task finishes (sender is dropped).
+    pub event_channels: Arc<DashMap<String, broadcast::Sender<DeploymentEventWrapper>>>,
 }
 
 impl DeploymentState {
@@ -101,6 +295,7 @@ impl DeploymentState {
             overlay: None,
             proxy: None,
             dns_handle: None,
+            event_channels: Arc::new(DashMap::new()),
         }
     }
 
@@ -118,6 +313,7 @@ impl DeploymentState {
             overlay,
             proxy: Some(proxy),
             dns_handle,
+            event_channels: Arc::new(DashMap::new()),
         }
     }
 
@@ -379,11 +575,21 @@ pub async fn create_deployment(
 
         let details = DeploymentDetails::from(&deployment);
 
+        // Create a broadcast channel for SSE progress events
+        let (event_tx, _) = broadcast::channel::<DeploymentEventWrapper>(256);
+        state
+            .event_channels
+            .insert(deployment_name.clone(), event_tx.clone());
+
         // Spawn background orchestration task
         let state_clone = state.clone();
         let spec_clone = spec.clone();
+        let deploy_name_clone = deployment_name.clone();
         tokio::spawn(async move {
-            orchestrate_deployment(state_clone, spec_clone).await;
+            orchestrate_deployment(state_clone.clone(), spec_clone, Some(event_tx)).await;
+            // Clean up the event channel once orchestration is done (sender dropped
+            // by the function, so subscribers see the stream end).
+            state_clone.event_channels.remove(&deploy_name_clone);
         });
 
         info!(deployment = %deployment_name, "Deployment submitted for orchestration");
@@ -411,8 +617,16 @@ pub async fn create_deployment(
 /// Registers each service with the `ServiceManager`, sets up overlay networks,
 /// configures proxy routes, scales to desired replicas, then waits for
 /// stabilization. Updates the stored deployment status to Running or Failed.
+///
+/// When `event_tx` is `Some`, progress events are broadcast to any SSE
+/// subscribers. The sender is consumed (dropped) at the end so that subscribers
+/// see the stream close.
 #[allow(clippy::too_many_lines)]
-async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::DeploymentSpec) {
+async fn orchestrate_deployment(
+    state: DeploymentState,
+    spec: zlayer_spec::DeploymentSpec,
+    event_tx: Option<broadcast::Sender<DeploymentEventWrapper>>,
+) {
     let deployment_name = spec.deployment.clone();
     info!(deployment = %deployment_name, "Starting deployment orchestration");
 
@@ -420,8 +634,24 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
         Arc::clone(m)
     } else {
         warn!(deployment = %deployment_name, "No service manager available for orchestration");
+        emit_progress(
+            event_tx.as_ref(),
+            DeploymentProgressEvent::Failed {
+                message: "No service manager available".to_string(),
+            },
+        );
         return;
     };
+
+    // Emit Started event
+    let service_names: Vec<String> = spec.services.keys().cloned().collect();
+    emit_progress(
+        event_tx.as_ref(),
+        DeploymentProgressEvent::Started {
+            deployment: deployment_name.clone(),
+            services: service_names,
+        },
+    );
 
     let mut errors: Vec<String> = Vec::new();
 
@@ -432,10 +662,23 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
             if let Err(e) = mgr.upsert_service(name.clone(), service_spec.clone()).await {
                 let msg = format!("{name}: failed to register: {e}");
                 warn!(deployment = %deployment_name, service = %name, error = %e, "Service registration failed");
+                emit_progress(
+                    event_tx.as_ref(),
+                    DeploymentProgressEvent::ServiceRegistrationFailed {
+                        service: name.clone(),
+                        error: e.to_string(),
+                    },
+                );
                 errors.push(msg);
                 continue;
             }
         }
+        emit_progress(
+            event_tx.as_ref(),
+            DeploymentProgressEvent::ServiceRegistered {
+                service: name.clone(),
+            },
+        );
 
         // 2. Set up service overlay network (non-fatal if unavailable)
         if let Some(om) = &state.overlay {
@@ -448,6 +691,13 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
                         interface = %iface,
                         "Service overlay created"
                     );
+                    emit_progress(
+                        event_tx.as_ref(),
+                        DeploymentProgressEvent::OverlayCreated {
+                            service: name.clone(),
+                            interface: iface,
+                        },
+                    );
                 }
                 Err(e) => {
                     warn!(
@@ -455,6 +705,13 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
                         service = %name,
                         error = %e,
                         "Failed to create service overlay (non-fatal)"
+                    );
+                    emit_progress(
+                        event_tx.as_ref(),
+                        DeploymentProgressEvent::OverlayFailed {
+                            service: name.clone(),
+                            error: e.to_string(),
+                        },
                     );
                 }
             }
@@ -478,6 +735,20 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
                     error = %e,
                     "Failed to setup proxy ports (non-fatal)"
                 );
+                emit_progress(
+                    event_tx.as_ref(),
+                    DeploymentProgressEvent::ProxyFailed {
+                        service: name.clone(),
+                        error: e.to_string(),
+                    },
+                );
+            } else {
+                emit_progress(
+                    event_tx.as_ref(),
+                    DeploymentProgressEvent::ProxyConfigured {
+                        service: name.clone(),
+                    },
+                );
             }
         }
 
@@ -489,6 +760,14 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
         };
 
         if target_replicas > 0 {
+            emit_progress(
+                event_tx.as_ref(),
+                DeploymentProgressEvent::ServiceScaling {
+                    service: name.clone(),
+                    target: target_replicas,
+                },
+            );
+
             let mgr = mgr_lock.read().await;
             if let Err(e) = mgr.scale_service(name, target_replicas).await {
                 let msg = format!("{name}: failed to scale to {target_replicas}: {e}");
@@ -499,6 +778,13 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
                     error = %e,
                     "Service scaling failed"
                 );
+                emit_progress(
+                    event_tx.as_ref(),
+                    DeploymentProgressEvent::ServiceScaleFailed {
+                        service: name.clone(),
+                        error: e.to_string(),
+                    },
+                );
                 errors.push(msg);
             } else {
                 info!(
@@ -507,11 +793,20 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
                     replicas = target_replicas,
                     "Service scaled"
                 );
+                emit_progress(
+                    event_tx.as_ref(),
+                    DeploymentProgressEvent::ServiceScaled {
+                        service: name.clone(),
+                        replicas: target_replicas,
+                    },
+                );
             }
         }
     }
 
     // 5. Wait for stabilization (30s timeout)
+    emit_progress(event_tx.as_ref(), DeploymentProgressEvent::Stabilizing);
+
     let final_status = if errors.is_empty() {
         let stabilization_timeout = Duration::from_secs(30);
         let mgr = mgr_lock.read().await;
@@ -531,6 +826,22 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
             message: format!("{} service(s) failed: {}", errors.len(), errors.join("; ")),
         }
     };
+
+    // Emit terminal progress event
+    match &final_status {
+        DeploymentStatus::Running => {
+            emit_progress(event_tx.as_ref(), DeploymentProgressEvent::Ready);
+        }
+        DeploymentStatus::Failed { message } => {
+            emit_progress(
+                event_tx.as_ref(),
+                DeploymentProgressEvent::Failed {
+                    message: message.clone(),
+                },
+            );
+        }
+        _ => {}
+    }
 
     // 6. Update stored deployment status
     match state.storage.get(&deployment_name).await {
@@ -564,6 +875,113 @@ async fn orchestrate_deployment(state: DeploymentState, spec: zlayer_spec::Deplo
             );
         }
     }
+
+    // event_tx is dropped here, closing the broadcast channel and ending all
+    // subscriber streams.
+}
+
+/// GET /api/v1/deployments/{name}/events
+/// Stream deployment orchestration progress via Server-Sent Events.
+///
+/// If orchestration is currently in progress, subscribes to the live broadcast
+/// channel and streams events as they occur. If orchestration has already
+/// completed, checks the stored deployment status and emits a single terminal
+/// event (`ready` or `failed`) before closing the stream.
+///
+/// # Errors
+///
+/// Returns 404 if the deployment does not exist at all.
+#[utoipa::path(
+    get,
+    path = "/api/v1/deployments/{name}/events",
+    params(
+        ("name" = String, Path, description = "Deployment name"),
+    ),
+    responses(
+        (status = 200, description = "SSE event stream"),
+        (status = 404, description = "Deployment not found"),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Deployments"
+)]
+pub async fn stream_deployment_events(
+    _user: AuthUser,
+    State(state): State<DeploymentState>,
+    Path(name): Path<String>,
+) -> Result<Sse<impl Stream<Item = std::result::Result<Event, Infallible>>>> {
+    // Try to subscribe to an active orchestration channel
+    if let Some(tx) = state.event_channels.get(&name) {
+        let rx = tx.subscribe();
+        drop(tx); // release DashMap ref
+
+        debug!(deployment = %name, "SSE client subscribed to deployment events");
+
+        let stream = BroadcastStream::new(rx).map(|result| {
+            let wrapper = match result {
+                Ok(w) => w,
+                Err(_) => DeploymentEventWrapper {
+                    event_type: "error".to_string(),
+                    data: serde_json::json!({"message": "Stream error"}),
+                },
+            };
+
+            Ok::<_, Infallible>(
+                Event::default()
+                    .event(&wrapper.event_type)
+                    .json_data(&wrapper.data)
+                    .unwrap_or_else(|_| Event::default().data("error")),
+            )
+        });
+
+        let boxed: futures_util::stream::BoxStream<
+            'static,
+            std::result::Result<Event, Infallible>,
+        > = Box::pin(stream);
+        return Ok(Sse::new(boxed).keep_alive(KeepAlive::default()));
+    }
+
+    // No active channel -- check if the deployment exists and has a terminal status
+    let stored = state
+        .storage
+        .get(&name)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Storage error: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("Deployment '{name}' not found")))?;
+
+    debug!(
+        deployment = %name,
+        status = %stored.status,
+        "No active SSE channel; sending terminal status"
+    );
+
+    // Build a single terminal event based on stored status
+    let terminal_event = match &stored.status {
+        DeploymentStatus::Running => DeploymentEventWrapper::from(DeploymentProgressEvent::Ready),
+        DeploymentStatus::Failed { message } => {
+            DeploymentEventWrapper::from(DeploymentProgressEvent::Failed {
+                message: message.clone(),
+            })
+        }
+        other => DeploymentEventWrapper {
+            event_type: "status".to_string(),
+            data: serde_json::json!({ "status": other.to_string() }),
+        },
+    };
+
+    // Return a single-item stream
+    let stream = futures_util::stream::once(async move {
+        Ok::<_, Infallible>(
+            Event::default()
+                .event(&terminal_event.event_type)
+                .json_data(&terminal_event.data)
+                .unwrap_or_else(|_| Event::default().data("error")),
+        )
+    });
+
+    let boxed: futures_util::stream::BoxStream<'static, std::result::Result<Event, Infallible>> =
+        Box::pin(stream);
+    Ok(Sse::new(boxed).keep_alive(KeepAlive::default()))
 }
 
 /// Delete a deployment.

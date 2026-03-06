@@ -236,7 +236,13 @@ impl OverlayHealthChecker {
     pub async fn ping_peer(&self, overlay_ip: Ipv4Addr) -> Result<Duration> {
         let start = Instant::now();
 
-        // Use ICMP ping via the ping command
+        // Use ICMP ping via the ping command.
+        // On macOS, -W takes milliseconds; on Linux, -W takes seconds.
+        #[cfg(target_os = "macos")]
+        let timeout_arg = (PING_TIMEOUT_SECS * 1000).to_string();
+        #[cfg(not(target_os = "macos"))]
+        let timeout_arg = PING_TIMEOUT_SECS.to_string();
+
         let output = tokio::time::timeout(
             Duration::from_secs(PING_TIMEOUT_SECS),
             Command::new("ping")
@@ -244,7 +250,7 @@ impl OverlayHealthChecker {
                     "-c",
                     "1", // Single ping
                     "-W",
-                    &PING_TIMEOUT_SECS.to_string(), // Timeout
+                    &timeout_arg,
                     &overlay_ip.to_string(),
                 ])
                 .output(),

@@ -116,6 +116,33 @@ jobs:
       - name: Cleanup
         run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-arm64.tar.gz
 
+  build-windows-amd64:
+    needs: [check-existing]
+    if: needs.check-existing.outputs.need_build == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+      - name: Install protobuf
+        shell: bash
+        run: |
+          choco install protoc -y
+          echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
+      - name: Build (thin Windows CLI)
+        run: cargo build --release --package zlayer --no-default-features --features wsl,docker
+      - name: Package
+        shell: pwsh
+        run: Compress-Archive -Path target\release\zlayer.exe -DestinationPath zlayer-windows-amd64.zip
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: zlayer-windows-amd64
+          path: zlayer-windows-amd64.zip
+          retention-days: 1
+
   # ===========================================
   # Wave 2: Image build + macOS amd64 (2 parallel)
   # ===========================================
@@ -235,7 +262,7 @@ jobs:
   # Verify all builds passed
   # ===========================================
   verify:
-    needs: [check-existing, build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64, image-build]
+    needs: [check-existing, build-linux-amd64, build-linux-arm64, build-macos-amd64, build-macos-arm64, build-windows-amd64, image-build]
     if: needs.check-existing.outputs.need_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5

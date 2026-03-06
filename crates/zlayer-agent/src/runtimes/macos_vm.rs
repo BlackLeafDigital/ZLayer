@@ -31,7 +31,7 @@
 //! - **CPU overhead**: Near-native (hardware virtualization via Hypervisor.framework)
 //! - **GPU**: Venus-Vulkan protocol (~30% native) or ggml API remoting (~97% native)
 //! - **Networking**: TSI maps guest sockets through the host process
-//! - **Compatibility**: Full Linux OCI containers (unlike SandboxRuntime which needs macOS-native binaries)
+//! - **Compatibility**: Full Linux OCI containers (unlike `SandboxRuntime` which needs macOS-native binaries)
 //!
 //! ## Limitations
 //!
@@ -142,14 +142,16 @@ struct LibKrun {
 // pointers themselves are safe to share across threads because they point to
 // code (not mutable data). libkrun's API is documented as thread-safe for
 // distinct context IDs.
+#[allow(unsafe_code)]
 unsafe impl Send for LibKrun {}
+#[allow(unsafe_code)]
 unsafe impl Sync for LibKrun {}
 
 impl LibKrun {
     /// Load libkrun dynamically from standard macOS library paths.
     ///
     /// Searches the following locations in order:
-    /// 1. `libkrun.dylib` (system library path / DYLD_LIBRARY_PATH)
+    /// 1. `libkrun.dylib` (system library path / `DYLD_LIBRARY_PATH`)
     /// 2. `/usr/local/lib/libkrun.dylib` (Intel Homebrew)
     /// 3. `/opt/homebrew/lib/libkrun.dylib` (Apple Silicon Homebrew)
     ///
@@ -157,6 +159,7 @@ impl LibKrun {
     ///
     /// Returns `AgentError::Configuration` if libkrun cannot be found or if
     /// any required symbol is missing from the library.
+    #[allow(unsafe_code)]
     fn load() -> Result<Self> {
         let lib_paths = [
             "libkrun.dylib",
@@ -250,7 +253,7 @@ struct VmContainer {
     /// The original service spec.
     spec: ServiceSpec,
     /// Thread handle for the VM. `krun_start_enter()` blocks the calling
-    /// thread, so we spawn it in `std::thread::spawn` (NOT tokio::spawn,
+    /// thread, so we spawn it in `std::thread::spawn` (NOT `tokio::spawn`,
     /// as it would block the async runtime).
     vm_thread: Option<std::thread::JoinHandle<i32>>,
     /// Whether this VM has GPU enabled (for enforcing one-GPU-at-a-time).
@@ -320,6 +323,11 @@ impl VmRuntime {
     /// Creates the required directory hierarchy:
     /// - `{data_dir}/vms/` -- per-VM state directories
     /// - `{data_dir}/images/` -- pulled OCI image rootfs
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the required directories cannot be created.
+    #[allow(unsafe_code)]
     pub fn new() -> Result<Self> {
         let data_dir = PathBuf::from("/var/lib/zlayer");
         let log_dir = PathBuf::from("/var/log/zlayer");
@@ -417,6 +425,7 @@ fn sanitize_image_name(image: &str) -> String {
 }
 
 /// Parse a memory string like "512Mi" or "2Gi" into megabytes.
+#[allow(clippy::cast_possible_truncation)]
 fn parse_memory_to_mib(s: &str) -> Option<u32> {
     let s = s.trim();
     if let Some(num) = s.strip_suffix("Gi") {
@@ -435,6 +444,7 @@ fn parse_memory_to_mib(s: &str) -> Option<u32> {
 ///
 /// libkrun silently hangs if more vCPUs are configured than the host
 /// has physical cores. This function prevents that.
+#[allow(clippy::cast_possible_truncation)]
 fn safe_vcpu_count(requested: u32) -> u32 {
     let host_cores = num_cpus::get() as u32;
     let clamped = requested.min(host_cores).max(1);
@@ -453,7 +463,7 @@ fn safe_vcpu_count(requested: u32) -> u32 {
 ///
 /// Checks `spec.command.entrypoint` and `spec.command.args` in order,
 /// then falls back to `/bin/sh`.
-fn resolve_entrypoint(spec: &ServiceSpec) -> Result<(String, Vec<String>)> {
+fn resolve_entrypoint(spec: &ServiceSpec) -> (String, Vec<String>) {
     // Use entrypoint if specified
     if let Some(ref entrypoint) = spec.command.entrypoint {
         if !entrypoint.is_empty() {
@@ -465,7 +475,7 @@ fn resolve_entrypoint(spec: &ServiceSpec) -> Result<(String, Vec<String>)> {
                 args.extend(extra_args.iter().cloned());
             }
 
-            return Ok((program, args));
+            return (program, args);
         }
     }
 
@@ -474,22 +484,22 @@ fn resolve_entrypoint(spec: &ServiceSpec) -> Result<(String, Vec<String>)> {
         if !cmd_args.is_empty() {
             let program = cmd_args[0].clone();
             let args = cmd_args[1..].to_vec();
-            return Ok((program, args));
+            return (program, args);
         }
     }
 
     // Fallback: use /bin/sh (Linux rootfs inside VM)
-    Ok(("/bin/sh".to_string(), vec![]))
+    ("/bin/sh".to_string(), vec![])
 }
 
-/// Convert a Rust string to a null-terminated CString, returning an error
+/// Convert a Rust string to a null-terminated `CString`, returning an error
 /// with context if the string contains interior null bytes.
 fn to_cstring(s: &str, context: &str) -> Result<CString> {
     CString::new(s)
         .map_err(|e| AgentError::InvalidSpec(format!("{context} contains null byte: {e}")))
 }
 
-/// Build a null-terminated array of CString pointers for passing to C.
+/// Build a null-terminated array of `CString` pointers for passing to C.
 ///
 /// Returns a tuple of `(Vec<CString>, Vec<*const c_char>)` where the
 /// second vec is the pointer array (null-terminated) suitable for C's
@@ -523,7 +533,7 @@ fn build_env_array(env: &HashMap<String, String>) -> Result<(Vec<CString>, Vec<*
 
 #[async_trait::async_trait]
 impl Runtime for VmRuntime {
-    /// Pull an image to local storage with default policy (IfNotPresent).
+    /// Pull an image to local storage with default policy (`IfNotPresent`).
     async fn pull_image(&self, image: &str) -> Result<()> {
         self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent)
             .await
@@ -532,7 +542,7 @@ impl Runtime for VmRuntime {
     /// Pull an image to local storage with a specific policy.
     ///
     /// Uses `zlayer_registry` to pull OCI image layers and extract them.
-    /// Unlike the SandboxRuntime, VM containers run real Linux -- so standard
+    /// Unlike the `SandboxRuntime`, VM containers run real Linux -- so standard
     /// Linux OCI images work directly.
     async fn pull_image_with_policy(
         &self,
@@ -630,10 +640,11 @@ impl Runtime for VmRuntime {
 
     /// Create a container (prepare VM rootfs and state directory).
     ///
-    /// Unlike the SandboxRuntime, no Seatbelt profile is needed -- the VM
+    /// Unlike the `SandboxRuntime`, no Seatbelt profile is needed -- the VM
     /// provides full hardware-level isolation. The rootfs is copied (not
     /// APFS-cloned) since each VM has its own filesystem view through
     /// the virtualization layer.
+    #[allow(clippy::too_many_lines)]
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
         let dir_name = Self::container_dir_name(id);
         let vm_dir = self.vm_dir(id);
@@ -720,15 +731,14 @@ impl Runtime for VmRuntime {
             .resources
             .gpu
             .as_ref()
-            .map(|gpu| gpu.vendor == "apple")
-            .unwrap_or(false);
+            .is_some_and(|gpu| gpu.vendor == "apple");
 
         // Determine vCPU count from spec (default 2)
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let vcpus = spec
             .resources
             .cpu
-            .map(|cpu| (cpu.ceil() as u32).max(1))
-            .unwrap_or(2);
+            .map_or(2, |cpu| (cpu.ceil() as u32).max(1));
         let vcpus = safe_vcpu_count(vcpus);
 
         // Determine RAM from spec (default 512 MiB, minimum 128 MiB for VM overhead)
@@ -784,6 +794,7 @@ impl Runtime for VmRuntime {
     ///
     /// Only one GPU-enabled VM can run at a time. If a GPU container is
     /// already running, this method returns an error.
+    #[allow(clippy::too_many_lines, unsafe_code)]
     async fn start_container(&self, id: &ContainerId) -> Result<()> {
         let dir_name = Self::container_dir_name(id);
         let api = self.require_api()?;
@@ -824,7 +835,7 @@ impl Runtime for VmRuntime {
         }
 
         // Resolve entrypoint
-        let (program, args) = resolve_entrypoint(&spec)?;
+        let (program, args) = resolve_entrypoint(&spec);
 
         tracing::info!(
             container = %dir_name,
@@ -849,6 +860,7 @@ impl Runtime for VmRuntime {
                 reason: format!("krun_create_ctx failed with code {ctx_id}"),
             });
         }
+        #[allow(clippy::cast_sign_loss)]
         let ctx_id = ctx_id as u32;
 
         // Helper closure to clean up context on error
@@ -1024,6 +1036,7 @@ impl Runtime for VmRuntime {
     /// 2. Wait for the VM thread to complete
     ///
     /// The `timeout` parameter is respected for waiting on the thread join.
+    #[allow(unsafe_code)]
     async fn stop_container(&self, id: &ContainerId, timeout: Duration) -> Result<()> {
         let dir_name = Self::container_dir_name(id);
 
@@ -1080,13 +1093,10 @@ impl Runtime for VmRuntime {
                 // std::thread::JoinHandle doesn't support timeout directly.
                 // We rely on krun_free_ctx having terminated the VM above.
                 // Give it a reasonable window then report.
-                match thread.join() {
-                    Ok(code) => code,
-                    Err(_) => {
-                        tracing::warn!("VM thread panicked during join");
-                        -1
-                    }
-                }
+                thread.join().unwrap_or_else(|_| {
+                    tracing::warn!("VM thread panicked during join");
+                    -1
+                })
             })
             .await
             .unwrap_or(-1);
@@ -1123,6 +1133,7 @@ impl Runtime for VmRuntime {
     ///
     /// Stops the VM if still running, removes the state directory, and
     /// removes the container from internal tracking.
+    #[allow(unsafe_code)]
     async fn remove_container(&self, id: &ContainerId) -> Result<()> {
         let dir_name = Self::container_dir_name(id);
 
@@ -1205,24 +1216,22 @@ impl Runtime for VmRuntime {
         if let Some(ref thread) = container.vm_thread {
             if thread.is_finished() {
                 // Thread finished -- take ownership to join it
-                if let Some(thread) = container.vm_thread.take() {
-                    let exit_code = match thread.join() {
-                        Ok(code) => code,
-                        Err(_) => {
-                            container.state = ContainerState::Failed {
-                                reason: "VM thread panicked".to_string(),
-                            };
-                            return Ok(container.state.clone());
-                        }
+                let Some(thread) = container.vm_thread.take() else {
+                    return Ok(container.state.clone());
+                };
+                let Ok(exit_code) = thread.join() else {
+                    container.state = ContainerState::Failed {
+                        reason: "VM thread panicked".to_string(),
                     };
+                    return Ok(container.state.clone());
+                };
 
-                    container.state = ContainerState::Exited { code: exit_code };
-                    container.ctx_id = None;
+                container.state = ContainerState::Exited { code: exit_code };
+                container.ctx_id = None;
 
-                    // Release GPU lock
-                    if container.gpu_enabled {
-                        self.gpu_in_use.store(false, Ordering::SeqCst);
-                    }
+                // Release GPU lock
+                if container.gpu_enabled {
+                    self.gpu_in_use.store(false, Ordering::SeqCst);
                 }
             }
             // else: thread still running, state is Running
@@ -1282,7 +1291,7 @@ impl Runtime for VmRuntime {
     /// - A vsock-based agent running inside the guest
     /// - Or SSH access into the VM
     ///
-    /// Neither is currently set up. Use the SandboxRuntime if exec is required.
+    /// Neither is currently set up. Use the `SandboxRuntime` if exec is required.
     async fn exec(&self, id: &ContainerId, _cmd: &[String]) -> Result<(i32, String, String)> {
         let dir_name = Self::container_dir_name(id);
 
@@ -1311,7 +1320,7 @@ impl Runtime for VmRuntime {
     /// stats. Instead, we report the configured resource limits as approximate
     /// values.
     ///
-    /// For accurate per-container stats, use the SandboxRuntime which has
+    /// For accurate per-container stats, use the `SandboxRuntime` which has
     /// real per-process monitoring via `proc_pidinfo`.
     async fn get_container_stats(&self, id: &ContainerId) -> Result<ContainerStats> {
         let dir_name = Self::container_dir_name(id);
@@ -1332,12 +1341,12 @@ impl Runtime for VmRuntime {
 
         // We cannot get real per-VM stats without an in-guest agent.
         // Report configured limits as approximate values.
+        #[allow(clippy::cast_possible_truncation)]
         let uptime_usec = container
             .started_at
-            .map(|t| t.elapsed().as_micros() as u64)
-            .unwrap_or(0);
+            .map_or(0, |t| t.elapsed().as_micros() as u64);
 
-        let memory_limit = (container.ram_mib as u64) * 1024 * 1024;
+        let memory_limit = u64::from(container.ram_mib) * 1024 * 1024;
 
         Ok(ContainerStats {
             // Approximate CPU usage based on uptime (not real usage).
@@ -1447,7 +1456,7 @@ impl Runtime for VmRuntime {
         };
 
         match tokio::fs::read_to_string(&log_file).await {
-            Ok(content) => Ok(content.lines().map(|l| l.to_string()).collect()),
+            Ok(content) => Ok(content.lines().map(str::to_string).collect()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
             Err(e) => Err(AgentError::Internal(format!(
                 "Failed to read VM console log: {e}"
@@ -1483,7 +1492,7 @@ impl Runtime for VmRuntime {
     ///
     /// ## Multi-replica note
     ///
-    /// Unlike the SandboxRuntime, the VmRuntime does NOT have a port conflict
+    /// Unlike the `SandboxRuntime`, the `VmRuntime` does NOT have a port conflict
     /// problem with multiple replicas. Each VM has its own full network stack
     /// via libkrun's TSI -- the guest binds inside its own namespace, and TSI
     /// maps it to a unique host port automatically. No `get_container_port_override`
@@ -1511,9 +1520,9 @@ impl Runtime for VmRuntime {
 
 /// Recursively copy a directory tree.
 ///
-/// Unlike the SandboxRuntime's `clone_directory_recursive` which uses APFS
-/// `clonefile` for CoW, this does a regular copy. VMs have their own
-/// filesystem view through virtio-fs, so CoW is not needed.
+/// Unlike the `SandboxRuntime`'s `clone_directory_recursive` which uses APFS
+/// `clonefile` for `CoW`, this does a regular copy. VMs have their own
+/// filesystem view through `virtio-fs`, so `CoW` is not needed.
 async fn copy_directory_recursive(
     src: &std::path::Path,
     dst: &std::path::Path,

@@ -3,14 +3,14 @@
 //!
 //! These tests verify that all critical infrastructure components (overlay network,
 //! proxy manager, DNS server, container supervisor) are properly wired through the
-//! ServiceManager -> ServiceInstance path during the deploy flow.
+//! `ServiceManager` -> `ServiceInstance` path during the deploy flow.
 //!
 //! These tests would have caught the following bugs in the original deploy flow:
-//! - upsert_service() passed None for overlay_manager (with a TODO comment!)
-//! - ProxyManager was never started, so expose: public had zero effect
-//! - DnsServer was never started, so service discovery didn't work
-//! - ContainerSupervisor was never created, so crashed containers stayed dead
-//! - setup_service_overlay() was never called
+//! - `upsert_service()` passed None for `overlay_manager` (with a TODO comment!)
+//! - `ProxyManager` was never started, so expose: public had zero effect
+//! - `DnsServer` was never started, so service discovery didn't work
+//! - `ContainerSupervisor` was never created, so crashed containers stayed dead
+//! - `setup_service_overlay()` was never called
 
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -27,7 +27,7 @@ use zlayer_spec::{DeploymentSpec, ServiceSpec};
 
 fn mock_http_spec() -> ServiceSpec {
     serde_yml::from_str::<DeploymentSpec>(
-        r#"
+        r"
 version: v1
 deployment: test
 services:
@@ -42,7 +42,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
+",
     )
     .unwrap()
     .services
@@ -52,7 +52,7 @@ services:
 
 fn mock_public_http_spec() -> ServiceSpec {
     serde_yml::from_str::<DeploymentSpec>(
-        r#"
+        r"
 version: v1
 deployment: test
 services:
@@ -68,7 +68,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
+",
     )
     .unwrap()
     .services
@@ -78,7 +78,7 @@ services:
 
 fn mock_mixed_endpoints_spec() -> ServiceSpec {
     serde_yml::from_str::<DeploymentSpec>(
-        r#"
+        r"
 version: v1
 deployment: test
 services:
@@ -100,7 +100,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
+",
     )
     .unwrap()
     .services
@@ -359,14 +359,14 @@ async fn test_upsert_update_preserves_dns_server() {
 #[test]
 fn test_api_spec_defaults_in_deployment() {
     // BUG THIS CATCHES: API server was a separate command, not embedded.
-    let yaml = r#"
+    let yaml = r"
 version: v1
 deployment: test
 services:
   hello:
     image:
       name: hello-world:latest
-"#;
+";
     let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
     assert!(spec.api.enabled, "API must be enabled by default");
     assert_eq!(
@@ -378,7 +378,7 @@ services:
 
 #[test]
 fn test_api_spec_can_be_disabled() {
-    let yaml = r#"
+    let yaml = r"
 version: v1
 deployment: test
 services:
@@ -387,7 +387,7 @@ services:
       name: hello-world:latest
 api:
   enabled: false
-"#;
+";
     let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
     assert!(!spec.api.enabled);
 }

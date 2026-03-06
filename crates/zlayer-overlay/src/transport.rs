@@ -2,6 +2,9 @@
 //!
 //! Uses boringtun (userspace `WireGuard`) to create TUN-based encrypted tunnels.
 //! No kernel `WireGuard` module or `wg` binary required.
+//!
+//! On Linux, creates TUN interfaces via `/dev/net/tun`.
+//! On macOS, creates utun interfaces via the kernel control socket.
 
 use crate::{config::OverlayConfig, PeerInfo};
 use boringtun::device::{DeviceConfig, DeviceHandle};
@@ -81,6 +84,16 @@ impl OverlayTransport {
         }
     }
 
+    /// Get the resolved interface name.
+    ///
+    /// On macOS, this returns the kernel-assigned `utunN` name after
+    /// [`create_interface`] has been called. Before that, it returns the
+    /// name passed to [`new`].
+    #[must_use]
+    pub fn interface_name(&self) -> &str {
+        &self.interface_name
+    }
+
     /// Path to the UAPI Unix socket for this interface.
     fn uapi_sock_path(&self) -> String {
         format!("/var/run/wireguard/{}.sock", self.interface_name)
@@ -92,12 +105,17 @@ impl OverlayTransport {
     /// device is torn down when this struct is dropped (or [`shutdown`] is
     /// called).
     ///
+    /// On Linux, creates a named TUN interface (requires `CAP_NET_ADMIN`).
+    /// On macOS, creates a kernel-assigned `utunN` interface (requires `sudo`).
+    ///
     /// # Errors
     ///
-    /// Returns an error if the interface name exceeds 15 characters, the TUN device
-    /// cannot be created, or `CAP_NET_ADMIN` is unavailable.
+    /// Returns an error if the TUN device cannot be created or required
+    /// privileges are unavailable.
     pub async fn create_interface(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // Validate interface name (kernel limit is 15 chars for IFNAMSIZ)
+        // On Linux, validate interface name length (IFNAMSIZ = 15).
+        // On macOS, the kernel auto-assigns utunN names so validation is skipped.
+        #[cfg(not(target_os = "macos"))]
         if self.interface_name.len() > 15 {
             return Err(format!(
                 "Interface name '{}' exceeds 15 character limit",
@@ -109,26 +127,30 @@ impl OverlayTransport {
         // Ensure the UAPI socket directory exists
         tokio::fs::create_dir_all("/var/run/wireguard").await?;
 
-        // Clean up any stale interface from a previous crashed deploy.
+        // On Linux, clean up stale interfaces from a previous crashed deploy.
         // If the process was SIGKILLed, the TUN device persists in the kernel
-        // and DeviceHandle::new() will fail on re-create. Best-effort cleanup:
-        // if `ip link delete` fails, we still attempt to create the device.
-        let check_output = Command::new("ip")
-            .args(["link", "show", &self.interface_name])
-            .output()
-            .await;
-        if let Ok(output) = check_output {
-            if output.status.success() {
-                tracing::warn!(
-                    interface = %self.interface_name,
-                    "stale network interface found, cleaning up before re-create"
-                );
-                let _ = Command::new("ip")
-                    .args(["link", "delete", &self.interface_name])
-                    .output()
-                    .await;
+        // and DeviceHandle::new() will fail on re-create.
+        #[cfg(target_os = "linux")]
+        {
+            let check_output = Command::new("ip")
+                .args(["link", "show", &self.interface_name])
+                .output()
+                .await;
+            if let Ok(output) = check_output {
+                if output.status.success() {
+                    tracing::warn!(
+                        interface = %self.interface_name,
+                        "stale network interface found, cleaning up before re-create"
+                    );
+                    let _ = Command::new("ip")
+                        .args(["link", "delete", &self.interface_name])
+                        .output()
+                        .await;
+                }
             }
         }
+        // macOS utun devices are kernel-managed and auto-destroyed when the
+        // owning socket closes. No stale interface cleanup needed.
 
         // Clean up stale UAPI socket left behind by a crashed process.
         let sock_path = format!("/var/run/wireguard/{}.sock", self.interface_name);
@@ -137,7 +159,25 @@ impl OverlayTransport {
             let _ = tokio::fs::remove_file(&sock_path).await;
         }
 
+        // On macOS, snapshot existing UAPI sockets so we can discover the
+        // kernel-assigned utunN name after device creation.
+        #[cfg(target_os = "macos")]
+        let existing_socks = {
+            let mut set = std::collections::HashSet::new();
+            if let Ok(mut entries) = tokio::fs::read_dir("/var/run/wireguard").await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    set.insert(entry.file_name().to_string_lossy().to_string());
+                }
+            }
+            set
+        };
+
+        // On macOS, pass "utun" to let the kernel auto-assign a utunN device.
+        #[cfg(target_os = "macos")]
+        let name = "utun".to_string();
+        #[cfg(not(target_os = "macos"))]
         let name = self.interface_name.clone();
+
         let cfg = DeviceConfig {
             n_threads: 2,
             use_connected_socket: true,
@@ -147,20 +187,45 @@ impl OverlayTransport {
             uapi_fd: -1,
         };
 
+        let iface_name_for_err = self.interface_name.clone();
+
         // DeviceHandle::new() blocks (spawns threads), so run on the blocking
         // thread pool.
         let handle = tokio::task::spawn_blocking(move || DeviceHandle::new(&name, cfg))
             .await
             .map_err(|e| format!("spawn_blocking join error: {e}"))?
             .map_err(|e| {
-                format!(
-                    "Failed to create boringtun device '{}': {e}. \
-                     Ensure CAP_NET_ADMIN capability is available.",
-                    self.interface_name
-                )
+                #[cfg(target_os = "macos")]
+                let hint = "Ensure running with sudo.";
+                #[cfg(not(target_os = "macos"))]
+                let hint = "Ensure CAP_NET_ADMIN capability is available.";
+                format!("Failed to create boringtun device '{iface_name_for_err}': {e}. {hint}")
             })?;
 
         self.device = Some(handle);
+
+        // On macOS, discover the actual utunN interface name by finding the
+        // newly created UAPI socket.
+        #[cfg(target_os = "macos")]
+        {
+            // Small delay to let boringtun finish socket setup
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if let Ok(mut entries) = tokio::fs::read_dir("/var/run/wireguard").await {
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let fname = entry.file_name().to_string_lossy().to_string();
+                    if !existing_socks.contains(&fname)
+                        && fname.starts_with("utun")
+                        && std::path::Path::new(&fname)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("sock"))
+                    {
+                        self.interface_name = fname.trim_end_matches(".sock").to_string();
+                        break;
+                    }
+                }
+            }
+        }
+
         tracing::info!(
             interface = %self.interface_name,
             "Created boringtun overlay transport"
@@ -171,8 +236,8 @@ impl OverlayTransport {
     /// Configure the transport with private key, listen port, and peers.
     ///
     /// After setting the `WireGuard` parameters via UAPI, this also assigns the
-    /// overlay IP address and brings the interface up using standard `ip`
-    /// commands.
+    /// overlay IP address and brings the interface up using platform-appropriate
+    /// commands (`ifconfig`/`route` on macOS, `ip` on Linux).
     ///
     /// # Errors
     ///
@@ -203,7 +268,73 @@ impl OverlayTransport {
         uapi_set(&sock, &body).await?;
         tracing::debug!(interface = %self.interface_name, "Applied UAPI configuration");
 
-        // Assign overlay IP address (generic networking command)
+        // Assign overlay IP address and bring interface up
+        self.configure_interface().await?;
+
+        tracing::info!(interface = %self.interface_name, "Overlay transport configured and up");
+        Ok(())
+    }
+
+    /// Platform-specific interface IP assignment and bring-up.
+    #[cfg(target_os = "macos")]
+    async fn configure_interface(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let cidr: ipnet::Ipv4Net = self.config.overlay_cidr.parse().map_err(|e| {
+            format!(
+                "Failed to parse overlay CIDR '{}': {e}",
+                self.config.overlay_cidr
+            )
+        })?;
+        let overlay_ip = cidr.addr().to_string();
+        let netmask = cidr.netmask().to_string();
+
+        // Configure point-to-point utun interface
+        let output = Command::new("ifconfig")
+            .args([
+                &self.interface_name,
+                "inet",
+                &overlay_ip,
+                &overlay_ip,
+                "netmask",
+                &netmask,
+                "up",
+            ])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("Failed to configure interface: {stderr}").into());
+        }
+
+        // Add route for the overlay subnet
+        let network_cidr = format!("{}/{}", cidr.network(), cidr.prefix_len());
+        let output = Command::new("route")
+            .args([
+                "-n",
+                "add",
+                "-net",
+                &network_cidr,
+                "-interface",
+                &self.interface_name,
+            ])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Ignore "already in table" — idempotent
+            if !stderr.contains("already in table") {
+                return Err(format!("Failed to add route: {stderr}").into());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Platform-specific interface IP assignment and bring-up.
+    #[cfg(not(target_os = "macos"))]
+    async fn configure_interface(&self) -> Result<(), Box<dyn std::error::Error>> {
+        // Assign overlay IP address
         let output = Command::new("ip")
             .args([
                 "addr",
@@ -223,7 +354,7 @@ impl OverlayTransport {
             }
         }
 
-        // Bring interface up (generic networking command)
+        // Bring interface up
         let output = Command::new("ip")
             .args(["link", "set", "dev", &self.interface_name, "up"])
             .output()
@@ -237,7 +368,6 @@ impl OverlayTransport {
             .into());
         }
 
-        tracing::info!(interface = %self.interface_name, "Overlay transport configured and up");
         Ok(())
     }
 
@@ -427,7 +557,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "Requires CAP_NET_ADMIN capability"]
+    #[ignore = "Requires root/CAP_NET_ADMIN"]
     async fn test_create_interface_boringtun() {
         let config = OverlayConfig {
             overlay_cidr: "10.42.0.1/24".to_string(),
@@ -437,25 +567,37 @@ mod tests {
             peer_discovery_interval: Duration::from_secs(30),
         };
 
-        let mut transport = OverlayTransport::new(config, "zl-bt-test0".to_string());
+        // On macOS, boringtun uses "utun" and the kernel assigns utunN.
+        // On Linux, we use a custom interface name.
+        #[cfg(target_os = "macos")]
+        let iface_name = "utun".to_string();
+        #[cfg(not(target_os = "macos"))]
+        let iface_name = "zl-bt-test0".to_string();
+
+        let mut transport = OverlayTransport::new(config, iface_name);
         let result = transport.create_interface().await;
 
         match result {
             Ok(()) => {
-                // Success — device was created. Shut it down cleanly.
+                #[cfg(target_os = "macos")]
+                assert!(
+                    transport.interface_name().starts_with("utun"),
+                    "macOS interface should be utunN, got: {}",
+                    transport.interface_name()
+                );
                 transport.shutdown();
             }
             Err(e) => {
                 let msg = e.to_string();
-                // Must mention boringtun or CAP_NET_ADMIN, never the cryptic
-                // kernel-wireguard "Attribute failed policy validation" message.
                 assert!(
                     !msg.contains("Attribute failed policy validation"),
                     "create_interface should not produce kernel WireGuard errors. Got: {msg}",
                 );
                 assert!(
-                    msg.contains("boringtun") || msg.contains("CAP_NET_ADMIN"),
-                    "Error should mention boringtun or CAP_NET_ADMIN. Got: {msg}",
+                    msg.contains("boringtun")
+                        || msg.contains("CAP_NET_ADMIN")
+                        || msg.contains("sudo"),
+                    "Error should mention boringtun, CAP_NET_ADMIN, or sudo. Got: {msg}",
                 );
             }
         }

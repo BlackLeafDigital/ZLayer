@@ -93,9 +93,10 @@ pub struct MacSandboxConfig {
 #[cfg(target_os = "macos")]
 impl Default for MacSandboxConfig {
     fn default() -> Self {
-        let base = std::env::var("HOME")
-            .map(|h| PathBuf::from(h).join(".local/share/zlayer"))
-            .unwrap_or_else(|_| PathBuf::from("/var/lib/zlayer"));
+        let base = std::env::var("HOME").map_or_else(
+            |_| PathBuf::from("/var/lib/zlayer"),
+            |h| PathBuf::from(h).join(".local/share/zlayer"),
+        );
         let log_dir = base.join("logs");
         Self {
             data_dir: base,
@@ -134,6 +135,9 @@ pub enum RuntimeConfig {
     /// Use macOS Virtualization.framework for full VM isolation
     #[cfg(target_os = "macos")]
     MacVm,
+    /// WSL2 backend (Windows only).
+    #[cfg(target_os = "windows")]
+    Wsl2,
 }
 
 /// Check if Docker daemon is available and responsive
@@ -255,6 +259,11 @@ pub async fn create_runtime(config: RuntimeConfig) -> Result<Arc<dyn Runtime + S
         )),
         #[cfg(target_os = "macos")]
         RuntimeConfig::MacVm => Ok(Arc::new(runtimes::macos_vm::VmRuntime::new()?)),
+        #[cfg(target_os = "windows")]
+        RuntimeConfig::Wsl2 => Err(AgentError::Configuration(
+            "WSL2 runtime is not yet implemented. Use Docker Desktop with WSL2 backend."
+                .to_string(),
+        )),
     }
 }
 
@@ -295,6 +304,12 @@ async fn create_auto_runtime() -> Result<Arc<dyn Runtime + Send + Sync>> {
             Ok(rt) => return Ok(Arc::new(rt)),
             Err(e) => tracing::warn!("macOS VM runtime (libkrun) unavailable: {e}"),
         }
+    }
+
+    // On Windows, log that we are using Docker via WSL2/Docker Desktop
+    #[cfg(target_os = "windows")]
+    {
+        tracing::info!("Windows detected -- will use Docker Desktop (WSL2 backend)");
     }
 
     // On non-Linux or if libcontainer failed, try Docker

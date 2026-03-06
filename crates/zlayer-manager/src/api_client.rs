@@ -48,6 +48,14 @@ pub struct HealthResponse {
     /// Uptime in seconds (optional)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uptime_secs: Option<u64>,
+    /// Container runtime name (e.g. "youki", "mac-sandbox", "docker")
+    #[serde(default = "default_runtime_name")]
+    pub runtime_name: String,
+}
+
+/// Fallback runtime name when the API does not include the field (older servers).
+fn default_runtime_name() -> String {
+    "auto".to_string()
 }
 
 /// Deployment summary for listing
@@ -1440,11 +1448,20 @@ mod tests {
 
     #[test]
     fn test_health_response_deserialize() {
+        // Without runtime_name -- should default to "auto"
         let json = r#"{"status":"ok","version":"0.1.0"}"#;
         let response: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.status, "ok");
         assert_eq!(response.version, "0.1.0");
         assert!(response.uptime_secs.is_none());
+        assert_eq!(response.runtime_name, "auto");
+    }
+
+    #[test]
+    fn test_health_response_deserialize_with_runtime() {
+        let json = r#"{"status":"ok","version":"0.1.0","runtime_name":"docker"}"#;
+        let response: HealthResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.runtime_name, "docker");
     }
 
     #[test]

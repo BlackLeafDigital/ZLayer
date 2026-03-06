@@ -74,7 +74,7 @@ pub fn Dashboard() -> impl IntoView {
                                                 </div>
                                                 <div class="stat-title">"Version"</div>
                                                 <div class="stat-value text-info text-lg">{s.version.clone()}</div>
-                                                <div class="stat-desc">"mac-sandbox runtime"</div>
+                                                <div class="stat-desc">{format!("{} runtime", s.runtime_name)}</div>
                                             </div>
                                             <div class="stat">
                                                 <div class="stat-title">"Uptime"</div>
