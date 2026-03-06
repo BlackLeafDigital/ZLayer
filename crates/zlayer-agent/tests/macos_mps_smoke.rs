@@ -1,5 +1,5 @@
 #![cfg(target_os = "macos")]
-//! MPS GPU smoke tests for ZLayer macOS Seatbelt sandbox runtime
+//! MPS GPU smoke tests for `ZLayer` macOS Seatbelt sandbox runtime
 //!
 //! These tests verify that actual Metal/MPS GPU workloads can execute
 //! inside the Seatbelt sandbox. Unlike the profile-generation tests in
@@ -43,7 +43,7 @@ const E2E_TEST_DIR: &str = "/tmp/zlayer-mps-smoke-test";
 // =============================================================================
 
 /// Swift program that checks Metal device availability and basic MPS support.
-/// Exits 0 and prints "METAL_OK" on success.
+/// Exits 0 and prints `METAL_OK` on success.
 const SWIFT_METAL_DEVICE_CHECK: &str = r#"
 import Metal
 
@@ -140,7 +140,7 @@ if correct == count {
 "#;
 
 /// Swift program that compiles a custom Metal compute shader at runtime.
-/// This requires full MetalCompute access (MTLCompilerService).
+/// This requires full `MetalCompute` access (`MTLCompilerService`).
 const SWIFT_METAL_SHADER_COMPILE: &str = r#"
 import Metal
 
@@ -246,9 +246,10 @@ fn unique_name(prefix: &str) -> String {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_millis() as u64
+        .as_millis()
         % 1_000_000;
-    format!("{}-{}-{}", prefix, timestamp, suffix)
+    let timestamp = u64::try_from(timestamp).unwrap_or(u64::MAX);
+    format!("{prefix}-{timestamp}-{suffix}")
 }
 
 fn create_e2e_runtime(gpu_access: bool) -> Result<SandboxRuntime, AgentError> {
@@ -267,7 +268,7 @@ fn compile_swift(source: &str, binary_name: &str) -> PathBuf {
     let tmp_dir = PathBuf::from(E2E_TEST_DIR).join("swift-build");
     std::fs::create_dir_all(&tmp_dir).expect("Failed to create swift build dir");
 
-    let src_path = tmp_dir.join(format!("{}.swift", binary_name));
+    let src_path = tmp_dir.join(format!("{binary_name}.swift"));
     let bin_path = tmp_dir.join(binary_name);
 
     std::fs::write(&src_path, source).expect("Failed to write Swift source");
@@ -284,13 +285,12 @@ fn compile_swift(source: &str, binary_name: &str) -> PathBuf {
         .output()
         .expect("Failed to run swiftc -- are Xcode command line tools installed?");
 
-    if !output.status.success() {
-        panic!(
-            "swiftc failed:\nstdout: {}\nstderr: {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    assert!(
+        output.status.success(),
+        "swiftc failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     bin_path
 }
@@ -323,7 +323,7 @@ async fn prepare_gpu_rootfs(
 
     // Also copy basic system binaries needed
     for bin in &["echo", "sh"] {
-        let src = format!("/bin/{}", bin);
+        let src = format!("/bin/{bin}");
         let dst = rootfs_dir.join("bin").join(bin);
         if std::path::Path::new(&src).exists() && !dst.exists() {
             tokio::fs::copy(&src, &dst).await.ok();
@@ -359,7 +359,7 @@ impl Drop for ContainerGuard {
 
 /// Verify Metal device is accessible from inside the Seatbelt sandbox.
 ///
-/// Compiles a Swift program that calls MTLCreateSystemDefaultDevice() and
+/// Compiles a Swift program that calls `MTLCreateSystemDefaultDevice()` and
 /// runs it inside a sandboxed container with full Metal compute access.
 #[tokio::test]
 async fn test_metal_device_available_in_sandbox() {
@@ -385,7 +385,7 @@ services:
   metal-dev:
     rtype: service
     image:
-      name: {}
+      name: {image_name}
     command:
       entrypoint: ["bin/metal-device-check"]
     endpoints:
@@ -399,8 +399,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
-            image_name
+"#
         );
 
         let spec = serde_yml::from_str::<DeploymentSpec>(&yaml)
@@ -420,16 +419,15 @@ services:
         runtime.start_container(&id).await.expect("start failed");
 
         let exit_code = runtime.wait_container(&id).await.expect("wait failed");
-        println!("Metal device check exit code: {}", exit_code);
+        println!("Metal device check exit code: {exit_code}");
 
         let logs = runtime.container_logs(&id, 100).await.expect("logs failed");
-        println!("--- Metal Device Check Output ---\n{}", logs);
+        println!("--- Metal Device Check Output ---\n{logs}");
 
         assert_eq!(exit_code, 0, "Metal device check should exit 0");
         assert!(
             logs.contains("METAL_OK"),
-            "Output should contain METAL_OK, got:\n{}",
-            logs
+            "Output should contain METAL_OK, got:\n{logs}"
         );
         assert!(
             logs.contains("METAL_DEVICE:"),
@@ -441,7 +439,7 @@ services:
     });
 }
 
-/// Run an actual MPS compute workload (vector addition via MPSGraph) inside
+/// Run an actual MPS compute workload (vector addition via `MPSGraph`) inside
 /// the Seatbelt sandbox with MPS-only GPU access.
 ///
 /// This proves that pre-compiled MPS kernels execute correctly when the
@@ -469,7 +467,7 @@ services:
   mps-compute:
     rtype: service
     image:
-      name: {}
+      name: {image_name}
     command:
       entrypoint: ["bin/mps-compute"]
     endpoints:
@@ -484,8 +482,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
-            image_name
+"#
         );
 
         let spec = serde_yml::from_str::<DeploymentSpec>(&yaml)
@@ -505,16 +502,15 @@ services:
         runtime.start_container(&id).await.expect("start failed");
 
         let exit_code = runtime.wait_container(&id).await.expect("wait failed");
-        println!("MPS compute exit code: {}", exit_code);
+        println!("MPS compute exit code: {exit_code}");
 
         let logs = runtime.container_logs(&id, 100).await.expect("logs failed");
-        println!("--- MPS Compute Output ---\n{}", logs);
+        println!("--- MPS Compute Output ---\n{logs}");
 
         assert_eq!(exit_code, 0, "MPS compute should exit 0");
         assert!(
             logs.contains("MPS_COMPUTE_OK"),
-            "Output should contain MPS_COMPUTE_OK, got:\n{}",
-            logs
+            "Output should contain MPS_COMPUTE_OK, got:\n{logs}"
         );
         assert!(
             logs.contains("1024/1024 correct"),
@@ -528,8 +524,8 @@ services:
 
 /// Run a Metal compute shader that is compiled at runtime inside the sandbox.
 ///
-/// This requires full MetalCompute access (not MPS-only) because it needs
-/// the MTLCompilerService to compile the shader source at runtime.
+/// This requires full `MetalCompute` access (not MPS-only) because it needs
+/// the `MTLCompilerService` to compile the shader source at runtime.
 /// This is the access level needed for MLX, custom Metal shaders, etc.
 #[tokio::test]
 async fn test_metal_shader_compile_in_sandbox() {
@@ -555,7 +551,7 @@ services:
   shader-compile:
     rtype: service
     image:
-      name: {}
+      name: {image_name}
     command:
       entrypoint: ["bin/metal-shader-compile"]
     endpoints:
@@ -569,8 +565,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
-            image_name
+"#
         );
 
         let spec = serde_yml::from_str::<DeploymentSpec>(&yaml)
@@ -590,16 +585,15 @@ services:
         runtime.start_container(&id).await.expect("start failed");
 
         let exit_code = runtime.wait_container(&id).await.expect("wait failed");
-        println!("Metal shader compile exit code: {}", exit_code);
+        println!("Metal shader compile exit code: {exit_code}");
 
         let logs = runtime.container_logs(&id, 100).await.expect("logs failed");
-        println!("--- Metal Shader Compile Output ---\n{}", logs);
+        println!("--- Metal Shader Compile Output ---\n{logs}");
 
         assert_eq!(exit_code, 0, "Metal shader compile should exit 0");
         assert!(
             logs.contains("SHADER_COMPUTE_OK"),
-            "Output should contain SHADER_COMPUTE_OK, got:\n{}",
-            logs
+            "Output should contain SHADER_COMPUTE_OK, got:\n{logs}"
         );
         assert!(
             logs.contains("SHADER_COMPILED:"),
@@ -615,11 +609,11 @@ services:
     });
 }
 
-/// Verify that GPU access is denied when the runtime has gpu_access=false.
+/// Verify that GPU access is denied when the runtime has `gpu_access=false`.
 ///
 /// Even if the deployment spec requests a GPU, a runtime configured with
 /// `gpu_access: false` should NOT include any GPU rules in the Seatbelt
-/// profile, causing MTLCreateSystemDefaultDevice() to return nil.
+/// profile, causing `MTLCreateSystemDefaultDevice()` to return nil.
 #[tokio::test]
 async fn test_gpu_denied_when_runtime_disabled() {
     with_timeout!(120, {
@@ -645,7 +639,7 @@ services:
   gpu-denied:
     rtype: service
     image:
-      name: {}
+      name: {image_name}
     command:
       entrypoint: ["bin/gpu-denied"]
     endpoints:
@@ -659,8 +653,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
-            image_name
+"#
         );
 
         let spec = serde_yml::from_str::<DeploymentSpec>(&yaml)
@@ -680,21 +673,19 @@ services:
         runtime.start_container(&id).await.expect("start failed");
 
         let exit_code = runtime.wait_container(&id).await.expect("wait failed");
-        println!("GPU denied exit code: {}", exit_code);
+        println!("GPU denied exit code: {exit_code}");
 
         let logs = runtime.container_logs(&id, 100).await.expect("logs failed");
-        println!("--- GPU Denied Output ---\n{}", logs);
+        println!("--- GPU Denied Output ---\n{logs}");
 
         // The process should fail because runtime disabled GPU access
         assert_ne!(
             exit_code, 0,
-            "Metal should fail when runtime disables GPU, but got exit 0:\n{}",
-            logs
+            "Metal should fail when runtime disables GPU, but got exit 0:\n{logs}"
         );
         assert!(
             logs.contains("METAL_FAIL"),
-            "Output should contain METAL_FAIL, got:\n{}",
-            logs
+            "Output should contain METAL_FAIL, got:\n{logs}"
         );
 
         let _ = runtime.stop_container(&id, Duration::from_secs(5)).await;
