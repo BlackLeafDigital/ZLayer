@@ -29,6 +29,7 @@ pub mod placement;
 pub mod raft;
 pub mod raft_network;
 pub mod raft_service;
+#[cfg(feature = "persistent")]
 pub mod raft_storage;
 
 pub use autoscaler::{

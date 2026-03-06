@@ -15,6 +15,9 @@ use tokio::sync::RwLock;
 use tracing::info;
 use utoipa::ToSchema;
 use zlayer_consensus::network::http_client::HttpNetwork;
+#[cfg(not(feature = "persistent"))]
+use zlayer_consensus::storage::mem_store::{MemLogStore, MemStateMachine, SmData};
+#[cfg(feature = "persistent")]
 use zlayer_consensus::storage::zql_store::{ZqlLogStore, ZqlSmCache, ZqlStateMachine};
 use zlayer_consensus::{ConsensusConfig, ConsensusNode, ConsensusNodeBuilder};
 
@@ -472,8 +475,12 @@ impl ClusterState {
 pub type ZLayerRaft = Raft<TypeConfig>;
 
 /// The state machine type, parameterized with our `ClusterState` and apply fn
+#[cfg(feature = "persistent")]
 pub type SchedulerStateMachine =
     ZqlStateMachine<TypeConfig, ClusterState, fn(&mut ClusterState, &Request) -> Response>;
+#[cfg(not(feature = "persistent"))]
+pub type SchedulerStateMachine =
+    MemStateMachine<TypeConfig, ClusterState, fn(&mut ClusterState, &Request) -> Response>;
 
 // =============================================================================
 // Raft Configuration
@@ -527,7 +534,10 @@ pub struct RaftCoordinator {
     /// `ConsensusNode` from zlayer-consensus
     node: ConsensusNode<TypeConfig>,
     /// Shared state machine data (for reading cluster state)
+    #[cfg(feature = "persistent")]
     sm_data: Arc<RwLock<ZqlSmCache<TypeConfig, ClusterState>>>,
+    #[cfg(not(feature = "persistent"))]
+    sm_data: Arc<RwLock<SmData<TypeConfig, ClusterState>>>,
     /// Configuration (retained for callers that need `raft_port`, etc.)
     #[allow(dead_code)]
     config: RaftConfig,
@@ -563,22 +573,34 @@ impl RaftCoordinator {
             ..ConsensusConfig::default()
         };
 
-        // Create persistent storage using ZQL
-        let log_path = config.data_dir.join("raft-log");
-        let sm_path = config.data_dir.join("raft-sm");
-
         // Ensure data directory exists
         std::fs::create_dir_all(&config.data_dir)
             .map_err(|e| SchedulerError::Raft(format!("Failed to create raft data dir: {e}")))?;
 
-        let log_store = ZqlLogStore::<TypeConfig>::new(&log_path)
-            .map_err(|e| SchedulerError::Raft(format!("Failed to open raft log store: {e}")))?;
-        let state_machine = ZqlStateMachine::<TypeConfig, ClusterState, _>::new(
-            &sm_path,
-            ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
-        )
-        .map_err(|e| SchedulerError::Raft(format!("Failed to open raft state machine: {e}")))?;
-        let sm_data = state_machine.state();
+        // Create storage (persistent ZQL or in-memory depending on feature)
+        #[cfg(feature = "persistent")]
+        let (log_store, state_machine, sm_data) = {
+            let log_path = config.data_dir.join("raft-log");
+            let sm_path = config.data_dir.join("raft-sm");
+            let log_store = ZqlLogStore::<TypeConfig>::new(&log_path)
+                .map_err(|e| SchedulerError::Raft(format!("Failed to open raft log store: {e}")))?;
+            let state_machine = ZqlStateMachine::<TypeConfig, ClusterState, _>::new(
+                &sm_path,
+                ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
+            )
+            .map_err(|e| SchedulerError::Raft(format!("Failed to open raft state machine: {e}")))?;
+            let sm_data = state_machine.state();
+            (log_store, state_machine, sm_data)
+        };
+        #[cfg(not(feature = "persistent"))]
+        let (log_store, state_machine, sm_data) = {
+            let log_store = MemLogStore::<TypeConfig>::default();
+            let state_machine = MemStateMachine::<TypeConfig, ClusterState, _>::new(
+                ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
+            );
+            let sm_data = state_machine.state();
+            (log_store, state_machine, sm_data)
+        };
 
         // Create network using zlayer-consensus's HttpNetwork (with optional auth)
         let network = HttpNetwork::<TypeConfig>::with_timeouts_and_auth(
