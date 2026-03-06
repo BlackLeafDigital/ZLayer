@@ -124,7 +124,7 @@ hickory-client = "0.24"
 # Storage
 redb = "2.2"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
-zql = { version = "0.3.2", registry = "forgejo", default-features = false, features = ["sql-compat", "native-storage"] }
+zql = { version = "0.3.21", registry = "forgejo", default-features = false, features = ["sql-compat", "native-storage"] }
 
 # Config
 config = "0.15"
