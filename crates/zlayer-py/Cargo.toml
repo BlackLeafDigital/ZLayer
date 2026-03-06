@@ -24,8 +24,8 @@ s3 = ["zlayer-agent/s3"]
 
 [dependencies]
 # PyO3 for Python bindings
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py38"] }
-pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+pyo3 = { version = "0.28", features = ["extension-module", "abi3-py38"] }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 
 # ZLayer crates
 zlayer-agent.workspace = true

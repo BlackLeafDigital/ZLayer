@@ -598,7 +598,7 @@ impl RaftCoordinator {
             let state_machine = MemStateMachine::<TypeConfig, ClusterState, _>::new(
                 ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
             );
-            let sm_data = state_machine.state();
+            let sm_data = state_machine.data();
             (log_store, state_machine, sm_data)
         };
 

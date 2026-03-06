@@ -85,6 +85,36 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
   # ===========================================
+  # Check (macOS) — catches cfg(target_os = "macos") errors
+  # ===========================================
+  check-macos:
+    name: Check (macOS)
+    runs-on: macos-latest
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    env:
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: zdb
+
+      - name: Install system dependencies
+        run: brew install protobuf python3
+
+      - name: Setup Rust
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          components: clippy
+          registries: ${{ env.FORGEJO_REGISTRIES }}
+
+      - name: Check compilation
+        run: cargo check --workspace --all-targets
+
+      - name: Clippy lints
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  # ===========================================
   # Test — skipped for tags
   # ===========================================
   test:
