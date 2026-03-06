@@ -22,6 +22,7 @@ members = [
   "bin/zlayer",
   "crates/zlayer-manager",
   "crates/zlayer-consensus",
+  "crates/zlayer-wsl",
 ]
 
 [workspace.package]
@@ -210,6 +211,10 @@ zlayer-web = { path = "crates/zlayer-web", version = "0.0.0-dev", package = "zla
 zlayer-secrets = { path = "crates/zlayer-secrets", version = "0.0.0-dev", package = "zlayer-secrets-zql" }
 zlayer-manager = { path = "crates/zlayer-manager", version = "0.0.0-dev", package = "zlayer-manager-zql" }
 zlayer-consensus = { path = "crates/zlayer-consensus", version = "0.0.0-dev", package = "zlayer-consensus-zql" }
+zlayer-wsl = { path = "crates/zlayer-wsl", version = "0.0.0-dev", package = "zlayer-wsl-zql" }
+
+# Windows-only dependencies
+winreg = "0.55"
 
 # =============================================================================
 # Build Profiles

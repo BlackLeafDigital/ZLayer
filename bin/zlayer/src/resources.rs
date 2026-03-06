@@ -117,25 +117,23 @@ fn detect_memory_used() -> u64 {
 // Disk detection (via nix::sys::statvfs)
 // =============================================================================
 
-#[allow(clippy::unnecessary_cast)]
 fn detect_disk_total(data_dir: &Path) -> u64 {
     match nix::sys::statvfs::statvfs(data_dir) {
         Ok(stat) => {
             // Total blocks * fragment size = total bytes
-            stat.blocks() as u64 * stat.fragment_size() as u64
+            u64::from(stat.blocks()) * stat.fragment_size()
         }
         Err(_) => 0,
     }
 }
 
-#[allow(clippy::unnecessary_cast)]
 fn detect_disk_used(data_dir: &Path) -> u64 {
     match nix::sys::statvfs::statvfs(data_dir) {
         Ok(stat) => {
-            let frag = stat.fragment_size() as u64;
-            let total = stat.blocks() as u64 * frag;
+            let frag = stat.fragment_size();
+            let total = u64::from(stat.blocks()) * frag;
             // blocks_available is free blocks available to unprivileged users
-            let avail = stat.blocks_available() as u64 * frag;
+            let avail = u64::from(stat.blocks_available()) * frag;
             total.saturating_sub(avail)
         }
         Err(_) => 0,
@@ -255,7 +253,7 @@ fn sysctl_hw_memsize() -> u64 {
 /// Estimate available memory on macOS by parsing `vm_stat` output.
 ///
 /// `vm_stat` reports page counts. We multiply by page size to get bytes.
-/// Available ~ (free + inactive) pages * page_size.
+/// Available ~ (free + inactive) pages * `page_size`.
 #[cfg(target_os = "macos")]
 fn macos_available_memory() -> u64 {
     let output = match std::process::Command::new("vm_stat").output() {

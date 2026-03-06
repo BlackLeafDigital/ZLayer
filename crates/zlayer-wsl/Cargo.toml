@@ -1,0 +1,21 @@
+[package]
+name = "zlayer-wsl-zql"
+version = "0.0.0-dev"
+edition = "2021"
+description = "WSL2 backend integration for ZLayer on Windows"
+license = "MIT"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true, features = ["process", "time", "net", "io-util"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"

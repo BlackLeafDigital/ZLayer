@@ -8396,9 +8396,9 @@ dependencies = [
 
 [[package]]
 name = "uuid"
-version = "1.21.0"
+version = "1.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
+checksum = "a68d3c8f01c0cfa54a75291d83601161799e4a89a39e0929f4b0354d88757a37"
 dependencies = [
  "getrandom 0.4.2",
  "js-sys",
@@ -9582,6 +9582,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "winreg"
+version = "0.55.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
+dependencies = [
+ "cfg-if",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "winx"
 version = "0.36.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10422,6 +10432,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "zlayer-wsl-zql"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "winreg",
+]
+
+[[package]]
 name = "zlayer-zql"
 version = "0.0.0-dev"
 dependencies = [
@@ -10467,6 +10490,7 @@ dependencies = [
  "zlayer-storage-zql",
  "zlayer-tui-zql",
  "zlayer-tunnel-zql",
+ "zlayer-wsl-zql",
 ]
 
 [[package]]

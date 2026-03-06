@@ -15,6 +15,12 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 /// Default overlay interface name for `ZLayer`
+///
+/// On macOS, this is `"utun"` which tells boringtun to let the kernel
+/// auto-assign a `utunN` device. On Linux, a custom name is used.
+#[cfg(target_os = "macos")]
+pub const DEFAULT_INTERFACE_NAME: &str = "utun";
+#[cfg(not(target_os = "macos"))]
 pub const DEFAULT_INTERFACE_NAME: &str = "zl-overlay0";
 
 /// Default overlay listen port
@@ -490,6 +496,18 @@ impl OverlayBootstrap {
             .create_interface()
             .await
             .map_err(|e| OverlayError::TransportCommand(e.to_string()))?;
+
+        // On macOS, the kernel assigns a utunN name that may differ from
+        // the requested name. Update our config to reflect the actual name.
+        let actual_name = transport.interface_name().to_string();
+        if actual_name != self.config.interface {
+            info!(
+                requested = %self.config.interface,
+                actual = %actual_name,
+                "Interface name resolved by kernel"
+            );
+            self.config.interface = actual_name;
+        }
 
         // Convert peers to PeerInfo
         let peer_infos: Vec<PeerInfo> = self

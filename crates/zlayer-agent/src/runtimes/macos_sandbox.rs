@@ -41,6 +41,7 @@ use crate::error::{AgentError, Result};
 use crate::runtime::{ContainerId, ContainerState, Runtime};
 use crate::MacSandboxConfig;
 use std::collections::HashMap;
+use std::fmt::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,17 +56,17 @@ use zlayer_spec::ServiceSpec;
 
 /// GPU access level for the sandbox profile.
 ///
-/// Controls which IOKit user client classes, Mach services, and framework
+/// Controls which `IOKit` user client classes, Mach services, and framework
 /// paths are allowed in the generated Seatbelt profile.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GpuAccess {
-    /// No GPU access -- deny all IOKit and GPU Mach services.
+    /// No GPU access -- deny all `IOKit` and GPU Mach services.
     None,
-    /// Full Metal compute -- shader compilation + IOKit GPU access.
-    /// Required for custom Metal shaders, PyTorch MPS with JIT compilation,
+    /// Full Metal compute -- shader compilation + `IOKit` GPU access.
+    /// Required for custom Metal shaders, `PyTorch` MPS with JIT compilation,
     /// and any workload that calls `MTLCreateSystemDefaultDevice()`.
     MetalCompute,
-    /// MPS only -- pre-compiled kernels, no MTLCompilerService needed.
+    /// MPS only -- pre-compiled kernels, no `MTLCompilerService` needed.
     /// Suitable for inference-only workloads using Apple's pre-built MPS kernels.
     /// Smaller attack surface than full Metal compute.
     MpsOnly,
@@ -102,7 +103,7 @@ pub struct SandboxConfig {
     pub readonly_dirs: Vec<PathBuf>,
     /// Maximum open file descriptors.
     pub max_files: u64,
-    /// CPU time limit in seconds (RLIMIT_CPU).
+    /// CPU time limit in seconds (`RLIMIT_CPU`).
     pub cpu_time_limit: Option<u64>,
     /// Memory limit in bytes (for watchdog, not kernel-enforced on macOS).
     pub memory_limit: Option<u64>,
@@ -110,18 +111,18 @@ pub struct SandboxConfig {
 
 /// Full Metal compute profile section.
 ///
-/// Allows IOKit GPU access, Mach shader compilation services,
+/// Allows `IOKit` GPU access, Mach shader compilation services,
 /// and all filesystem paths needed for Metal.framework.
 ///
-/// IOKit user client class names were derived from:
-/// - `ioreg -l -w0` on macOS 26 / Apple M5 (AGXAcceleratorG17G, AGXDeviceUserClient)
+/// `IOKit` user client class names were derived from:
+/// - `ioreg -l -w0` on macOS 26 / Apple M5 (`AGXAcceleratorG17G`, `AGXDeviceUserClient`)
 /// - Apple's own system sandbox profiles:
 ///   - `/System/Library/Sandbox/Profiles/com.apple.intelligenceplatformd.sb`
 ///   - `/System/Library/Sandbox/Profiles/safety-inference-extension-macos.sb`
 ///   - `/System/Library/Sandbox/Profiles/com.apple.intelligenceplatform.IntelligencePlatformComputeService.sb`
 ///
-/// Key insight: On Apple Silicon (M1+), the actual IOUserClient class opened by
-/// MTLCreateSystemDefaultDevice() is `AGXDeviceUserClient` -- NOT `AGXAccelerator`
+/// Key insight: On Apple Silicon (M1+), the actual `IOUserClient` class opened by
+/// `MTLCreateSystemDefaultDevice()` is `AGXDeviceUserClient` -- NOT `AGXAccelerator`
 /// (which is the IOService/kernel driver class name, not a user client class).
 /// `AGXSharedUserClient` is needed for multi-process GPU sharing.
 const METAL_COMPUTE_PROFILE_SECTION: &str = "\
@@ -253,11 +254,11 @@ const METAL_COMPUTE_PROFILE_SECTION: &str = "\
 /// MPS-only profile section (subset of Metal compute).
 ///
 /// MPS mode provides a smaller attack surface than full Metal compute by
-/// restricting IOKit access to a minimal set and omitting AGXCompilerService
-/// XPC services. However, MTLCompilerService is still required because
-/// MPSGraph on macOS 26+ uses JIT compilation internally for kernel fusion.
+/// restricting `IOKit` access to a minimal set and omitting `AGXCompilerService`
+/// XPC services. However, `MTLCompilerService` is still required because
+/// `MPSGraph` on macOS 26+ uses JIT compilation internally for kernel fusion.
 ///
-/// Uses the same corrected IOKit user client classes as the full Metal profile
+/// Uses the same corrected `IOKit` user client classes as the full Metal profile
 /// (`AGXDeviceUserClient` instead of the incorrect `AGXAccelerator`).
 const MPS_ONLY_PROFILE_SECTION: &str = "\
 ; --- GPU: MPS Only (pre-compiled kernels, no shader compilation) ---
@@ -337,6 +338,8 @@ const MPS_ONLY_PROFILE_SECTION: &str = "\
 /// 5. GPU rules (if `gpu_access != None`)
 /// 6. Network rules (based on `network_access`)
 /// 7. Logging and /dev/null access
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn generate_sandbox_profile(config: &SandboxConfig) -> String {
     let mut profile = String::with_capacity(4096);
 
@@ -385,32 +388,36 @@ pub fn generate_sandbox_profile(config: &SandboxConfig) -> String {
 
     // ===== Section 3: Container rootfs access =====
     profile.push_str("; --- Container rootfs ---\n");
-    profile.push_str(&format!(
-        "(allow file-read* file-write* (subpath \"{}\"))\n",
+    let _ = writeln!(
+        profile,
+        "(allow file-read* file-write* (subpath \"{}\"))",
         config.rootfs_dir.display()
-    ));
-    profile.push_str(&format!(
-        "(allow file-map-executable (subpath \"{}\"))\n",
+    );
+    let _ = writeln!(
+        profile,
+        "(allow file-map-executable (subpath \"{}\"))",
         config.rootfs_dir.display()
-    ));
+    );
     profile.push('\n');
 
     // Workspace directory (logs, config, etc.)
     profile.push_str("; --- Workspace directory ---\n");
-    profile.push_str(&format!(
-        "(allow file-read* file-write* (subpath \"{}\"))\n",
+    let _ = writeln!(
+        profile,
+        "(allow file-read* file-write* (subpath \"{}\"))",
         config.workspace_dir.display()
-    ));
+    );
     profile.push('\n');
 
     // ===== Section 4: Volume mounts =====
     if !config.writable_dirs.is_empty() {
         profile.push_str("; --- Volume mounts (writable) ---\n");
         for dir in &config.writable_dirs {
-            profile.push_str(&format!(
-                "(allow file-read* file-write* (subpath \"{}\"))\n",
+            let _ = writeln!(
+                profile,
+                "(allow file-read* file-write* (subpath \"{}\"))",
                 dir.display()
-            ));
+            );
         }
         profile.push('\n');
     }
@@ -418,10 +425,11 @@ pub fn generate_sandbox_profile(config: &SandboxConfig) -> String {
     if !config.readonly_dirs.is_empty() {
         profile.push_str("; --- Volume mounts (read-only) ---\n");
         for dir in &config.readonly_dirs {
-            profile.push_str(&format!(
-                "(allow file-read* (subpath \"{}\"))\n",
+            let _ = writeln!(
+                profile,
+                "(allow file-read* (subpath \"{}\"))",
                 dir.display()
-            ));
+            );
         }
         profile.push('\n');
     }
@@ -448,16 +456,16 @@ pub fn generate_sandbox_profile(config: &SandboxConfig) -> String {
         } => {
             profile.push_str("; --- Network: localhost only ---\n");
             for port in bind_ports {
-                profile.push_str(&format!(
-                    "(allow network-bind (local ip \"localhost:{}\"))\n",
-                    port
-                ));
+                let _ = writeln!(
+                    profile,
+                    "(allow network-bind (local ip \"localhost:{port}\"))",
+                );
             }
             for port in connect_ports {
-                profile.push_str(&format!(
-                    "(allow network-outbound (remote ip \"localhost:{}\"))\n",
-                    port
-                ));
+                let _ = writeln!(
+                    profile,
+                    "(allow network-outbound (remote ip \"localhost:{port}\"))",
+                );
             }
             // Allow inbound on bound ports
             if !bind_ports.is_empty() {
@@ -523,6 +531,12 @@ mod seatbelt_ffi {
 ///
 /// This is called in the child process after `fork()` and before `exec()`.
 /// Once applied, the sandbox cannot be removed or loosened.
+///
+/// # Errors
+///
+/// Returns an error if the profile string contains a null byte or if
+/// `sandbox_init()` fails to apply the profile.
+#[allow(unsafe_code)]
 fn apply_seatbelt_profile(sbpl: &str) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::ptr;
@@ -536,12 +550,14 @@ fn apply_seatbelt_profile(sbpl: &str) -> std::io::Result<()> {
         seatbelt_ffi::sandbox_init(
             profile_cstr.as_ptr(),
             0, // 0 = raw SBPL string
-            &mut error_buf,
+            &raw mut error_buf,
         )
     };
 
     if result != 0 {
-        let error_msg = if !error_buf.is_null() {
+        let error_msg = if error_buf.is_null() {
+            format!("sandbox_init returned error code {result}")
+        } else {
             let msg = unsafe {
                 std::ffi::CStr::from_ptr(error_buf)
                     .to_string_lossy()
@@ -549,12 +565,10 @@ fn apply_seatbelt_profile(sbpl: &str) -> std::io::Result<()> {
             };
             unsafe { seatbelt_ffi::sandbox_free_error(error_buf) };
             msg
-        } else {
-            format!("sandbox_init returned error code {}", result)
         };
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            format!("Failed to initialize sandbox: {}", error_msg),
+            format!("Failed to initialize sandbox: {error_msg}"),
         ));
     }
 
@@ -578,11 +592,18 @@ extern "C" {
     ) -> libc::c_int;
 }
 
-/// Clone a single file using APFS CoW.
+/// Clone a single file using APFS `CoW`.
 ///
 /// Returns `Ok(true)` if clonefile succeeded, `Ok(false)` if clonefile
 /// is not supported (non-APFS volume) and the caller should fall back
 /// to a regular copy.
+///
+/// # Errors
+///
+/// Returns an error if the source or destination paths contain invalid
+/// characters or if `clonefile()` fails for a reason other than unsupported
+/// filesystem or cross-device.
+#[allow(unsafe_code)]
 fn clone_file_apfs(src: &Path, dst: &Path) -> std::io::Result<bool> {
     use std::ffi::CString;
 
@@ -675,9 +696,16 @@ async fn clone_directory_recursive(src: &Path, dst: &Path) -> std::io::Result<()
 ///
 /// On macOS, we use the `PROC_PIDTASKINFO` flavor which works for child
 /// processes without special entitlements.
+///
+/// # Errors
+///
+/// Returns an error if `proc_pidinfo` fails (e.g. the process does not exist).
+#[allow(unsafe_code)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn get_process_rss(pid: u32) -> std::io::Result<u64> {
     #[repr(C)]
     #[allow(non_snake_case)]
+    #[allow(clippy::struct_field_names)]
     struct ProcTaskInfo {
         pti_virtual_size: u64,
         pti_resident_size: u64,
@@ -719,7 +747,7 @@ fn get_process_rss(pid: u32) -> std::io::Result<u64> {
             pid as libc::c_int,
             PROC_PIDTASKINFO,
             0,
-            &mut info as *mut _ as *mut libc::c_void,
+            (&raw mut info).cast::<libc::c_void>(),
             size,
         )
     };
@@ -734,9 +762,16 @@ fn get_process_rss(pid: u32) -> std::io::Result<u64> {
 /// Get CPU time (user + system) and memory RSS for a process.
 ///
 /// CPU time is returned in microseconds. Memory is returned in bytes.
+///
+/// # Errors
+///
+/// Returns an error if `proc_pidinfo` fails (e.g. the process does not exist).
+#[allow(unsafe_code)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn get_process_stats(pid: u32) -> Result<(u64, u64)> {
     #[repr(C)]
     #[allow(non_snake_case)]
+    #[allow(clippy::struct_field_names)]
     struct ProcTaskInfo {
         pti_virtual_size: u64,
         pti_resident_size: u64,
@@ -778,15 +813,14 @@ fn get_process_stats(pid: u32) -> Result<(u64, u64)> {
             pid as libc::c_int,
             PROC_PIDTASKINFO,
             0,
-            &mut info as *mut _ as *mut libc::c_void,
+            (&raw mut info).cast::<libc::c_void>(),
             size,
         )
     };
 
     if ret <= 0 {
         return Err(AgentError::Internal(format!(
-            "proc_pidinfo failed for pid {}: {}",
-            pid,
+            "proc_pidinfo failed for pid {pid}: {}",
             std::io::Error::last_os_error()
         )));
     }
@@ -806,13 +840,18 @@ fn get_process_stats(pid: u32) -> Result<(u64, u64)> {
 /// Set resource limits for the sandboxed process.
 ///
 /// Called in the child process after `fork()` via `pre_exec`.
+///
+/// # Errors
+///
+/// Returns an error if `setrlimit` fails.
+#[allow(unsafe_code)]
 fn set_resource_limits(max_files: u64, cpu_seconds: Option<u64>) -> std::io::Result<()> {
     // Limit open file descriptors
     let file_limit = libc::rlimit {
         rlim_cur: max_files,
         rlim_max: max_files,
     };
-    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &file_limit) } != 0 {
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raw const file_limit) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
 
@@ -822,7 +861,7 @@ fn set_resource_limits(max_files: u64, cpu_seconds: Option<u64>) -> std::io::Res
             rlim_cur: seconds,
             rlim_max: seconds,
         };
-        if unsafe { libc::setrlimit(libc::RLIMIT_CPU, &cpu_limit) } != 0 {
+        if unsafe { libc::setrlimit(libc::RLIMIT_CPU, &raw const cpu_limit) } != 0 {
             return Err(std::io::Error::last_os_error());
         }
     }
@@ -838,6 +877,8 @@ fn set_resource_limits(max_files: u64, cpu_seconds: Option<u64>) -> std::io::Res
 ///
 /// This is necessary because macOS does NOT enforce `RLIMIT_RSS` or `RLIMIT_AS`.
 /// The watchdog polls every 2 seconds using `proc_pidinfo` (Mach API).
+#[allow(unsafe_code)]
+#[allow(clippy::cast_possible_wrap)]
 async fn memory_watchdog(pid: u32, limit_bytes: u64) {
     let check_interval = Duration::from_secs(2);
 
@@ -913,23 +954,21 @@ fn build_writable_dirs(spec: &ServiceSpec, container_dir: &Path) -> Vec<PathBuf>
     ];
 
     for storage in &spec.storage {
-        match storage {
+        let target = match storage {
             zlayer_spec::StorageSpec::Named { target, .. }
             | zlayer_spec::StorageSpec::Anonymous { target, .. }
             | zlayer_spec::StorageSpec::Bind { target, .. }
-            | zlayer_spec::StorageSpec::Tmpfs { target, .. } => {
-                dirs.push(PathBuf::from(target));
-            }
-            zlayer_spec::StorageSpec::S3 { target, .. } => {
-                dirs.push(PathBuf::from(target));
-            }
-        }
+            | zlayer_spec::StorageSpec::Tmpfs { target, .. }
+            | zlayer_spec::StorageSpec::S3 { target, .. } => target,
+        };
+        dirs.push(PathBuf::from(target));
     }
 
     dirs
 }
 
 /// Parse a memory string like "512Mi" or "2Gi" into bytes.
+#[must_use]
 fn parse_memory_string(s: &str) -> Option<u64> {
     let s = s.trim();
     if let Some(num) = s.strip_suffix("Gi") {
@@ -944,6 +983,7 @@ fn parse_memory_string(s: &str) -> Option<u64> {
 }
 
 /// Sanitize an image name for use as a filesystem directory name.
+#[must_use]
 fn sanitize_image_name(image: &str) -> String {
     image.replace(['/', ':', '@'], "_")
 }
@@ -952,13 +992,17 @@ fn sanitize_image_name(image: &str) -> String {
 ///
 /// Checks `spec.command.entrypoint` and `spec.command.args` in order,
 /// then falls back to searching for a shell in the rootfs.
+///
+/// # Errors
+///
+/// Returns an error if no entrypoint is specified and no shell is found.
 fn resolve_entrypoint(spec: &ServiceSpec, rootfs: &Path) -> Result<(String, Vec<String>)> {
     // Resolve a program path for the macOS sandbox runtime.
     //
     // If the program is an absolute path (e.g. "/usr/local/bin/app"):
-    //   1. If it exists on the host → use the host path (macOS platform binaries
+    //   1. If it exists on the host -> use the host path (macOS platform binaries
     //      must be exec'd from their original path to pass code-signing checks).
-    //   2. Else if it exists inside rootfs → use the rootfs-resolved path so
+    //   2. Else if it exists inside rootfs -> use the rootfs-resolved path so
     //      `Command::new()` can find it.
     //   3. Otherwise return as-is and let exec() produce a clear error.
     let resolve_program = |prog: &str| -> String {
@@ -1040,6 +1084,11 @@ struct SandboxSpawnParams {
 ///    and resource limits.
 /// 4. Spawn the child process.
 /// 5. Return the child PID.
+///
+/// # Errors
+///
+/// Returns an error if log files cannot be created or the process fails to spawn.
+#[allow(unsafe_code)]
 fn spawn_sandboxed_process(params: &SandboxSpawnParams) -> Result<u32> {
     use std::os::unix::process::CommandExt;
 
@@ -1074,12 +1123,12 @@ fn spawn_sandboxed_process(params: &SandboxSpawnParams) -> Result<u32> {
     let stdout_file =
         std::fs::File::create(&params.stdout_path).map_err(|e| AgentError::CreateFailed {
             id: "sandbox-process".to_string(),
-            reason: format!("Failed to create stdout log: {}", e),
+            reason: format!("Failed to create stdout log: {e}"),
         })?;
     let stderr_file =
         std::fs::File::create(&params.stderr_path).map_err(|e| AgentError::CreateFailed {
             id: "sandbox-process".to_string(),
-            reason: format!("Failed to create stderr log: {}", e),
+            reason: format!("Failed to create stderr log: {e}"),
         })?;
 
     // Spawn the child process with pre_exec hook for sandbox application.
@@ -1106,7 +1155,7 @@ fn spawn_sandboxed_process(params: &SandboxSpawnParams) -> Result<u32> {
     }
     .map_err(|e| AgentError::StartFailed {
         id: "sandbox-process".to_string(),
-        reason: format!("Failed to spawn sandboxed process: {}", e),
+        reason: format!("Failed to spawn sandboxed process: {e}"),
     })?;
 
     Ok(child.id())
@@ -1125,16 +1174,20 @@ fn spawn_sandboxed_process(params: &SandboxSpawnParams) -> Result<u32> {
 /// claim it.
 ///
 /// The flow:
-///   1. Parent calls `reserve_port()` → gets `(port, guard_listener)`
+///   1. Parent calls `reserve_port()` -> gets `(port, guard_listener)`
 ///   2. Parent spawns the child with `PORT={port}` in its environment
 ///   3. Parent drops `guard_listener` immediately after `spawn()` returns
 ///   4. Child's framework reads `PORT`, calls `bind("0.0.0.0:{port}")`
 ///
-/// The race window (step 3→4) is on the order of microseconds (process
+/// The race window (step 3->4) is on the order of microseconds (process
 /// startup before the child enters `bind()`).  On a developer laptop
 /// (the target for macOS sandbox), port theft in this window is not a
-/// realistic concern.  For server-class isolation use the VmRuntime,
+/// realistic concern.  For server-class isolation use the `VmRuntime`,
 /// where each VM has its own network stack.
+///
+/// # Errors
+///
+/// Returns an error if binding to port 0 fails.
 fn reserve_port() -> std::io::Result<(u16, std::net::TcpListener)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let port = listener.local_addr()?.port();
@@ -1162,7 +1215,7 @@ struct SandboxContainer {
     stderr_path: PathBuf,
     /// When the process was started.
     started_at: Option<Instant>,
-    /// The original service spec (needed for start_container).
+    /// The original service spec (needed for `start_container`).
     spec: ServiceSpec,
     /// Generated sandbox configuration.
     sandbox_config: SandboxConfig,
@@ -1204,7 +1257,7 @@ static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// GPU access (Metal/MPS) runs at 100% native performance -- no
 /// virtualization overhead. Each container gets a generated `.sb` profile
-/// that precisely whitelists the IOKit classes, Mach services, and filesystem
+/// that precisely whitelists the `IOKit` classes, Mach services, and filesystem
 /// paths required for its workload.
 pub struct SandboxRuntime {
     /// Runtime configuration.
@@ -1229,27 +1282,28 @@ impl SandboxRuntime {
     /// Creates the required directory hierarchy under `config.data_dir`:
     /// - `containers/` -- per-container state
     /// - `images/` -- pulled OCI image rootfs
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the required directories cannot be created.
     pub fn new(config: MacSandboxConfig) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir).map_err(|e| {
             AgentError::Configuration(format!(
-                "Failed to create data dir {}: {}",
+                "Failed to create data dir {}: {e}",
                 config.data_dir.display(),
-                e
             ))
         })?;
         std::fs::create_dir_all(&config.log_dir).map_err(|e| {
             AgentError::Configuration(format!(
-                "Failed to create log dir {}: {}",
+                "Failed to create log dir {}: {e}",
                 config.log_dir.display(),
-                e
             ))
         })?;
         std::fs::create_dir_all(config.data_dir.join("containers")).map_err(|e| {
-            AgentError::Configuration(format!("Failed to create containers dir: {}", e))
+            AgentError::Configuration(format!("Failed to create containers dir: {e}"))
         })?;
-        std::fs::create_dir_all(config.data_dir.join("images")).map_err(|e| {
-            AgentError::Configuration(format!("Failed to create images dir: {}", e))
-        })?;
+        std::fs::create_dir_all(config.data_dir.join("images"))
+            .map_err(|e| AgentError::Configuration(format!("Failed to create images dir: {e}")))?;
         tracing::info!(
             data_dir = %config.data_dir.display(),
             log_dir = %config.log_dir.display(),
@@ -1265,6 +1319,7 @@ impl SandboxRuntime {
     }
 
     /// Get the runtime configuration.
+    #[must_use]
     pub fn config(&self) -> &MacSandboxConfig {
         &self.config
     }
@@ -1296,6 +1351,16 @@ impl SandboxRuntime {
     ///
     /// Used by E2E tests to provide macOS-native binaries, and can be used
     /// by the builder to register locally-built images.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the image directory cannot be created or the
+    /// rootfs cannot be cloned.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the system clock is before the Unix epoch.
+    #[allow(clippy::too_many_lines)]
     pub async fn register_local_rootfs(&self, image: &str, source_dir: &Path) -> Result<()> {
         let safe_name = sanitize_image_name(image);
         let image_dir = self.images_dir().join(&safe_name);
@@ -1313,7 +1378,7 @@ impl SandboxRuntime {
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
-                reason: format!("Failed to create image dir: {}", e),
+                reason: format!("Failed to create image dir: {e}"),
             })?;
 
         // Clone to a unique staging directory to avoid races when multiple
@@ -1336,14 +1401,13 @@ impl SandboxRuntime {
                 AgentError::PullFailed {
                     image: image.to_string(),
                     reason: format!(
-                        "Failed to clone local rootfs from {}: {}",
+                        "Failed to clone local rootfs from {}: {e}",
                         source_dir.display(),
-                        e
                     ),
                 }
             })?;
 
-        // Atomic rename — only one caller wins the race
+        // Atomic rename -- only one caller wins the race
         if tokio::fs::rename(&staging_dir, &rootfs_dir).await.is_err() {
             // Race loser: clean up staging, use winner's rootfs
             let _ = tokio::fs::remove_dir_all(&staging_dir).await;
@@ -1375,7 +1439,7 @@ impl SandboxRuntime {
 
 #[async_trait::async_trait]
 impl Runtime for SandboxRuntime {
-    /// Pull an image to local storage with default policy (IfNotPresent).
+    /// Pull an image to local storage with default policy (`IfNotPresent`).
     async fn pull_image(&self, image: &str) -> Result<()> {
         self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent)
             .await
@@ -1387,6 +1451,7 @@ impl Runtime for SandboxRuntime {
     /// `{data_dir}/images/{sanitized_name}/rootfs/`. On macOS, OCI images
     /// from registries contain Linux binaries -- the sandbox runtime expects
     /// macOS-native binaries or cross-platform scripts.
+    #[allow(clippy::too_many_lines)]
     async fn pull_image_with_policy(
         &self,
         image: &str,
@@ -1430,7 +1495,7 @@ impl Runtime for SandboxRuntime {
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
-                reason: format!("Failed to create rootfs dir: {}", e),
+                reason: format!("Failed to create rootfs dir: {e}"),
             })?;
 
         // Use zlayer-registry to pull and extract OCI image layers.
@@ -1442,7 +1507,7 @@ impl Runtime for SandboxRuntime {
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
-                reason: format!("Failed to open blob cache: {}", e),
+                reason: format!("Failed to open blob cache: {e}"),
             })?;
 
         let puller = zlayer_registry::ImagePuller::with_cache(blob_cache);
@@ -1453,7 +1518,7 @@ impl Runtime for SandboxRuntime {
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
-                reason: format!("Failed to pull image layers: {}", e),
+                reason: format!("Failed to pull image layers: {e}"),
             })?;
 
         tracing::info!(
@@ -1469,7 +1534,7 @@ impl Runtime for SandboxRuntime {
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
-                reason: format!("Failed to extract rootfs: {}", e),
+                reason: format!("Failed to extract rootfs: {e}"),
             })?;
 
         // Track the rootfs path
@@ -1492,6 +1557,7 @@ impl Runtime for SandboxRuntime {
     /// 3. Writes the profile to `{container_dir}/sandbox.sb`.
     /// 4. Writes container metadata to `{container_dir}/config.json`.
     /// 5. Stores the container as [`ContainerState::Pending`].
+    #[allow(clippy::too_many_lines)]
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
         let dir_name = Self::container_dir_name(id);
         let container_dir = self.container_dir(id);
@@ -1518,9 +1584,8 @@ impl Runtime for SandboxRuntime {
             .map_err(|e| AgentError::CreateFailed {
                 id: dir_name.clone(),
                 reason: format!(
-                    "Failed to create container dir {}: {}",
+                    "Failed to create container dir {}: {e}",
                     container_dir.display(),
-                    e
                 ),
             })?;
 
@@ -1529,7 +1594,7 @@ impl Runtime for SandboxRuntime {
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: dir_name.clone(),
-                reason: format!("Failed to create container tmp dir: {}", e),
+                reason: format!("Failed to create container tmp dir: {e}"),
             })?;
 
         // Locate the base image rootfs
@@ -1563,10 +1628,9 @@ impl Runtime for SandboxRuntime {
             .map_err(|e| AgentError::CreateFailed {
                 id: dir_name.clone(),
                 reason: format!(
-                    "Failed to clone rootfs from {} to {}: {}",
+                    "Failed to clone rootfs from {} to {}: {e}",
                     image_rootfs.display(),
                     rootfs_dir.display(),
-                    e
                 ),
             })?;
 
@@ -1602,10 +1666,7 @@ impl Runtime for SandboxRuntime {
         // the child process, preventing other processes from stealing it.
         let (assigned_port, port_guard) = reserve_port().map_err(|e| AgentError::CreateFailed {
             id: dir_name.clone(),
-            reason: format!(
-                "Failed to reserve a dynamic port for sandbox container: {}",
-                e
-            ),
+            reason: format!("Failed to reserve a dynamic port for sandbox container: {e}",),
         })?;
 
         tracing::info!(
@@ -1674,20 +1735,20 @@ impl Runtime for SandboxRuntime {
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: dir_name.clone(),
-                reason: format!("Failed to write Seatbelt profile: {}", e),
+                reason: format!("Failed to write Seatbelt profile: {e}"),
             })?;
 
         // Write config to disk (for use by start_container)
         let config_json =
             serde_json::to_string_pretty(spec).map_err(|e| AgentError::CreateFailed {
                 id: dir_name.clone(),
-                reason: format!("Failed to serialize spec: {}", e),
+                reason: format!("Failed to serialize spec: {e}"),
             })?;
         tokio::fs::write(container_dir.join("config.json"), &config_json)
             .await
             .map_err(|e| AgentError::CreateFailed {
                 id: dir_name.clone(),
-                reason: format!("Failed to write config.json: {}", e),
+                reason: format!("Failed to write config.json: {e}"),
             })?;
 
         let stdout_path = container_dir.join("stdout.log");
@@ -1734,6 +1795,7 @@ impl Runtime for SandboxRuntime {
     /// `ZLAYER_PORT` environment variables. The port guard listener (which
     /// was holding the port since `create_container()`) is dropped immediately
     /// after the child process spawns, freeing the port for the child to bind.
+    #[allow(clippy::too_many_lines)]
     async fn start_container(&self, id: &ContainerId) -> Result<()> {
         let dir_name = Self::container_dir_name(id);
 
@@ -1772,7 +1834,7 @@ impl Runtime for SandboxRuntime {
             .await
             .map_err(|e| AgentError::StartFailed {
                 id: dir_name.clone(),
-                reason: format!("Failed to read Seatbelt profile: {}", e),
+                reason: format!("Failed to read Seatbelt profile: {e}"),
             })?;
 
         // Resolve the command to execute
@@ -1820,7 +1882,7 @@ impl Runtime for SandboxRuntime {
         .await
         .map_err(|e| AgentError::StartFailed {
             id: dir_name_for_err,
-            reason: format!("spawn task join error: {}", e),
+            reason: format!("spawn task join error: {e}"),
         })??;
 
         // Write PID file
@@ -1829,7 +1891,7 @@ impl Runtime for SandboxRuntime {
             .await
             .map_err(|e| AgentError::StartFailed {
                 id: dir_name.clone(),
-                reason: format!("Failed to write PID file: {}", e),
+                reason: format!("Failed to write PID file: {e}"),
             })?;
 
         // Update container state and optionally start memory watchdog
@@ -1862,6 +1924,9 @@ impl Runtime for SandboxRuntime {
     ///
     /// Sends `SIGTERM` to the process and waits up to `timeout` for graceful
     /// shutdown. If the process is still alive after the timeout, sends `SIGKILL`.
+    #[allow(unsafe_code)]
+    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::cast_possible_wrap)]
     async fn stop_container(&self, id: &ContainerId, timeout: Duration) -> Result<()> {
         let dir_name = Self::container_dir_name(id);
 
@@ -1905,7 +1970,7 @@ impl Runtime for SandboxRuntime {
 
             // Check if process has exited (non-blocking waitpid)
             let mut status: libc::c_int = 0;
-            let result = unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+            let result = unsafe { libc::waitpid(pid as i32, &raw mut status, libc::WNOHANG) };
 
             if result > 0 {
                 // Process exited
@@ -1951,12 +2016,12 @@ impl Runtime for SandboxRuntime {
             loop {
                 let mut status: libc::c_int = 0;
                 let result =
-                    unsafe { libc::waitpid(pid_for_wait as i32, &mut status, libc::WNOHANG) };
+                    unsafe { libc::waitpid(pid_for_wait as i32, &raw mut status, libc::WNOHANG) };
                 if result > 0 || result == -1 {
                     break; // reaped or already gone
                 }
                 if std::time::Instant::now() >= deadline {
-                    break; // give up — process already reaped elsewhere
+                    break; // give up -- process already reaped elsewhere
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -1982,6 +2047,8 @@ impl Runtime for SandboxRuntime {
     /// Kills the process if still running, aborts the watchdog, removes the
     /// container directory (rootfs clone, profile, logs), and removes it
     /// from internal tracking.
+    #[allow(unsafe_code)]
+    #[allow(clippy::cast_possible_wrap)]
     async fn remove_container(&self, id: &ContainerId) -> Result<()> {
         let dir_name = Self::container_dir_name(id);
 
@@ -2010,8 +2077,9 @@ impl Runtime for SandboxRuntime {
                             std::time::Instant::now() + std::time::Duration::from_secs(3);
                         loop {
                             let mut status: libc::c_int = 0;
-                            let result =
-                                unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) };
+                            let result = unsafe {
+                                libc::waitpid(pid as i32, &raw mut status, libc::WNOHANG)
+                            };
                             if result > 0 || result == -1 {
                                 break;
                             }
@@ -2033,9 +2101,8 @@ impl Runtime for SandboxRuntime {
                 .await
                 .map_err(|e| {
                     AgentError::Internal(format!(
-                        "Failed to remove container dir {}: {}",
+                        "Failed to remove container dir {}: {e}",
                         container_dir.display(),
-                        e
                     ))
                 })?;
         }
@@ -2048,6 +2115,8 @@ impl Runtime for SandboxRuntime {
     ///
     /// If the container is in a running state, checks whether the process
     /// is still alive via `waitpid(WNOHANG)` and updates the state accordingly.
+    #[allow(unsafe_code)]
+    #[allow(clippy::cast_possible_wrap)]
     async fn container_state(&self, id: &ContainerId) -> Result<ContainerState> {
         let dir_name = Self::container_dir_name(id);
 
@@ -2071,29 +2140,34 @@ impl Runtime for SandboxRuntime {
         // Check if process is still alive
         if container.pid > 0 {
             let mut status: libc::c_int = 0;
-            let result = unsafe { libc::waitpid(container.pid as i32, &mut status, libc::WNOHANG) };
+            let result =
+                unsafe { libc::waitpid(container.pid as i32, &raw mut status, libc::WNOHANG) };
 
-            if result > 0 {
-                // Process has exited
-                let exit_code = if libc::WIFEXITED(status) {
-                    libc::WEXITSTATUS(status)
-                } else if libc::WIFSIGNALED(status) {
-                    -(libc::WTERMSIG(status))
-                } else {
-                    -1
-                };
-                container.state = ContainerState::Exited { code: exit_code };
-                if let Some(h) = container.watchdog_handle.take() {
-                    h.abort();
+            match result.cmp(&0) {
+                std::cmp::Ordering::Greater => {
+                    // Process has exited
+                    let exit_code = if libc::WIFEXITED(status) {
+                        libc::WEXITSTATUS(status)
+                    } else if libc::WIFSIGNALED(status) {
+                        -(libc::WTERMSIG(status))
+                    } else {
+                        -1
+                    };
+                    container.state = ContainerState::Exited { code: exit_code };
+                    if let Some(h) = container.watchdog_handle.take() {
+                        h.abort();
+                    }
                 }
-            } else if result == 0 {
-                // Process still running
-                container.state = ContainerState::Running;
-            } else {
-                // Error -- process disappeared
-                container.state = ContainerState::Failed {
-                    reason: "Process disappeared".to_string(),
-                };
+                std::cmp::Ordering::Equal => {
+                    // Process still running
+                    container.state = ContainerState::Running;
+                }
+                std::cmp::Ordering::Less => {
+                    // Error -- process disappeared
+                    container.state = ContainerState::Failed {
+                        reason: "Process disappeared".to_string(),
+                    };
+                }
             }
         }
 
@@ -2179,7 +2253,7 @@ impl Runtime for SandboxRuntime {
         // Read the Seatbelt profile (same sandbox as the main process)
         let profile = tokio::fs::read_to_string(&profile_path)
             .await
-            .map_err(|e| AgentError::Internal(format!("Failed to read Seatbelt profile: {}", e)))?;
+            .map_err(|e| AgentError::Internal(format!("Failed to read Seatbelt profile: {e}")))?;
 
         tracing::debug!(
             container = %dir_name,
@@ -2205,8 +2279,8 @@ impl Runtime for SandboxRuntime {
                 .output()
         })
         .await
-        .map_err(|e| AgentError::Internal(format!("exec task join error: {}", e)))?
-        .map_err(|e| AgentError::Internal(format!("Failed to exec: {}", e)))?;
+        .map_err(|e| AgentError::Internal(format!("exec task join error: {e}")))?
+        .map_err(|e| AgentError::Internal(format!("Failed to exec: {e}")))?;
 
         let exit_code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -2253,7 +2327,7 @@ impl Runtime for SandboxRuntime {
         let (cpu_usec, memory_bytes) =
             tokio::task::spawn_blocking(move || get_process_stats(pid_for_stats))
                 .await
-                .map_err(|e| AgentError::Internal(format!("stats task join error: {}", e)))??;
+                .map_err(|e| AgentError::Internal(format!("stats task join error: {e}")))??;
 
         Ok(ContainerStats {
             cpu_usage_usec: cpu_usec,
@@ -2267,6 +2341,8 @@ impl Runtime for SandboxRuntime {
     ///
     /// Uses `spawn_blocking` with `waitpid` (blocking) to avoid tying up
     /// the async runtime. Updates the container state on completion.
+    #[allow(unsafe_code)]
+    #[allow(clippy::cast_possible_wrap)]
     async fn wait_container(&self, id: &ContainerId) -> Result<i32> {
         let dir_name = Self::container_dir_name(id);
         let pid = {
@@ -2297,7 +2373,7 @@ impl Runtime for SandboxRuntime {
         // Block on waitpid in a spawned blocking task
         let exit_code = tokio::task::spawn_blocking(move || {
             let mut status: libc::c_int = 0;
-            let result = unsafe { libc::waitpid(pid as i32, &mut status, 0) };
+            let result = unsafe { libc::waitpid(pid as i32, &raw mut status, 0) };
             if result < 0 {
                 return -1;
             }
@@ -2310,7 +2386,7 @@ impl Runtime for SandboxRuntime {
             }
         })
         .await
-        .map_err(|e| AgentError::Internal(format!("wait task join error: {}", e)))?;
+        .map_err(|e| AgentError::Internal(format!("wait task join error: {e}")))?;
 
         // Update state
         let mut containers = self.containers.write().await;
@@ -2350,14 +2426,14 @@ impl Runtime for SandboxRuntime {
         // Read stdout
         if let Ok(content) = tokio::fs::read_to_string(&stdout_path).await {
             for line in content.lines() {
-                logs.push(format!("[stdout] {}", line));
+                logs.push(format!("[stdout] {line}"));
             }
         }
 
         // Read stderr
         if let Ok(content) = tokio::fs::read_to_string(&stderr_path).await {
             for line in content.lines() {
-                logs.push(format!("[stderr] {}", line));
+                logs.push(format!("[stderr] {line}"));
             }
         }
 
@@ -2379,11 +2455,11 @@ impl Runtime for SandboxRuntime {
                 reason: "Container not found".to_string(),
             })?;
 
-        Ok(if container.pid > 0 {
-            Some(container.pid)
+        if container.pid > 0 {
+            Ok(Some(container.pid))
         } else {
-            None
-        })
+            Ok(None)
+        }
     }
 
     /// Get the IP address of a container.
