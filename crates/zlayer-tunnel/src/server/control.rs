@@ -4,7 +4,7 @@
 //! WebSocket connections from tunnel clients. It manages authentication,
 //! service registration, heartbeat monitoring, and message routing.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,6 +16,7 @@ use tokio::time::{interval, timeout};
 use tokio_tungstenite::{accept_async, tungstenite::Message as WsMessage, WebSocketStream};
 use uuid::Uuid;
 
+use crate::overlay::DynTunnelDnsRegistrar;
 use crate::{
     ControlMessage, Message, Result, ServiceProtocol, TunnelError, TunnelRegistry,
     TunnelServerConfig,
@@ -70,6 +71,12 @@ pub struct ControlHandler {
 
     /// Token validator function (returns `Ok(())` if token is valid, `Err` with reason if not)
     token_validator: TokenValidator,
+
+    /// Optional DNS registrar for registering tunnel services in overlay DNS
+    dns_registrar: Option<DynTunnelDnsRegistrar>,
+
+    /// Local overlay IP for DNS registration
+    local_overlay_ip: Option<Ipv4Addr>,
 }
 
 impl ControlHandler {
@@ -90,7 +97,23 @@ impl ControlHandler {
             registry,
             config,
             token_validator,
+            dns_registrar: None,
+            local_overlay_ip: None,
         }
+    }
+
+    /// Set the DNS registrar for registering tunnel services in overlay DNS
+    #[must_use]
+    pub fn with_dns_registrar(mut self, registrar: DynTunnelDnsRegistrar) -> Self {
+        self.dns_registrar = Some(registrar);
+        self
+    }
+
+    /// Set the local overlay IP for DNS registration
+    #[must_use]
+    pub fn with_local_overlay_ip(mut self, ip: Ipv4Addr) -> Self {
+        self.local_overlay_ip = Some(ip);
+        self
     }
 
     /// Handle a new WebSocket connection
@@ -428,13 +451,40 @@ impl ControlHandler {
 
         let response = match result {
             Ok(service) => {
+                let assigned_port = service.assigned_port.unwrap_or(remote_port);
                 tracing::info!(
                     tunnel_id = %tunnel_id,
                     service_name = %name,
                     local_port = local_port,
-                    remote_port = service.assigned_port.unwrap_or(remote_port),
+                    remote_port = assigned_port,
                     "Service registered"
                 );
+
+                // Optionally register in overlay DNS
+                if let (Some(ref registrar), Some(overlay_ip)) =
+                    (&self.dns_registrar, self.local_overlay_ip)
+                {
+                    let dns_name = format!("tun-{name}");
+                    if let Err(e) = registrar
+                        .register_service(&dns_name, overlay_ip, assigned_port)
+                        .await
+                    {
+                        tracing::warn!(
+                            service_name = %name,
+                            dns_name = %dns_name,
+                            error = %e,
+                            "Failed to register service in overlay DNS"
+                        );
+                    } else {
+                        tracing::debug!(
+                            dns_name = %dns_name,
+                            overlay_ip = %overlay_ip,
+                            port = assigned_port,
+                            "Registered service in overlay DNS"
+                        );
+                    }
+                }
+
                 Message::RegisterOk {
                     service_id: service.id,
                 }

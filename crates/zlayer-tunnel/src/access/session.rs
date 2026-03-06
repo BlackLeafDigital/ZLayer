@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::client::LocalProxy;
+use crate::overlay::{DynOverlayResolver, OverlayReachability};
 use crate::{Result, ServiceProtocol, TunnelError};
 
 /// An access session provides temporary local access to a remote service
@@ -182,6 +183,9 @@ pub struct AccessManager {
 
     /// Default TTL for new sessions
     default_ttl: Option<Duration>,
+
+    /// Optional overlay resolver for routing through overlay network
+    overlay_resolver: Option<DynOverlayResolver>,
 }
 
 impl AccessManager {
@@ -192,6 +196,7 @@ impl AccessManager {
             sessions: DashMap::new(),
             shutdown_handles: DashMap::new(),
             default_ttl: None,
+            overlay_resolver: None,
         }
     }
 
@@ -200,6 +205,29 @@ impl AccessManager {
     pub fn with_default_ttl(mut self, ttl: Duration) -> Self {
         self.default_ttl = Some(ttl);
         self
+    }
+
+    /// Set the overlay resolver for routing session connections through the overlay network
+    #[must_use]
+    pub fn with_overlay_resolver(mut self, resolver: DynOverlayResolver) -> Self {
+        self.overlay_resolver = Some(resolver);
+        self
+    }
+
+    /// Resolve a remote address through the overlay network if available
+    fn resolve_remote(&self, remote_addr: &str) -> String {
+        if let Some(ref resolver) = self.overlay_resolver {
+            // Try to extract hostname and resolve via overlay
+            if let Some((host, port)) = remote_addr.rsplit_once(':') {
+                match resolver.resolve_overlay_ip(host) {
+                    OverlayReachability::Reachable(ip) => {
+                        return format!("{ip}:{port}");
+                    }
+                    OverlayReachability::Unreachable | OverlayReachability::Unavailable => {}
+                }
+            }
+        }
+        remote_addr.to_string()
     }
 
     /// Start a new access session
@@ -225,6 +253,8 @@ impl AccessManager {
 
         let local_addr = listener.local_addr().map_err(TunnelError::connection)?;
 
+        let resolved_remote = self.resolve_remote(&remote_addr);
+
         let session_ttl = ttl.or(self.default_ttl);
         let mut session = AccessSession::new(endpoint, local_addr, remote_addr.clone());
         if let Some(ttl) = session_ttl {
@@ -237,11 +267,17 @@ impl AccessManager {
         // Create shutdown channel
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
 
-        // Spawn listener task
+        // Spawn listener task using the resolved remote address
         let session_clone = session.clone();
         let sessions = self.sessions.clone();
         tokio::spawn(async move {
-            Self::run_listener(listener, session_clone.clone(), remote_addr, shutdown_rx).await;
+            Self::run_listener(
+                listener,
+                session_clone.clone(),
+                resolved_remote,
+                shutdown_rx,
+            )
+            .await;
             sessions.remove(&session_id);
         });
 

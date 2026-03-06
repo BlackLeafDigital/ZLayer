@@ -108,6 +108,9 @@ pub mod error;
 pub mod health;
 pub mod transport;
 
+#[cfg(feature = "nat")]
+pub mod nat;
+
 // Re-export commonly used types
 pub use allocator::IpAllocator;
 pub use bootstrap::{
@@ -119,3 +122,9 @@ pub use dns::*;
 pub use error::{OverlayError, Result};
 pub use health::{OverlayHealth, OverlayHealthChecker, PeerStatus};
 pub use transport::*;
+
+#[cfg(feature = "nat")]
+pub use nat::{
+    Candidate, CandidateType, ConnectionType, NatConfig, NatTraversal, RelayClient, RelayDiscovery,
+    RelayServer, StunClient,
+};

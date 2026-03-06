@@ -1,5 +1,7 @@
 //! Overlay network configuration
 
+#[cfg(feature = "nat")]
+use crate::nat::NatConfig;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -24,6 +26,11 @@ pub struct OverlayConfig {
     /// Peer discovery interval
     #[serde(default = "OverlayConfig::default_discovery")]
     pub peer_discovery_interval: Duration,
+
+    /// NAT traversal configuration (requires "nat" feature)
+    #[cfg(feature = "nat")]
+    #[serde(default)]
+    pub nat: NatConfig,
 }
 
 impl OverlayConfig {
@@ -48,6 +55,8 @@ impl Default for OverlayConfig {
             public_key: String::new(),
             overlay_cidr: "10.0.0.0/8".to_string(),
             peer_discovery_interval: Duration::from_secs(30),
+            #[cfg(feature = "nat")]
+            nat: NatConfig::default(),
         }
     }
 }
