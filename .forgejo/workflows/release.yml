@@ -128,6 +128,14 @@ jobs:
             echo "OK ${name}.tar.gz"
           done
 
+          # Download Windows artifact (zip format)
+          echo "Downloading zlayer-windows-amd64.zip..."
+          curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
+            --user "$AUTH" \
+            -o "artifacts/zlayer-windows-amd64.zip" \
+            "${BASE_URL}/zlayer-windows-amd64.zip"
+          echo "OK zlayer-windows-amd64.zip"
+
       - name: Upload to Forgejo Packages
         shell: bash
         run: |
@@ -554,9 +562,9 @@ jobs:
 
           ### Binary
 
-          | Binary | Linux | macOS |
-          |--------|-------|-------|
-          | `zlayer` | [amd64](${PACKAGES_URL}/zlayer-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-darwin-arm64.tar.gz) |
+          | Binary | Linux | macOS | Windows |
+          |--------|-------|-------|---------|
+          | `zlayer` | [amd64](${PACKAGES_URL}/zlayer-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-darwin-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-windows-amd64.zip) |
 
           ### Container Images
 

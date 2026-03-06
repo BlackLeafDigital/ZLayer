@@ -16,6 +16,11 @@ OS="$(uname -s)"
 case "$OS" in
     Linux)  OS="linux" ;;
     Darwin) OS="darwin" ;;
+    MINGW*|MSYS*|CYGWIN*)
+        echo "Windows detected. Use PowerShell instead:" >&2
+        echo "  irm https://raw.githubusercontent.com/BlackLeafDigital/ZLayer/main/install.ps1 | iex" >&2
+        exit 1
+        ;;
     *)
         echo "Error: Unsupported OS: $OS" >&2
         exit 1
