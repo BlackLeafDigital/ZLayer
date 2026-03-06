@@ -156,6 +156,10 @@ pub enum BuildError {
         /// Description of the pipeline error
         message: String,
     },
+
+    /// WASM build failed
+    #[error("WASM build error: {0}")]
+    WasmBuild(#[from] crate::wasm_builder::WasmBuildError),
 }
 
 impl BuildError {

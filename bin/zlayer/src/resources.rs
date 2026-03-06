@@ -117,8 +117,8 @@ fn detect_memory_used() -> u64 {
 // Disk detection (via nix::sys::statvfs)
 // =============================================================================
 
-/// statvfs blocks()/blocks_available() return u64 on Linux but u32 on macOS.
-/// This helper widens to u64 on macOS and is a no-op on Linux.
+/// statvfs `blocks()`/`blocks_available()` return `u64` on Linux but `u32` on macOS.
+/// This helper widens to `u64` on macOS and is a no-op on Linux.
 #[cfg(target_os = "macos")]
 fn blocks_u64(v: u32) -> u64 {
     u64::from(v)

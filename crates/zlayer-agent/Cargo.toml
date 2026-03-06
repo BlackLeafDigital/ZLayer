@@ -23,6 +23,7 @@ wasm = [
     "dep:http-body-util",
     "dep:hyper",
     "dep:anyhow",
+    "dep:sha2",
 ]
 s3 = ["zlayer-init-actions/s3", "zlayer-registry/s3", "dep:zlayer-storage"]
 
@@ -81,6 +82,7 @@ http = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", optional = true }
 anyhow = { version = "1", optional = true }
+sha2 = { workspace = true, optional = true }
 
 # Linux-specific dependencies for native container runtime (youki/libcontainer)
 [target.'cfg(target_os = "linux")'.dependencies]

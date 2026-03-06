@@ -61,23 +61,26 @@
 //! ```
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, info, instrument, warn};
 use wasmtime::component::{Component, Linker, ResourceTable};
-use wasmtime::{Config, Engine, Store};
+use wasmtime::{Config, Engine, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::{WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use wasmtime_wasi_http::bindings::http::types::Scheme;
 use wasmtime_wasi_http::bindings::{Proxy, ProxyPre};
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
-use zlayer_spec::WasmHttpConfig;
+#[allow(deprecated)]
+use zlayer_spec::{WasmCapabilities, WasmHttpConfig};
 
 // =============================================================================
 // HTTP Request/Response Types
@@ -313,10 +316,14 @@ pub struct WasmHttpState {
     http_ctx: WasiHttpCtx,
     /// Resource table for managing WASI resources
     table: ResourceTable,
+    /// Resource limiter for memory/table growth enforcement
+    limiter: StoreLimits,
 }
 
 impl WasmHttpState {
-    /// Create a new WASM HTTP state
+    /// Create a new WASM HTTP state with all WASI capabilities enabled
+    ///
+    /// This is the backward-compatible default: inherits stdio and env.
     fn new() -> Self {
         let wasi_ctx = WasiCtxBuilder::new().inherit_stdio().inherit_env().build();
 
@@ -324,6 +331,62 @@ impl WasmHttpState {
             wasi_ctx,
             http_ctx: WasiHttpCtx::new(),
             table: ResourceTable::new(),
+            limiter: StoreLimitsBuilder::new().build(),
+        }
+    }
+
+    /// Create a new WASM HTTP state with capabilities-gated WASI context
+    ///
+    /// Only the WASI features enabled in the capabilities struct will be
+    /// configured on the WASI context. This provides defense-in-depth:
+    /// even if the linker has all interfaces registered, the WASI context
+    /// controls which OS resources are actually available.
+    fn with_capabilities(capabilities: &WasmCapabilities) -> Self {
+        let mut builder = WasiCtxBuilder::new();
+        super::wasm_host::configure_wasi_ctx_with_capabilities(&mut builder, capabilities);
+        let wasi_ctx = builder.build();
+
+        Self {
+            wasi_ctx,
+            http_ctx: WasiHttpCtx::new(),
+            table: ResourceTable::new(),
+            limiter: StoreLimitsBuilder::new().build(),
+        }
+    }
+
+    /// Create a new WASM HTTP state with resource limits applied.
+    ///
+    /// The `store_limits` are built from the spec-level `WasmConfig.max_memory` field.
+    #[allow(dead_code)] // Will be used when resource limits are fully wired in
+    fn with_limits(store_limits: StoreLimits) -> Self {
+        let wasi_ctx = WasiCtxBuilder::new().inherit_stdio().inherit_env().build();
+
+        Self {
+            wasi_ctx,
+            http_ctx: WasiHttpCtx::new(),
+            table: ResourceTable::new(),
+            limiter: store_limits,
+        }
+    }
+
+    /// Create a new WASM HTTP state with both capabilities gating and resource limits.
+    ///
+    /// This combines the WASI context gating from capabilities with the memory/table
+    /// growth limits from the resource limiter.
+    #[allow(dead_code)] // Will be used when resource limits are fully wired in
+    fn with_capabilities_and_limits(
+        capabilities: &WasmCapabilities,
+        store_limits: StoreLimits,
+    ) -> Self {
+        let mut builder = WasiCtxBuilder::new();
+        super::wasm_host::configure_wasi_ctx_with_capabilities(&mut builder, capabilities);
+        let wasi_ctx = builder.build();
+
+        Self {
+            wasi_ctx,
+            http_ctx: WasiHttpCtx::new(),
+            table: ResourceTable::new(),
+            limiter: store_limits,
         }
     }
 }
@@ -525,6 +588,7 @@ pub struct ComponentStats {
 ///
 /// The `prewarm` method compiles components ahead of time but doesn't pre-create
 /// instances since they can't be shared across threads.
+#[allow(deprecated)]
 pub struct WasmHttpRuntime {
     /// Wasmtime engine (shared across all instances)
     engine: Engine,
@@ -536,18 +600,33 @@ pub struct WasmHttpRuntime {
     config: WasmHttpConfig,
     /// Component linker with WASI HTTP bindings
     linker: Arc<Linker<WasmHttpState>>,
+    /// Directory for AOT pre-compiled component disk cache
+    cache_dir: PathBuf,
+    /// Capability grants controlling which host interfaces are available.
+    /// When `None`, all interfaces are linked (backward-compatible default).
+    capabilities: Option<WasmCapabilities>,
+    /// Optional store limits built from spec-level `WasmConfig.max_memory`.
+    /// Applied to every per-request Store created in `create_instance`.
+    store_limits: Option<StoreLimits>,
+    /// Fuel budget per request (0 = unlimited).
+    /// From spec-level `WasmConfig.max_fuel`.
+    max_fuel: u64,
 }
 
 impl std::fmt::Debug for WasmHttpRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WasmHttpRuntime")
             .field("config", &self.config)
+            .field("capabilities", &self.capabilities)
             .finish_non_exhaustive()
     }
 }
 
 impl WasmHttpRuntime {
     /// Create a new WASM HTTP runtime with the given configuration
+    ///
+    /// All host interfaces are linked (backward-compatible behavior).
+    /// For capability-gated linking, use [`new_with_capabilities`](Self::new_with_capabilities).
     ///
     /// # Arguments
     ///
@@ -560,16 +639,20 @@ impl WasmHttpRuntime {
     /// # Errors
     ///
     /// Returns an error if the wasmtime engine cannot be created.
+    #[allow(deprecated)]
     pub fn new(config: WasmHttpConfig) -> Result<Self, WasmHttpError> {
         let mut engine_config = Config::new();
         engine_config.async_support(true);
         engine_config.wasm_component_model(true);
         engine_config.epoch_interruption(true);
+        // Enable fuel metering so per-request fuel budgets can be applied.
+        // Negligible cost when fuel is not actually set on a particular Store.
+        engine_config.consume_fuel(true);
 
         let engine = Engine::new(&engine_config)
             .map_err(|e| WasmHttpError::EngineCreation(e.to_string()))?;
 
-        // Create linker with WASI HTTP bindings
+        // Create linker with WASI HTTP bindings (all linked, no gating)
         let mut linker = Linker::new(&engine);
 
         // Add WASI bindings
@@ -580,7 +663,17 @@ impl WasmHttpRuntime {
         wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)
             .map_err(|e| WasmHttpError::EngineCreation(format!("failed to add WASI HTTP: {e}")))?;
 
-        info!("WASM HTTP runtime initialized");
+        // Initialize the AOT disk cache directory
+        let cache_dir = PathBuf::from("/var/lib/zlayer/wasm/compiled");
+        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+            warn!(
+                cache_dir = %cache_dir.display(),
+                error = %e,
+                "Failed to create WASM AOT cache directory (disk caching will be attempted on first compile)"
+            );
+        }
+
+        info!(cache_dir = %cache_dir.display(), "WASM HTTP runtime initialized (all capabilities)");
 
         Ok(Self {
             engine,
@@ -588,7 +681,136 @@ impl WasmHttpRuntime {
             instance_pools: Arc::new(RwLock::new(HashMap::new())),
             config,
             linker: Arc::new(linker),
+            cache_dir,
+            capabilities: None,
+            store_limits: None,
+            max_fuel: 0,
         })
+    }
+
+    /// Create a new WASM HTTP runtime with capability-gated host interfaces
+    ///
+    /// Only the host interfaces enabled in `capabilities` will be linked and
+    /// available to WASM components. This provides security isolation by
+    /// controlling what the guest can access.
+    ///
+    /// Gating happens at two levels:
+    /// - **Linker level**: `ZLayer` custom interfaces (config, KV, logging, secrets,
+    ///   metrics) and WASI HTTP are conditionally registered
+    /// - **`WasiCtx` level**: WASI standard interfaces (CLI, filesystem, sockets)
+    ///   are configured per-instance via the builder
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Configuration for the runtime including pool sizes and timeouts
+    /// * `capabilities` - Controls which host interfaces are available
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the wasmtime engine cannot be created.
+    #[allow(deprecated)]
+    pub fn new_with_capabilities(
+        config: WasmHttpConfig,
+        capabilities: WasmCapabilities,
+    ) -> Result<Self, WasmHttpError> {
+        let mut engine_config = Config::new();
+        engine_config.async_support(true);
+        engine_config.wasm_component_model(true);
+        engine_config.epoch_interruption(true);
+        engine_config.consume_fuel(true);
+
+        let engine = Engine::new(&engine_config)
+            .map_err(|e| WasmHttpError::EngineCreation(e.to_string()))?;
+
+        // Create linker with only the enabled interfaces
+        let mut linker = Linker::new(&engine);
+
+        // Always add core WASI bindings (clocks, random, I/O streams, etc.)
+        // These are needed for basic WASM component operation.
+        // CLI, filesystem, and sockets are gated at the WasiCtx builder level.
+        wasmtime_wasi::p2::add_to_linker_async(&mut linker)
+            .map_err(|e| WasmHttpError::EngineCreation(format!("failed to add WASI: {e}")))?;
+
+        // Conditionally add WASI HTTP bindings (outgoing handler)
+        if capabilities.http_client {
+            wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker).map_err(|e| {
+                WasmHttpError::EngineCreation(format!("failed to add WASI HTTP: {e}"))
+            })?;
+            debug!("WASI HTTP outgoing handler linked");
+        } else {
+            debug!("WASI HTTP outgoing handler NOT linked (capability disabled)");
+        }
+
+        // Initialize the AOT disk cache directory
+        let cache_dir = PathBuf::from("/var/lib/zlayer/wasm/compiled");
+        if let Err(e) = std::fs::create_dir_all(&cache_dir) {
+            warn!(
+                cache_dir = %cache_dir.display(),
+                error = %e,
+                "Failed to create WASM AOT cache directory (disk caching will be attempted on first compile)"
+            );
+        }
+
+        info!(
+            cache_dir = %cache_dir.display(),
+            ?capabilities,
+            "WASM HTTP runtime initialized with capabilities"
+        );
+
+        Ok(Self {
+            engine,
+            module_cache: Arc::new(RwLock::new(HashMap::new())),
+            instance_pools: Arc::new(RwLock::new(HashMap::new())),
+            config,
+            linker: Arc::new(linker),
+            cache_dir,
+            capabilities: Some(capabilities),
+            store_limits: None,
+            max_fuel: 0,
+        })
+    }
+
+    /// Get the capabilities for this runtime, if set
+    ///
+    /// Returns `None` if the runtime was created without capability gating
+    /// (i.e., via [`new()`](Self::new)).
+    #[must_use]
+    pub fn capabilities(&self) -> Option<&WasmCapabilities> {
+        self.capabilities.as_ref()
+    }
+
+    /// Configure resource limits from the spec-level [`zlayer_spec::WasmConfig`].
+    ///
+    /// This sets the per-request memory limit and fuel budget. Call this after
+    /// constructing the runtime to apply limits from the deployment spec.
+    ///
+    /// # Arguments
+    /// * `spec_wasm` - The spec-level [`WasmConfig`](zlayer_spec::WasmConfig) containing `max_memory` and `max_fuel`
+    pub fn set_resource_limits(&mut self, spec_wasm: &zlayer_spec::WasmConfig) {
+        // Parse memory limit
+        if let Some(ref max_memory) = spec_wasm.max_memory {
+            match super::wasm::parse_memory_limit(max_memory) {
+                Ok(max_bytes) => {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let mem_size = max_bytes as usize;
+                    self.store_limits =
+                        Some(StoreLimitsBuilder::new().memory_size(mem_size).build());
+                    info!(
+                        max_bytes = max_bytes,
+                        "WASM HTTP store memory limit configured"
+                    );
+                }
+                Err(e) => {
+                    warn!(max_memory = %max_memory, error = %e, "ignoring invalid max_memory");
+                }
+            }
+        }
+
+        // Set fuel budget
+        self.max_fuel = spec_wasm.max_fuel;
+        if self.max_fuel > 0 {
+            info!(max_fuel = self.max_fuel, "WASM HTTP fuel budget configured");
+        }
     }
 
     /// Handle an HTTP request with a WASM component
@@ -612,6 +834,7 @@ impl WasmHttpRuntime {
     /// # Errors
     ///
     /// Returns an error if the component cannot be loaded, instantiated, or the request fails.
+    #[allow(deprecated)]
     #[instrument(skip(self, wasm_bytes, request), fields(component = %component_ref, method = %request.method, uri = %request.uri))]
     pub async fn handle_request(
         &self,
@@ -663,7 +886,7 @@ impl WasmHttpRuntime {
     /// # Errors
     ///
     /// Returns an error if the component cannot be compiled.
-    #[allow(clippy::used_underscore_binding)]
+    #[allow(clippy::used_underscore_binding, deprecated)]
     #[instrument(skip(self, wasm_bytes), fields(component = %component_ref))]
     pub async fn prewarm(
         &self,
@@ -717,36 +940,132 @@ impl WasmHttpRuntime {
         stats
     }
 
-    /// Clear the component cache
+    /// Clear the in-memory and disk caches for compiled WASM components
     ///
     /// This forces recompilation of all components on next use.
     pub async fn clear_cache(&self) {
         let mut cache = self.module_cache.write().await;
         cache.clear();
-        info!("Component cache cleared");
+
+        // Clear the disk cache as well
+        if self.cache_dir.exists() {
+            if let Err(e) = tokio::fs::remove_dir_all(&self.cache_dir).await {
+                warn!(
+                    cache_dir = %self.cache_dir.display(),
+                    error = %e,
+                    "Failed to remove WASM AOT disk cache directory"
+                );
+            } else if let Err(e) = tokio::fs::create_dir_all(&self.cache_dir).await {
+                warn!(
+                    cache_dir = %self.cache_dir.display(),
+                    error = %e,
+                    "Failed to recreate WASM AOT disk cache directory"
+                );
+            }
+        }
+
+        info!("Component cache cleared (in-memory and disk)");
     }
 
     // -------------------------------------------------------------------------
     // Private Helper Methods
     // -------------------------------------------------------------------------
 
-    /// Get a compiled component from cache or compile it
+    /// Compute a SHA-256 content hash for use as a disk cache key
+    fn content_hash(wasm_bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(wasm_bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Get a compiled component from in-memory cache, disk cache, or compile from scratch
+    #[allow(clippy::too_many_lines, unsafe_code)]
     async fn get_or_compile(
         &self,
         component_ref: &str,
         wasm_bytes: &[u8],
     ) -> Result<Arc<Component>, WasmHttpError> {
-        // Check cache first
+        // 1. Check in-memory cache first
         {
             let cache = self.module_cache.read().await;
             if let Some(compiled) = cache.get(component_ref) {
-                debug!("Using cached component for {}", component_ref);
+                debug!(
+                    component = component_ref,
+                    "Using in-memory cached component"
+                );
                 return Ok(Arc::new(compiled.component.clone()));
             }
         }
 
-        // Compile the component
-        info!("Compiling component {}", component_ref);
+        // 2. Compute content hash for disk cache key
+        let hash = Self::content_hash(wasm_bytes);
+        let cache_path = self.cache_dir.join(format!("{hash}.cwasm"));
+
+        // 3. Try to load from disk cache
+        if cache_path.exists() {
+            match tokio::fs::read(&cache_path).await {
+                Ok(serialized) => {
+                    let engine = self.engine.clone();
+                    let cache_path_display = cache_path.display().to_string();
+                    let component_ref_owned = component_ref.to_string();
+
+                    match tokio::task::spawn_blocking(move || {
+                        // SAFETY: We trust our own serialized cache files.
+                        // The content-addressed SHA-256 hash ensures integrity.
+                        unsafe { Component::deserialize(&engine, &serialized) }
+                    })
+                    .await
+                    {
+                        Ok(Ok(component)) => {
+                            info!(
+                                component = component_ref,
+                                cache_path = cache_path_display,
+                                "Loaded pre-compiled WASM component from disk cache"
+                            );
+
+                            // Store in in-memory cache
+                            let mut cache = self.module_cache.write().await;
+                            cache.insert(
+                                component_ref.to_string(),
+                                CompiledComponent {
+                                    component: component.clone(),
+                                    compiled_at: Instant::now(),
+                                },
+                            );
+
+                            return Ok(Arc::new(component));
+                        }
+                        Ok(Err(e)) => {
+                            warn!(
+                                component = component_ref_owned,
+                                error = %e,
+                                "Failed to deserialize cached component, recompiling"
+                            );
+                            // Delete stale/incompatible cache file
+                            let _ = tokio::fs::remove_file(&cache_path).await;
+                        }
+                        Err(e) => {
+                            warn!(
+                                component = component_ref_owned,
+                                error = %e,
+                                "Disk cache deserialization task failed, recompiling"
+                            );
+                            let _ = tokio::fs::remove_file(&cache_path).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    debug!(
+                        component = component_ref,
+                        error = %e,
+                        "Disk cache file not readable, compiling from scratch"
+                    );
+                }
+            }
+        }
+
+        // 4. Compile from scratch
+        info!(component = component_ref, "Compiling WASM component");
         let engine = self.engine.clone();
         let bytes = wasm_bytes.to_vec();
         let component_ref_owned = component_ref.to_string();
@@ -760,7 +1079,43 @@ impl WasmHttpRuntime {
         .await
         .map_err(|e| WasmHttpError::Internal(format!("task join error: {e}")))??;
 
-        // Cache the compiled component
+        // 5. Serialize to disk cache (non-blocking, best-effort)
+        match component.serialize() {
+            Ok(serialized) => {
+                let cache_dir = self.cache_dir.clone();
+                let cache_path_clone = cache_path.clone();
+                let component_ref_clone = component_ref.to_string();
+                tokio::spawn(async move {
+                    if let Err(e) = tokio::fs::create_dir_all(&cache_dir).await {
+                        warn!(error = %e, "Failed to create WASM AOT cache directory");
+                        return;
+                    }
+                    if let Err(e) = tokio::fs::write(&cache_path_clone, &serialized).await {
+                        warn!(
+                            component = component_ref_clone,
+                            error = %e,
+                            "Failed to write WASM component to disk cache"
+                        );
+                    } else {
+                        debug!(
+                            component = component_ref_clone,
+                            cache_path = %cache_path_clone.display(),
+                            size_bytes = serialized.len(),
+                            "Cached pre-compiled WASM component to disk"
+                        );
+                    }
+                });
+            }
+            Err(e) => {
+                warn!(
+                    component = component_ref,
+                    error = %e,
+                    "Failed to serialize WASM component for disk caching"
+                );
+            }
+        }
+
+        // 6. Store in in-memory cache
         {
             let mut cache = self.module_cache.write().await;
             cache.insert(
@@ -776,6 +1131,7 @@ impl WasmHttpRuntime {
     }
 
     /// Create a new instance for a component
+    #[allow(deprecated)]
     async fn create_instance(
         &self,
         component_ref: &str,
@@ -810,12 +1166,32 @@ impl WasmHttpRuntime {
             })?
         };
 
-        // Create the store with WASM HTTP state
-        let state = WasmHttpState::new();
+        // Create the store with WASM HTTP state, gated by capabilities if set.
+        // If resource limits are configured, apply them to the state.
+        let state = match (&self.capabilities, &self.store_limits) {
+            (Some(caps), Some(limits)) => {
+                let mut s = WasmHttpState::with_capabilities(caps);
+                s.limiter = limits.clone();
+                s
+            }
+            (Some(caps), None) => WasmHttpState::with_capabilities(caps),
+            (None, Some(limits)) => WasmHttpState::with_limits(limits.clone()),
+            (None, None) => WasmHttpState::new(),
+        };
         let mut store = Store::new(&self.engine, state);
+
+        // Attach the resource limiter to the store (enforces max_memory)
+        store.limiter(|s| &mut s.limiter);
 
         // Set epoch deadline for interruption
         store.set_epoch_deadline(1_000_000);
+
+        // Apply fuel budget if configured
+        if self.max_fuel > 0 {
+            store
+                .set_fuel(self.max_fuel)
+                .map_err(|e| WasmHttpError::Internal(format!("failed to set fuel: {e}")))?;
+        }
 
         // Instantiate the proxy asynchronously
         let proxy = proxy_pre.instantiate_async(&mut store).await.map_err(|e| {

@@ -25,8 +25,7 @@
 //!     language: None,  // Auto-detect
 //!     target: WasiTarget::Preview2,
 //!     optimize: true,
-//!     wit_path: None,
-//!     output_path: None,
+//!     ..Default::default()
 //! };
 //!
 //! let result = build_wasm(Path::new("./my-plugin"), config).await?;
@@ -35,6 +34,7 @@
 //! # }
 //! ```
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -161,6 +161,32 @@ impl WasmLanguage {
             WasmLanguage::RustComponent | WasmLanguage::Python | WasmLanguage::TypeScript
         )
     }
+
+    /// Parse a language name string into a `WasmLanguage`.
+    ///
+    /// Accepts common names and aliases (case-insensitive):
+    /// - "rust" -> Rust
+    /// - "rust-component" / "`rust_component`" / "cargo-component" -> `RustComponent`
+    /// - "go" / "tinygo" -> Go
+    /// - "python" / "py" -> Python
+    /// - "typescript" / "ts" -> TypeScript
+    /// - "assemblyscript" / "as" -> `AssemblyScript`
+    /// - "c" -> C
+    /// - "zig" -> Zig
+    #[must_use]
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_lowercase().as_str() {
+            "rust" => Some(Self::Rust),
+            "rust-component" | "rust_component" | "cargo-component" => Some(Self::RustComponent),
+            "go" | "tinygo" => Some(Self::Go),
+            "python" | "py" => Some(Self::Python),
+            "typescript" | "ts" => Some(Self::TypeScript),
+            "assemblyscript" | "as" => Some(Self::AssemblyScript),
+            "c" => Some(Self::C),
+            "zig" => Some(Self::Zig),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for WasmLanguage {
@@ -206,7 +232,7 @@ impl fmt::Display for WasiTarget {
 }
 
 /// Configuration for building a WASM component
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct WasmBuildConfig {
     /// Source language (None = auto-detect)
     pub language: Option<WasmLanguage>,
@@ -214,14 +240,54 @@ pub struct WasmBuildConfig {
     /// Target WASI version
     pub target: WasiTarget,
 
-    /// Whether to optimize the output (release mode)
+    /// Whether to optimize the output with wasm-opt (release mode)
     pub optimize: bool,
+
+    /// Optimization level for wasm-opt (default: "Oz")
+    pub opt_level: String,
 
     /// Path to WIT files for component model
     pub wit_path: Option<PathBuf>,
 
     /// Override output path
     pub output_path: Option<PathBuf>,
+
+    /// Target WIT world name (e.g., "zlayer-http-handler")
+    pub world: Option<String>,
+
+    /// Language-specific features to enable
+    pub features: Vec<String>,
+
+    /// Additional build arguments
+    pub build_args: HashMap<String, String>,
+
+    /// Pre-build commands to run
+    pub pre_build: Vec<Vec<String>>,
+
+    /// Post-build commands to run after compilation
+    pub post_build: Vec<Vec<String>>,
+
+    /// Component adapter path for WASI preview1 -> preview2 lifting
+    pub adapter: Option<PathBuf>,
+}
+
+impl Default for WasmBuildConfig {
+    fn default() -> Self {
+        Self {
+            language: None,
+            target: WasiTarget::default(),
+            optimize: false,
+            opt_level: "Oz".to_string(),
+            wit_path: None,
+            output_path: None,
+            world: None,
+            features: Vec::new(),
+            build_args: HashMap::new(),
+            pre_build: Vec::new(),
+            post_build: Vec::new(),
+            adapter: None,
+        }
+    }
 }
 
 impl WasmBuildConfig {
@@ -263,6 +329,55 @@ impl WasmBuildConfig {
     #[must_use]
     pub fn output_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.output_path = Some(path.into());
+        self
+    }
+
+    /// Set the optimization level for wasm-opt
+    #[must_use]
+    pub fn opt_level(mut self, level: impl Into<String>) -> Self {
+        self.opt_level = level.into();
+        self
+    }
+
+    /// Set the target WIT world name
+    #[must_use]
+    pub fn world(mut self, world: impl Into<String>) -> Self {
+        self.world = Some(world.into());
+        self
+    }
+
+    /// Set language-specific features to enable
+    #[must_use]
+    pub fn features(mut self, features: Vec<String>) -> Self {
+        self.features = features;
+        self
+    }
+
+    /// Set additional build arguments
+    #[must_use]
+    pub fn build_args(mut self, args: HashMap<String, String>) -> Self {
+        self.build_args = args;
+        self
+    }
+
+    /// Set pre-build commands
+    #[must_use]
+    pub fn pre_build(mut self, commands: Vec<Vec<String>>) -> Self {
+        self.pre_build = commands;
+        self
+    }
+
+    /// Set post-build commands
+    #[must_use]
+    pub fn post_build(mut self, commands: Vec<Vec<String>>) -> Self {
+        self.post_build = commands;
+        self
+    }
+
+    /// Set the component adapter path
+    #[must_use]
+    pub fn adapter(mut self, path: impl Into<PathBuf>) -> Self {
+        self.adapter = Some(path.into());
         self
     }
 }
@@ -479,6 +594,20 @@ fn has_c_source_files(path: &Path) -> bool {
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn get_build_command(language: WasmLanguage, target: WasiTarget, release: bool) -> Vec<String> {
+    get_build_command_with_config(language, target, release, None)
+}
+
+/// Get the build command with full config support (world, features, etc.)
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn get_build_command_with_config(
+    language: WasmLanguage,
+    target: WasiTarget,
+    release: bool,
+    config: Option<&WasmBuildConfig>,
+) -> Vec<String> {
+    let world = config.and_then(|c| c.world.as_deref());
+
     match language {
         WasmLanguage::Rust => {
             let mut cmd = vec![
@@ -502,6 +631,9 @@ pub fn get_build_command(language: WasmLanguage, target: WasiTarget, release: bo
             if release {
                 cmd.push("--release".to_string());
             }
+            // For cargo-component, the world is typically in Cargo.toml,
+            // but we set an env var that can be picked up by build scripts
+            // (env var is applied in execute_build_command)
             cmd
         }
 
@@ -532,12 +664,13 @@ pub fn get_build_command(language: WasmLanguage, target: WasiTarget, release: bo
             // Note: componentize-py doesn't have explicit optimization flags,
             // the output is already optimized regardless of the release flag
             let _ = release; // Silence unused warning
+            let world_name = world.unwrap_or("world");
             vec![
                 "componentize-py".to_string(),
                 "-d".to_string(),
                 "wit".to_string(),
                 "-w".to_string(),
-                "world".to_string(),
+                world_name.to_string(),
                 "componentize".to_string(),
                 "app".to_string(),
                 "-o".to_string(),
@@ -547,16 +680,21 @@ pub fn get_build_command(language: WasmLanguage, target: WasiTarget, release: bo
 
         WasmLanguage::TypeScript => {
             // jco componentize for TypeScript
-            vec![
+            let mut cmd = vec![
                 "npx".to_string(),
                 "jco".to_string(),
                 "componentize".to_string(),
                 "src/index.js".to_string(),
                 "--wit".to_string(),
                 "wit".to_string(),
-                "-o".to_string(),
-                "dist/component.wasm".to_string(),
-            ]
+            ];
+            if let Some(w) = world {
+                cmd.push("--world-name".to_string());
+                cmd.push(w.to_string());
+            }
+            cmd.push("-o".to_string());
+            cmd.push("dist/component.wasm".to_string());
+            cmd
         }
 
         WasmLanguage::AssemblyScript => {
@@ -640,12 +778,32 @@ pub async fn build_wasm(
     // Verify build tool is available
     verify_build_tool(language).await?;
 
-    // Get build command
-    let cmd = get_build_command(language, config.target, config.optimize);
+    // Run pre-build commands
+    for cmd in &config.pre_build {
+        if cmd.is_empty() {
+            continue;
+        }
+        debug!("Running pre-build command: {:?}", cmd);
+        let output = execute_build_command(context, cmd, &config).await?;
+        if !output.status.success() {
+            let exit_code = output.status.code().unwrap_or(-1);
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            return Err(WasmBuildError::BuildFailed {
+                exit_code,
+                stderr,
+                stdout,
+            });
+        }
+    }
+
+    // Get build command (with config for world support)
+    let cmd =
+        get_build_command_with_config(language, config.target, config.optimize, Some(&config));
     debug!("Build command: {:?}", cmd);
 
     // Execute build
-    let output = execute_build_command(context, &cmd).await?;
+    let output = execute_build_command(context, &cmd, &config).await?;
 
     // Check for success
     if !output.status.success() {
@@ -666,6 +824,32 @@ pub async fn build_wasm(
 
     // Find output file
     let wasm_path = find_wasm_output(context, language, config.target, config.optimize)?;
+
+    // Run post-build commands
+    for cmd in &config.post_build {
+        if cmd.is_empty() {
+            continue;
+        }
+        debug!("Running post-build command: {:?}", cmd);
+        let output = execute_build_command(context, cmd, &config).await?;
+        if !output.status.success() {
+            let exit_code = output.status.code().unwrap_or(-1);
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            return Err(WasmBuildError::BuildFailed {
+                exit_code,
+                stderr,
+                stdout,
+            });
+        }
+    }
+
+    // Optimize with wasm-opt if requested
+    let wasm_path = if config.optimize {
+        optimize_wasm(&wasm_path, &config.opt_level).await?
+    } else {
+        wasm_path
+    };
 
     // Apply output path override if specified
     let final_path = if let Some(ref output_path) = config.output_path {
@@ -728,14 +912,28 @@ async fn verify_build_tool(language: WasmLanguage) -> Result<()> {
     }
 }
 
-/// Execute the build command
-async fn execute_build_command(context: &Path, cmd: &[String]) -> Result<std::process::Output> {
+/// Execute the build command, applying config-driven env vars
+async fn execute_build_command(
+    context: &Path,
+    cmd: &[String],
+    config: &WasmBuildConfig,
+) -> Result<std::process::Output> {
     let mut command = Command::new(&cmd[0]);
     command
         .args(&cmd[1..])
         .current_dir(context)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
+
+    // Set world env var for cargo-component (RustComponent)
+    if let Some(ref world) = config.world {
+        command.env("CARGO_COMPONENT_WIT_WORLD", world);
+    }
+
+    // Apply additional build_args as env vars
+    for (key, value) in &config.build_args {
+        command.env(key, value);
+    }
 
     debug!("Executing: {} in {}", cmd.join(" "), context.display());
 
@@ -920,6 +1118,112 @@ fn search_wasm_recursive(dir: &Path, max_depth: usize) -> Option<PathBuf> {
                     return Some(found);
                 }
             }
+        }
+    }
+
+    None
+}
+
+/// Optimize a WASM binary using wasm-opt.
+///
+/// Falls back gracefully if wasm-opt is not installed, logging a warning.
+///
+/// # Arguments
+/// * `wasm_path` - Path to the WASM binary to optimize
+/// * `opt_level` - Optimization level: "O", "Os", "Oz", "O2", "O3"
+///
+/// # Returns
+/// Path to the optimized binary (`.opt.wasm` extension)
+///
+/// # Errors
+///
+/// Returns an error if wasm-opt is found but fails to run successfully.
+pub async fn optimize_wasm(wasm_path: &Path, opt_level: &str) -> Result<PathBuf> {
+    let flag = match opt_level {
+        "O" => "-O",
+        "Os" => "-Os",
+        "O2" => "-O2",
+        "O3" => "-O3",
+        // "Oz" and anything else defaults to -Oz (best size optimization)
+        _ => "-Oz",
+    };
+
+    // Check if wasm-opt is available
+    let wasm_opt = which_wasm_opt();
+
+    if let Some(wasm_opt_path) = wasm_opt {
+        let optimized_path = wasm_path.with_extension("opt.wasm");
+        let output = Command::new(&wasm_opt_path)
+            .arg(flag)
+            .arg("-o")
+            .arg(&optimized_path)
+            .arg(wasm_path)
+            .output()
+            .await
+            .map_err(|e| WasmBuildError::ConfigError {
+                message: format!("Failed to run wasm-opt: {e}"),
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(WasmBuildError::ConfigError {
+                message: format!("wasm-opt failed: {stderr}"),
+            });
+        }
+
+        // Log size reduction
+        if let (Ok(original), Ok(optimized)) = (
+            std::fs::metadata(wasm_path),
+            std::fs::metadata(&optimized_path),
+        ) {
+            let original_size = original.len();
+            let optimized_size = optimized.len();
+            #[allow(clippy::cast_precision_loss)]
+            let reduction = if original_size > 0 {
+                ((original_size.saturating_sub(optimized_size)) as f64 / original_size as f64)
+                    * 100.0
+            } else {
+                0.0
+            };
+            info!(
+                "wasm-opt: {:.1}% size reduction ({} -> {} bytes)",
+                reduction, original_size, optimized_size,
+            );
+        }
+
+        Ok(optimized_path)
+    } else {
+        warn!(
+            "wasm-opt not found in PATH; skipping optimization. \
+             Install binaryen for WASM size optimization."
+        );
+        Ok(wasm_path.to_path_buf())
+    }
+}
+
+/// Find wasm-opt in PATH or common locations
+fn which_wasm_opt() -> Option<PathBuf> {
+    // Check PATH first
+    if let Ok(output) = std::process::Command::new("which").arg("wasm-opt").output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return Some(PathBuf::from(path));
+            }
+        }
+    }
+
+    // Check common locations
+    let common_paths = [
+        "/usr/local/bin/wasm-opt",
+        "/usr/bin/wasm-opt",
+        "/opt/binaryen/bin/wasm-opt",
+    ];
+
+    for path in &common_paths {
+        let p = PathBuf::from(path);
+        if p.exists() {
+            return Some(p);
         }
     }
 
@@ -1175,8 +1479,15 @@ mod tests {
             assert_eq!(config.language, None);
             assert_eq!(config.target, WasiTarget::Preview2); // Default WasiTarget
             assert!(!config.optimize);
+            assert_eq!(config.opt_level, "Oz");
             assert_eq!(config.wit_path, None);
             assert_eq!(config.output_path, None);
+            assert_eq!(config.world, None);
+            assert!(config.features.is_empty());
+            assert!(config.build_args.is_empty());
+            assert!(config.pre_build.is_empty());
+            assert!(config.post_build.is_empty());
+            assert_eq!(config.adapter, None);
         }
 
         #[test]
@@ -1187,8 +1498,15 @@ mod tests {
             assert_eq!(new_config.language, default_config.language);
             assert_eq!(new_config.target, default_config.target);
             assert_eq!(new_config.optimize, default_config.optimize);
+            assert_eq!(new_config.opt_level, default_config.opt_level);
             assert_eq!(new_config.wit_path, default_config.wit_path);
             assert_eq!(new_config.output_path, default_config.output_path);
+            assert_eq!(new_config.world, default_config.world);
+            assert_eq!(new_config.features, default_config.features);
+            assert_eq!(new_config.build_args, default_config.build_args);
+            assert_eq!(new_config.pre_build, default_config.pre_build);
+            assert_eq!(new_config.post_build, default_config.post_build);
+            assert_eq!(new_config.adapter, default_config.adapter);
         }
 
         #[test]

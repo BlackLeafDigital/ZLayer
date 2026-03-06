@@ -39,14 +39,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tracing::instrument;
 use wasmtime::component::{Component, Linker as ComponentLinker, ResourceTable};
-use wasmtime::{Config, Engine, Linker, Module, Store};
+use wasmtime::{Config, Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder};
 use wasmtime_wasi::p1::{self, WasiP1Ctx};
 // TODO: Phase 6 (stdout/stderr capture) will use these pipe types
 #[allow(unused_imports)]
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use zlayer_registry::{detect_wasm_version_from_binary, WasiVersion};
-use zlayer_spec::{PullPolicy, ServiceSpec, StorageSpec};
+use zlayer_spec::{PullPolicy, ServiceSpec, StorageSpec, WasmCapabilities};
 
 /// Default directory for WASM module cache
 pub const DEFAULT_WASM_CACHE_DIR: &str = "/var/lib/zlayer/wasm";
@@ -175,6 +175,121 @@ fn configure_wasi_mounts(
     Ok(())
 }
 
+/// Parse a memory format string like "64Mi", "256Mi", "1Gi" into bytes.
+///
+/// Supports Kubernetes-style binary suffixes:
+/// - `Ki` = kibibytes (1024)
+/// - `Mi` = mebibytes (1024^2)
+/// - `Gi` = gibibytes (1024^3)
+/// - `Ti` = tebibytes (1024^4)
+pub(super) fn parse_memory_limit(s: &str) -> std::result::Result<u64, String> {
+    let s = s.trim();
+    if s.len() < 3 {
+        return Err(format!("invalid memory format: {s}"));
+    }
+    let (num_str, suffix) = s.split_at(s.len() - 2);
+    let num: u64 = num_str
+        .parse()
+        .map_err(|e| format!("invalid number in memory limit '{s}': {e}"))?;
+    match suffix {
+        "Ki" => Ok(num.saturating_mul(1024)),
+        "Mi" => Ok(num.saturating_mul(1024 * 1024)),
+        "Gi" => Ok(num.saturating_mul(1024 * 1024 * 1024)),
+        "Ti" => Ok(num.saturating_mul(1024 * 1024 * 1024 * 1024)),
+        _ => Err(format!("unknown memory suffix '{suffix}' in '{s}'")),
+    }
+}
+
+/// Build a [`StoreLimits`] from the spec-level [`zlayer_spec::WasmConfig`] resource fields.
+///
+/// Returns `None` when no resource limits are configured (default behaviour).
+fn build_store_limits(spec_wasm: Option<&zlayer_spec::WasmConfig>) -> Option<StoreLimits> {
+    let wasm = spec_wasm?;
+
+    // Only build limits if max_memory is actually set
+    let max_memory = wasm.max_memory.as_ref()?;
+    let max_bytes = match parse_memory_limit(max_memory) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(max_memory = %max_memory, error = %e, "ignoring invalid max_memory");
+            return None;
+        }
+    };
+
+    let limits = StoreLimitsBuilder::new()
+        .memory_size(
+            #[allow(clippy::cast_possible_truncation)]
+            {
+                max_bytes as usize
+            },
+        )
+        .build();
+
+    tracing::info!(max_bytes = max_bytes, "WASM store memory limit configured");
+    Some(limits)
+}
+
+/// Per-instance resource limit configuration extracted from the spec.
+///
+/// Passed through to `execute_module` / `execute_component` so that Store-level
+/// limits can be applied when execution begins.
+#[derive(Debug, Clone)]
+struct ResourceLimits {
+    /// Parsed memory limit in bytes (from spec `max_memory`)
+    store_limits: Option<StoreLimits>,
+    /// Fuel budget (0 = unlimited)
+    max_fuel: u64,
+    /// Epoch interval for cooperative preemption (overrides engine default)
+    epoch_interval: Option<Duration>,
+}
+
+impl ResourceLimits {
+    /// Build from the spec-level `WasmConfig` if present.
+    fn from_spec(spec_wasm: Option<&zlayer_spec::WasmConfig>) -> Self {
+        let store_limits = build_store_limits(spec_wasm);
+        let max_fuel = spec_wasm.map_or(0, |w| w.max_fuel);
+        let epoch_interval = spec_wasm.and_then(|w| w.epoch_interval);
+        Self {
+            store_limits,
+            max_fuel,
+            epoch_interval,
+        }
+    }
+}
+
+/// `WASIp1` state wrapper that owns both the WASI context and the resource limiter.
+///
+/// This is needed because `Store::limiter()` requires the limiter to be accessible
+/// via a closure from the store's state type, and `WasiP1Ctx` is an external type
+/// we cannot modify.
+struct WasiP1State {
+    /// The underlying `WASIp1` context
+    wasi: WasiP1Ctx,
+    /// Optional resource limiter for memory/table growth
+    limiter: StoreLimits,
+}
+
+/// `WASIp2` component state wrapper (extends existing `WasiState`)
+///
+/// Holds the WASI context, resource table, and resource limiter.
+struct WasiP2State {
+    /// WASI Preview 2 context with environment, args, and capabilities
+    ctx: WasiCtx,
+    /// Resource table for component model resources (files, sockets, etc.)
+    table: ResourceTable,
+    /// Resource limiter for memory/table growth
+    limiter: StoreLimits,
+}
+
+impl WasiView for WasiP2State {
+    fn ctx(&mut self) -> WasiCtxView<'_> {
+        WasiCtxView {
+            ctx: &mut self.ctx,
+            table: &mut self.table,
+        }
+    }
+}
+
 /// Configuration for `WasmRuntime`
 #[derive(Debug, Clone)]
 pub struct WasmConfig {
@@ -241,6 +356,10 @@ struct WasmInstance {
     args: Vec<String>,
     /// Filesystem mounts for WASI preopens
     mounts: Vec<StorageSpec>,
+    /// Resource limits from the spec-level `WasmConfig`
+    resource_limits: ResourceLimits,
+    /// Capability grants from the spec-level `WasmConfig` (controls WASI context gating)
+    capabilities: Option<WasmCapabilities>,
     /// Execution handle (if running) - returns `ExecutionResult` with captured stdout/stderr
     execution_handle: Option<tokio::task::JoinHandle<std::result::Result<ExecutionResult, String>>>,
 }
@@ -306,6 +425,10 @@ impl WasmRuntime {
         if config.enable_epochs {
             engine_config.epoch_interruption(true);
         }
+
+        // Enable fuel metering so that per-instance fuel budgets can be applied.
+        // This has negligible cost when fuel is not set on a particular Store.
+        engine_config.consume_fuel(true);
 
         let engine = Engine::new(&engine_config).map_err(|e| AgentError::CreateFailed {
             id: "wasm-runtime".to_string(),
@@ -448,9 +571,15 @@ impl WasmRuntime {
     /// * `mounts` - Filesystem mounts to configure as preopens
     /// * `epoch_deadline` - Epoch deadline for interruption
     /// * `enable_epochs` - Whether to enable epoch-based interruption
+    /// * `resource_limits` - Per-instance resource limits from the spec
+    /// * `capabilities` - Optional capability grants controlling WASI context.
+    ///   `WASIp1` modules don't support `ZLayer` custom interfaces, so only
+    ///   WASI-level capabilities (CLI, filesystem, sockets) are relevant.
+    ///   When `None`, all capabilities are enabled (backward-compatible).
     ///
     /// # Returns
     /// `ExecutionResult` containing the exit code and captured stdout/stderr
+    #[allow(clippy::too_many_arguments)]
     async fn execute_module(
         engine: Engine,
         module_bytes: Vec<u8>,
@@ -459,6 +588,8 @@ impl WasmRuntime {
         mounts: Vec<StorageSpec>,
         epoch_deadline: u64,
         enable_epochs: bool,
+        resource_limits: ResourceLimits,
+        capabilities: Option<WasmCapabilities>,
     ) -> std::result::Result<ExecutionResult, String> {
         // This runs in a blocking context because wasmtime operations are CPU-bound
         tokio::task::spawn_blocking(move || {
@@ -466,19 +597,34 @@ impl WasmRuntime {
             let module = Module::new(&engine, &module_bytes)
                 .map_err(|e| format!("failed to compile module: {e}"))?;
 
-            // Build WASI context with environment and args
+            // Build WASI context with environment and args, gated by capabilities
             let mut wasi_builder = WasiCtxBuilder::new();
 
-            // Set environment variables
-            for (key, value) in &env_vars {
-                wasi_builder.env(key, value);
+            if let Some(ref caps) = capabilities {
+                // Apply capability-gated WASI context (handles CLI, sockets)
+                super::wasm_host::configure_wasi_ctx_with_capabilities(&mut wasi_builder, caps);
+
+                // Always set explicit env vars and args for module execution
+                for (key, value) in &env_vars {
+                    wasi_builder.env(key, value);
+                }
+                wasi_builder.args(&args);
+
+                // Only configure filesystem mounts if filesystem capability is enabled
+                if caps.filesystem {
+                    configure_wasi_mounts(&mut wasi_builder, &mounts)?;
+                } else {
+                    tracing::debug!("filesystem capability disabled, skipping WASI mounts");
+                }
+            } else {
+                // Backward-compatible: all capabilities enabled
+                for (key, value) in &env_vars {
+                    wasi_builder.env(key, value);
+                }
+                wasi_builder.args(&args);
+                configure_wasi_mounts(&mut wasi_builder, &mounts)?;
+                wasi_builder.inherit_network();
             }
-
-            // Set command line arguments
-            wasi_builder.args(&args);
-
-            // Configure filesystem mounts as preopened directories
-            configure_wasi_mounts(&mut wasi_builder, &mounts)?;
 
             // Create memory pipes for stdout/stderr capture
             // These are cloneable (Arc<Mutex> internally) so we can read after execution
@@ -490,22 +636,40 @@ impl WasmRuntime {
             wasi_builder.stdout(stdout_pipe.clone());
             wasi_builder.stderr(stderr_pipe.clone());
 
-            // Enable network access for wasi:sockets (TCP, UDP, IP name lookup)
-            wasi_builder.inherit_network();
-
             let wasi_ctx = wasi_builder.build_p1();
 
-            // Create store with WASI context
-            let mut store = Store::new(&engine, wasi_ctx);
+            // Build store limits from the per-instance resource limits
+            let limiter = resource_limits
+                .store_limits
+                .clone()
+                .unwrap_or_else(|| StoreLimitsBuilder::new().build());
+
+            // Create store with wrapped state (WasiP1Ctx + limiter)
+            let state = WasiP1State {
+                wasi: wasi_ctx,
+                limiter,
+            };
+            let mut store = Store::new(&engine, state);
+
+            // Attach the resource limiter to the store
+            store.limiter(|s| &mut s.limiter);
 
             // Set epoch deadline for interruption if enabled
             if enable_epochs {
                 store.set_epoch_deadline(epoch_deadline);
             }
 
-            // Create linker and add WASI
-            let mut linker: Linker<WasiP1Ctx> = Linker::new(&engine);
-            p1::add_to_linker_sync(&mut linker, |ctx| ctx)
+            // Apply fuel budget if configured
+            if resource_limits.max_fuel > 0 {
+                store
+                    .set_fuel(resource_limits.max_fuel)
+                    .map_err(|e| format!("failed to set fuel: {e}"))?;
+                tracing::debug!(fuel = resource_limits.max_fuel, "WASM fuel budget set");
+            }
+
+            // Create linker and add WASI (closure extracts WasiP1Ctx from our wrapper)
+            let mut linker: Linker<WasiP1State> = Linker::new(&engine);
+            p1::add_to_linker_sync(&mut linker, |state| &mut state.wasi)
                 .map_err(|e| format!("failed to add WASI to linker: {e}"))?;
 
             // Instantiate the module
@@ -575,11 +739,18 @@ impl WasmRuntime {
     /// * `mounts` - Filesystem mounts to configure as preopens
     /// * `epoch_deadline` - Epoch deadline for interruption
     /// * `enable_epochs` - Whether to enable epoch-based interruption
+    /// * `resource_limits` - Per-instance resource limits from the spec
+    /// * `capabilities` - Optional capability grants for WASI context gating.
+    ///   When `None`, all capabilities are enabled (backward-compatible).
+    ///   When `Some`, the WASI context is configured based on the capabilities:
+    ///   - CLI, filesystem, sockets gated at `WasiCtx` level
+    ///   - `ZLayer` custom interfaces not applicable here (`WASIp2` only)
     ///
     /// # Returns
     /// `ExecutionResult` containing the exit code and captured stdout/stderr
+    #[allow(clippy::too_many_arguments)]
     #[instrument(
-        skip(engine, component_bytes, env_vars, args, mounts),
+        skip(engine, component_bytes, env_vars, args, mounts, resource_limits, capabilities),
         fields(
             component_size = component_bytes.len(),
             args_count = args.len(),
@@ -594,6 +765,8 @@ impl WasmRuntime {
         mounts: Vec<StorageSpec>,
         epoch_deadline: u64,
         enable_epochs: bool,
+        resource_limits: ResourceLimits,
+        capabilities: Option<WasmCapabilities>,
     ) -> std::result::Result<ExecutionResult, String> {
         // Component model operations are CPU-bound, run in blocking context
         tokio::task::spawn_blocking(move || {
@@ -601,19 +774,34 @@ impl WasmRuntime {
             let component = Component::from_binary(&engine, &component_bytes)
                 .map_err(|e| format!("failed to compile component: {e}"))?;
 
-            // Build WASIp2 context with environment and args
+            // Build WASIp2 context with environment and args, gated by capabilities
             let mut wasi_builder = WasiCtxBuilder::new();
 
-            // Set environment variables
-            for (key, value) in &env_vars {
-                wasi_builder.env(key, value);
+            if let Some(ref caps) = capabilities {
+                // Apply capability-gated WASI context (handles CLI, sockets)
+                super::wasm_host::configure_wasi_ctx_with_capabilities(&mut wasi_builder, caps);
+
+                // Always set explicit env vars and args
+                for (key, value) in &env_vars {
+                    wasi_builder.env(key, value);
+                }
+                wasi_builder.args(&args);
+
+                // Only configure filesystem mounts if filesystem capability is enabled
+                if caps.filesystem {
+                    configure_wasi_mounts(&mut wasi_builder, &mounts)?;
+                } else {
+                    tracing::debug!("filesystem capability disabled, skipping WASI mounts");
+                }
+            } else {
+                // Backward-compatible: all capabilities enabled
+                for (key, value) in &env_vars {
+                    wasi_builder.env(key, value);
+                }
+                wasi_builder.args(&args);
+                configure_wasi_mounts(&mut wasi_builder, &mounts)?;
+                wasi_builder.inherit_network();
             }
-
-            // Set command line arguments
-            wasi_builder.args(&args);
-
-            // Configure filesystem mounts as preopened directories
-            configure_wasi_mounts(&mut wasi_builder, &mounts)?;
 
             // Create memory pipes for stdout/stderr capture
             // These are cloneable (Arc<Mutex> internally) so we can read after execution
@@ -625,31 +813,46 @@ impl WasmRuntime {
             wasi_builder.stdout(stdout_pipe.clone());
             wasi_builder.stderr(stderr_pipe.clone());
 
-            // Enable network access for wasi:sockets (TCP, UDP, IP name lookup)
-            wasi_builder.inherit_network();
-
             // Build the WASIp2 context
             let wasi_ctx = wasi_builder.build();
 
             // Create resource table for component model resources
             let table = ResourceTable::new();
 
-            // Create our WasiState that implements WasiView
-            let state = WasiState {
+            // Build store limits from the per-instance resource limits
+            let limiter = resource_limits
+                .store_limits
+                .clone()
+                .unwrap_or_else(|| StoreLimitsBuilder::new().build());
+
+            // Create our WasiP2State that implements WasiView (with limiter)
+            let state = WasiP2State {
                 ctx: wasi_ctx,
                 table,
+                limiter,
             };
 
             // Create store with our WASI state
             let mut store = Store::new(&engine, state);
+
+            // Attach the resource limiter to the store
+            store.limiter(|s| &mut s.limiter);
 
             // Set epoch deadline for interruption if enabled
             if enable_epochs {
                 store.set_epoch_deadline(epoch_deadline);
             }
 
+            // Apply fuel budget if configured
+            if resource_limits.max_fuel > 0 {
+                store
+                    .set_fuel(resource_limits.max_fuel)
+                    .map_err(|e| format!("failed to set fuel: {e}"))?;
+                tracing::debug!(fuel = resource_limits.max_fuel, "WASM fuel budget set");
+            }
+
             // Create component linker and add WASIp2 interfaces
-            let mut linker: ComponentLinker<WasiState> = ComponentLinker::new(&engine);
+            let mut linker: ComponentLinker<WasiP2State> = ComponentLinker::new(&engine);
             wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
                 .map_err(|e| format!("failed to add WASIp2 to linker: {e}"))?;
 
@@ -713,27 +916,6 @@ impl WasmRuntime {
         })
         .await
         .map_err(|e| format!("task join error: {e}"))?
-    }
-}
-
-/// `WASIp2` state for the component model
-///
-/// This struct holds the WASI context and resource table required
-/// for executing `WASIp2` components. It implements [`WasiView`] to
-/// provide access to these resources during component execution.
-struct WasiState {
-    /// WASI Preview 2 context with environment, args, and capabilities
-    ctx: WasiCtx,
-    /// Resource table for component model resources (files, sockets, etc.)
-    table: ResourceTable,
-}
-
-impl WasiView for WasiState {
-    fn ctx(&mut self) -> WasiCtxView<'_> {
-        WasiCtxView {
-            ctx: &mut self.ctx,
-            table: &mut self.table,
-        }
     }
 }
 
@@ -892,6 +1074,45 @@ impl Runtime for WasmRuntime {
             );
         }
 
+        // Extract resource limits from the spec-level WasmConfig
+        let resource_limits = ResourceLimits::from_spec(spec.wasm.as_ref());
+
+        if resource_limits.store_limits.is_some() || resource_limits.max_fuel > 0 {
+            tracing::info!(
+                instance = %instance_id,
+                has_memory_limit = resource_limits.store_limits.is_some(),
+                max_fuel = resource_limits.max_fuel,
+                has_epoch_interval = resource_limits.epoch_interval.is_some(),
+                "WASM resource limits configured from spec"
+            );
+        }
+
+        // Extract capabilities from the spec-level WasmConfig, falling back
+        // to ServiceType defaults if no explicit capabilities are provided.
+        // This ensures each WASM service type gets its appropriate default
+        // security sandbox even when capabilities aren't explicitly configured.
+        let capabilities = spec
+            .wasm
+            .as_ref()
+            .and_then(|w| w.capabilities.clone())
+            .or_else(|| spec.service_type.default_wasm_capabilities());
+
+        if let Some(ref caps) = capabilities {
+            tracing::info!(
+                instance = %instance_id,
+                config = caps.config,
+                keyvalue = caps.keyvalue,
+                logging = caps.logging,
+                secrets = caps.secrets,
+                metrics = caps.metrics,
+                http_client = caps.http_client,
+                cli = caps.cli,
+                filesystem = caps.filesystem,
+                sockets = caps.sockets,
+                "WASM capabilities configured"
+            );
+        }
+
         // Create instance entry
         let instance = WasmInstance {
             state: InstanceState::Pending,
@@ -903,6 +1124,8 @@ impl Runtime for WasmRuntime {
             env_vars,
             args,
             mounts,
+            resource_limits,
+            capabilities,
             execution_handle: None,
         };
 
@@ -935,7 +1158,7 @@ impl Runtime for WasmRuntime {
         tracing::info!(instance = %instance_id, "starting WASM instance");
 
         // Get instance and extract data for execution
-        let (wasm_bytes, wasi_version, env_vars, args, mounts) = {
+        let (wasm_bytes, wasi_version, env_vars, args, mounts, resource_limits, capabilities) = {
             let mut instances = self.instances.write().await;
             let instance = instances
                 .get_mut(&instance_id)
@@ -955,6 +1178,8 @@ impl Runtime for WasmRuntime {
                 instance.env_vars.clone(),
                 instance.args.clone(),
                 instance.mounts.clone(),
+                instance.resource_limits.clone(),
+                instance.capabilities.clone(),
             )
         };
 
@@ -994,6 +1219,8 @@ impl Runtime for WasmRuntime {
                     mounts,
                     epoch_deadline,
                     enable_epochs,
+                    resource_limits,
+                    capabilities,
                 )
                 .await
             })
@@ -1007,6 +1234,8 @@ impl Runtime for WasmRuntime {
                     mounts,
                     epoch_deadline,
                     enable_epochs,
+                    resource_limits,
+                    capabilities,
                 )
                 .await
             })
@@ -1471,5 +1700,76 @@ mod tests {
         builder.inherit_network();
         let _ctx = builder.build();
         // If this compiles and runs, networking is properly configured
+    }
+
+    #[test]
+    fn test_parse_memory_limit_valid() {
+        assert_eq!(parse_memory_limit("64Mi").unwrap(), 64 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("256Mi").unwrap(), 256 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("1Gi").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_memory_limit("2Ti").unwrap(),
+            2 * 1024 * 1024 * 1024 * 1024
+        );
+        assert_eq!(parse_memory_limit("512Ki").unwrap(), 512 * 1024);
+    }
+
+    #[test]
+    fn test_parse_memory_limit_with_whitespace() {
+        assert_eq!(parse_memory_limit("  64Mi  ").unwrap(), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_parse_memory_limit_invalid() {
+        assert!(parse_memory_limit("").is_err());
+        assert!(parse_memory_limit("64").is_err());
+        assert!(parse_memory_limit("Mi").is_err());
+        assert!(parse_memory_limit("64MB").is_err());
+        assert!(parse_memory_limit("abcMi").is_err());
+    }
+
+    #[test]
+    fn test_build_store_limits_with_memory() {
+        let wasm_config = zlayer_spec::WasmConfig {
+            max_memory: Some("64Mi".to_string()),
+            ..Default::default()
+        };
+        let limits = build_store_limits(Some(&wasm_config));
+        assert!(limits.is_some());
+    }
+
+    #[test]
+    fn test_build_store_limits_without_memory() {
+        let wasm_config = zlayer_spec::WasmConfig::default();
+        let limits = build_store_limits(Some(&wasm_config));
+        assert!(limits.is_none());
+    }
+
+    #[test]
+    fn test_build_store_limits_none_config() {
+        let limits = build_store_limits(None);
+        assert!(limits.is_none());
+    }
+
+    #[test]
+    fn test_resource_limits_from_spec() {
+        let wasm_config = zlayer_spec::WasmConfig {
+            max_memory: Some("128Mi".to_string()),
+            max_fuel: 1_000_000,
+            epoch_interval: Some(Duration::from_millis(100)),
+            ..Default::default()
+        };
+        let limits = ResourceLimits::from_spec(Some(&wasm_config));
+        assert!(limits.store_limits.is_some());
+        assert_eq!(limits.max_fuel, 1_000_000);
+        assert_eq!(limits.epoch_interval, Some(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn test_resource_limits_from_spec_none() {
+        let limits = ResourceLimits::from_spec(None);
+        assert!(limits.store_limits.is_none());
+        assert_eq!(limits.max_fuel, 0);
+        assert!(limits.epoch_interval.is_none());
     }
 }

@@ -781,7 +781,7 @@ mod tests {
             node_mode,
             node_selector,
             service_type: ServiceType::default(),
-            wasm_http: None,
+            wasm: None,
             host_network: false,
         }
     }

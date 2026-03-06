@@ -80,13 +80,25 @@ pub enum NodeMode {
 
 /// Service type - determines runtime behavior and scaling model
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ServiceType {
     /// Standard long-running container service
     #[default]
     Standard,
-    /// WASM-based HTTP service with instance pooling
+    /// WASM-based HTTP service (wasi:http/incoming-handler)
     WasmHttp,
+    /// WASM-based general plugin (zlayer:plugin handler - full host access)
+    WasmPlugin,
+    /// WASM-based stateless request/response transformer
+    WasmTransformer,
+    /// WASM-based authenticator plugin (secrets + KV + HTTP)
+    WasmAuthenticator,
+    /// WASM-based rate limiter (KV + metrics)
+    WasmRateLimiter,
+    /// WASM-based request/response middleware
+    WasmMiddleware,
+    /// WASM-based custom router
+    WasmRouter,
     /// Run-to-completion job
     Job,
 }
@@ -116,7 +128,182 @@ pub struct NodeSelector {
     pub prefer_labels: HashMap<String, String>,
 }
 
+/// Explicit capability declarations for WASM modules.
+/// Controls which host interfaces are linked and available to the component.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct WasmCapabilities {
+    /// Config interface access (zlayer:plugin/config)
+    #[serde(default = "default_true")]
+    pub config: bool,
+    /// Key-value storage access (zlayer:plugin/keyvalue)
+    #[serde(default = "default_true")]
+    pub keyvalue: bool,
+    /// Logging access (zlayer:plugin/logging)
+    #[serde(default = "default_true")]
+    pub logging: bool,
+    /// Secrets access (zlayer:plugin/secrets)
+    #[serde(default)]
+    pub secrets: bool,
+    /// Metrics emission (zlayer:plugin/metrics)
+    #[serde(default = "default_true")]
+    pub metrics: bool,
+    /// HTTP client for outgoing requests (wasi:http/outgoing-handler)
+    #[serde(default)]
+    pub http_client: bool,
+    /// WASI CLI access (args, env, stdio)
+    #[serde(default)]
+    pub cli: bool,
+    /// WASI filesystem access
+    #[serde(default)]
+    pub filesystem: bool,
+    /// WASI sockets access (TCP/UDP)
+    #[serde(default)]
+    pub sockets: bool,
+}
+
+impl Default for WasmCapabilities {
+    fn default() -> Self {
+        Self {
+            config: true,
+            keyvalue: true,
+            logging: true,
+            secrets: false,
+            metrics: true,
+            http_client: false,
+            cli: false,
+            filesystem: false,
+            sockets: false,
+        }
+    }
+}
+
+/// Pre-opened directory for WASM filesystem access
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WasmPreopen {
+    /// Host path to mount
+    pub source: String,
+    /// Guest path (visible to WASM module)
+    pub target: String,
+    /// Read-only access (default: false)
+    #[serde(default)]
+    pub readonly: bool,
+}
+
+/// Comprehensive configuration for all WASM service types.
+///
+/// Replaces the previous `WasmHttpConfig` with resource limits, capability
+/// declarations, networking controls, and storage configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct WasmConfig {
+    // --- Instance Management ---
+    /// Minimum number of warm instances to keep ready
+    #[serde(default = "default_min_instances")]
+    pub min_instances: u32,
+    /// Maximum number of instances to scale to
+    #[serde(default = "default_max_instances")]
+    pub max_instances: u32,
+    /// Time before idle instances are terminated
+    #[serde(default = "default_idle_timeout", with = "duration::required")]
+    pub idle_timeout: std::time::Duration,
+    /// Maximum time for a single request
+    #[serde(default = "default_request_timeout", with = "duration::required")]
+    pub request_timeout: std::time::Duration,
+
+    // --- Resource Limits ---
+    /// Maximum linear memory (e.g., "64Mi", "256Mi")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory: Option<String>,
+    /// Maximum fuel (instruction count limit, 0 = unlimited)
+    #[serde(default)]
+    pub max_fuel: u64,
+    /// Epoch interval for cooperative preemption
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "duration::option"
+    )]
+    pub epoch_interval: Option<std::time::Duration>,
+
+    // --- Capabilities ---
+    /// Explicit capability grants (overrides world defaults when restricting)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<WasmCapabilities>,
+
+    // --- Networking ---
+    /// Allow outgoing HTTP requests (default: true)
+    #[serde(default = "default_true")]
+    pub allow_http_outgoing: bool,
+    /// Allowed outgoing HTTP hosts (empty = all allowed)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<String>,
+    /// Allow raw TCP sockets (default: false)
+    #[serde(default)]
+    pub allow_tcp: bool,
+    /// Allow raw UDP sockets (default: false)
+    #[serde(default)]
+    pub allow_udp: bool,
+
+    // --- Storage ---
+    /// Pre-opened directories (host path -> guest path)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preopens: Vec<WasmPreopen>,
+    /// Enable KV store access (default: true)
+    #[serde(default = "default_true")]
+    pub kv_enabled: bool,
+    /// KV store namespace (default: service name)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_namespace: Option<String>,
+    /// KV store max value size in bytes (default: 1MB)
+    #[serde(default = "default_kv_max_value_size")]
+    pub kv_max_value_size: u64,
+
+    // --- Secrets ---
+    /// Secret names accessible to this WASM module
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+
+    // --- Performance ---
+    /// Pre-compile on deploy to reduce cold start (default: true)
+    #[serde(default = "default_true")]
+    pub precompile: bool,
+}
+
+fn default_kv_max_value_size() -> u64 {
+    1_048_576 // 1MB
+}
+
+impl Default for WasmConfig {
+    fn default() -> Self {
+        Self {
+            min_instances: default_min_instances(),
+            max_instances: default_max_instances(),
+            idle_timeout: default_idle_timeout(),
+            request_timeout: default_request_timeout(),
+            max_memory: None,
+            max_fuel: 0,
+            epoch_interval: None,
+            capabilities: None,
+            allow_http_outgoing: true,
+            allowed_hosts: Vec::new(),
+            allow_tcp: false,
+            allow_udp: false,
+            preopens: Vec::new(),
+            kv_enabled: true,
+            kv_namespace: None,
+            kv_max_value_size: default_kv_max_value_size(),
+            secrets: Vec::new(),
+            precompile: true,
+        }
+    }
+}
+
 /// Configuration for WASM HTTP services with instance pooling
+#[deprecated(note = "Use WasmConfig instead")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WasmHttpConfig {
@@ -150,6 +337,7 @@ fn default_request_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(30)
 }
 
+#[allow(deprecated)]
 impl Default for WasmHttpConfig {
     fn default() -> Self {
         Self {
@@ -157,6 +345,111 @@ impl Default for WasmHttpConfig {
             max_instances: default_max_instances(),
             idle_timeout: default_idle_timeout(),
             request_timeout: default_request_timeout(),
+        }
+    }
+}
+
+#[allow(deprecated)]
+impl From<WasmHttpConfig> for WasmConfig {
+    fn from(old: WasmHttpConfig) -> Self {
+        Self {
+            min_instances: old.min_instances,
+            max_instances: old.max_instances,
+            idle_timeout: old.idle_timeout,
+            request_timeout: old.request_timeout,
+            ..Default::default()
+        }
+    }
+}
+
+impl ServiceType {
+    /// Returns true if this is any WASM service type
+    #[must_use]
+    pub fn is_wasm(&self) -> bool {
+        matches!(
+            self,
+            ServiceType::WasmHttp
+                | ServiceType::WasmPlugin
+                | ServiceType::WasmTransformer
+                | ServiceType::WasmAuthenticator
+                | ServiceType::WasmRateLimiter
+                | ServiceType::WasmMiddleware
+                | ServiceType::WasmRouter
+        )
+    }
+
+    /// Returns the default capabilities for this WASM service type.
+    /// Returns None for non-WASM types.
+    #[must_use]
+    pub fn default_wasm_capabilities(&self) -> Option<WasmCapabilities> {
+        match self {
+            ServiceType::WasmHttp | ServiceType::WasmRouter => Some(WasmCapabilities {
+                config: true,
+                keyvalue: true,
+                logging: true,
+                secrets: false,
+                metrics: false,
+                http_client: true,
+                cli: false,
+                filesystem: false,
+                sockets: false,
+            }),
+            ServiceType::WasmPlugin => Some(WasmCapabilities {
+                config: true,
+                keyvalue: true,
+                logging: true,
+                secrets: true,
+                metrics: true,
+                http_client: true,
+                cli: true,
+                filesystem: true,
+                sockets: false,
+            }),
+            ServiceType::WasmTransformer => Some(WasmCapabilities {
+                config: false,
+                keyvalue: false,
+                logging: true,
+                secrets: false,
+                metrics: false,
+                http_client: false,
+                cli: true,
+                filesystem: false,
+                sockets: false,
+            }),
+            ServiceType::WasmAuthenticator => Some(WasmCapabilities {
+                config: true,
+                keyvalue: false,
+                logging: true,
+                secrets: true,
+                metrics: false,
+                http_client: true,
+                cli: false,
+                filesystem: false,
+                sockets: false,
+            }),
+            ServiceType::WasmRateLimiter => Some(WasmCapabilities {
+                config: true,
+                keyvalue: true,
+                logging: true,
+                secrets: false,
+                metrics: true,
+                http_client: false,
+                cli: true,
+                filesystem: false,
+                sockets: false,
+            }),
+            ServiceType::WasmMiddleware => Some(WasmCapabilities {
+                config: true,
+                keyvalue: false,
+                logging: true,
+                secrets: false,
+                metrics: false,
+                http_client: true,
+                cli: false,
+                filesystem: false,
+                sockets: false,
+            }),
+            _ => None,
         }
     }
 }
@@ -347,13 +640,14 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<NodeSelector>,
 
-    /// Service type (standard, `wasm_http`, job)
+    /// Service type (standard, `wasm_http`, `wasm_plugin`, etc.)
     #[serde(default)]
     pub service_type: ServiceType,
 
-    /// WASM HTTP configuration (only used when `service_type` is `WasmHttp`)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wasm_http: Option<WasmHttpConfig>,
+    /// WASM configuration (used when `service_type` is any Wasm* variant)
+    /// Also accepts the deprecated `wasm_http` key for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "wasm_http")]
+    pub wasm: Option<WasmConfig>,
 
     /// Use host networking (container shares host network namespace)
     ///
