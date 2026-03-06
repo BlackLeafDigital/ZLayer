@@ -82,7 +82,33 @@ fn main() -> ExitCode {
             }
         }
 
-        #[cfg(target_os = "windows")]
+        #[cfg(all(target_os = "windows", feature = "wsl"))]
+        {
+            match zlayer_wsl::setup::ensure_wsl_backend_ready() {
+                Ok(config) => {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("Failed to create tokio runtime");
+                    match rt.block_on(zlayer_wsl::daemon::start_daemon(&config)) {
+                        Ok(()) => {
+                            println!("zlayer daemon started inside WSL2 on {}", config.api_addr);
+                            return ExitCode::SUCCESS;
+                        }
+                        Err(e) => {
+                            eprintln!("Error starting WSL2 daemon: {e:#}");
+                            return ExitCode::FAILURE;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error setting up WSL2 backend: {e:#}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+
+        #[cfg(all(target_os = "windows", not(feature = "wsl")))]
         {
             eprintln!("On Windows, use 'zlayer serve' to start the daemon inside WSL2.");
             eprintln!("The daemon runs automatically inside WSL2 when needed.");
@@ -427,17 +453,31 @@ async fn run(cli: Cli) -> Result<()> {
             daemon: _, // Already handled in main() before tokio runtime
             ..
         } => {
-            let socket_path = cli.effective_socket_path();
-            let data_dir = cli.effective_data_dir();
-            commands::serve::serve(
-                bind,
-                jwt_secret.clone(),
-                *no_swagger,
-                &socket_path,
-                cli.host_network,
-                data_dir,
-            )
-            .await
+            #[cfg(all(target_os = "windows", feature = "wsl"))]
+            {
+                let _ = (bind, jwt_secret, no_swagger);
+                let config = zlayer_wsl::setup::ensure_wsl_backend_ready()
+                    .context("Failed to set up WSL2 backend")?;
+                zlayer_wsl::daemon::start_daemon(&config)
+                    .await
+                    .context("Failed to start daemon in WSL2")?;
+                println!("zlayer daemon running inside WSL2 on {}", config.api_addr);
+                Ok(())
+            }
+            #[cfg(not(all(target_os = "windows", feature = "wsl")))]
+            {
+                let socket_path = cli.effective_socket_path();
+                let data_dir = cli.effective_data_dir();
+                commands::serve::serve(
+                    bind,
+                    jwt_secret.clone(),
+                    *no_swagger,
+                    &socket_path,
+                    cli.host_network,
+                    data_dir,
+                )
+                .await
+            }
         }
         Commands::Status => commands::lifecycle::status(&cli).await,
         Commands::Validate { spec_path } => {
