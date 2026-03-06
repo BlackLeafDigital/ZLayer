@@ -451,11 +451,12 @@ impl WasmRuntime {
                     id: "wasm-runtime".to_string(),
                     reason: format!("failed to configure blob cache from env: {e}"),
                 })?;
+            #[allow(clippy::match_wildcard_for_single_variants)]
             let cache_type = match cache_type {
                 zlayer_registry::CacheType::Persistent { .. } => {
                     zlayer_registry::CacheType::persistent_at(config.cache_dir.clone())
                 }
-                other @ zlayer_registry::CacheType::Memory => other,
+                other => other,
             };
             cache_type
                 .build()
