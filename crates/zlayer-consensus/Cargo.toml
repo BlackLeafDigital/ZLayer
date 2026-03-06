@@ -16,7 +16,7 @@ openraft = { workspace = true, features = ["serde", "storage-v2"] }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
-bincode = "1"
+postcard2 = { version = "0.2.1", features = ["alloc"] }
 
 # Async
 tokio = { workspace = true }

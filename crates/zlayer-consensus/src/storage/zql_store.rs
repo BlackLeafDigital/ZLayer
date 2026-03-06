@@ -699,7 +699,7 @@ where
     async fn build_snapshot(&mut self) -> Result<Snapshot<C>, StorageError<NodeId>> {
         let sm = self.sm.read().await;
 
-        let data = bincode::serialize(&sm.state).map_err(|e| {
+        let data = postcard2::to_vec(&sm.state).map_err(|e| {
             zql_to_storage_err(
                 openraft::ErrorSubject::StateMachine,
                 openraft::ErrorVerb::Read,
@@ -833,7 +833,7 @@ where
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let state: S = bincode::deserialize(&data).map_err(|e| {
+        let state: S = postcard2::from_bytes(&data).map_err(|e| {
             zql_to_storage_err(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Read,
