@@ -158,10 +158,14 @@ cargo run -p zlayer-build -- build . -t myapp:latest
 
 ### Formatting and Linting
 
+**CRITICAL: ALWAYS lint the ENTIRE workspace, not individual crates.** Never use `-p <crate>` for clippy. Always use `--workspace`.
+
 ```bash
 cargo fmt --all
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 ```
+
+After ANY code change, run both commands above on the full workspace before considering the work done. No exceptions.
 
 ## Changelog
 
@@ -189,7 +193,7 @@ Read the diff. Write a test for the exact thing that changed. Run it. If it touc
 
 ## Important Notes
 
-- Linux only for production (uses libcontainer/cgroups)
-- Requires `libseccomp-dev` for building
+- Linux, macOS, and Windows supported (Windows uses WSL2 backend)
+- Requires `libseccomp-dev` for building on Linux
 - Buildah required for image building (auto-installed if missing)
-- Minimum Rust version: 1.85
+- Minimum Rust version: 1.91

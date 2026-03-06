@@ -10504,9 +10504,9 @@ dependencies = [
 
 [[package]]
 name = "zql"
-version = "0.3.0"
+version = "0.3.1"
 source = "sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/"
-checksum = "9d8b7099a89f2c891d3ff7926c7303163dd8553eb8cb2ae3433f577b368ac877"
+checksum = "aa0e9ec117a74f10eda47a9a3068f5a42020465959099aa73b4369fed7befcf7"
 dependencies = [
  "blake3",
  "cbindgen",
