@@ -148,7 +148,7 @@ mod tests {
                 node_mode: Default::default(),
                 node_selector: None,
                 service_type: Default::default(),
-                wasm_http: None,
+                wasm: None,
                 host_network: false,
             },
         );

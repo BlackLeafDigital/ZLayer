@@ -130,6 +130,31 @@ use zlayer_registry::cache::BlobCacheBackend;
 #[cfg(feature = "local-registry")]
 use zlayer_registry::LocalRegistry;
 
+/// Output from parsing a ZImagefile - either a Dockerfile for container builds
+/// or a WASM build result for WebAssembly builds.
+///
+/// Most ZImagefile modes (runtime, single-stage, multi-stage) produce a
+/// [`Dockerfile`] IR that is then built with buildah. WASM mode produces
+/// a compiled artifact directly, bypassing the container build pipeline.
+#[derive(Debug)]
+pub enum BuildOutput {
+    /// Standard container build - produces a Dockerfile to be built with buildah.
+    Dockerfile(Dockerfile),
+    /// WASM component build - already built, produces artifact path.
+    WasmArtifact {
+        /// Path to the compiled WASM binary.
+        wasm_path: PathBuf,
+        /// Path to the OCI artifact directory (if exported).
+        oci_path: Option<PathBuf>,
+        /// Source language used.
+        language: String,
+        /// Whether optimization was applied.
+        optimized: bool,
+        /// Size of the output file in bytes.
+        size: u64,
+    },
+}
+
 /// Configuration for the layer cache backend.
 ///
 /// This enum specifies which cache backend to use for storing and retrieving
@@ -1273,8 +1298,46 @@ impl ImageBuilder {
             build_id
         );
 
-        // 1. Get parsed Dockerfile (from template, ZImagefile, or Dockerfile)
-        let dockerfile = self.get_dockerfile().await?;
+        // 1. Get build output (Dockerfile IR or WASM artifact)
+        let build_output = self.get_build_output().await?;
+
+        // If this is a WASM build, return early with the artifact info.
+        if let BuildOutput::WasmArtifact {
+            wasm_path,
+            oci_path: _,
+            language,
+            optimized,
+            size,
+        } = build_output
+        {
+            let build_time_ms = start_time.elapsed().as_millis() as u64;
+
+            self.send_event(BuildEvent::BuildComplete {
+                image_id: wasm_path.display().to_string(),
+            });
+
+            info!(
+                "WASM build completed in {}ms: {} ({}, {} bytes, optimized={})",
+                build_time_ms,
+                wasm_path.display(),
+                language,
+                size,
+                optimized
+            );
+
+            return Ok(BuiltImage {
+                image_id: format!("wasm:{}", wasm_path.display()),
+                tags: self.options.tags.clone(),
+                layer_count: 1,
+                size,
+                build_time_ms,
+            });
+        }
+
+        // Extract the Dockerfile from the BuildOutput.
+        let BuildOutput::Dockerfile(dockerfile) = build_output else {
+            unreachable!("WasmArtifact case handled above");
+        };
         debug!("Parsed Dockerfile with {} stages", dockerfile.stages.len());
 
         // 2. Determine stages to build
@@ -1637,19 +1700,22 @@ impl ImageBuilder {
         })
     }
 
-    /// Get a parsed [`Dockerfile`] from the configured source.
+    /// Get a parsed build output from the configured source.
     ///
     /// Detection order:
-    /// 1. If `runtime` is set → use template string → parse as Dockerfile
-    /// 2. If `zimagefile` is explicitly set → read & parse `ZImagefile` → convert
-    /// 3. If a file called `ZImagefile` exists in the context dir → same as (2)
+    /// 1. If `runtime` is set -> use template string -> parse as Dockerfile
+    /// 2. If `zimagefile` is explicitly set -> read & parse `ZImagefile` -> convert
+    /// 3. If a file called `ZImagefile` exists in the context dir -> same as (2)
     /// 4. Fall back to reading a Dockerfile (from `dockerfile` option or default)
-    async fn get_dockerfile(&self) -> Result<Dockerfile> {
+    ///
+    /// Returns [`BuildOutput::Dockerfile`] for container builds or
+    /// [`BuildOutput::WasmArtifact`] for WASM builds.
+    async fn get_build_output(&self) -> Result<BuildOutput> {
         // (a) Runtime template takes highest priority.
         if let Some(runtime) = &self.options.runtime {
             debug!("Using runtime template: {}", runtime);
             let content = get_template(*runtime);
-            return Dockerfile::parse(content);
+            return Ok(BuildOutput::Dockerfile(Dockerfile::parse(content)?));
         }
 
         // (b) Explicit ZImagefile path.
@@ -1700,18 +1766,18 @@ impl ImageBuilder {
                     source: e,
                 })?;
 
-        Dockerfile::parse(&content)
+        Ok(BuildOutput::Dockerfile(Dockerfile::parse(&content)?))
     }
 
-    /// Convert a parsed [`ZImage`] into the internal [`Dockerfile`] IR.
+    /// Convert a parsed [`ZImage`] into a [`BuildOutput`].
     ///
-    /// Handles the three `ZImage` modes that can produce a Dockerfile:
-    /// - **Runtime** mode: delegates to the template system
-    /// - **Single-stage / Multi-stage**: converts via [`zimage_to_dockerfile`]
-    /// - **WASM** mode: errors out (WASM uses `zlayer wasm build`, not `zlayer build`)
+    /// Handles all four `ZImage` modes:
+    /// - **Runtime** mode: delegates to the template system -> [`BuildOutput::Dockerfile`]
+    /// - **Single-stage / Multi-stage**: converts via [`zimage_to_dockerfile`] -> [`BuildOutput::Dockerfile`]
+    /// - **WASM** mode: builds a WASM component -> [`BuildOutput::WasmArtifact`]
     ///
     /// Any `build:` directives are resolved first by spawning nested builds.
-    async fn handle_zimage(&self, zimage: &crate::zimage::ZImage) -> Result<Dockerfile> {
+    async fn handle_zimage(&self, zimage: &crate::zimage::ZImage) -> Result<BuildOutput> {
         // Runtime mode: delegate to template system.
         if let Some(ref runtime_name) = zimage.runtime {
             let rt = Runtime::from_name(runtime_name).ok_or_else(|| {
@@ -1720,22 +1786,105 @@ impl ImageBuilder {
                 ))
             })?;
             let content = get_template(rt);
-            return Dockerfile::parse(content);
+            return Ok(BuildOutput::Dockerfile(Dockerfile::parse(content)?));
         }
 
-        // WASM mode: not supported through `zlayer build`.
-        if zimage.wasm.is_some() {
-            return Err(BuildError::invalid_instruction(
-                "ZImagefile",
-                "WASM builds use `zlayer wasm build`, not `zlayer build`",
-            ));
+        // WASM mode: build a WASM component.
+        if let Some(ref wasm_config) = zimage.wasm {
+            return self.handle_wasm_build(wasm_config).await;
         }
 
         // Resolve any `build:` directives to concrete base image tags.
         let resolved = self.resolve_build_directives(zimage).await?;
 
         // Single-stage or multi-stage: convert to Dockerfile IR directly.
-        crate::zimage::zimage_to_dockerfile(&resolved)
+        Ok(BuildOutput::Dockerfile(
+            crate::zimage::zimage_to_dockerfile(&resolved)?,
+        ))
+    }
+
+    /// Build a WASM component from the ZImagefile wasm configuration.
+    ///
+    /// Converts [`ZWasmConfig`](crate::zimage::ZWasmConfig) into a
+    /// [`WasmBuildConfig`](crate::wasm_builder::WasmBuildConfig) and invokes
+    /// the WASM builder pipeline.
+    async fn handle_wasm_build(
+        &self,
+        wasm_config: &crate::zimage::ZWasmConfig,
+    ) -> Result<BuildOutput> {
+        use crate::wasm_builder::{build_wasm, WasiTarget, WasmBuildConfig, WasmLanguage};
+
+        info!("ZImagefile specifies WASM mode, running WASM build");
+
+        // Convert target string to WasiTarget enum.
+        let target = match wasm_config.target.as_str() {
+            "preview1" => WasiTarget::Preview1,
+            _ => WasiTarget::Preview2,
+        };
+
+        // Resolve language: parse from string or leave as None for auto-detection.
+        let language = wasm_config
+            .language
+            .as_deref()
+            .and_then(WasmLanguage::from_name);
+
+        if let Some(ref lang_str) = wasm_config.language {
+            if language.is_none() {
+                return Err(BuildError::zimagefile_validation(format!(
+                    "unknown WASM language '{lang_str}'. Supported: rust, go, python, \
+                     typescript, assemblyscript, c, zig"
+                )));
+            }
+        }
+
+        // Build the WasmBuildConfig.
+        let mut config = WasmBuildConfig {
+            language,
+            target,
+            optimize: wasm_config.optimize,
+            opt_level: wasm_config
+                .opt_level
+                .clone()
+                .unwrap_or_else(|| "Oz".to_string()),
+            wit_path: wasm_config.wit.as_ref().map(PathBuf::from),
+            output_path: wasm_config.output.as_ref().map(PathBuf::from),
+            world: wasm_config.world.clone(),
+            features: wasm_config.features.clone(),
+            build_args: wasm_config.build_args.clone(),
+            pre_build: Vec::new(),
+            post_build: Vec::new(),
+            adapter: wasm_config.adapter.as_ref().map(PathBuf::from),
+        };
+
+        // Convert ZCommand pre/post build steps to Vec<Vec<String>>.
+        for cmd in &wasm_config.pre_build {
+            config.pre_build.push(zcommand_to_args(cmd));
+        }
+        for cmd in &wasm_config.post_build {
+            config.post_build.push(zcommand_to_args(cmd));
+        }
+
+        // Build the WASM component.
+        let result = build_wasm(&self.context, config).await?;
+
+        let language_name = result.language.name().to_string();
+        let wasm_path = result.wasm_path;
+        let size = result.size;
+
+        info!(
+            "WASM build complete: {} ({} bytes, optimized={})",
+            wasm_path.display(),
+            size,
+            wasm_config.optimize
+        );
+
+        Ok(BuildOutput::WasmArtifact {
+            wasm_path,
+            oci_path: None,
+            language: language_name,
+            optimized: wasm_config.optimize,
+            size,
+        })
     }
 
     /// Resolve `build:` directives in a `ZImage` by running nested builds.
@@ -2085,6 +2234,18 @@ fn generate_build_id() -> String {
     let hash = hasher.finalize();
     // 12 hex chars = 6 bytes = 48 bits of entropy, ample for build parallelism
     hex::encode(&hash[..6])
+}
+
+/// Convert a [`ZCommand`](crate::zimage::ZCommand) into a vector of string arguments
+/// suitable for passing to [`WasmBuildConfig`](crate::wasm_builder::WasmBuildConfig)
+/// pre/post build command lists.
+fn zcommand_to_args(cmd: &crate::zimage::ZCommand) -> Vec<String> {
+    match cmd {
+        crate::zimage::ZCommand::Shell(s) => {
+            vec!["/bin/sh".to_string(), "-c".to_string(), s.clone()]
+        }
+        crate::zimage::ZCommand::Exec(args) => args.clone(),
+    }
 }
 
 #[cfg(test)]

@@ -117,11 +117,22 @@ fn detect_memory_used() -> u64 {
 // Disk detection (via nix::sys::statvfs)
 // =============================================================================
 
+/// statvfs `blocks()`/`blocks_available()` return `u64` on Linux but `u32` on macOS.
+/// This helper widens to `u64` on macOS and is a no-op on Linux.
+#[cfg(target_os = "macos")]
+fn blocks_u64(v: u32) -> u64 {
+    u64::from(v)
+}
+#[cfg(not(target_os = "macos"))]
+fn blocks_u64(v: u64) -> u64 {
+    v
+}
+
 fn detect_disk_total(data_dir: &Path) -> u64 {
     match nix::sys::statvfs::statvfs(data_dir) {
         Ok(stat) => {
             // Total blocks * fragment size = total bytes
-            u64::from(stat.blocks()) * stat.fragment_size()
+            blocks_u64(stat.blocks()) * stat.fragment_size()
         }
         Err(_) => 0,
     }
@@ -131,9 +142,9 @@ fn detect_disk_used(data_dir: &Path) -> u64 {
     match nix::sys::statvfs::statvfs(data_dir) {
         Ok(stat) => {
             let frag = stat.fragment_size();
-            let total = u64::from(stat.blocks()) * frag;
+            let total = blocks_u64(stat.blocks()) * frag;
             // blocks_available is free blocks available to unprivileged users
-            let avail = u64::from(stat.blocks_available()) * frag;
+            let avail = blocks_u64(stat.blocks_available()) * frag;
             total.saturating_sub(avail)
         }
         Err(_) => 0,

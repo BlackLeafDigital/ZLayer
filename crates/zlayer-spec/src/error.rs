@@ -119,6 +119,24 @@ pub enum ValidationErrorKind {
 
     /// Invalid tunnel TTL format
     InvalidTunnelTtl { value: String, reason: String },
+
+    /// WASM config present on non-WASM service type
+    WasmConfigOnNonWasmType,
+
+    /// WASM `min_instances` > `max_instances`
+    InvalidWasmInstanceRange { min: u32, max: u32 },
+
+    /// WASM capability not available for this service type
+    WasmCapabilityNotAvailable {
+        capability: String,
+        service_type: String,
+    },
+
+    /// `WasmHttp` service missing HTTP endpoint
+    WasmHttpMissingHttpEndpoint,
+
+    /// WASM preopen with empty source or target
+    WasmPreopenEmpty { index: usize, field: String },
 }
 
 impl fmt::Display for ValidationErrorKind {
@@ -185,6 +203,31 @@ impl fmt::Display for ValidationErrorKind {
             }
             Self::InvalidTunnelTtl { value, reason } => {
                 write!(f, "invalid tunnel max_ttl '{value}': {reason}")
+            }
+            Self::WasmConfigOnNonWasmType => {
+                write!(f, "wasm config provided but service_type is not a WASM type")
+            }
+            Self::InvalidWasmInstanceRange { min, max } => {
+                write!(
+                    f,
+                    "wasm min_instances ({min}) > max_instances ({max})"
+                )
+            }
+            Self::WasmCapabilityNotAvailable {
+                capability,
+                service_type,
+            } => write!(
+                f,
+                "capability '{capability}' is not available for WASM service type '{service_type}' (world does not import it)"
+            ),
+            Self::WasmHttpMissingHttpEndpoint => {
+                write!(
+                    f,
+                    "wasm_http service type should have at least one HTTP endpoint"
+                )
+            }
+            Self::WasmPreopenEmpty { index, field } => {
+                write!(f, "wasm preopen[{index}].{field} cannot be empty")
             }
         }
     }

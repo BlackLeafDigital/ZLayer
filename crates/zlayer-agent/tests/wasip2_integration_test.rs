@@ -153,7 +153,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         node_mode: NodeMode::default(),
         node_selector: None,
         service_type: zlayer_spec::ServiceType::Standard,
-        wasm_http: None,
+        wasm: None,
         host_network: false,
     }
 }

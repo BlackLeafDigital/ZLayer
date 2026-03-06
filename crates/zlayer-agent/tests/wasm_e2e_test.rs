@@ -2546,3 +2546,494 @@ mod wasm_complete_flow_e2e {
         );
     }
 }
+
+// =============================================================================
+// E2E Test: Expanded ServiceType
+// =============================================================================
+
+mod wasm_service_type_e2e {
+    use zlayer_spec::ServiceType;
+
+    #[test]
+    fn test_is_wasm() {
+        assert!(!ServiceType::Standard.is_wasm());
+        assert!(!ServiceType::Job.is_wasm());
+        assert!(ServiceType::WasmHttp.is_wasm());
+        assert!(ServiceType::WasmPlugin.is_wasm());
+        assert!(ServiceType::WasmTransformer.is_wasm());
+        assert!(ServiceType::WasmAuthenticator.is_wasm());
+        assert!(ServiceType::WasmRateLimiter.is_wasm());
+        assert!(ServiceType::WasmMiddleware.is_wasm());
+        assert!(ServiceType::WasmRouter.is_wasm());
+    }
+
+    #[test]
+    fn test_default_capabilities_for_non_wasm_is_none() {
+        assert!(ServiceType::Standard.default_wasm_capabilities().is_none());
+        assert!(ServiceType::Job.default_wasm_capabilities().is_none());
+    }
+
+    #[test]
+    fn test_wasm_http_default_capabilities() {
+        let caps = ServiceType::WasmHttp.default_wasm_capabilities().unwrap();
+        assert!(caps.config);
+        assert!(caps.keyvalue);
+        assert!(caps.logging);
+        assert!(!caps.secrets);
+        assert!(!caps.metrics);
+        assert!(caps.http_client);
+        assert!(!caps.cli);
+        assert!(!caps.filesystem);
+        assert!(!caps.sockets);
+    }
+
+    #[test]
+    fn test_wasm_plugin_default_capabilities() {
+        let caps = ServiceType::WasmPlugin.default_wasm_capabilities().unwrap();
+        // Plugin gets everything except sockets
+        assert!(caps.config);
+        assert!(caps.keyvalue);
+        assert!(caps.logging);
+        assert!(caps.secrets);
+        assert!(caps.metrics);
+        assert!(caps.http_client);
+        assert!(caps.cli);
+        assert!(caps.filesystem);
+        assert!(!caps.sockets);
+    }
+
+    #[test]
+    fn test_wasm_authenticator_default_capabilities() {
+        let caps = ServiceType::WasmAuthenticator
+            .default_wasm_capabilities()
+            .unwrap();
+        assert!(caps.config);
+        assert!(!caps.keyvalue); // Auth doesn't get KV by default
+        assert!(caps.logging);
+        assert!(caps.secrets); // Auth gets secrets
+        assert!(!caps.metrics);
+        assert!(caps.http_client); // Auth can make outgoing HTTP (e.g. OIDC)
+        assert!(!caps.cli);
+        assert!(!caps.filesystem);
+        assert!(!caps.sockets);
+    }
+
+    #[test]
+    fn test_wasm_rate_limiter_default_capabilities() {
+        let caps = ServiceType::WasmRateLimiter
+            .default_wasm_capabilities()
+            .unwrap();
+        assert!(caps.config);
+        assert!(caps.keyvalue); // Rate limiter needs KV for counters
+        assert!(caps.logging);
+        assert!(!caps.secrets);
+        assert!(caps.metrics); // Rate limiter emits metrics
+        assert!(!caps.http_client);
+        assert!(caps.cli);
+        assert!(!caps.filesystem);
+        assert!(!caps.sockets);
+    }
+
+    #[test]
+    fn test_wasm_transformer_default_capabilities() {
+        let caps = ServiceType::WasmTransformer
+            .default_wasm_capabilities()
+            .unwrap();
+        // Transformer is minimal - just logging and CLI
+        assert!(!caps.config);
+        assert!(!caps.keyvalue);
+        assert!(caps.logging);
+        assert!(!caps.secrets);
+        assert!(!caps.metrics);
+        assert!(!caps.http_client);
+        assert!(caps.cli);
+        assert!(!caps.filesystem);
+        assert!(!caps.sockets);
+    }
+
+    #[test]
+    fn test_wasm_middleware_default_capabilities() {
+        let caps = ServiceType::WasmMiddleware
+            .default_wasm_capabilities()
+            .unwrap();
+        assert!(caps.config);
+        assert!(!caps.keyvalue);
+        assert!(caps.logging);
+        assert!(!caps.secrets);
+        assert!(!caps.metrics);
+        assert!(caps.http_client);
+        assert!(!caps.cli);
+        assert!(!caps.filesystem);
+        assert!(!caps.sockets);
+    }
+
+    #[test]
+    fn test_wasm_router_default_capabilities() {
+        let caps = ServiceType::WasmRouter.default_wasm_capabilities().unwrap();
+        assert!(caps.config);
+        assert!(caps.keyvalue);
+        assert!(caps.logging);
+        assert!(!caps.secrets);
+        assert!(!caps.metrics);
+        assert!(caps.http_client);
+        assert!(!caps.cli);
+        assert!(!caps.filesystem);
+        assert!(!caps.sockets);
+    }
+
+    #[test]
+    fn test_all_wasm_types_have_logging() {
+        // Every WASM world should have logging enabled by default
+        let wasm_types = [
+            ServiceType::WasmHttp,
+            ServiceType::WasmPlugin,
+            ServiceType::WasmTransformer,
+            ServiceType::WasmAuthenticator,
+            ServiceType::WasmRateLimiter,
+            ServiceType::WasmMiddleware,
+            ServiceType::WasmRouter,
+        ];
+        for st in wasm_types {
+            let caps = st
+                .default_wasm_capabilities()
+                .unwrap_or_else(|| panic!("{:?} should have default capabilities", st));
+            assert!(caps.logging, "{:?} should have logging enabled", st);
+        }
+    }
+
+    #[test]
+    fn test_service_type_serde_round_trip() {
+        // Test that all variants serialize/deserialize correctly
+        let types = [
+            ("\"standard\"", ServiceType::Standard),
+            ("\"wasm_http\"", ServiceType::WasmHttp),
+            ("\"wasm_plugin\"", ServiceType::WasmPlugin),
+            ("\"wasm_transformer\"", ServiceType::WasmTransformer),
+            ("\"wasm_authenticator\"", ServiceType::WasmAuthenticator),
+            ("\"wasm_rate_limiter\"", ServiceType::WasmRateLimiter),
+            ("\"wasm_middleware\"", ServiceType::WasmMiddleware),
+            ("\"wasm_router\"", ServiceType::WasmRouter),
+            ("\"job\"", ServiceType::Job),
+        ];
+        for (json, expected) in types {
+            let deserialized: ServiceType = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("Failed to deserialize {}: {}", json, e));
+            assert_eq!(deserialized, expected, "Failed for {}", json);
+
+            let serialized = serde_json::to_string(&expected).unwrap();
+            assert_eq!(
+                serialized, json,
+                "Serialization mismatch for {:?}",
+                expected
+            );
+        }
+    }
+}
+
+// =============================================================================
+// E2E Test: WasmConfig
+// =============================================================================
+
+mod wasm_config_e2e {
+    use std::time::Duration;
+    use zlayer_spec::{WasmCapabilities, WasmConfig, WasmPreopen};
+
+    #[test]
+    fn test_wasm_config_defaults() {
+        let config = WasmConfig::default();
+        assert_eq!(config.min_instances, 0);
+        assert_eq!(config.max_instances, 10);
+        assert_eq!(config.idle_timeout, Duration::from_secs(300));
+        assert_eq!(config.request_timeout, Duration::from_secs(30));
+        assert!(config.max_memory.is_none());
+        assert_eq!(config.max_fuel, 0);
+        assert!(config.epoch_interval.is_none());
+        assert!(config.capabilities.is_none());
+        assert!(config.allow_http_outgoing);
+        assert!(config.allowed_hosts.is_empty());
+        assert!(!config.allow_tcp);
+        assert!(!config.allow_udp);
+        assert!(config.preopens.is_empty());
+        assert!(config.kv_enabled);
+        assert!(config.kv_namespace.is_none());
+        assert_eq!(config.kv_max_value_size, 1_048_576); // 1MB
+        assert!(config.secrets.is_empty());
+        assert!(config.precompile);
+    }
+
+    #[test]
+    fn test_wasm_config_yaml_parsing() {
+        let yaml = r#"
+min_instances: 2
+max_instances: 50
+request_timeout: 30s
+idle_timeout: 5m
+max_memory: 64Mi
+max_fuel: 1000000000
+allow_http_outgoing: true
+allowed_hosts:
+  - "api.stripe.com"
+  - "api.github.com"
+allow_tcp: false
+allow_udp: false
+kv_enabled: true
+kv_namespace: my-service
+secrets:
+  - stripe-key
+  - db-password
+precompile: true
+preopens:
+  - source: /host/data
+    target: /guest/data
+    readonly: true
+capabilities:
+  config: true
+  keyvalue: true
+  logging: true
+  secrets: true
+  metrics: false
+"#;
+        let config: WasmConfig = serde_yml::from_str(yaml).unwrap();
+        assert_eq!(config.min_instances, 2);
+        assert_eq!(config.max_instances, 50);
+        assert_eq!(config.max_memory, Some("64Mi".to_string()));
+        assert_eq!(config.max_fuel, 1_000_000_000);
+        assert_eq!(config.allowed_hosts.len(), 2);
+        assert_eq!(config.secrets.len(), 2);
+        assert_eq!(config.preopens.len(), 1);
+        assert_eq!(config.preopens[0].source, "/host/data");
+        assert!(config.preopens[0].readonly);
+        let caps = config.capabilities.unwrap();
+        assert!(caps.secrets);
+        assert!(!caps.metrics);
+    }
+
+    #[test]
+    fn test_wasm_capabilities_defaults() {
+        let caps = WasmCapabilities::default();
+        assert!(caps.config);
+        assert!(caps.keyvalue);
+        assert!(caps.logging);
+        assert!(!caps.secrets);
+        assert!(caps.metrics);
+        assert!(!caps.http_client);
+        assert!(!caps.cli);
+        assert!(!caps.filesystem);
+        assert!(!caps.sockets);
+    }
+
+    #[test]
+    fn test_wasm_preopen_construction() {
+        let preopen = WasmPreopen {
+            source: "/host/path".to_string(),
+            target: "/guest/path".to_string(),
+            readonly: true,
+        };
+        assert_eq!(preopen.source, "/host/path");
+        assert_eq!(preopen.target, "/guest/path");
+        assert!(preopen.readonly);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_wasm_config_from_wasm_http_config() {
+        let old = zlayer_spec::WasmHttpConfig {
+            min_instances: 3,
+            max_instances: 25,
+            idle_timeout: Duration::from_secs(120),
+            request_timeout: Duration::from_secs(45),
+        };
+        let new: WasmConfig = old.into();
+        assert_eq!(new.min_instances, 3);
+        assert_eq!(new.max_instances, 25);
+        assert_eq!(new.idle_timeout, Duration::from_secs(120));
+        assert_eq!(new.request_timeout, Duration::from_secs(45));
+        // All other fields should be defaults
+        assert!(new.max_memory.is_none());
+        assert_eq!(new.max_fuel, 0);
+        assert!(new.precompile);
+    }
+
+    #[test]
+    fn test_wasm_config_backward_compat_alias() {
+        // Test that 'wasm_http' key still works via serde alias in ServiceSpec
+        let yaml = r#"
+version: v1
+deployment: test-deploy
+services:
+  my-svc:
+    service_type: wasm_http
+    image:
+      name: test:latest
+    wasm_http:
+      min_instances: 1
+      max_instances: 5
+      idle_timeout: 60s
+      request_timeout: 10s
+    endpoints:
+      - name: http
+        protocol: http
+        port: 8080
+"#;
+        let result = zlayer_spec::from_yaml_str(yaml);
+        // This should parse without errors - the wasm_http alias works
+        assert!(
+            result.is_ok(),
+            "wasm_http alias should be accepted: {:?}",
+            result.err()
+        );
+    }
+}
+
+// =============================================================================
+// E2E Test: Runtime Dispatcher
+// =============================================================================
+
+mod wasm_runtime_dispatcher_e2e {
+    use zlayer_agent::runtimes::{
+        create_wasm_runtime_for_service_type, WasmPipelineConfig, WasmPipelineRuntime,
+        WasmRuntimeKind,
+    };
+    use zlayer_spec::{ServiceType, WasmCapabilities, WasmConfig};
+
+    #[test]
+    fn test_dispatch_wasm_http() {
+        let config = WasmConfig::default();
+        let result = create_wasm_runtime_for_service_type(ServiceType::WasmHttp, &config);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), WasmRuntimeKind::Http(_)));
+    }
+
+    #[test]
+    fn test_dispatch_wasm_plugin() {
+        let config = WasmConfig::default();
+        let result = create_wasm_runtime_for_service_type(ServiceType::WasmPlugin, &config);
+        assert!(result.is_ok());
+        assert!(matches!(result.unwrap(), WasmRuntimeKind::Plugin(_)));
+    }
+
+    #[test]
+    fn test_dispatch_pipeline_types() {
+        let config = WasmConfig::default();
+        let pipeline_types = [
+            ServiceType::WasmTransformer,
+            ServiceType::WasmAuthenticator,
+            ServiceType::WasmRateLimiter,
+            ServiceType::WasmMiddleware,
+            ServiceType::WasmRouter,
+        ];
+        for st in pipeline_types {
+            let result = create_wasm_runtime_for_service_type(st, &config);
+            assert!(result.is_ok(), "Failed for {:?}", st);
+            assert!(
+                matches!(result.unwrap(), WasmRuntimeKind::Pipeline(_)),
+                "Expected Pipeline for {:?}",
+                st
+            );
+        }
+    }
+
+    #[test]
+    fn test_dispatch_non_wasm_type_fails() {
+        let config = WasmConfig::default();
+        let result = create_wasm_runtime_for_service_type(ServiceType::Standard, &config);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_pipeline_runtime_stage_names() {
+        let cases = [
+            (ServiceType::WasmTransformer, "transform"),
+            (ServiceType::WasmAuthenticator, "authenticate"),
+            (ServiceType::WasmRateLimiter, "rate_limit"),
+            (ServiceType::WasmMiddleware, "middleware"),
+            (ServiceType::WasmRouter, "route"),
+        ];
+        for (st, expected_stage) in cases {
+            let config = WasmPipelineConfig {
+                service_type: st,
+                capabilities: WasmCapabilities::default(),
+                max_memory: None,
+                max_fuel: 0,
+                request_timeout: std::time::Duration::from_secs(30),
+                min_instances: 0,
+                max_instances: 10,
+            };
+            let runtime = WasmPipelineRuntime::new(config).unwrap();
+            assert_eq!(runtime.pipeline_stage(), expected_stage);
+            assert_eq!(runtime.service_type(), st);
+        }
+    }
+}
+
+// =============================================================================
+// E2E Test: Capability-Aware HTTP Runtime
+// =============================================================================
+
+mod wasm_capability_runtime_e2e {
+    use super::*;
+    use zlayer_spec::WasmCapabilities;
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_http_runtime_with_capabilities() {
+        let config = WasmHttpConfig::default();
+        let caps = WasmCapabilities {
+            config: true,
+            keyvalue: true,
+            logging: true,
+            secrets: false,
+            metrics: false,
+            http_client: true,
+            cli: false,
+            filesystem: false,
+            sockets: false,
+        };
+        let runtime = WasmHttpRuntime::new_with_capabilities(config, caps.clone());
+        assert!(runtime.is_ok(), "Should create runtime with capabilities");
+
+        let rt = runtime.unwrap();
+        let rt_caps = rt.capabilities();
+        assert!(rt_caps.is_some());
+        let rt_caps = rt_caps.unwrap();
+        assert!(rt_caps.config);
+        assert!(!rt_caps.secrets);
+        assert!(rt_caps.http_client);
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_http_runtime_with_minimal_capabilities() {
+        let config = WasmHttpConfig::default();
+        let caps = WasmCapabilities {
+            config: false,
+            keyvalue: false,
+            logging: true, // Always need logging
+            secrets: false,
+            metrics: false,
+            http_client: false,
+            cli: false,
+            filesystem: false,
+            sockets: false,
+        };
+        let runtime = WasmHttpRuntime::new_with_capabilities(config, caps);
+        assert!(
+            runtime.is_ok(),
+            "Should create runtime with minimal capabilities"
+        );
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn test_http_runtime_pool_stats_with_capabilities() {
+        let config = WasmHttpConfig::default();
+        let caps = WasmCapabilities::default();
+        let runtime = WasmHttpRuntime::new_with_capabilities(config, caps).unwrap();
+
+        // Should still track pool stats normally
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let stats = rt.block_on(runtime.pool_stats());
+        assert_eq!(stats.cached_components, 0);
+        assert_eq!(stats.total_requests, 0);
+    }
+}

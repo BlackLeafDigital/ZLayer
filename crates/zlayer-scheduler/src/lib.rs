@@ -449,7 +449,7 @@ impl Scheduler {
             node_mode: zlayer_spec::NodeMode::Shared,
             node_selector: None,
             service_type: zlayer_spec::ServiceType::default(),
-            wasm_http: None,
+            wasm: None,
             host_network: false,
         };
 

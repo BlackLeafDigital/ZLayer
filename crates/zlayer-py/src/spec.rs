@@ -568,7 +568,7 @@ pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResu
         node_mode: zlayer_spec::NodeMode::default(),
         node_selector: None,
         service_type: zlayer_spec::ServiceType::default(),
-        wasm_http: None,
+        wasm: None,
         host_network: false,
     };
 

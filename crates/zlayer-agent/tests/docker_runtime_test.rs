@@ -98,7 +98,7 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         node_mode: NodeMode::default(),
         node_selector: None,
         service_type: ServiceType::default(),
-        wasm_http: None,
+        wasm: None,
         host_network: false,
     }
 }
