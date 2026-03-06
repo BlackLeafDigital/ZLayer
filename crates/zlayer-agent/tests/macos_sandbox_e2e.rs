@@ -386,11 +386,7 @@ async fn prepare_native_image(runtime: &SandboxRuntime, image_name: &str) {
     runtime
         .register_local_rootfs(image_name, &source_dir)
         .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "Failed to register local rootfs for '{image_name}': {e}"
-            )
-        });
+        .unwrap_or_else(|e| panic!("Failed to register local rootfs for '{image_name}': {e}"));
 }
 
 /// Cleanup helper -- ensures container is removed even on test failure
@@ -1258,9 +1254,7 @@ async fn test_exec_in_container() {
         assert!(result.is_ok(), "exec failed: {result:?}");
 
         let (exit_code, stdout, stderr) = result.unwrap();
-        println!(
-            "exec exit_code={exit_code}, stdout={stdout}, stderr={stderr}"
-        );
+        println!("exec exit_code={exit_code}, stdout={stdout}, stderr={stderr}");
         assert_eq!(exit_code, 0, "echo should exit with code 0");
         assert!(
             stdout.contains("exec test"),
@@ -1467,9 +1461,7 @@ async fn test_state_nonexistent() {
             Err(other) => {
                 panic!("Expected NotFound, got: {other:?}");
             }
-            Ok(state) => panic!(
-                "Should not get state for non-existent container, got: {state:?}"
-            ),
+            Ok(state) => panic!("Should not get state for non-existent container, got: {state:?}"),
         }
     });
 }

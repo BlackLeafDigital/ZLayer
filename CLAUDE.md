@@ -158,6 +158,8 @@ cargo run -p zlayer-build -- build . -t myapp:latest
 
 ### Formatting and Linting
 
+**CRITICAL: `cargo fmt --all` MUST be run after EVERY code change. No exceptions. Ever. Do it before clippy, before tests, before commits. If code is not formatted, it is not done.**
+
 **CRITICAL: ALWAYS lint the ENTIRE workspace, not individual crates.** Never use `-p <crate>` for clippy. Always use `--workspace`.
 
 ```bash
@@ -165,7 +167,17 @@ cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-After ANY code change, run both commands above on the full workspace before considering the work done. No exceptions.
+After ANY code change, run BOTH commands above on the full workspace before considering the work done. `cargo fmt --all` FIRST, then clippy. No exceptions.
+
+### Pre-commit Hook
+
+A pre-commit hook lives in `.githooks/pre-commit` and runs `cargo fmt --all` + `cargo clippy --workspace --all-targets -- -D warnings` on every commit. Git must be configured to use it:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Never skip it with `--no-verify`. If it fails, fix the code.
 
 ## Changelog
 

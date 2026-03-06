@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+set -e
+
+echo ">>> pre-commit: cargo fmt --all"
+cargo fmt --all
+
+# Re-stage any files that were reformatted
+git diff --name-only | while read -r file; do
+    if git diff --cached --name-only | grep -qF "$file"; then
+        git add "$file"
+    fi
+done
+
+echo ">>> pre-commit: cargo clippy --workspace --all-targets -- -D warnings"
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo ">>> pre-commit: passed"
