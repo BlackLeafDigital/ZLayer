@@ -16,8 +16,11 @@
 mod app;
 mod cli;
 mod commands;
+#[cfg(unix)]
 mod config;
+#[cfg(unix)]
 pub mod daemon;
+#[cfg(unix)]
 pub mod daemon_client;
 #[allow(dead_code)]
 mod deploy_tui;
@@ -426,93 +429,10 @@ async fn run(cli: Cli) -> Result<()> {
         .as_ref()
         .expect("command should be Some in run()");
     match command {
+        // =================================================================
+        // Cross-platform commands (build, registry, inspection, etc.)
+        // =================================================================
         Commands::Tui { .. } => unreachable!("TUI handled before async runtime"),
-        Commands::Deploy { spec_path, dry_run } => {
-            let path = util::discover_spec_path(spec_path.as_deref())?;
-            commands::deploy::deploy(&cli, &path, *dry_run).await
-        }
-        Commands::Join {
-            token,
-            spec_dir,
-            service,
-            replicas,
-        } => {
-            commands::join::join(
-                &cli,
-                token,
-                spec_dir.as_deref(),
-                service.as_deref(),
-                *replicas,
-            )
-            .await
-        }
-        Commands::Serve {
-            bind,
-            jwt_secret,
-            no_swagger,
-            daemon: _, // Already handled in main() before tokio runtime
-            ..
-        } => {
-            #[cfg(all(target_os = "windows", feature = "wsl"))]
-            {
-                let _ = (bind, jwt_secret, no_swagger);
-                let config = zlayer_wsl::setup::ensure_wsl_backend_ready()
-                    .context("Failed to set up WSL2 backend")?;
-                zlayer_wsl::daemon::start_daemon(&config)
-                    .await
-                    .context("Failed to start daemon in WSL2")?;
-                println!("zlayer daemon running inside WSL2 on {}", config.api_addr);
-                Ok(())
-            }
-            #[cfg(not(all(target_os = "windows", feature = "wsl")))]
-            {
-                let socket_path = cli.effective_socket_path();
-                let data_dir = cli.effective_data_dir();
-                commands::serve::serve(
-                    bind,
-                    jwt_secret.clone(),
-                    *no_swagger,
-                    &socket_path,
-                    cli.host_network,
-                    data_dir,
-                )
-                .await
-            }
-        }
-        Commands::Status => commands::lifecycle::status(&cli).await,
-        Commands::Validate { spec_path } => {
-            let path = util::discover_spec_path(spec_path.as_deref())?;
-            commands::lifecycle::validate(&path)
-        }
-        Commands::Logs {
-            deployment,
-            service,
-            lines,
-            follow,
-            instance,
-        } => {
-            commands::lifecycle::logs(deployment, service, *lines, *follow, instance.clone()).await
-        }
-        Commands::Stop {
-            deployment,
-            service,
-            force,
-            timeout,
-        } => {
-            commands::lifecycle::stop(
-                deployment,
-                service.clone(),
-                *force,
-                *timeout,
-                &cli.effective_state_dir(),
-            )
-            .await
-        }
-        Commands::Up { spec_path } => {
-            let path = util::discover_spec_path(spec_path.as_deref())?;
-            commands::deploy::up(&cli, &path).await
-        }
-        Commands::Down { deployment } => commands::deploy::down(deployment.clone()).await,
         Commands::Build {
             context,
             file,
@@ -544,36 +464,11 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Commands::Runtimes => commands::build::handle_runtimes(),
-        Commands::Token(token_cmd) => commands::token::handle_token(token_cmd),
+        Commands::Validate { spec_path } => {
+            let path = util::discover_spec_path(spec_path.as_deref())?;
+            commands::lifecycle::validate(&path)
+        }
         Commands::Spec(spec_cmd) => commands::spec::handle_spec(spec_cmd),
-        Commands::Export {
-            image,
-            output,
-            gzip,
-        } => commands::registry::handle_export(&cli, image, output, *gzip).await,
-        Commands::Import { input, tag } => {
-            commands::registry::handle_import(&cli, input, tag.clone()).await
-        }
-        Commands::Wasm(wasm_cmd) => commands::wasm::handle_wasm(&cli, wasm_cmd).await,
-        Commands::Tunnel(tunnel_cmd) => commands::tunnel::handle_tunnel(&cli, tunnel_cmd).await,
-        Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd),
-        Commands::Pull { image } => {
-            commands::registry::handle_pull(image, &cli.effective_data_dir()).await
-        }
-        Commands::Exec {
-            service,
-            deployment,
-            replica,
-            cmd,
-        } => commands::exec::exec(deployment.clone(), service, *replica, cmd).await,
-        Commands::Ps {
-            deployment,
-            containers,
-            format,
-        } => commands::ps::ps(deployment.clone(), *containers, format).await,
-        Commands::Node(node_cmd) => {
-            commands::node::handle_node(node_cmd, &cli.effective_data_dir()).await
-        }
         Commands::Pipeline {
             file,
             set,
@@ -592,6 +487,151 @@ async fn run(cli: Cli) -> Result<()> {
             )
             .await
         }
+        Commands::Wasm(wasm_cmd) => commands::wasm::handle_wasm(&cli, wasm_cmd).await,
+        Commands::Tunnel(tunnel_cmd) => commands::tunnel::handle_tunnel(&cli, tunnel_cmd).await,
+        Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd),
+        Commands::Export {
+            image,
+            output,
+            gzip,
+        } => commands::registry::handle_export(&cli, image, output, *gzip).await,
+        Commands::Import { input, tag } => {
+            commands::registry::handle_import(&cli, input, tag.clone()).await
+        }
+        Commands::Pull { image } => {
+            commands::registry::handle_pull(image, &cli.effective_data_dir()).await
+        }
+
+        // =================================================================
+        // Serve -- special handling: WSL on Windows, direct on Unix
+        // =================================================================
+        Commands::Serve {
+            bind,
+            jwt_secret,
+            no_swagger,
+            daemon: _, // Already handled in main() before tokio runtime
+            ..
+        } => {
+            #[cfg(all(target_os = "windows", feature = "wsl"))]
+            {
+                let _ = (bind, jwt_secret, no_swagger);
+                let config = zlayer_wsl::setup::ensure_wsl_backend_ready()
+                    .context("Failed to set up WSL2 backend")?;
+                zlayer_wsl::daemon::start_daemon(&config)
+                    .await
+                    .context("Failed to start daemon in WSL2")?;
+                println!("zlayer daemon running inside WSL2 on {}", config.api_addr);
+                Ok(())
+            }
+            #[cfg(all(target_os = "windows", not(feature = "wsl")))]
+            {
+                let _ = (bind, jwt_secret, no_swagger);
+                anyhow::bail!(
+                    "The 'serve' command requires the WSL feature on Windows.\n\
+                     Rebuild with: cargo build --features wsl"
+                );
+            }
+            #[cfg(unix)]
+            {
+                let socket_path = cli.effective_socket_path();
+                let data_dir = cli.effective_data_dir();
+                commands::serve::serve(
+                    bind,
+                    jwt_secret.clone(),
+                    *no_swagger,
+                    &socket_path,
+                    cli.host_network,
+                    data_dir,
+                )
+                .await
+            }
+        }
+
+        // =================================================================
+        // Runtime commands -- Unix only
+        // =================================================================
+        #[cfg(unix)]
+        Commands::Deploy { spec_path, dry_run } => {
+            let path = util::discover_spec_path(spec_path.as_deref())?;
+            commands::deploy::deploy(&cli, &path, *dry_run).await
+        }
+        #[cfg(unix)]
+        Commands::Join {
+            token,
+            spec_dir,
+            service,
+            replicas,
+        } => {
+            commands::join::join(
+                &cli,
+                token,
+                spec_dir.as_deref(),
+                service.as_deref(),
+                *replicas,
+            )
+            .await
+        }
+        #[cfg(unix)]
+        Commands::Status => commands::lifecycle::status(&cli).await,
+        #[cfg(unix)]
+        Commands::Logs {
+            deployment,
+            service,
+            lines,
+            follow,
+            instance,
+        } => {
+            commands::lifecycle::logs(deployment, service, *lines, *follow, instance.clone()).await
+        }
+        #[cfg(unix)]
+        Commands::Stop {
+            deployment,
+            service,
+            force,
+            timeout,
+        } => {
+            commands::lifecycle::stop(
+                deployment,
+                service.clone(),
+                *force,
+                *timeout,
+                &cli.effective_state_dir(),
+            )
+            .await
+        }
+        #[cfg(unix)]
+        Commands::Up { spec_path } => {
+            let path = util::discover_spec_path(spec_path.as_deref())?;
+            commands::deploy::up(&cli, &path).await
+        }
+        #[cfg(unix)]
+        Commands::Down { deployment } => commands::deploy::down(deployment.clone()).await,
+        #[cfg(unix)]
+        Commands::Token(token_cmd) => commands::token::handle_token(token_cmd),
+        #[cfg(unix)]
+        Commands::Exec {
+            service,
+            deployment,
+            replica,
+            cmd,
+        } => commands::exec::exec(deployment.clone(), service, *replica, cmd).await,
+        #[cfg(unix)]
+        Commands::Ps {
+            deployment,
+            containers,
+            format,
+        } => commands::ps::ps(deployment.clone(), *containers, format).await,
+        #[cfg(unix)]
+        Commands::Node(node_cmd) => {
+            commands::node::handle_node(node_cmd, &cli.effective_data_dir()).await
+        }
+
+        // On non-Unix platforms, runtime commands are not available
+        #[cfg(not(unix))]
+        _ => anyhow::bail!(
+            "This command requires the ZLayer runtime which is not available on Windows.\n\
+             Start the WSL2 daemon with 'zlayer serve' and use the daemon API."
+        ),
     }
 }
 

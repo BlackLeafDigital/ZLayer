@@ -1,7 +1,7 @@
 //! Axum HTTP service for receiving Raft RPCs.
 //!
 //! Provides an Axum router with endpoints for all Raft RPC operations.
-//! Uses **bincode** serialization for request/response bodies.
+//! Uses **postcard2** serialization for request/response bodies.
 //!
 //! When an `auth_token` is provided, every request must include an
 //! `Authorization: Bearer <token>` header matching the expected value.
@@ -44,7 +44,7 @@ struct RaftState<C: RaftTypeConfig> {
 /// the `Authorization: Bearer <token>` header on every request.  Requests
 /// that do not carry a matching token are rejected with HTTP 401.
 ///
-/// The router uses bincode for serialization. Mount it at any prefix:
+/// The router uses postcard2 for serialization. Mount it at any prefix:
 ///
 /// ```ignore
 /// let raft_router = raft_service_router(raft_instance, Some("secret".into()));
@@ -116,7 +116,7 @@ where
     C::R: serde::Serialize + serde::de::DeserializeOwned,
     C::Entry: serde::Serialize + serde::de::DeserializeOwned,
 {
-    let req: VoteRequest<NodeId> = match bincode::deserialize(&body) {
+    let req: VoteRequest<NodeId> = match postcard2::from_bytes(&body) {
         Ok(r) => r,
         Err(e) => {
             error!("Failed to deserialize vote request: {e}");
@@ -127,7 +127,7 @@ where
     debug!("Received vote RPC");
 
     match state.raft.vote(req).await {
-        Ok(resp) => match bincode::serialize(&resp) {
+        Ok(resp) => match postcard2::to_vec(&resp) {
             Ok(bytes) => (StatusCode::OK, bytes),
             Err(e) => {
                 error!("Failed to serialize vote response: {e}");
@@ -148,7 +148,7 @@ where
     C::R: serde::Serialize + serde::de::DeserializeOwned,
     C::Entry: serde::Serialize + serde::de::DeserializeOwned,
 {
-    let req: AppendEntriesRequest<C> = match bincode::deserialize(&body) {
+    let req: AppendEntriesRequest<C> = match postcard2::from_bytes(&body) {
         Ok(r) => r,
         Err(e) => {
             error!("Failed to deserialize append request: {e}");
@@ -159,7 +159,7 @@ where
     debug!("Received append_entries RPC");
 
     match state.raft.append_entries(req).await {
-        Ok(resp) => match bincode::serialize(&resp) {
+        Ok(resp) => match postcard2::to_vec(&resp) {
             Ok(bytes) => (StatusCode::OK, bytes),
             Err(e) => {
                 error!("Failed to serialize append response: {e}");
@@ -183,7 +183,7 @@ where
     C::R: serde::Serialize + serde::de::DeserializeOwned,
     C::Entry: serde::Serialize + serde::de::DeserializeOwned,
 {
-    let req: InstallSnapshotRequest<C> = match bincode::deserialize(&body) {
+    let req: InstallSnapshotRequest<C> = match postcard2::from_bytes(&body) {
         Ok(r) => r,
         Err(e) => {
             error!("Failed to deserialize snapshot request: {e}");
@@ -194,7 +194,7 @@ where
     debug!("Received install_snapshot RPC");
 
     match state.raft.install_snapshot(req).await {
-        Ok(resp) => match bincode::serialize(&resp) {
+        Ok(resp) => match postcard2::to_vec(&resp) {
             Ok(bytes) => (StatusCode::OK, bytes),
             Err(e) => {
                 error!("Failed to serialize snapshot response: {e}");
@@ -225,7 +225,7 @@ where
     C::R: serde::Serialize + serde::de::DeserializeOwned,
     C::Entry: serde::Serialize + serde::de::DeserializeOwned,
 {
-    let req: FullSnapshotReq = match bincode::deserialize(&body) {
+    let req: FullSnapshotReq = match postcard2::from_bytes(&body) {
         Ok(r) => r,
         Err(e) => {
             error!("Failed to deserialize full snapshot request: {e}");
@@ -241,7 +241,7 @@ where
     };
 
     match state.raft.install_full_snapshot(req.vote, snapshot).await {
-        Ok(resp) => match bincode::serialize(&resp) {
+        Ok(resp) => match postcard2::to_vec(&resp) {
             Ok(bytes) => (StatusCode::OK, bytes),
             Err(e) => {
                 error!("Failed to serialize full snapshot response: {e}");

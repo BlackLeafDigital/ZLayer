@@ -1,12 +1,20 @@
 //! Lifecycle command handlers: status, validate, logs, stop.
 
-use anyhow::{Context, Result};
+#[cfg(unix)]
+use anyhow::Context;
+use anyhow::Result;
 use std::path::Path;
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(unix)]
+use tracing::warn;
 
+#[cfg(unix)]
 use crate::cli::Cli;
-use crate::util::{discover_spec_path, parse_spec};
+#[cfg(unix)]
+use crate::util::discover_spec_path;
+use crate::util::parse_spec;
 
+#[cfg(unix)]
 use zlayer_agent::RuntimeConfig;
 use zlayer_spec::DeploymentSpec;
 
@@ -15,6 +23,7 @@ use zlayer_spec::DeploymentSpec;
 /// When the daemon is running, displays PID, API bind address, socket path,
 /// runtime type, and a summary of active deployments.  When the daemon is
 /// not running, shows helpful instructions for starting it.
+#[cfg(unix)]
 pub(crate) async fn status(cli: &Cli) -> Result<()> {
     info!("Checking daemon status");
 
@@ -119,6 +128,7 @@ pub(crate) async fn status(cli: &Cli) -> Result<()> {
 }
 
 /// Read and parse `{data_dir}/daemon.json` if it exists.
+#[cfg(unix)]
 async fn read_daemon_metadata(data_dir: &std::path::Path) -> Option<serde_json::Value> {
     let path = data_dir.join("daemon.json");
     let contents = tokio::fs::read_to_string(&path).await.ok()?;
@@ -126,6 +136,7 @@ async fn read_daemon_metadata(data_dir: &std::path::Path) -> Option<serde_json::
 }
 
 /// Extract service count and total replica count from a deployment JSON value.
+#[cfg(unix)]
 #[allow(clippy::cast_possible_truncation)]
 fn extract_deployment_counts(dep: &serde_json::Value) -> (usize, u32) {
     // The deployment response may include a nested "spec" with services
@@ -157,6 +168,7 @@ fn extract_deployment_counts(dep: &serde_json::Value) -> (usize, u32) {
 }
 
 /// Return a human-readable name for the current platform's default runtime.
+#[cfg(unix)]
 fn detect_runtime_name() -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -195,6 +207,7 @@ pub(crate) fn validate(spec_path: &Path) -> Result<()> {
 /// When `follow` is false, fetches the last `lines` lines and prints them.
 /// When `follow` is true, opens an SSE stream to the daemon and prints log
 /// lines as they arrive in real time (until the user presses Ctrl+C).
+#[cfg(unix)]
 pub(crate) async fn logs(
     deployment: &str,
     service: &str,
@@ -246,6 +259,7 @@ pub(crate) async fn logs(
 /// `ServiceManager` (which has no knowledge of already-running containers).
 /// If a spec is found matching the deployment, it iterates over services and replicas.
 /// Also scans the state directory for any extra containers beyond the spec's replica count.
+#[cfg(unix)]
 pub(crate) async fn stop(
     deployment: &str,
     service: Option<String>,

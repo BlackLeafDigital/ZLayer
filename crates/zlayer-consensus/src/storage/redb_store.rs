@@ -14,9 +14,9 @@
 //!
 //! | Table | Key | Value |
 //! |-------|-----|-------|
-//! | `log_entries` | `u64` (log index) | bincode-encoded `Entry<C>` |
-//! | `meta` | `&str` (key name) | bincode-encoded metadata |
-//! | `snapshots` | `&str` ("current") | bincode-encoded snapshot |
+//! | `log_entries` | `u64` (log index) | postcard2-encoded `Entry<C>` |
+//! | `meta` | `&str` (key name) | postcard2-encoded metadata |
+//! | `snapshots` | `&str` ("current") | postcard2-encoded snapshot |
 
 use std::fmt::Debug;
 use std::io::Cursor;
@@ -40,17 +40,17 @@ use crate::types::NodeId;
 // Table definitions
 // ---------------------------------------------------------------------------
 
-/// Log entries table: index -> bincode(Entry<C>)
+/// Log entries table: index -> postcard2(Entry<C>)
 const LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("log_entries");
 
-/// Metadata table: `key_name` -> bincode(value)
+/// Metadata table: `key_name` -> postcard2(value)
 /// Keys: "vote", "`last_purged`", "committed"
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
-/// Snapshot table: "current" -> bincode(snapshot)
+/// Snapshot table: "current" -> postcard2(snapshot)
 const SNAPSHOT_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("snapshots");
 
-/// State machine table: "state" -> bincode(SM state)
+/// State machine table: "state" -> postcard2(SM state)
 const SM_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("state_machine");
 
 // Metadata keys
@@ -185,7 +185,7 @@ where
             let (_, value) = item.map_err(|e| {
                 redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Read, e)
             })?;
-            let entry: C::Entry = bincode::deserialize(value.value()).map_err(|e| {
+            let entry: C::Entry = postcard2::from_bytes(value.value()).map_err(|e| {
                 redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Read, e)
             })?;
             entries.push(entry);
@@ -231,7 +231,7 @@ where
             })?;
             match meta.get(META_LAST_PURGED) {
                 Ok(Some(v)) => {
-                    let id: LogId<NodeId> = bincode::deserialize(v.value()).map_err(|e| {
+                    let id: LogId<NodeId> = postcard2::from_bytes(v.value()).map_err(|e| {
                         redb_to_storage_err(
                             openraft::ErrorSubject::Logs,
                             openraft::ErrorVerb::Read,
@@ -254,7 +254,7 @@ where
             })?;
             match result {
                 Some((_, v)) => {
-                    let entry: C::Entry = bincode::deserialize(v.value()).map_err(|e| {
+                    let entry: C::Entry = postcard2::from_bytes(v.value()).map_err(|e| {
                         redb_to_storage_err(
                             openraft::ErrorSubject::Logs,
                             openraft::ErrorVerb::Read,
@@ -281,7 +281,7 @@ where
     }
 
     async fn save_vote(&mut self, vote: &Vote<NodeId>) -> Result<(), StorageError<NodeId>> {
-        let bytes = bincode::serialize(vote).map_err(|e| {
+        let bytes = postcard2::to_vec(vote).map_err(|e| {
             redb_to_storage_err(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Write, e)
         })?;
 
@@ -311,7 +311,7 @@ where
         })?;
         match meta.get(META_VOTE) {
             Ok(Some(v)) => {
-                let vote: Vote<NodeId> = bincode::deserialize(v.value()).map_err(|e| {
+                let vote: Vote<NodeId> = postcard2::from_bytes(v.value()).map_err(|e| {
                     redb_to_storage_err(openraft::ErrorSubject::Vote, openraft::ErrorVerb::Read, e)
                 })?;
                 Ok(Some(vote))
@@ -338,7 +338,7 @@ where
             })?;
             match committed {
                 Some(ref id) => {
-                    let bytes = bincode::serialize(id).map_err(|e| {
+                    let bytes = postcard2::to_vec(id).map_err(|e| {
                         redb_to_storage_err(
                             openraft::ErrorSubject::Logs,
                             openraft::ErrorVerb::Write,
@@ -373,7 +373,7 @@ where
         })?;
         match meta.get(META_COMMITTED) {
             Ok(Some(v)) => {
-                let id: LogId<NodeId> = bincode::deserialize(v.value()).map_err(|e| {
+                let id: LogId<NodeId> = postcard2::from_bytes(v.value()).map_err(|e| {
                     redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Read, e)
                 })?;
                 Ok(Some(id))
@@ -405,7 +405,7 @@ where
             })?;
             for entry in entries {
                 let idx = entry.get_log_id().index;
-                let bytes = bincode::serialize(&entry).map_err(|e| {
+                let bytes = postcard2::to_vec(&entry).map_err(|e| {
                     redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
                 })?;
                 table.insert(idx, bytes.as_slice()).map_err(|e| {
@@ -494,7 +494,7 @@ where
             let mut meta = txn.open_table(META_TABLE).map_err(|e| {
                 redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
             })?;
-            let bytes = bincode::serialize(&log_id).map_err(|e| {
+            let bytes = postcard2::to_vec(&log_id).map_err(|e| {
                 redb_to_storage_err(openraft::ErrorSubject::Logs, openraft::ErrorVerb::Write, e)
             })?;
             meta.insert(META_LAST_PURGED, bytes.as_slice())
@@ -631,7 +631,7 @@ where
                 return RedbSmCache::default();
             };
             match table.get(SM_STATE) {
-                Ok(Some(v)) => bincode::deserialize(v.value()).unwrap_or_default(),
+                Ok(Some(v)) => postcard2::from_bytes(v.value()).unwrap_or_default(),
                 _ => S::default(),
             }
         };
@@ -641,7 +641,7 @@ where
                 return RedbSmCache::default();
             };
             match meta.get(META_LAST_APPLIED) {
-                Ok(Some(v)) => bincode::deserialize(v.value()).ok(),
+                Ok(Some(v)) => postcard2::from_bytes(v.value()).ok(),
                 _ => None,
             }
         };
@@ -651,7 +651,7 @@ where
                 return RedbSmCache::default();
             };
             match meta.get(META_LAST_MEMBERSHIP) {
-                Ok(Some(v)) => bincode::deserialize(v.value()).unwrap_or_default(),
+                Ok(Some(v)) => postcard2::from_bytes(v.value()).unwrap_or_default(),
                 _ => StoredMembership::default(),
             }
         };
@@ -695,7 +695,7 @@ where
     async fn build_snapshot(&mut self) -> Result<Snapshot<C>, StorageError<NodeId>> {
         let sm = self.sm.read().await;
 
-        let data = bincode::serialize(&sm.state).map_err(|e| {
+        let data = postcard2::to_vec(&sm.state).map_err(|e| {
             redb_to_storage_err(
                 openraft::ErrorSubject::StateMachine,
                 openraft::ErrorVerb::Read,
@@ -788,7 +788,7 @@ where
                     e,
                 )
             })?;
-            let state_bytes = bincode::serialize(&sm.state).map_err(|e| {
+            let state_bytes = postcard2::to_vec(&sm.state).map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Write,
@@ -814,7 +814,7 @@ where
             })?;
 
             if let Some(ref id) = sm.last_applied_log {
-                let bytes = bincode::serialize(id).map_err(|e| {
+                let bytes = postcard2::to_vec(id).map_err(|e| {
                     redb_to_storage_err(
                         openraft::ErrorSubject::StateMachine,
                         openraft::ErrorVerb::Write,
@@ -832,7 +832,7 @@ where
                     })?;
             }
 
-            let membership_bytes = bincode::serialize(&sm.last_membership).map_err(|e| {
+            let membership_bytes = postcard2::to_vec(&sm.last_membership).map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::StateMachine,
                     openraft::ErrorVerb::Write,
@@ -879,7 +879,7 @@ where
         snapshot: Box<Cursor<Vec<u8>>>,
     ) -> Result<(), StorageError<NodeId>> {
         let data = snapshot.into_inner();
-        let state: S = bincode::deserialize(&data).map_err(|e| {
+        let state: S = postcard2::from_bytes(&data).map_err(|e| {
             redb_to_storage_err(
                 openraft::ErrorSubject::Snapshot(None),
                 openraft::ErrorVerb::Read,
@@ -909,7 +909,7 @@ where
                     e,
                 )
             })?;
-            let state_bytes = bincode::serialize(&sm.state).map_err(|e| {
+            let state_bytes = postcard2::to_vec(&sm.state).map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Write,
@@ -943,7 +943,7 @@ where
                         e,
                     )
                 })?;
-            let meta_bytes = bincode::serialize(meta).map_err(|e| {
+            let meta_bytes = postcard2::to_vec(meta).map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Write,
@@ -969,7 +969,7 @@ where
                 )
             })?;
             if let Some(ref id) = sm.last_applied_log {
-                let bytes = bincode::serialize(id).map_err(|e| {
+                let bytes = postcard2::to_vec(id).map_err(|e| {
                     redb_to_storage_err(
                         openraft::ErrorSubject::Snapshot(None),
                         openraft::ErrorVerb::Write,
@@ -986,7 +986,7 @@ where
                         )
                     })?;
             }
-            let membership_bytes = bincode::serialize(&sm.last_membership).map_err(|e| {
+            let membership_bytes = postcard2::to_vec(&sm.last_membership).map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Write,
@@ -1043,7 +1043,7 @@ where
         };
 
         let meta: SnapshotMeta<NodeId, C::Node> =
-            bincode::deserialize(&meta_bytes).map_err(|e| {
+            postcard2::from_bytes(&meta_bytes).map_err(|e| {
                 redb_to_storage_err(
                     openraft::ErrorSubject::Snapshot(None),
                     openraft::ErrorVerb::Read,

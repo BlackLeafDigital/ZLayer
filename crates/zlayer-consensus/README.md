@@ -32,7 +32,7 @@ Shared Raft consensus library built on [openraft 0.9](https://docs.rs/openraft) 
     +-----------------+  +----------------+
               |
     +---------v---------+
-    |  HttpNetwork      |  <-- bincode over HTTP
+    |  HttpNetwork      |  <-- postcard2 over HTTP
     |  (RaftNetworkFactory)|
     +-------------------+
               |
@@ -162,7 +162,7 @@ Requirements for `R` (response type):
 
 ## Performance Characteristics
 
-- **Serialization**: bincode (70-90% smaller than JSON, 4x faster)
+- **Serialization**: postcard2 (70-90% smaller than JSON, 4x faster)
 - **Persistent storage**: redb (~15K durable writes/sec on SSD)
 - **In-memory storage**: Limited only by memory bandwidth
 - **Network**: HTTP/1.1 with connection pooling (reqwest)

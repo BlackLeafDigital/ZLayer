@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Windows compilation for the `zlayer` binary: moved Unix-only crate dependencies
+  (`zlayer-agent`, `zlayer-overlay`, `zlayer-api`, `zlayer-proxy`, `zlayer-scheduler`,
+  `zlayer-secrets`, `zlayer-storage`, `zlayer-init-actions`, `secrecy`) behind
+  `[target.'cfg(unix)'.dependencies]`. Gate Unix-only modules (`daemon`, `daemon_client`,
+  `config`) and command modules (`deploy`, `exec`, `join`, `node`, `ps`, `serve`, `token`)
+  with `#[cfg(unix)]`. Disk detection in `resources.rs` stubbed to 0 on non-Unix platforms.
+  Cross-platform commands (build, validate, pipeline, spec, wasm, tunnel, manager, registry)
+  remain available on Windows. Runtime commands bail with a helpful error on Windows.
+  CI Windows build changed from `--features wsl,docker` to `--features wsl`.
+
 ### Added
 - macOS overlay networking support: boringtun now creates `utun` devices on macOS
   via kernel control sockets (same mechanism as Tailscale CLI and wireguard-go).
