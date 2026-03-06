@@ -259,8 +259,7 @@ mod tests {
         // Every cell should be the filled character.
         assert!(
             line.chars().all(|c| c == PROGRESS_FILLED),
-            "Expected all filled, got: {:?}",
-            line,
+            "Expected all filled, got: {line:?}",
         );
     }
 
@@ -281,8 +280,7 @@ mod tests {
             .collect();
         assert!(
             line.chars().all(|c| c == PROGRESS_EMPTY),
-            "Expected all empty, got: {:?}",
-            line,
+            "Expected all empty, got: {line:?}",
         );
     }
 
@@ -322,7 +320,7 @@ mod tests {
                     .unwrap_or(' ')
             })
             .collect();
-        assert!(line.contains("OK"), "Label not found in: {:?}", line);
+        assert!(line.contains("OK"), "Label not found in: {line:?}");
     }
 
     #[test]
@@ -340,7 +338,7 @@ mod tests {
                     .unwrap_or(' ')
             })
             .collect();
-        assert!(line.contains("30%"), "Percentage not found in: {:?}", line);
+        assert!(line.contains("30%"), "Percentage not found in: {line:?}");
     }
 
     // -----------------------------------------------------------------
@@ -364,8 +362,7 @@ mod tests {
             .collect();
         assert!(
             line.chars().all(|c| c == PROGRESS_EMPTY),
-            "Expected all empty for zero total, got: {:?}",
-            line,
+            "Expected all empty for zero total, got: {line:?}",
         );
     }
 
@@ -374,7 +371,7 @@ mod tests {
         let compact = ProgressBar::new(0, 0)
             .with_percentage()
             .to_string_compact(10);
-        assert!(compact.contains("0%"), "Expected 0%% in: {:?}", compact);
+        assert!(compact.contains("0%"), "Expected 0%% in: {compact:?}");
     }
 
     // -----------------------------------------------------------------
@@ -393,7 +390,7 @@ mod tests {
         let s = ProgressBar::new(5, 10)
             .with_label("building")
             .to_string_compact(10);
-        assert!(s.contains("building"), "Label not in compact: {:?}", s);
+        assert!(s.contains("building"), "Label not in compact: {s:?}");
         // Bar should be exactly 10 chars, then " building"
         assert!(s.starts_with(&std::iter::repeat_n(PROGRESS_FILLED, 5).collect::<String>()));
     }
@@ -403,7 +400,7 @@ mod tests {
         let s = ProgressBar::new(3, 10)
             .with_percentage()
             .to_string_compact(20);
-        assert!(s.contains("30%"), "Percentage not in compact: {:?}", s);
+        assert!(s.contains("30%"), "Percentage not in compact: {s:?}");
         // Bar portion should be exactly 20 characters wide.
         let bar_part: String = s.chars().take(20).collect();
         assert_eq!(bar_part.chars().count(), 20);
@@ -415,8 +412,8 @@ mod tests {
             .with_label("done")
             .with_percentage()
             .to_string_compact(10);
-        assert!(s.contains("done"), "Label not found: {:?}", s);
-        assert!(s.contains("100%"), "Percentage not found: {:?}", s);
+        assert!(s.contains("done"), "Label not found: {s:?}");
+        assert!(s.contains("100%"), "Percentage not found: {s:?}");
     }
 
     #[test]
@@ -455,8 +452,7 @@ mod tests {
         // Should contain the beginning of the label, not bar characters.
         assert!(
             line.starts_with("Building"),
-            "Expected label fallback, got: {:?}",
-            line,
+            "Expected label fallback, got: {line:?}",
         );
     }
 
@@ -478,8 +474,7 @@ mod tests {
             .collect();
         assert!(
             line.contains("50%"),
-            "Expected percentage fallback, got: {:?}",
-            line,
+            "Expected percentage fallback, got: {line:?}",
         );
     }
 
@@ -513,8 +508,7 @@ mod tests {
         // Should not contain bar characters.
         assert!(
             !line.contains(PROGRESS_FILLED),
-            "Did not expect bar chars in narrow area: {:?}",
-            line,
+            "Did not expect bar chars in narrow area: {line:?}",
         );
     }
 
@@ -539,8 +533,7 @@ mod tests {
             .collect();
         assert!(
             line.chars().all(|c| c == PROGRESS_FILLED),
-            "Expected fully filled when current > total, got: {:?}",
-            line,
+            "Expected fully filled when current > total, got: {line:?}",
         );
     }
 
@@ -549,6 +542,6 @@ mod tests {
         let s = ProgressBar::new(999, 10)
             .with_percentage()
             .to_string_compact(10);
-        assert!(s.contains("100%"), "Expected 100%% in: {:?}", s);
+        assert!(s.contains("100%"), "Expected 100%% in: {s:?}");
     }
 }

@@ -949,7 +949,7 @@ mod tests {
             repository: "test".to_string(),
             tag: "v1".to_string(),
         };
-        let debug_str = format!("{:?}", image);
+        let debug_str = format!("{image:?}");
         assert!(debug_str.contains("Image"));
         assert!(debug_str.contains("docker.io"));
         assert!(debug_str.contains("test"));
@@ -1096,7 +1096,7 @@ mod tests {
             registry: "ghcr.io".to_string(),
             reason: "invalid token".to_string(),
         };
-        let debug_str = format!("{:?}", err);
+        let debug_str = format!("{err:?}");
         assert!(debug_str.contains("AuthenticationFailed"));
         assert!(debug_str.contains("ghcr.io"));
         assert!(debug_str.contains("invalid token"));
@@ -1108,7 +1108,7 @@ mod tests {
             digest: "sha256:abc123".to_string(),
             reason: "network error".to_string(),
         };
-        let debug_str = format!("{:?}", err);
+        let debug_str = format!("{err:?}");
         assert!(debug_str.contains("BlobUploadFailed"));
         assert!(debug_str.contains("sha256:abc123"));
         assert!(debug_str.contains("network error"));
@@ -1119,7 +1119,7 @@ mod tests {
         let err = PushError::ManifestUploadFailed {
             reason: "schema validation failed".to_string(),
         };
-        let debug_str = format!("{:?}", err);
+        let debug_str = format!("{err:?}");
         assert!(debug_str.contains("ManifestUploadFailed"));
         assert!(debug_str.contains("schema validation failed"));
     }
@@ -1127,7 +1127,7 @@ mod tests {
     #[test]
     fn test_push_error_debug_network_error() {
         let err = PushError::NetworkError("connection timed out".to_string());
-        let debug_str = format!("{:?}", err);
+        let debug_str = format!("{err:?}");
         assert!(debug_str.contains("NetworkError"));
         assert!(debug_str.contains("connection timed out"));
     }
@@ -1137,7 +1137,7 @@ mod tests {
         let err = PushError::InvalidReference {
             reference: "bad-ref".to_string(),
         };
-        let debug_str = format!("{:?}", err);
+        let debug_str = format!("{err:?}");
         assert!(debug_str.contains("InvalidReference"));
         assert!(debug_str.contains("bad-ref"));
     }
@@ -1148,7 +1148,7 @@ mod tests {
         let oci_err =
             oci_client::errors::OciDistributionError::GenericError(Some("test error".to_string()));
         let err = PushError::OciError(oci_err);
-        let debug_str = format!("{:?}", err);
+        let debug_str = format!("{err:?}");
         assert!(debug_str.contains("OciError"));
     }
 
@@ -1365,7 +1365,7 @@ mod tests {
 
     #[test]
     fn test_push_result_creation_many_blobs() {
-        let blobs: Vec<String> = (0..100).map(|i| format!("sha256:blob{:03}", i)).collect();
+        let blobs: Vec<String> = (0..100).map(|i| format!("sha256:blob{i:03}")).collect();
         let result = PushResult {
             manifest_digest: "sha256:many".to_string(),
             blobs_pushed: blobs,
@@ -1416,7 +1416,7 @@ mod tests {
             blobs_pushed: vec!["sha256:blob1".to_string(), "sha256:blob2".to_string()],
             reference: "ghcr.io/org/repo:tag".to_string(),
         };
-        let debug_str = format!("{:?}", result);
+        let debug_str = format!("{result:?}");
         assert!(debug_str.contains("PushResult"));
         assert!(debug_str.contains("sha256:test"));
         assert!(debug_str.contains("sha256:blob1"));
@@ -1728,7 +1728,7 @@ mod tests {
             Err(PushError::InvalidReference { reference }) => {
                 assert_eq!(reference, "invalid::reference");
             }
-            other => panic!("Expected InvalidReference error, got {:?}", other),
+            other => panic!("Expected InvalidReference error, got {other:?}"),
         }
     }
 
@@ -1752,7 +1752,7 @@ mod tests {
             Err(PushError::InvalidReference { reference }) => {
                 assert!(reference.is_empty());
             }
-            other => panic!("Expected InvalidReference error, got {:?}", other),
+            other => panic!("Expected InvalidReference error, got {other:?}"),
         }
     }
 
@@ -1772,7 +1772,7 @@ mod tests {
             Err(PushError::InvalidReference { reference }) => {
                 assert_eq!(reference, "invalid::reference");
             }
-            other => panic!("Expected InvalidReference error, got {:?}", other),
+            other => panic!("Expected InvalidReference error, got {other:?}"),
         }
     }
 
@@ -1792,7 +1792,7 @@ mod tests {
             Err(PushError::InvalidReference { reference }) => {
                 assert!(reference.is_empty());
             }
-            other => panic!("Expected InvalidReference error, got {:?}", other),
+            other => panic!("Expected InvalidReference error, got {other:?}"),
         }
     }
 
@@ -1836,7 +1836,7 @@ mod tests {
             Err(PushError::InvalidReference { reference }) => {
                 assert_eq!(reference, "invalid::reference");
             }
-            other => panic!("Expected InvalidReference error, got {:?}", other),
+            other => panic!("Expected InvalidReference error, got {other:?}"),
         }
     }
 
@@ -1872,7 +1872,7 @@ mod tests {
             Err(PushError::InvalidReference { reference }) => {
                 assert!(reference.is_empty());
             }
-            other => panic!("Expected InvalidReference error, got {:?}", other),
+            other => panic!("Expected InvalidReference error, got {other:?}"),
         }
     }
 
@@ -1900,7 +1900,7 @@ mod tests {
             wasm_binary: vec![],
         };
 
-        let debug_str = format!("{:?}", result);
+        let debug_str = format!("{result:?}");
         assert!(debug_str.contains("WasmExportResult"));
         assert!(debug_str.contains("sha256:manifest"));
         assert!(debug_str.contains("sha256:layer"));

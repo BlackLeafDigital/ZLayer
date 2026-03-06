@@ -247,18 +247,13 @@ mod tests {
         touch(&dir, "beta.zlayer.yml");
 
         let err = discover_spec_path_in_dir(None, &dir).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(
             msg.contains("Multiple deployment specs found"),
-            "expected 'Multiple deployment specs found', got: {}",
-            msg
+            "expected 'Multiple deployment specs found', got: {msg}",
         );
-        assert!(
-            msg.contains("alpha.zlayer.yml"),
-            "should list alpha: {}",
-            msg
-        );
-        assert!(msg.contains("beta.zlayer.yml"), "should list beta: {}", msg);
+        assert!(msg.contains("alpha.zlayer.yml"), "should list alpha: {msg}",);
+        assert!(msg.contains("beta.zlayer.yml"), "should list beta: {msg}");
 
         cleanup(&dir);
     }
@@ -270,11 +265,10 @@ mod tests {
         touch(&dir, "README.md");
 
         let err = discover_spec_path_in_dir(None, &dir).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(
             msg.contains("No deployment spec found"),
-            "expected 'No deployment spec found', got: {}",
-            msg
+            "expected 'No deployment spec found', got: {msg}",
         );
 
         cleanup(&dir);
@@ -300,11 +294,10 @@ mod tests {
         fs::create_dir_all(&subdir).expect("failed to create subdir");
 
         let err = discover_spec_path_in_dir(None, &dir).unwrap_err();
-        let msg = format!("{}", err);
+        let msg = format!("{err}");
         assert!(
             msg.contains("No deployment spec found"),
-            "directories should not match: {}",
-            msg
+            "directories should not match: {msg}",
         );
 
         cleanup(&dir);

@@ -471,7 +471,7 @@ mod tests {
             last_handshake_secs: Some(10),
             last_ping_ms: Some(5),
             failure_count: 0,
-            last_check: 1234567890,
+            last_check: 1_234_567_890,
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -489,7 +489,7 @@ mod tests {
             healthy_peers: 1,
             unhealthy_peers: 1,
             peers: vec![],
-            last_check: 1234567890,
+            last_check: 1_234_567_890,
         };
 
         let json = serde_json::to_string_pretty(&health).unwrap();
@@ -586,7 +586,7 @@ mod tests {
         assert_eq!(peer.public_key, expected_b64);
         assert_eq!(peer.endpoint, Some("192.168.1.5:51820".to_string()));
         assert_eq!(peer.allowed_ips, vec!["10.200.0.2/32".to_string()]);
-        assert_eq!(peer.last_handshake_time, Some(1700000000));
+        assert_eq!(peer.last_handshake_time, Some(1_700_000_000));
         assert_eq!(peer.transfer_rx, 12345);
         assert_eq!(peer.transfer_tx, 67890);
     }

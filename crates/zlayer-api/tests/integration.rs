@@ -167,7 +167,7 @@ async fn test_deployments_with_auth() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/deployments")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -194,7 +194,7 @@ async fn test_deployment_not_found() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/deployments/nonexistent")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )

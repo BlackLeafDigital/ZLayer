@@ -614,7 +614,7 @@ mod tests {
         assert_eq!(req.mode, "full"); // default
         assert!(req.services.is_none());
         // Resource fields default to zero/empty
-        assert_eq!(req.cpu_total, 0.0);
+        assert!((req.cpu_total - 0.0).abs() < f64::EPSILON);
         assert_eq!(req.memory_total, 0);
         assert_eq!(req.disk_total, 0);
         assert!(req.gpus.is_empty());
@@ -636,9 +636,9 @@ mod tests {
             ]
         }"#;
         let req: ClusterJoinRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.cpu_total, 16.0);
-        assert_eq!(req.memory_total, 68719476736);
-        assert_eq!(req.disk_total, 1099511627776);
+        assert!((req.cpu_total - 16.0).abs() < f64::EPSILON);
+        assert_eq!(req.memory_total, 68_719_476_736);
+        assert_eq!(req.disk_total, 1_099_511_627_776);
         assert_eq!(req.gpus.len(), 1);
         assert_eq!(req.gpus[0].vendor, "nvidia");
         assert_eq!(req.gpus[0].memory_mb, 81920);
@@ -654,9 +654,9 @@ mod tests {
         }"#;
         let req: HeartbeatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.node_id, 2);
-        assert_eq!(req.cpu_used, 4.5);
-        assert_eq!(req.memory_used, 8589934592);
-        assert_eq!(req.disk_used, 107374182400);
+        assert!((req.cpu_used - 4.5).abs() < f64::EPSILON);
+        assert_eq!(req.memory_used, 8_589_934_592);
+        assert_eq!(req.disk_used, 107_374_182_400);
     }
 
     #[test]

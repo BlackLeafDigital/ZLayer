@@ -913,7 +913,7 @@ mod tests {
             WasmError::InvalidStructure { reason } => {
                 assert!(reason.contains("version"));
             }
-            other => panic!("Expected InvalidStructure, got {:?}", other),
+            other => panic!("Expected InvalidStructure, got {other:?}"),
         }
     }
 
@@ -1167,8 +1167,7 @@ mod tests {
             assert_eq!(
                 version,
                 WasiVersion::Preview2,
-                "Expected Preview2 for version {}",
-                v
+                "Expected Preview2 for version {v}",
             );
         }
     }
@@ -1238,15 +1237,12 @@ mod tests {
             let result = extract_wasm_binary_info(truncated);
             assert!(
                 result.is_err(),
-                "Expected error for {} bytes, got {:?}",
-                len,
-                result
+                "Expected error for {len} bytes, got {result:?}",
             );
             assert_eq!(
                 result.unwrap_err(),
                 WasmError::TooShort,
-                "Expected TooShort for {} bytes",
-                len
+                "Expected TooShort for {len} bytes",
             );
         }
     }
@@ -1308,17 +1304,17 @@ mod tests {
     #[test]
     fn test_wasm_error_debug_formatting() {
         let magic_err = WasmError::InvalidMagic;
-        let debug_str = format!("{:?}", magic_err);
+        let debug_str = format!("{magic_err:?}");
         assert!(debug_str.contains("InvalidMagic"));
 
         let short_err = WasmError::TooShort;
-        let debug_str = format!("{:?}", short_err);
+        let debug_str = format!("{short_err:?}");
         assert!(debug_str.contains("TooShort"));
 
         let struct_err = WasmError::InvalidStructure {
             reason: "custom reason".to_string(),
         };
-        let debug_str = format!("{:?}", struct_err);
+        let debug_str = format!("{struct_err:?}");
         assert!(debug_str.contains("InvalidStructure"));
         assert!(debug_str.contains("custom reason"));
     }
@@ -1366,7 +1362,7 @@ mod tests {
             size: 1024,
         };
 
-        let debug_str = format!("{:?}", info);
+        let debug_str = format!("{info:?}");
         assert!(debug_str.contains("WasmBinaryInfo"));
         assert!(debug_str.contains("Preview1"));
         assert!(debug_str.contains("is_component"));
@@ -1435,7 +1431,7 @@ mod tests {
 
     #[test]
     fn test_wasi_version_default() {
-        let default: WasiVersion = Default::default();
+        let default: WasiVersion = WasiVersion::default();
         assert_eq!(default, WasiVersion::Unknown);
     }
 
@@ -1479,13 +1475,13 @@ mod tests {
     #[test]
     fn test_artifact_type_debug_formatting() {
         let container = ArtifactType::Container;
-        assert!(format!("{:?}", container).contains("Container"));
+        assert!(format!("{container:?}").contains("Container"));
 
         let wasm = ArtifactType::Wasm {
             wasi_version: WasiVersion::Preview1,
         };
-        assert!(format!("{:?}", wasm).contains("Wasm"));
-        assert!(format!("{:?}", wasm).contains("Preview1"));
+        assert!(format!("{wasm:?}").contains("Wasm"));
+        assert!(format!("{wasm:?}").contains("Preview1"));
     }
 
     #[test]

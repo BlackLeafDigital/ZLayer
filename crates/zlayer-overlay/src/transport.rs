@@ -498,6 +498,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_keys_native() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        use x25519_dalek::{PublicKey, StaticSecret};
+
         let (private_key, public_key) = OverlayTransport::generate_keys().await.unwrap();
 
         assert_eq!(
@@ -507,13 +510,11 @@ mod tests {
         );
         assert_eq!(public_key.len(), 44, "Public key should be 44 chars base64");
 
-        use base64::{engine::general_purpose::STANDARD, Engine as _};
         let priv_bytes = STANDARD.decode(&private_key).unwrap();
         let pub_bytes = STANDARD.decode(&public_key).unwrap();
         assert_eq!(priv_bytes.len(), 32);
         assert_eq!(pub_bytes.len(), 32);
 
-        use x25519_dalek::{PublicKey, StaticSecret};
         let secret = StaticSecret::from(<[u8; 32]>::try_from(priv_bytes.as_slice()).unwrap());
         let expected_public = PublicKey::from(&secret);
         assert_eq!(pub_bytes.as_slice(), expected_public.as_bytes());
@@ -563,7 +564,7 @@ mod tests {
             overlay_cidr: "10.42.0.1/24".to_string(),
             private_key: "test_key".to_string(),
             public_key: "test_pub".to_string(),
-            local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 51820),
+            local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51820),
             peer_discovery_interval: Duration::from_secs(30),
         };
 

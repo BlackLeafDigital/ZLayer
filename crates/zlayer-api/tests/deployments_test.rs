@@ -47,8 +47,8 @@ fn create_test_token(config: &ApiConfig) -> String {
 /// Create a valid deployment YAML spec
 fn valid_deployment_spec(name: &str) -> String {
     format!(
-        r#"version: v1
-deployment: {}
+        r"version: v1
+deployment: {name}
 services:
   api:
     rtype: service
@@ -58,33 +58,32 @@ services:
       - name: http
         protocol: http
         port: 8080
-"#,
-        name
+",
     )
 }
 
 /// Create an invalid deployment YAML spec (missing required fields)
 fn invalid_deployment_spec() -> String {
     // Invalid: version v2 is not supported
-    r#"version: v2
+    r"version: v2
 deployment: invalid-app
 services:
   api:
     image:
       name: nginx:latest
-"#
+"
     .to_string()
 }
 
 /// Create a deployment spec with invalid YAML syntax
 fn malformed_yaml_spec() -> String {
-    r#"version: v1
+    r"version: v1
 deployment: test
 services:
   api:
     image:
       name: [invalid yaml here
-"#
+"
     .to_string()
 }
 
@@ -115,7 +114,7 @@ async fn test_create_deployment_success() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/deployments")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_string(&json!({
@@ -154,7 +153,7 @@ async fn test_create_deployment_invalid_spec_returns_400() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/deployments")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_string(&json!({
@@ -186,7 +185,7 @@ async fn test_create_deployment_malformed_yaml_returns_400() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/deployments")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_string(&json!({
@@ -218,7 +217,7 @@ async fn test_create_deployment_missing_spec_returns_400() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/deployments")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(serde_json::to_string(&json!({})).unwrap()))
                 .unwrap(),
@@ -278,7 +277,7 @@ async fn test_list_deployments_empty() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/deployments")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -310,7 +309,7 @@ async fn test_list_deployments_with_data() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/deployments")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -376,7 +375,7 @@ async fn test_get_deployment_success() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/deployments/my-app")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -404,7 +403,7 @@ async fn test_get_deployment_not_found() {
         .oneshot(
             Request::builder()
                 .uri("/api/v1/deployments/nonexistent")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -467,7 +466,7 @@ async fn test_delete_deployment_success() {
             Request::builder()
                 .method("DELETE")
                 .uri("/api/v1/deployments/to-delete")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -497,7 +496,7 @@ async fn test_delete_deployment_not_found() {
             Request::builder()
                 .method("DELETE")
                 .uri("/api/v1/deployments/nonexistent")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -545,6 +544,7 @@ async fn test_delete_deployment_requires_auth() {
 // =============================================================================
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_deployment_full_lifecycle() {
     let config = test_config();
     let token = create_test_token(&config);
@@ -558,7 +558,7 @@ async fn test_deployment_full_lifecycle() {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/deployments")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_string(&json!({
@@ -588,7 +588,7 @@ async fn test_deployment_full_lifecycle() {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/deployments")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -614,7 +614,7 @@ async fn test_deployment_full_lifecycle() {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/deployments/lifecycle-test")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -640,7 +640,7 @@ async fn test_deployment_full_lifecycle() {
                 Request::builder()
                     .method("DELETE")
                     .uri("/api/v1/deployments/lifecycle-test")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -661,7 +661,7 @@ async fn test_deployment_full_lifecycle() {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/deployments/lifecycle-test")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -682,7 +682,7 @@ async fn test_deployment_full_lifecycle() {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/deployments")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -766,6 +766,7 @@ async fn test_malformed_auth_header_rejected() {
 // =============================================================================
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn test_create_multiple_deployments() {
     let config = test_config();
     let token = create_test_token(&config);
@@ -779,7 +780,7 @@ async fn test_create_multiple_deployments() {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/deployments")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_string(&json!({
@@ -803,7 +804,7 @@ async fn test_create_multiple_deployments() {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/deployments")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_string(&json!({
@@ -827,7 +828,7 @@ async fn test_create_multiple_deployments() {
                 Request::builder()
                     .method("POST")
                     .uri("/api/v1/deployments")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::to_string(&json!({
@@ -850,7 +851,7 @@ async fn test_create_multiple_deployments() {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/deployments")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -877,7 +878,7 @@ async fn test_create_multiple_deployments() {
                 Request::builder()
                     .method("DELETE")
                     .uri("/api/v1/deployments/app-three")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -894,7 +895,7 @@ async fn test_create_multiple_deployments() {
             .oneshot(
                 Request::builder()
                     .uri("/api/v1/deployments")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -927,7 +928,7 @@ async fn test_create_deployment_without_content_type() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/deployments")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 // Intentionally omitting Content-Type header
                 .body(Body::from(
                     serde_json::to_string(&json!({
@@ -961,7 +962,7 @@ async fn test_create_deployment_with_empty_body() {
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/deployments")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::empty())
                 .unwrap(),
@@ -989,7 +990,7 @@ async fn test_create_deployment_with_multiple_services() {
     let storage = Arc::new(InMemoryStorage::new());
     let app = build_router_with_storage(&config, storage);
 
-    let complex_spec = r#"version: v1
+    let complex_spec = r"version: v1
 deployment: complex-app
 services:
   api:
@@ -1018,14 +1019,14 @@ services:
       - name: redis
         protocol: tcp
         port: 6379
-"#;
+";
 
     let response = app
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/api/v1/deployments")
-                .header(header::AUTHORIZATION, format!("Bearer {}", token))
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::to_string(&json!({

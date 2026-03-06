@@ -251,7 +251,7 @@ mod tests {
     fn test_plain_deploy_logger_creation() {
         let logger = PlainDeployLogger::new();
         // Just verify it doesn't panic
-        let _ = format!("{:?}", logger);
+        let _ = format!("{logger:?}");
     }
 
     #[test]
@@ -283,7 +283,7 @@ mod tests {
     #[test]
     fn test_default() {
         let logger = PlainDeployLogger::default();
-        let _ = format!("{:?}", logger);
+        let _ = format!("{logger:?}");
     }
 
     #[test]

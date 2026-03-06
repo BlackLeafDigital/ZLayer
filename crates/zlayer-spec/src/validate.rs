@@ -1085,6 +1085,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_validate_cpu_negative() {
         let result = validate_cpu(&-1.0);
         assert!(result.is_err());
@@ -1256,7 +1257,7 @@ mod tests {
     #[test]
     fn test_validate_schedule_wrapper_invalid() {
         // Invalid cron expressions
-        assert!(validate_schedule_wrapper(&"".to_string()).is_err()); // Empty
+        assert!(validate_schedule_wrapper(&String::new()).is_err()); // Empty
         assert!(validate_schedule_wrapper(&"not a cron".to_string()).is_err()); // Plain text
         assert!(validate_schedule_wrapper(&"0 0 * * *".to_string()).is_err()); // 5-field (standard unix cron) not supported
         assert!(validate_schedule_wrapper(&"60 0 0 * * * *".to_string()).is_err());

@@ -702,9 +702,9 @@ wasm:
 
     #[test]
     fn test_wasm_defaults() {
-        let yaml = r#"
+        let yaml = r"
 wasm: {}
-"#;
+";
         let img: ZImage = serde_yml::from_str(yaml).unwrap();
         let wasm = img.wasm.as_ref().unwrap();
         assert_eq!(wasm.target, "preview2");
@@ -838,12 +838,12 @@ retries: 3
 
     #[test]
     fn test_cache_mount_deserialize() {
-        let yaml = r#"
+        let yaml = r"
 target: /var/cache/apt
 id: apt-cache
 sharing: shared
 readonly: false
-"#;
+";
         let cm: ZCacheMount = serde_yml::from_str(yaml).unwrap();
         assert_eq!(cm.target, "/var/cache/apt");
         assert_eq!(cm.id.as_deref(), Some("apt-cache"));

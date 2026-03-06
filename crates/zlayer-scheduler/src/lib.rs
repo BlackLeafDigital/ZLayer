@@ -1014,7 +1014,7 @@ mod tests {
 
         match decision {
             ScalingDecision::ScaleUp { from: 2, to: 3, .. } => {}
-            other => panic!("Expected ScaleUp, got {:?}", other),
+            other => panic!("Expected ScaleUp, got {other:?}"),
         }
     }
 
@@ -1033,8 +1033,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(err, SchedulerError::NotLeader),
-            "Expected NotLeader, got: {:?}",
-            err
+            "Expected NotLeader, got: {err:?}"
         );
     }
 }

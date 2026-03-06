@@ -14,12 +14,14 @@ use crate::error::Result;
 
 /// Guard that must be held to keep the async file writer running
 pub struct LogGuard {
-    _guard: Option<WorkerGuard>,
+    /// Held for its `Drop` implementation to flush async log writes.
+    #[allow(dead_code)]
+    guard: Option<WorkerGuard>,
 }
 
 impl LogGuard {
     fn new(guard: Option<WorkerGuard>) -> Self {
-        Self { _guard: guard }
+        Self { guard }
     }
 }
 
@@ -219,6 +221,6 @@ mod tests {
     #[test]
     fn test_log_guard_creation() {
         let guard = LogGuard::new(None);
-        assert!(guard._guard.is_none());
+        assert!(guard.guard.is_none());
     }
 }

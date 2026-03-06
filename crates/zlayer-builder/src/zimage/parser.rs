@@ -354,9 +354,9 @@ wasm:
 
     #[test]
     fn test_version_omitted_is_ok() {
-        let yaml = r#"
+        let yaml = r"
 runtime: node22
-"#;
+";
         let img = parse_zimagefile(yaml).unwrap();
         assert!(img.version.is_none());
         assert_eq!(img.runtime.as_deref(), Some("node22"));

@@ -234,7 +234,7 @@ mod tests {
             services: vec![],
         };
         // Ensure Debug trait works
-        let _ = format!("{:?}", event);
+        let _ = format!("{event:?}");
     }
 
     #[test]

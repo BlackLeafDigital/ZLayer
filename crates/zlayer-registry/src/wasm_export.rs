@@ -457,7 +457,7 @@ mod tests {
     // WASM Binary Helpers
     // =========================================================================
 
-    /// Create a minimal valid WASIp1 core module
+    /// Create a minimal valid `WASIp1` core module
     fn create_minimal_wasm_module() -> Vec<u8> {
         // Minimal valid WASM module:
         // Magic: \0asm
@@ -469,7 +469,7 @@ mod tests {
         ]
     }
 
-    /// Create a minimal WASIp1 module with a type section
+    /// Create a minimal `WASIp1` module with a type section
     fn create_wasm_module_with_type_section() -> Vec<u8> {
         vec![
             0x00, 0x61, 0x73, 0x6d, // Magic: \0asm
@@ -483,7 +483,7 @@ mod tests {
         ]
     }
 
-    /// Create a WASIp1 module with a custom section (name section)
+    /// Create a `WASIp1` module with a custom section (name section)
     fn create_wasm_module_with_custom_section() -> Vec<u8> {
         vec![
             0x00, 0x61, 0x73, 0x6d, // Magic: \0asm
@@ -495,7 +495,7 @@ mod tests {
         ]
     }
 
-    /// Create a minimal WASIp2 component using component model layer version
+    /// Create a minimal `WASIp2` component using component model layer version
     fn create_minimal_wasm_component() -> Vec<u8> {
         // Component model binaries start with the same magic but different version
         let mut data = vec![
@@ -507,7 +507,7 @@ mod tests {
         data
     }
 
-    /// Create a WASIp2 component with wit-component marker
+    /// Create a `WASIp2` component with wit-component marker
     fn create_wasm_component_with_wit_marker() -> Vec<u8> {
         let mut data = vec![
             0x00, 0x61, 0x73, 0x6d, // Magic: \0asm
@@ -599,7 +599,7 @@ mod tests {
             annotations: HashMap::new(),
         };
 
-        let debug_str = format!("{:?}", config);
+        let debug_str = format!("{config:?}");
         assert!(debug_str.contains("WasmExportConfig"));
         assert!(debug_str.contains("wasm_path"));
         assert!(debug_str.contains("module_name"));
@@ -1353,7 +1353,7 @@ mod tests {
             Err(WasmExportError::InvalidWasmBinary { reason }) => {
                 assert!(reason.contains("invalid magic bytes"));
             }
-            other => panic!("expected InvalidWasmBinary error, got {:?}", other),
+            other => panic!("expected InvalidWasmBinary error, got {other:?}"),
         }
     }
 
@@ -1380,7 +1380,7 @@ mod tests {
             Err(WasmExportError::InvalidWasmBinary { reason }) => {
                 assert!(reason.contains("too small"));
             }
-            other => panic!("expected InvalidWasmBinary error, got {:?}", other),
+            other => panic!("expected InvalidWasmBinary error, got {other:?}"),
         }
     }
 
@@ -1400,7 +1400,7 @@ mod tests {
             Err(WasmExportError::IoError(e)) => {
                 assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
             }
-            other => panic!("expected IoError, got {:?}", other),
+            other => panic!("expected IoError, got {other:?}"),
         }
     }
 
@@ -1437,7 +1437,7 @@ mod tests {
                 Err(WasmExportError::IoError(e)) => {
                     assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied);
                 }
-                other => panic!("expected IoError(PermissionDenied), got {:?}", other),
+                other => panic!("expected IoError(PermissionDenied), got {other:?}"),
             }
 
             // Restore permissions for cleanup
@@ -1673,7 +1673,7 @@ mod tests {
             wasm_binary: vec![],
         };
 
-        let debug_str = format!("{:?}", result);
+        let debug_str = format!("{result:?}");
         assert!(debug_str.contains("WasmExportResult"));
         assert!(debug_str.contains("manifest_digest"));
         assert!(debug_str.contains("Preview2"));

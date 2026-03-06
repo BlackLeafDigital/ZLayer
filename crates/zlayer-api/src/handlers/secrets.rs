@@ -313,16 +313,16 @@ mod tests {
     fn test_secret_metadata_response_from() {
         let metadata = SecretMetadata {
             name: "test-secret".to_string(),
-            created_at: 1234567890,
-            updated_at: 1234567900,
+            created_at: 1_234_567_890,
+            updated_at: 1_234_567_900,
             version: 3,
         };
 
         let response = SecretMetadataResponse::from(metadata);
 
         assert_eq!(response.name, "test-secret");
-        assert_eq!(response.created_at, 1234567890);
-        assert_eq!(response.updated_at, 1234567900);
+        assert_eq!(response.created_at, 1_234_567_890);
+        assert_eq!(response.updated_at, 1_234_567_900);
         assert_eq!(response.version, 3);
     }
 
@@ -347,7 +347,7 @@ mod tests {
         assert!(json.contains("db-password"));
         assert!(json.contains("1000"));
         assert!(json.contains("2000"));
-        assert!(json.contains("5"));
+        assert!(json.contains('5'));
         // Ensure the value is NOT in the response
         assert!(!json.contains("value"));
     }

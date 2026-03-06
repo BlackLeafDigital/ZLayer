@@ -327,7 +327,7 @@ mod tests {
 
         // Empty variable uses default (colon variant)
         let mut args = HashMap::new();
-        args.insert("VERSION".to_string(), "".to_string());
+        args.insert("VERSION".to_string(), String::new());
         assert_eq!(expand_variables("${VERSION:-1.0}", &args, &env), "1.0");
     }
 
@@ -341,7 +341,7 @@ mod tests {
 
         // Empty variable keeps empty (non-colon variant)
         let mut args = HashMap::new();
-        args.insert("VERSION".to_string(), "".to_string());
+        args.insert("VERSION".to_string(), String::new());
         assert_eq!(expand_variables("${VERSION-1.0}", &args, &env), "");
     }
 
@@ -358,7 +358,7 @@ mod tests {
         assert_eq!(expand_variables("${VERSION:+set}", &args, &env), "set");
 
         // Set empty variable - no alternate (colon variant)
-        args.insert("VERSION".to_string(), "".to_string());
+        args.insert("VERSION".to_string(), String::new());
         assert_eq!(expand_variables("${VERSION:+set}", &args, &env), "");
     }
 
@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(expand_variables("${VERSION+set}", &args, &env), "");
 
         // Set empty variable - use alternate (non-colon variant)
-        args.insert("VERSION".to_string(), "".to_string());
+        args.insert("VERSION".to_string(), String::new());
         assert_eq!(expand_variables("${VERSION+set}", &args, &env), "set");
     }
 

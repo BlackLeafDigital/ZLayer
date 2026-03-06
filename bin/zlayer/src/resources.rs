@@ -317,7 +317,7 @@ mod tests {
     #[test]
     fn test_detect_cpu_total_is_positive() {
         let cpus = detect_cpu_total();
-        assert!(cpus >= 1.0, "Expected at least 1 CPU, got {}", cpus);
+        assert!(cpus >= 1.0, "Expected at least 1 CPU, got {cpus}");
     }
 
     #[cfg(target_os = "linux")]
@@ -327,8 +327,7 @@ mod tests {
         // Any machine should have at least 64 MB
         assert!(
             mem >= 64 * 1024 * 1024,
-            "Expected at least 64 MB, got {} bytes",
-            mem
+            "Expected at least 64 MB, got {mem} bytes",
         );
     }
 
@@ -339,9 +338,7 @@ mod tests {
         let used = detect_memory_used();
         assert!(
             used <= total,
-            "Used memory ({}) should not exceed total ({})",
-            used,
-            total
+            "Used memory ({used}) should not exceed total ({total})",
         );
     }
 
@@ -360,9 +357,7 @@ mod tests {
         let used = detect_disk_used(&dir);
         assert!(
             used <= total,
-            "Disk used ({}) should not exceed total ({})",
-            used,
-            total
+            "Disk used ({used}) should not exceed total ({total})",
         );
     }
 
@@ -372,7 +367,7 @@ mod tests {
         let res = detect_system_resources(&dir);
         assert!(res.cpu_total >= 1.0);
         // cpu_used is 0.0 at startup by design
-        assert_eq!(res.cpu_used, 0.0);
+        assert!((res.cpu_used - 0.0).abs() < f64::EPSILON);
         // disk should be nonzero for /tmp
         assert!(res.disk_total > 0);
     }
@@ -407,12 +402,10 @@ mod tests {
     fn test_cpu_used_bounded() {
         let used = detect_cpu_used();
         let total = detect_cpu_total();
-        assert!(used >= 0.0, "CPU used should be non-negative, got {}", used);
+        assert!(used >= 0.0, "CPU used should be non-negative, got {used}");
         assert!(
             used <= total,
-            "CPU used ({}) should not exceed total ({})",
-            used,
-            total
+            "CPU used ({used}) should not exceed total ({total})",
         );
     }
 

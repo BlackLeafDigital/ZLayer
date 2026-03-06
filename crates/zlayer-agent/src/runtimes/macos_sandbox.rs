@@ -1048,7 +1048,7 @@ fn resolve_entrypoint(spec: &ServiceSpec, rootfs: &Path) -> Result<(String, Vec<
     // then check rootfs
     for shell in &["/bin/sh", "/bin/bash", "/usr/bin/sh"] {
         if std::path::Path::new(shell).exists() {
-            return Ok((shell.to_string(), vec![]));
+            return Ok(((*shell).to_string(), vec![]));
         }
         if rootfs.join(shell.trim_start_matches('/')).exists() {
             let resolved = rootfs.join(shell.trim_start_matches('/'));

@@ -771,7 +771,7 @@ mod tests {
             from_replicas: 2,
             to_replicas: 4,
             reason: "High CPU".to_string(),
-            timestamp: 1234567890,
+            timestamp: 1_234_567_890,
         });
 
         let events = state.get_scale_events(10);
@@ -781,7 +781,7 @@ mod tests {
         // Service should be updated
         let svc = state.get_service("api").unwrap();
         assert_eq!(svc.current_replicas, 4);
-        assert_eq!(svc.last_scale_time, Some(1234567890));
+        assert_eq!(svc.last_scale_time, Some(1_234_567_890));
     }
 
     #[test]
@@ -804,7 +804,7 @@ mod tests {
 
         let node = state.get_node(1).unwrap();
         assert_eq!(node.address, "192.168.1.1:8000");
-        assert_eq!(node.cpu_total, 8.0);
+        assert!((node.cpu_total - 8.0).abs() < f64::EPSILON);
         assert_eq!(node.memory_total, 16_000_000_000);
         assert_eq!(node.status, "ready");
     }

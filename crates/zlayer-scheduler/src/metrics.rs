@@ -937,7 +937,7 @@ mod tests {
             let map = self.stats.read().await;
             map.get(&id.to_string())
                 .cloned()
-                .ok_or_else(|| format!("No stats for container: {}", id))
+                .ok_or_else(|| format!("No stats for container: {id}"))
         }
     }
 
@@ -969,7 +969,7 @@ mod tests {
             memory_limit: u64::MAX,
             timestamp: Instant::now(),
         };
-        assert_eq!(stats.memory_percent(), 0.0);
+        assert!(stats.memory_percent().abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -1018,7 +1018,7 @@ mod tests {
         // First sample - CPU should be 0 (no previous sample)
         let metrics = source.collect("api").await.unwrap();
         assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0].cpu_percent, 0.0); // First sample has no delta
+        assert!(metrics[0].cpu_percent.abs() < f64::EPSILON); // First sample has no delta
         assert!((metrics[0].memory_percent() - 19.53).abs() < 0.1); // ~50MB/256MB
     }
 
@@ -1103,8 +1103,8 @@ mod tests {
                 .set_stats(
                     &container_id,
                     RawContainerStats {
-                        cpu_usage_usec: 500_000 * (i as u64),
-                        memory_bytes: 50 * 1024 * 1024 * (i as u64),
+                        cpu_usage_usec: 500_000 * u64::from(i),
+                        memory_bytes: 50 * 1024 * 1024 * u64::from(i),
                         memory_limit: 512 * 1024 * 1024,
                         timestamp: Instant::now(),
                     },
@@ -1211,6 +1211,6 @@ mod tests {
 
         // After cache clear, should be like first sample again (CPU = 0)
         let metrics = source.collect("cache-test").await.unwrap();
-        assert_eq!(metrics[0].cpu_percent, 0.0);
+        assert!(metrics[0].cpu_percent.abs() < f64::EPSILON);
     }
 }

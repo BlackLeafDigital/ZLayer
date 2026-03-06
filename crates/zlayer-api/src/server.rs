@@ -376,8 +376,7 @@ mod tests {
             let mode = meta.permissions().mode() & 0o777;
             assert_eq!(
                 mode, 0o660,
-                "Socket permissions should be 0o660, got {:o}",
-                mode
+                "Socket permissions should be 0o660, got {mode:o}",
             );
         }
 
