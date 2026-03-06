@@ -17,6 +17,9 @@ default = ["full"]
 # Full runtime with all CLI commands and capabilities
 full = ["docker", "wasm", "s3", "persistent", "observability"]
 
+# WSL2 backend (Windows-only, thin CLI proxies to daemon in WSL2)
+wsl = ["dep:zlayer-wsl"]
+
 # Runtime capabilities (forwarded to deps)
 docker = ["zlayer-agent/docker"]
 wasm = ["zlayer-agent/wasm"]
@@ -93,7 +96,7 @@ nix = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-zlayer-wsl = { workspace = true }
+zlayer-wsl = { workspace = true, optional = true }
 
 [lints]
 workspace = true
