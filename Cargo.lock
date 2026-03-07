@@ -10465,9 +10465,9 @@ dependencies = [
 
 [[package]]
 name = "zql"
-version = "0.3.21"
+version = "0.3.22"
 source = "sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/"
-checksum = "685cfd0bddaaacd138608209ad899413290f5fea3af67777e561df77cae0fcd9"
+checksum = "4399a36b2f39958a28cf744aa376667f7f85d4d5ff8e05f1a7ca8c3623326568"
 dependencies = [
  "blake3",
  "cbindgen",
@@ -10486,6 +10486,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlparser",
+ "tempfile",
  "thiserror 2.0.18",
  "tonic-build",
  "tonic-prost-build",

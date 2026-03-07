@@ -86,8 +86,11 @@ impl PersistentSecretsStore {
     pub async fn open(path: impl AsRef<Path>, key: EncryptionKey) -> Result<Self> {
         let path = path.as_ref();
 
-        // If the path is an existing directory, append the default database dirname
-        let db_path = if path.is_dir() {
+        // If the path is an existing directory that isn't itself a ZQL database,
+        // append the default database dirname so callers can pass e.g. `/var/lib/zlayer`.
+        // Once the database has been created (as a directory), subsequent opens
+        // at the same path will detect the ZQL marker and use it directly.
+        let db_path = if path.is_dir() && !path.join("ZQL_MANIFEST").exists() {
             path.join(DEFAULT_DB_DIRNAME)
         } else {
             path.to_path_buf()
