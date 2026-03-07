@@ -18,6 +18,7 @@
 //! ```
 
 #![cfg(feature = "wasm")]
+#![allow(deprecated)]
 
 use std::time::Duration;
 use tempfile::TempDir;
@@ -804,7 +805,7 @@ mod wasm_http_e2e {
         assert!(debug.contains("total_requests: 1000"));
     }
 
-    /// Test `WasmConfig` default values
+    /// Test `WasmHttpConfig` default values
     #[test]
     fn test_wasm_http_config_defaults() {
         let config = WasmConfig::default();
@@ -1251,8 +1252,12 @@ mod wasm_host_functions_e2e {
                 .expect("Secret should exist");
 
             // 5. Store in cache with TTL
-            host.kv_set_with_ttl(cache_key, b"cached_data", ttl as u64 * 1_000_000_000)
-                .expect("KV set should work");
+            host.kv_set_with_ttl(
+                cache_key,
+                b"cached_data",
+                ttl.unsigned_abs() * 1_000_000_000,
+            )
+            .expect("KV set should work");
 
             // 6. Record metrics
             host.counter_inc("cache_misses", 1);
@@ -1547,7 +1552,7 @@ mod kv_error_e2e {
 mod wasm_runtime_config_e2e {
     use super::*;
 
-    /// Test `WasmConfig` validation
+    /// Test `WasmHttpConfig` validation
     #[test]
     fn test_wasm_http_config_validation() {
         // Valid config
@@ -2107,9 +2112,9 @@ mod wasm_http_interfaces_e2e {
         assert_eq!(ping_msg.msg_type, MessageType::Ping);
         assert!(ping_msg.is_control());
 
-        let pong_msg = WebSocketMessage::pong(vec![1, 2, 3, 4]);
-        assert_eq!(pong_msg.msg_type, MessageType::Pong);
-        assert!(pong_msg.is_control());
+        let pong_message = WebSocketMessage::pong(vec![1, 2, 3, 4]);
+        assert_eq!(pong_message.msg_type, MessageType::Pong);
+        assert!(pong_message.is_control());
 
         let close_msg = WebSocketMessage::close();
         assert_eq!(close_msg.msg_type, MessageType::Close);

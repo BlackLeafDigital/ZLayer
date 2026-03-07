@@ -3,7 +3,7 @@
 //! Provides consensus-based service state management across nodes.
 //! Uses `zlayer-consensus` for storage, network, and Raft RPC plumbing.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -73,6 +73,8 @@ pub enum Request {
         disk_total: u64,
         #[serde(default)]
         gpus: Vec<GpuInfoSummary>,
+        #[serde(default)]
+        mode: String,
     },
     /// Update node heartbeat with current resource usage
     UpdateNodeHeartbeat {
@@ -106,6 +108,15 @@ impl Default for Response {
     fn default() -> Self {
         Response::Success { data: None }
     }
+}
+
+/// The role assigned to a cluster member in the Raft consensus layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MemberRole {
+    /// Full voting member (contributes to quorum).
+    Voter,
+    /// Non-voting learner (receives replication but doesn't vote).
+    Learner,
 }
 
 /// Service state tracked in Raft
@@ -209,10 +220,17 @@ pub struct NodeInfo {
     /// Node status: "ready", "draining", or "dead"
     #[serde(default = "default_node_status")]
     pub status: String,
+    /// Join mode: "full" (eligible to be voter) or "replicate" (always learner)
+    #[serde(default = "default_node_mode")]
+    pub mode: String,
 }
 
 fn default_node_status() -> String {
     "ready".to_string()
+}
+
+fn default_node_mode() -> String {
+    "full".to_string()
 }
 
 /// Summary of a GPU on a node, stored in Raft cluster state
@@ -254,6 +272,8 @@ pub struct AddMemberParams {
     pub disk_total: u64,
     /// Detected GPUs on this node
     pub gpus: Vec<GpuInfoSummary>,
+    /// Join mode: "full" or "replicate"
+    pub mode: String,
 }
 
 impl ClusterState {
@@ -303,6 +323,7 @@ impl ClusterState {
                 memory_total,
                 disk_total,
                 gpus,
+                mode,
             } => self.apply_register_node(
                 *node_id,
                 address,
@@ -315,6 +336,7 @@ impl ClusterState {
                 *memory_total,
                 *disk_total,
                 gpus,
+                mode,
             ),
             Request::UpdateNodeHeartbeat {
                 node_id,
@@ -410,6 +432,7 @@ impl ClusterState {
         memory_total: u64,
         disk_total: u64,
         gpus: &[GpuInfoSummary],
+        mode: &str,
     ) -> Response {
         let now = u64::try_from(
             std::time::SystemTime::now()
@@ -439,6 +462,7 @@ impl ClusterState {
                 memory_used: 0,
                 disk_used: 0,
                 status: "ready".to_string(),
+                mode: mode.to_owned(),
             },
         );
 
@@ -735,26 +759,31 @@ impl RaftCoordinator {
         self.node.metrics()
     }
 
-    /// Add a new member (voter) to the Raft cluster.
+    /// Add a new member to the Raft cluster.
     ///
-    /// The caller must be the current leader. This first adds the node as a
-    /// **learner** (non-voting) so it can catch up on the log, then promotes
-    /// it to a voting member via a membership change.
+    /// The caller must be the current leader. The node is always added as a
+    /// **learner** first so it can catch up on the log. If `params.mode` is
+    /// `"full"`, `rebalance_voters()` is called afterwards which may promote
+    /// the node (or others) to voter status. If `params.mode` is `"replicate"`,
+    /// the node stays as a learner permanently.
+    ///
+    /// Returns the [`MemberRole`] that was assigned to the new member.
     ///
     /// # Errors
     ///
-    /// Returns an error if this node is not the leader, if the voter addition
-    /// fails, or if the `RegisterNode` proposal fails to reach consensus.
-    pub async fn add_member(&self, params: AddMemberParams) -> Result<()> {
-        // Use ConsensusNode's add_voter (learner + promote in one call)
+    /// Returns an error if this node is not the leader, if the learner
+    /// addition fails, or if the `RegisterNode` proposal fails to reach
+    /// consensus.
+    pub async fn add_member(&self, params: AddMemberParams) -> Result<MemberRole> {
+        // Step 1: Always add as a learner first (blocking so it catches up)
         self.node
-            .add_voter(params.node_id, params.addr.clone())
+            .add_learner(params.node_id, params.addr.clone(), true)
             .await
             .map_err(|e| {
-                SchedulerError::Raft(format!("Failed to add member {}: {}", params.node_id, e))
+                SchedulerError::Raft(format!("Failed to add learner {}: {}", params.node_id, e))
             })?;
 
-        // Register the node in the state machine so cluster state knows about it
+        // Step 2: Register the node in the state machine
         self.propose(Request::RegisterNode {
             node_id: params.node_id,
             address: params.addr.clone(),
@@ -767,15 +796,171 @@ impl RaftCoordinator {
             memory_total: params.memory_total,
             disk_total: params.disk_total,
             gpus: params.gpus,
+            mode: params.mode.clone(),
         })
         .await?;
+
+        // Step 3: Determine role based on mode
+        if params.mode == "replicate" {
+            info!(
+                node_id = params.node_id,
+                addr = %params.addr,
+                "Added member to Raft cluster as learner (replicate mode)"
+            );
+            return Ok(MemberRole::Learner);
+        }
+
+        // "full" mode: rebalance voters, then check if this node became a voter
+        self.rebalance_voters().await?;
+
+        let role = if self.node.voter_ids().contains(&params.node_id) {
+            MemberRole::Voter
+        } else {
+            MemberRole::Learner
+        };
 
         info!(
             node_id = params.node_id,
             addr = %params.addr,
-            "Added member to Raft cluster as voter"
+            role = ?role,
+            "Added member to Raft cluster"
         );
 
+        Ok(role)
+    }
+
+    /// Rebalance the voter set to maintain an optimal odd number of voters.
+    ///
+    /// Reads the current cluster state to find all "full" mode nodes (eligible voters),
+    /// then computes the target voter count and adjusts membership accordingly.
+    /// Nodes with mode "replicate" are never promoted to voter.
+    ///
+    /// # Errors
+    /// Returns an error if the membership change fails.
+    pub async fn rebalance_voters(&self) -> Result<()> {
+        // Read cluster state to get node modes
+        let cluster_state = self.read_state().await;
+
+        // Current Raft membership
+        let current_voters = self.node.voter_ids();
+        let current_learners = self.node.learner_ids();
+
+        // Eligible nodes: registered, mode == "full", and present in Raft membership
+        let all_members: BTreeSet<NodeId> = current_voters
+            .iter()
+            .chain(current_learners.iter())
+            .copied()
+            .collect();
+
+        let eligible: Vec<NodeId> = all_members
+            .iter()
+            .filter(|id| {
+                cluster_state
+                    .nodes
+                    .get(id)
+                    .is_some_and(|n| n.mode == "full" && n.status != "dead")
+            })
+            .copied()
+            .collect();
+
+        let target = target_voters(eligible.len());
+
+        // Current voters that are still eligible
+        let mut surviving_voters: Vec<NodeId> = current_voters
+            .iter()
+            .filter(|id| eligible.contains(id))
+            .copied()
+            .collect();
+        surviving_voters.sort_unstable();
+
+        if surviving_voters.len() == target {
+            // Already balanced
+            return Ok(());
+        }
+
+        let new_voter_ids: BTreeSet<NodeId> = if surviving_voters.len() < target {
+            // Need more voters — promote eligible learners (prefer lower IDs)
+            let mut voters: BTreeSet<NodeId> = surviving_voters.iter().copied().collect();
+            let mut candidates: Vec<NodeId> = eligible
+                .iter()
+                .filter(|id| !voters.contains(id))
+                .copied()
+                .collect();
+            candidates.sort_unstable();
+
+            for id in candidates {
+                if voters.len() >= target {
+                    break;
+                }
+                voters.insert(id);
+            }
+            voters
+        } else {
+            // Too many voters — demote excess (keep the leader + lowest IDs)
+            let leader_id = self.node.leader_id();
+
+            // Partition into leader and non-leader, keeping order
+            let mut keep: Vec<NodeId> = Vec::with_capacity(target);
+
+            // Always keep the leader first if it's among survivors
+            if let Some(lid) = leader_id {
+                if surviving_voters.contains(&lid) {
+                    keep.push(lid);
+                }
+            }
+
+            // Fill remaining slots with lowest IDs (excluding leader already added)
+            for &id in &surviving_voters {
+                if keep.len() >= target {
+                    break;
+                }
+                if !keep.contains(&id) {
+                    keep.push(id);
+                }
+            }
+
+            keep.into_iter().collect()
+        };
+
+        // Apply the membership change (retain=true keeps demoted nodes as learners)
+        self.node
+            .change_membership(new_voter_ids, true)
+            .await
+            .map_err(|e| SchedulerError::Raft(format!("Failed to rebalance voters: {e}")))?;
+
+        info!("Rebalanced voter set (target={target})");
+        Ok(())
+    }
+
+    /// Remove a member from the Raft cluster entirely.
+    ///
+    /// This removes the node from both the Raft membership and the application
+    /// state machine. After removal, the node will no longer receive log replication.
+    ///
+    /// # Errors
+    /// Returns an error if this node is not the leader or if the removal fails.
+    pub async fn remove_member(&self, node_id: NodeId) -> Result<()> {
+        // Get current voters and remove this node
+        let mut voter_ids = self.node.voter_ids();
+        voter_ids.remove(&node_id);
+
+        // Change membership with retain=false to fully remove the node
+        self.node
+            .change_membership(voter_ids, false)
+            .await
+            .map_err(|e| {
+                SchedulerError::Raft(format!(
+                    "Failed to remove member {node_id} from membership: {e}"
+                ))
+            })?;
+
+        // Remove from the application state machine
+        self.propose(Request::DeregisterNode { node_id }).await?;
+
+        // Rebalance remaining voters
+        self.rebalance_voters().await?;
+
+        info!(node_id, "Removed member from Raft cluster");
         Ok(())
     }
 
@@ -813,6 +998,70 @@ impl RaftCoordinator {
     pub fn raft_clone(&self) -> ZLayerRaft {
         self.node.raft_clone()
     }
+}
+
+/// Compute the target number of voters for optimal fault tolerance.
+///
+/// Rules:
+/// - Always an odd number (prevents tied votes)
+/// - Minimum 1
+/// - Maximum 7 (beyond 7 voters, consensus overhead outweighs benefits)
+/// - Formula: min(7, largest odd number <= `eligible_count`)
+#[must_use]
+pub fn target_voters(eligible_count: usize) -> usize {
+    if eligible_count == 0 {
+        return 1;
+    }
+    let capped = eligible_count.min(7);
+    if capped % 2 == 0 {
+        capped - 1
+    } else {
+        capped
+    }
+}
+
+/// Path to the force-leader recovery marker file.
+#[must_use]
+pub fn force_leader_marker_path(data_dir: &std::path::Path) -> std::path::PathBuf {
+    data_dir.join("force_leader_recovery.json")
+}
+
+/// Save cluster state for force-leader recovery.
+///
+/// Writes a JSON file that the daemon checks on startup. When found, the daemon
+/// wipes Raft storage and re-bootstraps as a single-node leader, then replays
+/// the saved state.
+///
+/// # Errors
+/// Returns an error if the file cannot be written.
+pub fn save_force_leader_state(
+    data_dir: &std::path::Path,
+    state: &ClusterState,
+) -> std::result::Result<(), std::io::Error> {
+    let path = force_leader_marker_path(data_dir);
+    let json = serde_json::to_string_pretty(state).map_err(std::io::Error::other)?;
+    std::fs::write(path, json)
+}
+
+/// Check for and load a force-leader recovery marker.
+///
+/// Returns `Some(ClusterState)` if a recovery is pending.
+/// Deletes the marker file after reading.
+///
+/// # Errors
+/// Returns an error if the file exists but cannot be read or parsed.
+pub fn load_and_clear_force_leader_state(
+    data_dir: &std::path::Path,
+) -> std::result::Result<Option<ClusterState>, std::io::Error> {
+    let path = force_leader_marker_path(data_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let json = std::fs::read_to_string(&path)?;
+    let state: ClusterState = serde_json::from_str(&json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    std::fs::remove_file(&path)?;
+    Ok(Some(state))
 }
 
 #[cfg(test)]
@@ -892,6 +1141,7 @@ mod tests {
             memory_total: 16_000_000_000,
             disk_total: 500_000_000_000,
             gpus: vec![],
+            mode: "full".to_string(),
         });
 
         let node = state.get_node(1).unwrap();
@@ -899,5 +1149,86 @@ mod tests {
         assert_eq!(node.cpu_total, 8.0);
         assert_eq!(node.memory_total, 16_000_000_000);
         assert_eq!(node.status, "ready");
+    }
+
+    #[test]
+    fn test_target_voters() {
+        assert_eq!(target_voters(0), 1);
+        assert_eq!(target_voters(1), 1);
+        assert_eq!(target_voters(2), 1);
+        assert_eq!(target_voters(3), 3);
+        assert_eq!(target_voters(4), 3);
+        assert_eq!(target_voters(5), 5);
+        assert_eq!(target_voters(6), 5);
+        assert_eq!(target_voters(7), 7);
+        assert_eq!(target_voters(8), 7);
+        assert_eq!(target_voters(100), 7);
+    }
+
+    #[test]
+    fn test_force_leader_state_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = ClusterState::new();
+        state.apply(&Request::UpdateServiceState {
+            service_name: "test-svc".to_string(),
+            state: ServiceState {
+                current_replicas: 3,
+                desired_replicas: 5,
+                ..Default::default()
+            },
+        });
+        state.apply(&Request::RegisterNode {
+            node_id: 1,
+            address: "10.0.0.1:9000".to_string(),
+            wg_public_key: String::new(),
+            overlay_ip: "10.200.0.1".to_string(),
+            overlay_port: 51820,
+            advertise_addr: "10.0.0.1".to_string(),
+            api_port: 3669,
+            cpu_total: 8.0,
+            memory_total: 16_000_000_000,
+            disk_total: 500_000_000_000,
+            gpus: vec![],
+            mode: "full".to_string(),
+        });
+
+        // Save
+        save_force_leader_state(dir.path(), &state).unwrap();
+        assert!(force_leader_marker_path(dir.path()).exists());
+
+        // Load
+        let loaded = load_and_clear_force_leader_state(dir.path()).unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.services.len(), 1);
+        assert_eq!(loaded.nodes.len(), 1);
+        assert_eq!(loaded.get_service("test-svc").unwrap().current_replicas, 3);
+
+        // Marker should be deleted
+        assert!(!force_leader_marker_path(dir.path()).exists());
+    }
+
+    #[test]
+    fn test_force_leader_no_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = load_and_clear_force_leader_state(dir.path()).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_node_info_mode_default() {
+        let json =
+            r#"{"node_id":1,"address":"10.0.0.1:9000","registered_at":0,"last_heartbeat":0}"#;
+        let info: NodeInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.mode, "full");
+        assert_eq!(info.status, "ready");
+    }
+
+    #[test]
+    fn test_member_role_serialization() {
+        let voter = MemberRole::Voter;
+        let learner = MemberRole::Learner;
+        assert_eq!(serde_json::to_string(&voter).unwrap(), "\"Voter\"");
+        assert_eq!(serde_json::to_string(&learner).unwrap(), "\"Learner\"");
     }
 }

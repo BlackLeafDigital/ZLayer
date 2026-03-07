@@ -1,7 +1,7 @@
-//! Built-in ZLayer relay server.
+//! Built-in `ZLayer` relay server.
 //!
-//! A simple UDP relay server that ZLayer nodes can optionally run.
-//! Accepts the custom ZLayer relay protocol (see [`super::turn`]) and
+//! A simple UDP relay server that `ZLayer` nodes can optionally run.
+//! Accepts the custom `ZLayer` relay protocol (see [`super::turn`]) and
 //! relays data between authenticated clients.
 //!
 //! Each allocation gets its own relay UDP port. Clients must authenticate
@@ -34,7 +34,7 @@ const MAX_PACKET_SIZE: usize = 65536;
 // ---- Allocation state -------------------------------------------------------
 
 /// A single relay allocation managed by the server.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::struct_field_names)]
 struct Allocation {
     /// The client's address (who created this allocation).
     client_addr: SocketAddr,
@@ -42,7 +42,7 @@ struct Allocation {
     allocation_id: [u8; 16],
     /// The relay socket bound for this allocation.
     relay_socket: Arc<UdpSocket>,
-    /// The relay address (external_addr:relay_port).
+    /// The relay address (`external_addr:relay_port`).
     relay_addr: SocketAddrV4,
     /// Permitted peer addresses that can send/receive through this allocation.
     permissions: Vec<SocketAddrV4>,
@@ -54,7 +54,7 @@ struct Allocation {
     relay_handle: tokio::task::JoinHandle<()>,
 }
 
-/// Shared allocation table, keyed by allocation_id.
+/// Shared allocation table, keyed by `allocation_id`.
 type AllocationTable = Arc<RwLock<HashMap<[u8; 16], Allocation>>>;
 
 /// Reverse lookup: client address -> allocation ID.
@@ -62,7 +62,7 @@ type ClientLookup = Arc<RwLock<HashMap<SocketAddr, [u8; 16]>>>;
 
 // ---- Relay server -----------------------------------------------------------
 
-/// A built-in relay server for the ZLayer custom relay protocol.
+/// A built-in relay server for the `ZLayer` custom relay protocol.
 ///
 /// Nodes can optionally run this to provide relay services for peers
 /// behind restrictive NATs.
@@ -129,6 +129,7 @@ impl RelayServer {
         let socket_clone = socket.clone();
 
         tokio::spawn(async move {
+            #[allow(clippy::large_stack_arrays)]
             let mut buf = [0u8; MAX_PACKET_SIZE];
 
             loop {
@@ -216,8 +217,8 @@ impl RelayServer {
 
 // ---- Handler functions ------------------------------------------------------
 
-/// Handle an AllocateReq message.
-#[allow(clippy::too_many_arguments)]
+/// Handle an `AllocateReq` message.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_allocate_req(
     packet: &[u8],
     from: SocketAddr,
@@ -257,15 +258,15 @@ async fn handle_allocate_req(
     }
 
     // Parse username from payload (we don't use it for auth, just logging)
-    let username = if !payload.is_empty() {
+    let username = if payload.is_empty() {
+        "unknown".to_string()
+    } else {
         let ulen = payload[0] as usize;
         if payload.len() > ulen {
             String::from_utf8_lossy(&payload[1..=ulen]).to_string()
         } else {
             "unknown".to_string()
         }
-    } else {
-        "unknown".to_string()
     };
 
     // Bind a new UDP socket for this allocation's relay port
@@ -310,6 +311,7 @@ async fn handle_allocate_req(
     let client_addr = from;
 
     let relay_handle = tokio::spawn(async move {
+        #[allow(clippy::large_stack_arrays)]
         let mut buf = [0u8; MAX_PACKET_SIZE];
 
         loop {
@@ -389,7 +391,7 @@ async fn handle_allocate_req(
     );
 }
 
-/// Handle a PermissionReq message.
+/// Handle a `PermissionReq` message.
 async fn handle_permission_req(
     packet: &[u8],
     from: SocketAddr,
@@ -437,7 +439,7 @@ async fn handle_permission_req(
     debug!(from = %from, peer = %peer_addr, "Permission added");
 }
 
-/// Handle a RefreshReq message.
+/// Handle a `RefreshReq` message.
 async fn handle_refresh_req(
     packet: &[u8],
     from: SocketAddr,
@@ -482,7 +484,7 @@ async fn handle_refresh_req(
     debug!(from = %from, lifetime = lifetime, "Allocation refreshed");
 }
 
-/// Handle a Deallocate message.
+/// Handle a `Deallocate` message.
 async fn handle_deallocate(
     packet: &[u8],
     from: SocketAddr,
@@ -522,7 +524,7 @@ async fn handle_deallocate(
     }
 }
 
-/// Handle a Data message from a client.
+/// Handle a `Data` message from a client.
 async fn handle_data(
     packet: &[u8],
     from: SocketAddr,

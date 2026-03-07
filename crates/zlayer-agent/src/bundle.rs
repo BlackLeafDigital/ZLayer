@@ -2185,10 +2185,7 @@ services:
 
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].destination().to_string_lossy(), "/app/tmp");
-        assert_eq!(
-            mounts[0].typ().as_ref().map(std::string::String::as_str),
-            Some("tmpfs")
-        );
+        assert_eq!(mounts[0].typ().as_ref().map(String::as_str), Some("tmpfs"));
         let options = mounts[0].options().as_ref().unwrap();
         assert!(options.iter().any(|o| o.starts_with("size=")));
         assert!(options.iter().any(|o| o.starts_with("mode=")));

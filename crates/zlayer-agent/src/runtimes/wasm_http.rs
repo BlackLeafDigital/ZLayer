@@ -1440,6 +1440,7 @@ impl WasmHttpRuntime {
 // =============================================================================
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use std::collections::HashMap;

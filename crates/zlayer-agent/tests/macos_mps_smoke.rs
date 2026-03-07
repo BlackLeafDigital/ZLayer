@@ -43,7 +43,7 @@ const E2E_TEST_DIR: &str = "/tmp/zlayer-mps-smoke-test";
 // =============================================================================
 
 /// Swift program that checks Metal device availability and basic MPS support.
-/// Exits 0 and prints `METAL_OK` on success.
+/// Exits 0 and prints "`METAL_OK`" on success.
 const SWIFT_METAL_DEVICE_CHECK: &str = r#"
 import Metal
 
@@ -243,12 +243,12 @@ do {
 fn unique_name(prefix: &str) -> String {
     use rand::Rng;
     let suffix: u32 = rand::rng().random_range(10000..99999);
+    #[allow(clippy::cast_possible_truncation)] // millis % 1_000_000 always fits in u64
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis()
         % 1_000_000;
-    let timestamp = u64::try_from(timestamp).unwrap_or(u64::MAX);
     format!("{prefix}-{timestamp}-{suffix}")
 }
 
@@ -427,7 +427,7 @@ services:
         assert_eq!(exit_code, 0, "Metal device check should exit 0");
         assert!(
             logs.contains("METAL_OK"),
-            "Output should contain METAL_OK, got:\n{logs}"
+            "Output should contain METAL_OK, got:\n{logs}",
         );
         assert!(
             logs.contains("METAL_DEVICE:"),
@@ -510,7 +510,7 @@ services:
         assert_eq!(exit_code, 0, "MPS compute should exit 0");
         assert!(
             logs.contains("MPS_COMPUTE_OK"),
-            "Output should contain MPS_COMPUTE_OK, got:\n{logs}"
+            "Output should contain MPS_COMPUTE_OK, got:\n{logs}",
         );
         assert!(
             logs.contains("1024/1024 correct"),
@@ -593,7 +593,7 @@ services:
         assert_eq!(exit_code, 0, "Metal shader compile should exit 0");
         assert!(
             logs.contains("SHADER_COMPUTE_OK"),
-            "Output should contain SHADER_COMPUTE_OK, got:\n{logs}"
+            "Output should contain SHADER_COMPUTE_OK, got:\n{logs}",
         );
         assert!(
             logs.contains("SHADER_COMPILED:"),
@@ -681,11 +681,11 @@ services:
         // The process should fail because runtime disabled GPU access
         assert_ne!(
             exit_code, 0,
-            "Metal should fail when runtime disables GPU, but got exit 0:\n{logs}"
+            "Metal should fail when runtime disables GPU, but got exit 0:\n{logs}",
         );
         assert!(
             logs.contains("METAL_FAIL"),
-            "Output should contain METAL_FAIL, got:\n{logs}"
+            "Output should contain METAL_FAIL, got:\n{logs}",
         );
 
         let _ = runtime.stop_container(&id, Duration::from_secs(5)).await;

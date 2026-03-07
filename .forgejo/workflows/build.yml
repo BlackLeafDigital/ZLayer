@@ -133,7 +133,7 @@ jobs:
           choco install protoc -y
           echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
       - name: Build (thin Windows CLI)
-        run: cargo build --release --package zlayer --no-default-features --features wsl,docker
+        run: cargo build --release --package zlayer --no-default-features --features wsl
       - name: Package
         shell: pwsh
         run: Compress-Archive -Path target\release\zlayer.exe -DestinationPath zlayer-windows-amd64.zip

@@ -121,6 +121,9 @@ hex = "0.4"
 hickory-server = "0.24"
 hickory-client = "0.24"
 
+# Serialization (binary)
+postcard2 = { version = "0.2.1", features = ["alloc"] }
+
 # Storage
 redb = "2.2"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
@@ -153,14 +156,6 @@ base64 = "0.22"
 
 # Validation
 validator = { version = "0.19", features = ["derive"] }
-
-# Pingora (Cloudflare's proxy framework)
-pingora = { version = "0.6", features = ["lb", "proxy", "cache", "rustls"] }
-pingora-core = { version = "0.6", features = ["rustls"] }
-pingora-proxy = { version = "0.6", features = ["rustls"] }
-pingora-load-balancing = "0.6"
-pingora-cache = "0.6"
-pingora-timeout = "0.6"
 
 # ACME/TLS certificates
 instant-acme = "0.7"
@@ -215,9 +210,6 @@ zlayer-secrets = { path = "crates/zlayer-secrets", version = "0.0.0-dev", packag
 zlayer-manager = { path = "crates/zlayer-manager", version = "0.0.0-dev", package = "zlayer-manager-zql" }
 zlayer-consensus = { path = "crates/zlayer-consensus", version = "0.0.0-dev", package = "zlayer-consensus-zql" }
 zlayer-wsl = { path = "crates/zlayer-wsl", version = "0.0.0-dev", package = "zlayer-wsl-zql" }
-
-# Windows-only dependencies
-winreg = "0.55"
 
 # =============================================================================
 # Build Profiles

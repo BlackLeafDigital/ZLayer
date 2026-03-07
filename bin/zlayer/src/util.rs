@@ -250,9 +250,9 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains("Multiple deployment specs found"),
-            "expected 'Multiple deployment specs found', got: {msg}"
+            "expected 'Multiple deployment specs found', got: {msg}",
         );
-        assert!(msg.contains("alpha.zlayer.yml"), "should list alpha: {msg}");
+        assert!(msg.contains("alpha.zlayer.yml"), "should list alpha: {msg}",);
         assert!(msg.contains("beta.zlayer.yml"), "should list beta: {msg}");
 
         cleanup(&dir);
@@ -268,7 +268,7 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains("No deployment spec found"),
-            "expected 'No deployment spec found', got: {msg}"
+            "expected 'No deployment spec found', got: {msg}",
         );
 
         cleanup(&dir);
@@ -297,7 +297,7 @@ mod tests {
         let msg = format!("{err}");
         assert!(
             msg.contains("No deployment spec found"),
-            "directories should not match: {msg}"
+            "directories should not match: {msg}",
         );
 
         cleanup(&dir);

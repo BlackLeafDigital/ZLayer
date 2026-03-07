@@ -345,7 +345,7 @@ async fn test_overlay_interface_lifecycle() {
     let link_stdout = String::from_utf8_lossy(&link_output.stdout);
     assert!(
         link_stdout.contains("UP") || link_stdout.contains("up"),
-        "Interface should be UP after configure_interface, got: {link_stdout}"
+        "Interface should be UP after configure_interface, got: {link_stdout}",
     );
 
     // Verify the overlay IP is assigned
@@ -357,7 +357,7 @@ async fn test_overlay_interface_lifecycle() {
     let addr_stdout = String::from_utf8_lossy(&addr_output.stdout);
     assert!(
         addr_stdout.contains("10.250.0.1"),
-        "Interface should have overlay IP 10.250.0.1 assigned, got: {addr_stdout}"
+        "Interface should have overlay IP 10.250.0.1 assigned, got: {addr_stdout}",
     );
 
     // Tear down the interface via transport shutdown
@@ -374,7 +374,7 @@ async fn test_overlay_interface_lifecycle() {
         .expect("ip link show should execute");
     assert!(
         !link_output.status.success(),
-        "Interface {iface_name} should no longer exist after shutdown"
+        "Interface {iface_name} should no longer exist after shutdown",
     );
 }
 
@@ -498,7 +498,7 @@ async fn test_dual_overlay_connectivity() {
     // Verify we received replies (not 100% packet loss)
     assert!(
         !ping_stdout.contains("100% packet loss"),
-        "Ping should not have 100% packet loss.\nstdout: {ping_stdout}"
+        "Ping should not have 100% packet loss.\nstdout: {ping_stdout}",
     );
 
     // Also ping in the reverse direction
@@ -534,7 +534,7 @@ async fn test_dual_overlay_connectivity() {
         .expect("ip link show should execute");
     assert!(
         !check_a.status.success(),
-        "Interface {iface_a} should be removed after shutdown"
+        "Interface {iface_a} should be removed after shutdown",
     );
 
     let check_b = Command::new("ip")
@@ -544,6 +544,6 @@ async fn test_dual_overlay_connectivity() {
         .expect("ip link show should execute");
     assert!(
         !check_b.status.success(),
-        "Interface {iface_b} should be removed after shutdown"
+        "Interface {iface_b} should be removed after shutdown",
     );
 }

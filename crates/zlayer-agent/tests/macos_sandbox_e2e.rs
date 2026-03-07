@@ -51,6 +51,7 @@ const E2E_TEST_DIR: &str = "/tmp/zlayer-macos-sandbox-e2e-test";
 // =============================================================================
 
 /// Generate a unique name with the given prefix for test isolation
+#[allow(clippy::cast_possible_truncation)]
 fn unique_name(prefix: &str) -> String {
     use rand::Rng;
     let suffix: u32 = rand::rng().random_range(10000..99999);
@@ -59,7 +60,6 @@ fn unique_name(prefix: &str) -> String {
         .unwrap()
         .as_millis()
         % 1_000_000;
-    let timestamp = u64::try_from(timestamp).unwrap_or(u64::MAX);
     format!("{prefix}-{timestamp}-{suffix}")
 }
 
@@ -419,9 +419,9 @@ impl Drop for ContainerGuard {
         if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
                 if pid > 0 {
-                    // SAFETY: pid is a valid positive process ID read from the container's
-                    // pid file. We send SIGKILL and reap with WNOHANG to avoid zombies.
-                    // This runs in Drop where async is unavailable.
+                    // SAFETY: pid was read from our own pid file and is > 0.
+                    // kill() and waitpid() are safe to call with any valid pid.
+                    // We use WNOHANG so waitpid() won't block.
                     unsafe {
                         libc::kill(pid, libc::SIGKILL);
                         let mut status: libc::c_int = 0;
@@ -1312,7 +1312,7 @@ async fn test_container_stats() {
         let stats = stats.unwrap();
         println!(
             "Container stats: cpu_usec={}, memory_bytes={}, memory_limit={}",
-            stats.cpu_usage_usec, stats.memory_bytes, stats.memory_limit
+            stats.cpu_usage_usec, stats.memory_bytes, stats.memory_limit,
         );
 
         // Memory should be non-zero (process is running)

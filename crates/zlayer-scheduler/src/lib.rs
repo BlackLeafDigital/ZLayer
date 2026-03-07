@@ -45,8 +45,10 @@ pub use placement::{
     NodeResources, NodeState, PlacementDecision, PlacementReason, PlacementState,
 };
 pub use raft::{
-    AddMemberParams, ClusterState, GpuInfoSummary, HealthStatus, NodeId, NodeInfo, RaftConfig,
-    RaftCoordinator, Request, Response, ScaleEvent, ServiceState, TypeConfig, ZLayerRaft,
+    force_leader_marker_path, load_and_clear_force_leader_state, save_force_leader_state,
+    target_voters, AddMemberParams, ClusterState, GpuInfoSummary, HealthStatus, MemberRole, NodeId,
+    NodeInfo, RaftConfig, RaftCoordinator, Request, Response, ScaleEvent, ServiceState, TypeConfig,
+    ZLayerRaft,
 };
 pub use raft_network::RaftHttpClient;
 pub use raft_service::RaftService;

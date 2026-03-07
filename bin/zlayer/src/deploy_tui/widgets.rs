@@ -311,8 +311,10 @@ use zlayer_tui::widgets::scrollable_pane::ScrollablePane;
 #[cfg(test)]
 pub fn render_deploy_view(state: &DeployState, tick: usize, area: Rect, buf: &mut Buffer) {
     // Vertical layout: infra, services, logs, footer
-    let infra_height = 2 + u16::try_from(state.infra_phases.len().div_ceil(3)).unwrap_or(u16::MAX); // border + rows
-    let service_count = u16::try_from(state.services.len().max(1)).unwrap_or(u16::MAX);
+    #[allow(clippy::cast_possible_truncation)]
+    let infra_height = 2 + state.infra_phases.len().div_ceil(3) as u16; // border + rows
+    #[allow(clippy::cast_possible_truncation)]
+    let service_count = state.services.len().max(1) as u16;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

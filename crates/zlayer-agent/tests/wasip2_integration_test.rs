@@ -106,11 +106,12 @@ fn create_test_config(cache_dir: &TempDir) -> WasmConfig {
 #[allow(clippy::cast_possible_truncation)]
 fn unique_service_name(prefix: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
+    #[allow(clippy::cast_possible_truncation)]
+    let timestamp = (SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_nanos() as u64
-        % 1_000_000_000;
+        .as_nanos()
+        % 1_000_000_000) as u64;
     format!("test-{prefix}-{timestamp}")
 }
 
@@ -216,7 +217,7 @@ impl Drop for InstanceGuard {
 // These are used for comparison and to verify module vs component detection
 // =============================================================================
 
-/// Minimal `WASIp1` module that exports _start and exits with code 0
+/// Minimal `WASIp1` module that exports `_start` and exits with code 0
 const MINIMAL_P1_MODULE: &str = r#"
 (module
     (import "wasi_snapshot_preview1" "proc_exit" (func $proc_exit (param i32)))
@@ -240,7 +241,7 @@ const EXIT_42_P1_MODULE: &str = r#"
 )
 "#;
 
-/// `WASIp1` module without _start or main (should fail)
+/// `WASIp1` module without `_start` or main (should fail)
 const NO_ENTRY_P1_MODULE: &str = r#"
 (module
     (memory (export "memory") 1)
@@ -319,7 +320,7 @@ mod component_loading_tests {
         let result = runtime.create_container(&id, &spec).await;
         assert!(
             result.is_ok(),
-            "Loading valid module should succeed: {result:?}"
+            "Loading valid module should succeed: {result:?}",
         );
 
         // State should be Pending
@@ -352,14 +353,14 @@ mod component_loading_tests {
         let create_result = runtime.create_container(&id, &spec).await;
         assert!(
             create_result.is_ok(),
-            "Create should succeed: {create_result:?}"
+            "Create should succeed: {create_result:?}",
         );
 
         // Starting should also succeed (spawns async task)
         let start_result = runtime.start_container(&id).await;
         assert!(
             start_result.is_ok(),
-            "Start should succeed: {start_result:?}"
+            "Start should succeed: {start_result:?}",
         );
 
         // But waiting should fail because the component is invalid
@@ -634,7 +635,7 @@ mod component_execution_tests {
                 state,
                 ContainerState::Exited { .. } | ContainerState::Failed { .. }
             ),
-            "State should be Exited or Failed after stop, got: {state:?}"
+            "State should be Exited or Failed after stop, got: {state:?}",
         );
     }
 
@@ -715,7 +716,7 @@ mod error_handling_tests {
                 reason.contains("_start")
                     || reason.contains("main")
                     || reason.contains("not found"),
-                "Error should mention missing entry point, got: {reason}"
+                "Error should mention missing entry point, got: {reason}",
             );
         }
     }
@@ -852,9 +853,9 @@ mod error_handling_tests {
             "Waiting for nonexistent container should error"
         );
 
-        let stats_result = runtime.get_container_stats(&id).await;
+        let ctr_stats_result = runtime.get_container_stats(&id).await;
         assert!(
-            stats_result.is_err(),
+            ctr_stats_result.is_err(),
             "Getting stats of nonexistent container should error"
         );
     }
@@ -884,10 +885,11 @@ mod error_handling_tests {
         let exec_result = runtime.exec(&id, &cmd).await;
 
         assert!(exec_result.is_err(), "Exec should fail for WASM");
-        let err_msg = format!("{:?}", exec_result.unwrap_err());
+        let err = exec_result.unwrap_err();
+        let err_msg = format!("{err:?}");
         assert!(
             err_msg.contains("not supported") || err_msg.contains("WASM"),
-            "Error should mention WASM or not supported: {err_msg}"
+            "Error should mention WASM or not supported: {err_msg}",
         );
     }
 }
@@ -991,7 +993,7 @@ mod version_detection_tests {
             assert_eq!(
                 version,
                 WasiVersion::Preview1,
-                "Section type {section_type:02x} should be detected as Preview1"
+                "Section type {section_type:02x} should be detected as Preview1",
             );
         }
     }
@@ -1009,7 +1011,7 @@ mod version_detection_tests {
             assert_eq!(
                 version,
                 WasiVersion::Preview2,
-                "Version {ver:02x} should be detected as Preview2"
+                "Version {ver:02x} should be detected as Preview2",
             );
         }
     }

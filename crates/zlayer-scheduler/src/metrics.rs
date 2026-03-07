@@ -970,7 +970,7 @@ mod tests {
             memory_limit: u64::MAX,
             timestamp: Instant::now(),
         };
-        assert_eq!(stats.memory_percent(), 0.0);
+        assert!(stats.memory_percent().abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -1020,7 +1020,7 @@ mod tests {
         // First sample - CPU should be 0 (no previous sample)
         let metrics = source.collect("api").await.unwrap();
         assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0].cpu_percent, 0.0); // First sample has no delta
+        assert!(metrics[0].cpu_percent.abs() < f64::EPSILON); // First sample has no delta
         assert!((metrics[0].memory_percent() - 19.53).abs() < 0.1); // ~50MB/256MB
     }
 
@@ -1214,6 +1214,6 @@ mod tests {
 
         // After cache clear, should be like first sample again (CPU = 0)
         let metrics = source.collect("cache-test").await.unwrap();
-        assert_eq!(metrics[0].cpu_percent, 0.0);
+        assert!(metrics[0].cpu_percent.abs() < f64::EPSILON);
     }
 }

@@ -341,7 +341,7 @@ mod tests {
             state.phase = phase;
             let view = DeployView::new(&state, 0);
             let (text, _style) = view.phase_display();
-            assert!(!text.is_empty(), "Phase {phase:?} should have display text");
+            assert!(!text.is_empty(), "Phase {phase:?} should have display text",);
         }
     }
 

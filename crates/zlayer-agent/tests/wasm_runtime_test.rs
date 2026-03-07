@@ -188,10 +188,13 @@ fn create_test_config(cache_dir: &TempDir) -> WasmConfig {
 #[allow(clippy::cast_possible_truncation)]
 fn unique_instance_name(prefix: &str) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
+    let timestamp = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap_or(0)
         % 1_000_000;
     format!("test-{prefix}-{timestamp}")
 }
@@ -383,7 +386,7 @@ mod runtime_creation_tests {
         let config = create_test_config(&cache_dir);
 
         let runtime = WasmRuntime::new(config).await;
-        assert!(runtime.is_ok(), "Failed to create WasmRuntime: {runtime:?}");
+        assert!(runtime.is_ok(), "Failed to create WasmRuntime: {runtime:?}",);
 
         let runtime = runtime.unwrap();
         println!("WasmRuntime created successfully: {runtime:?}");
@@ -404,7 +407,7 @@ mod runtime_creation_tests {
         let runtime = WasmRuntime::new(config).await;
         assert!(
             runtime.is_ok(),
-            "Failed to create WasmRuntime with modified defaults: {runtime:?}"
+            "Failed to create WasmRuntime with modified defaults: {runtime:?}",
         );
     }
 
@@ -455,7 +458,7 @@ mod lifecycle_tests {
 
         // Create instance
         let result = runtime.create_container(&id, &spec).await;
-        assert!(result.is_ok(), "Failed to create WASM instance: {result:?}");
+        assert!(result.is_ok(), "Failed to create WASM instance: {result:?}",);
 
         // Verify state is Pending
         let state = runtime.container_state(&id).await;
@@ -490,7 +493,7 @@ mod lifecycle_tests {
             .await
             .expect("Failed to create");
         let result = runtime.start_container(&id).await;
-        assert!(result.is_ok(), "Failed to start WASM instance: {result:?}");
+        assert!(result.is_ok(), "Failed to start WASM instance: {result:?}",);
 
         println!("WASM instance started successfully");
     }
@@ -553,7 +556,7 @@ mod lifecycle_tests {
 
         // Remove instance
         let result = runtime.remove_container(&id).await;
-        assert!(result.is_ok(), "Failed to remove WASM instance: {result:?}");
+        assert!(result.is_ok(), "Failed to remove WASM instance: {result:?}",);
 
         // Verify instance is gone
         let state = runtime.container_state(&id).await;
@@ -691,7 +694,7 @@ mod state_tests {
                 state,
                 ContainerState::Running | ContainerState::Exited { .. }
             ),
-            "Expected Running or Exited, got: {state:?}"
+            "Expected Running or Exited, got: {state:?}",
         );
     }
 

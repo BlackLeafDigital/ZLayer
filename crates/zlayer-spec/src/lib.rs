@@ -92,7 +92,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("version") || err_str.contains("v1"),
-            "Error should mention version: {err_str}"
+            "Error should mention version: {err_str}",
         );
     }
 
@@ -112,7 +112,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("deployment") || err_str.contains("3-63"),
-            "Error should mention deployment name: {err_str}"
+            "Error should mention deployment name: {err_str}",
         );
     }
 
@@ -136,7 +136,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("port"),
-            "Error should mention port: {err_str}"
+            "Error should mention port: {err_str}",
         );
     }
 
@@ -158,7 +158,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("database") || err_str.contains("unknown"),
-            "Error should mention unknown dependency: {err_str}"
+            "Error should mention unknown dependency: {err_str}",
         );
     }
 
@@ -185,7 +185,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("http") || err_str.contains("duplicate"),
-            "Error should mention duplicate endpoint: {err_str}"
+            "Error should mention duplicate endpoint: {err_str}",
         );
     }
 
@@ -209,7 +209,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("scale") || err_str.contains("min") || err_str.contains("max"),
-            "Error should mention scale range: {err_str}"
+            "Error should mention scale range: {err_str}",
         );
     }
 
@@ -231,7 +231,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("cpu") || err_str.contains("CPU"),
-            "Error should mention CPU: {err_str}"
+            "Error should mention CPU: {err_str}",
         );
     }
 
@@ -253,7 +253,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("memory"),
-            "Error should mention memory format: {err_str}"
+            "Error should mention memory format: {err_str}",
         );
     }
 
@@ -273,7 +273,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("image") || err_str.contains("empty"),
-            "Error should mention empty image name: {err_str}"
+            "Error should mention empty image name: {err_str}",
         );
     }
 
@@ -386,7 +386,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("schedule") || err_str.contains("cron"),
-            "Error should mention missing schedule: {err_str}"
+            "Error should mention missing schedule: {err_str}",
         );
     }
 
@@ -408,7 +408,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("schedule") || err_str.contains("cron"),
-            "Error should mention schedule/cron mismatch: {err_str}"
+            "Error should mention schedule/cron mismatch: {err_str}",
         );
     }
 
@@ -430,7 +430,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("schedule") || err_str.contains("cron"),
-            "Error should mention schedule/cron mismatch: {err_str}"
+            "Error should mention schedule/cron mismatch: {err_str}",
         );
     }
 
@@ -452,7 +452,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("cron") || err_str.contains("schedule") || err_str.contains("invalid"),
-            "Error should mention invalid cron expression: {err_str}"
+            "Error should mention invalid cron expression: {err_str}",
         );
     }
 
@@ -589,7 +589,7 @@ services:
         let err_str = err.to_string();
         assert!(
             err_str.contains("ttl") || err_str.contains("TTL") || err_str.contains("invalid"),
-            "Error should mention invalid TTL: {err_str}"
+            "Error should mention invalid TTL: {err_str}",
         );
     }
 
@@ -612,7 +612,7 @@ tunnels:
         let err_str = err.to_string();
         assert!(
             err_str.contains("port") || err_str.contains("local"),
-            "Error should mention invalid port: {err_str}"
+            "Error should mention invalid port: {err_str}",
         );
     }
 
@@ -635,7 +635,7 @@ tunnels:
         let err_str = err.to_string();
         assert!(
             err_str.contains("port") || err_str.contains("remote"),
-            "Error should mention invalid port: {err_str}"
+            "Error should mention invalid port: {err_str}",
         );
     }
 
@@ -696,7 +696,7 @@ services:
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("wasm") || err_str.contains("WASM"),
-            "Error should mention wasm config on non-wasm type: {err_str}"
+            "Error should mention wasm config on non-wasm type: {err_str}",
         );
     }
 
@@ -738,7 +738,7 @@ services:
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("min_instances") || err_str.contains("max_instances"),
-            "Error should mention instance range: {err_str}"
+            "Error should mention instance range: {err_str}",
         );
     }
 
@@ -781,7 +781,7 @@ services:
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("memory") || err_str.contains("512MB"),
-            "Error should mention invalid memory format: {err_str}"
+            "Error should mention invalid memory format: {err_str}",
         );
     }
 
@@ -825,7 +825,7 @@ services:
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("secrets") || err_str.contains("capability"),
-            "Error should mention capability escalation: {err_str}"
+            "Error should mention capability escalation: {err_str}",
         );
     }
 
@@ -884,7 +884,7 @@ services:
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("HTTP") || err_str.contains("http") || err_str.contains("endpoint"),
-            "Error should mention missing HTTP endpoint: {err_str}"
+            "Error should mention missing HTTP endpoint: {err_str}",
         );
     }
 
@@ -953,7 +953,7 @@ services:
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("preopen") || err_str.contains("source") || err_str.contains("empty"),
-            "Error should mention empty preopen source: {err_str}"
+            "Error should mention empty preopen source: {err_str}",
         );
     }
 
@@ -977,7 +977,7 @@ services:
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("preopen") || err_str.contains("target") || err_str.contains("empty"),
-            "Error should mention empty preopen target: {err_str}"
+            "Error should mention empty preopen target: {err_str}",
         );
     }
 
@@ -1050,7 +1050,7 @@ services:
         let err_str = result.unwrap_err().to_string();
         assert!(
             err_str.contains("sockets") || err_str.contains("capability"),
-            "Error should mention sockets capability escalation: {err_str}"
+            "Error should mention sockets capability escalation: {err_str}",
         );
     }
 

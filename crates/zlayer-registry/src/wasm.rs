@@ -1167,7 +1167,7 @@ mod tests {
             assert_eq!(
                 version,
                 WasiVersion::Preview2,
-                "Expected Preview2 for version {v}"
+                "Expected Preview2 for version {v}",
             );
         }
     }
@@ -1237,12 +1237,12 @@ mod tests {
             let result = extract_wasm_binary_info(truncated);
             assert!(
                 result.is_err(),
-                "Expected error for {len} bytes, got {result:?}"
+                "Expected error for {len} bytes, got {result:?}",
             );
             assert_eq!(
                 result.unwrap_err(),
                 WasmError::TooShort,
-                "Expected TooShort for {len} bytes"
+                "Expected TooShort for {len} bytes",
             );
         }
     }

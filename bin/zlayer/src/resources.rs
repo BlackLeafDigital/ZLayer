@@ -339,7 +339,7 @@ mod tests {
         // Any machine should have at least 64 MB
         assert!(
             mem >= 64 * 1024 * 1024,
-            "Expected at least 64 MB, got {mem} bytes"
+            "Expected at least 64 MB, got {mem} bytes",
         );
     }
 
@@ -350,7 +350,7 @@ mod tests {
         let used = detect_memory_used();
         assert!(
             used <= total,
-            "Used memory ({used}) should not exceed total ({total})"
+            "Used memory ({used}) should not exceed total ({total})",
         );
     }
 
@@ -371,7 +371,7 @@ mod tests {
         let used = detect_disk_used(&dir);
         assert!(
             used <= total,
-            "Disk used ({used}) should not exceed total ({total})"
+            "Disk used ({used}) should not exceed total ({total})",
         );
     }
 
@@ -421,7 +421,7 @@ mod tests {
         assert!(used >= 0.0, "CPU used should be non-negative, got {used}");
         assert!(
             used <= total,
-            "CPU used ({used}) should not exceed total ({total})"
+            "CPU used ({used}) should not exceed total ({total})",
         );
     }
 

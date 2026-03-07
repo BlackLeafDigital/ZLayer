@@ -16,7 +16,6 @@ openraft = { workspace = true, features = ["serde", "storage-v2"] }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
-postcard2 = { version = "0.2.1", features = ["alloc"] }
 
 # Async
 tokio = { workspace = true }
@@ -39,6 +38,7 @@ hex = { workspace = true }
 # Persistent storage (optional)
 zql = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
+postcard2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

@@ -51,6 +51,7 @@ async fn skip_if_no_docker() -> Option<DockerRuntime> {
 fn unique_container_name(prefix: &str) -> String {
     use rand::Rng;
     let suffix: u32 = rand::rng().random_range(10000..99999);
+    #[allow(clippy::cast_possible_truncation)]
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -225,9 +226,11 @@ async fn test_pull_image() {
 
     let result = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
 
-    let inner = result.expect("Timeout pulling image");
-    inner.expect("Failed to pull image");
-    println!("Image pulled successfully");
+    match result {
+        Ok(Ok(())) => println!("Image pulled successfully"),
+        Ok(Err(e)) => panic!("Failed to pull image: {e}"),
+        Err(e) => panic!("Timeout pulling image: {e}"),
+    }
 }
 
 /// Test that `IfNotPresent` policy skips pulling when image exists
@@ -255,14 +258,18 @@ async fn test_pull_image_if_not_present() {
     let elapsed = start.elapsed();
     println!("IfNotPresent pull completed in {elapsed:?}");
 
-    let inner = result.expect("Timeout with IfNotPresent policy");
-    inner.expect("Failed with IfNotPresent policy");
-    // Should complete quickly since image is already present
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "IfNotPresent should be fast for existing images"
-    );
-    println!("IfNotPresent correctly skipped pull");
+    match result {
+        Ok(Ok(())) => {
+            // Should complete quickly since image is already present
+            assert!(
+                elapsed < Duration::from_secs(5),
+                "IfNotPresent should be fast for existing images"
+            );
+            println!("IfNotPresent correctly skipped pull");
+        }
+        Ok(Err(e)) => panic!("Failed with IfNotPresent policy: {e}"),
+        Err(e) => panic!("Timeout with IfNotPresent policy: {e}"),
+    }
 }
 
 /// Test complete container lifecycle: create -> start -> get state -> stop -> remove
@@ -885,9 +892,11 @@ async fn test_pull_always_policy() {
     )
     .await;
 
-    let inner = result.expect("Timeout with Always policy");
-    inner.expect("Failed with Always policy");
-    println!("Always policy pulled successfully");
+    match result {
+        Ok(Ok(())) => println!("Always policy pulled successfully"),
+        Ok(Err(e)) => panic!("Failed with Always policy: {e}"),
+        Err(e) => panic!("Timeout with Always policy: {e}"),
+    }
 }
 
 /// Test container with environment variables

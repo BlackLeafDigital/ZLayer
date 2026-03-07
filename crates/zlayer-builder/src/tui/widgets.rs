@@ -132,8 +132,6 @@ impl Widget for InstructionList<'_> {
 
 #[cfg(test)]
 mod tests {
-    use ratatui::buffer::Cell;
-
     use super::*;
     use zlayer_tui::widgets::progress_bar::ProgressBar;
     use zlayer_tui::widgets::scrollable_pane::{OutputLine, ScrollablePane};
@@ -151,7 +149,11 @@ mod tests {
         progress.render(area, &mut buf);
 
         // Check that something was rendered
-        let content: String = buf.content().iter().map(Cell::symbol).collect();
+        let content = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
         assert!(!content.trim().is_empty());
     }
 
@@ -209,7 +211,11 @@ mod tests {
         list.render(area, &mut buf);
 
         // Check that content was rendered
-        let content: String = buf.content().iter().map(Cell::symbol).collect();
+        let content = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
         assert!(content.contains("WORKDIR") || content.contains("RUN") || content.contains("COPY"));
     }
 
@@ -230,7 +236,11 @@ mod tests {
 
         list.render(area, &mut buf);
 
-        let content: String = buf.content().iter().map(Cell::symbol).collect();
+        let content = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
         assert!(content.contains("[cached]"));
     }
 
@@ -243,7 +253,11 @@ mod tests {
         let pane = ScrollablePane::new(&lines, 0).with_empty_text("Waiting for output...");
         pane.render(area, &mut buf);
 
-        let content: String = buf.content().iter().map(Cell::symbol).collect();
+        let content = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
         assert!(content.contains("Waiting"));
     }
 
@@ -266,7 +280,11 @@ mod tests {
         let pane = ScrollablePane::new(&lines, 0);
         pane.render(area, &mut buf);
 
-        let content: String = buf.content().iter().map(Cell::symbol).collect();
+        let content = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
         assert!(content.contains("stdout") || content.contains("stderr"));
     }
 
@@ -287,7 +305,11 @@ mod tests {
         pane.render(area, &mut buf);
 
         // Check that we're showing lines from the scrolled position
-        let content: String = buf.content().iter().map(Cell::symbol).collect();
+        let content = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
         // Should show lines around position 5
         assert!(
             content.contains("Line 5") || content.contains("Line 6") || content.contains("Line 7")

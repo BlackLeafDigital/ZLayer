@@ -318,7 +318,10 @@ mod tests {
         let config = BackoffConfig::default();
         assert_eq!(config.initial_delay, Duration::from_secs(1));
         assert_eq!(config.max_delay, Duration::from_secs(60));
-        assert_eq!(config.multiplier, 2.0);
+        assert!(
+            (config.multiplier - 2.0).abs() < f64::EPSILON,
+            "multiplier should be 2.0"
+        );
     }
 
     #[test]

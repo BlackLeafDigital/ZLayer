@@ -427,6 +427,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_eviction() {
+        let (cache, _temp) = create_test_cache().await;
+        let cache = cache.with_max_size(100); // 100 bytes max
+
+        // Insert data that exceeds limit
+        for i in 0..20 {
+            let data = format!("data_{i:02}");
+            let digest = compute_digest(data.as_bytes());
+            cache.put(&digest, data.as_bytes()).await.unwrap();
+
+            // Add small delay to ensure different timestamps
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // Cache should have evicted some entries
+        let size = cache.size().await.unwrap();
+        assert!(size <= 100, "Cache size {size} should be <= 100");
+    }
+
+    #[tokio::test]
     async fn test_invalid_digest() {
         let (cache, _temp) = create_test_cache().await;
 
@@ -447,6 +467,82 @@ mod tests {
 
         let result = cache.put(wrong_digest, data).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_open_with_directory_path() {
+        // Test that opening with a directory path works
+        let temp_dir = TempDir::new().unwrap();
+
+        // Pass the directory path directly - ZQL uses it as the database directory
+        let cache = PersistentBlobCache::open(temp_dir.path()).await.unwrap();
+
+        // Verify cache works
+        let data = b"test data for directory path";
+        let digest = compute_digest(data);
+
+        cache.put(&digest, data).await.unwrap();
+        let retrieved = cache.get(&digest).await.unwrap();
+        assert_eq!(retrieved, Some(data.to_vec()));
+    }
+
+    #[tokio::test]
+    async fn test_lru_access_time_update() {
+        let (cache, _temp) = create_test_cache().await;
+        let cache = cache.with_max_size(150); // 150 bytes max
+
+        // Create three blobs of 60 bytes each
+        let data1 = vec![1u8; 60];
+        let digest1 = compute_digest(&data1);
+        let data2 = vec![2u8; 60];
+        let digest2 = compute_digest(&data2);
+        let data3 = vec![3u8; 60];
+        let digest3 = compute_digest(&data3);
+
+        // Add first two blobs (120 bytes total, under limit)
+        cache.put(&digest1, &data1).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await; // Use full second sleeps for timestamp resolution
+        cache.put(&digest2, &data2).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Verify both exist
+        assert!(cache.contains(&digest1).await.unwrap());
+        assert!(cache.contains(&digest2).await.unwrap());
+
+        // Access digest1 to update its access time (making it more recent than data2)
+        let result = cache.get(&digest1).await.unwrap();
+        assert!(result.is_some(), "data1 should exist");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+
+        // Adding third blob brings us to 180 bytes (over 150 limit)
+        // Eviction target is 90% of 150 = 135 bytes
+        // Need to evict 180 - 135 = 45 bytes
+        // Should evict data2 (60 bytes, the oldest), leaving data1 and data3
+        cache.put(&digest3, &data3).await.unwrap();
+
+        // Verify the eviction happened correctly
+        let has_data1 = cache.contains(&digest1).await.unwrap();
+        let has_data2 = cache.contains(&digest2).await.unwrap();
+        let has_data3 = cache.contains(&digest3).await.unwrap();
+        let final_size = cache.size().await.unwrap();
+
+        // data3 (just added) should always remain
+        assert!(
+            has_data3,
+            "data3 should remain (just added). data1={has_data1}, data2={has_data2}, data3={has_data3}, size={final_size}"
+        );
+
+        // At least one should be evicted
+        assert!(
+            !has_data1 || !has_data2,
+            "At least one of data1 or data2 should be evicted. data1={has_data1}, data2={has_data2}, data3={has_data3}, size={final_size}"
+        );
+
+        // data2 (oldest) should be evicted before data1 (accessed recently)
+        assert!(
+            has_data1 || !has_data2,
+            "LRU eviction failed: data1 (recently accessed) was evicted but data2 (oldest) was kept. data1={has_data1}, data2={has_data2}, data3={has_data3}, size={final_size}"
+        );
     }
 
     #[tokio::test]
