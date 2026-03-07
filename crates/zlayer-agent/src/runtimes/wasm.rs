@@ -455,7 +455,8 @@ impl WasmRuntime {
                 zlayer_registry::CacheType::Persistent { .. } => {
                     zlayer_registry::CacheType::persistent_at(config.cache_dir.clone())
                 }
-                other => other,
+                other
+                @ (zlayer_registry::CacheType::Memory | zlayer_registry::CacheType::S3(_)) => other,
             };
             cache_type
                 .build()
@@ -579,7 +580,7 @@ impl WasmRuntime {
     ///
     /// # Returns
     /// `ExecutionResult` containing the exit code and captured stdout/stderr
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn execute_module(
         engine: Engine,
         module_bytes: Vec<u8>,
@@ -659,12 +660,18 @@ impl WasmRuntime {
                 store.set_epoch_deadline(epoch_deadline);
             }
 
-            // Apply fuel budget if configured
+            // Apply fuel budget if configured, otherwise set unlimited fuel.
+            // consume_fuel(true) is set on the engine, so stores start with 0 fuel
+            // and will immediately trap unless fuel is explicitly provided.
             if resource_limits.max_fuel > 0 {
                 store
                     .set_fuel(resource_limits.max_fuel)
                     .map_err(|e| format!("failed to set fuel: {e}"))?;
                 tracing::debug!(fuel = resource_limits.max_fuel, "WASM fuel budget set");
+            } else {
+                store
+                    .set_fuel(u64::MAX)
+                    .map_err(|e| format!("failed to set default fuel: {e}"))?;
             }
 
             // Create linker and add WASI (closure extracts WasiP1Ctx from our wrapper)
@@ -748,7 +755,7 @@ impl WasmRuntime {
     ///
     /// # Returns
     /// `ExecutionResult` containing the exit code and captured stdout/stderr
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     #[instrument(
         skip(engine, component_bytes, env_vars, args, mounts, resource_limits, capabilities),
         fields(
@@ -843,12 +850,18 @@ impl WasmRuntime {
                 store.set_epoch_deadline(epoch_deadline);
             }
 
-            // Apply fuel budget if configured
+            // Apply fuel budget if configured, otherwise set unlimited fuel.
+            // consume_fuel(true) is set on the engine, so stores start with 0 fuel
+            // and will immediately trap unless fuel is explicitly provided.
             if resource_limits.max_fuel > 0 {
                 store
                     .set_fuel(resource_limits.max_fuel)
                     .map_err(|e| format!("failed to set fuel: {e}"))?;
                 tracing::debug!(fuel = resource_limits.max_fuel, "WASM fuel budget set");
+            } else {
+                store
+                    .set_fuel(u64::MAX)
+                    .map_err(|e| format!("failed to set default fuel: {e}"))?;
             }
 
             // Create component linker and add WASIp2 interfaces
