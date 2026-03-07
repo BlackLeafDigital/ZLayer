@@ -88,6 +88,10 @@ done
 for artifact in "${ARTIFACTS_DIR}"/*.tar.gz "${ARTIFACTS_DIR}"/*/*.tar.gz; do
   [ -f "$artifact" ] && files+=("$artifact")
 done
+# Windows zip artifacts
+for artifact in "${ARTIFACTS_DIR}"/zlayer-*/*.zip "${ARTIFACTS_DIR}"/*.zip "${ARTIFACTS_DIR}"/*/*.zip; do
+  [ -f "$artifact" ] && files+=("$artifact")
+done
 # Container images
 for archive in "${ARTIFACTS_DIR}"/container-images/*.tar; do
   [ -f "$archive" ] && files+=("$archive")
