@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::io::Cursor;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +15,10 @@ use tokio::sync::RwLock;
 use tracing::info;
 use utoipa::ToSchema;
 use zlayer_consensus::network::http_client::HttpNetwork;
+#[cfg(not(feature = "persistent"))]
 use zlayer_consensus::storage::mem_store::{MemLogStore, MemStateMachine, SmData};
+#[cfg(feature = "persistent")]
+use zlayer_consensus::storage::redb_store::{RedbLogStore, RedbSmCache, RedbStateMachine};
 use zlayer_consensus::{ConsensusConfig, ConsensusNode, ConsensusNodeBuilder};
 
 use crate::error::{Result, SchedulerError};
@@ -145,10 +149,9 @@ pub struct ScaleEvent {
 
 /// Cluster state (the Raft state machine application state).
 ///
-/// This is the `S` generic parameter to `MemStateMachine<TypeConfig, S, F>`.
+/// This is the `S` generic parameter to the storage state machine types.
 /// It only contains application-level fields -- the Raft bookkeeping
-/// (`last_applied_log`, `last_membership`) is managed by `SmData` inside the
-/// consensus crate.
+/// (`last_applied_log`, `last_membership`) is managed by the consensus crate.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ClusterState {
     /// Service states
@@ -259,12 +262,12 @@ impl ClusterState {
         Self::default()
     }
 
-    /// Apply a request to the state machine.
+    /// Apply a request to the state machine
     ///
     /// # Panics
     ///
-    /// Panics if the system clock is before the Unix epoch.
-    #[allow(clippy::too_many_lines)]
+    /// Panics if the system clock is before the Unix epoch (only relevant for
+    /// `RegisterNode` requests).
     pub fn apply(&mut self, request: &Request) -> Response {
         match request {
             Request::UpdateServiceState {
@@ -280,29 +283,13 @@ impl ClusterState {
                 to_replicas,
                 reason,
                 timestamp,
-            } => {
-                let event = ScaleEvent {
-                    service_name: service_name.clone(),
-                    from_replicas: *from_replicas,
-                    to_replicas: *to_replicas,
-                    reason: reason.clone(),
-                    timestamp: *timestamp,
-                };
-
-                // Keep last 100 events
-                self.scale_events.push(event);
-                if self.scale_events.len() > 100 {
-                    self.scale_events.remove(0);
-                }
-
-                // Update last scale time on service
-                if let Some(svc) = self.services.get_mut(service_name) {
-                    svc.last_scale_time = Some(*timestamp);
-                    svc.current_replicas = *to_replicas;
-                }
-
-                Response::Success { data: None }
-            }
+            } => self.apply_record_scale_event(
+                service_name,
+                *from_replicas,
+                *to_replicas,
+                reason,
+                *timestamp,
+            ),
             Request::RegisterNode {
                 node_id,
                 address,
@@ -315,38 +302,19 @@ impl ClusterState {
                 memory_total,
                 disk_total,
                 gpus,
-            } => {
-                #[allow(clippy::cast_possible_truncation)]
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis() as u64;
-
-                self.nodes.insert(
-                    *node_id,
-                    NodeInfo {
-                        node_id: *node_id,
-                        address: address.clone(),
-                        registered_at: now,
-                        last_heartbeat: now,
-                        gpus: gpus.clone(),
-                        wg_public_key: wg_public_key.clone(),
-                        overlay_ip: overlay_ip.clone(),
-                        overlay_port: *overlay_port,
-                        advertise_addr: advertise_addr.clone(),
-                        api_port: *api_port,
-                        cpu_total: *cpu_total,
-                        memory_total: *memory_total,
-                        disk_total: *disk_total,
-                        cpu_used: 0.0,
-                        memory_used: 0,
-                        disk_used: 0,
-                        status: "ready".to_string(),
-                    },
-                );
-
-                Response::Success { data: None }
-            }
+            } => self.apply_register_node(
+                *node_id,
+                address,
+                wg_public_key,
+                overlay_ip,
+                *overlay_port,
+                advertise_addr,
+                *api_port,
+                *cpu_total,
+                *memory_total,
+                *disk_total,
+                gpus,
+            ),
             Request::UpdateNodeHeartbeat {
                 node_id,
                 timestamp,
@@ -394,6 +362,88 @@ impl ClusterState {
         }
     }
 
+    /// Apply a `RecordScaleEvent` request.
+    fn apply_record_scale_event(
+        &mut self,
+        service_name: &str,
+        from_replicas: u32,
+        to_replicas: u32,
+        reason: &str,
+        timestamp: u64,
+    ) -> Response {
+        let event = ScaleEvent {
+            service_name: service_name.to_owned(),
+            from_replicas,
+            to_replicas,
+            reason: reason.to_owned(),
+            timestamp,
+        };
+
+        // Keep last 100 events
+        self.scale_events.push(event);
+        if self.scale_events.len() > 100 {
+            self.scale_events.remove(0);
+        }
+
+        // Update last scale time on service
+        if let Some(svc) = self.services.get_mut(service_name) {
+            svc.last_scale_time = Some(timestamp);
+            svc.current_replicas = to_replicas;
+        }
+
+        Response::Success { data: None }
+    }
+
+    /// Apply a `RegisterNode` request.
+    #[allow(clippy::too_many_arguments)]
+    fn apply_register_node(
+        &mut self,
+        node_id: NodeId,
+        address: &str,
+        wg_public_key: &str,
+        overlay_ip: &str,
+        overlay_port: u16,
+        advertise_addr: &str,
+        api_port: u16,
+        cpu_total: f64,
+        memory_total: u64,
+        disk_total: u64,
+        gpus: &[GpuInfoSummary],
+    ) -> Response {
+        let now = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+
+        self.nodes.insert(
+            node_id,
+            NodeInfo {
+                node_id,
+                address: address.to_owned(),
+                registered_at: now,
+                last_heartbeat: now,
+                gpus: gpus.to_vec(),
+                wg_public_key: wg_public_key.to_owned(),
+                overlay_ip: overlay_ip.to_owned(),
+                overlay_port,
+                advertise_addr: advertise_addr.to_owned(),
+                api_port,
+                cpu_total,
+                memory_total,
+                disk_total,
+                cpu_used: 0.0,
+                memory_used: 0,
+                disk_used: 0,
+                status: "ready".to_string(),
+            },
+        );
+
+        Response::Success { data: None }
+    }
+
     /// Get service state
     #[must_use]
     pub fn get_service(&self, name: &str) -> Option<&ServiceState> {
@@ -424,6 +474,10 @@ impl ClusterState {
 pub type ZLayerRaft = Raft<TypeConfig>;
 
 /// The state machine type, parameterized with our `ClusterState` and apply fn
+#[cfg(feature = "persistent")]
+pub type SchedulerStateMachine =
+    RedbStateMachine<TypeConfig, ClusterState, fn(&mut ClusterState, &Request) -> Response>;
+#[cfg(not(feature = "persistent"))]
 pub type SchedulerStateMachine =
     MemStateMachine<TypeConfig, ClusterState, fn(&mut ClusterState, &Request) -> Response>;
 
@@ -446,6 +500,8 @@ pub struct RaftConfig {
     pub rpc_timeout_ms: u64,
     /// Raft API port (default 9090)
     pub raft_port: u16,
+    /// Path to the data directory for persistent Raft storage
+    pub data_dir: PathBuf,
 }
 
 impl Default for RaftConfig {
@@ -457,6 +513,7 @@ impl Default for RaftConfig {
             election_timeout_ms: (300, 600),
             rpc_timeout_ms: 5000,
             raft_port: 9090,
+            data_dir: PathBuf::from("/var/lib/zlayer/raft"),
         }
     }
 }
@@ -476,6 +533,9 @@ pub struct RaftCoordinator {
     /// `ConsensusNode` from zlayer-consensus
     node: ConsensusNode<TypeConfig>,
     /// Shared state machine data (for reading cluster state)
+    #[cfg(feature = "persistent")]
+    sm_data: Arc<RwLock<RedbSmCache<TypeConfig, ClusterState>>>,
+    #[cfg(not(feature = "persistent"))]
     sm_data: Arc<RwLock<SmData<TypeConfig, ClusterState>>>,
     /// Configuration (retained for callers that need `raft_port`, etc.)
     #[allow(dead_code)]
@@ -487,7 +547,8 @@ impl RaftCoordinator {
     ///
     /// # Errors
     ///
-    /// Returns `SchedulerError::Raft` if the consensus node fails to build.
+    /// Returns an error if the data directory cannot be created, or if the
+    /// log store, state machine, or consensus node fails to initialize.
     pub async fn new(config: RaftConfig) -> Result<Self> {
         Self::with_auth(config, None).await
     }
@@ -499,7 +560,8 @@ impl RaftCoordinator {
     ///
     /// # Errors
     ///
-    /// Returns `SchedulerError::Raft` if the consensus node fails to build.
+    /// Returns an error if the data directory cannot be created, or if the
+    /// log store, state machine, or consensus node fails to initialize.
     pub async fn with_auth(config: RaftConfig, auth_token: Option<String>) -> Result<Self> {
         let consensus_config = ConsensusConfig {
             cluster_name: "zlayer".to_string(),
@@ -510,12 +572,34 @@ impl RaftCoordinator {
             ..ConsensusConfig::default()
         };
 
-        // Create storage using zlayer-consensus's MemLogStore + MemStateMachine
-        let log_store = MemLogStore::<TypeConfig>::new();
-        let state_machine = MemStateMachine::<TypeConfig, ClusterState, _>::new(
-            ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
-        );
-        let sm_data = state_machine.data();
+        // Ensure data directory exists
+        std::fs::create_dir_all(&config.data_dir)
+            .map_err(|e| SchedulerError::Raft(format!("Failed to create raft data dir: {e}")))?;
+
+        // Create storage (persistent redb or in-memory depending on feature)
+        #[cfg(feature = "persistent")]
+        let (log_store, state_machine, sm_data) = {
+            let log_path = config.data_dir.join("raft-log");
+            let sm_path = config.data_dir.join("raft-sm");
+            let log_store = RedbLogStore::<TypeConfig>::new(&log_path)
+                .map_err(|e| SchedulerError::Raft(format!("Failed to open raft log store: {e}")))?;
+            let state_machine = RedbStateMachine::<TypeConfig, ClusterState, _>::new(
+                &sm_path,
+                ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
+            )
+            .map_err(|e| SchedulerError::Raft(format!("Failed to open raft state machine: {e}")))?;
+            let sm_data = state_machine.state();
+            (log_store, state_machine, sm_data)
+        };
+        #[cfg(not(feature = "persistent"))]
+        let (log_store, state_machine, sm_data) = {
+            let log_store = MemLogStore::<TypeConfig>::default();
+            let state_machine = MemStateMachine::<TypeConfig, ClusterState, _>::new(
+                ClusterState::apply as fn(&mut ClusterState, &Request) -> Response,
+            );
+            let sm_data = state_machine.data();
+            (log_store, state_machine, sm_data)
+        };
 
         // Create network using zlayer-consensus's HttpNetwork (with optional auth)
         let network = HttpNetwork::<TypeConfig>::with_timeouts_and_auth(
@@ -540,13 +624,14 @@ impl RaftCoordinator {
         })
     }
 
-    /// Bootstrap a new single-node cluster.
+    /// Bootstrap a new single-node cluster
     ///
     /// This should only be called once when creating a new cluster.
     ///
     /// # Errors
     ///
-    /// Returns `SchedulerError::Raft` if bootstrapping fails.
+    /// Returns an error if the Raft bootstrap operation fails (e.g., cluster
+    /// already bootstrapped).
     pub async fn bootstrap(&self) -> Result<()> {
         self.node
             .bootstrap()
@@ -567,11 +652,12 @@ impl RaftCoordinator {
         self.node.leader_id()
     }
 
-    /// Propose a state change (must be leader).
+    /// Propose a state change (must be leader)
     ///
     /// # Errors
     ///
-    /// Returns `SchedulerError::Raft` if the proposal fails.
+    /// Returns an error if this node is not the leader or if the Raft proposal
+    /// fails to reach consensus.
     pub async fn propose(&self, request: Request) -> Result<Response> {
         self.node
             .propose(request)
@@ -591,11 +677,12 @@ impl RaftCoordinator {
         state.services.get(name).cloned()
     }
 
-    /// Update service state (proposes to Raft).
+    /// Update service state (proposes to Raft)
     ///
     /// # Errors
     ///
-    /// Returns `SchedulerError::Raft` if the proposal fails.
+    /// Returns an error if this node is not the leader or if the Raft proposal
+    /// fails to reach consensus.
     pub async fn update_service(&self, name: String, state: ServiceState) -> Result<()> {
         self.propose(Request::UpdateServiceState {
             service_name: name,
@@ -605,11 +692,12 @@ impl RaftCoordinator {
         Ok(())
     }
 
-    /// Record a scale event.
+    /// Record a scale event
     ///
     /// # Errors
     ///
-    /// Returns `SchedulerError::Raft` if the proposal fails.
+    /// Returns an error if this node is not the leader or if the Raft proposal
+    /// fails to reach consensus.
     ///
     /// # Panics
     ///
@@ -621,11 +709,13 @@ impl RaftCoordinator {
         to_replicas: u32,
         reason: String,
     ) -> Result<()> {
-        #[allow(clippy::cast_possible_truncation)]
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let timestamp = u64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
 
         self.propose(Request::RecordScaleEvent {
             service_name,
@@ -652,8 +742,8 @@ impl RaftCoordinator {
     ///
     /// # Errors
     ///
-    /// Returns `SchedulerError::Raft` if adding the voter or proposing
-    /// the node registration fails.
+    /// Returns an error if this node is not the leader, if the voter addition
+    /// fails, or if the `RegisterNode` proposal fails to reach consensus.
     pub async fn add_member(&self, params: AddMemberParams) -> Result<()> {
         // Use ConsensusNode's add_voter (learner + promote in one call)
         self.node
@@ -694,11 +784,11 @@ impl RaftCoordinator {
         self.config.node_id
     }
 
-    /// Shutdown the Raft node.
+    /// Shutdown the Raft node
     ///
     /// # Errors
     ///
-    /// Returns `SchedulerError::Raft` if shutdown fails.
+    /// Returns an error if the Raft shutdown operation fails.
     pub async fn shutdown(&self) -> Result<()> {
         self.node
             .shutdown()
@@ -785,6 +875,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_node_registration() {
         let mut state = ClusterState::new();
 
@@ -804,7 +895,7 @@ mod tests {
 
         let node = state.get_node(1).unwrap();
         assert_eq!(node.address, "192.168.1.1:8000");
-        assert!((node.cpu_total - 8.0).abs() < f64::EPSILON);
+        assert_eq!(node.cpu_total, 8.0);
         assert_eq!(node.memory_total, 16_000_000_000);
         assert_eq!(node.status, "ready");
     }

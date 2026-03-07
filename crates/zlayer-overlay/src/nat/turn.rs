@@ -1,23 +1,23 @@
-//! Custom ZLayer relay protocol client.
+//! Custom `ZLayer` relay protocol client.
 //!
 //! Implements a lightweight relay client using BLAKE2b-256 authentication
-//! instead of full RFC 5766 TURN. ZLayer nodes only talk to other ZLayer
+//! instead of full RFC 5766 TURN. `ZLayer` nodes only talk to other `ZLayer`
 //! nodes, so standard TURN interoperability is unnecessary.
 //!
 //! # Protocol
 //!
 //! All messages are big-endian:
 //! - Header: 1 byte type + 2 bytes payload length + payload
-//! - Control types: AllocateReq(0x01), AllocateResp(0x02), AllocateErr(0x03),
-//!   PermissionReq(0x04), PermissionResp(0x05), RefreshReq(0x06),
-//!   RefreshResp(0x07), Deallocate(0x08)
-//! - Data type: Data(0x80) -- 1 byte type + 2 bytes length + 6 bytes peer addr
+//! - Control types: `AllocateReq`(0x01), `AllocateResp`(0x02), `AllocateErr`(0x03),
+//!   `PermissionReq`(0x04), `PermissionResp`(0x05), `RefreshReq`(0x06),
+//!   `RefreshResp`(0x07), `Deallocate`(0x08)
+//! - Data type: `Data`(0x80) -- 1 byte type + 2 bytes length + 6 bytes peer addr
 //!   (4 IPv4 + 2 port) + raw data
 //!
 //! # Authentication
 //!
 //! BLAKE2b-256 MAC. Key = BLAKE2b-256(credential). Auth tag =
-//! BLAKE2bMac256(key, message_bytes_before_tag). The 32-byte tag is
+//! `Blake2bMac256`(key, `message_bytes_before_tag`). The 32-byte tag is
 //! appended to control messages.
 
 use crate::error::OverlayError;
@@ -36,7 +36,7 @@ use tracing::{debug, warn};
 
 // ---- Protocol message types ------------------------------------------------
 
-/// Control message types for the ZLayer relay protocol.
+/// Control message types for the `ZLayer` relay protocol.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MsgType {
@@ -53,6 +53,7 @@ pub enum MsgType {
 
 impl MsgType {
     /// Parse a byte into a message type.
+    #[must_use]
     pub fn from_byte(b: u8) -> Option<Self> {
         match b {
             0x01 => Some(Self::AllocateReq),
@@ -87,6 +88,7 @@ pub(crate) const PEER_ADDR_LEN: usize = 6;
 // ---- Auth helpers -----------------------------------------------------------
 
 /// Derive an auth key from a credential string via BLAKE2b-256 hashing.
+#[must_use]
 pub fn derive_auth_key(credential: &str) -> [u8; 32] {
     let hash = Blake2b256::digest(credential.as_bytes());
     let mut key = [0u8; 32];
@@ -95,6 +97,11 @@ pub fn derive_auth_key(credential: &str) -> [u8; 32] {
 }
 
 /// Compute a BLAKE2b-256 MAC tag over `data` using `key`.
+///
+/// # Panics
+///
+/// Panics if BLAKE2b-256 MAC initialization fails (should never happen with a 32-byte key).
+#[must_use]
 pub fn compute_auth_tag(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
     let mut mac = <Blake2bMac256 as KeyInit>::new_from_slice(key)
         .expect("BLAKE2bMac256 accepts 32-byte keys");
@@ -106,6 +113,11 @@ pub fn compute_auth_tag(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
 }
 
 /// Verify a BLAKE2b-256 MAC tag. Returns `true` if valid.
+///
+/// # Panics
+///
+/// Panics if BLAKE2b-256 MAC initialization fails (should never happen with a 32-byte key).
+#[must_use]
 pub fn verify_auth_tag(key: &[u8; 32], data: &[u8], tag: &[u8]) -> bool {
     let mut mac = <Blake2bMac256 as KeyInit>::new_from_slice(key)
         .expect("BLAKE2bMac256 accepts 32-byte keys");
@@ -116,6 +128,7 @@ pub fn verify_auth_tag(key: &[u8; 32], data: &[u8], tag: &[u8]) -> bool {
 // ---- Message building / parsing helpers ------------------------------------
 
 /// Encode a `SocketAddrV4` into 6 bytes (4 IP + 2 port, big-endian).
+#[must_use]
 pub fn encode_addr_v4(addr: SocketAddrV4) -> [u8; PEER_ADDR_LEN] {
     let mut buf = [0u8; PEER_ADDR_LEN];
     buf[..4].copy_from_slice(&addr.ip().octets());
@@ -124,6 +137,7 @@ pub fn encode_addr_v4(addr: SocketAddrV4) -> [u8; PEER_ADDR_LEN] {
 }
 
 /// Decode a `SocketAddrV4` from 6 bytes (4 IP + 2 port, big-endian).
+#[must_use]
 pub fn decode_addr_v4(buf: &[u8]) -> Option<SocketAddrV4> {
     if buf.len() < PEER_ADDR_LEN {
         return None;
@@ -135,9 +149,11 @@ pub fn decode_addr_v4(buf: &[u8]) -> Option<SocketAddrV4> {
 
 /// Build an authenticated control message.
 ///
-/// Layout: [type: 1] [payload_len: 2] [payload] [auth_tag: 32]
+/// Layout: `[type: 1] [payload_len: 2] [payload] [auth_tag: 32]`
 ///
-/// The auth tag covers [type + payload_len + payload].
+/// The auth tag covers `[type + payload_len + payload]`.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
 pub fn build_control_msg(msg_type: MsgType, payload: &[u8], key: &[u8; 32]) -> Vec<u8> {
     let payload_len = payload.len() as u16;
     let total = HEADER_LEN + payload.len() + AUTH_TAG_LEN;
@@ -154,7 +170,9 @@ pub fn build_control_msg(msg_type: MsgType, payload: &[u8], key: &[u8; 32]) -> V
 
 /// Build a DATA message (no auth tag needed -- relay already authenticated).
 ///
-/// Layout: [0x80: 1] [length: 2] [peer_addr: 6] [raw_data]
+/// Layout: `[0x80: 1] [length: 2] [peer_addr: 6] [raw_data]`
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
 pub fn build_data_msg(peer_addr: SocketAddrV4, data: &[u8]) -> Vec<u8> {
     let inner_len = (PEER_ADDR_LEN + data.len()) as u16;
     let total = HEADER_LEN + PEER_ADDR_LEN + data.len();
@@ -170,6 +188,7 @@ pub fn build_data_msg(peer_addr: SocketAddrV4, data: &[u8]) -> Vec<u8> {
 ///
 /// For control messages, the payload includes the auth tag at the end.
 /// For data messages, the payload includes the peer addr + raw data.
+#[must_use]
 pub fn parse_msg(buf: &[u8]) -> Option<(MsgType, &[u8])> {
     if buf.len() < HEADER_LEN {
         return None;
@@ -195,6 +214,7 @@ pub fn parse_msg(buf: &[u8]) -> Option<(MsgType, &[u8])> {
 }
 
 /// Parse and verify a control message. Returns the payload (without auth tag).
+#[must_use]
 pub fn parse_and_verify_control(buf: &[u8], key: &[u8; 32]) -> Option<(MsgType, Vec<u8>)> {
     if buf.len() < HEADER_LEN {
         return None;
@@ -221,7 +241,8 @@ pub fn parse_and_verify_control(buf: &[u8], key: &[u8; 32]) -> Option<(MsgType, 
     Some((msg_type, buf[HEADER_LEN..msg_end].to_vec()))
 }
 
-/// Parse a DATA message payload into (peer_addr, raw_data).
+/// Parse a DATA message payload into `(peer_addr, raw_data)`.
+#[must_use]
 pub fn parse_data_payload(payload: &[u8]) -> Option<(SocketAddrV4, &[u8])> {
     if payload.len() < PEER_ADDR_LEN {
         return None;
@@ -233,6 +254,7 @@ pub fn parse_data_payload(payload: &[u8]) -> Option<(SocketAddrV4, &[u8])> {
 // ---- Relay allocation -------------------------------------------------------
 
 /// Active relay allocation state.
+#[allow(clippy::struct_field_names)]
 struct RelayAllocation {
     /// The address the relay server allocated for us.
     relay_addr: SocketAddr,
@@ -246,10 +268,10 @@ struct RelayAllocation {
 
 // ---- Relay client -----------------------------------------------------------
 
-/// Client for the ZLayer custom relay protocol.
+/// Client for the `ZLayer` custom relay protocol.
 ///
 /// Connects to a relay server, allocates a relay address, and runs a local
-/// UDP proxy that bridges WireGuard traffic through the relay.
+/// UDP proxy that bridges `WireGuard` traffic through the relay.
 pub struct RelayClient {
     server_addr: SocketAddr,
     username: String,
@@ -442,9 +464,9 @@ impl RelayClient {
         Ok(())
     }
 
-    /// Start a local UDP proxy that bridges WireGuard traffic through the relay.
+    /// Start a local UDP proxy that bridges `WireGuard` traffic through the relay.
     ///
-    /// Returns the local proxy address. Set the WireGuard peer endpoint to this
+    /// Returns the local proxy address. Set the `WireGuard` peer endpoint to this
     /// address so WG sends packets to the proxy, which forwards them through
     /// the relay to the remote peer.
     ///
@@ -489,7 +511,9 @@ impl RelayClient {
         let relay_read = relay_socket.clone();
 
         let handle = tokio::spawn(async move {
+            #[allow(clippy::large_stack_arrays)]
             let mut proxy_buf = [0u8; 65536];
+            #[allow(clippy::large_stack_arrays)]
             let mut relay_buf = [0u8; 65536];
 
             loop {
@@ -728,13 +752,13 @@ mod tests {
     #[test]
     fn test_encode_decode_addr_v4_edge_cases() {
         // Broadcast
-        let addr = SocketAddrV4::new(Ipv4Addr::new(255, 255, 255, 255), 65535);
+        let addr = SocketAddrV4::new(Ipv4Addr::BROADCAST, 65535);
         let encoded = encode_addr_v4(addr);
         let decoded = decode_addr_v4(&encoded).unwrap();
         assert_eq!(addr, decoded);
 
         // All zeros
-        let addr = SocketAddrV4::new(Ipv4Addr::new(0, 0, 0, 0), 0);
+        let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
         let encoded = encode_addr_v4(addr);
         let decoded = decode_addr_v4(&encoded).unwrap();
         assert_eq!(addr, decoded);
