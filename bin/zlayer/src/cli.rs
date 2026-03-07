@@ -1026,6 +1026,22 @@ pub(crate) enum NodeCommands {
         #[arg(long)]
         data_dir: Option<PathBuf>,
     },
+
+    /// Force this node to become cluster leader (disaster recovery)
+    ///
+    /// Use when the original leader is permanently lost in a 2-node cluster.
+    /// The surviving learner node will take over with preserved state.
+    /// Requires daemon restart after execution.
+    ///
+    /// Examples:
+    ///   zlayer node force-leader
+    ///   zlayer node force-leader --api-addr 127.0.0.1:3669
+    #[command(verbatim_doc_comment)]
+    ForceLeader {
+        /// API address of this node (host:port)
+        #[arg(long, default_value = "127.0.0.1:3669")]
+        api_addr: String,
+    },
 }
 
 /// Token management subcommands

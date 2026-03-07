@@ -16,6 +16,14 @@ All notable changes to this project will be documented in this file.
   CI Windows build changed from `--features wsl,docker` to `--features wsl`.
 
 ### Added
+- Force-leader disaster recovery feature for Raft consensus. When the original
+  cluster leader is permanently lost, a surviving node can be promoted via
+  `POST /api/v1/cluster/force-leader`. This saves the current cluster state to
+  a recovery marker, shuts down Raft, and on daemon restart wipes Raft storage
+  and re-bootstraps as a single-node leader replaying preserved service state.
+  Persistence helpers (`save_force_leader_state`, `load_and_clear_force_leader_state`)
+  added to `zlayer-scheduler`. Safety checks prevent accidental use when the
+  leader is still reachable (<30s quorum ack).
 - NAT traversal Phase 4: Custom ZLayer relay protocol with BLAKE2b-256 authentication.
   - `RelayClient` (`nat/turn.rs`): Allocates relay addresses, creates permissions,
     and runs a local UDP proxy bridging WireGuard traffic through the relay server.

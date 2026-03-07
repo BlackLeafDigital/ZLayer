@@ -283,6 +283,7 @@ pub(crate) async fn handle_node(
         NodeCommands::Label { node_id, label } => {
             handle_node_label(node_id.clone(), label.clone(), cli_data_dir).await
         }
+        NodeCommands::ForceLeader { api_addr } => handle_node_force_leader(api_addr.clone()).await,
         NodeCommands::GenerateJoinToken {
             deployment,
             api,
@@ -427,6 +428,7 @@ pub(crate) async fn handle_node_init(
         memory_total: 0,
         disk_total: 0,
         gpus: vec![],
+        mode: "full".to_string(),
     })
     .await
     .context("Failed to register leader in Raft state")?;
@@ -1179,6 +1181,55 @@ pub(crate) async fn handle_node_label(
     }
 
     println!("Label '{key}={value}' added to node '{node_id}'.");
+
+    Ok(())
+}
+
+/// Force this node to become cluster leader (disaster recovery).
+///
+/// Sends a POST to the local API server's force-leader endpoint. Use this when
+/// the original leader is permanently lost and the surviving learner needs to
+/// take over the cluster.
+async fn handle_node_force_leader(api_addr: String) -> Result<()> {
+    use std::time::Duration;
+
+    println!("WARNING: Force-leader will make this node the new cluster leader.");
+    println!("         Only use when the original leader is permanently lost.\n");
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("Failed to create HTTP client")?;
+
+    let url = format!("http://{api_addr}/api/v1/cluster/force-leader");
+    let resp = client
+        .post(&url)
+        .json(&serde_json::json!({"confirm": "CONFIRM_FORCE_LEADER"}))
+        .send()
+        .await
+        .context("Failed to connect to API server")?;
+
+    if resp.status().is_success() {
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .context("Failed to parse force-leader response")?;
+        println!("Force-leader initiated successfully.");
+        if let Some(nodes) = body.get("preserved_nodes") {
+            println!(
+                "  Preserved {} nodes, {} services",
+                nodes,
+                body.get("preserved_services")
+                    .unwrap_or(&serde_json::Value::Null)
+            );
+        }
+        println!("\nRestart the daemon to complete recovery:");
+        println!("  systemctl restart zlayer");
+    } else {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        anyhow::bail!("Force-leader failed: {status} - {body}");
+    }
 
     Ok(())
 }
