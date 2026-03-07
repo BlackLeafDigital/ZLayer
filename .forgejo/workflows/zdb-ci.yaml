@@ -3,6 +3,7 @@ name: ZDB CI
 on:
   push:
     branches: [zdb]
+    tags: ['zdb-v*']
   pull_request:
     branches: [zdb]
   workflow_dispatch:
@@ -265,13 +266,14 @@ jobs:
 
   # ===========================================
   # Auto-tag and trigger publish on successful build
-  # Only on push to zdb (not PRs or workflow_dispatch)
+  # Runs on: branch push (auto-increments tag) or tag push (uses that tag)
+  # Skipped if commit message contains [np]
   # ===========================================
   auto-tag-and-publish:
     name: Auto-Tag & Publish
     runs-on: ubuntu-latest
     needs: [build]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/zdb' && !contains(github.event.head_commit.message, '[np]') }}
+    if: ${{ github.event_name == 'push' && !contains(github.event.head_commit.message, '[np]') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -280,32 +282,36 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.FORGEJO_TOKEN }}
 
-      - name: Determine next version
+      - name: Determine version
         id: version
         run: |
-          # Get the latest zdb-v* tag, sorted by version number
-          LATEST_TAG=$(git tag -l 'zdb-v*' --sort=-v:refname | head -n1)
-
-          if [ -z "$LATEST_TAG" ]; then
-            # No tags yet, start at 0.1.0
-            NEXT_VERSION="0.1.0"
+          if [[ "${{ github.ref }}" == refs/tags/zdb-v* ]]; then
+            # Tag was pushed directly -- use it
+            TAG="${{ github.ref_name }}"
+            VERSION="${TAG#zdb-v}"
+            echo "Using pushed tag: ${TAG}"
           else
-            # Strip 'zdb-v' prefix
-            CURRENT="${LATEST_TAG#zdb-v}"
+            # Branch push -- auto-increment
+            LATEST_TAG=$(git tag -l 'zdb-v*' --sort=-v:refname | head -n1)
 
-            # Split into major.minor.patch
-            IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+            if [ -z "$LATEST_TAG" ]; then
+              VERSION="0.1.0"
+            else
+              CURRENT="${LATEST_TAG#zdb-v}"
+              IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
+              PATCH=$((PATCH + 1))
+              VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            fi
 
-            # Increment patch
-            PATCH=$((PATCH + 1))
-            NEXT_VERSION="${MAJOR}.${MINOR}.${PATCH}"
+            TAG="zdb-v${VERSION}"
+            echo "Auto-tagging as ${TAG}"
           fi
 
-          echo "version=${NEXT_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=zdb-v${NEXT_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "Auto-tagging as zdb-v${NEXT_VERSION}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Create and push tag
+      - name: Create and push tag (branch push only)
+        if: ${{ startsWith(github.ref, 'refs/heads/') }}
         run: |
           git tag "${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
