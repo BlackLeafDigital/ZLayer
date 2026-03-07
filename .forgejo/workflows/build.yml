@@ -135,8 +135,10 @@ jobs:
       - name: Build (thin Windows CLI)
         run: cargo build --release --package zlayer --no-default-features --features wsl
       - name: Package
-        shell: pwsh
-        run: Compress-Archive -Path target\release\zlayer.exe -DestinationPath zlayer-windows-amd64.zip
+        shell: bash
+        run: |
+          command -v 7z >/dev/null 2>&1 || choco install 7zip -y
+          7z a zlayer-windows-amd64.zip target/release/zlayer.exe
       - name: Upload artifact
         uses: actions/upload-artifact@v3
         with:
