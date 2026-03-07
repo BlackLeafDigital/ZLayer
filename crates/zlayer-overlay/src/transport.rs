@@ -450,6 +450,74 @@ impl OverlayTransport {
         Ok((private_key, public_key))
     }
 
+    /// Update a peer's endpoint address via UAPI.
+    ///
+    /// Used by NAT traversal to switch endpoints after discovery (e.g. from a
+    /// relay to a direct reflexive address after hole punching succeeds).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if key conversion or UAPI command fails.
+    #[cfg(feature = "nat")]
+    pub async fn update_peer_endpoint(
+        &self,
+        public_key: &str,
+        new_endpoint: std::net::SocketAddr,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let sock = self.uapi_sock_path();
+        let pub_hex = key_to_hex(public_key)?;
+        let body = format!("public_key={pub_hex}\nendpoint={new_endpoint}\n");
+        uapi_set(&sock, &body).await?;
+        tracing::debug!(
+            peer_key = %public_key,
+            endpoint = %new_endpoint,
+            "Updated peer endpoint"
+        );
+        Ok(())
+    }
+
+    /// Check if a peer has completed a `WireGuard` handshake since a given timestamp.
+    ///
+    /// Returns `true` if `last_handshake_time_sec >= since` (and is non-zero).
+    /// Used by NAT traversal to verify connectivity after switching endpoints.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the UAPI query fails.
+    #[cfg(feature = "nat")]
+    pub async fn check_peer_handshake(
+        &self,
+        public_key: &str,
+        since: u64,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let sock = self.uapi_sock_path();
+        let response = uapi_get(&sock).await?;
+        let target_hex = key_to_hex(public_key)?;
+
+        let mut in_target = false;
+        for line in response.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("errno=") {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            match key {
+                "public_key" => {
+                    in_target = value == target_hex;
+                }
+                "last_handshake_time_sec" if in_target => {
+                    if let Ok(t) = value.parse::<u64>() {
+                        return Ok(t > 0 && t >= since);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
     /// Shut down the overlay transport, destroying the TUN device.
     ///
     /// This takes the [`DeviceHandle`] and drops it, which triggers boringtun's
@@ -566,6 +634,8 @@ mod tests {
             public_key: "test_pub".to_string(),
             local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51820),
             peer_discovery_interval: Duration::from_secs(30),
+            #[cfg(feature = "nat")]
+            nat: crate::nat::NatConfig::default(),
         };
 
         // On macOS, boringtun uses "utun" and the kernel assigns utunN.

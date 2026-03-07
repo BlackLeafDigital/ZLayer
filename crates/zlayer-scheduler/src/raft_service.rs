@@ -102,9 +102,17 @@ mod tests {
     use super::*;
     use crate::raft::RaftConfig;
 
+    fn test_config() -> RaftConfig {
+        let tmp = tempfile::tempdir().unwrap();
+        RaftConfig {
+            data_dir: tmp.keep(),
+            ..RaftConfig::default()
+        }
+    }
+
     #[tokio::test]
     async fn test_service_creation() {
-        let config = RaftConfig::default();
+        let config = test_config();
         let raft = RaftCoordinator::new(config).await.unwrap();
         let service = RaftService::new(Arc::new(raft));
 
@@ -115,7 +123,7 @@ mod tests {
     #[test]
     fn test_router_endpoints() {
         // Verify that the router has the expected structure
-        let config = RaftConfig::default();
+        let config = test_config();
         let rt = tokio::runtime::Runtime::new().unwrap();
 
         rt.block_on(async {

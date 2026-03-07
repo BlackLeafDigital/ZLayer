@@ -5,7 +5,9 @@
 //! service registration, and handling incoming connections.
 
 pub mod agent;
+pub mod connector;
 pub mod proxy;
 
 pub use agent::*;
+pub use connector::*;
 pub use proxy::*;

@@ -182,6 +182,9 @@ num_cpus = "1.16"
 # Random number generation
 rand = "0.9"
 
+# Socket utilities
+socket2 = "0.5"
+
 # =============================================================================
 # Internal Workspace Crates (aliased with -zql suffix for publishing)
 # =============================================================================

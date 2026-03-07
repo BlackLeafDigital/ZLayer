@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- NAT traversal Phase 4: Custom ZLayer relay protocol with BLAKE2b-256 authentication.
+  - `RelayClient` (`nat/turn.rs`): Allocates relay addresses, creates permissions,
+    and runs a local UDP proxy bridging WireGuard traffic through the relay server.
+  - `RelayServer` (`nat/relay.rs`): Built-in UDP relay server with per-allocation
+    relay ports, permission-based forwarding, and session management.
+  - `RelayDiscovery` (`nat/discovery.rs`): Static configuration-based relay server
+    discovery from `NatConfig::turn_servers`.
+  - `NatTraversal` now gathers relay candidates after STUN reflexive candidates and
+    refreshes relay allocations during periodic maintenance.
+  - `OverlayBootstrap` optionally starts the built-in relay server during NAT
+    traversal initialization when `relay_server` config is present.
 - macOS overlay networking support: boringtun now creates `utun` devices on macOS
   via kernel control sockets (same mechanism as Tailscale CLI and wireguard-go).
   Interface configuration uses `ifconfig`/`route` instead of Linux `ip` commands.

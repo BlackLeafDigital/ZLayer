@@ -9,6 +9,7 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 use super::NodeTunnel;
+use crate::overlay::{DynOverlayResolver, OverlayReachability};
 use crate::{
     Result, ServiceConfig, TunnelAgent, TunnelClientConfig, TunnelError, TunnelRegistry,
     TunnelServerConfig,
@@ -88,6 +89,9 @@ pub struct NodeTunnelManager {
 
     /// Tunnel status tracking
     status: DashMap<String, TunnelStatus>,
+
+    /// Optional overlay resolver for routing through overlay network
+    overlay_resolver: Option<DynOverlayResolver>,
 }
 
 impl NodeTunnelManager {
@@ -102,7 +106,15 @@ impl NodeTunnelManager {
             tunnels: DashMap::new(),
             outbound_agents: DashMap::new(),
             status: DashMap::new(),
+            overlay_resolver: None,
         }
+    }
+
+    /// Set the overlay resolver for routing tunnel connections through the overlay network
+    #[must_use]
+    pub fn with_overlay_resolver(mut self, resolver: DynOverlayResolver) -> Self {
+        self.overlay_resolver = Some(resolver);
+        self
     }
 
     /// Get this node's name
@@ -265,6 +277,8 @@ impl NodeTunnelManager {
             status.state = TunnelState::Connecting;
         }
 
+        let overlay_url = self.compute_overlay_url(&tunnel);
+
         let config = TunnelClientConfig {
             server_url,
             token,
@@ -276,9 +290,14 @@ impl NodeTunnelManager {
                 local_port: tunnel.local_port,
                 remote_port: tunnel.remote_port,
             }],
+            overlay_server_url: overlay_url,
+            routing_mode: tunnel.routing_mode,
         };
 
-        let agent = TunnelAgent::new(config);
+        let mut agent = TunnelAgent::new(config);
+        if let Some(ref resolver) = self.overlay_resolver {
+            agent = agent.with_overlay_resolver(resolver.clone());
+        }
         let tunnel_name = name.to_string();
         let status_map = self.status.clone();
 
@@ -308,6 +327,21 @@ impl NodeTunnelManager {
         );
 
         Ok(())
+    }
+
+    /// Compute the overlay WebSocket URL for a tunnel, if the overlay is available
+    fn compute_overlay_url(&self, tunnel: &NodeTunnel) -> Option<String> {
+        let resolver = self.overlay_resolver.as_ref()?;
+        match resolver.resolve_overlay_ip(&tunnel.to) {
+            OverlayReachability::Reachable(ip) => {
+                // Use the same control path as the server config
+                Some(format!(
+                    "ws://{}:3669{}",
+                    ip, self.server_config.control_path
+                ))
+            }
+            _ => None,
+        }
     }
 
     /// Stop an outbound tunnel

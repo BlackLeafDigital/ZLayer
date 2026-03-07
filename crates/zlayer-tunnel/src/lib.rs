@@ -55,6 +55,7 @@ pub mod client;
 pub mod config;
 pub mod error;
 pub mod node;
+pub mod overlay;
 pub mod protocol;
 pub mod server;
 
@@ -67,6 +68,10 @@ pub use client::{
 pub use config::{ServiceConfig, TunnelClientConfig, TunnelServerConfig};
 pub use error::{Result, TunnelError};
 pub use node::{NodeTunnel, NodeTunnelManager, TunnelState, TunnelStatus};
+pub use overlay::{
+    DynOverlayResolver, DynTunnelDnsRegistrar, OverlayReachability, OverlayResolver, RoutingMode,
+    TunnelDnsRegistrar,
+};
 pub use protocol::{
     Message, MessageType, ServiceProtocol, HEADER_SIZE, MAX_MESSAGE_SIZE, PROTOCOL_VERSION,
 };
