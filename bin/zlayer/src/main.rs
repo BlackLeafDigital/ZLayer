@@ -87,23 +87,21 @@ fn main() -> ExitCode {
 
         #[cfg(all(target_os = "windows", feature = "wsl"))]
         {
-            match zlayer_wsl::setup::ensure_wsl_backend_ready() {
-                Ok(config) => {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .expect("Failed to create tokio runtime");
-                    match rt.block_on(zlayer_wsl::daemon::start_daemon(&config)) {
-                        Ok(()) => {
-                            println!("zlayer daemon started inside WSL2 on {}", config.api_addr);
-                            return ExitCode::SUCCESS;
-                        }
-                        Err(e) => {
-                            eprintln!("Error starting WSL2 daemon: {e:#}");
-                            return ExitCode::FAILURE;
-                        }
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create tokio runtime");
+            match rt.block_on(zlayer_wsl::setup::ensure_wsl_backend_ready()) {
+                Ok(config) => match rt.block_on(zlayer_wsl::daemon::start_daemon(&config)) {
+                    Ok(()) => {
+                        println!("zlayer daemon started inside WSL2 on {}", config.api_addr);
+                        return ExitCode::SUCCESS;
                     }
-                }
+                    Err(e) => {
+                        eprintln!("Error starting WSL2 daemon: {e:#}");
+                        return ExitCode::FAILURE;
+                    }
+                },
                 Err(e) => {
                     eprintln!("Error setting up WSL2 backend: {e:#}");
                     return ExitCode::FAILURE;
@@ -516,6 +514,7 @@ async fn run(cli: Cli) -> Result<()> {
             {
                 let _ = (bind, jwt_secret, no_swagger);
                 let config = zlayer_wsl::setup::ensure_wsl_backend_ready()
+                    .await
                     .context("Failed to set up WSL2 backend")?;
                 zlayer_wsl::daemon::start_daemon(&config)
                     .await

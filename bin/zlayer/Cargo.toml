@@ -42,7 +42,7 @@ crossterm = "0.28"
 zlayer-tui.workspace = true
 
 # CLI
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 
 # Async
 tokio = { workspace = true, features = ["full"] }
