@@ -477,6 +477,7 @@ pub fn submit_deployment(rt: &tokio::runtime::Runtime, state: &mut DeployState) 
 
     state.step = DeployStep::Deploying;
 
+    #[cfg(unix)]
     let result = rt.block_on(async {
         let client = match tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -494,6 +495,12 @@ pub fn submit_deployment(rt: &tokio::runtime::Runtime, state: &mut DeployState) 
             Err(e) => Err(format!("{e:#}")),
         }
     });
+
+    #[cfg(not(unix))]
+    let result: Result<(), String> = {
+        let _ = &yaml;
+        Err("Daemon not available on this platform".to_string())
+    };
 
     match result {
         Ok(()) => {
