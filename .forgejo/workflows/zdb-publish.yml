@@ -26,12 +26,20 @@ jobs:
         id: version
         run: |
           if [ -n "${{ inputs.version }}" ]; then
-            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+            VERSION="${{ inputs.version }}"
           else
             # Strip zdb-v prefix from tag
             TAG="${{ github.ref_name }}"
-            echo "version=${TAG#zdb-v}" >> "$GITHUB_OUTPUT"
+            VERSION="${TAG#zdb-v}"
           fi
+
+          # Validate semver (no leading zeros allowed)
+          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+            echo "ERROR: Invalid semver: ${VERSION}"
+            exit 1
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
   # ===========================================
   # Build zlayer binary (Linux amd64)
