@@ -1,7 +1,7 @@
 # ZLayer Manager - Management UI (Leptos SSR + Hydration + Tailwind v4)
 #
 # ZImagefile equivalent of Dockerfile.zlayer-manager
-# Uses cache mounts instead of cargo-chef for dependency caching.
+# Uses cargo-chef for dependency layer caching + buildah cache mounts.
 # cargo-leptos auto-downloads the Tailwind v4 CLI when tailwind-input-file
 # is configured in Leptos.toml, so no manual Tailwind installation is needed.
 #
@@ -11,15 +11,36 @@
 version: "1"
 
 stages:
+  chef:
+    base: "lukemathwalker/cargo-chef:latest-rust-1.90"
+    workdir: "/build"
+
+  planner:
+    base: "chef"
+    steps:
+      - copy: "."
+        to: "/build"
+      - run: "cargo chef prepare --recipe-path recipe.json"
+
   builder:
-    base: "rust:1.90-bookworm"
+    base: "chef"
     workdir: "/build"
     steps:
-      # Install system dependencies
+      # Install system dependencies (includes nodejs/npm for daisyui)
       - run: "apt-get update && apt-get install -y protobuf-compiler libseccomp-dev pkg-config cmake libssl-dev nodejs npm && rm -rf /var/lib/apt/lists/*"
 
       # Install wasm target and cargo-leptos
       - run: "rustup target add wasm32-unknown-unknown && cargo install cargo-leptos"
+        cache:
+          - target: /usr/local/cargo/registry
+            id: cargo-registry
+            sharing: shared
+
+      # Cook dependencies (cached layer - only rebuilds when Cargo.lock changes)
+      - copy: "recipe.json"
+        from: planner
+        to: "/build/recipe.json"
+      - run: "cargo chef cook --release --recipe-path recipe.json"
         cache:
           - target: /usr/local/cargo/registry
             id: cargo-registry
@@ -38,25 +59,15 @@ stages:
           - target: /usr/local/cargo/registry
             id: cargo-registry
             sharing: shared
-          - target: /build/target
-            id: cargo-target-manager
+          - target: /root/.cache/cargo-leptos
+            id: cargo-leptos-cache
             sharing: shared
 
-      # Copy binary out of cached target dir
+      # Copy binary out of target dir
       - run: "cp target/release/zlayer-manager /build/zlayer-manager"
-        cache:
-          - target: /build/target
-            id: cargo-target-manager
-            sharing: shared
-            readonly: true
 
-      # Copy site assets out of cached target dir
+      # Copy site assets out of target dir
       - run: "cp -r target/site /build/site"
-        cache:
-          - target: /build/target
-            id: cargo-target-manager
-            sharing: shared
-            readonly: true
 
   runtime:
     base: "debian:bookworm-slim"
