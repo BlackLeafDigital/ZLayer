@@ -1,7 +1,6 @@
 [package]
 name = "zlayer-api-zql"
 version.workspace = true
-publish = false
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -4,7 +4,6 @@ version = "0.0.0-dev"
 edition = "2021"
 description = "WSL2 backend integration for ZLayer on Windows"
 license = "MIT"
-publish = false
 
 [lints]
 workspace = true
