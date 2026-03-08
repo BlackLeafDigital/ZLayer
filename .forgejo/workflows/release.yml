@@ -41,6 +41,12 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.ref }}
           fetch-depth: 0
+      - name: Resolve version
+        id: resolve
+        uses: https://forge.blackleafdigital.com/Public/actions/resolve-version@main
+        with:
+          version: ${{ inputs.version || github.ref_name }}
+          service-type: rust
       - name: Detect release type
         id: check
         run: |
@@ -49,10 +55,7 @@ jobs:
           else
             TAG="${{ github.ref_name }}"
           fi
-          RAW_VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
-          # Strip leading zeros from each component to avoid "invalid leading zero" cargo errors
-          IFS='.' read -r V_MAJOR V_MINOR V_PATCH <<< "$RAW_VERSION"
-          VERSION="$((10#$V_MAJOR)).$((10#$V_MINOR)).$((10#$V_PATCH))"
+          VERSION="${{ steps.resolve.outputs.version }}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
           if [[ "$TAG" == major-v* ]]; then
@@ -117,7 +120,18 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.ref }}
           sparse-checkout: scripts/upload-packages.sh
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.detect.outputs.version }}
+          step: upload-binaries
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Download artifacts from temp storage
+        if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
           BASE_URL="${{ inputs.artifact_base_url }}"
@@ -142,12 +156,23 @@ jobs:
           echo "OK zlayer-windows-amd64.zip"
 
       - name: Upload to Forgejo Packages
+        if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           PKG_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
           chmod +x scripts/upload-packages.sh
           ./scripts/upload-packages.sh "$PKG_URL" "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" artifacts
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.detect.outputs.version }}
+          step: upload-binaries
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # Merge to main (after binaries uploaded)
@@ -186,12 +211,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.ref }}
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.detect.outputs.version }}
+          step: publish-crate-${{ needs.detect.outputs.crate_name }}
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        if: steps.check.outputs.completed != 'true'
         with:
           registries: ${{ env.FORGEJO_REGISTRIES }}
       - name: Install deps
+        if: steps.check.outputs.completed != 'true'
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev protobuf-compiler
       - name: Set crate versions
+        if: steps.check.outputs.completed != 'true'
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           echo "Setting all crate versions to ${VERSION}"
@@ -200,7 +238,18 @@ jobs:
           sed -i "s/version = \"0.0.0-dev\", package/version = \"${VERSION}\", package/" Cargo.toml
           cargo generate-lockfile
       - name: Publish
+        if: steps.check.outputs.completed != 'true'
         run: cargo publish --registry forgejo -p ${{ needs.detect.outputs.crate_name }} --allow-dirty
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.detect.outputs.version }}
+          step: publish-crate-${{ needs.detect.outputs.crate_name }}
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # Publish all crates (general release, after merge)
@@ -214,12 +263,25 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.ref }}
           fetch-depth: 0
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.detect.outputs.version }}
+          step: publish-all-crates
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        if: steps.check.outputs.completed != 'true'
         with:
           registries: ${{ env.FORGEJO_REGISTRIES }}
       - name: Install deps
+        if: steps.check.outputs.completed != 'true'
         run: sudo apt-get update && sudo apt-get install -y libseccomp-dev protobuf-compiler
       - name: Set crate versions
+        if: steps.check.outputs.completed != 'true'
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           echo "Setting all crate versions to ${VERSION}"
@@ -228,6 +290,7 @@ jobs:
           sed -i "s/version = \"0.0.0-dev\", package/version = \"${VERSION}\", package/" Cargo.toml
           cargo generate-lockfile
       - name: Publish crates that need updating
+        if: steps.check.outputs.completed != 'true'
         run: |
           INPUT_VERSION="${{ needs.detect.outputs.version }}"
 
@@ -281,6 +344,16 @@ jobs:
               echo "Skipping $crate (already at or above $INPUT_VERSION)"
             fi
           done
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.detect.outputs.version }}
+          step: publish-all-crates
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # SDK Publishing
@@ -421,10 +494,22 @@ jobs:
     if: needs.detect.outputs.docker == 'true'
     runs-on: ubuntu-latest
     steps:
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.detect.outputs.version }}
+          step: docker-push
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Install buildah
+        if: steps.check.outputs.completed != 'true'
         run: sudo apt-get update && sudo apt-get install -y buildah
 
       - name: Download pre-built image archives
+        if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
           for img in zlayer-node zlayer-web zlayer-manager; do
@@ -437,12 +522,15 @@ jobs:
           done
 
       - name: Login to Docker Hub
+        if: steps.check.outputs.completed != 'true'
         run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | sudo buildah login -u zachhandley --password-stdin docker.io
 
       - name: Login to GHCR
+        if: steps.check.outputs.completed != 'true'
         run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | sudo buildah login -u "${{ github.actor }}" --password-stdin ghcr.io
 
       - name: Download binary archive for CLI image
+        if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
@@ -453,6 +541,7 @@ jobs:
             "${{ inputs.artifact_base_url }}/zlayer-linux-amd64.tar.gz"
 
       - name: Load, tag, and push images
+        if: steps.check.outputs.completed != 'true'
         run: |
           set +o pipefail  # Disable pipefail to avoid SIGPIPE issues
           VERSION="${{ needs.detect.outputs.version }}"
@@ -520,6 +609,7 @@ jobs:
           echo "Done: zlayer"
 
       - name: Upload image archives to Forgejo Packages
+        if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
@@ -549,6 +639,16 @@ jobs:
               --upload-file "$file" \
               "$url" && echo "OK $file uploaded"
           done
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.detect.outputs.version }}
+          step: docker-push
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # Create Forgejo Release
@@ -561,8 +661,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.detect.outputs.version }}
+          step: create-forgejo-release
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
       - name: Create Forgejo Release
+        if: steps.check.outputs.completed != 'true'
         run: |
           VERSION="${{ needs.detect.outputs.version }}"
           TAG="v${VERSION}"
@@ -636,6 +747,16 @@ jobs:
               --arg body "$(cat release_body.md)" \
               '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}'
             )"
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.detect.outputs.version }}
+          step: create-forgejo-release
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # Trigger GitHub release

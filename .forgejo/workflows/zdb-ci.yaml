@@ -26,10 +26,33 @@ env:
 
 jobs:
   # ===========================================
+  # Resolve version for ci-step-status tracking
+  # ===========================================
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: zdb
+          fetch-depth: 0
+      - name: Resolve version
+        id: version
+        uses: https://forge.blackleafdigital.com/Public/actions/resolve-version@main
+        with:
+          version: ${{ inputs.version }}
+          tag-prefix: zdb-v
+          bump: patch
+          service-type: rust
+
+  # ===========================================
   # Check (fmt, clippy)
   # ===========================================
   check:
     name: Check
+    needs: [version]
     runs-on: ubuntu-latest
     if: ${{ !startsWith(github.ref, 'refs/tags/') && !contains(github.event.head_commit.message, '[skip-checks]') }}
     steps:
@@ -38,18 +61,32 @@ jobs:
         with:
           ref: zdb
 
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.version.outputs.version }}
+          step: zdb-check
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
       - name: Install system dependencies
+        if: steps.check.outputs.completed != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
+        if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           components: rustfmt, clippy
           registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Restore cache
+        if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
@@ -62,12 +99,15 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
       - name: Check formatting
+        if: steps.check.outputs.completed != 'true'
         run: cargo fmt --all -- --check
 
       - name: Check compilation
+        if: steps.check.outputs.completed != 'true'
         run: cargo check --workspace --all-targets
 
       - name: Clippy lints
+        if: steps.check.outputs.completed != 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Save cache
@@ -83,11 +123,23 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.version.outputs.version }}
+          step: zdb-check
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
   # ===========================================
   # Check (macOS) — catches cfg(target_os = "macos") errors
   # ===========================================
   check-macos:
     name: Check (macOS)
+    needs: [version]
     runs-on: macos-latest
     if: ${{ !startsWith(github.ref, 'refs/tags/') && !contains(github.event.head_commit.message, '[skip-checks]') }}
     env:
@@ -98,20 +150,46 @@ jobs:
         with:
           ref: zdb
 
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.version.outputs.version }}
+          step: zdb-check-macos
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
       - name: Install system dependencies
+        if: steps.check.outputs.completed != 'true'
         run: brew install protobuf python3
 
       - name: Setup Rust
+        if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           components: clippy
           registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Check compilation
+        if: steps.check.outputs.completed != 'true'
         run: cargo check --workspace --all-targets
 
       - name: Clippy lints
+        if: steps.check.outputs.completed != 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.version.outputs.version }}
+          step: zdb-check-macos
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # Test
@@ -119,7 +197,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    needs: [check, check-macos]
+    needs: [version, check, check-macos]
     if: ${{ !startsWith(github.ref, 'refs/tags/') && !contains(github.event.head_commit.message, '[skip-checks]') }}
     steps:
       - name: Checkout
@@ -127,17 +205,31 @@ jobs:
         with:
           ref: zdb
 
+      - name: Check step status
+        id: check-status
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.version.outputs.version }}
+          step: zdb-test
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
       - name: Install system dependencies
+        if: steps.check-status.outputs.completed != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
+        if: steps.check-status.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Restore cache
+        if: steps.check-status.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
@@ -150,14 +242,17 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
       - name: Run unit tests
+        if: steps.check-status.outputs.completed != 'true'
         run: cargo test --workspace --lib --bins
 
       - name: Run integration tests
+        if: steps.check-status.outputs.completed != 'true'
         run: |
           cargo test -p zlayer-scheduler-zql --features test-skip-http --test '*'
           cargo test --workspace --test '*' --exclude zlayer-scheduler
 
       - name: Run doc tests
+        if: steps.check-status.outputs.completed != 'true'
         run: cargo test --workspace --doc
 
       - name: Save cache
@@ -173,13 +268,24 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
+      - name: Mark step complete
+        if: steps.check-status.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.version.outputs.version }}
+          step: zdb-test
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
   # ===========================================
   # Feature Matrix Tests
   # ===========================================
   feature-tests:
     name: Feature Tests
     runs-on: ubuntu-latest
-    needs: [check, check-macos]
+    needs: [version, check, check-macos]
     if: ${{ !startsWith(github.ref, 'refs/tags/') && !contains(github.event.head_commit.message, '[skip-checks]') }}
     strategy:
       matrix:
@@ -192,17 +298,31 @@ jobs:
         with:
           ref: zdb
 
+      - name: Check step status
+        id: check-status
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.version.outputs.version }}
+          step: zdb-feature-tests-${{ strategy.job-index }}
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
       - name: Install system dependencies
+        if: steps.check-status.outputs.completed != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
+        if: steps.check-status.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           registries: ${{ env.FORGEJO_REGISTRIES }}
 
       - name: Restore cache
+        if: steps.check-status.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
@@ -215,10 +335,23 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
       - name: Build with features
+        if: steps.check-status.outputs.completed != 'true'
         run: cargo build --package zlayer-zql ${{ matrix.features }}
 
       - name: Test with features
+        if: steps.check-status.outputs.completed != 'true'
         run: cargo test --package zlayer-zql ${{ matrix.features }}
+
+      - name: Mark step complete
+        if: steps.check-status.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.version.outputs.version }}
+          step: zdb-feature-tests-${{ strategy.job-index }}
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # Auto-tag and trigger publish on successful tests
@@ -228,7 +361,7 @@ jobs:
   auto-tag-and-publish:
     name: Auto-Tag & Publish
     runs-on: ubuntu-latest
-    needs: [test, feature-tests]
+    needs: [version, test, feature-tests]
     if: ${{ !cancelled() && !failure() && github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/') || !contains(github.event.head_commit.message, '[np]')) }}
     steps:
       - name: Checkout
@@ -238,48 +371,28 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.FORGEJO_TOKEN }}
 
-      - name: Determine version
+      - name: Resolve version
         id: version
+        uses: https://forge.blackleafdigital.com/Public/actions/resolve-version@main
+        with:
+          version: ${{ inputs.version }}
+          tag-prefix: zdb-v
+          bump: patch
+          service-type: rust
+
+      - name: Determine tag
+        id: tag
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/zdb-v* ]]; then
-            # Tag was pushed directly -- use it
-            TAG="${{ github.ref_name }}"
-            VERSION="${TAG#zdb-v}"
-            echo "Using pushed tag: ${TAG}"
-          else
-            # Branch push -- auto-increment
-            LATEST_TAG=$(git tag -l 'zdb-v*' --sort=-v:refname | head -n1)
-
-            if [ -z "$LATEST_TAG" ]; then
-              VERSION="0.1.0"
-            else
-              CURRENT="${LATEST_TAG#zdb-v}"
-              IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT"
-              # Strip leading zeros to avoid invalid semver
-              MAJOR=$((10#$MAJOR))
-              MINOR=$((10#$MINOR))
-              PATCH=$((10#$PATCH + 1))
-              VERSION="${MAJOR}.${MINOR}.${PATCH}"
-            fi
-
-            TAG="zdb-v${VERSION}"
-            echo "Auto-tagging as ${TAG}"
-          fi
-
-          # Validate semver (no leading zeros allowed)
-          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "ERROR: Invalid semver: ${VERSION}"
-            exit 1
-          fi
-
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          VERSION="${{ steps.version.outputs.version }}"
+          TAG="zdb-v${VERSION}"
           echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: ${VERSION}, tag: ${TAG}"
 
       - name: Create and push tag (branch push only)
         if: ${{ startsWith(github.ref, 'refs/heads/') }}
         run: |
-          git tag "${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
+          git tag "${{ steps.tag.outputs.tag }}"
+          git push origin "${{ steps.tag.outputs.tag }}"
 
       - name: Trigger ZDB Publish workflow
         run: |
@@ -295,7 +408,7 @@ jobs:
   cache-cleanup:
     name: Cleanup Old Caches
     runs-on: ubuntu-latest
-    needs: [test, feature-tests]
+    needs: [version, test, feature-tests]
     if: always()
     steps:
       - name: Cleanup old caches

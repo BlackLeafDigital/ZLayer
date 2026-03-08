@@ -15,31 +15,25 @@ env:
 
 jobs:
   # ===========================================
-  # Extract version from tag or input
+  # Resolve version from tag or input
   # ===========================================
   resolve-version:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: zdb
+          fetch-depth: 0
       - name: Resolve version
         id: version
-        run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            VERSION="${{ inputs.version }}"
-          else
-            # Strip zdb-v prefix from tag
-            TAG="${{ github.ref_name }}"
-            VERSION="${TAG#zdb-v}"
-          fi
-
-          # Validate semver (no leading zeros allowed)
-          if ! [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-            echo "ERROR: Invalid semver: ${VERSION}"
-            exit 1
-          fi
-
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        uses: https://forge.blackleafdigital.com/Public/actions/resolve-version@main
+        with:
+          version: ${{ inputs.version }}
+          tag-prefix: zdb-v
+          bump: patch
+          service-type: rust
 
   # ===========================================
   # Publish crates to Forgejo Cargo registry
@@ -53,12 +47,25 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: zdb
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ needs.resolve-version.outputs.version }}
+          step: zdb-publish-crates
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        if: steps.check.outputs.completed != 'true'
         with:
           registries: ${{ env.FORGEJO_REGISTRIES }}
       - name: Install system deps
+        if: steps.check.outputs.completed != 'true'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev jq
       - name: Restore cache
+        if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
@@ -71,6 +78,7 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
       - name: Set release version
+        if: steps.check.outputs.completed != 'true'
         run: |
           VERSION="${{ needs.resolve-version.outputs.version || inputs.version }}"
           if [ -z "$VERSION" ]; then echo "ERROR: No version!"; exit 1; fi
@@ -80,6 +88,7 @@ jobs:
           sed -i "s/version = \"0.0.0-dev\", package/version = \"${VERSION}\", package/" Cargo.toml
           cargo generate-lockfile
       - name: Publish crates to Forgejo
+        if: steps.check.outputs.completed != 'true'
         run: |
           # Topological publish order (leaves first, dependents after)
           CRATES="
@@ -107,3 +116,13 @@ jobs:
             fi
             sleep 10
           done
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ needs.resolve-version.outputs.version }}
+          step: zdb-publish-crates
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
