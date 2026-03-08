@@ -70,7 +70,18 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: build-linux-amd64
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Restore cache
+        if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
@@ -82,18 +93,33 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
       - name: Install system deps
+        if: steps.check.outputs.completed != 'true'
         run: apt-get update && apt-get install -y protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git
       - name: Build
+        if: steps.check.outputs.completed != 'true'
         run: cargo build --release --package zlayer
       - name: Package
+        if: steps.check.outputs.completed != 'true'
         run: tar czf "zlayer-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer
       - name: Upload artifact
+        if: steps.check.outputs.completed != 'true'
         uses: actions/upload-artifact@v3
         with:
           name: zlayer-linux-amd64
           path: zlayer-linux-amd64.tar.gz
           retention-days: 1
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: build-linux-amd64
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Cleanup
+        if: steps.check.outputs.completed != 'true'
         run: rm -rf $CARGO_TARGET_DIR zlayer-linux-amd64.tar.gz
 
   build-macos-arm64:
@@ -108,9 +134,21 @@ jobs:
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           targets: aarch64-apple-darwin
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: build-macos-arm64
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Ensure target installed
+        if: steps.check.outputs.completed != 'true'
         run: rustup target add aarch64-apple-darwin
       - name: Restore cache
+        if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
@@ -122,20 +160,36 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
       - name: Clean build state
+        if: steps.check.outputs.completed != 'true'
         run: cargo clean
       - name: Install protobuf
+        if: steps.check.outputs.completed != 'true'
         run: brew install protobuf
       - name: Build
+        if: steps.check.outputs.completed != 'true'
         run: cargo build --release --target aarch64-apple-darwin --package zlayer
       - name: Package
+        if: steps.check.outputs.completed != 'true'
         run: tar czf "zlayer-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer
       - name: Upload artifact
+        if: steps.check.outputs.completed != 'true'
         uses: actions/upload-artifact@v3
         with:
           name: zlayer-darwin-arm64
           path: zlayer-darwin-arm64.tar.gz
           retention-days: 1
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: build-macos-arm64
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Cleanup
+        if: steps.check.outputs.completed != 'true'
         run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-arm64.tar.gz
 
   build-windows-amd64:
@@ -148,7 +202,18 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: build-windows-amd64
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Restore cache
+        if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
@@ -160,23 +225,37 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
       - name: Install protobuf
+        if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
           choco install protoc -y
           echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
       - name: Build (thin Windows CLI)
+        if: steps.check.outputs.completed != 'true'
         run: cargo build --release --package zlayer --no-default-features --features wsl
       - name: Package
+        if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
           command -v 7z >/dev/null 2>&1 || choco install 7zip -y
           7z a zlayer-windows-amd64.zip target/release/zlayer.exe
       - name: Upload artifact
+        if: steps.check.outputs.completed != 'true'
         uses: actions/upload-artifact@v3
         with:
           name: zlayer-windows-amd64
           path: zlayer-windows-amd64.zip
           retention-days: 1
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: build-windows-amd64
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # Wave 2: Image build + macOS amd64 (2 parallel)
@@ -192,19 +271,34 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: image-build
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Install buildah
+        if: steps.check.outputs.completed != 'true'
         run: sudo apt-get update && sudo apt-get install -y buildah
       - name: Download zlayer
+        if: steps.check.outputs.completed != 'true'
         uses: actions/download-artifact@v3
         with:
           name: zlayer-linux-amd64
       - name: Install zlayer
+        if: steps.check.outputs.completed != 'true'
         run: tar xzf zlayer-linux-amd64.tar.gz && chmod +x zlayer && sudo mv zlayer /usr/local/bin/
       - name: Prepare zlayer binary for node image
+        if: steps.check.outputs.completed != 'true'
         run: |
           mkdir -p target/release
           cp /usr/local/bin/zlayer target/release/zlayer
       - name: Build all images with pipeline
+        if: steps.check.outputs.completed != 'true'
         run: |
           sudo zlayer pipeline \
             -f ZPipeline.yaml \
@@ -213,6 +307,7 @@ jobs:
             --set REGISTRY=zlayer
 
       - name: Export images as OCI archives
+        if: steps.check.outputs.completed != 'true'
         run: |
           for img in zlayer-node zlayer-web zlayer-manager; do
             echo "Exporting ${img}..."
@@ -221,6 +316,7 @@ jobs:
           done
 
       - name: Upload image artifacts
+        if: steps.check.outputs.completed != 'true'
         uses: actions/upload-artifact@v3
         with:
           name: container-images
@@ -229,6 +325,17 @@ jobs:
             zlayer-web-oci.tar
             zlayer-manager-oci.tar
           retention-days: 1
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: image-build
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   build-macos-amd64:
     needs: [check-existing, build-macos-arm64]
@@ -242,9 +349,21 @@ jobs:
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           targets: x86_64-apple-darwin
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: build-macos-amd64
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Ensure target installed
+        if: steps.check.outputs.completed != 'true'
         run: rustup target add x86_64-apple-darwin
       - name: Restore cache
+        if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
@@ -256,18 +375,33 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
       - name: Install protobuf
+        if: steps.check.outputs.completed != 'true'
         run: brew install protobuf
       - name: Build
+        if: steps.check.outputs.completed != 'true'
         run: cargo build --release --target x86_64-apple-darwin --package zlayer
       - name: Package
+        if: steps.check.outputs.completed != 'true'
         run: tar czf "zlayer-darwin-amd64.tar.gz" -C $CARGO_TARGET_DIR/x86_64-apple-darwin/release zlayer
       - name: Upload artifact
+        if: steps.check.outputs.completed != 'true'
         uses: actions/upload-artifact@v3
         with:
           name: zlayer-darwin-amd64
           path: zlayer-darwin-amd64.tar.gz
           retention-days: 1
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: build-macos-amd64
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Cleanup
+        if: steps.check.outputs.completed != 'true'
         run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-amd64.tar.gz
 
   # ===========================================
@@ -285,9 +419,21 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: build-linux-arm64
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Install cross
+        if: steps.check.outputs.completed != 'true'
         run: cargo install cross
       - name: Restore cache
+        if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
         with:
           mode: restore
@@ -299,20 +445,36 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
       - name: Install system deps
+        if: steps.check.outputs.completed != 'true'
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
       - name: Create target directory
+        if: steps.check.outputs.completed != 'true'
         run: mkdir -p $CROSS_TARGET_DIR
       - name: Build
+        if: steps.check.outputs.completed != 'true'
         run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer --target-dir $CROSS_TARGET_DIR
       - name: Package
+        if: steps.check.outputs.completed != 'true'
         run: tar czf "zlayer-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer
       - name: Upload artifact
+        if: steps.check.outputs.completed != 'true'
         uses: actions/upload-artifact@v3
         with:
           name: zlayer-linux-arm64
           path: zlayer-linux-arm64.tar.gz
           retention-days: 1
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: build-linux-arm64
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Cleanup
+        if: steps.check.outputs.completed != 'true'
         run: rm -rf $CROSS_TARGET_DIR zlayer-linux-arm64.tar.gz
 
   # ===========================================
@@ -346,17 +508,31 @@ jobs:
           ref: ${{ inputs.sha || github.sha }}
           sparse-checkout: scripts/upload-packages.sh
 
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: upload-temp-packages
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
       - name: Download all artifacts
+        if: steps.check.outputs.completed != 'true'
         uses: actions/download-artifact@v3
         with:
           path: artifacts
 
       - name: List artifacts for debugging
+        if: steps.check.outputs.completed != 'true'
         run: |
           echo "=== Downloaded artifacts ==="
           find artifacts -type f -ls
 
       - name: Upload to temp packages
+        if: steps.check.outputs.completed != 'true'
         id: upload
         shell: bash
         run: |
@@ -364,6 +540,17 @@ jobs:
           chmod +x scripts/upload-packages.sh
           ./scripts/upload-packages.sh "$BASE_URL" "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" artifacts
           echo "package_base_url=${BASE_URL}" >> $GITHUB_OUTPUT
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: upload-temp-packages
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # Dispatch Release workflow
