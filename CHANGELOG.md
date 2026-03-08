@@ -14,8 +14,23 @@ All notable changes to this project will be documented in this file.
   Cross-platform commands (build, validate, pipeline, spec, wasm, tunnel, manager, registry)
   remain available on Windows. Runtime commands bail with a helpful error on Windows.
   CI Windows build changed from `--features wsl,docker` to `--features wsl`.
+- CI: Windows build packaging replaced `pwsh`/`Compress-Archive` with `bash`/`7z`
+  to fix `Cannot find: pwsh in PATH` on Forgejo runners without PowerShell.
+- CI: Upload script now collects `.zip` artifacts (Windows builds) in addition to
+  `.tar.gz`, fixing 404 errors when the release workflow tried to download them.
+- CI: Release workflow sanitizes version numbers to strip leading zeros from
+  semver components, preventing `invalid leading zero in patch version` cargo errors.
+- CI: `[np]` flag in commit messages skips the auto-tag and publish workflow while
+  still running checks, tests, and builds.
+- CI: Release workflow cleans buildah storage before loading OCI archives to prevent
+  stale overlay layer errors (`no such file or directory` on `buildah pull`).
 
 ### Added
+- Multi-platform build support for ZPipeline. Optional `platforms` field on pipeline
+  defaults and per-image config enables building for multiple architectures (e.g.,
+  linux/amd64, linux/arm64). Multi-arch builds create OCI manifest lists via buildah.
+  CLI `--platform` flag overrides platforms for all images. Requires `qemu-user-static`
+  for cross-architecture emulation.
 - Dynamic Raft voter management: the cluster now maintains an optimal odd number
   of voters for fault tolerance. The formula is `min(7, largest_odd <= eligible)`,
   so 1 node = 1 voter, 2 nodes = 1 voter + 1 learner (first-up-wins), 3 nodes =
