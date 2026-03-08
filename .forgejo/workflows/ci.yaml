@@ -364,12 +364,12 @@ jobs:
           git tag -a "${{ steps.version.outputs.tag }}" -m "Auto-tagged from CI: ${{ steps.version.outputs.tag }}"
           git push origin "${{ steps.version.outputs.tag }}"
 
-      - name: Trigger publish workflow
+      - name: Trigger build workflow
         run: |
           curl -X POST \
             -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
             -H "Content-Type: application/json" \
-            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/publish.yml/dispatches" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches" \
             -d '{"ref": "dev", "inputs": {"version": "${{ steps.version.outputs.tag }}", "sha": "${{ github.sha }}"}}'
 
   # ===========================================

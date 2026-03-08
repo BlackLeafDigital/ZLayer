@@ -47,6 +47,10 @@ jobs:
           else
             TAG="${{ github.ref_name }}"
           fi
+          # Normalize bare version numbers (e.g. "0.10.5" -> "v0.10.5")
+          if [[ "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            TAG="v${TAG}"
+          fi
           RAW_VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
           # Strip leading zeros from each component to avoid "invalid leading zero" cargo errors
           IFS='.' read -r V_MAJOR V_MINOR V_PATCH <<< "$RAW_VERSION"
@@ -201,7 +205,7 @@ jobs:
   # Publish all crates (general release, after merge)
   # ===========================================
   publish-all-crates:
-    needs: [detect, upload-binaries, merge-to-main]
+    needs: [detect]
     if: needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -278,10 +282,10 @@ jobs:
   # SDK Publishing
   # ===========================================
   publish-rust-sdk:
-    needs: [detect, upload-binaries, merge-to-main]
+    needs: [detect]
     if: |
       needs.detect.outputs.sdk_name == 'rust' ||
-      (needs.detect.outputs.is_general == 'true' && needs.merge-to-main.result == 'success')
+      needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -304,10 +308,10 @@ jobs:
           fi
 
   publish-python-sdk:
-    needs: [detect, upload-binaries, merge-to-main]
+    needs: [detect]
     if: |
       needs.detect.outputs.sdk_name == 'python' ||
-      (needs.detect.outputs.is_general == 'true' && needs.merge-to-main.result == 'success')
+      needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -338,10 +342,10 @@ jobs:
           fi
 
   publish-typescript-sdk:
-    needs: [detect, upload-binaries, merge-to-main]
+    needs: [detect]
     if: |
       needs.detect.outputs.sdk_name == 'typescript' ||
-      (needs.detect.outputs.is_general == 'true' && needs.merge-to-main.result == 'success')
+      needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -371,10 +375,10 @@ jobs:
           fi
 
   publish-go-sdk:
-    needs: [detect, upload-binaries, merge-to-main]
+    needs: [detect]
     if: |
       needs.detect.outputs.sdk_name == 'go' ||
-      (needs.detect.outputs.is_general == 'true' && needs.merge-to-main.result == 'success')
+      needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -388,10 +392,10 @@ jobs:
         run: go mod verify
 
   publish-c-sdk:
-    needs: [detect, upload-binaries, merge-to-main]
+    needs: [detect]
     if: |
       needs.detect.outputs.sdk_name == 'c' ||
-      (needs.detect.outputs.is_general == 'true' && needs.merge-to-main.result == 'success')
+      needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -547,7 +551,7 @@ jobs:
   # ===========================================
   create-forgejo-release:
     needs: [detect, upload-binaries, docker-push]
-    if: needs.detect.outputs.is_general == 'true'
+    if: always() && needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -633,7 +637,7 @@ jobs:
   # Trigger GitHub release
   # ===========================================
   trigger-github:
-    needs: [detect, upload-binaries, merge-to-main, docker-push, publish-all-crates]
+    needs: [detect, upload-binaries]
     if: always() && needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success'
     runs-on: ubuntu-latest
     steps:
