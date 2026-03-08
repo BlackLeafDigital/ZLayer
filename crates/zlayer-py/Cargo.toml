@@ -41,7 +41,7 @@ thiserror.workspace = true
 # Serialization for conversion
 serde.workspace = true
 serde_json.workspace = true
-serde_yml.workspace = true
+serde_yaml.workspace = true
 
 # Tracing for logging
 tracing.workspace = true

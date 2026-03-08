@@ -1460,7 +1460,7 @@ services:
         expose: public
 ";
 
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(spec.version, "v1");
         assert_eq!(spec.deployment, "test");
         assert!(spec.services.contains_key("hello"));
@@ -1485,7 +1485,7 @@ services:
         port: 8080
 ";
 
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let health = &spec.services["test"].health;
         assert_eq!(health.timeout, Some(std::time::Duration::from_secs(30)));
         assert_eq!(health.interval, Some(std::time::Duration::from_secs(60)));
@@ -1516,7 +1516,7 @@ services:
         rps: 800
 ";
 
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let scale = &spec.services["test"].scale;
         match scale {
             ScaleSpec::Adaptive {
@@ -1547,7 +1547,7 @@ services:
       name: hello-world:latest
 ";
 
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(spec.services["hello"].node_mode, NodeMode::Shared);
         assert!(spec.services["hello"].node_selector.is_none());
     }
@@ -1565,7 +1565,7 @@ services:
     node_mode: dedicated
 ";
 
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(spec.services["api"].node_mode, NodeMode::Dedicated);
     }
 
@@ -1582,7 +1582,7 @@ services:
     node_mode: exclusive
 ";
 
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(spec.services["database"].node_mode, NodeMode::Exclusive);
     }
 
@@ -1605,7 +1605,7 @@ services:
         storage: ssd
 "#;
 
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let service = &spec.services["ml-worker"];
         assert_eq!(service.node_mode, NodeMode::Dedicated);
 
@@ -1649,7 +1649,7 @@ services:
       labels: {}
 ";
 
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let selector = spec.services["api"].node_selector.as_ref().unwrap();
         assert!(selector.labels.is_empty());
         assert!(selector.prefer_labels.is_empty());
@@ -1681,7 +1681,7 @@ services:
         storage: ssd
 ";
 
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(spec.services["redis"].node_mode, NodeMode::Shared);
         assert_eq!(spec.services["api"].node_mode, NodeMode::Dedicated);
         assert_eq!(spec.services["database"].node_mode, NodeMode::Exclusive);
@@ -1705,7 +1705,7 @@ services:
         target: /app/data
         readonly: true
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         assert_eq!(storage.len(), 1);
         match &storage[0] {
@@ -1737,7 +1737,7 @@ services:
         target: /app/data
         tier: cached
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
             StorageSpec::Named {
@@ -1764,7 +1764,7 @@ services:
       - type: anonymous
         target: /app/cache
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
             StorageSpec::Anonymous { target, tier } => {
@@ -1790,7 +1790,7 @@ services:
         size: 256Mi
         mode: 1777
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
             StorageSpec::Tmpfs { target, size, mode } => {
@@ -1820,7 +1820,7 @@ services:
         endpoint: https://s3.us-west-2.amazonaws.com
         credentials: aws-creds
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
             StorageSpec::S3 {
@@ -1865,7 +1865,7 @@ services:
       - type: tmpfs
         target: /app/tmp
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         assert_eq!(storage.len(), 3);
         assert!(matches!(&storage[0], StorageSpec::Bind { .. }));
@@ -1887,7 +1887,7 @@ services:
         name: data
         target: /data
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         match &spec.services["app"].storage[0] {
             StorageSpec::Named { tier, .. } => {
                 assert_eq!(*tier, StorageTier::Local); // default should be Local
@@ -1917,7 +1917,7 @@ services:
           enabled: true
           remote_port: 8080
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let endpoint = &spec.services["api"].endpoints[0];
         let tunnel = endpoint.tunnel.as_ref().unwrap();
         assert!(tunnel.enabled);
@@ -1950,7 +1950,7 @@ services:
             max_ttl: 4h
             audit: true
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let endpoint = &spec.services["api"].endpoints[0];
         let tunnel = endpoint.tunnel.as_ref().unwrap();
         assert!(tunnel.enabled);
@@ -1980,7 +1980,7 @@ tunnels:
     protocol: tcp
     expose: internal
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let tunnel = spec.tunnels.get("db-tunnel").unwrap();
         assert_eq!(tunnel.from, "app-node");
         assert_eq!(tunnel.to, "db-node");
@@ -2003,7 +2003,7 @@ tunnels:
     local_port: 3000
     remote_port: 3000
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let tunnel = spec.tunnels.get("simple-tunnel").unwrap();
         assert_eq!(tunnel.protocol, TunnelProtocol::Tcp); // default
         assert_eq!(tunnel.expose, ExposeType::Internal); // default
@@ -2023,7 +2023,7 @@ tunnels:
     remote_port: 5353
     protocol: udp
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let tunnel = spec.tunnels.get("udp-tunnel").unwrap();
         assert_eq!(tunnel.protocol, TunnelProtocol::Udp);
     }
@@ -2042,7 +2042,7 @@ services:
         protocol: http
         port: 8080
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         let endpoint = &spec.services["api"].endpoints[0];
         assert!(endpoint.tunnel.is_none());
     }
@@ -2057,7 +2057,7 @@ services:
     image:
       name: api:latest
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         assert!(spec.tunnels.is_empty());
     }
 
@@ -2075,7 +2075,7 @@ services:
     image:
       name: hello-world:latest
 ";
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         assert!(spec.api.enabled);
         assert_eq!(spec.api.bind, "0.0.0.0:3669");
         assert!(spec.api.jwt_secret.is_none());
@@ -2097,7 +2097,7 @@ api:
   jwt_secret: "my-secret"
   swagger: false
 "#;
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         assert!(!spec.api.enabled);
         assert_eq!(spec.api.bind, "127.0.0.1:9090");
         assert_eq!(spec.api.jwt_secret, Some("my-secret".to_string()));
@@ -2116,7 +2116,7 @@ services:
 api:
   bind: "0.0.0.0:3000"
 "#;
-        let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
         assert!(spec.api.enabled); // default true
         assert_eq!(spec.api.bind, "0.0.0.0:3000");
         assert!(spec.api.jwt_secret.is_none()); // default None

@@ -371,7 +371,7 @@ services:
       name: placeholder:latest
 "
             );
-            let spec: DeploymentSpec = serde_yml::from_str(&yaml).map_err(ZLayerError::from)?;
+            let spec: DeploymentSpec = serde_yaml::from_str(&yaml).map_err(ZLayerError::from)?;
             let service_spec = spec
                 .services
                 .get(&service)

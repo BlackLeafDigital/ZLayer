@@ -10,7 +10,7 @@ use thiserror::Error;
 pub enum SpecError {
     /// YAML parsing error
     #[error("YAML parse error: {0}")]
-    YamlError(#[from] serde_yml::Error),
+    YamlError(#[from] serde_yaml::Error),
 
     /// Validation error
     #[error("Validation error: {0}")]

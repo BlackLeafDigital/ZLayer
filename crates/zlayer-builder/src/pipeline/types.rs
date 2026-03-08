@@ -230,7 +230,7 @@ mod tests {
         let yaml = r"
 file: Dockerfile
 ";
-        let img: PipelineImage = serde_yml::from_str(yaml).unwrap();
+        let img: PipelineImage = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(img.file, PathBuf::from("Dockerfile"));
         assert_eq!(img.context, PathBuf::from("."));
         assert!(img.tags.is_empty());
@@ -246,7 +246,7 @@ file: Dockerfile
     #[test]
     fn test_pipeline_defaults_empty() {
         let yaml = "{}";
-        let defaults: PipelineDefaults = serde_yml::from_str(yaml).unwrap();
+        let defaults: PipelineDefaults = serde_yaml::from_str(yaml).unwrap();
         assert!(defaults.format.is_none());
         assert!(defaults.build_args.is_empty());
         assert!(!defaults.no_cache);
@@ -263,7 +263,7 @@ build_args:
   RUST_VERSION: "1.90"
 no_cache: true
 "#;
-        let defaults: PipelineDefaults = serde_yml::from_str(yaml).unwrap();
+        let defaults: PipelineDefaults = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(defaults.format, Some("oci".to_string()));
         assert_eq!(
             defaults.build_args.get("RUST_VERSION"),
@@ -275,14 +275,14 @@ no_cache: true
     #[test]
     fn test_push_config_defaults() {
         let yaml = "{}";
-        let push: PushConfig = serde_yml::from_str(yaml).unwrap();
+        let push: PushConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(!push.after_all);
     }
 
     #[test]
     fn test_push_config_after_all() {
         let yaml = "after_all: true";
-        let push: PushConfig = serde_yml::from_str(yaml).unwrap();
+        let push: PushConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(push.after_all);
     }
 
@@ -292,7 +292,7 @@ no_cache: true
 file: Dockerfile
 unknown_field: "should fail"
 "#;
-        let result: Result<PipelineImage, _> = serde_yml::from_str(yaml);
+        let result: Result<PipelineImage, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "Should reject unknown fields");
     }
 
@@ -302,7 +302,7 @@ unknown_field: "should fail"
 format: oci
 bogus: "nope"
 "#;
-        let result: Result<PipelineDefaults, _> = serde_yml::from_str(yaml);
+        let result: Result<PipelineDefaults, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "Should reject unknown fields");
     }
 
@@ -318,7 +318,7 @@ cache_mounts:
   - target: /root/.cache/pip
 retries: 3
 ";
-        let defaults: PipelineDefaults = serde_yml::from_str(yaml).unwrap();
+        let defaults: PipelineDefaults = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(defaults.cache_mounts.len(), 2);
         assert_eq!(defaults.cache_mounts[0].target, "/root/.cargo/registry");
         assert_eq!(
@@ -340,7 +340,7 @@ cache_mounts:
     readonly: true
 retries: 5
 ";
-        let img: PipelineImage = serde_yml::from_str(yaml).unwrap();
+        let img: PipelineImage = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(img.cache_mounts.len(), 1);
         assert_eq!(img.cache_mounts[0].target, "/tmp/build-cache");
         assert!(img.cache_mounts[0].readonly);
@@ -353,7 +353,7 @@ retries: 5
 after_all: true
 extra: "bad"
 "#;
-        let result: Result<PushConfig, _> = serde_yml::from_str(yaml);
+        let result: Result<PushConfig, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "Should reject unknown fields");
     }
 
@@ -371,7 +371,7 @@ extra: "bad"
             retries: None,
             platforms: vec![],
         };
-        let serialized = serde_yml::to_string(&img).unwrap();
+        let serialized = serde_yaml::to_string(&img).unwrap();
         // Should only contain "file" since everything else is default/empty
         assert!(serialized.contains("file:"));
         assert!(!serialized.contains("context:"));
@@ -404,7 +404,7 @@ extra: "bad"
             retries: Some(3),
             platforms: vec!["linux/amd64".to_string(), "linux/arm64".to_string()],
         };
-        let serialized = serde_yml::to_string(&img).unwrap();
+        let serialized = serde_yaml::to_string(&img).unwrap();
         assert!(serialized.contains("context:"));
         assert!(serialized.contains("tags:"));
         assert!(serialized.contains("build_args:"));

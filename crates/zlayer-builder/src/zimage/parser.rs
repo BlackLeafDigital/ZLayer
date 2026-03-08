@@ -20,7 +20,7 @@ use crate::error::{BuildError, Result};
 pub fn parse_zimagefile(content: &str) -> Result<ZImage> {
     // Phase 1: Deserialize YAML into the ZImage struct.
     let image: ZImage =
-        serde_yml::from_str(content).map_err(|e| BuildError::zimagefile_parse(e.to_string()))?;
+        serde_yaml::from_str(content).map_err(|e| BuildError::zimagefile_parse(e.to_string()))?;
 
     // Phase 2: Semantic validation.
     validate_version(&image)?;

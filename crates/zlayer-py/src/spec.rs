@@ -107,7 +107,7 @@ impl Spec {
 
     /// Convert to YAML string
     fn to_yaml(&self) -> PyResult<String> {
-        serde_yml::to_string(&self.inner).map_err(|e| ZLayerError::Spec(e.to_string()).into())
+        serde_yaml::to_string(&self.inner).map_err(|e| ZLayerError::Spec(e.to_string()).into())
     }
 
     fn __repr__(&self) -> String {
