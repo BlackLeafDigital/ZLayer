@@ -449,12 +449,20 @@ jobs:
           set +o pipefail  # Disable pipefail to avoid SIGPIPE issues
           VERSION="${{ needs.detect.outputs.version }}"
 
+          # Clean buildah storage to avoid stale overlay layer errors
+          sudo buildah rm --all 2>/dev/null || true
+          sudo buildah rmi --all --force 2>/dev/null || true
+
           # --- Pre-built container images (from ZPipeline) ---
           for img in zlayer-node zlayer-web zlayer-manager; do
             echo "Processing ${img}..."
 
             # Load from OCI archive - capture image ID from output
-            IMAGE_ID=$(sudo buildah pull oci-archive:${img}-oci.tar | tail -1)
+            IMAGE_ID=$(sudo buildah pull oci-archive:${img}-oci.tar 2>&1 | tail -1)
+            if [ -z "$IMAGE_ID" ] || [[ "$IMAGE_ID" == *"Error"* ]]; then
+              echo "ERROR: Failed to load ${img}-oci.tar, skipping"
+              continue
+            fi
             echo "Loaded image ID: ${IMAGE_ID}"
 
             # zlayer-web only goes to Forgejo, others go to Docker Hub + GHCR
