@@ -1769,7 +1769,7 @@ mod tests {
     use zlayer_spec::*;
 
     fn mock_spec() -> ServiceSpec {
-        serde_yml::from_str::<DeploymentSpec>(
+        serde_yaml::from_str::<DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -1791,7 +1791,7 @@ services:
     }
 
     fn mock_spec_with_resources() -> ServiceSpec {
-        serde_yml::from_str::<DeploymentSpec>(
+        serde_yaml::from_str::<DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -1819,7 +1819,7 @@ services:
     }
 
     fn mock_privileged_spec() -> ServiceSpec {
-        serde_yml::from_str::<DeploymentSpec>(
+        serde_yaml::from_str::<DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -2076,7 +2076,7 @@ services:
 
     #[test]
     fn test_build_storage_mounts_bind() {
-        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -2117,7 +2117,7 @@ services:
 
     #[test]
     fn test_build_storage_mounts_named() {
-        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -2158,7 +2158,7 @@ services:
 
     #[test]
     fn test_build_storage_mounts_tmpfs() {
-        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -2193,7 +2193,7 @@ services:
 
     #[test]
     fn test_build_storage_mounts_multiple() {
-        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -2241,7 +2241,7 @@ services:
 
     #[test]
     fn test_build_storage_mounts_anonymous_missing_path() {
-        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -2274,7 +2274,7 @@ services:
             service: "test".to_string(),
             replica: 1,
         };
-        let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        let spec = serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test

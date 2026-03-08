@@ -26,7 +26,7 @@ use zlayer_proxy::{ServiceRegistry, StreamRegistry};
 use zlayer_spec::{DeploymentSpec, ServiceSpec};
 
 fn mock_http_spec() -> ServiceSpec {
-    serde_yml::from_str::<DeploymentSpec>(
+    serde_yaml::from_str::<DeploymentSpec>(
         r"
 version: v1
 deployment: test
@@ -51,7 +51,7 @@ services:
 }
 
 fn mock_public_http_spec() -> ServiceSpec {
-    serde_yml::from_str::<DeploymentSpec>(
+    serde_yaml::from_str::<DeploymentSpec>(
         r"
 version: v1
 deployment: test
@@ -77,7 +77,7 @@ services:
 }
 
 fn mock_mixed_endpoints_spec() -> ServiceSpec {
-    serde_yml::from_str::<DeploymentSpec>(
+    serde_yaml::from_str::<DeploymentSpec>(
         r"
 version: v1
 deployment: test
@@ -367,7 +367,7 @@ services:
     image:
       name: hello-world:latest
 ";
-    let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+    let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
     assert!(spec.api.enabled, "API must be enabled by default");
     assert_eq!(
         spec.api.bind, "0.0.0.0:3669",
@@ -388,7 +388,7 @@ services:
 api:
   enabled: false
 ";
-    let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+    let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
     assert!(!spec.api.enabled);
 }
 
@@ -404,7 +404,7 @@ services:
 api:
   bind: "0.0.0.0:3000"
 "#;
-    let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
+    let spec: DeploymentSpec = serde_yaml::from_str(yaml).unwrap();
     assert!(spec.api.enabled, "enabled should default to true");
     assert_eq!(spec.api.bind, "0.0.0.0:3000");
     assert!(spec.api.swagger, "swagger should default to true");

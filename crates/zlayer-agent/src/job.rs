@@ -593,7 +593,7 @@ mod tests {
 
     fn mock_job_spec() -> ServiceSpec {
         use zlayer_spec::*;
-        serde_yml::from_str::<DeploymentSpec>(
+        serde_yaml::from_str::<DeploymentSpec>(
             r"
 version: v1
 deployment: test

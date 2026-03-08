@@ -2803,7 +2803,7 @@ capabilities:
   secrets: true
   metrics: false
 "#;
-        let config: WasmConfig = serde_yml::from_str(yaml).unwrap();
+        let config: WasmConfig = serde_yaml::from_str(yaml).unwrap();
         assert_eq!(config.min_instances, 2);
         assert_eq!(config.max_instances, 50);
         assert_eq!(config.max_memory, Some("64Mi".to_string()));

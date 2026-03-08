@@ -24,7 +24,7 @@ required-features = ["ssr"]
 # Serialization (needed for server fn types)
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yml = { workspace = true }
+serde_yaml = { workspace = true }
 
 # Web UI - core Leptos components (using 0.8.x for stability)
 leptos = { version = "0.8", default-features = false, features = ["nonce"] }

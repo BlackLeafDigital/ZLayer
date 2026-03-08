@@ -1996,7 +1996,7 @@ mod tests {
     }
 
     fn mock_spec() -> ServiceSpec {
-        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -2274,7 +2274,7 @@ services:
     // ==================== Job/Cron Integration Tests ====================
 
     fn mock_job_spec() -> ServiceSpec {
-        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -2292,7 +2292,7 @@ services:
     }
 
     fn mock_cron_spec() -> ServiceSpec {
-        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r#"
 version: v1
 deployment: test
@@ -2616,7 +2616,7 @@ services:
     // ==================== Stream Registry Integration Tests ====================
 
     fn mock_tcp_spec() -> ServiceSpec {
-        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -2641,7 +2641,7 @@ services:
     }
 
     fn mock_udp_spec() -> ServiceSpec {
-        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -2666,7 +2666,7 @@ services:
     }
 
     fn mock_mixed_spec() -> ServiceSpec {
-        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test

@@ -682,7 +682,7 @@ mod tests {
 
     fn mock_service_spec_with_endpoints() -> ServiceSpec {
         use zlayer_spec::*;
-        serde_yml::from_str::<DeploymentSpec>(
+        serde_yaml::from_str::<DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -712,7 +712,7 @@ services:
 
     fn mock_service_spec_tcp_only() -> ServiceSpec {
         use zlayer_spec::*;
-        serde_yml::from_str::<DeploymentSpec>(
+        serde_yaml::from_str::<DeploymentSpec>(
             r"
 version: v1
 deployment: test
@@ -890,7 +890,7 @@ services:
 
     fn mock_mixed_service_spec() -> ServiceSpec {
         use zlayer_spec::*;
-        serde_yml::from_str::<DeploymentSpec>(
+        serde_yaml::from_str::<DeploymentSpec>(
             r"
 version: v1
 deployment: test
