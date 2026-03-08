@@ -469,6 +469,10 @@ pub(crate) enum Commands {
         /// Only build specific images (comma-separated)
         #[arg(long)]
         only: Option<String>,
+
+        /// Override platforms for all images (comma-separated, e.g., "linux/amd64,linux/arm64")
+        #[arg(long)]
+        platform: Option<String>,
     },
 
     /// List available runtime templates
@@ -1581,6 +1585,7 @@ mod tests {
                 fail_fast,
                 no_tui,
                 only,
+                platform,
             }) => {
                 assert!(file.is_none());
                 assert!(set.is_empty());
@@ -1588,6 +1593,7 @@ mod tests {
                 assert!(fail_fast);
                 assert!(!no_tui);
                 assert!(only.is_none());
+                assert!(platform.is_none());
             }
             _ => panic!("Expected Pipeline command"),
         }

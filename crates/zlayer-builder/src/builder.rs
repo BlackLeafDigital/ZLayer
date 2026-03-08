@@ -356,6 +356,8 @@ pub struct BuiltImage {
     pub size: u64,
     /// Build duration in milliseconds
     pub build_time_ms: u64,
+    /// Whether this image is a manifest list (multi-arch).
+    pub is_manifest: bool,
 }
 
 /// Registry authentication credentials
@@ -474,6 +476,9 @@ pub struct BuildOptions {
     pub default_cache_mounts: Vec<RunMount>,
     /// Number of retries for failed RUN steps (0 = no retries, default)
     pub retries: u32,
+    /// Target platform for the build (e.g., "linux/amd64", "linux/arm64").
+    /// When set, `buildah from` pulls the platform-specific image variant.
+    pub platform: Option<String>,
 }
 
 impl Default for BuildOptions {
@@ -499,6 +504,7 @@ impl Default for BuildOptions {
             default_registry: None,
             default_cache_mounts: Vec::new(),
             retries: 0,
+            platform: None,
         }
     }
 }
@@ -1017,6 +1023,13 @@ impl ImageBuilder {
         self
     }
 
+    /// Set the target platform for cross-architecture builds.
+    #[must_use]
+    pub fn platform(mut self, platform: impl Into<String>) -> Self {
+        self.options.platform = Some(platform.into());
+        self
+    }
+
     /// Set an event sender for TUI progress updates
     ///
     /// Events will be sent as the build progresses, allowing you to
@@ -1332,6 +1345,7 @@ impl ImageBuilder {
                 layer_count: 1,
                 size,
                 build_time_ms,
+                is_manifest: false,
             });
         }
 
@@ -1698,6 +1712,7 @@ impl ImageBuilder {
             layer_count: total_instructions,
             size: 0, // TODO: get actual size via buildah inspect
             build_time_ms,
+            is_manifest: false,
         })
     }
 
@@ -2142,7 +2157,9 @@ impl ImageBuilder {
 
     /// Create a working container from an image
     async fn create_container(&self, image: &str) -> Result<String> {
-        let cmd = BuildahCommand::from_image(image);
+        let cmd = BuildahCommand::new("from")
+            .arg_opt("--platform", self.options.platform.as_deref())
+            .arg(image);
         let output = self.executor.execute_checked(&cmd).await?;
         Ok(output.stdout.trim().to_string())
     }
