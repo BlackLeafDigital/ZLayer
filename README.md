@@ -311,10 +311,14 @@ ZLayer nodes form a Raft-based cluster for distributed container scheduling, aut
 ### How It Works
 
 1. **Bootstrap** -- The first node initializes the cluster and becomes the Raft leader. It detects local CPU, memory, disk, and GPU resources and registers itself in the cluster state.
-2. **Join** -- Additional nodes join via `zlayer node join`, providing a join token for authentication. Each joining node reports its hardware resources (CPU cores, memory, disk, GPUs) which are stored in the Raft-replicated cluster state.
-3. **Heartbeat** -- Worker nodes send resource usage heartbeats to the leader every 5 seconds. If a node misses heartbeats for 30 seconds, the leader marks it as "dead".
-4. **Scheduling** -- When a deployment is created or scaled, the scheduler builds a placement plan across all live nodes using bin-packing, dedicated, or exclusive allocation modes (depending on the service spec). Containers are dispatched to remote nodes via internal API calls.
-5. **Failover** -- When a node dies, the scheduler automatically reschedules its containers to remaining live nodes. If a dead node later resumes heartbeating, it is automatically recovered to "ready" status.
+2. **Join** -- Additional nodes join via `zlayer node join`, providing a join token for authentication. Each joining node reports its hardware resources (CPU cores, memory, disk, GPUs) which are stored in the Raft-replicated cluster state. Nodes can join in two modes:
+   - **`full`** (default) -- Eligible to become a voting member. The cluster dynamically promotes full nodes to voters to maintain an optimal odd-numbered voter set.
+   - **`replicate`** -- Always a non-voting learner. Receives full data replication but never participates in leader elections or quorum.
+3. **Dynamic Voter Management** -- The cluster automatically maintains an odd number of voters for optimal fault tolerance: 1 node = 1 voter, 2 nodes = 1 voter + 1 learner, 3 nodes = 3 voters, 5 nodes = 5 voters, 7+ nodes = 7 voters (cap) with the rest as learners. This means a 2-node cluster works safely -- the first node up wins leadership, and the cluster remains available if the learner goes down.
+4. **Heartbeat** -- Worker nodes send resource usage heartbeats to the leader every 5 seconds. If a node misses heartbeats for 30 seconds, the leader marks it as "dead" and rebalances the voter set (promoting a learner if a voter died).
+5. **Scheduling** -- When a deployment is created or scaled, the scheduler builds a placement plan across all live nodes using bin-packing, dedicated, or exclusive allocation modes (depending on the service spec). Containers are dispatched to remote nodes via internal API calls.
+6. **Failover** -- When a node dies, the scheduler automatically reschedules its containers to remaining live nodes. If a dead node later resumes heartbeating, it is automatically recovered to "ready" status.
+7. **Disaster Recovery** -- If the leader is permanently lost in a small cluster, a surviving node can take over via `zlayer node force-leader`. This preserves cluster state and re-bootstraps as a new single-node leader.
 
 ### Bootstrapping a Cluster
 

@@ -49,7 +49,10 @@ jobs:
           else
             TAG="${{ github.ref_name }}"
           fi
-          VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
+          RAW_VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
+          # Strip leading zeros from each component to avoid "invalid leading zero" cargo errors
+          IFS='.' read -r V_MAJOR V_MINOR V_PATCH <<< "$RAW_VERSION"
+          VERSION="$((10#$V_MAJOR)).$((10#$V_MINOR)).$((10#$V_PATCH))"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
           if [[ "$TAG" == major-v* ]]; then
@@ -454,12 +457,20 @@ jobs:
           set +o pipefail  # Disable pipefail to avoid SIGPIPE issues
           VERSION="${{ needs.detect.outputs.version }}"
 
+          # Clean buildah storage to avoid stale overlay layer errors
+          sudo buildah rm --all 2>/dev/null || true
+          sudo buildah rmi --all --force 2>/dev/null || true
+
           # --- Pre-built container images (from ZPipeline) ---
           for img in zlayer-node zlayer-web zlayer-manager; do
             echo "Processing ${img}..."
 
             # Load from OCI archive - capture image ID from output
-            IMAGE_ID=$(sudo buildah pull oci-archive:${img}-oci.tar | tail -1)
+            IMAGE_ID=$(sudo buildah pull oci-archive:${img}-oci.tar 2>&1 | tail -1)
+            if [ -z "$IMAGE_ID" ] || [[ "$IMAGE_ID" == *"Error"* ]]; then
+              echo "ERROR: Failed to load ${img}-oci.tar, skipping"
+              continue
+            fi
             echo "Loaded image ID: ${IMAGE_ID}"
 
             # zlayer-web only goes to Forgejo, others go to Docker Hub + GHCR
