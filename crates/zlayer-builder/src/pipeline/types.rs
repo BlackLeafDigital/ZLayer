@@ -108,6 +108,11 @@ pub struct PipelineDefaults {
     /// Default retry count for failed RUN steps (0 = no retries)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
+
+    /// Default target platforms for multi-arch builds (e.g., `linux/amd64`, `linux/arm64`).
+    /// When set, each image is built once per platform and a manifest list is created.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -175,6 +180,11 @@ pub struct PipelineImage {
     /// Override retry count for this image
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retries: Option<u32>,
+
+    /// Target platforms for this image (overrides defaults.platforms).
+    /// If empty, inherits from defaults.platforms.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub platforms: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +240,7 @@ file: Dockerfile
         assert!(img.format.is_none());
         assert!(img.cache_mounts.is_empty());
         assert!(img.retries.is_none());
+        assert!(img.platforms.is_empty());
     }
 
     #[test]
@@ -241,6 +252,7 @@ file: Dockerfile
         assert!(!defaults.no_cache);
         assert!(defaults.cache_mounts.is_empty());
         assert!(defaults.retries.is_none());
+        assert!(defaults.platforms.is_empty());
     }
 
     #[test]
@@ -357,6 +369,7 @@ extra: "bad"
             format: None,
             cache_mounts: vec![],
             retries: None,
+            platforms: vec![],
         };
         let serialized = serde_yml::to_string(&img).unwrap();
         // Should only contain "file" since everything else is default/empty
@@ -369,6 +382,7 @@ extra: "bad"
         assert!(!serialized.contains("format:"));
         assert!(!serialized.contains("cache_mounts:"));
         assert!(!serialized.contains("retries:"));
+        assert!(!serialized.contains("platforms:"));
     }
 
     #[test]
@@ -388,6 +402,7 @@ extra: "bad"
                 readonly: false,
             }],
             retries: Some(3),
+            platforms: vec!["linux/amd64".to_string(), "linux/arm64".to_string()],
         };
         let serialized = serde_yml::to_string(&img).unwrap();
         assert!(serialized.contains("context:"));
@@ -398,5 +413,6 @@ extra: "bad"
         assert!(serialized.contains("format:"));
         assert!(serialized.contains("cache_mounts:"));
         assert!(serialized.contains("retries:"));
+        assert!(serialized.contains("platforms:"));
     }
 }

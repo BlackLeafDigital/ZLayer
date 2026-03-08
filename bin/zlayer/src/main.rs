@@ -474,6 +474,7 @@ async fn run(cli: Cli) -> Result<()> {
             fail_fast,
             no_tui,
             only,
+            platform,
         } => {
             commands::pipeline::cmd_pipeline(
                 file.clone(),
@@ -482,6 +483,7 @@ async fn run(cli: Cli) -> Result<()> {
                 *fail_fast,
                 *no_tui,
                 only.clone(),
+                platform.clone(),
             )
             .await
         }

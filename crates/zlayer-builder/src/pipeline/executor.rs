@@ -42,11 +42,11 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
-use crate::buildah::BuildahExecutor;
+use crate::buildah::{BuildahCommand, BuildahExecutor};
 use crate::builder::{BuiltImage, ImageBuilder};
 use crate::error::{BuildError, Result};
 
-use super::types::ZPipeline;
+use super::types::{PipelineDefaults, PipelineImage, ZPipeline};
 
 /// Result of a pipeline execution
 #[derive(Debug)]
@@ -258,7 +258,13 @@ impl PipelineExecutor {
 
             for (name, image) in &succeeded {
                 for tag in &image.tags {
-                    if let Err(e) = self.push_image(tag).await {
+                    let push_result = if image.is_manifest {
+                        self.push_manifest(tag).await
+                    } else {
+                        self.push_image(tag).await
+                    };
+
+                    if let Err(e) = push_result {
                         warn!("[{}] Failed to push {}: {}", name, tag, e);
                         // Push failures don't fail the overall pipeline
                         // since the images were built successfully
@@ -281,6 +287,12 @@ impl PipelineExecutor {
 
     /// Build all images in a wave concurrently
     ///
+    /// Each image is checked for multi-platform configuration. Images with
+    /// 2+ platforms use `build_multiplatform_image` (manifest list), images
+    /// with exactly 1 platform use `build_single_image` with that platform
+    /// set, and images with no platforms use the native platform (existing
+    /// behavior).
+    ///
     /// Returns a vector of (name, result) tuples for each image in the wave.
     async fn build_wave(&self, wave: &[String]) -> Vec<(String, Result<BuiltImage>)> {
         // Create shared data for spawned tasks
@@ -297,7 +309,27 @@ impl PipelineExecutor {
             let executor = executor.clone();
 
             set.spawn(async move {
-                let result = build_single_image(&name, &pipeline, &base_dir, executor).await;
+                let platforms = {
+                    let image_config = &pipeline.images[&name];
+                    effective_platforms(image_config, &pipeline.defaults)
+                };
+
+                let result = match platforms.len() {
+                    // No platforms specified — native build (existing behavior)
+                    0 => build_single_image(&name, &pipeline, &base_dir, executor, None).await,
+                    // Single platform — use build_single_image with platform set
+                    1 => {
+                        let platform = platforms[0].clone();
+                        build_single_image(&name, &pipeline, &base_dir, executor, Some(&platform))
+                            .await
+                    }
+                    // Multiple platforms — build each, then create manifest list
+                    _ => {
+                        build_multiplatform_image(&name, &pipeline, &base_dir, executor, &platforms)
+                            .await
+                    }
+                };
+
                 (name, result)
             });
         }
@@ -326,33 +358,100 @@ impl PipelineExecutor {
         results
     }
 
-    /// Push an image to its registry
+    /// Push a regular image to its registry
     async fn push_image(&self, tag: &str) -> Result<()> {
-        use crate::buildah::BuildahCommand;
-
         let cmd = BuildahCommand::push(tag);
+        self.executor.execute_checked(&cmd).await?;
+        Ok(())
+    }
+
+    /// Push a manifest list (and all referenced images) to its registry
+    async fn push_manifest(&self, tag: &str) -> Result<()> {
+        let destination = format!("docker://{tag}");
+        let cmd = BuildahCommand::manifest_push(tag, &destination);
         self.executor.execute_checked(&cmd).await?;
         Ok(())
     }
 }
 
-/// Build a single image from the pipeline
+/// Get the effective platforms for an image, considering defaults.
 ///
-/// This is extracted as a separate function to make it easier to spawn
-/// in a tokio task without borrowing issues.
-async fn build_single_image(
-    name: &str,
-    pipeline: &ZPipeline,
-    base_dir: &Path,
-    executor: BuildahExecutor,
-) -> Result<BuiltImage> {
-    let image_config = &pipeline.images[name];
-    let context = base_dir.join(&image_config.context);
-    let file_path = base_dir.join(&image_config.file);
+/// If the image specifies its own platforms, those take precedence.
+/// Otherwise, the pipeline-level defaults are used. An empty result
+/// means "native platform only" (no multi-arch).
+fn effective_platforms(image: &PipelineImage, defaults: &PipelineDefaults) -> Vec<String> {
+    if image.platforms.is_empty() {
+        defaults.platforms.clone()
+    } else {
+        image.platforms.clone()
+    }
+}
 
-    let mut builder = ImageBuilder::with_executor(&context, executor)?;
+/// Extract architecture suffix from a platform string.
+///
+/// # Examples
+///
+/// - `"linux/amd64"` -> `"amd64"`
+/// - `"linux/arm64"` -> `"arm64"`
+/// - `"linux/arm64/v8"` -> `"arm64-v8"`
+/// - `"linux"` -> `"linux"`
+fn platform_to_suffix(platform: &str) -> String {
+    let parts: Vec<&str> = platform.split('/').collect();
+    match parts.len() {
+        0 | 1 => platform.replace('/', "-"),
+        2 => parts[1].to_string(),
+        _ => format!("{}-{}", parts[1], parts[2]),
+    }
+}
 
-    // Determine if this is a ZImagefile or Dockerfile based on extension/name
+/// Apply pipeline configuration (`build_args`, format, `cache_mounts`, retries, `no_cache`)
+/// to an [`ImageBuilder`].
+///
+/// This merges default-level and per-image settings, with per-image values taking
+/// precedence for scalar settings and being additive for collections.
+fn apply_pipeline_config(
+    mut builder: ImageBuilder,
+    image_config: &PipelineImage,
+    defaults: &PipelineDefaults,
+) -> ImageBuilder {
+    // Merge build_args: defaults + per-image (per-image overrides defaults)
+    let mut args = defaults.build_args.clone();
+    args.extend(image_config.build_args.clone());
+    builder = builder.build_args(args);
+
+    // Format (per-image overrides default)
+    if let Some(fmt) = image_config.format.as_ref().or(defaults.format.as_ref()) {
+        builder = builder.format(fmt);
+    }
+
+    // No cache (per-image overrides default)
+    if image_config.no_cache.unwrap_or(defaults.no_cache) {
+        builder = builder.no_cache();
+    }
+
+    // Cache mounts: defaults + per-image (per-image are additive)
+    let mut cache_mounts = defaults.cache_mounts.clone();
+    cache_mounts.extend(image_config.cache_mounts.clone());
+    if !cache_mounts.is_empty() {
+        let run_mounts: Vec<_> = cache_mounts
+            .iter()
+            .map(crate::zimage::convert_cache_mount)
+            .collect();
+        builder = builder.default_cache_mounts(run_mounts);
+    }
+
+    // Retries (per-image overrides default)
+    let retries = image_config.retries.or(defaults.retries).unwrap_or(0);
+    if retries > 0 {
+        builder = builder.retries(retries);
+    }
+
+    builder
+}
+
+/// Detect whether a build file is a ZImagefile/YAML or a Dockerfile and
+/// configure the builder accordingly.
+fn apply_build_file(builder: ImageBuilder, file_path: &Path) -> ImageBuilder {
     let file_name = file_path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -363,9 +462,38 @@ async fn build_single_image(
         .unwrap_or_default();
 
     if extension == "yaml" || extension == "yml" || file_name.starts_with("ZImagefile") {
-        builder = builder.zimagefile(&file_path);
+        builder.zimagefile(file_path)
     } else {
-        builder = builder.dockerfile(&file_path);
+        builder.dockerfile(file_path)
+    }
+}
+
+/// Build a single image from the pipeline
+///
+/// This is extracted as a separate function to make it easier to spawn
+/// in a tokio task without borrowing issues.
+///
+/// When `platform` is `Some`, the builder is configured for that specific
+/// platform (e.g. `"linux/arm64"`), enabling cross-architecture builds.
+async fn build_single_image(
+    name: &str,
+    pipeline: &ZPipeline,
+    base_dir: &Path,
+    executor: BuildahExecutor,
+    platform: Option<&str>,
+) -> Result<BuiltImage> {
+    let image_config = &pipeline.images[name];
+    let context = base_dir.join(&image_config.context);
+    let file_path = base_dir.join(&image_config.file);
+
+    let mut builder = ImageBuilder::with_executor(&context, executor)?;
+
+    // Determine if this is a ZImagefile or Dockerfile based on extension/name
+    builder = apply_build_file(builder, &file_path);
+
+    // Set platform if specified
+    if let Some(plat) = platform {
+        builder = builder.platform(plat);
     }
 
     // Apply tags with variable expansion
@@ -374,46 +502,117 @@ async fn build_single_image(
         builder = builder.tag(expanded);
     }
 
-    // Merge build_args: defaults + per-image (per-image overrides defaults)
-    let mut args = pipeline.defaults.build_args.clone();
-    args.extend(image_config.build_args.clone());
-    builder = builder.build_args(args);
-
-    // Apply format (per-image overrides default)
-    if let Some(fmt) = image_config
-        .format
-        .as_ref()
-        .or(pipeline.defaults.format.as_ref())
-    {
-        builder = builder.format(fmt);
-    }
-
-    // Apply no_cache (per-image overrides default)
-    if image_config.no_cache.unwrap_or(pipeline.defaults.no_cache) {
-        builder = builder.no_cache();
-    }
-
-    // Merge cache mounts: defaults + per-image (per-image are additive)
-    let mut cache_mounts = pipeline.defaults.cache_mounts.clone();
-    cache_mounts.extend(image_config.cache_mounts.clone());
-    if !cache_mounts.is_empty() {
-        let run_mounts: Vec<_> = cache_mounts
-            .iter()
-            .map(crate::zimage::convert_cache_mount)
-            .collect();
-        builder = builder.default_cache_mounts(run_mounts);
-    }
-
-    // Apply retries (per-image overrides default)
-    let retries = image_config
-        .retries
-        .or(pipeline.defaults.retries)
-        .unwrap_or(0);
-    if retries > 0 {
-        builder = builder.retries(retries);
-    }
+    // Apply shared pipeline config (build_args, format, no_cache, cache_mounts, retries)
+    builder = apply_pipeline_config(builder, image_config, &pipeline.defaults);
 
     builder.build().await
+}
+
+/// Build an image for multiple platforms and create a manifest list.
+///
+/// Each platform is built sequentially (QEMU can be flaky with parallel
+/// cross-arch builds), then a buildah manifest list is created that
+/// references all per-platform images.
+async fn build_multiplatform_image(
+    name: &str,
+    pipeline: &ZPipeline,
+    base_dir: &Path,
+    executor: BuildahExecutor,
+    platforms: &[String],
+) -> Result<BuiltImage> {
+    let image_config = &pipeline.images[name];
+    let start_time = std::time::Instant::now();
+
+    // Expand tags with variables
+    let expanded_tags: Vec<String> = image_config
+        .tags
+        .iter()
+        .map(|t| expand_tag_with_vars(t, &pipeline.vars))
+        .collect();
+
+    let manifest_name = expanded_tags
+        .first()
+        .cloned()
+        .unwrap_or_else(|| format!("zlayer-manifest-{name}"));
+
+    // Build for each platform sequentially (QEMU can be flaky with parallel cross-arch)
+    let mut arch_tags: Vec<String> = Vec::new();
+    let mut total_layers = 0usize;
+    let mut total_size = 0u64;
+
+    for platform in platforms {
+        let suffix = platform_to_suffix(platform);
+        let platform_tags: Vec<String> = expanded_tags
+            .iter()
+            .map(|t| format!("{t}-{suffix}"))
+            .collect();
+
+        info!("[{name}] Building for platform {platform}");
+
+        // Build with platform-specific tags
+        let context = base_dir.join(&image_config.context);
+        let file_path = base_dir.join(&image_config.file);
+
+        let mut builder = ImageBuilder::with_executor(&context, executor.clone())?;
+
+        // Determine file type (same detection as build_single_image)
+        builder = apply_build_file(builder, &file_path);
+
+        // Set platform
+        builder = builder.platform(platform);
+
+        // Apply platform-specific tags
+        for tag in &platform_tags {
+            builder = builder.tag(tag);
+        }
+
+        // Apply shared config (build_args, format, no_cache, cache_mounts, retries)
+        builder = apply_pipeline_config(builder, image_config, &pipeline.defaults);
+
+        let built = builder.build().await?;
+        total_layers += built.layer_count;
+        total_size += built.size;
+
+        if let Some(first_tag) = platform_tags.first() {
+            arch_tags.push(first_tag.clone());
+        }
+    }
+
+    // Create manifest list
+    info!("[{name}] Creating manifest: {manifest_name}");
+    executor
+        .execute_checked(&BuildahCommand::manifest_create(&manifest_name))
+        .await
+        .map_err(|e| BuildError::pipeline_error(format!("manifest create failed: {e}")))?;
+
+    // Add each arch image to the manifest
+    for arch_tag in &arch_tags {
+        info!("[{name}] Adding to manifest: {arch_tag}");
+        executor
+            .execute_checked(&BuildahCommand::manifest_add(&manifest_name, arch_tag))
+            .await
+            .map_err(|e| BuildError::pipeline_error(format!("manifest add failed: {e}")))?;
+    }
+
+    // Tag the manifest with additional tags
+    for tag in expanded_tags.iter().skip(1) {
+        executor
+            .execute_checked(&BuildahCommand::tag(&manifest_name, tag))
+            .await
+            .map_err(|e| BuildError::pipeline_error(format!("manifest tag failed: {e}")))?;
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    let build_time_ms = start_time.elapsed().as_millis() as u64;
+
+    Ok(BuiltImage {
+        image_id: manifest_name,
+        tags: expanded_tags,
+        layer_count: total_layers,
+        size: total_size,
+        build_time_ms,
+        is_manifest: true,
+    })
 }
 
 /// Expand variables in a tag string
@@ -608,6 +807,7 @@ images:
                 layer_count: 5,
                 size: 0,
                 build_time_ms: 50,
+                is_manifest: false,
             },
         );
         result
@@ -637,5 +837,96 @@ push:
 
         assert!(!executor.fail_fast);
         assert!(!executor.push_enabled);
+    }
+
+    /// Helper to create a minimal `PipelineImage` for tests.
+    fn test_pipeline_image() -> PipelineImage {
+        PipelineImage {
+            file: PathBuf::from("Dockerfile"),
+            context: PathBuf::from("."),
+            tags: vec![],
+            build_args: HashMap::new(),
+            depends_on: vec![],
+            no_cache: None,
+            format: None,
+            cache_mounts: vec![],
+            retries: None,
+            platforms: vec![],
+        }
+    }
+
+    #[test]
+    fn test_platform_to_suffix() {
+        assert_eq!(platform_to_suffix("linux/amd64"), "amd64");
+        assert_eq!(platform_to_suffix("linux/arm64"), "arm64");
+        assert_eq!(platform_to_suffix("linux/arm64/v8"), "arm64-v8");
+        assert_eq!(platform_to_suffix("linux"), "linux");
+    }
+
+    #[test]
+    fn test_effective_platforms_image_overrides() {
+        let defaults = PipelineDefaults {
+            platforms: vec!["linux/amd64".into()],
+            ..Default::default()
+        };
+        let image = PipelineImage {
+            platforms: vec!["linux/arm64".into()],
+            ..test_pipeline_image()
+        };
+        assert_eq!(effective_platforms(&image, &defaults), vec!["linux/arm64"]);
+    }
+
+    #[test]
+    fn test_effective_platforms_inherits_defaults() {
+        let defaults = PipelineDefaults {
+            platforms: vec!["linux/amd64".into()],
+            ..Default::default()
+        };
+        let image = test_pipeline_image();
+        assert_eq!(effective_platforms(&image, &defaults), vec!["linux/amd64"]);
+    }
+
+    #[test]
+    fn test_effective_platforms_empty() {
+        let defaults = PipelineDefaults::default();
+        let image = test_pipeline_image();
+        assert!(effective_platforms(&image, &defaults).is_empty());
+    }
+
+    #[test]
+    fn test_platform_to_suffix_edge_cases() {
+        // Empty string
+        assert_eq!(platform_to_suffix(""), "");
+        // Single component
+        assert_eq!(platform_to_suffix("linux"), "linux");
+        // Four components (unusual but handle gracefully)
+        assert_eq!(platform_to_suffix("linux/arm/v7/extra"), "arm-v7");
+    }
+
+    #[test]
+    fn test_effective_platforms_multiple_defaults() {
+        let defaults = PipelineDefaults {
+            platforms: vec!["linux/amd64".into(), "linux/arm64".into()],
+            ..Default::default()
+        };
+        let image = test_pipeline_image();
+        assert_eq!(
+            effective_platforms(&image, &defaults),
+            vec!["linux/amd64", "linux/arm64"]
+        );
+    }
+
+    #[test]
+    fn test_effective_platforms_image_overrides_multiple() {
+        let defaults = PipelineDefaults {
+            platforms: vec!["linux/amd64".into(), "linux/arm64".into()],
+            ..Default::default()
+        };
+        let image = PipelineImage {
+            platforms: vec!["linux/s390x".into()],
+            ..test_pipeline_image()
+        };
+        // Image platforms completely replace defaults, not merge
+        assert_eq!(effective_platforms(&image, &defaults), vec!["linux/s390x"]);
     }
 }
