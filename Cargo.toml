@@ -188,28 +188,28 @@ socket2 = "0.5"
 # The `package` field tells Cargo the actual crate name on the registry.
 
 # --- Publishable crates ---
-zlayer-spec = { path = "crates/zlayer-spec", version = "0.0.0-dev", package = "zlayer-spec-zql" }
-zlayer-observability = { path = "crates/zlayer-observability", version = "0.0.0-dev", package = "zlayer-observability-zql" }
-zlayer-overlay = { path = "crates/zlayer-overlay", version = "0.0.0-dev", package = "zlayer-overlay-zql" }
-zlayer-storage = { path = "crates/zlayer-storage", version = "0.0.0-dev", package = "zlayer-storage-zql" }
-zlayer-core = { path = "crates/zlayer-core", version = "0.0.0-dev", package = "zlayer-core-zql" }
-zlayer-builder = { path = "crates/zlayer-builder", version = "0.0.0-dev", package = "zlayer-builder-zql" }
-zlayer-init-actions = { path = "crates/zlayer-init-actions", version = "0.0.0-dev", package = "zlayer-init-actions-zql" }
-zlayer-registry = { path = "crates/zlayer-registry", version = "0.0.0-dev", package = "zlayer-registry-zql" }
-zlayer-scheduler = { path = "crates/zlayer-scheduler", version = "0.0.0-dev", package = "zlayer-scheduler-zql" }
-zlayer-tunnel = { path = "crates/zlayer-tunnel", version = "0.0.0-dev", package = "zlayer-tunnel-zql" }
+zlayer-spec = { path = "crates/zlayer-spec", version = "0.0.0-dev", package = "zlayer-spec-zql", registry = "forgejo" }
+zlayer-observability = { path = "crates/zlayer-observability", version = "0.0.0-dev", package = "zlayer-observability-zql", registry = "forgejo" }
+zlayer-overlay = { path = "crates/zlayer-overlay", version = "0.0.0-dev", package = "zlayer-overlay-zql", registry = "forgejo" }
+zlayer-storage = { path = "crates/zlayer-storage", version = "0.0.0-dev", package = "zlayer-storage-zql", registry = "forgejo" }
+zlayer-core = { path = "crates/zlayer-core", version = "0.0.0-dev", package = "zlayer-core-zql", registry = "forgejo" }
+zlayer-builder = { path = "crates/zlayer-builder", version = "0.0.0-dev", package = "zlayer-builder-zql", registry = "forgejo" }
+zlayer-init-actions = { path = "crates/zlayer-init-actions", version = "0.0.0-dev", package = "zlayer-init-actions-zql", registry = "forgejo" }
+zlayer-registry = { path = "crates/zlayer-registry", version = "0.0.0-dev", package = "zlayer-registry-zql", registry = "forgejo" }
+zlayer-scheduler = { path = "crates/zlayer-scheduler", version = "0.0.0-dev", package = "zlayer-scheduler-zql", registry = "forgejo" }
+zlayer-tunnel = { path = "crates/zlayer-tunnel", version = "0.0.0-dev", package = "zlayer-tunnel-zql", registry = "forgejo" }
 
 # --- Non-publishable workspace crates ---
-zlayer-agent = { path = "crates/zlayer-agent", version = "0.0.0-dev", package = "zlayer-agent-zql" }
-zlayer-proxy = { path = "crates/zlayer-proxy", version = "0.0.0-dev", package = "zlayer-proxy-zql" }
-zlayer-api = { path = "crates/zlayer-api", version = "0.0.0-dev", package = "zlayer-api-zql" }
-zlayer-tui = { path = "crates/zlayer-tui", version = "0.0.0-dev", package = "zlayer-tui-zql" }
-zlayer-py = { path = "crates/zlayer-py", version = "0.0.0-dev", package = "zlayer-py-zql" }
-zlayer-web = { path = "crates/zlayer-web", version = "0.0.0-dev", package = "zlayer-web-zql" }
-zlayer-secrets = { path = "crates/zlayer-secrets", version = "0.0.0-dev", package = "zlayer-secrets-zql" }
-zlayer-manager = { path = "crates/zlayer-manager", version = "0.0.0-dev", package = "zlayer-manager-zql" }
-zlayer-consensus = { path = "crates/zlayer-consensus", version = "0.0.0-dev", package = "zlayer-consensus-zql" }
-zlayer-wsl = { path = "crates/zlayer-wsl", version = "0.0.0-dev", package = "zlayer-wsl-zql" }
+zlayer-agent = { path = "crates/zlayer-agent", version = "0.0.0-dev", package = "zlayer-agent-zql", registry = "forgejo" }
+zlayer-proxy = { path = "crates/zlayer-proxy", version = "0.0.0-dev", package = "zlayer-proxy-zql", registry = "forgejo" }
+zlayer-api = { path = "crates/zlayer-api", version = "0.0.0-dev", package = "zlayer-api-zql", registry = "forgejo" }
+zlayer-tui = { path = "crates/zlayer-tui", version = "0.0.0-dev", package = "zlayer-tui-zql", registry = "forgejo" }
+zlayer-py = { path = "crates/zlayer-py", version = "0.0.0-dev", package = "zlayer-py-zql", registry = "forgejo" }
+zlayer-web = { path = "crates/zlayer-web", version = "0.0.0-dev", package = "zlayer-web-zql", registry = "forgejo" }
+zlayer-secrets = { path = "crates/zlayer-secrets", version = "0.0.0-dev", package = "zlayer-secrets-zql", registry = "forgejo" }
+zlayer-manager = { path = "crates/zlayer-manager", version = "0.0.0-dev", package = "zlayer-manager-zql", registry = "forgejo" }
+zlayer-consensus = { path = "crates/zlayer-consensus", version = "0.0.0-dev", package = "zlayer-consensus-zql", registry = "forgejo" }
+zlayer-wsl = { path = "crates/zlayer-wsl", version = "0.0.0-dev", package = "zlayer-wsl-zql", registry = "forgejo" }
 
 # =============================================================================
 # Build Profiles
