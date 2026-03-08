@@ -4,8 +4,8 @@
 
 use crate::error::{ValidationError, ValidationErrorKind};
 use crate::types::{
-    DeploymentSpec, EndpointSpec, EndpointTunnelConfig, ResourceType, ScaleSpec, ServiceSpec,
-    TunnelAccessConfig, TunnelDefinition,
+    DeploymentSpec, EndpointSpec, EndpointTunnelConfig, Protocol, ResourceType, ScaleSpec,
+    ServiceSpec, ServiceType, TunnelAccessConfig, TunnelDefinition,
 };
 use cron::Schedule;
 use std::collections::HashSet;
@@ -784,6 +784,194 @@ pub fn validate_tunnels(spec: &DeploymentSpec) -> Result<(), ValidationError> {
     Ok(())
 }
 
+// =============================================================================
+// WASM validation functions
+// =============================================================================
+
+/// Validate WASM configuration for all services in a deployment spec
+///
+/// # Errors
+///
+/// Returns a validation error if any WASM configuration is invalid.
+pub fn validate_wasm_configs(spec: &DeploymentSpec) -> Result<(), ValidationError> {
+    for (service_name, service_spec) in &spec.services {
+        validate_wasm_config(service_name, service_spec)?;
+    }
+    Ok(())
+}
+
+/// Validate WASM configuration for a single service
+///
+/// Checks:
+/// - WASM config should not be present on non-WASM service types
+/// - `min_instances` <= `max_instances`
+/// - `max_memory` format validation
+/// - Capability restriction validation (users can only restrict from defaults, not grant)
+/// - `WasmHttp` must have at least one HTTP endpoint (if endpoints exist)
+/// - Preopens must have non-empty source and target
+///
+/// # Errors
+///
+/// Returns a validation error if the WASM configuration is invalid.
+pub fn validate_wasm_config(service_name: &str, spec: &ServiceSpec) -> Result<(), ValidationError> {
+    // If service_type is NOT wasm but wasm config IS present, that's an error
+    if !spec.service_type.is_wasm() && spec.wasm.is_some() {
+        return Err(ValidationError {
+            kind: ValidationErrorKind::WasmConfigOnNonWasmType,
+            path: format!("services.{service_name}.wasm"),
+        });
+    }
+
+    if let Some(ref wasm) = spec.wasm {
+        validate_wasm_fields(service_name, wasm)?;
+        validate_wasm_capabilities(service_name, spec, wasm)?;
+        validate_wasm_http_endpoints(service_name, spec)?;
+        validate_wasm_preopens(service_name, wasm)?;
+    }
+
+    Ok(())
+}
+
+/// Validate basic WASM config fields (memory format, instance range).
+fn validate_wasm_fields(
+    service_name: &str,
+    wasm: &crate::types::WasmConfig,
+) -> Result<(), ValidationError> {
+    if let Some(ref max_mem) = wasm.max_memory {
+        validate_memory_format(max_mem).map_err(|_| ValidationError {
+            kind: ValidationErrorKind::InvalidMemoryFormat {
+                value: max_mem.clone(),
+            },
+            path: format!("services.{service_name}.wasm.max_memory"),
+        })?;
+    }
+
+    if wasm.min_instances > wasm.max_instances {
+        return Err(ValidationError {
+            kind: ValidationErrorKind::InvalidWasmInstanceRange {
+                min: wasm.min_instances,
+                max: wasm.max_instances,
+            },
+            path: format!("services.{service_name}.wasm"),
+        });
+    }
+
+    Ok(())
+}
+
+/// Validate WASM capability restrictions against service type defaults.
+fn validate_wasm_capabilities(
+    service_name: &str,
+    spec: &ServiceSpec,
+    wasm: &crate::types::WasmConfig,
+) -> Result<(), ValidationError> {
+    let Some(ref caps) = wasm.capabilities else {
+        return Ok(());
+    };
+    let Some(defaults) = spec.service_type.default_wasm_capabilities() else {
+        return Ok(());
+    };
+
+    let checks: &[(&str, bool, bool)] = &[
+        ("config", caps.config, defaults.config),
+        ("keyvalue", caps.keyvalue, defaults.keyvalue),
+        ("logging", caps.logging, defaults.logging),
+        ("secrets", caps.secrets, defaults.secrets),
+        ("metrics", caps.metrics, defaults.metrics),
+        ("http_client", caps.http_client, defaults.http_client),
+        ("cli", caps.cli, defaults.cli),
+        ("filesystem", caps.filesystem, defaults.filesystem),
+        ("sockets", caps.sockets, defaults.sockets),
+    ];
+
+    for &(cap_name, requested, default) in checks {
+        validate_capability_restriction(
+            service_name,
+            spec.service_type,
+            cap_name,
+            requested,
+            default,
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Validate that `WasmHttp` services have at least one HTTP endpoint when endpoints exist.
+fn validate_wasm_http_endpoints(
+    service_name: &str,
+    spec: &ServiceSpec,
+) -> Result<(), ValidationError> {
+    if spec.service_type == ServiceType::WasmHttp && !spec.endpoints.is_empty() {
+        let has_http_endpoint = spec
+            .endpoints
+            .iter()
+            .any(|e| matches!(e.protocol, Protocol::Http | Protocol::Https));
+        if !has_http_endpoint {
+            return Err(ValidationError {
+                kind: ValidationErrorKind::WasmHttpMissingHttpEndpoint,
+                path: format!("services.{service_name}.endpoints"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate that WASM preopens have non-empty source and target paths.
+fn validate_wasm_preopens(
+    service_name: &str,
+    wasm: &crate::types::WasmConfig,
+) -> Result<(), ValidationError> {
+    for (i, preopen) in wasm.preopens.iter().enumerate() {
+        if preopen.source.is_empty() {
+            return Err(ValidationError {
+                kind: ValidationErrorKind::WasmPreopenEmpty {
+                    index: i,
+                    field: "source".to_string(),
+                },
+                path: format!("services.{service_name}.wasm.preopens[{i}].source"),
+            });
+        }
+        if preopen.target.is_empty() {
+            return Err(ValidationError {
+                kind: ValidationErrorKind::WasmPreopenEmpty {
+                    index: i,
+                    field: "target".to_string(),
+                },
+                path: format!("services.{service_name}.wasm.preopens[{i}].target"),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validate that a requested capability does not exceed the default for the service type.
+///
+/// Users can only restrict capabilities from their defaults, not grant new ones.
+///
+/// # Errors
+///
+/// Returns a validation error if the user requests a capability that is not
+/// available for this WASM service type.
+fn validate_capability_restriction(
+    service_name: &str,
+    service_type: ServiceType,
+    cap_name: &str,
+    requested: bool,
+    default: bool,
+) -> Result<(), ValidationError> {
+    if requested && !default {
+        return Err(ValidationError {
+            kind: ValidationErrorKind::WasmCapabilityNotAvailable {
+                capability: cap_name.to_string(),
+                service_type: format!("{service_type:?}"),
+            },
+            path: format!("services.{service_name}.wasm.capabilities.{cap_name}"),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -897,6 +1085,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn test_validate_cpu_negative() {
         let result = validate_cpu(&-1.0);
         assert!(result.is_err());
@@ -1068,7 +1257,7 @@ mod tests {
     #[test]
     fn test_validate_schedule_wrapper_invalid() {
         // Invalid cron expressions
-        assert!(validate_schedule_wrapper(&"".to_string()).is_err()); // Empty
+        assert!(validate_schedule_wrapper(&String::new()).is_err()); // Empty
         assert!(validate_schedule_wrapper(&"not a cron".to_string()).is_err()); // Plain text
         assert!(validate_schedule_wrapper(&"0 0 * * *".to_string()).is_err()); // 5-field (standard unix cron) not supported
         assert!(validate_schedule_wrapper(&"60 0 0 * * * *".to_string()).is_err());
@@ -1256,5 +1445,66 @@ mod tests {
             result.unwrap_err().kind,
             ValidationErrorKind::InvalidTunnelTtl { .. }
         ));
+    }
+
+    // =========================================================================
+    // WASM validation tests
+    // =========================================================================
+
+    #[test]
+    fn test_validate_capability_restriction_allowed() {
+        // Requesting a capability that defaults to true is fine
+        let result = validate_capability_restriction(
+            "test-svc",
+            ServiceType::WasmHttp,
+            "config",
+            true,
+            true,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_capability_restriction_restricting_is_ok() {
+        // Restricting a capability (setting false when default is true) is fine
+        let result = validate_capability_restriction(
+            "test-svc",
+            ServiceType::WasmHttp,
+            "config",
+            false,
+            true,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_validate_capability_restriction_granting_not_allowed() {
+        // Requesting a capability that defaults to false is not allowed
+        let result = validate_capability_restriction(
+            "test-svc",
+            ServiceType::WasmHttp,
+            "secrets",
+            true,
+            false,
+        );
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err().kind,
+            ValidationErrorKind::WasmCapabilityNotAvailable { ref capability, .. }
+            if capability == "secrets"
+        ));
+    }
+
+    #[test]
+    fn test_validate_capability_restriction_both_false_is_ok() {
+        // Both false is fine (not requesting, not available)
+        let result = validate_capability_restriction(
+            "test-svc",
+            ServiceType::WasmTransformer,
+            "sockets",
+            false,
+            false,
+        );
+        assert!(result.is_ok());
     }
 }

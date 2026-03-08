@@ -208,7 +208,7 @@ pub use buildah::{
 };
 #[cfg(feature = "cache")]
 pub use builder::CacheBackendConfig;
-pub use builder::{BuildOptions, BuiltImage, ImageBuilder, RegistryAuth};
+pub use builder::{BuildOptions, BuildOutput, BuiltImage, ImageBuilder, RegistryAuth};
 pub use dockerfile::{
     expand_variables,
     // Instruction types

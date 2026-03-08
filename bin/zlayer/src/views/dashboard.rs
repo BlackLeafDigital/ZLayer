@@ -306,89 +306,99 @@ pub struct ServiceInfo {
 #[allow(clippy::cast_possible_truncation)]
 pub fn refresh_data(rt: &tokio::runtime::Runtime, state: &mut DashboardState) {
     state.last_refresh = Some(Instant::now());
-    state.daemon_status = DaemonStatus::Connecting;
 
-    // Try to connect and fetch data with a timeout
-    let result = rt.block_on(async {
-        let client = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            crate::daemon_client::DaemonClient::connect(),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(format!("{e:#}")),
-            Err(_) => return Err("Connection timed out".to_string()),
-        };
+    #[cfg(not(unix))]
+    {
+        state.daemon_status = DaemonStatus::Offline;
+        return;
+    }
 
-        // Check health
-        match client.health_check().await {
-            Ok(true) => {}
-            Ok(false) => return Err("Daemon unhealthy".to_string()),
-            Err(e) => return Err(format!("Health check failed: {e:#}")),
-        }
+    #[cfg(unix)]
+    {
+        state.daemon_status = DaemonStatus::Connecting;
 
-        // List deployments
-        let deployments = match client.list_deployments().await {
-            Ok(d) => d,
-            Err(e) => return Err(format!("Failed to list deployments: {e:#}")),
-        };
-
-        let mut infos = Vec::new();
-        for dep in &deployments {
-            let name = dep
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let status = dep
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let services_count = dep
-                .get("services")
-                .and_then(|v| v.as_array())
-                .map(std::vec::Vec::len)
-                .or_else(|| {
-                    dep.get("service_count")
-                        .and_then(serde_json::Value::as_u64)
-                        .map(|n| n as usize)
-                })
-                .unwrap_or(0);
-            let total_replicas = dep
-                .get("total_replicas")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32;
-
-            infos.push(DeploymentInfo {
-                name,
-                status,
-                services_count,
-                total_replicas,
-            });
-        }
-
-        Ok(infos)
-    });
-
-    match result {
-        Ok(deployments) => {
-            state.daemon_status = DaemonStatus::Connected;
-            state.deployments = deployments;
-        }
-        Err(msg) => {
-            // Check if it's a connection issue vs. other error
-            if msg.contains("timed out")
-                || msg.contains("Connection refused")
-                || msg.contains("No such file")
-                || msg.contains("not running")
+        // Try to connect and fetch data with a timeout
+        let result = rt.block_on(async {
+            let client = match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::daemon_client::DaemonClient::connect(),
+            )
+            .await
             {
-                state.daemon_status = DaemonStatus::Offline;
-            } else {
-                state.daemon_status = DaemonStatus::Error(msg);
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => return Err(format!("{e:#}")),
+                Err(_) => return Err("Connection timed out".to_string()),
+            };
+
+            // Check health
+            match client.health_check().await {
+                Ok(true) => {}
+                Ok(false) => return Err("Daemon unhealthy".to_string()),
+                Err(e) => return Err(format!("Health check failed: {e:#}")),
             }
-            state.deployments.clear();
+
+            // List deployments
+            let deployments = match client.list_deployments().await {
+                Ok(d) => d,
+                Err(e) => return Err(format!("Failed to list deployments: {e:#}")),
+            };
+
+            let mut infos = Vec::new();
+            for dep in &deployments {
+                let name = dep
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let status = dep
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let services_count = dep
+                    .get("services")
+                    .and_then(|v| v.as_array())
+                    .map(std::vec::Vec::len)
+                    .or_else(|| {
+                        dep.get("service_count")
+                            .and_then(serde_json::Value::as_u64)
+                            .map(|n| n as usize)
+                    })
+                    .unwrap_or(0);
+                let total_replicas = dep
+                    .get("total_replicas")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0) as u32;
+
+                infos.push(DeploymentInfo {
+                    name,
+                    status,
+                    services_count,
+                    total_replicas,
+                });
+            }
+
+            Ok(infos)
+        });
+
+        match result {
+            Ok(deployments) => {
+                state.daemon_status = DaemonStatus::Connected;
+                state.deployments = deployments;
+            }
+            Err(msg) => {
+                // Check if it's a connection issue vs. other error
+                if msg.contains("timed out")
+                    || msg.contains("Connection refused")
+                    || msg.contains("No such file")
+                    || msg.contains("not running")
+                {
+                    state.daemon_status = DaemonStatus::Offline;
+                } else {
+                    state.daemon_status = DaemonStatus::Error(msg);
+                }
+                state.deployments.clear();
+            }
         }
     }
 }
@@ -399,83 +409,102 @@ pub fn refresh_detail(
     state: &mut DashboardState,
     deployment_name: &str,
 ) {
-    let name = deployment_name.to_string();
-    let result = rt.block_on(async {
-        let client = match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            crate::daemon_client::DaemonClient::connect(),
-        )
-        .await
-        {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => return Err(format!("{e:#}")),
-            Err(_) => return Err("Connection timed out".to_string()),
-        };
+    #[cfg(not(unix))]
+    {
+        let _ = (rt, deployment_name);
+        state.daemon_status = DaemonStatus::Offline;
+        return;
+    }
 
-        let services = match client.list_services(&name).await {
-            Ok(s) => s,
-            Err(e) => return Err(format!("Failed to list services: {e:#}")),
-        };
+    #[cfg(unix)]
+    {
+        let name = deployment_name.to_string();
+        let result = rt.block_on(async {
+            let client = match tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                crate::daemon_client::DaemonClient::connect(),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(e)) => return Err(format!("{e:#}")),
+                Err(_) => return Err("Connection timed out".to_string()),
+            };
 
-        let mut infos = Vec::new();
-        for svc in &services {
-            let svc_name = svc
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let status = svc
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let replicas = svc
-                .get("replicas")
-                .map_or_else(|| "?".to_string(), std::string::ToString::to_string);
-            let health = svc
-                .get("health")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let service_type = svc
-                .get("rtype")
-                .or_else(|| svc.get("type"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("service")
-                .to_string();
+            let services = match client.list_services(&name).await {
+                Ok(s) => s,
+                Err(e) => return Err(format!("Failed to list services: {e:#}")),
+            };
 
-            infos.push(ServiceInfo {
-                name: svc_name,
-                status,
-                replicas,
-                health,
-                service_type,
-            });
-        }
+            let mut infos = Vec::new();
+            for svc in &services {
+                let svc_name = svc
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let status = svc
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let replicas = svc
+                    .get("replicas")
+                    .map_or_else(|| "?".to_string(), std::string::ToString::to_string);
+                let health = svc
+                    .get("health")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string();
+                let service_type = svc
+                    .get("rtype")
+                    .or_else(|| svc.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("service")
+                    .to_string();
 
-        Ok(infos)
-    });
+                infos.push(ServiceInfo {
+                    name: svc_name,
+                    status,
+                    replicas,
+                    health,
+                    service_type,
+                });
+            }
 
-    match result {
-        Ok(services) => {
-            state.detail_view = Some(DeploymentDetail {
-                deployment_name: name,
-                services,
-            });
-            state.detail_selected = 0;
-        }
-        Err(msg) => {
-            state.daemon_status = DaemonStatus::Error(msg);
+            Ok(infos)
+        });
+
+        match result {
+            Ok(services) => {
+                state.detail_view = Some(DeploymentDetail {
+                    deployment_name: name,
+                    services,
+                });
+                state.detail_selected = 0;
+            }
+            Err(msg) => {
+                state.daemon_status = DaemonStatus::Error(msg);
+            }
         }
     }
 }
 
 /// Attempt to start the daemon
 pub fn start_daemon(rt: &tokio::runtime::Runtime) {
-    // Use DaemonClient::connect which auto-starts the daemon
-    rt.block_on(async {
-        let _ = crate::daemon_client::DaemonClient::connect().await;
-    });
+    #[cfg(not(unix))]
+    {
+        let _ = rt;
+        return;
+    }
+
+    #[cfg(unix)]
+    {
+        // Use DaemonClient::connect which auto-starts the daemon
+        rt.block_on(async {
+            let _ = crate::daemon_client::DaemonClient::connect().await;
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 use zlayer_spec::ExposeType;
 
+use crate::overlay::RoutingMode;
 use crate::ServiceProtocol;
 
 /// Definition of a node-to-node tunnel
@@ -34,6 +35,10 @@ pub struct NodeTunnel {
     /// Auto-generated token for this tunnel
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+
+    /// Routing mode for this tunnel connection
+    #[serde(default)]
+    pub routing_mode: RoutingMode,
 }
 
 impl NodeTunnel {
@@ -49,6 +54,7 @@ impl NodeTunnel {
             protocol: ServiceProtocol::Tcp,
             expose: ExposeType::Internal,
             token: None,
+            routing_mode: RoutingMode::default(),
         }
     }
 

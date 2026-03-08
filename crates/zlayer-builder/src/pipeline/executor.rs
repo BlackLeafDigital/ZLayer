@@ -434,11 +434,11 @@ mod tests {
 
     #[test]
     fn test_resolve_execution_order_simple() {
-        let yaml = r#"
+        let yaml = r"
 images:
   app:
     file: Dockerfile
-"#;
+";
         let pipeline = parse_pipeline(yaml).unwrap();
         let executor = PipelineExecutor::new(
             pipeline,
@@ -453,7 +453,7 @@ images:
 
     #[test]
     fn test_resolve_execution_order_with_deps() {
-        let yaml = r#"
+        let yaml = r"
 images:
   base:
     file: Dockerfile.base
@@ -463,7 +463,7 @@ images:
   test:
     file: Dockerfile.test
     depends_on: [app]
-"#;
+";
         let pipeline = parse_pipeline(yaml).unwrap();
         let executor = PipelineExecutor::new(
             pipeline,
@@ -480,7 +480,7 @@ images:
 
     #[test]
     fn test_resolve_execution_order_parallel() {
-        let yaml = r#"
+        let yaml = r"
 images:
   base:
     file: Dockerfile.base
@@ -490,7 +490,7 @@ images:
   app2:
     file: Dockerfile.app2
     depends_on: [base]
-"#;
+";
         let pipeline = parse_pipeline(yaml).unwrap();
         let executor = PipelineExecutor::new(
             pipeline,
@@ -509,12 +509,12 @@ images:
 
     #[test]
     fn test_resolve_execution_order_missing_dep() {
-        let yaml = r#"
+        let yaml = r"
 images:
   app:
     file: Dockerfile
     depends_on: [missing]
-"#;
+";
         let pipeline = parse_pipeline(yaml).unwrap();
         let executor = PipelineExecutor::new(
             pipeline,
@@ -529,7 +529,7 @@ images:
 
     #[test]
     fn test_resolve_execution_order_circular() {
-        let yaml = r#"
+        let yaml = r"
 images:
   a:
     file: Dockerfile.a
@@ -537,7 +537,7 @@ images:
   b:
     file: Dockerfile.b
     depends_on: [a]
-"#;
+";
         let pipeline = parse_pipeline(yaml).unwrap();
         let executor = PipelineExecutor::new(
             pipeline,
@@ -552,7 +552,7 @@ images:
                 assert!(stages.contains(&"a".to_string()));
                 assert!(stages.contains(&"b".to_string()));
             }
-            e => panic!("Expected CircularDependency error, got: {:?}", e),
+            e => panic!("Expected CircularDependency error, got: {e:?}"),
         }
     }
 
@@ -619,13 +619,13 @@ images:
 
     #[test]
     fn test_builder_methods() {
-        let yaml = r#"
+        let yaml = r"
 images:
   app:
     file: Dockerfile
 push:
   after_all: true
-"#;
+";
         let pipeline = parse_pipeline(yaml).unwrap();
         let executor = PipelineExecutor::new(
             pipeline,

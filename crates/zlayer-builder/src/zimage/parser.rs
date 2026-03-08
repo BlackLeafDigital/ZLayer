@@ -26,6 +26,7 @@ pub fn parse_zimagefile(content: &str) -> Result<ZImage> {
     validate_version(&image)?;
     validate_mode_exclusivity(&image)?;
     validate_steps(&image)?;
+    validate_wasm(&image)?;
 
     Ok(image)
 }
@@ -208,6 +209,75 @@ fn validate_step(step: &ZStep, index: usize, stage: Option<&str>) -> Result<()> 
 }
 
 // ---------------------------------------------------------------------------
+// WASM validation
+// ---------------------------------------------------------------------------
+
+/// Validate WASM-specific configuration fields when the `wasm` mode is active.
+#[allow(clippy::items_after_statements)]
+fn validate_wasm(image: &ZImage) -> Result<()> {
+    let Some(ref wasm) = image.wasm else {
+        return Ok(());
+    };
+
+    // `target` must be "preview1" or "preview2".
+    const VALID_TARGETS: &[&str] = &["preview1", "preview2"];
+    if !VALID_TARGETS.contains(&wasm.target.as_str()) {
+        return Err(BuildError::zimagefile_validation(format!(
+            "wasm.target must be one of {VALID_TARGETS:?}, got '{}'",
+            wasm.target
+        )));
+    }
+
+    // `world` must be a known ZLayer world name.
+    if let Some(ref world) = wasm.world {
+        const VALID_WORLDS: &[&str] = &[
+            "zlayer-plugin",
+            "zlayer-http-handler",
+            "zlayer-transformer",
+            "zlayer-authenticator",
+            "zlayer-rate-limiter",
+            "zlayer-middleware",
+            "zlayer-router",
+        ];
+        if !VALID_WORLDS.contains(&world.as_str()) {
+            return Err(BuildError::zimagefile_validation(format!(
+                "wasm.world must be one of {VALID_WORLDS:?}, got '{world}'"
+            )));
+        }
+    }
+
+    // `opt_level` must be a valid wasm-opt optimization level.
+    if let Some(ref opt_level) = wasm.opt_level {
+        const VALID_OPT_LEVELS: &[&str] = &["O", "Os", "Oz", "O2", "O3"];
+        if !VALID_OPT_LEVELS.contains(&opt_level.as_str()) {
+            return Err(BuildError::zimagefile_validation(format!(
+                "wasm.opt_level must be one of {VALID_OPT_LEVELS:?}, got '{opt_level}'"
+            )));
+        }
+    }
+
+    // `language` must be a supported source language.
+    if let Some(ref language) = wasm.language {
+        const VALID_LANGUAGES: &[&str] = &[
+            "rust",
+            "go",
+            "python",
+            "typescript",
+            "assemblyscript",
+            "c",
+            "zig",
+        ];
+        if !VALID_LANGUAGES.contains(&language.as_str()) {
+            return Err(BuildError::zimagefile_validation(format!(
+                "wasm.language must be one of {VALID_LANGUAGES:?}, got '{language}'"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -284,9 +354,9 @@ wasm:
 
     #[test]
     fn test_version_omitted_is_ok() {
-        let yaml = r#"
+        let yaml = r"
 runtime: node22
-"#;
+";
         let img = parse_zimagefile(yaml).unwrap();
         assert!(img.version.is_none());
         assert_eq!(img.runtime.as_deref(), Some("node22"));
@@ -652,5 +722,157 @@ stages:
         let err = parse_zimagefile(yaml).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("neither was found"), "got: {msg}");
+    }
+
+    // -- WASM validation tests ------------------------------------------------
+
+    #[test]
+    fn test_wasm_valid_full_config() {
+        let yaml = r#"
+version: "1"
+wasm:
+  target: "preview2"
+  optimize: true
+  opt_level: "Oz"
+  language: "rust"
+  world: "zlayer-http-handler"
+  wit: "./wit"
+  output: "./output.wasm"
+  features: [json, metrics]
+  build_args:
+    CARGO_PROFILE_RELEASE_LTO: "true"
+  pre_build:
+    - "wit-bindgen tiny-go --world zlayer-http-handler --out-dir bindings/"
+  post_build:
+    - "wasm-tools component embed --world zlayer-http-handler wit/ output.wasm -o output.wasm"
+  adapter: "./wasi_snapshot_preview1.reactor.wasm"
+"#;
+        parse_zimagefile(yaml).unwrap();
+    }
+
+    #[test]
+    fn test_wasm_preview1_target_valid() {
+        let yaml = r#"
+version: "1"
+wasm:
+  target: "preview1"
+"#;
+        parse_zimagefile(yaml).unwrap();
+    }
+
+    #[test]
+    fn test_wasm_invalid_target_rejected() {
+        let yaml = r#"
+version: "1"
+wasm:
+  target: "preview3"
+"#;
+        let err = parse_zimagefile(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wasm.target"), "got: {msg}");
+        assert!(msg.contains("preview3"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_wasm_invalid_world_rejected() {
+        let yaml = r#"
+version: "1"
+wasm:
+  world: "unknown-world"
+"#;
+        let err = parse_zimagefile(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wasm.world"), "got: {msg}");
+        assert!(msg.contains("unknown-world"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_wasm_all_valid_worlds() {
+        for world in &[
+            "zlayer-plugin",
+            "zlayer-http-handler",
+            "zlayer-transformer",
+            "zlayer-authenticator",
+            "zlayer-rate-limiter",
+            "zlayer-middleware",
+            "zlayer-router",
+        ] {
+            let yaml = format!(
+                r#"
+version: "1"
+wasm:
+  world: "{world}"
+"#
+            );
+            parse_zimagefile(&yaml).unwrap_or_else(|e| {
+                panic!("world '{world}' should be valid, got: {e}");
+            });
+        }
+    }
+
+    #[test]
+    fn test_wasm_invalid_opt_level_rejected() {
+        let yaml = r#"
+version: "1"
+wasm:
+  opt_level: "O4"
+"#;
+        let err = parse_zimagefile(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wasm.opt_level"), "got: {msg}");
+        assert!(msg.contains("O4"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_wasm_all_valid_opt_levels() {
+        for level in &["O", "Os", "Oz", "O2", "O3"] {
+            let yaml = format!(
+                r#"
+version: "1"
+wasm:
+  opt_level: "{level}"
+"#
+            );
+            parse_zimagefile(&yaml).unwrap_or_else(|e| {
+                panic!("opt_level '{level}' should be valid, got: {e}");
+            });
+        }
+    }
+
+    #[test]
+    fn test_wasm_invalid_language_rejected() {
+        let yaml = r#"
+version: "1"
+wasm:
+  language: "java"
+"#;
+        let err = parse_zimagefile(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wasm.language"), "got: {msg}");
+        assert!(msg.contains("java"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_wasm_all_valid_languages() {
+        for lang in &[
+            "rust",
+            "go",
+            "python",
+            "typescript",
+            "assemblyscript",
+            "c",
+            "zig",
+        ] {
+            let yaml = format!(
+                r#"
+version: "1"
+wasm:
+  language: "{lang}"
+"#
+            );
+            parse_zimagefile(&yaml).unwrap_or_else(|e| {
+                panic!("language '{lang}' should be valid, got: {e}");
+            });
+        }
     }
 }

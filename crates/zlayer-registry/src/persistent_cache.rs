@@ -468,7 +468,7 @@ mod tests {
 
         // Insert data that exceeds limit
         for i in 0..20 {
-            let data = format!("data_{:02}", i);
+            let data = format!("data_{i:02}");
             let digest = compute_digest(data.as_bytes());
             cache.put(&digest, data.as_bytes()).await.unwrap();
 
@@ -478,7 +478,7 @@ mod tests {
 
         // Cache should have evicted some entries
         let size = cache.size().await.unwrap();
-        assert!(size <= 100, "Cache size {} should be <= 100", size);
+        assert!(size <= 100, "Cache size {size} should be <= 100");
     }
 
     #[tokio::test]
@@ -524,8 +524,7 @@ mod tests {
         let expected_db_path = temp_dir.path().join(DEFAULT_DB_FILENAME);
         assert!(
             expected_db_path.exists(),
-            "Database file should be created at {:?}",
-            expected_db_path
+            "Database file should be created at {expected_db_path:?}"
         );
     }
 
@@ -572,24 +571,20 @@ mod tests {
         // data3 (just added) should always remain
         assert!(
             has_data3,
-            "data3 should remain (just added). data1={}, data2={}, data3={}, size={}",
-            has_data1, has_data2, has_data3, final_size
+            "data3 should remain (just added). data1={has_data1}, data2={has_data2}, data3={has_data3}, size={final_size}"
         );
 
         // At least one should be evicted
         assert!(
             !has_data1 || !has_data2,
-            "At least one of data1 or data2 should be evicted. data1={}, data2={}, data3={}, size={}",
-            has_data1, has_data2, has_data3, final_size
+            "At least one of data1 or data2 should be evicted. data1={has_data1}, data2={has_data2}, data3={has_data3}, size={final_size}"
         );
 
         // data2 (oldest) should be evicted before data1 (accessed recently)
-        if !has_data1 && has_data2 {
-            panic!(
-                "LRU eviction failed: data1 (recently accessed) was evicted but data2 (oldest) was kept. data1={}, data2={}, data3={}, size={}",
-                has_data1, has_data2, has_data3, final_size
-            );
-        }
+        assert!(
+            has_data1 || !has_data2,
+            "LRU eviction failed: data1 (recently accessed) was evicted but data2 (oldest) was kept. data1={has_data1}, data2={has_data2}, data3={has_data3}, size={final_size}"
+        );
     }
 
     #[tokio::test]

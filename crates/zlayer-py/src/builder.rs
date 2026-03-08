@@ -12,7 +12,7 @@ use tokio::sync::RwLock;
 use zlayer_builder::{BuiltImage, ImageBuilder as RustImageBuilder, RegistryAuth};
 
 /// A built container image
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct Image {
     /// The image ID (digest)
@@ -54,7 +54,7 @@ impl From<BuiltImage> for Image {
 }
 
 /// Runtime detection result
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct DetectedRuntime {
     /// The detected runtime name

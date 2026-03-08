@@ -7,6 +7,8 @@ use crate::allocator::IpAllocator;
 use crate::config::PeerInfo;
 use crate::dns::{peer_hostname, DnsConfig, DnsHandle, DnsServer, DEFAULT_DNS_PORT};
 use crate::error::{OverlayError, Result};
+#[cfg(feature = "nat")]
+use crate::nat::{Candidate, ConnectionType, NatTraversal, RelayServer};
 use crate::transport::OverlayTransport;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -95,6 +97,16 @@ pub struct PeerConfig {
     /// to the auto-generated IP-based hostname.
     #[serde(default)]
     pub hostname: Option<String>,
+
+    /// NAT traversal candidates for this peer
+    #[serde(default)]
+    #[cfg(feature = "nat")]
+    pub candidates: Vec<Candidate>,
+
+    /// How this peer is currently connected
+    #[serde(default)]
+    #[cfg(feature = "nat")]
+    pub connection_type: ConnectionType,
 }
 
 impl PeerConfig {
@@ -113,6 +125,10 @@ impl PeerConfig {
             overlay_ip,
             keepalive: Some(DEFAULT_KEEPALIVE_SECS),
             hostname: None,
+            #[cfg(feature = "nat")]
+            candidates: Vec::new(),
+            #[cfg(feature = "nat")]
+            connection_type: ConnectionType::default(),
         }
     }
 
@@ -184,6 +200,14 @@ pub struct OverlayBootstrap {
     /// Must be kept alive for the overlay network lifetime; dropping the
     /// transport destroys the TUN device.
     transport: Option<OverlayTransport>,
+
+    /// NAT traversal orchestrator (available after `start()` if NAT is enabled)
+    #[cfg(feature = "nat")]
+    nat_traversal: Option<NatTraversal>,
+
+    /// Built-in relay server (available after `start()` if relay is configured)
+    #[cfg(feature = "nat")]
+    relay_server: Option<RelayServer>,
 }
 
 impl OverlayBootstrap {
@@ -253,6 +277,10 @@ impl OverlayBootstrap {
             dns_config: None,
             dns_handle: None,
             transport: None,
+            #[cfg(feature = "nat")]
+            nat_traversal: None,
+            #[cfg(feature = "nat")]
+            relay_server: None,
         };
 
         // Persist state
@@ -324,6 +352,10 @@ impl OverlayBootstrap {
             overlay_ip: leader_overlay_ip,
             keepalive: Some(DEFAULT_KEEPALIVE_SECS),
             hostname: None, // Leader gets its own DNS alias "leader.zone"
+            #[cfg(feature = "nat")]
+            candidates: Vec::new(),
+            #[cfg(feature = "nat")]
+            connection_type: ConnectionType::default(),
         };
 
         info!(
@@ -340,6 +372,10 @@ impl OverlayBootstrap {
             dns_config: None,
             dns_handle: None,
             transport: None,
+            #[cfg(feature = "nat")]
+            nat_traversal: None,
+            #[cfg(feature = "nat")]
+            relay_server: None,
         };
 
         // Persist state
@@ -377,6 +413,10 @@ impl OverlayBootstrap {
             dns_config: None, // DNS config must be re-enabled after load
             dns_handle: None,
             transport: None,
+            #[cfg(feature = "nat")]
+            nat_traversal: None,
+            #[cfg(feature = "nat")]
+            relay_server: None,
         })
     }
 
@@ -486,7 +526,12 @@ impl OverlayBootstrap {
             public_key: self.config.public_key.clone(),
             overlay_cidr: self.config.allowed_ip(),
             peer_discovery_interval: Duration::from_secs(30),
+            #[cfg(feature = "nat")]
+            nat: crate::nat::NatConfig::default(),
         };
+
+        #[cfg(feature = "nat")]
+        let nat_config = overlay_config.nat.clone();
 
         // Create overlay transport
         let mut transport = OverlayTransport::new(overlay_config, self.config.interface.clone());
@@ -532,68 +577,135 @@ impl OverlayBootstrap {
         // lifetime. Dropping the OverlayTransport destroys the boringtun device.
         self.transport = Some(transport);
 
+        // NAT traversal: gather candidates and connect to peers
+        #[cfg(feature = "nat")]
+        self.start_nat_traversal(nat_config).await;
+
         // Start DNS server if configured
-        if let Some(dns_config) = &self.dns_config {
-            info!(
-                zone = %dns_config.zone,
-                port = dns_config.port,
-                "Starting DNS server for overlay"
-            );
-
-            let dns_server =
-                DnsServer::from_config(dns_config).map_err(|e| OverlayError::Dns(e.to_string()))?;
-
-            // Register self with IP-based hostname
-            let self_hostname = peer_hostname(self.config.node_ip);
-            dns_server
-                .add_record(&self_hostname, self.config.node_ip)
-                .await
-                .map_err(|e| OverlayError::Dns(e.to_string()))?;
-
-            // If leader, also register "leader" alias
-            if self.config.is_leader {
-                dns_server
-                    .add_record("leader", self.config.node_ip)
-                    .await
-                    .map_err(|e| OverlayError::Dns(e.to_string()))?;
-                debug!(ip = %self.config.node_ip, "Registered leader.{}", dns_config.zone);
-            }
-
-            // Register existing peers
-            for peer in &self.peers {
-                // Always register IP-based hostname
-                let hostname = peer_hostname(peer.overlay_ip);
-                dns_server
-                    .add_record(&hostname, peer.overlay_ip)
-                    .await
-                    .map_err(|e| OverlayError::Dns(e.to_string()))?;
-
-                // Also register custom hostname if provided
-                if let Some(custom) = &peer.hostname {
-                    dns_server
-                        .add_record(custom, peer.overlay_ip)
-                        .await
-                        .map_err(|e| OverlayError::Dns(e.to_string()))?;
-                    debug!(
-                        hostname = custom,
-                        ip = %peer.overlay_ip,
-                        "Registered custom hostname"
-                    );
-                }
-            }
-
-            // Start the DNS server and store the handle
-            let handle = dns_server
-                .start()
-                .await
-                .map_err(|e| OverlayError::Dns(e.to_string()))?;
-            self.dns_handle = Some(handle);
-
-            info!("DNS server started successfully");
-        }
+        self.start_dns().await?;
 
         info!("Overlay network started successfully");
         Ok(())
+    }
+
+    /// Start the DNS server and register all known peers.
+    async fn start_dns(&mut self) -> Result<()> {
+        let Some(dns_config) = &self.dns_config else {
+            return Ok(());
+        };
+
+        info!(
+            zone = %dns_config.zone,
+            port = dns_config.port,
+            "Starting DNS server for overlay"
+        );
+
+        let dns_server =
+            DnsServer::from_config(dns_config).map_err(|e| OverlayError::Dns(e.to_string()))?;
+
+        // Register self with IP-based hostname
+        let self_hostname = peer_hostname(self.config.node_ip);
+        dns_server
+            .add_record(&self_hostname, self.config.node_ip)
+            .await
+            .map_err(|e| OverlayError::Dns(e.to_string()))?;
+
+        // If leader, also register "leader" alias
+        if self.config.is_leader {
+            dns_server
+                .add_record("leader", self.config.node_ip)
+                .await
+                .map_err(|e| OverlayError::Dns(e.to_string()))?;
+            debug!(ip = %self.config.node_ip, "Registered leader.{}", dns_config.zone);
+        }
+
+        // Register existing peers
+        for peer in &self.peers {
+            // Always register IP-based hostname
+            let hostname = peer_hostname(peer.overlay_ip);
+            dns_server
+                .add_record(&hostname, peer.overlay_ip)
+                .await
+                .map_err(|e| OverlayError::Dns(e.to_string()))?;
+
+            // Also register custom hostname if provided
+            if let Some(custom) = &peer.hostname {
+                dns_server
+                    .add_record(custom, peer.overlay_ip)
+                    .await
+                    .map_err(|e| OverlayError::Dns(e.to_string()))?;
+                debug!(
+                    hostname = custom,
+                    ip = %peer.overlay_ip,
+                    "Registered custom hostname"
+                );
+            }
+        }
+
+        // Start the DNS server and store the handle
+        let handle = dns_server
+            .start()
+            .await
+            .map_err(|e| OverlayError::Dns(e.to_string()))?;
+        self.dns_handle = Some(handle);
+
+        info!("DNS server started successfully");
+        Ok(())
+    }
+
+    /// Initialize NAT traversal, gather candidates, and connect to known peers.
+    #[cfg(feature = "nat")]
+    async fn start_nat_traversal(&mut self, nat_config: crate::nat::NatConfig) {
+        if !nat_config.enabled {
+            return;
+        }
+
+        // Optionally start built-in relay server
+        if let Some(ref relay_config) = nat_config.relay_server {
+            let relay = RelayServer::new(relay_config, &self.config.private_key);
+            match relay.start().await {
+                Ok(()) => {
+                    info!("Built-in relay server started");
+                    self.relay_server = Some(relay);
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to start relay server");
+                }
+            }
+        }
+
+        let mut nat = NatTraversal::new(nat_config, self.config.port);
+        match nat.gather_candidates().await {
+            Ok(candidates) => {
+                info!(count = candidates.len(), "Gathered NAT candidates");
+                if let Some(ref transport) = self.transport {
+                    for peer in &mut self.peers {
+                        if !peer.candidates.is_empty() {
+                            match nat
+                                .connect_to_peer(transport, &peer.public_key, &peer.candidates)
+                                .await
+                            {
+                                Ok(ct) => {
+                                    peer.connection_type = ct;
+                                    info!(
+                                        peer = %peer.node_id,
+                                        connection = %ct,
+                                        "NAT traversal succeeded"
+                                    );
+                                }
+                                Err(e) => warn!(
+                                    peer = %peer.node_id,
+                                    error = %e,
+                                    "NAT traversal failed"
+                                ),
+                            }
+                        }
+                    }
+                }
+                self.nat_traversal = Some(nat);
+            }
+            Err(e) => warn!(error = %e, "NAT candidate gathering failed"),
+        }
     }
 
     /// Stop the overlay network (shut down the boringtun transport)
@@ -647,6 +759,8 @@ impl OverlayBootstrap {
                     public_key: self.config.public_key.clone(),
                     overlay_cidr: self.config.allowed_ip(),
                     peer_discovery_interval: Duration::from_secs(30),
+                    #[cfg(feature = "nat")]
+                    nat: crate::nat::NatConfig::default(),
                 };
                 let tmp = OverlayTransport::new(overlay_config, self.config.interface.clone());
                 tmp.add_peer(&peer_info).await
@@ -677,6 +791,33 @@ impl OverlayBootstrap {
                     .await
                     .map_err(|e| OverlayError::Dns(e.to_string()))?;
                 debug!(hostname = %custom, ip = %overlay_ip, "Registered custom hostname in DNS");
+            }
+        }
+
+        // NAT traversal for new peer
+        #[cfg(feature = "nat")]
+        {
+            if let (Some(ref nat), Some(ref transport)) = (&self.nat_traversal, &self.transport) {
+                if !peer.candidates.is_empty() {
+                    match nat
+                        .connect_to_peer(transport, &peer.public_key, &peer.candidates)
+                        .await
+                    {
+                        Ok(ct) => {
+                            peer.connection_type = ct;
+                            info!(
+                                peer = %peer.node_id,
+                                connection = %ct,
+                                "NAT traversal for new peer"
+                            );
+                        }
+                        Err(e) => warn!(
+                            peer = %peer.node_id,
+                            error = %e,
+                            "NAT failed for new peer"
+                        ),
+                    }
+                }
             }
         }
 
@@ -749,6 +890,8 @@ impl OverlayBootstrap {
                 public_key: self.config.public_key.clone(),
                 overlay_cidr: self.config.allowed_ip(),
                 peer_discovery_interval: Duration::from_secs(30),
+                #[cfg(feature = "nat")]
+                nat: crate::nat::NatConfig::default(),
             };
             let tmp = OverlayTransport::new(overlay_config, self.config.interface.clone());
             tmp.remove_peer(public_key).await
@@ -843,6 +986,57 @@ impl OverlayBootstrap {
             .as_ref()
             .map(|a| (a.allocated_count() as u32, a.total_hosts()))
     }
+
+    /// Perform NAT maintenance: refresh STUN, attempt relay upgrades.
+    ///
+    /// Call this periodically from the runtime's main loop. Re-probes
+    /// STUN servers to detect reflexive address changes and attempts
+    /// to upgrade relayed connections to direct or hole-punched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if STUN refresh fails.
+    #[cfg(feature = "nat")]
+    pub async fn nat_maintenance_tick(&mut self) -> Result<()> {
+        let (Some(nat), Some(transport)) = (&mut self.nat_traversal, &self.transport) else {
+            return Ok(());
+        };
+
+        if nat.refresh().await? {
+            info!("Reflexive address changed");
+        }
+
+        for peer in &mut self.peers {
+            if peer.connection_type == ConnectionType::Relayed && !peer.candidates.is_empty() {
+                if let Ok(Some(upgraded)) = nat
+                    .attempt_upgrade(transport, &peer.public_key, &peer.candidates)
+                    .await
+                {
+                    peer.connection_type = upgraded;
+                    info!(
+                        peer = %peer.node_id,
+                        connection = %upgraded,
+                        "Upgraded relayed connection"
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Get this node's NAT candidates for sharing with peers.
+    ///
+    /// Returns an empty vec if NAT traversal has not been initialized
+    /// or no candidates were gathered.
+    #[cfg(feature = "nat")]
+    #[must_use]
+    pub fn nat_candidates(&self) -> Vec<Candidate> {
+        self.nat_traversal
+            .as_ref()
+            .map(|n| n.local_candidates().to_vec())
+            .unwrap_or_default()
+    }
 }
 
 /// Get current Unix timestamp
@@ -924,7 +1118,7 @@ mod tests {
             private_key: "private".to_string(),
             public_key: "public".to_string(),
             is_leader: true,
-            created_at: 1234567890,
+            created_at: 1_234_567_890,
         };
 
         let state = BootstrapState {

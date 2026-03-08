@@ -474,7 +474,7 @@ mod tests {
         RouteEntry {
             service_name: service.to_string(),
             endpoint_name: "http".to_string(),
-            host: host.map(|s| s.to_string()),
+            host: host.map(std::string::ToString::to_string),
             path_prefix: path.to_string(),
             resolved: ResolvedService {
                 name: service.to_string(),

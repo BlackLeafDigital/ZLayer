@@ -505,13 +505,13 @@ mod tests {
         let long_ref = long.as_str();
 
         let name = make_interface_name(&[long_ref], "g");
-        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{}' too long", name);
+        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{name}' too long");
 
         let name = make_interface_name(&[long_ref, long_ref, long_ref], "s");
-        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{}' too long", name);
+        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{name}' too long");
 
         let name = make_interface_name(&[long_ref], "");
-        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{}' too long", name);
+        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{name}' too long");
     }
 
     /// Empty parts and suffix must still produce a valid name.
@@ -585,9 +585,7 @@ mod tests {
             let name = make_interface_name(&[deployment], "g");
             assert!(
                 name.len() <= MAX_IFNAME_LEN,
-                "Global overlay '{}' for deployment '{}' exceeds limit",
-                name,
-                deployment,
+                "Global overlay '{name}' for deployment '{deployment}' exceeds limit",
             );
             assert!(name.starts_with("zl-"));
         }
@@ -609,10 +607,7 @@ mod tests {
             let name = make_interface_name(&[deployment, service], "s");
             assert!(
                 name.len() <= MAX_IFNAME_LEN,
-                "Service overlay '{}' for ({}, {}) exceeds limit",
-                name,
-                deployment,
-                service,
+                "Service overlay '{name}' for ({deployment}, {service}) exceeds limit",
             );
             assert!(name.starts_with("zl-"));
         }
@@ -622,13 +617,13 @@ mod tests {
     #[test]
     fn interface_name_with_unicode() {
         let name = make_interface_name(&["\u{1F600}\u{1F600}\u{1F600}"], "g");
-        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{}' too long", name);
+        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{name}' too long");
 
         let name = make_interface_name(&["\u{00E9}\u{00E9}\u{00E9}", "\u{00FC}\u{00FC}"], "s");
-        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{}' too long", name);
+        assert!(name.len() <= MAX_IFNAME_LEN, "Name '{name}' too long");
     }
 
-    /// node_ip() should be None before setup_global_overlay and Some after.
+    /// `node_ip()` should be None before `setup_global_overlay` and Some after.
     #[tokio::test]
     async fn test_node_ip_before_and_after_init() {
         let om = OverlayManager::new("test-deploy".to_string())

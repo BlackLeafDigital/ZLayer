@@ -511,14 +511,24 @@ pub struct ZHealthcheck {
 /// wasm:
 ///   target: "preview2"
 ///   optimize: true
+///   opt_level: "Oz"
 ///   language: "rust"
+///   world: "zlayer-http-handler"
 ///   wit: "./wit"
 ///   output: "./output.wasm"
+///   features: [json, metrics]
+///   build_args:
+///     CARGO_PROFILE_RELEASE_LTO: "true"
+///   pre_build:
+///     - "wit-bindgen tiny-go --world zlayer-http-handler --out-dir bindings/"
+///   post_build:
+///     - "wasm-tools component embed --world zlayer-http-handler wit/ output.wasm -o output.wasm"
+///   adapter: "./wasi_snapshot_preview1.reactor.wasm"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ZWasmConfig {
-    /// WASI target version (default: "preview2")
+    /// WASI target version: "preview1" or "preview2" (default: "preview2")
     #[serde(default = "default_wasm_target")]
     pub target: String,
 
@@ -526,17 +536,49 @@ pub struct ZWasmConfig {
     #[serde(default, skip_serializing_if = "crate::zimage::types::is_false")]
     pub optimize: bool,
 
-    /// Source language (auto-detected if omitted)
+    /// Optimization level for wasm-opt: "O", "Os", "Oz", "O2", "O3" (default: "Oz")
+    #[serde(
+        default = "default_wasm_opt_level",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub opt_level: Option<String>,
+
+    /// Source language (auto-detected if omitted): rust, go, python, typescript, assemblyscript, c, zig
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
 
-    /// Path to WIT definitions
+    /// Path to WIT definitions (default: "./wit")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wit: Option<String>,
+
+    /// Target WIT world name (e.g., "zlayer-http-handler", "zlayer-plugin", "zlayer-transformer",
+    /// "zlayer-authenticator", "zlayer-rate-limiter", "zlayer-middleware", "zlayer-router")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world: Option<String>,
 
     /// Output path for the compiled WASM file
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+
+    /// Language-specific features to enable during build
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+
+    /// Additional build arguments (language-specific, e.g. `CARGO_PROFILE_RELEASE_LTO`)
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub build_args: HashMap<String, String>,
+
+    /// Pre-build commands to run before compilation (e.g., WIT binding generation for Go)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pre_build: Vec<ZCommand>,
+
+    /// Post-build commands to run after compilation (before optimization)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_build: Vec<ZCommand>,
+
+    /// Component adapter path for WASI preview1 -> preview2 lifting
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +588,12 @@ pub struct ZWasmConfig {
 /// Default WASM target version.
 fn default_wasm_target() -> String {
     "preview2".to_string()
+}
+
+/// Default WASM optimization level.
+#[allow(clippy::unnecessary_wraps)]
+fn default_wasm_opt_level() -> Option<String> {
+    Some("Oz".to_string())
 }
 
 /// Helper for `skip_serializing_if` on boolean fields.
@@ -654,14 +702,70 @@ wasm:
 
     #[test]
     fn test_wasm_defaults() {
-        let yaml = r#"
+        let yaml = r"
 wasm: {}
-"#;
+";
         let img: ZImage = serde_yml::from_str(yaml).unwrap();
         let wasm = img.wasm.as_ref().unwrap();
         assert_eq!(wasm.target, "preview2");
         assert!(!wasm.optimize);
         assert!(wasm.language.is_none());
+        assert_eq!(wasm.opt_level.as_deref(), Some("Oz"));
+        assert!(wasm.world.is_none());
+        assert!(wasm.features.is_empty());
+        assert!(wasm.build_args.is_empty());
+        assert!(wasm.pre_build.is_empty());
+        assert!(wasm.post_build.is_empty());
+        assert!(wasm.adapter.is_none());
+    }
+
+    #[test]
+    fn test_wasm_full_config() {
+        let yaml = r#"
+wasm:
+  target: "preview2"
+  optimize: true
+  opt_level: "O3"
+  language: "rust"
+  world: "zlayer-http-handler"
+  wit: "./wit"
+  output: "./output.wasm"
+  features:
+    - json
+    - metrics
+  build_args:
+    CARGO_PROFILE_RELEASE_LTO: "true"
+    RUSTFLAGS: "-C target-feature=+simd128"
+  pre_build:
+    - "wit-bindgen tiny-go --world zlayer-http-handler --out-dir bindings/"
+  post_build:
+    - "wasm-tools component embed --world zlayer-http-handler wit/ output.wasm -o output.wasm"
+  adapter: "./wasi_snapshot_preview1.reactor.wasm"
+"#;
+        let img: ZImage = serde_yml::from_str(yaml).unwrap();
+        let wasm = img.wasm.as_ref().unwrap();
+        assert_eq!(wasm.target, "preview2");
+        assert!(wasm.optimize);
+        assert_eq!(wasm.opt_level.as_deref(), Some("O3"));
+        assert_eq!(wasm.language.as_deref(), Some("rust"));
+        assert_eq!(wasm.world.as_deref(), Some("zlayer-http-handler"));
+        assert_eq!(wasm.wit.as_deref(), Some("./wit"));
+        assert_eq!(wasm.output.as_deref(), Some("./output.wasm"));
+        assert_eq!(wasm.features, vec!["json", "metrics"]);
+        assert_eq!(
+            wasm.build_args.get("CARGO_PROFILE_RELEASE_LTO").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            wasm.build_args.get("RUSTFLAGS").unwrap(),
+            "-C target-feature=+simd128"
+        );
+        assert_eq!(wasm.pre_build.len(), 1);
+        assert_eq!(wasm.post_build.len(), 1);
+        assert_eq!(
+            wasm.adapter.as_deref(),
+            Some("./wasi_snapshot_preview1.reactor.wasm")
+        );
     }
 
     #[test]
@@ -734,12 +838,12 @@ retries: 3
 
     #[test]
     fn test_cache_mount_deserialize() {
-        let yaml = r#"
+        let yaml = r"
 target: /var/cache/apt
 id: apt-cache
 sharing: shared
 readonly: false
-"#;
+";
         let cm: ZCacheMount = serde_yml::from_str(yaml).unwrap();
         assert_eq!(cm.target, "/var/cache/apt");
         assert_eq!(cm.id.as_deref(), Some("apt-cache"));

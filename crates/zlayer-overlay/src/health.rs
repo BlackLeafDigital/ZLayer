@@ -5,6 +5,8 @@
 //! device directly -- no external `wg` binary required.
 
 use crate::error::{OverlayError, Result};
+#[cfg(feature = "nat")]
+use crate::nat::ConnectionType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -46,6 +48,11 @@ pub struct PeerStatus {
 
     /// Last check timestamp (Unix epoch)
     pub last_check: u64,
+
+    /// How this peer is connected (requires "nat" feature)
+    #[cfg(feature = "nat")]
+    #[serde(default)]
+    pub connection_type: ConnectionType,
 }
 
 /// Aggregated health status for the overlay network
@@ -200,6 +207,8 @@ impl OverlayHealthChecker {
                 last_ping_ms: None, // Ping is optional
                 failure_count: u32::from(!healthy),
                 last_check: now,
+                #[cfg(feature = "nat")]
+                connection_type: ConnectionType::default(),
             };
 
             peers.push(status);
@@ -471,7 +480,9 @@ mod tests {
             last_handshake_secs: Some(10),
             last_ping_ms: Some(5),
             failure_count: 0,
-            last_check: 1234567890,
+            last_check: 1_234_567_890,
+            #[cfg(feature = "nat")]
+            connection_type: ConnectionType::default(),
         };
 
         let json = serde_json::to_string(&status).unwrap();
@@ -489,7 +500,7 @@ mod tests {
             healthy_peers: 1,
             unhealthy_peers: 1,
             peers: vec![],
-            last_check: 1234567890,
+            last_check: 1_234_567_890,
         };
 
         let json = serde_json::to_string_pretty(&health).unwrap();
@@ -586,7 +597,7 @@ mod tests {
         assert_eq!(peer.public_key, expected_b64);
         assert_eq!(peer.endpoint, Some("192.168.1.5:51820".to_string()));
         assert_eq!(peer.allowed_ips, vec!["10.200.0.2/32".to_string()]);
-        assert_eq!(peer.last_handshake_time, Some(1700000000));
+        assert_eq!(peer.last_handshake_time, Some(1_700_000_000));
         assert_eq!(peer.transfer_rx, 12345);
         assert_eq!(peer.transfer_tx, 67890);
     }

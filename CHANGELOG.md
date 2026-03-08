@@ -4,7 +4,58 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Windows compilation for the `zlayer` binary: moved Unix-only crate dependencies
+  (`zlayer-agent`, `zlayer-overlay`, `zlayer-api`, `zlayer-proxy`, `zlayer-scheduler`,
+  `zlayer-secrets`, `zlayer-storage`, `zlayer-init-actions`, `secrecy`) behind
+  `[target.'cfg(unix)'.dependencies]`. Gate Unix-only modules (`daemon`, `daemon_client`,
+  `config`) and command modules (`deploy`, `exec`, `join`, `node`, `ps`, `serve`, `token`)
+  with `#[cfg(unix)]`. Disk detection in `resources.rs` stubbed to 0 on non-Unix platforms.
+  Cross-platform commands (build, validate, pipeline, spec, wasm, tunnel, manager, registry)
+  remain available on Windows. Runtime commands bail with a helpful error on Windows.
+  CI Windows build changed from `--features wsl,docker` to `--features wsl`.
+
 ### Added
+- Dynamic Raft voter management: the cluster now maintains an optimal odd number
+  of voters for fault tolerance. The formula is `min(7, largest_odd <= eligible)`,
+  so 1 node = 1 voter, 2 nodes = 1 voter + 1 learner (first-up-wins), 3 nodes =
+  3 voters, 5 nodes = 5 voters, 7+ nodes = 7 voters with the rest as learners.
+  Nodes with `mode=replicate` are always learners regardless of cluster size.
+  When voters die, `rebalance_voters()` automatically promotes eligible learners
+  to maintain the target count.
+- `MemberRole` enum (`Voter`/`Learner`) returned from `RaftCoordinator::add_member()`.
+  The cluster join response now includes a `role` field indicating the assigned role.
+  `GET /api/v1/cluster/nodes` now shows "leader", "voter", or "learner" per node.
+- `mode` field on `NodeInfo`, `AddMemberParams`, and `RegisterNode` request. Nodes
+  joining with `mode=replicate` are always learners; `mode=full` nodes are eligible
+  for voter promotion via the dynamic voter management logic.
+- `RaftCoordinator::rebalance_voters()` method to adjust the voter set after node
+  joins, deaths, or removals. Called automatically during `add_member()`,
+  `remove_member()`, and the dead-node detection loop.
+- `RaftCoordinator::remove_member()` method to fully remove a node from Raft
+  membership and deregister it from the cluster state machine.
+- `ConsensusNode` helper methods: `voter_ids()`, `voter_count()`, `learner_ids()`,
+  `all_member_ids()` for querying Raft membership from OpenRaft metrics.
+- `target_voters()` utility function for computing the optimal voter count.
+- Force-leader disaster recovery feature for Raft consensus. When the original
+  cluster leader is permanently lost, a surviving node can be promoted via
+  `POST /api/v1/cluster/force-leader` or `zlayer node force-leader`. This saves
+  the current cluster state to a recovery marker, shuts down Raft, and on daemon
+  restart wipes Raft storage and re-bootstraps as a single-node leader replaying
+  preserved service state. Safety checks prevent accidental use when the leader
+  is still reachable (<30s quorum ack).
+- `zlayer node force-leader` CLI subcommand for disaster recovery.
+- NAT traversal Phase 4: Custom ZLayer relay protocol with BLAKE2b-256 authentication.
+  - `RelayClient` (`nat/turn.rs`): Allocates relay addresses, creates permissions,
+    and runs a local UDP proxy bridging WireGuard traffic through the relay server.
+  - `RelayServer` (`nat/relay.rs`): Built-in UDP relay server with per-allocation
+    relay ports, permission-based forwarding, and session management.
+  - `RelayDiscovery` (`nat/discovery.rs`): Static configuration-based relay server
+    discovery from `NatConfig::turn_servers`.
+  - `NatTraversal` now gathers relay candidates after STUN reflexive candidates and
+    refreshes relay allocations during periodic maintenance.
+  - `OverlayBootstrap` optionally starts the built-in relay server during NAT
+    traversal initialization when `relay_server` config is present.
 - macOS overlay networking support: boringtun now creates `utun` devices on macOS
   via kernel control sockets (same mechanism as Tailscale CLI and wireguard-go).
   Interface configuration uses `ifconfig`/`route` instead of Linux `ip` commands.

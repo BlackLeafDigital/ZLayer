@@ -543,7 +543,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
     // Phase 13: Node configuration (auto-init if first run)
     // -----------------------------------------------------------------------
-    let node_config = load_or_init_node_config(&config.data_dir).await?;
+    let mut node_config = load_or_init_node_config(&config.data_dir).await?;
 
     // -----------------------------------------------------------------------
     // Phase 14: Internal token (generated early for Raft auth + Scheduler)
@@ -553,6 +553,26 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // Scheduler (for dispatching scale requests), and the API InternalState
     // (for validating them) all share the same secret.
     let internal_token = generate_internal_token();
+
+    // -----------------------------------------------------------------------
+    // Phase 14b: Force-leader recovery check
+    // -----------------------------------------------------------------------
+    let force_leader_recovery = zlayer_scheduler::raft::load_and_clear_force_leader_state(
+        &config.data_dir,
+    )
+    .unwrap_or_else(|e| {
+        warn!("Failed to check force-leader recovery: {e}");
+        None
+    });
+    if force_leader_recovery.is_some() {
+        info!("Force-leader recovery detected, wiping Raft storage");
+        let raft_log = config.data_dir.join("raft-log");
+        let raft_sm = config.data_dir.join("raft-sm");
+        let _ = std::fs::remove_dir_all(&raft_log);
+        let _ = std::fs::remove_dir_all(&raft_sm);
+        node_config.is_leader = true;
+        node_config.raft_node_id = 1;
+    }
 
     // -----------------------------------------------------------------------
     // Phase 15: Raft distributed consensus
@@ -596,10 +616,27 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                             memory_total: sys_res.memory_total,
                             disk_total: sys_res.disk_total,
                             gpus: vec![],
+                            mode: "full".to_string(),
                         })
                         .await
                     {
                         warn!("Failed to register leader in Raft state: {e}");
+                    }
+                }
+
+                // Replay saved state from force-leader recovery
+                if let Some(ref saved_state) = force_leader_recovery {
+                    info!(
+                        "Replaying {} services from force-leader recovery",
+                        saved_state.services.len()
+                    );
+                    for (name, svc) in &saved_state.services {
+                        let _ = coordinator
+                            .propose(Request::UpdateServiceState {
+                                service_name: name.clone(),
+                                state: svc.clone(),
+                            })
+                            .await;
                     }
                 }
 
@@ -849,6 +886,16 @@ async fn dead_node_detection_loop(
                         status: "dead".to_string(),
                     })
                     .await;
+
+                // Rebalance voters to maintain odd count (promotes eligible learners
+                // if the dead node was a voter).
+                if let Err(e) = raft.rebalance_voters().await {
+                    warn!(
+                        node_id = id,
+                        error = %e,
+                        "Failed to rebalance voters after node death"
+                    );
+                }
 
                 // Trigger rescheduling of the dead node's containers
                 if let Some(ref sched) = scheduler {

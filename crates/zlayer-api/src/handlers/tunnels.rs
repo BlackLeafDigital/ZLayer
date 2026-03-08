@@ -614,9 +614,9 @@ mod tests {
             name: "my-tunnel".to_string(),
             status: "active".to_string(),
             services: vec!["ssh".to_string()],
-            created_at: 1706745600,
-            expires_at: 1706832000,
-            last_connected: Some(1706750000),
+            created_at: 1_706_745_600,
+            expires_at: 1_706_832_000,
+            last_connected: Some(1_706_750_000),
         };
         let json = serde_json::to_string(&summary).unwrap();
         assert!(json.contains("my-tunnel"));

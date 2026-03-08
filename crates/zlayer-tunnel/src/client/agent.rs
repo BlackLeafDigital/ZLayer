@@ -15,9 +15,11 @@ use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
 use tokio::time::{interval, timeout};
-use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use uuid::Uuid;
 
+use crate::client::connector::OverlayAwareConnector;
+use crate::overlay::DynOverlayResolver;
 use crate::{Message, Result, ServiceConfig, ServiceProtocol, TunnelClientConfig, TunnelError};
 
 // =============================================================================
@@ -243,6 +245,8 @@ pub struct TunnelAgent {
     command_tx: Option<mpsc::Sender<ControlCommand>>,
     /// Event channel for external listeners
     event_tx: Option<mpsc::Sender<ControlEvent>>,
+    /// Optional overlay resolver for routing through overlay network
+    overlay_resolver: Option<DynOverlayResolver>,
 }
 
 impl TunnelAgent {
@@ -266,6 +270,7 @@ impl TunnelAgent {
             connection_callback: None,
             command_tx: None,
             event_tx: None,
+            overlay_resolver: None,
         }
     }
 
@@ -285,6 +290,13 @@ impl TunnelAgent {
     #[must_use]
     pub fn with_event_channel(mut self, tx: mpsc::Sender<ControlEvent>) -> Self {
         self.event_tx = Some(tx);
+        self
+    }
+
+    /// Set the overlay resolver for routing connections through the overlay network
+    #[must_use]
+    pub fn with_overlay_resolver(mut self, resolver: DynOverlayResolver) -> Self {
+        self.overlay_resolver = Some(resolver);
         self
     }
 
@@ -424,12 +436,16 @@ impl TunnelAgent {
     pub async fn run_once(&self) -> Result<()> {
         *self.state.write() = AgentState::Connecting;
 
-        // Connect to WebSocket server
+        // Connect to WebSocket server via overlay-aware connector
         tracing::debug!(url = %self.config.server_url, "connecting to server");
 
-        let (ws_stream, _response) = connect_async(&self.config.server_url)
-            .await
-            .map_err(TunnelError::connection)?;
+        let connector = OverlayAwareConnector::new(
+            &self.config.server_url,
+            self.config.overlay_server_url.as_deref(),
+            self.config.routing_mode,
+            self.overlay_resolver.clone(),
+        );
+        let (ws_stream, _response) = connector.connect().await?;
 
         let (mut ws_sink, mut ws_stream) = ws_stream.split();
 
@@ -894,6 +910,7 @@ impl Clone for TunnelAgent {
             connection_callback: self.connection_callback.clone(),
             command_tx: self.command_tx.clone(),
             event_tx: self.event_tx.clone(),
+            overlay_resolver: self.overlay_resolver.clone(),
         }
     }
 }

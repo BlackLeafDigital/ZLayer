@@ -334,7 +334,9 @@ mod tests {
 
         // Write valid header
         data[0..4].copy_from_slice(&0x377f_0682_u32.to_be_bytes());
-        data[8..12].copy_from_slice(&(page_size as u32).to_be_bytes());
+        #[allow(clippy::cast_possible_truncation)]
+        let page_size_u32 = page_size as u32;
+        data[8..12].copy_from_slice(&page_size_u32.to_be_bytes());
 
         let count = WalMonitor::count_frames(&data).unwrap();
         assert_eq!(count, 2);

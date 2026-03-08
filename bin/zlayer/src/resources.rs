@@ -114,30 +114,53 @@ fn detect_memory_used() -> u64 {
 }
 
 // =============================================================================
-// Disk detection (via nix::sys::statvfs)
+// Disk detection (via nix::sys::statvfs on Unix, stubbed on other platforms)
 // =============================================================================
 
+/// statvfs `blocks()`/`blocks_available()` return `u64` on Linux but `u32` on macOS.
+/// This helper widens to `u64` on macOS and is a no-op on Linux.
+#[cfg(all(unix, target_os = "macos"))]
+fn blocks_u64(v: u32) -> u64 {
+    u64::from(v)
+}
+#[cfg(all(unix, not(target_os = "macos")))]
+fn blocks_u64(v: u64) -> u64 {
+    v
+}
+
+#[cfg(unix)]
 fn detect_disk_total(data_dir: &Path) -> u64 {
     match nix::sys::statvfs::statvfs(data_dir) {
         Ok(stat) => {
             // Total blocks * fragment size = total bytes
-            u64::from(stat.blocks()) * stat.fragment_size()
+            blocks_u64(stat.blocks()) * stat.fragment_size()
         }
         Err(_) => 0,
     }
 }
 
+#[cfg(not(unix))]
+fn detect_disk_total(_data_dir: &Path) -> u64 {
+    0
+}
+
+#[cfg(unix)]
 fn detect_disk_used(data_dir: &Path) -> u64 {
     match nix::sys::statvfs::statvfs(data_dir) {
         Ok(stat) => {
             let frag = stat.fragment_size();
-            let total = u64::from(stat.blocks()) * frag;
+            let total = blocks_u64(stat.blocks()) * frag;
             // blocks_available is free blocks available to unprivileged users
-            let avail = u64::from(stat.blocks_available()) * frag;
+            let avail = blocks_u64(stat.blocks_available()) * frag;
             total.saturating_sub(avail)
         }
         Err(_) => 0,
     }
+}
+
+#[cfg(not(unix))]
+fn detect_disk_used(_data_dir: &Path) -> u64 {
+    0
 }
 
 // =============================================================================
@@ -306,7 +329,7 @@ mod tests {
     #[test]
     fn test_detect_cpu_total_is_positive() {
         let cpus = detect_cpu_total();
-        assert!(cpus >= 1.0, "Expected at least 1 CPU, got {}", cpus);
+        assert!(cpus >= 1.0, "Expected at least 1 CPU, got {cpus}");
     }
 
     #[cfg(target_os = "linux")]
@@ -316,8 +339,7 @@ mod tests {
         // Any machine should have at least 64 MB
         assert!(
             mem >= 64 * 1024 * 1024,
-            "Expected at least 64 MB, got {} bytes",
-            mem
+            "Expected at least 64 MB, got {mem} bytes",
         );
     }
 
@@ -328,12 +350,11 @@ mod tests {
         let used = detect_memory_used();
         assert!(
             used <= total,
-            "Used memory ({}) should not exceed total ({})",
-            used,
-            total
+            "Used memory ({used}) should not exceed total ({total})",
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_disk_total_nonzero() {
         // Use /tmp as a directory that always exists
@@ -342,6 +363,7 @@ mod tests {
         assert!(total > 0, "Disk total should be nonzero for /tmp");
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_disk_used_le_total() {
         let dir = PathBuf::from("/tmp");
@@ -349,23 +371,23 @@ mod tests {
         let used = detect_disk_used(&dir);
         assert!(
             used <= total,
-            "Disk used ({}) should not exceed total ({})",
-            used,
-            total
+            "Disk used ({used}) should not exceed total ({total})",
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_system_resources_all_fields() {
         let dir = PathBuf::from("/tmp");
         let res = detect_system_resources(&dir);
         assert!(res.cpu_total >= 1.0);
         // cpu_used is 0.0 at startup by design
-        assert_eq!(res.cpu_used, 0.0);
+        assert!((res.cpu_used - 0.0).abs() < f64::EPSILON);
         // disk should be nonzero for /tmp
         assert!(res.disk_total > 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_current_usage() {
         let dir = PathBuf::from("/tmp");
@@ -396,15 +418,14 @@ mod tests {
     fn test_cpu_used_bounded() {
         let used = detect_cpu_used();
         let total = detect_cpu_total();
-        assert!(used >= 0.0, "CPU used should be non-negative, got {}", used);
+        assert!(used >= 0.0, "CPU used should be non-negative, got {used}");
         assert!(
             used <= total,
-            "CPU used ({}) should not exceed total ({})",
-            used,
-            total
+            "CPU used ({used}) should not exceed total ({total})",
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn test_detect_disk_nonexistent_dir() {
         let dir = PathBuf::from("/this/path/should/not/exist/ever");

@@ -217,9 +217,9 @@ mod tests {
 
     #[test]
     fn test_pipeline_image_defaults() {
-        let yaml = r#"
+        let yaml = r"
 file: Dockerfile
-"#;
+";
         let img: PipelineImage = serde_yml::from_str(yaml).unwrap();
         assert_eq!(img.file, PathBuf::from("Dockerfile"));
         assert_eq!(img.context, PathBuf::from("."));
@@ -296,7 +296,7 @@ bogus: "nope"
 
     #[test]
     fn test_cache_mounts_and_retries_deserialize_defaults() {
-        let yaml = r#"
+        let yaml = r"
 format: oci
 no_cache: true
 cache_mounts:
@@ -305,7 +305,7 @@ cache_mounts:
     sharing: shared
   - target: /root/.cache/pip
 retries: 3
-"#;
+";
         let defaults: PipelineDefaults = serde_yml::from_str(yaml).unwrap();
         assert_eq!(defaults.cache_mounts.len(), 2);
         assert_eq!(defaults.cache_mounts[0].target, "/root/.cargo/registry");
@@ -321,13 +321,13 @@ retries: 3
 
     #[test]
     fn test_cache_mounts_and_retries_deserialize_image() {
-        let yaml = r#"
+        let yaml = r"
 file: Dockerfile
 cache_mounts:
   - target: /tmp/build-cache
     readonly: true
 retries: 5
-"#;
+";
         let img: PipelineImage = serde_yml::from_str(yaml).unwrap();
         assert_eq!(img.cache_mounts.len(), 1);
         assert_eq!(img.cache_mounts[0].target, "/tmp/build-cache");

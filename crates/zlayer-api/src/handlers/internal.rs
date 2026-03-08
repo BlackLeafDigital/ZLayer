@@ -371,7 +371,7 @@ mod tests {
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("web"));
-        assert!(json.contains("5"));
+        assert!(json.contains('5'));
         assert!(!json.contains("message")); // skip_serializing_if
     }
 

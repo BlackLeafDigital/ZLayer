@@ -17,6 +17,9 @@ default = ["full"]
 # Full runtime with all CLI commands and capabilities
 full = ["docker", "wasm", "s3", "persistent", "observability"]
 
+# WSL2 backend (Windows-only, thin CLI proxies to daemon in WSL2)
+wsl = ["dep:zlayer-wsl"]
+
 # Runtime capabilities (forwarded to deps)
 docker = ["zlayer-agent/docker"]
 wasm = ["zlayer-agent/wasm"]
@@ -25,21 +28,13 @@ persistent = ["zlayer-scheduler/persistent", "zlayer-registry/persistent"]
 observability = ["zlayer-observability/axum", "zlayer-observability/propagation"]
 
 [dependencies]
-# Internal crates
-zlayer-agent.workspace = true
+# Internal crates (cross-platform)
 zlayer-spec.workspace = true
 zlayer-observability.workspace = true
-zlayer-init-actions.workspace = true
 zlayer-builder.workspace = true
-zlayer-scheduler.workspace = true
-zlayer-overlay.workspace = true
 zlayer-core.workspace = true
 zlayer-tunnel.workspace = true
-zlayer-api.workspace = true
-zlayer-proxy.workspace = true
-zlayer-secrets.workspace = true
 zlayer-registry = { workspace = true, features = ["local"] }
-zlayer-storage.workspace = true
 
 # TUI
 ratatui = "0.29"
@@ -47,7 +42,7 @@ crossterm = "0.28"
 zlayer-tui.workspace = true
 
 # CLI
-clap = { workspace = true, features = ["derive"] }
+clap = { workspace = true, features = ["derive", "env"] }
 
 # Async
 tokio = { workspace = true, features = ["full"] }
@@ -59,9 +54,6 @@ tracing-appender = { workspace = true }
 
 # Error handling
 anyhow = { workspace = true }
-
-# Secrets
-secrecy = { workspace = true }
 
 # Serialization
 serde = { workspace = true }
@@ -88,12 +80,22 @@ tokio-stream = { workspace = true }
 num_cpus = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
+# Internal crates (Unix-only -- depend on boringtun, libcontainer, etc.)
+zlayer-agent.workspace = true
+zlayer-overlay.workspace = true
+zlayer-api.workspace = true
+zlayer-proxy.workspace = true
+zlayer-scheduler.workspace = true
+zlayer-secrets.workspace = true
+zlayer-storage.workspace = true
+zlayer-init-actions.workspace = true
+secrecy = { workspace = true }
 # Daemonization (fork, setsid) and signal handling (kill) -- Unix only
 nix = { workspace = true }
 libc = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
-zlayer-wsl = { workspace = true }
+zlayer-wsl = { workspace = true, optional = true }
 
 [lints]
 workspace = true

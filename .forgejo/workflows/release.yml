@@ -47,7 +47,10 @@ jobs:
           else
             TAG="${{ github.ref_name }}"
           fi
-          VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
+          RAW_VERSION=$(echo "$TAG" | grep -oP '\d+\.\d+\.\d+' || echo "0.0.0")
+          # Strip leading zeros from each component to avoid "invalid leading zero" cargo errors
+          IFS='.' read -r V_MAJOR V_MINOR V_PATCH <<< "$RAW_VERSION"
+          VERSION="$((10#$V_MAJOR)).$((10#$V_MINOR)).$((10#$V_PATCH))"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
           if [[ "$TAG" == major-v* ]]; then

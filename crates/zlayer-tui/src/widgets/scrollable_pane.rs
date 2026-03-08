@@ -294,7 +294,10 @@ mod tests {
     }
 
     fn buffer_text(buf: &Buffer) -> String {
-        buf.content().iter().map(|c| c.symbol()).collect()
+        buf.content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect()
     }
 
     // -- ScrollablePane with OutputLine --
@@ -375,7 +378,7 @@ mod tests {
 
         let entries: Vec<OutputLine> = (0..3)
             .map(|i| OutputLine {
-                text: format!("Line {}", i),
+                text: format!("Line {i}"),
                 is_stderr: false,
             })
             .collect();
@@ -397,7 +400,7 @@ mod tests {
         // Inner height = 5 - 2 (borders) = 3 lines visible, 10 entries total
         let entries: Vec<OutputLine> = (0..10)
             .map(|i| OutputLine {
-                text: format!("Line {}", i),
+                text: format!("Line {i}"),
                 is_stderr: false,
             })
             .collect();
@@ -473,7 +476,7 @@ mod tests {
         let entries: Vec<LogEntry> = (0..20)
             .map(|i| LogEntry {
                 level: LogLevel::Info,
-                message: format!("Log line {}", i),
+                message: format!("Log line {i}"),
             })
             .collect();
 

@@ -11,7 +11,7 @@ use zlayer_agent::{ContainerId, ContainerState, Runtime};
 use zlayer_spec::ServiceSpec;
 
 /// Container state as a Python-friendly enum
-#[pyclass(eq, eq_int)]
+#[pyclass(eq, eq_int, from_py_object)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PyContainerState {
     Pending,
@@ -348,7 +348,7 @@ impl Container {
     #[getter]
     fn id(&self, py: Python<'_>) -> PyResult<String> {
         let inner = self.inner.clone();
-        py.allow_threads(|| {
+        py.detach(|| {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let inner = inner.read().await;

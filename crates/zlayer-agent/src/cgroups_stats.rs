@@ -220,7 +220,10 @@ mod tests {
             memory_limit: u64::MAX,
             timestamp: Instant::now(),
         };
-        assert_eq!(stats.memory_percent(), 0.0);
+        assert!(
+            (stats.memory_percent() - 0.0).abs() < f64::EPSILON,
+            "memory_percent should be 0.0"
+        );
     }
 
     #[test]
@@ -231,7 +234,10 @@ mod tests {
             memory_limit: 0,
             timestamp: Instant::now(),
         };
-        assert_eq!(stats.memory_percent(), 0.0);
+        assert!(
+            (stats.memory_percent() - 0.0).abs() < f64::EPSILON,
+            "memory_percent should be 0.0"
+        );
     }
 
     #[test]
@@ -274,7 +280,10 @@ mod tests {
 
         // Same timestamp should return 0
         let cpu_pct = calculate_cpu_percent_with_cpus(&stats, &stats, 1);
-        assert_eq!(cpu_pct, 0.0);
+        assert!(
+            (cpu_pct - 0.0).abs() < f64::EPSILON,
+            "cpu_pct should be 0.0"
+        );
     }
 
     #[test]
@@ -297,7 +306,10 @@ mod tests {
 
         // Zero CPUs should return 0 (avoid division by zero)
         let cpu_pct = calculate_cpu_percent_with_cpus(&prev, &curr, 0);
-        assert_eq!(cpu_pct, 0.0);
+        assert!(
+            (cpu_pct - 0.0).abs() < f64::EPSILON,
+            "cpu_pct should be 0.0"
+        );
     }
 
     #[test]

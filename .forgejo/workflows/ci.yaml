@@ -2,11 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, dev]
-    tags:
-      - 'v*'
+    branches: [dev]
   pull_request:
-    branches: [main, dev]
+    branches: [dev]
   workflow_dispatch:
     inputs:
       version:
@@ -116,7 +114,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
-    needs: check
+    needs: [check, check-macos]
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     steps:
       - name: Checkout
@@ -290,7 +288,7 @@ jobs:
   feature-tests:
     name: Feature Tests
     runs-on: ubuntu-latest
-    needs: check
+    needs: [check, check-macos]
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     strategy:
       matrix:
@@ -326,6 +324,53 @@ jobs:
 
       - name: Test with features
         run: cargo test --package zlayer ${{ matrix.features }}
+
+  # ===========================================
+  # Auto Tag & Publish — only on push to dev
+  # After successful build, finds latest dev-v* tag,
+  # bumps patch number, creates new tag, triggers publish.
+  # ===========================================
+  auto-tag:
+    name: Auto Tag & Publish
+    runs-on: ubuntu-latest
+    needs: [build, build-macos]
+    if: ${{ github.ref == 'refs/heads/dev' && !contains(github.event.head_commit.message, '[np]') }}
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.FORGEJO_TOKEN }}
+
+      - name: Calculate next version
+        id: version
+        run: |
+          LATEST=$(git tag -l 'v*' --sort=-v:refname | head -n1)
+          if [[ -z "$LATEST" ]]; then
+            NEXT="v0.10.0"
+          else
+            VERSION="${LATEST#v}"
+            IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
+            PATCH=$((PATCH + 1))
+            NEXT="v${MAJOR}.${MINOR}.${PATCH}"
+          fi
+          echo "tag=$NEXT" >> $GITHUB_OUTPUT
+          echo "Next version: $NEXT"
+
+      - name: Create and push tag
+        run: |
+          git config user.name "Zach Handley"
+          git config user.email "zachhandley@gmail.com"
+          git tag -a "${{ steps.version.outputs.tag }}" -m "Auto-tagged from CI: ${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      - name: Trigger publish workflow
+        run: |
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/publish.yml/dispatches" \
+            -d '{"ref": "dev", "inputs": {"version": "${{ steps.version.outputs.tag }}", "sha": "${{ github.sha }}"}}'
 
   # ===========================================
   # Trigger E2E Tests

@@ -121,6 +121,40 @@ where
         self.raft.metrics().borrow().current_leader
     }
 
+    /// Returns the set of current voter node IDs.
+    #[must_use]
+    pub fn voter_ids(&self) -> BTreeSet<NodeId> {
+        let metrics = self.raft.metrics().borrow().clone();
+        metrics.membership_config.membership().voter_ids().collect()
+    }
+
+    /// Returns the number of current voters.
+    #[must_use]
+    pub fn voter_count(&self) -> usize {
+        self.voter_ids().len()
+    }
+
+    /// Returns the set of current learner node IDs (non-voters).
+    #[must_use]
+    pub fn learner_ids(&self) -> BTreeSet<NodeId> {
+        let metrics = self.raft.metrics().borrow().clone();
+        metrics
+            .membership_config
+            .membership()
+            .learner_ids()
+            .collect()
+    }
+
+    /// Returns all member node IDs (voters + learners).
+    #[must_use]
+    pub fn all_member_ids(&self) -> BTreeSet<NodeId> {
+        let metrics = self.raft.metrics().borrow().clone();
+        let membership = metrics.membership_config.membership();
+        let mut ids: BTreeSet<NodeId> = membership.voter_ids().collect();
+        ids.extend(membership.learner_ids());
+        ids
+    }
+
     /// Bootstrap a new single-node cluster.
     ///
     /// This must only be called once, on the first node, when creating a new cluster.

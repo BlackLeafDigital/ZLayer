@@ -1770,7 +1770,7 @@ mod tests {
 
     fn mock_spec() -> ServiceSpec {
         serde_yml::from_str::<DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -1782,7 +1782,7 @@ services:
       - name: http
         protocol: http
         port: 8080
-"#,
+",
         )
         .unwrap()
         .services
@@ -1792,7 +1792,7 @@ services:
 
     fn mock_spec_with_resources() -> ServiceSpec {
         serde_yml::from_str::<DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -1810,7 +1810,7 @@ services:
       - name: http
         protocol: http
         port: 8080
-"#,
+",
         )
         .unwrap()
         .services
@@ -1820,7 +1820,7 @@ services:
 
     fn mock_privileged_spec() -> ServiceSpec {
         serde_yml::from_str::<DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -1833,7 +1833,7 @@ services:
       - name: http
         protocol: http
         port: 8080
-"#,
+",
         )
         .unwrap()
         .services
@@ -2013,7 +2013,10 @@ services:
         let namespaces = linux.namespaces().as_ref().unwrap();
 
         // Check we have the expected namespaces
-        let namespace_types: Vec<_> = namespaces.iter().map(|ns| ns.typ()).collect();
+        let namespace_types: Vec<_> = namespaces
+            .iter()
+            .map(oci_spec::runtime::LinuxNamespace::typ)
+            .collect();
         assert!(namespace_types.contains(&LinuxNamespaceType::Pid));
         assert!(namespace_types.contains(&LinuxNamespaceType::Ipc));
         assert!(namespace_types.contains(&LinuxNamespaceType::Uts));
@@ -2038,7 +2041,10 @@ services:
         let namespaces = linux.namespaces().as_ref().unwrap();
 
         // Check we have the expected namespaces (NO Network namespace)
-        let namespace_types: Vec<_> = namespaces.iter().map(|ns| ns.typ()).collect();
+        let namespace_types: Vec<_> = namespaces
+            .iter()
+            .map(oci_spec::runtime::LinuxNamespace::typ)
+            .collect();
         assert!(namespace_types.contains(&LinuxNamespaceType::Pid));
         assert!(namespace_types.contains(&LinuxNamespaceType::Ipc));
         assert!(namespace_types.contains(&LinuxNamespaceType::Uts));
@@ -2071,7 +2077,7 @@ services:
     #[test]
     fn test_build_storage_mounts_bind() {
         let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -2083,7 +2089,7 @@ services:
         source: /host/data
         target: /app/data
         readonly: true
-"#,
+",
         )
         .unwrap()
         .services
@@ -2112,7 +2118,7 @@ services:
     #[test]
     fn test_build_storage_mounts_named() {
         let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -2123,7 +2129,7 @@ services:
       - type: named
         name: my-volume
         target: /app/data
-"#,
+",
         )
         .unwrap()
         .services
@@ -2153,7 +2159,7 @@ services:
     #[test]
     fn test_build_storage_mounts_tmpfs() {
         let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -2165,7 +2171,7 @@ services:
         target: /app/tmp
         size: 256Mi
         mode: 1777
-"#,
+",
         )
         .unwrap()
         .services
@@ -2179,7 +2185,7 @@ services:
 
         assert_eq!(mounts.len(), 1);
         assert_eq!(mounts[0].destination().to_string_lossy(), "/app/tmp");
-        assert_eq!(mounts[0].typ().as_ref().map(|s| s.as_str()), Some("tmpfs"));
+        assert_eq!(mounts[0].typ().as_ref().map(String::as_str), Some("tmpfs"));
         let options = mounts[0].options().as_ref().unwrap();
         assert!(options.iter().any(|o| o.starts_with("size=")));
         assert!(options.iter().any(|o| o.starts_with("mode=")));
@@ -2188,7 +2194,7 @@ services:
     #[test]
     fn test_build_storage_mounts_multiple() {
         let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -2205,7 +2211,7 @@ services:
         target: /app/data
       - type: tmpfs
         target: /app/tmp
-"#,
+",
         )
         .unwrap()
         .services
@@ -2236,7 +2242,7 @@ services:
     #[test]
     fn test_build_storage_mounts_anonymous_missing_path() {
         let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -2246,7 +2252,7 @@ services:
     storage:
       - type: anonymous
         target: /app/cache
-"#,
+",
         )
         .unwrap()
         .services
@@ -2269,7 +2275,7 @@ services:
             replica: 1,
         };
         let spec = serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -2282,7 +2288,7 @@ services:
         target: /app/data
       - type: tmpfs
         target: /app/tmp
-"#,
+",
         )
         .unwrap()
         .services

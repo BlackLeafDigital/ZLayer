@@ -1096,7 +1096,7 @@ mod tests {
         assert_eq!(host_config.privileged, Some(true));
     }
 
-    /// Helper to create a minimal test ServiceSpec
+    /// Helper to create a minimal test `ServiceSpec`
     fn create_test_spec(ports: Vec<u16>) -> ServiceSpec {
         use zlayer_spec::*;
 
@@ -1104,7 +1104,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(i, port)| EndpointSpec {
-                name: format!("endpoint{}", i),
+                name: format!("endpoint{i}"),
                 protocol: Protocol::Http,
                 port,
                 target_port: None,
@@ -1145,7 +1145,7 @@ mod tests {
             node_mode: NodeMode::default(),
             node_selector: None,
             service_type: ServiceType::default(),
-            wasm_http: None,
+            wasm: None,
             host_network: false,
         }
     }

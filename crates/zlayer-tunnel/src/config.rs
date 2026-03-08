@@ -1,5 +1,6 @@
 //! Configuration types for tunnel server and client
 
+use crate::overlay::RoutingMode;
 use crate::protocol::ServiceProtocol;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -78,6 +79,18 @@ pub struct TunnelServerConfig {
     /// Maximum services per tunnel
     #[serde(default = "default_max_services")]
     pub max_services_per_tunnel: usize,
+
+    /// Routing mode for tunnel connections
+    #[serde(default)]
+    pub routing_mode: RoutingMode,
+
+    /// Whether to also bind on the overlay network interface
+    #[serde(default)]
+    pub bind_overlay: bool,
+
+    /// Whether to register tunnel services in overlay DNS
+    #[serde(default)]
+    pub dns_registration: bool,
 }
 
 impl Default for TunnelServerConfig {
@@ -90,6 +103,9 @@ impl Default for TunnelServerConfig {
             heartbeat_timeout: default_heartbeat_timeout(),
             max_tunnels: default_max_tunnels(),
             max_services_per_tunnel: default_max_services(),
+            routing_mode: RoutingMode::default(),
+            bind_overlay: false,
+            dns_registration: false,
         }
     }
 }
@@ -175,6 +191,14 @@ pub struct TunnelClientConfig {
     /// Services to expose through the tunnel
     #[serde(default)]
     pub services: Vec<ServiceConfig>,
+
+    /// Optional overlay server URL (e.g., `ws://10.0.0.5:3669/tunnel/v1`)
+    #[serde(default)]
+    pub overlay_server_url: Option<String>,
+
+    /// Routing mode for this client connection
+    #[serde(default)]
+    pub routing_mode: RoutingMode,
 }
 
 impl TunnelClientConfig {
@@ -187,6 +211,8 @@ impl TunnelClientConfig {
             reconnect_interval: default_reconnect_interval(),
             max_reconnect_interval: default_max_reconnect_interval(),
             services: Vec::new(),
+            overlay_server_url: None,
+            routing_mode: RoutingMode::default(),
         }
     }
 

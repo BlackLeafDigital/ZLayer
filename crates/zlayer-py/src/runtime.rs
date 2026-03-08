@@ -16,7 +16,7 @@ use zlayer_agent::{
 use zlayer_spec::DeploymentSpec;
 
 /// Runtime configuration options
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone, Default)]
 pub struct RuntimeOptions {
     /// Use mock runtime for testing (default: false for production)

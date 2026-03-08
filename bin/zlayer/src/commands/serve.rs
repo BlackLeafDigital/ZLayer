@@ -645,6 +645,7 @@ pub(crate) async fn serve(
         ip_allocator,
         Some(ip_allocator_path),
         internal_token,
+        Some(config.data_dir.clone()),
     );
     let cluster_routes = build_cluster_routes(cluster_state);
     router = router.nest("/api/v1/cluster", cluster_routes);

@@ -341,11 +341,7 @@ mod tests {
             state.phase = phase;
             let view = DeployView::new(&state, 0);
             let (text, _style) = view.phase_display();
-            assert!(
-                !text.is_empty(),
-                "Phase {:?} should have display text",
-                phase
-            );
+            assert!(!text.is_empty(), "Phase {phase:?} should have display text",);
         }
     }
 
@@ -455,7 +451,11 @@ mod tests {
         let mut buf = create_buffer(80, 5);
         view.render_infra(area, &mut buf);
 
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(
             content.contains("Infrastructure"),
             "Infra widget should render Infrastructure title"
@@ -471,7 +471,11 @@ mod tests {
         let mut buf = create_buffer(80, 10);
         view.render_services(area, &mut buf);
 
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(
             content.contains("Services"),
             "Service widget should render Services title"
@@ -487,7 +491,11 @@ mod tests {
         let mut buf = create_buffer(60, 6);
         view.render_logs(area, &mut buf);
 
-        let content: String = buf.content().iter().map(|c| c.symbol()).collect();
+        let content: String = buf
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect();
         assert!(
             content.contains("Logs"),
             "Log widget should render Logs title"

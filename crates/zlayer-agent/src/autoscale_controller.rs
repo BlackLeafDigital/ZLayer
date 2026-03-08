@@ -455,7 +455,7 @@ mod tests {
 
     fn mock_spec() -> zlayer_spec::ServiceSpec {
         serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
-            r#"
+            r"
 version: v1
 deployment: test
 services:
@@ -470,7 +470,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
+",
         )
         .unwrap()
         .services

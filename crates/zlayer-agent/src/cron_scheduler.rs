@@ -341,11 +341,10 @@ deployment: test
 services:
   cleanup:
     rtype: cron
-    schedule: "{}"
+    schedule: "{schedule}"
     image:
       name: cleanup:latest
-"#,
-            schedule
+"#
         );
 
         serde_yml::from_str::<DeploymentSpec>(&yaml)

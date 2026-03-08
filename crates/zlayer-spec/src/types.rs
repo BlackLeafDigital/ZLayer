@@ -80,13 +80,25 @@ pub enum NodeMode {
 
 /// Service type - determines runtime behavior and scaling model
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum ServiceType {
     /// Standard long-running container service
     #[default]
     Standard,
-    /// WASM-based HTTP service with instance pooling
+    /// WASM-based HTTP service (wasi:http/incoming-handler)
     WasmHttp,
+    /// WASM-based general plugin (zlayer:plugin handler - full host access)
+    WasmPlugin,
+    /// WASM-based stateless request/response transformer
+    WasmTransformer,
+    /// WASM-based authenticator plugin (secrets + KV + HTTP)
+    WasmAuthenticator,
+    /// WASM-based rate limiter (KV + metrics)
+    WasmRateLimiter,
+    /// WASM-based request/response middleware
+    WasmMiddleware,
+    /// WASM-based custom router
+    WasmRouter,
     /// Run-to-completion job
     Job,
 }
@@ -116,7 +128,182 @@ pub struct NodeSelector {
     pub prefer_labels: HashMap<String, String>,
 }
 
+/// Explicit capability declarations for WASM modules.
+/// Controls which host interfaces are linked and available to the component.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct WasmCapabilities {
+    /// Config interface access (zlayer:plugin/config)
+    #[serde(default = "default_true")]
+    pub config: bool,
+    /// Key-value storage access (zlayer:plugin/keyvalue)
+    #[serde(default = "default_true")]
+    pub keyvalue: bool,
+    /// Logging access (zlayer:plugin/logging)
+    #[serde(default = "default_true")]
+    pub logging: bool,
+    /// Secrets access (zlayer:plugin/secrets)
+    #[serde(default)]
+    pub secrets: bool,
+    /// Metrics emission (zlayer:plugin/metrics)
+    #[serde(default = "default_true")]
+    pub metrics: bool,
+    /// HTTP client for outgoing requests (wasi:http/outgoing-handler)
+    #[serde(default)]
+    pub http_client: bool,
+    /// WASI CLI access (args, env, stdio)
+    #[serde(default)]
+    pub cli: bool,
+    /// WASI filesystem access
+    #[serde(default)]
+    pub filesystem: bool,
+    /// WASI sockets access (TCP/UDP)
+    #[serde(default)]
+    pub sockets: bool,
+}
+
+impl Default for WasmCapabilities {
+    fn default() -> Self {
+        Self {
+            config: true,
+            keyvalue: true,
+            logging: true,
+            secrets: false,
+            metrics: true,
+            http_client: false,
+            cli: false,
+            filesystem: false,
+            sockets: false,
+        }
+    }
+}
+
+/// Pre-opened directory for WASM filesystem access
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct WasmPreopen {
+    /// Host path to mount
+    pub source: String,
+    /// Guest path (visible to WASM module)
+    pub target: String,
+    /// Read-only access (default: false)
+    #[serde(default)]
+    pub readonly: bool,
+}
+
+/// Comprehensive configuration for all WASM service types.
+///
+/// Replaces the previous `WasmHttpConfig` with resource limits, capability
+/// declarations, networking controls, and storage configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct WasmConfig {
+    // --- Instance Management ---
+    /// Minimum number of warm instances to keep ready
+    #[serde(default = "default_min_instances")]
+    pub min_instances: u32,
+    /// Maximum number of instances to scale to
+    #[serde(default = "default_max_instances")]
+    pub max_instances: u32,
+    /// Time before idle instances are terminated
+    #[serde(default = "default_idle_timeout", with = "duration::required")]
+    pub idle_timeout: std::time::Duration,
+    /// Maximum time for a single request
+    #[serde(default = "default_request_timeout", with = "duration::required")]
+    pub request_timeout: std::time::Duration,
+
+    // --- Resource Limits ---
+    /// Maximum linear memory (e.g., "64Mi", "256Mi")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_memory: Option<String>,
+    /// Maximum fuel (instruction count limit, 0 = unlimited)
+    #[serde(default)]
+    pub max_fuel: u64,
+    /// Epoch interval for cooperative preemption
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "duration::option"
+    )]
+    pub epoch_interval: Option<std::time::Duration>,
+
+    // --- Capabilities ---
+    /// Explicit capability grants (overrides world defaults when restricting)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<WasmCapabilities>,
+
+    // --- Networking ---
+    /// Allow outgoing HTTP requests (default: true)
+    #[serde(default = "default_true")]
+    pub allow_http_outgoing: bool,
+    /// Allowed outgoing HTTP hosts (empty = all allowed)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<String>,
+    /// Allow raw TCP sockets (default: false)
+    #[serde(default)]
+    pub allow_tcp: bool,
+    /// Allow raw UDP sockets (default: false)
+    #[serde(default)]
+    pub allow_udp: bool,
+
+    // --- Storage ---
+    /// Pre-opened directories (host path -> guest path)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preopens: Vec<WasmPreopen>,
+    /// Enable KV store access (default: true)
+    #[serde(default = "default_true")]
+    pub kv_enabled: bool,
+    /// KV store namespace (default: service name)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_namespace: Option<String>,
+    /// KV store max value size in bytes (default: 1MB)
+    #[serde(default = "default_kv_max_value_size")]
+    pub kv_max_value_size: u64,
+
+    // --- Secrets ---
+    /// Secret names accessible to this WASM module
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
+
+    // --- Performance ---
+    /// Pre-compile on deploy to reduce cold start (default: true)
+    #[serde(default = "default_true")]
+    pub precompile: bool,
+}
+
+fn default_kv_max_value_size() -> u64 {
+    1_048_576 // 1MB
+}
+
+impl Default for WasmConfig {
+    fn default() -> Self {
+        Self {
+            min_instances: default_min_instances(),
+            max_instances: default_max_instances(),
+            idle_timeout: default_idle_timeout(),
+            request_timeout: default_request_timeout(),
+            max_memory: None,
+            max_fuel: 0,
+            epoch_interval: None,
+            capabilities: None,
+            allow_http_outgoing: true,
+            allowed_hosts: Vec::new(),
+            allow_tcp: false,
+            allow_udp: false,
+            preopens: Vec::new(),
+            kv_enabled: true,
+            kv_namespace: None,
+            kv_max_value_size: default_kv_max_value_size(),
+            secrets: Vec::new(),
+            precompile: true,
+        }
+    }
+}
+
 /// Configuration for WASM HTTP services with instance pooling
+#[deprecated(note = "Use WasmConfig instead")]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WasmHttpConfig {
@@ -150,6 +337,7 @@ fn default_request_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(30)
 }
 
+#[allow(deprecated)]
 impl Default for WasmHttpConfig {
     fn default() -> Self {
         Self {
@@ -157,6 +345,111 @@ impl Default for WasmHttpConfig {
             max_instances: default_max_instances(),
             idle_timeout: default_idle_timeout(),
             request_timeout: default_request_timeout(),
+        }
+    }
+}
+
+#[allow(deprecated)]
+impl From<WasmHttpConfig> for WasmConfig {
+    fn from(old: WasmHttpConfig) -> Self {
+        Self {
+            min_instances: old.min_instances,
+            max_instances: old.max_instances,
+            idle_timeout: old.idle_timeout,
+            request_timeout: old.request_timeout,
+            ..Default::default()
+        }
+    }
+}
+
+impl ServiceType {
+    /// Returns true if this is any WASM service type
+    #[must_use]
+    pub fn is_wasm(&self) -> bool {
+        matches!(
+            self,
+            ServiceType::WasmHttp
+                | ServiceType::WasmPlugin
+                | ServiceType::WasmTransformer
+                | ServiceType::WasmAuthenticator
+                | ServiceType::WasmRateLimiter
+                | ServiceType::WasmMiddleware
+                | ServiceType::WasmRouter
+        )
+    }
+
+    /// Returns the default capabilities for this WASM service type.
+    /// Returns None for non-WASM types.
+    #[must_use]
+    pub fn default_wasm_capabilities(&self) -> Option<WasmCapabilities> {
+        match self {
+            ServiceType::WasmHttp | ServiceType::WasmRouter => Some(WasmCapabilities {
+                config: true,
+                keyvalue: true,
+                logging: true,
+                secrets: false,
+                metrics: false,
+                http_client: true,
+                cli: false,
+                filesystem: false,
+                sockets: false,
+            }),
+            ServiceType::WasmPlugin => Some(WasmCapabilities {
+                config: true,
+                keyvalue: true,
+                logging: true,
+                secrets: true,
+                metrics: true,
+                http_client: true,
+                cli: true,
+                filesystem: true,
+                sockets: false,
+            }),
+            ServiceType::WasmTransformer => Some(WasmCapabilities {
+                config: false,
+                keyvalue: false,
+                logging: true,
+                secrets: false,
+                metrics: false,
+                http_client: false,
+                cli: true,
+                filesystem: false,
+                sockets: false,
+            }),
+            ServiceType::WasmAuthenticator => Some(WasmCapabilities {
+                config: true,
+                keyvalue: false,
+                logging: true,
+                secrets: true,
+                metrics: false,
+                http_client: true,
+                cli: false,
+                filesystem: false,
+                sockets: false,
+            }),
+            ServiceType::WasmRateLimiter => Some(WasmCapabilities {
+                config: true,
+                keyvalue: true,
+                logging: true,
+                secrets: false,
+                metrics: true,
+                http_client: false,
+                cli: true,
+                filesystem: false,
+                sockets: false,
+            }),
+            ServiceType::WasmMiddleware => Some(WasmCapabilities {
+                config: true,
+                keyvalue: false,
+                logging: true,
+                secrets: false,
+                metrics: false,
+                http_client: true,
+                cli: false,
+                filesystem: false,
+                sockets: false,
+            }),
+            _ => None,
         }
     }
 }
@@ -347,13 +640,14 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<NodeSelector>,
 
-    /// Service type (standard, `wasm_http`, job)
+    /// Service type (standard, `wasm_http`, `wasm_plugin`, etc.)
     #[serde(default)]
     pub service_type: ServiceType,
 
-    /// WASM HTTP configuration (only used when `service_type` is `WasmHttp`)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wasm_http: Option<WasmHttpConfig>,
+    /// WASM configuration (used when `service_type` is any Wasm* variant)
+    /// Also accepts the deprecated `wasm_http` key for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none", alias = "wasm_http")]
+    pub wasm: Option<WasmConfig>,
 
     /// Use host networking (container shares host network namespace)
     ///
@@ -1151,7 +1445,7 @@ mod tests {
 
     #[test]
     fn test_parse_simple_spec() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1164,7 +1458,7 @@ services:
         protocol: http
         port: 8080
         expose: public
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert_eq!(spec.version, "v1");
@@ -1174,7 +1468,7 @@ services:
 
     #[test]
     fn test_parse_duration() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1189,7 +1483,7 @@ services:
       check:
         type: tcp
         port: 8080
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let health = &spec.services["test"].health;
@@ -1204,7 +1498,7 @@ services:
 
     #[test]
     fn test_parse_adaptive_scale() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1220,7 +1514,7 @@ services:
       targets:
         cpu: 70
         rps: 800
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let scale = &spec.services["test"].scale;
@@ -1243,7 +1537,7 @@ services:
 
     #[test]
     fn test_node_mode_default() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1251,7 +1545,7 @@ services:
     rtype: service
     image:
       name: hello-world:latest
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert_eq!(spec.services["hello"].node_mode, NodeMode::Shared);
@@ -1260,7 +1554,7 @@ services:
 
     #[test]
     fn test_node_mode_dedicated() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1269,7 +1563,7 @@ services:
     image:
       name: api:latest
     node_mode: dedicated
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert_eq!(spec.services["api"].node_mode, NodeMode::Dedicated);
@@ -1277,7 +1571,7 @@ services:
 
     #[test]
     fn test_node_mode_exclusive() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1286,7 +1580,7 @@ services:
     image:
       name: postgres:15
     node_mode: exclusive
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert_eq!(spec.services["database"].node_mode, NodeMode::Exclusive);
@@ -1334,16 +1628,16 @@ services:
 
         for (mode, expected) in modes.iter().zip(expected_json.iter()) {
             let json = serde_json::to_string(mode).unwrap();
-            assert_eq!(&json, *expected, "Serialization failed for {:?}", mode);
+            assert_eq!(&json, *expected, "Serialization failed for {mode:?}");
 
             let deserialized: NodeMode = serde_json::from_str(&json).unwrap();
-            assert_eq!(deserialized, *mode, "Roundtrip failed for {:?}", mode);
+            assert_eq!(deserialized, *mode, "Roundtrip failed for {mode:?}");
         }
     }
 
     #[test]
     fn test_node_selector_empty() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1353,7 +1647,7 @@ services:
       name: api:latest
     node_selector:
       labels: {}
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let selector = spec.services["api"].node_selector.as_ref().unwrap();
@@ -1363,7 +1657,7 @@ services:
 
     #[test]
     fn test_mixed_node_modes_in_deployment() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1385,7 +1679,7 @@ services:
     node_selector:
       labels:
         storage: ssd
-"#;
+";
 
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert_eq!(spec.services["redis"].node_mode, NodeMode::Shared);
@@ -1398,7 +1692,7 @@ services:
 
     #[test]
     fn test_storage_bind_mount() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1410,7 +1704,7 @@ services:
         source: /host/data
         target: /app/data
         readonly: true
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         assert_eq!(storage.len(), 1);
@@ -1430,7 +1724,7 @@ services:
 
     #[test]
     fn test_storage_named_with_tier() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1442,7 +1736,7 @@ services:
         name: my-data
         target: /app/data
         tier: cached
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
@@ -1459,7 +1753,7 @@ services:
 
     #[test]
     fn test_storage_anonymous() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1469,7 +1763,7 @@ services:
     storage:
       - type: anonymous
         target: /app/cache
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
@@ -1483,7 +1777,7 @@ services:
 
     #[test]
     fn test_storage_tmpfs() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1495,7 +1789,7 @@ services:
         target: /app/tmp
         size: 256Mi
         mode: 1777
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
@@ -1510,7 +1804,7 @@ services:
 
     #[test]
     fn test_storage_s3() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1525,7 +1819,7 @@ services:
         readonly: true
         endpoint: https://s3.us-west-2.amazonaws.com
         credentials: aws-creds
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         match &storage[0] {
@@ -1553,7 +1847,7 @@ services:
 
     #[test]
     fn test_storage_multiple_types() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1570,7 +1864,7 @@ services:
         target: /app/data
       - type: tmpfs
         target: /app/tmp
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let storage = &spec.services["app"].storage;
         assert_eq!(storage.len(), 3);
@@ -1581,7 +1875,7 @@ services:
 
     #[test]
     fn test_storage_tier_default() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1592,7 +1886,7 @@ services:
       - type: named
         name: data
         target: /data
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         match &spec.services["app"].storage[0] {
             StorageSpec::Named { tier, .. } => {
@@ -1608,7 +1902,7 @@ services:
 
     #[test]
     fn test_endpoint_tunnel_config_basic() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1622,7 +1916,7 @@ services:
         tunnel:
           enabled: true
           remote_port: 8080
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let endpoint = &spec.services["api"].endpoints[0];
         let tunnel = endpoint.tunnel.as_ref().unwrap();
@@ -1634,7 +1928,7 @@ services:
 
     #[test]
     fn test_endpoint_tunnel_config_full() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1655,7 +1949,7 @@ services:
             enabled: true
             max_ttl: 4h
             audit: true
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let endpoint = &spec.services["api"].endpoints[0];
         let tunnel = endpoint.tunnel.as_ref().unwrap();
@@ -1673,7 +1967,7 @@ services:
 
     #[test]
     fn test_top_level_tunnel_definition() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services: {}
@@ -1685,7 +1979,7 @@ tunnels:
     remote_port: 5432
     protocol: tcp
     expose: internal
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let tunnel = spec.tunnels.get("db-tunnel").unwrap();
         assert_eq!(tunnel.from, "app-node");
@@ -1698,7 +1992,7 @@ tunnels:
 
     #[test]
     fn test_top_level_tunnel_defaults() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services: {}
@@ -1708,7 +2002,7 @@ tunnels:
     to: node-b
     local_port: 3000
     remote_port: 3000
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let tunnel = spec.tunnels.get("simple-tunnel").unwrap();
         assert_eq!(tunnel.protocol, TunnelProtocol::Tcp); // default
@@ -1717,7 +2011,7 @@ tunnels:
 
     #[test]
     fn test_tunnel_protocol_udp() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services: {}
@@ -1728,7 +2022,7 @@ tunnels:
     local_port: 5353
     remote_port: 5353
     protocol: udp
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let tunnel = spec.tunnels.get("udp-tunnel").unwrap();
         assert_eq!(tunnel.protocol, TunnelProtocol::Udp);
@@ -1736,7 +2030,7 @@ tunnels:
 
     #[test]
     fn test_endpoint_without_tunnel() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
@@ -1747,7 +2041,7 @@ services:
       - name: http
         protocol: http
         port: 8080
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         let endpoint = &spec.services["api"].endpoints[0];
         assert!(endpoint.tunnel.is_none());
@@ -1755,14 +2049,14 @@ services:
 
     #[test]
     fn test_deployment_without_tunnels() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
   api:
     image:
       name: api:latest
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert!(spec.tunnels.is_empty());
     }
@@ -1773,14 +2067,14 @@ services:
 
     #[test]
     fn test_spec_without_api_block_uses_defaults() {
-        let yaml = r#"
+        let yaml = r"
 version: v1
 deployment: test
 services:
   hello:
     image:
       name: hello-world:latest
-"#;
+";
         let spec: DeploymentSpec = serde_yml::from_str(yaml).unwrap();
         assert!(spec.api.enabled);
         assert_eq!(spec.api.bind, "0.0.0.0:3669");

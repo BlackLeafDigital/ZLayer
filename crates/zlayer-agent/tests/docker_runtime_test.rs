@@ -1,6 +1,6 @@
 //! Docker runtime integration tests
 //!
-//! These tests verify the DockerRuntime implementation against a real Docker daemon.
+//! These tests verify the `DockerRuntime` implementation against a real Docker daemon.
 //! Tests are gated behind the `docker` feature and will be skipped if Docker is not available.
 //!
 //! # Requirements
@@ -50,15 +50,16 @@ async fn skip_if_no_docker() -> Option<DockerRuntime> {
 fn unique_container_name(prefix: &str) -> String {
     use rand::Rng;
     let suffix: u32 = rand::rng().random_range(10000..99999);
+    #[allow(clippy::cast_possible_truncation)]
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
         % 1_000_000;
-    format!("test-{}-{}-{}", prefix, timestamp, suffix)
+    format!("test-{prefix}-{timestamp}-{suffix}")
 }
 
-/// Create a ContainerId with a unique service name
+/// Create a `ContainerId` with a unique service name
 fn unique_container_id(prefix: &str) -> ContainerId {
     ContainerId {
         service: unique_container_name(prefix),
@@ -66,7 +67,7 @@ fn unique_container_id(prefix: &str) -> ContainerId {
     }
 }
 
-/// Create a minimal ServiceSpec for testing
+/// Create a minimal `ServiceSpec` for testing
 fn create_test_spec(image: &str) -> ServiceSpec {
     ServiceSpec {
         rtype: ResourceType::Service,
@@ -98,12 +99,12 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         node_mode: NodeMode::default(),
         node_selector: None,
         service_type: ServiceType::default(),
-        wasm_http: None,
+        wasm: None,
         host_network: false,
     }
 }
 
-/// Create a ServiceSpec with a command that outputs to stdout and exits
+/// Create a `ServiceSpec` with a command that outputs to stdout and exits
 fn create_echo_spec(message: &str) -> ServiceSpec {
     let mut spec = create_test_spec(TEST_IMAGE);
     spec.command = CommandSpec {
@@ -118,7 +119,7 @@ fn create_echo_spec(message: &str) -> ServiceSpec {
     spec
 }
 
-/// Create a ServiceSpec that sleeps for the specified number of seconds
+/// Create a `ServiceSpec` that sleeps for the specified number of seconds
 fn create_sleep_spec(seconds: u32) -> ServiceSpec {
     let mut spec = create_test_spec(TEST_IMAGE);
     spec.command = CommandSpec {
@@ -184,7 +185,7 @@ async fn wait_for_state(
             Err(e) => {
                 // Container might not exist yet, keep waiting
                 if start.elapsed() > Duration::from_secs(5) {
-                    return Err(format!("Error getting container state: {}", e));
+                    return Err(format!("Error getting container state: {e}"));
                 }
             }
         }
@@ -192,8 +193,7 @@ async fn wait_for_state(
     }
 
     Err(format!(
-        "Timeout waiting for container {:?} to reach state {:?}",
-        id, expected
+        "Timeout waiting for container {id:?} to reach state {expected:?}"
     ))
 }
 
@@ -213,7 +213,7 @@ async fn test_docker_connection() {
     println!("Successfully connected to Docker daemon");
 }
 
-/// Test pulling an image with default policy (IfNotPresent)
+/// Test pulling an image with default policy (`IfNotPresent`)
 #[tokio::test]
 async fn test_pull_image() {
     let Some(runtime) = skip_if_no_docker().await else {
@@ -221,18 +221,18 @@ async fn test_pull_image() {
         return;
     };
 
-    println!("Pulling image: {}", TEST_IMAGE);
+    println!("Pulling image: {TEST_IMAGE}");
 
     let result = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
 
     match result {
         Ok(Ok(())) => println!("Image pulled successfully"),
-        Ok(Err(e)) => panic!("Failed to pull image: {}", e),
-        Err(_) => panic!("Timeout pulling image"),
+        Ok(Err(e)) => panic!("Failed to pull image: {e}"),
+        Err(e) => panic!("Timeout pulling image: {e}"),
     }
 }
 
-/// Test that IfNotPresent policy skips pulling when image exists
+/// Test that `IfNotPresent` policy skips pulling when image exists
 #[tokio::test]
 async fn test_pull_image_if_not_present() {
     let Some(runtime) = skip_if_no_docker().await else {
@@ -241,7 +241,7 @@ async fn test_pull_image_if_not_present() {
     };
 
     // First, ensure the image exists by pulling it
-    println!("Ensuring image exists: {}", TEST_IMAGE);
+    println!("Ensuring image exists: {TEST_IMAGE}");
     let _ = tokio::time::timeout(LONG_TIMEOUT, runtime.pull_image(TEST_IMAGE)).await;
 
     // Now pull with IfNotPresent - this should be instant since image exists
@@ -255,7 +255,7 @@ async fn test_pull_image_if_not_present() {
     .await;
 
     let elapsed = start.elapsed();
-    println!("IfNotPresent pull completed in {:?}", elapsed);
+    println!("IfNotPresent pull completed in {elapsed:?}");
 
     match result {
         Ok(Ok(())) => {
@@ -266,8 +266,8 @@ async fn test_pull_image_if_not_present() {
             );
             println!("IfNotPresent correctly skipped pull");
         }
-        Ok(Err(e)) => panic!("Failed with IfNotPresent policy: {}", e),
-        Err(_) => panic!("Timeout with IfNotPresent policy"),
+        Ok(Err(e)) => panic!("Failed with IfNotPresent policy: {e}"),
+        Err(e) => panic!("Timeout with IfNotPresent policy: {e}"),
     }
 }
 
@@ -294,13 +294,12 @@ async fn test_container_lifecycle() {
     let create_result = runtime.create_container(&id, &spec).await;
     assert!(
         create_result.is_ok(),
-        "Failed to create container: {:?}",
-        create_result
+        "Failed to create container: {create_result:?}"
     );
 
     // 2. Verify container exists and is in Pending state
     let state = runtime.container_state(&id).await;
-    assert!(state.is_ok(), "Failed to get container state: {:?}", state);
+    assert!(state.is_ok(), "Failed to get container state: {state:?}");
     assert_eq!(
         state.unwrap(),
         ContainerState::Pending,
@@ -312,8 +311,7 @@ async fn test_container_lifecycle() {
     let start_result = runtime.start_container(&id).await;
     assert!(
         start_result.is_ok(),
-        "Failed to start container: {:?}",
-        start_result
+        "Failed to start container: {start_result:?}"
     );
 
     // 4. Wait for Running state
@@ -330,8 +328,7 @@ async fn test_container_lifecycle() {
     let stop_result = runtime.stop_container(&id, Duration::from_secs(10)).await;
     assert!(
         stop_result.is_ok(),
-        "Failed to stop container: {:?}",
-        stop_result
+        "Failed to stop container: {stop_result:?}"
     );
 
     // 6. Verify container is stopped (Exited state)
@@ -339,9 +336,9 @@ async fn test_container_lifecycle() {
     assert!(state.is_ok(), "Failed to get container state after stop");
     match state.unwrap() {
         ContainerState::Exited { code } => {
-            println!("Container exited with code: {}", code);
+            println!("Container exited with code: {code}");
         }
-        other => panic!("Expected Exited state, got: {:?}", other),
+        other => panic!("Expected Exited state, got: {other:?}"),
     }
 
     // 7. Remove container
@@ -349,8 +346,7 @@ async fn test_container_lifecycle() {
     let remove_result = runtime.remove_container(&id).await;
     assert!(
         remove_result.is_ok(),
-        "Failed to remove container: {:?}",
-        remove_result
+        "Failed to remove container: {remove_result:?}"
     );
 
     // 8. Verify container is gone
@@ -379,7 +375,7 @@ async fn test_container_logs() {
     let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
     // Create and start container
-    println!("Creating container that outputs: {}", test_message);
+    println!("Creating container that outputs: {test_message}");
     runtime
         .create_container(&id, &spec)
         .await
@@ -405,7 +401,7 @@ async fn test_container_logs() {
         .await
         .expect("Failed to get logs");
 
-    println!("Logs: {}", logs);
+    println!("Logs: {logs}");
     assert!(
         logs.contains(test_message),
         "Logs should contain the test message"
@@ -416,7 +412,7 @@ async fn test_container_logs() {
         .get_logs(&id)
         .await
         .expect("Failed to get log lines");
-    println!("Log lines: {:?}", log_lines);
+    println!("Log lines: {log_lines:?}");
     assert!(
         log_lines.iter().any(|line| line.contains(test_message)),
         "Log lines should contain the test message"
@@ -462,10 +458,7 @@ async fn test_container_exec() {
     let cmd = vec!["echo".to_string(), "exec test output".to_string()];
     let (exit_code, stdout, stderr) = runtime.exec(&id, &cmd).await.expect("Failed to exec");
 
-    println!(
-        "Exec result - exit_code: {}, stdout: {}, stderr: {}",
-        exit_code, stdout, stderr
-    );
+    println!("Exec result - exit_code: {exit_code}, stdout: {stdout}, stderr: {stderr}");
 
     assert_eq!(exit_code, 0, "Exec should succeed with exit code 0");
     assert!(
@@ -482,10 +475,7 @@ async fn test_container_exec() {
     ];
     let (exit_code, stdout, stderr) = runtime.exec(&id, &cmd).await.expect("Failed to exec");
 
-    println!(
-        "Stderr exec - exit_code: {}, stdout: '{}', stderr: '{}'",
-        exit_code, stdout, stderr
-    );
+    println!("Stderr exec - exit_code: {exit_code}, stdout: '{stdout}', stderr: '{stderr}'");
     assert_eq!(exit_code, 0, "Exec should succeed");
     assert!(
         stderr.contains("stderr output"),
@@ -601,7 +591,7 @@ async fn test_wait_container_success() {
         .expect("Timeout waiting for container")
         .expect("Failed to wait for container");
 
-    println!("Container exited with code: {}", exit_code);
+    println!("Container exited with code: {exit_code}");
     assert_eq!(exit_code, 0, "Expected exit code 0");
 }
 
@@ -633,7 +623,7 @@ async fn test_wait_container_failure() {
     };
 
     println!("Creating and starting container for exit code 42 test");
-    println!("Container ID: {:?}", id);
+    println!("Container ID: {id:?}");
 
     runtime
         .create_container(&id, &spec)
@@ -650,7 +640,7 @@ async fn test_wait_container_failure() {
         .container_state(&id)
         .await
         .expect("Failed to get state after start");
-    println!("State after start: {:?}", state);
+    println!("State after start: {state:?}");
 
     // Wait for container using container_state polling as a workaround
     // if the wait_container API is unreliable
@@ -668,12 +658,12 @@ async fn test_wait_container_failure() {
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
             other => {
-                panic!("Unexpected state: {:?}", other);
+                panic!("Unexpected state: {other:?}");
             }
         }
     };
 
-    println!("Container exited with code: {}", exit_code);
+    println!("Container exited with code: {exit_code}");
     assert_eq!(exit_code, 42, "Expected exit code 42");
 }
 
@@ -716,10 +706,7 @@ async fn test_wait_container_timing() {
         .expect("Failed to wait for container");
     let elapsed = start.elapsed();
 
-    println!(
-        "Container exited with code {} after {:?}",
-        exit_code, elapsed
-    );
+    println!("Container exited with code {exit_code} after {elapsed:?}");
     assert_eq!(exit_code, 0, "Expected exit code 0");
     assert!(
         elapsed >= Duration::from_millis(900),
@@ -744,12 +731,12 @@ async fn test_concurrent_containers() {
     let mut ids = Vec::new();
 
     // Create multiple containers concurrently
-    println!("Creating {} containers concurrently", container_count);
+    println!("Creating {container_count} containers concurrently");
     let mut create_handles = Vec::new();
 
     for i in 0..container_count {
         let runtime_clone = runtime.clone();
-        let id = unique_container_id(&format!("concurrent-{}", i));
+        let id = unique_container_id(&format!("concurrent-{i}"));
         let spec = create_sleep_spec(300);
         let id_clone = id.clone();
 
@@ -764,11 +751,11 @@ async fn test_concurrent_containers() {
     // Wait for all creates to complete
     for handle in create_handles {
         let result = handle.await.expect("Task panicked");
-        assert!(result.is_ok(), "Failed to create container: {:?}", result);
+        assert!(result.is_ok(), "Failed to create container: {result:?}");
     }
 
     // Start all containers concurrently
-    println!("Starting {} containers concurrently", container_count);
+    println!("Starting {container_count} containers concurrently");
     let mut start_handles = Vec::new();
 
     for id in &ids {
@@ -782,7 +769,7 @@ async fn test_concurrent_containers() {
 
     for handle in start_handles {
         let result = handle.await.expect("Task panicked");
-        assert!(result.is_ok(), "Failed to start container: {:?}", result);
+        assert!(result.is_ok(), "Failed to start container: {result:?}");
     }
 
     // Verify all are running
@@ -799,10 +786,10 @@ async fn test_concurrent_containers() {
         );
     }
 
-    println!("All {} containers are running", container_count);
+    println!("All {container_count} containers are running");
 
     // Stop all containers concurrently
-    println!("Stopping {} containers concurrently", container_count);
+    println!("Stopping {container_count} containers concurrently");
     let mut stop_handles = Vec::new();
 
     for id in &ids {
@@ -818,7 +805,7 @@ async fn test_concurrent_containers() {
 
     for handle in stop_handles {
         let result = handle.await.expect("Task panicked");
-        assert!(result.is_ok(), "Failed to stop container: {:?}", result);
+        assert!(result.is_ok(), "Failed to stop container: {result:?}");
     }
 
     println!("All containers stopped successfully");
@@ -844,11 +831,11 @@ async fn test_remove_nonexistent_container() {
     // Or it might return NotFound - both are acceptable
     match result {
         Ok(()) => println!("Remove succeeded (idempotent behavior)"),
-        Err(e) => println!("Remove returned error (also acceptable): {}", e),
+        Err(e) => println!("Remove returned error (also acceptable): {e}"),
     }
 }
 
-/// Test that getting state of non-existent container returns NotFound error
+/// Test that getting state of non-existent container returns `NotFound` error
 #[tokio::test]
 async fn test_state_nonexistent_container() {
     let Some(runtime) = skip_if_no_docker().await else {
@@ -884,8 +871,7 @@ async fn test_pull_never_policy() {
     // Never policy should return Ok immediately without pulling
     assert!(
         result.is_ok(),
-        "Never policy should succeed without pulling: {:?}",
-        result
+        "Never policy should succeed without pulling: {result:?}"
     );
     println!("Never policy correctly skipped pull attempt");
 }
@@ -907,8 +893,8 @@ async fn test_pull_always_policy() {
 
     match result {
         Ok(Ok(())) => println!("Always policy pulled successfully"),
-        Ok(Err(e)) => panic!("Failed with Always policy: {}", e),
-        Err(_) => panic!("Timeout with Always policy"),
+        Ok(Err(e)) => panic!("Failed with Always policy: {e}"),
+        Err(e) => panic!("Timeout with Always policy: {e}"),
     }
 }
 
@@ -967,7 +953,7 @@ async fn test_container_with_env() {
         .await
         .expect("Failed to get logs");
 
-    println!("Container output:\n{}", logs);
+    println!("Container output:\n{logs}");
     assert!(
         logs.contains("TEST_VAR=test_value"),
         "Logs should contain TEST_VAR"

@@ -874,10 +874,10 @@ COPY --from=builder /app /app
 
     #[test]
     fn test_parse_env_instruction() {
-        let content = r#"
+        let content = r"
 FROM alpine
 ENV FOO=bar BAZ=qux
-"#;
+";
 
         let dockerfile = Dockerfile::parse(content).unwrap();
         let stage = &dockerfile.stages[0];

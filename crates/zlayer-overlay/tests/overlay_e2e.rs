@@ -1,6 +1,6 @@
-//! End-to-end integration tests for ZLayer overlay networking.
+//! End-to-end integration tests for `ZLayer` overlay networking.
 //!
-//! Tests marked with `#[ignore]` require root or CAP_NET_ADMIN capability.
+//! Tests marked with `#[ignore]` require root or `CAP_NET_ADMIN` capability.
 //! Run them with:
 //!
 //! ```sh
@@ -207,6 +207,8 @@ async fn test_overlay_config_and_peer_config_format() {
         public_key: public_key.clone(),
         overlay_cidr: "10.200.0.1/16".to_string(),
         peer_discovery_interval: Duration::from_secs(30),
+        #[cfg(feature = "nat")]
+        nat: zlayer_overlay::nat::NatConfig::default(),
     };
 
     assert_eq!(config.local_endpoint.port(), 51820);
@@ -229,7 +231,7 @@ async fn test_overlay_config_and_peer_config_format() {
         "Peer config must contain [Peer] section header"
     );
     assert!(
-        peer_config.contains(&format!("PublicKey = {}", public_key)),
+        peer_config.contains(&format!("PublicKey = {public_key}")),
         "Peer config must contain the correct public key"
     );
     assert!(
@@ -258,7 +260,7 @@ async fn test_overlay_config_and_peer_config_format() {
         "Full config must start with [Interface] section"
     );
     assert!(
-        full_config.contains(&format!("PrivateKey = {}", private_key)),
+        full_config.contains(&format!("PrivateKey = {private_key}")),
         "Full config must contain the private key"
     );
     assert!(
@@ -287,11 +289,13 @@ async fn test_overlay_interface_lifecycle() {
         .expect("key generation should succeed");
 
     let config = OverlayConfig {
-        local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), 51830),
+        local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 51830),
         private_key,
         public_key,
         overlay_cidr: "10.250.0.1/24".to_string(),
         peer_discovery_interval: Duration::from_secs(30),
+        #[cfg(feature = "nat")]
+        nat: zlayer_overlay::nat::NatConfig::default(),
     };
 
     let mut manager = OverlayTransport::new(config, iface_name.to_string());
@@ -341,8 +345,7 @@ async fn test_overlay_interface_lifecycle() {
     let link_stdout = String::from_utf8_lossy(&link_output.stdout);
     assert!(
         link_stdout.contains("UP") || link_stdout.contains("up"),
-        "Interface should be UP after configure_interface, got: {}",
-        link_stdout
+        "Interface should be UP after configure_interface, got: {link_stdout}",
     );
 
     // Verify the overlay IP is assigned
@@ -354,8 +357,7 @@ async fn test_overlay_interface_lifecycle() {
     let addr_stdout = String::from_utf8_lossy(&addr_output.stdout);
     assert!(
         addr_stdout.contains("10.250.0.1"),
-        "Interface should have overlay IP 10.250.0.1 assigned, got: {}",
-        addr_stdout
+        "Interface should have overlay IP 10.250.0.1 assigned, got: {addr_stdout}",
     );
 
     // Tear down the interface via transport shutdown
@@ -372,8 +374,7 @@ async fn test_overlay_interface_lifecycle() {
         .expect("ip link show should execute");
     assert!(
         !link_output.status.success(),
-        "Interface {} should no longer exist after shutdown",
-        iface_name
+        "Interface {iface_name} should no longer exist after shutdown",
     );
 }
 
@@ -384,6 +385,7 @@ async fn test_overlay_interface_lifecycle() {
 
 #[tokio::test]
 #[ignore = "requires root or CAP_NET_ADMIN"]
+#[allow(clippy::too_many_lines)]
 async fn test_dual_overlay_connectivity() {
     let iface_a = "wg-test-a";
     let iface_b = "wg-test-b";
@@ -402,19 +404,23 @@ async fn test_dual_overlay_connectivity() {
         .expect("key generation for B should succeed");
 
     let config_a = OverlayConfig {
-        local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port_a),
+        local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port_a),
         private_key: priv_a,
         public_key: pub_a.clone(),
-        overlay_cidr: format!("{}{}", ip_a, subnet),
+        overlay_cidr: format!("{ip_a}{subnet}"),
         peer_discovery_interval: Duration::from_secs(30),
+        #[cfg(feature = "nat")]
+        nat: zlayer_overlay::nat::NatConfig::default(),
     };
 
     let config_b = OverlayConfig {
-        local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port_b),
+        local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port_b),
         private_key: priv_b,
         public_key: pub_b.clone(),
-        overlay_cidr: format!("{}{}", ip_b, subnet),
+        overlay_cidr: format!("{ip_b}{subnet}"),
         peer_discovery_interval: Duration::from_secs(30),
+        #[cfg(feature = "nat")]
+        nat: zlayer_overlay::nat::NatConfig::default(),
     };
 
     let mut manager_a = OverlayTransport::new(config_a, iface_a.to_string());
@@ -443,16 +449,16 @@ async fn test_dual_overlay_connectivity() {
     // Peer B is a peer of A: endpoint is 127.0.0.1:port_b, allowed IP is B's overlay IP
     let peer_b_for_a = PeerInfo::new(
         pub_b.clone(),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port_b),
-        &format!("{}/32", ip_b),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_b),
+        &format!("{ip_b}/32"),
         Duration::from_secs(25),
     );
 
     // Peer A is a peer of B: endpoint is 127.0.0.1:port_a, allowed IP is A's overlay IP
     let peer_a_for_b = PeerInfo::new(
         pub_a.clone(),
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port_a),
-        &format!("{}/32", ip_a),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port_a),
+        &format!("{ip_a}/32"),
         Duration::from_secs(25),
     );
 
@@ -486,20 +492,13 @@ async fn test_dual_overlay_connectivity() {
 
     assert!(
         ping_output.status.success(),
-        "Ping from {} ({}) to {} ({}) should succeed.\nstdout: {}\nstderr: {}",
-        iface_a,
-        ip_a,
-        iface_b,
-        ip_b,
-        ping_stdout,
-        ping_stderr,
+        "Ping from {iface_a} ({ip_a}) to {iface_b} ({ip_b}) should succeed.\nstdout: {ping_stdout}\nstderr: {ping_stderr}",
     );
 
     // Verify we received replies (not 100% packet loss)
     assert!(
         !ping_stdout.contains("100% packet loss"),
-        "Ping should not have 100% packet loss.\nstdout: {}",
-        ping_stdout
+        "Ping should not have 100% packet loss.\nstdout: {ping_stdout}",
     );
 
     // Also ping in the reverse direction
@@ -535,8 +534,7 @@ async fn test_dual_overlay_connectivity() {
         .expect("ip link show should execute");
     assert!(
         !check_a.status.success(),
-        "Interface {} should be removed after shutdown",
-        iface_a
+        "Interface {iface_a} should be removed after shutdown",
     );
 
     let check_b = Command::new("ip")
@@ -546,7 +544,6 @@ async fn test_dual_overlay_connectivity() {
         .expect("ip link show should execute");
     assert!(
         !check_b.status.success(),
-        "Interface {} should be removed after shutdown",
-        iface_b
+        "Interface {iface_b} should be removed after shutdown",
     );
 }

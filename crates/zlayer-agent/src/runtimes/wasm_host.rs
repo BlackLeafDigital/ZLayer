@@ -895,10 +895,12 @@ impl ZLayerHost for DefaultHost {
     }
 }
 
-/// Add `ZLayer` host functions to a wasmtime component linker
+/// Add all `ZLayer` host functions to a wasmtime component linker
 ///
 /// This registers all `ZLayer` host interfaces with the linker so WASM components
 /// can import and call them. The store must contain a type implementing `ZLayerHost`.
+///
+/// For capability-gated linking, use [`add_to_linker_with_capabilities`] instead.
 ///
 /// # Interface Versions
 ///
@@ -950,6 +952,167 @@ where
     add_metrics_to_linker(linker)?;
 
     Ok(())
+}
+
+/// Add `ZLayer` host functions to a linker, gated by [`WasmCapabilities`].
+///
+/// Only the `ZLayer` host interfaces that are enabled in the capabilities struct
+/// will be registered with the linker. Components that try to call ungated
+/// interfaces will trap at runtime.
+///
+/// WASI standard interfaces (filesystem, sockets, CLI) are NOT controlled here;
+/// those are gated at the [`WasiCtxBuilder`](wasmtime_wasi::WasiCtxBuilder)
+/// level using [`configure_wasi_ctx_with_capabilities`].
+///
+/// # Interface Mapping
+///
+/// | Capability  | Interface                        |
+/// |-------------|----------------------------------|
+/// | `config`    | `zlayer:plugin/config@0.1.0`     |
+/// | `keyvalue`  | `zlayer:plugin/keyvalue@0.1.0`   |
+/// | `logging`   | `zlayer:plugin/logging@0.1.0`    |
+/// | `secrets`   | `zlayer:plugin/secrets@0.1.0`    |
+/// | `metrics`   | `zlayer:plugin/metrics@0.1.0`    |
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use zlayer_spec::WasmCapabilities;
+/// use zlayer_agent::runtimes::wasm_host::{add_to_linker_with_capabilities, DefaultHost};
+///
+/// let capabilities = WasmCapabilities {
+///     config: true,
+///     logging: true,
+///     keyvalue: false,
+///     secrets: false,
+///     metrics: false,
+///     ..Default::default()
+/// };
+///
+/// let mut linker = Linker::new(&engine);
+/// add_to_linker_with_capabilities(&mut linker, &capabilities)?;
+/// ```
+///
+/// # Errors
+///
+/// Returns a `wasmtime::Error` if any enabled interface fails to register.
+pub fn add_to_linker_with_capabilities<T>(
+    linker: &mut wasmtime::component::Linker<T>,
+    capabilities: &zlayer_spec::WasmCapabilities,
+) -> Result<(), wasmtime::Error>
+where
+    T: ZLayerHost + wasmtime_wasi::WasiView + 'static,
+{
+    if capabilities.config {
+        tracing::debug!("linking zlayer:plugin/config@0.1.0");
+        add_config_to_linker(linker)?;
+    }
+
+    if capabilities.keyvalue {
+        tracing::debug!("linking zlayer:plugin/keyvalue@0.1.0");
+        add_keyvalue_to_linker(linker)?;
+    }
+
+    if capabilities.logging {
+        tracing::debug!("linking zlayer:plugin/logging@0.1.0");
+        add_logging_to_linker(linker)?;
+    }
+
+    if capabilities.secrets {
+        tracing::debug!("linking zlayer:plugin/secrets@0.1.0");
+        add_secrets_to_linker(linker)?;
+    }
+
+    if capabilities.metrics {
+        tracing::debug!("linking zlayer:plugin/metrics@0.1.0");
+        add_metrics_to_linker(linker)?;
+    }
+
+    tracing::info!(
+        config = capabilities.config,
+        keyvalue = capabilities.keyvalue,
+        logging = capabilities.logging,
+        secrets = capabilities.secrets,
+        metrics = capabilities.metrics,
+        "ZLayer host interfaces linked with capabilities"
+    );
+
+    Ok(())
+}
+
+/// Configure a [`WasiCtxBuilder`](wasmtime_wasi::WasiCtxBuilder) based on
+/// [`WasmCapabilities`].
+///
+/// WASI standard interfaces (CLI, filesystem, sockets) are controlled at the
+/// `WasiCtxBuilder` level rather than the linker level, because they are
+/// provided by `wasmtime_wasi::p2::add_to_linker_*` as a bundle. The builder
+/// selectively enables or disables the underlying OS resources:
+///
+/// | Capability   | Builder calls                                          |
+/// |--------------|--------------------------------------------------------|
+/// | `cli`        | `inherit_env()`, `inherit_args()`, `inherit_stdio()`   |
+/// | `filesystem` | Preopened directories (configured separately)          |
+/// | `sockets`    | `inherit_network()`                                    |
+///
+/// When a capability is disabled, the corresponding resources are simply not
+/// provided to the WASI context. Calls to those interfaces will fail gracefully
+/// (e.g., no preopened dirs means filesystem calls return errors).
+///
+/// # Arguments
+///
+/// * `builder` - The `WasiCtxBuilder` to configure
+/// * `capabilities` - The capabilities controlling which WASI features to enable
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use zlayer_spec::WasmCapabilities;
+/// use wasmtime_wasi::WasiCtxBuilder;
+///
+/// let capabilities = WasmCapabilities {
+///     cli: true,
+///     filesystem: false,
+///     sockets: true,
+///     ..Default::default()
+/// };
+///
+/// let mut builder = WasiCtxBuilder::new();
+/// configure_wasi_ctx_with_capabilities(&mut builder, &capabilities);
+/// let ctx = builder.build();
+/// ```
+pub fn configure_wasi_ctx_with_capabilities(
+    builder: &mut wasmtime_wasi::WasiCtxBuilder,
+    capabilities: &zlayer_spec::WasmCapabilities,
+) {
+    if capabilities.cli {
+        builder.inherit_env();
+        builder.inherit_args();
+        builder.inherit_stdio();
+        tracing::debug!("WASI CLI capabilities enabled (env, args, stdio)");
+    }
+
+    if capabilities.sockets {
+        builder.inherit_network();
+        tracing::debug!("WASI sockets capability enabled (inherit_network)");
+    }
+
+    // Note: filesystem capability controls whether preopened directories are
+    // added. The actual preopen configuration is done by the caller since
+    // it requires knowledge of the specific directories to mount.
+    // When filesystem is disabled, no preopens are added, so all filesystem
+    // calls from the guest will fail with "no preopened directory" errors.
+    if capabilities.filesystem {
+        tracing::debug!("WASI filesystem capability enabled (preopens will be configured)");
+    } else {
+        tracing::debug!("WASI filesystem capability disabled (no preopens)");
+    }
+
+    tracing::info!(
+        cli = capabilities.cli,
+        filesystem = capabilities.filesystem,
+        sockets = capabilities.sockets,
+        "WASI context configured with capabilities"
+    );
 }
 
 /// Register config interface functions
@@ -1527,7 +1690,7 @@ mod tests {
             "storage error: connection failed"
         );
         assert_eq!(
-            KvError::Storage("".to_string()).to_string(),
+            KvError::Storage(String::new()).to_string(),
             "storage error: "
         );
     }
@@ -1587,7 +1750,7 @@ mod tests {
         assert_eq!(kv_error_to_wit(&KvError::QuotaExceeded), 2);
         assert_eq!(kv_error_to_wit(&KvError::InvalidKey), 3);
         assert_eq!(kv_error_to_wit(&KvError::Storage("test".to_string())), 4);
-        assert_eq!(kv_error_to_wit(&KvError::Storage("".to_string())), 4);
+        assert_eq!(kv_error_to_wit(&KvError::Storage(String::new())), 4);
     }
 
     // =========================================================================
@@ -1725,7 +1888,7 @@ mod tests {
     #[test]
     fn test_default_host_debug_formatting() {
         let host = DefaultHost::new();
-        let debug_str = format!("{:?}", host);
+        let debug_str = format!("{host:?}");
         assert!(debug_str.contains("DefaultHost"));
         assert!(debug_str.contains("plugin_id"));
     }
@@ -2385,7 +2548,7 @@ mod tests {
             LogLevel::Info,
             "message",
             &[
-                ("empty".to_string(), "".to_string()),
+                ("empty".to_string(), String::new()),
                 ("unicode".to_string(), "test".to_string()),
                 ("json".to_string(), "{\"key\": \"value\"}".to_string()),
             ],
@@ -2802,12 +2965,13 @@ mod tests {
 
     #[test]
     fn test_default_host_thread_safety() {
-        // Verify DefaultHost is Send
         fn assert_send<T: Send>() {}
+        fn assert_trait_send<T: ZLayerHost>() {}
+
+        // Verify DefaultHost is Send
         assert_send::<DefaultHost>();
 
         // Verify ZLayerHost requires Send
-        fn assert_trait_send<T: ZLayerHost>() {}
         assert_trait_send::<DefaultHost>();
     }
 }

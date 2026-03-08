@@ -1,4 +1,4 @@
-//! HTTP client for Raft network communication using bincode serialization.
+//! HTTP client for Raft network communication using postcard2 serialization.
 //!
 //! Implements `RaftNetworkFactory` and `RaftNetwork` traits from openraft,
 //! using reqwest with connection pooling and split timeouts (short for
@@ -30,7 +30,7 @@ use crate::types::NodeId;
 // HTTP client
 // ---------------------------------------------------------------------------
 
-/// HTTP client for Raft RPCs using **bincode** serialization.
+/// HTTP client for Raft RPCs using **postcard2** serialization.
 ///
 /// Maintains separate timeout configurations for regular RPCs and
 /// snapshot transfers.  Optionally attaches a bearer token to every
@@ -83,8 +83,8 @@ impl RaftHttpClient {
         }
     }
 
-    /// Send a bincode-encoded POST request and decode the response.
-    async fn bincode_post<Req, Resp>(
+    /// Send a postcard2-encoded POST request and decode the response.
+    async fn postcard_post<Req, Resp>(
         client: &Client,
         url: &str,
         request: &Req,
@@ -95,7 +95,7 @@ impl RaftHttpClient {
         Resp: serde::de::DeserializeOwned,
     {
         let body =
-            bincode::serialize(request).map_err(|e| format!("bincode serialize error: {e}"))?;
+            postcard2::to_vec(request).map_err(|e| format!("postcard2 serialize error: {e}"))?;
 
         let mut builder = client
             .post(url)
@@ -125,7 +125,7 @@ impl RaftHttpClient {
             .bytes()
             .await
             .map_err(|e| format!("read body error: {e}"))?;
-        bincode::deserialize(&bytes).map_err(|e| format!("bincode deserialize error: {e}"))
+        postcard2::from_bytes(&bytes).map_err(|e| format!("postcard2 deserialize error: {e}"))
     }
 }
 
@@ -276,7 +276,7 @@ where
         let url = format!("{}/raft/append", normalize_addr(&self.target_addr));
         debug!(target_addr = %self.target_addr, "Sending append_entries RPC");
 
-        RaftHttpClient::bincode_post(
+        RaftHttpClient::postcard_post(
             &self.client.rpc_client,
             &url,
             &rpc,
@@ -297,7 +297,7 @@ where
         let url = format!("{}/raft/snapshot", normalize_addr(&self.target_addr));
         debug!(target_addr = %self.target_addr, "Sending install_snapshot RPC");
 
-        RaftHttpClient::bincode_post(
+        RaftHttpClient::postcard_post(
             &self.client.snapshot_client,
             &url,
             &rpc,
@@ -315,7 +315,7 @@ where
         let url = format!("{}/raft/vote", normalize_addr(&self.target_addr));
         debug!(target_addr = %self.target_addr, "Sending vote RPC");
 
-        RaftHttpClient::bincode_post(
+        RaftHttpClient::postcard_post(
             &self.client.rpc_client,
             &url,
             &rpc,
@@ -350,7 +350,7 @@ where
             snapshot_data,
         };
 
-        RaftHttpClient::bincode_post::<FullSnapshotReq, SnapshotResponse<NodeId>>(
+        RaftHttpClient::postcard_post::<FullSnapshotReq, SnapshotResponse<NodeId>>(
             &self.client.snapshot_client,
             &url,
             &req,

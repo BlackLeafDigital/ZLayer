@@ -1,12 +1,12 @@
 #![cfg(target_os = "macos")]
-//! End-to-end integration tests for ZLayer macOS Seatbelt sandbox runtime
+//! End-to-end integration tests for `ZLayer` macOS Seatbelt sandbox runtime
 //!
 //! These tests verify the complete container lifecycle using the macOS
 //! sandbox runtime (`SandboxRuntime`), which uses:
 //! - `sandbox_init()` (Seatbelt) for mandatory access control
 //! - APFS `clonefile()` for copy-on-write rootfs isolation
 //! - Dynamic port allocation for host-network port isolation
-//! - Metal/MPS GPU access via IOKit whitelisting
+//! - Metal/MPS GPU access via `IOKit` whitelisting
 //!
 //! # Requirements
 //! - macOS (tests are gated with `#![cfg(target_os = "macos")]`)
@@ -51,6 +51,7 @@ const E2E_TEST_DIR: &str = "/tmp/zlayer-macos-sandbox-e2e-test";
 // =============================================================================
 
 /// Generate a unique name with the given prefix for test isolation
+#[allow(clippy::cast_possible_truncation)]
 fn unique_name(prefix: &str) -> String {
     use rand::Rng;
     let suffix: u32 = rand::rng().random_range(10000..99999);
@@ -59,7 +60,7 @@ fn unique_name(prefix: &str) -> String {
         .unwrap()
         .as_millis() as u64
         % 1_000_000;
-    format!("{}-{}-{}", prefix, timestamp, suffix)
+    format!("{prefix}-{timestamp}-{suffix}")
 }
 
 /// Wait for a container to reach the expected state with timeout
@@ -93,19 +94,18 @@ async fn wait_for_state(
                 return Ok(());
             }
             Err(e) => {
-                return Err(format!("Error getting container state: {}", e));
+                return Err(format!("Error getting container state: {e}"));
             }
         }
         tokio::time::sleep(poll_interval).await;
     }
 
     Err(format!(
-        "Timeout waiting for container {:?} to reach state {:?}",
-        id, expected
+        "Timeout waiting for container {id:?} to reach state {expected:?}"
     ))
 }
 
-/// Create a SandboxRuntime configured for E2E testing
+/// Create a `SandboxRuntime` configured for E2E testing
 fn create_e2e_runtime(gpu_access: bool) -> Result<SandboxRuntime, AgentError> {
     let test_dir = PathBuf::from(E2E_TEST_DIR);
     let config = MacSandboxConfig {
@@ -116,7 +116,7 @@ fn create_e2e_runtime(gpu_access: bool) -> Result<SandboxRuntime, AgentError> {
     SandboxRuntime::new(config)
 }
 
-/// Create a ServiceSpec that runs a macOS-native binary.
+/// Create a `ServiceSpec` that runs a macOS-native binary.
 ///
 /// Uses `/bin/echo` which is available on all macOS installations and exits
 /// immediately, making it ideal for lifecycle tests.
@@ -147,7 +147,7 @@ services:
         .expect("Missing echo service")
 }
 
-/// Create a ServiceSpec that runs a long-lived process (`/bin/sleep`).
+/// Create a `ServiceSpec` that runs a long-lived process (`/bin/sleep`).
 ///
 /// Useful for testing stop/kill behavior where the process needs to be
 /// alive long enough to test state transitions.
@@ -162,7 +162,7 @@ services:
     image:
       name: macos-native/sleep:latest
     command:
-      entrypoint: ["/bin/sleep", "{}"]
+      entrypoint: ["/bin/sleep", "{seconds}"]
     endpoints:
       - name: dummy
         protocol: tcp
@@ -170,8 +170,7 @@ services:
     scale:
       mode: fixed
       replicas: 1
-"#,
-        seconds
+"#
     );
 
     serde_yml::from_str::<DeploymentSpec>(&yaml)
@@ -181,7 +180,7 @@ services:
         .expect("Missing sleeper service")
 }
 
-/// Create a ServiceSpec with GPU (Metal compute) access enabled.
+/// Create a `ServiceSpec` with GPU (Metal compute) access enabled.
 fn create_gpu_spec() -> ServiceSpec {
     let yaml = r#"
 version: v1
@@ -213,7 +212,7 @@ services:
         .expect("Missing gpu-test service")
 }
 
-/// Create a ServiceSpec with MPS-only GPU access.
+/// Create a `ServiceSpec` with MPS-only GPU access.
 fn create_mps_spec() -> ServiceSpec {
     let yaml = r#"
 version: v1
@@ -246,7 +245,7 @@ services:
         .expect("Missing mps-test service")
 }
 
-/// Create a ServiceSpec with no endpoints (tests full network access path).
+/// Create a `ServiceSpec` with no endpoints (tests full network access path).
 fn create_no_endpoints_spec() -> ServiceSpec {
     let yaml = r#"
 version: v1
@@ -270,7 +269,7 @@ services:
         .expect("Missing no-net service")
 }
 
-/// Create a ServiceSpec with a memory limit for watchdog testing.
+/// Create a `ServiceSpec` with a memory limit for watchdog testing.
 fn create_memory_limited_spec() -> ServiceSpec {
     let yaml = r#"
 version: v1
@@ -300,7 +299,7 @@ services:
         .expect("Missing memlimit service")
 }
 
-/// Create a ServiceSpec with storage volumes for writable dir testing.
+/// Create a `ServiceSpec` with storage volumes for writable dir testing.
 fn create_volume_spec() -> ServiceSpec {
     let yaml = r#"
 version: v1
@@ -362,7 +361,7 @@ async fn prepare_native_image(runtime: &SandboxRuntime, image_name: &str) {
 
             std::fs::create_dir_all(dir.join("bin")).expect("Failed to create bin dir");
             for binary in &["echo", "sleep", "sh", "cat", "ls"] {
-                let src = format!("/bin/{}", binary);
+                let src = format!("/bin/{binary}");
                 let dst = dir.join("bin").join(binary);
                 if std::path::Path::new(&src).exists() && !dst.exists() {
                     std::fs::copy(&src, &dst).ok();
@@ -371,7 +370,7 @@ async fn prepare_native_image(runtime: &SandboxRuntime, image_name: &str) {
 
             std::fs::create_dir_all(dir.join("usr/bin")).expect("Failed to create usr/bin dir");
             for binary in &["env", "true", "false"] {
-                let src = format!("/usr/bin/{}", binary);
+                let src = format!("/usr/bin/{binary}");
                 let dst = dir.join("usr/bin").join(binary);
                 if std::path::Path::new(&src).exists() && !dst.exists() {
                     std::fs::copy(&src, &dst).ok();
@@ -387,12 +386,7 @@ async fn prepare_native_image(runtime: &SandboxRuntime, image_name: &str) {
     runtime
         .register_local_rootfs(image_name, &source_dir)
         .await
-        .unwrap_or_else(|e| {
-            panic!(
-                "Failed to register local rootfs for '{}': {}",
-                image_name, e
-            )
-        });
+        .unwrap_or_else(|e| panic!("Failed to register local rootfs for '{image_name}': {e}"));
 }
 
 /// Cleanup helper -- ensures container is removed even on test failure
@@ -408,6 +402,7 @@ impl ContainerGuard {
 }
 
 impl Drop for ContainerGuard {
+    #[allow(unsafe_code)]
     fn drop(&mut self) {
         // Synchronous cleanup: we cannot await in Drop, and tokio::spawn tasks
         // get aborted when the test runtime shuts down, leaving orphaned processes.
@@ -424,10 +419,13 @@ impl Drop for ContainerGuard {
         if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
             if let Ok(pid) = pid_str.trim().parse::<i32>() {
                 if pid > 0 {
+                    // SAFETY: pid was read from our own pid file and is > 0.
+                    // kill() and waitpid() are safe to call with any valid pid.
+                    // We use WNOHANG so waitpid() won't block.
                     unsafe {
                         libc::kill(pid, libc::SIGKILL);
                         let mut status: libc::c_int = 0;
-                        libc::waitpid(pid, &mut status, libc::WNOHANG);
+                        libc::waitpid(pid, std::ptr::addr_of_mut!(status), libc::WNOHANG);
                     }
                 }
             }
@@ -527,17 +525,16 @@ async fn test_container_lifecycle_echo() {
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
         // 1. Create container
-        println!("Creating container: {}", id);
+        println!("Creating container: {id}");
         let create_result = runtime.create_container(&id, &spec).await;
         assert!(
             create_result.is_ok(),
-            "Failed to create container: {:?}",
-            create_result
+            "Failed to create container: {create_result:?}"
         );
 
         // Verify container is in Pending state
         let state = runtime.container_state(&id).await;
-        assert!(state.is_ok(), "Failed to get container state: {:?}", state);
+        assert!(state.is_ok(), "Failed to get container state: {state:?}");
         assert_eq!(state.unwrap(), ContainerState::Pending);
 
         // 2. Verify sandbox profile was written
@@ -566,12 +563,11 @@ async fn test_container_lifecycle_echo() {
         );
 
         // 4. Start container
-        println!("Starting container: {}", id);
+        println!("Starting container: {id}");
         let start_result = runtime.start_container(&id).await;
         assert!(
             start_result.is_ok(),
-            "Failed to start container: {:?}",
-            start_result
+            "Failed to start container: {start_result:?}"
         );
 
         // 5. Verify PID file was created
@@ -596,23 +592,21 @@ async fn test_container_lifecycle_echo() {
 
         // 7. Check logs
         let logs = runtime.container_logs(&id, 100).await;
-        assert!(logs.is_ok(), "Failed to get logs: {:?}", logs);
+        assert!(logs.is_ok(), "Failed to get logs: {logs:?}");
         let log_content = logs.unwrap();
-        println!("Container logs:\n{}", log_content);
+        println!("Container logs:\n{log_content}");
         // echo should have written "hello from sandbox" to stdout
         assert!(
             log_content.contains("hello from sandbox"),
-            "Logs should contain echo output, got: {}",
-            log_content
+            "Logs should contain echo output, got: {log_content}"
         );
 
         // 8. Remove container
-        println!("Removing container: {}", id);
+        println!("Removing container: {id}");
         let remove_result = runtime.remove_container(&id).await;
         assert!(
             remove_result.is_ok(),
-            "Failed to remove container: {:?}",
-            remove_result
+            "Failed to remove container: {remove_result:?}"
         );
 
         // 9. Verify container directory is cleaned up
@@ -667,18 +661,17 @@ async fn test_container_stop_sigterm() {
 
         // Verify we can get the PID
         let pid = runtime.get_container_pid(&id).await;
-        assert!(pid.is_ok(), "Failed to get PID: {:?}", pid);
+        assert!(pid.is_ok(), "Failed to get PID: {pid:?}");
         let pid = pid.unwrap();
         assert!(pid.is_some(), "PID should be set for running container");
         println!("Container PID: {}", pid.unwrap());
 
         // Stop with timeout
-        println!("Stopping container: {}", id);
+        println!("Stopping container: {id}");
         let stop_result = runtime.stop_container(&id, Duration::from_secs(5)).await;
         assert!(
             stop_result.is_ok(),
-            "Failed to stop container: {:?}",
-            stop_result
+            "Failed to stop container: {stop_result:?}"
         );
 
         // Verify exited state
@@ -688,7 +681,7 @@ async fn test_container_stop_sigterm() {
             ContainerState::Exited { .. } => {
                 println!("Container exited as expected after stop");
             }
-            other => panic!("Expected Exited state, got: {:?}", other),
+            other => panic!("Expected Exited state, got: {other:?}"),
         }
 
         // Cleanup
@@ -696,7 +689,7 @@ async fn test_container_stop_sigterm() {
     });
 }
 
-/// Test that wait_container returns the correct exit code.
+/// Test that `wait_container` returns the correct exit code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_wait_container_exit_code() {
     with_timeout!(60, {
@@ -774,22 +767,21 @@ async fn test_unique_port_allocation() {
             ids.push(id);
         }
 
-        println!("Allocated ports: {:?}", ports);
+        println!("Allocated ports: {ports:?}");
 
         // Verify all ports are unique
         let unique_ports: std::collections::HashSet<_> = ports.iter().collect();
         assert_eq!(
             unique_ports.len(),
             ports.len(),
-            "All container ports should be unique, got: {:?}",
-            ports
+            "All container ports should be unique, got: {ports:?}"
         );
 
         // Verify all ports are valid (non-zero, not well-known ports)
         for port in &ports {
             assert!(*port > 0, "Port should be non-zero");
             // OS-assigned ephemeral ports are typically > 1024
-            assert!(*port > 1024, "Port {} should be in ephemeral range", port);
+            assert!(*port > 1024, "Port {port} should be in ephemeral range");
         }
 
         // Cleanup
@@ -819,7 +811,7 @@ async fn test_container_ip_is_localhost() {
         runtime.create_container(&id, &spec).await.expect("create");
 
         let ip = runtime.get_container_ip(&id).await;
-        assert!(ip.is_ok(), "Failed to get container IP: {:?}", ip);
+        assert!(ip.is_ok(), "Failed to get container IP: {ip:?}");
         let ip = ip.unwrap();
         assert!(ip.is_some(), "Container should have an IP");
         assert_eq!(
@@ -839,7 +831,7 @@ async fn test_container_ip_is_localhost() {
 /// Test container creation with Metal compute GPU access.
 ///
 /// Verifies that the generated Seatbelt profile contains the Metal compute
-/// IOKit rules when GPU access is enabled and vendor is "apple".
+/// `IOKit` rules when GPU access is enabled and vendor is "apple".
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gpu_metal_compute_profile() {
     with_timeout!(30, {
@@ -869,7 +861,7 @@ async fn test_gpu_metal_compute_profile() {
             .await
             .expect("Failed to read sandbox profile");
 
-        println!("Generated Seatbelt profile:\n{}", profile);
+        println!("Generated Seatbelt profile:\n{profile}");
 
         // Verify Metal compute rules are present
         assert!(
@@ -900,8 +892,8 @@ async fn test_gpu_metal_compute_profile() {
 /// Test container creation with MPS-only GPU access.
 ///
 /// MPS-only mode has a smaller attack surface than full Metal compute --
-/// it omits AGXCompilerService XPC services and cvmsServ. However,
-/// MTLCompilerService is still required because MPSGraph uses JIT
+/// it omits `AGXCompilerService` XPC services and `cvmsServ`. However,
+/// `MTLCompilerService` is still required because `MPSGraph` uses JIT
 /// compilation internally on macOS 26+.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gpu_mps_only_profile() {
@@ -956,7 +948,7 @@ async fn test_gpu_mps_only_profile() {
     });
 }
 
-/// Test that GPU access is denied when the runtime has gpu_access=false,
+/// Test that GPU access is denied when the runtime has `gpu_access=false`,
 /// even if the spec requests a GPU.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_gpu_denied_when_runtime_disabled() {
@@ -1010,7 +1002,7 @@ async fn test_gpu_denied_when_runtime_disabled() {
 /// Test Seatbelt profile generation for different network configurations.
 ///
 /// Verifies that the profile correctly restricts network access based on
-/// the ServiceSpec's endpoints.
+/// the `ServiceSpec`'s endpoints.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_network_localhost_only_profile() {
     with_timeout!(30, {
@@ -1259,18 +1251,14 @@ async fn test_exec_in_container() {
         // Execute a command in the container's sandbox
         let cmd = vec!["/bin/echo".to_string(), "exec test".to_string()];
         let result = runtime.exec(&id, &cmd).await;
-        assert!(result.is_ok(), "exec failed: {:?}", result);
+        assert!(result.is_ok(), "exec failed: {result:?}");
 
         let (exit_code, stdout, stderr) = result.unwrap();
-        println!(
-            "exec exit_code={}, stdout={}, stderr={}",
-            exit_code, stdout, stderr
-        );
+        println!("exec exit_code={exit_code}, stdout={stdout}, stderr={stderr}");
         assert_eq!(exit_code, 0, "echo should exit with code 0");
         assert!(
             stdout.contains("exec test"),
-            "stdout should contain echo output, got: {}",
-            stdout
+            "stdout should contain echo output, got: {stdout}"
         );
 
         let _ = runtime.stop_container(&id, Duration::from_secs(5)).await;
@@ -1319,12 +1307,12 @@ async fn test_container_stats() {
 
         // Get stats
         let stats = runtime.get_container_stats(&id).await;
-        assert!(stats.is_ok(), "Failed to get stats: {:?}", stats);
+        assert!(stats.is_ok(), "Failed to get stats: {stats:?}");
 
         let stats = stats.unwrap();
         println!(
             "Container stats: cpu_usec={}, memory_bytes={}, memory_limit={}",
-            stats.cpu_usage_usec, stats.memory_bytes, stats.memory_limit
+            stats.cpu_usage_usec, stats.memory_bytes, stats.memory_limit,
         );
 
         // Memory should be non-zero (process is running)
@@ -1407,7 +1395,7 @@ async fn test_memory_limited_container() {
 
         // Get stats -- memory_limit should reflect the configured 512Mi
         let stats = runtime.get_container_stats(&id).await;
-        assert!(stats.is_ok(), "Failed to get stats: {:?}", stats);
+        assert!(stats.is_ok(), "Failed to get stats: {stats:?}");
         // 512Mi = 536870912 bytes
         // Note: The memory_limit in stats comes from the SandboxContainer's memory_limit field
         // We cannot directly verify it through the public API, but if stats work the watchdog
@@ -1428,7 +1416,7 @@ async fn test_memory_limited_container() {
 
 /// Test that removing a non-existent container succeeds (idempotent).
 ///
-/// Like the youki runtime, remove_container should be idempotent so that
+/// Like the youki runtime, `remove_container` should be idempotent so that
 /// cleanup operations are resilient.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_remove_nonexistent_is_idempotent() {
@@ -1440,7 +1428,7 @@ async fn test_remove_nonexistent_is_idempotent() {
             replica: 999,
         };
 
-        println!("Attempting to remove non-existent container: {}", id);
+        println!("Attempting to remove non-existent container: {id}");
         let result = runtime.remove_container(&id).await;
 
         // remove_container checks the directory; if it doesn't exist,
@@ -1448,13 +1436,12 @@ async fn test_remove_nonexistent_is_idempotent() {
         // either, so it should succeed.
         assert!(
             result.is_ok(),
-            "remove_container should be idempotent: {:?}",
-            result
+            "remove_container should be idempotent: {result:?}"
         );
     });
 }
 
-/// Test that container_state returns NotFound for a non-existent container.
+/// Test that `container_state` returns `NotFound` for a non-existent container.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_state_nonexistent() {
     with_timeout!(30, {
@@ -1472,12 +1459,9 @@ async fn test_state_nonexistent() {
                 println!("Got expected NotFound error for container state");
             }
             Err(other) => {
-                panic!("Expected NotFound, got: {:?}", other);
+                panic!("Expected NotFound, got: {other:?}");
             }
-            Ok(state) => panic!(
-                "Should not get state for non-existent container, got: {:?}",
-                state
-            ),
+            Ok(state) => panic!("Should not get state for non-existent container, got: {state:?}"),
         }
     });
 }
@@ -1530,20 +1514,19 @@ services:
                 assert!(
                     reason.contains("rootfs not found")
                         || reason.contains("Image rootfs not found"),
-                    "Error should mention missing rootfs, got: {}",
-                    reason
+                    "Error should mention missing rootfs, got: {reason}"
                 );
-                println!("Got expected error: {}", reason);
+                println!("Got expected error: {reason}");
             }
             Err(other) => {
-                panic!("Expected CreateFailed, got: {:?}", other);
+                panic!("Expected CreateFailed, got: {other:?}");
             }
-            Ok(_) => panic!("Should have failed"),
+            Ok(()) => panic!("Should have failed"),
         }
     });
 }
 
-/// Test that starting a non-existent container returns NotFound.
+/// Test that starting a non-existent container returns `NotFound`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_start_nonexistent_fails() {
     with_timeout!(30, {
@@ -1564,9 +1547,9 @@ async fn test_start_nonexistent_fails() {
                 println!("Got expected NotFound error");
             }
             Err(other) => {
-                panic!("Expected NotFound, got: {:?}", other);
+                panic!("Expected NotFound, got: {other:?}");
             }
-            Ok(_) => panic!("Should have failed"),
+            Ok(()) => panic!("Should have failed"),
         }
     });
 }
@@ -1598,12 +1581,11 @@ async fn test_exec_empty_command_fails() {
             Err(AgentError::InvalidSpec(msg)) => {
                 assert!(
                     msg.contains("empty"),
-                    "Error should mention empty command, got: {}",
-                    msg
+                    "Error should mention empty command, got: {msg}"
                 );
             }
             Err(other) => {
-                panic!("Expected InvalidSpec, got: {:?}", other);
+                panic!("Expected InvalidSpec, got: {other:?}");
             }
             Ok(_) => panic!("Should have failed"),
         }
@@ -1638,7 +1620,7 @@ async fn test_concurrent_containers() {
 
             handles.push(tokio::spawn(async move {
                 let id = ContainerId {
-                    service: format!("{}-{}", name, i),
+                    service: format!("{name}-{i}"),
                     replica: 1,
                 };
 
@@ -1654,7 +1636,7 @@ async fn test_concurrent_containers() {
             if result.is_ok() {
                 created_ids.push(id);
             } else {
-                eprintln!("Failed to create container: {:?}", result);
+                eprintln!("Failed to create container: {result:?}");
             }
         }
 
@@ -1681,7 +1663,7 @@ async fn test_concurrent_containers() {
                 started += 1;
             }
         }
-        println!("Started {} containers concurrently", started);
+        println!("Started {started} containers concurrently");
         assert_eq!(started, container_count, "All containers should start");
 
         // Cleanup all containers
@@ -1728,8 +1710,7 @@ async fn test_stale_container_cleanup() {
         let result = runtime.create_container(&id, &spec).await;
         assert!(
             result.is_ok(),
-            "create_container should succeed even with stale dir: {:?}",
-            result
+            "create_container should succeed even with stale dir: {result:?}"
         );
 
         // Stale file should be gone, fresh config should exist
@@ -1798,7 +1779,7 @@ async fn test_volume_writable_dirs_in_profile() {
 // Container Logs Tests
 // =============================================================================
 
-/// Test get_logs (vector form) for a container.
+/// Test `get_logs` (vector form) for a container.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_get_logs_vector() {
     with_timeout!(60, {
@@ -1830,10 +1811,10 @@ async fn test_get_logs_vector() {
 
         // Get logs as vector
         let logs = runtime.get_logs(&id).await;
-        assert!(logs.is_ok(), "Failed to get logs: {:?}", logs);
+        assert!(logs.is_ok(), "Failed to get logs: {logs:?}");
 
         let log_lines = logs.unwrap();
-        println!("Log lines: {:?}", log_lines);
+        println!("Log lines: {log_lines:?}");
 
         // At least one line should contain our echo output
         let has_output = log_lines
@@ -1841,8 +1822,7 @@ async fn test_get_logs_vector() {
             .any(|line| line.contains("hello from sandbox"));
         assert!(
             has_output,
-            "Logs should contain echo output, got: {:?}",
-            log_lines
+            "Logs should contain echo output, got: {log_lines:?}"
         );
 
         let _ = runtime.remove_container(&id).await;

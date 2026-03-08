@@ -44,8 +44,10 @@ pub use placement::{
     NodeResources, NodeState, PlacementDecision, PlacementReason, PlacementState,
 };
 pub use raft::{
-    AddMemberParams, ClusterState, GpuInfoSummary, HealthStatus, NodeId, NodeInfo, RaftConfig,
-    RaftCoordinator, Request, Response, ScaleEvent, ServiceState, TypeConfig, ZLayerRaft,
+    force_leader_marker_path, load_and_clear_force_leader_state, save_force_leader_state,
+    target_voters, AddMemberParams, ClusterState, GpuInfoSummary, HealthStatus, MemberRole, NodeId,
+    NodeInfo, RaftConfig, RaftCoordinator, Request, Response, ScaleEvent, ServiceState, TypeConfig,
+    ZLayerRaft,
 };
 pub use raft_network::RaftHttpClient;
 pub use raft_service::RaftService;
@@ -449,7 +451,7 @@ impl Scheduler {
             node_mode: zlayer_spec::NodeMode::Shared,
             node_selector: None,
             service_type: zlayer_spec::ServiceType::default(),
-            wasm_http: None,
+            wasm: None,
             host_network: false,
         };
 
@@ -1014,7 +1016,7 @@ mod tests {
 
         match decision {
             ScalingDecision::ScaleUp { from: 2, to: 3, .. } => {}
-            other => panic!("Expected ScaleUp, got {:?}", other),
+            other => panic!("Expected ScaleUp, got {other:?}"),
         }
     }
 
@@ -1033,8 +1035,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(err, SchedulerError::NotLeader),
-            "Expected NotLeader, got: {:?}",
-            err
+            "Expected NotLeader, got: {err:?}"
         );
     }
 }

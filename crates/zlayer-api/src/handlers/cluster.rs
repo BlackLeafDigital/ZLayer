@@ -76,6 +76,8 @@ pub struct ClusterJoinResponse {
     pub overlay_ip: String,
     /// Existing peers in the cluster
     pub peers: Vec<ClusterPeer>,
+    /// Role assigned to this node: "voter" or "learner"
+    pub role: String,
 }
 
 /// Summary of an existing cluster peer returned in join response.
@@ -137,6 +139,8 @@ pub struct ClusterApiState {
     /// Internal shared secret for authenticating peer-broadcast calls to existing nodes.
     /// Required for the leader to POST `/api/v1/internal/add-peer` on other nodes.
     pub internal_token: Option<String>,
+    /// Data directory for Raft storage and recovery markers.
+    pub data_dir: Option<std::path::PathBuf>,
 }
 
 impl ClusterApiState {
@@ -146,11 +150,13 @@ impl ClusterApiState {
     /// `join_secret` is the `auth_secret` that must appear in the join token.
     /// `ip_allocator` is a CIDR-aware allocator for overlay IPs.
     /// `ip_allocator_path` is the file path used to persist allocator state.
+    /// `data_dir` is the Raft data directory for recovery markers.
     pub fn new(
         raft: Option<Arc<RaftCoordinator>>,
         join_secret: Option<String>,
         ip_allocator: Arc<RwLock<IpAllocator>>,
         ip_allocator_path: Option<std::path::PathBuf>,
+        data_dir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             raft,
@@ -159,6 +165,7 @@ impl ClusterApiState {
             ip_allocator,
             ip_allocator_path,
             internal_token: None,
+            data_dir,
         }
     }
 
@@ -169,6 +176,7 @@ impl ClusterApiState {
         ip_allocator: Arc<RwLock<IpAllocator>>,
         ip_allocator_path: Option<std::path::PathBuf>,
         internal_token: String,
+        data_dir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
             raft,
@@ -177,6 +185,7 @@ impl ClusterApiState {
             ip_allocator,
             ip_allocator_path,
             internal_token: Some(internal_token),
+            data_dir,
         }
     }
 
@@ -198,6 +207,7 @@ impl ClusterApiState {
             ip_allocator: Arc::new(RwLock::new(allocator)),
             ip_allocator_path: None,
             internal_token: None,
+            data_dir: None,
         }
     }
 
@@ -269,21 +279,23 @@ pub async fn cluster_join(
     };
 
     // 6. Add the member to the Raft cluster (with overlay networking metadata)
-    raft.add_member(AddMemberParams {
-        node_id: raft_node_id,
-        addr: raft_addr,
-        wg_public_key: req.wg_public_key.clone(),
-        overlay_ip: overlay_ip.clone(),
-        overlay_port: req.overlay_port,
-        advertise_addr: req.advertise_addr.clone(),
-        api_port: req.api_port,
-        cpu_total: req.cpu_total,
-        memory_total: req.memory_total,
-        disk_total: req.disk_total,
-        gpus: req.gpus.clone(),
-    })
-    .await
-    .map_err(|e| ApiError::Internal(format!("Failed to add member to Raft: {e}")))?;
+    let role = raft
+        .add_member(AddMemberParams {
+            node_id: raft_node_id,
+            addr: raft_addr,
+            wg_public_key: req.wg_public_key.clone(),
+            overlay_ip: overlay_ip.clone(),
+            overlay_port: req.overlay_port,
+            advertise_addr: req.advertise_addr.clone(),
+            api_port: req.api_port,
+            cpu_total: req.cpu_total,
+            memory_total: req.memory_total,
+            disk_total: req.disk_total,
+            gpus: req.gpus.clone(),
+            mode: req.mode.clone(),
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to add member to Raft: {e}")))?;
 
     info!(
         node_uuid = %node_uuid,
@@ -390,6 +402,10 @@ pub async fn cluster_join(
         raft_node_id,
         overlay_ip,
         peers,
+        role: match role {
+            zlayer_scheduler::raft::MemberRole::Voter => "voter".to_string(),
+            zlayer_scheduler::raft::MemberRole::Learner => "learner".to_string(),
+        },
     }))
 }
 
@@ -411,20 +427,30 @@ pub async fn cluster_list_nodes(
     let cluster_state = raft.read_state().await;
     let leader_id = raft.leader_id();
 
+    let metrics = raft.metrics();
+    let voter_ids: std::collections::BTreeSet<u64> =
+        metrics.membership_config.voter_ids().collect();
+
     let nodes: Vec<ClusterNodeSummary> = cluster_state
         .nodes
         .values()
-        .map(|n| ClusterNodeSummary {
-            id: format!("{}", n.node_id),
-            address: n.address.clone(),
-            status: "ready".to_string(),
-            mode: if Some(n.node_id) == leader_id {
+        .map(|n| {
+            let mode = if Some(n.node_id) == leader_id {
                 "leader".to_string()
+            } else if voter_ids.contains(&n.node_id) {
+                "voter".to_string()
             } else {
-                "worker".to_string()
-            },
-            services: Vec::new(),
-            is_leader: Some(n.node_id) == leader_id,
+                "learner".to_string()
+            };
+
+            ClusterNodeSummary {
+                id: format!("{}", n.node_id),
+                address: n.address.clone(),
+                status: n.status.clone(),
+                mode,
+                services: Vec::new(),
+                is_leader: Some(n.node_id) == leader_id,
+            }
         })
         .collect();
 
@@ -506,6 +532,95 @@ pub async fn cluster_heartbeat(
         )
             .into_response(),
     }
+}
+
+// =============================================================================
+// Force-leader types and handler
+// =============================================================================
+
+/// Request body for force-leader operation.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ForceLeaderRequest {
+    /// Confirmation string -- must be `"CONFIRM_FORCE_LEADER"` to prevent accidents
+    pub confirm: String,
+}
+
+/// Response body for force-leader operation.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ForceLeaderResponse {
+    pub success: bool,
+    pub message: String,
+    /// Number of cluster nodes whose state was preserved
+    pub preserved_nodes: usize,
+    /// Number of services whose state was preserved
+    pub preserved_services: usize,
+}
+
+/// Force this node to become the cluster leader (disaster recovery).
+///
+/// `POST /api/v1/cluster/force-leader`
+///
+/// DESTRUCTIVE operation for when the original leader is permanently lost.
+/// Saves cluster state, shuts down Raft, writes a recovery marker.
+/// The daemon must be restarted to complete recovery.
+///
+/// # Errors
+///
+/// Returns an error if the confirmation string is wrong, the Raft coordinator
+/// is unavailable, this node is already the leader, or the recovery state
+/// cannot be saved.
+pub async fn cluster_force_leader(
+    State(state): State<ClusterApiState>,
+    Json(req): Json<ForceLeaderRequest>,
+) -> Result<Json<ForceLeaderResponse>> {
+    if req.confirm != "CONFIRM_FORCE_LEADER" {
+        return Err(ApiError::BadRequest(
+            "Must provide confirm: \"CONFIRM_FORCE_LEADER\"".into(),
+        ));
+    }
+
+    let raft = state
+        .raft
+        .as_ref()
+        .ok_or_else(|| ApiError::ServiceUnavailable("Raft coordinator not available".into()))?;
+
+    if raft.is_leader() {
+        return Err(ApiError::BadRequest(
+            "This node is already the leader".into(),
+        ));
+    }
+
+    // Check if leader is actually unreachable
+    let metrics = raft.metrics();
+    if let Some(millis) = metrics.millis_since_quorum_ack {
+        if millis < 30_000 {
+            return Err(ApiError::BadRequest(format!(
+                "Leader was seen {millis}ms ago. Wait for confirmed unreachability (>30s).",
+            )));
+        }
+    }
+
+    let saved_state = raft.read_state().await;
+    let preserved_nodes = saved_state.nodes.len();
+    let preserved_services = saved_state.services.len();
+
+    // Save recovery marker - we need the data_dir from ClusterApiState
+    // Use a well-known path derived from the raft coordinator's config
+    if let Some(ref data_dir) = state.data_dir {
+        zlayer_scheduler::raft::save_force_leader_state(data_dir, &saved_state)
+            .map_err(|e| ApiError::Internal(format!("Failed to save recovery state: {e}")))?;
+    }
+
+    if let Err(e) = raft.shutdown().await {
+        warn!("Raft shutdown during force-leader: {e}");
+    }
+
+    Ok(Json(ForceLeaderResponse {
+        success: true,
+        message: "Force-leader initiated. Restart the daemon to complete recovery.".into(),
+        preserved_nodes,
+        preserved_services,
+    }))
 }
 
 // =============================================================================
@@ -614,7 +729,7 @@ mod tests {
         assert_eq!(req.mode, "full"); // default
         assert!(req.services.is_none());
         // Resource fields default to zero/empty
-        assert_eq!(req.cpu_total, 0.0);
+        assert!((req.cpu_total - 0.0).abs() < f64::EPSILON);
         assert_eq!(req.memory_total, 0);
         assert_eq!(req.disk_total, 0);
         assert!(req.gpus.is_empty());
@@ -636,9 +751,9 @@ mod tests {
             ]
         }"#;
         let req: ClusterJoinRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.cpu_total, 16.0);
-        assert_eq!(req.memory_total, 68719476736);
-        assert_eq!(req.disk_total, 1099511627776);
+        assert!((req.cpu_total - 16.0).abs() < f64::EPSILON);
+        assert_eq!(req.memory_total, 68_719_476_736);
+        assert_eq!(req.disk_total, 1_099_511_627_776);
         assert_eq!(req.gpus.len(), 1);
         assert_eq!(req.gpus[0].vendor, "nvidia");
         assert_eq!(req.gpus[0].memory_mb, 81920);
@@ -654,9 +769,9 @@ mod tests {
         }"#;
         let req: HeartbeatRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.node_id, 2);
-        assert_eq!(req.cpu_used, 4.5);
-        assert_eq!(req.memory_used, 8589934592);
-        assert_eq!(req.disk_used, 107374182400);
+        assert!((req.cpu_used - 4.5).abs() < f64::EPSILON);
+        assert_eq!(req.memory_used, 8_589_934_592);
+        assert_eq!(req.disk_used, 107_374_182_400);
     }
 
     #[test]
@@ -666,6 +781,7 @@ mod tests {
             raft_node_id: 2,
             overlay_ip: "10.200.0.2".into(),
             peers: vec![],
+            role: "voter".into(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("uuid-123"));

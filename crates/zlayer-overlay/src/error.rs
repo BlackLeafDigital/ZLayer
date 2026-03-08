@@ -89,6 +89,26 @@ pub enum OverlayError {
     /// DNS error
     #[error("DNS error: {0}")]
     Dns(String),
+
+    /// STUN discovery failed
+    #[error("STUN discovery failed: {0}")]
+    StunDiscovery(String),
+
+    /// Hole punch failed for a specific peer
+    #[error("Hole punch failed for peer {peer}: {reason}")]
+    HolePunchFailed { peer: String, reason: String },
+
+    /// TURN relay error
+    #[error("TURN relay error: {0}")]
+    TurnRelay(String),
+
+    /// NAT traversal exhausted all candidates
+    #[error("NAT traversal failed for peer {peer}: exhausted all candidates")]
+    NatTraversalFailed { peer: String },
+
+    /// No STUN servers configured
+    #[error("No STUN servers configured")]
+    NoStunServers,
 }
 
 /// Result type alias for overlay operations

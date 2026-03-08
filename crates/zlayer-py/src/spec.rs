@@ -12,7 +12,7 @@ use std::time::Duration;
 ///
 /// This class represents a parsed `ZLayer` deployment specification,
 /// providing access to its services and configuration.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct Spec {
     inner: zlayer_spec::DeploymentSpec,
@@ -120,7 +120,7 @@ impl Spec {
 }
 
 /// A service specification
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct ServiceSpec {
     name: String,
@@ -231,7 +231,7 @@ impl ServiceSpec {
 }
 
 /// An endpoint specification
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct EndpointSpec {
     inner: zlayer_spec::EndpointSpec,
@@ -289,7 +289,7 @@ impl EndpointSpec {
 }
 
 /// A scale specification
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct ScaleSpec {
     inner: zlayer_spec::ScaleSpec,
@@ -357,7 +357,7 @@ impl ScaleSpec {
 }
 
 /// A dependency specification
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct DependsSpec {
     inner: zlayer_spec::DependsSpec,
@@ -407,7 +407,7 @@ impl DependsSpec {
 }
 
 /// Resource limits specification
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct ResourcesSpec {
     inner: zlayer_spec::ResourcesSpec,
@@ -437,7 +437,7 @@ impl ResourcesSpec {
 }
 
 /// Health check specification
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Clone)]
 pub struct HealthSpec {
     inner: zlayer_spec::HealthSpec,
@@ -568,7 +568,7 @@ pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResu
         node_mode: zlayer_spec::NodeMode::default(),
         node_selector: None,
         service_type: zlayer_spec::ServiceType::default(),
-        wasm_http: None,
+        wasm: None,
         host_network: false,
     };
 
