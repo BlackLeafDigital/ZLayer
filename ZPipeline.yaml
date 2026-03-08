@@ -15,6 +15,7 @@ vars:
 defaults:
   format: oci
   retries: 2
+  # platforms: ["linux/amd64", "linux/arm64"]  # Multi-arch builds (requires qemu-user-static)
   cache_mounts:
     - target: /root/.cache/cargo-leptos
       id: cargo-leptos-cache

@@ -645,6 +645,46 @@ impl BuildahCommand {
     }
 
     // =========================================================================
+    // Manifest Commands
+    // =========================================================================
+
+    /// Create a new manifest list.
+    ///
+    /// `buildah manifest create <name>`
+    #[must_use]
+    pub fn manifest_create(name: &str) -> Self {
+        Self::new("manifest").arg("create").arg(name)
+    }
+
+    /// Add an image to a manifest list.
+    ///
+    /// `buildah manifest add <list> <image>`
+    #[must_use]
+    pub fn manifest_add(list: &str, image: &str) -> Self {
+        Self::new("manifest").arg("add").arg(list).arg(image)
+    }
+
+    /// Push a manifest list and all referenced images.
+    ///
+    /// `buildah manifest push --all <list> <destination>`
+    #[must_use]
+    pub fn manifest_push(list: &str, destination: &str) -> Self {
+        Self::new("manifest")
+            .arg("push")
+            .arg("--all")
+            .arg(list)
+            .arg(destination)
+    }
+
+    /// Remove a manifest list.
+    ///
+    /// `buildah manifest rm <list>`
+    #[must_use]
+    pub fn manifest_rm(list: &str) -> Self {
+        Self::new("manifest").arg("rm").arg(list)
+    }
+
+    // =========================================================================
     // Convert Instruction to Commands
     // =========================================================================
 
@@ -1016,5 +1056,43 @@ mod tests {
         assert!(cmd.args.contains(&"--".to_string()));
         assert!(cmd.args.contains(&"pip".to_string()));
         assert!(cmd.args.contains(&"install".to_string()));
+    }
+
+    #[test]
+    fn test_manifest_create() {
+        let cmd = BuildahCommand::manifest_create("myapp:latest");
+        assert_eq!(cmd.program, "buildah");
+        assert_eq!(cmd.args, vec!["manifest", "create", "myapp:latest"]);
+    }
+
+    #[test]
+    fn test_manifest_add() {
+        let cmd = BuildahCommand::manifest_add("myapp:latest", "myapp-amd64:latest");
+        assert_eq!(
+            cmd.args,
+            vec!["manifest", "add", "myapp:latest", "myapp-amd64:latest"]
+        );
+    }
+
+    #[test]
+    fn test_manifest_push() {
+        let cmd =
+            BuildahCommand::manifest_push("myapp:latest", "docker://registry.example.com/myapp");
+        assert_eq!(
+            cmd.args,
+            vec![
+                "manifest",
+                "push",
+                "--all",
+                "myapp:latest",
+                "docker://registry.example.com/myapp"
+            ]
+        );
+    }
+
+    #[test]
+    fn test_manifest_rm() {
+        let cmd = BuildahCommand::manifest_rm("myapp:latest");
+        assert_eq!(cmd.args, vec!["manifest", "rm", "myapp:latest"]);
     }
 }

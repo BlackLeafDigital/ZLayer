@@ -42,6 +42,7 @@ pub async fn cmd_pipeline(
     fail_fast: bool,
     _no_tui: bool,
     only: Option<String>,
+    platform: Option<String>,
 ) -> Result<()> {
     let file = discover_pipeline_file(file)?;
 
@@ -58,6 +59,12 @@ pub async fn cmd_pipeline(
             .split_once('=')
             .with_context(|| format!("Invalid --set format '{s}', expected KEY=VALUE"))?;
         pipeline.vars.insert(key.to_string(), value.to_string());
+    }
+
+    // Override platforms if --platform was passed
+    if let Some(ref plat) = platform {
+        let platforms: Vec<String> = plat.split(',').map(|s| s.trim().to_string()).collect();
+        pipeline.defaults.platforms = platforms;
     }
 
     // 3. Filter --only images
