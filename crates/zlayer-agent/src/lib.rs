@@ -184,7 +184,7 @@ pub async fn is_docker_available() -> bool {
 /// # Example
 ///
 /// ```
-/// use zlayer_agent::is_wasm_available;
+/// use zlayer_agent_zql::is_wasm_available;
 ///
 /// if is_wasm_available() {
 ///     println!("WASM runtime is available");
@@ -227,9 +227,9 @@ pub fn is_wasm_available() -> bool {
 ///
 /// # Example
 /// ```no_run
-/// use zlayer_agent::{RuntimeConfig, create_runtime};
+/// use zlayer_agent_zql::{RuntimeConfig, create_runtime};
 ///
-/// # async fn example() -> Result<(), zlayer_agent::AgentError> {
+/// # async fn example() -> Result<(), zlayer_agent_zql::AgentError> {
 /// let runtime = create_runtime(RuntimeConfig::Auto).await?;
 /// # Ok(())
 /// # }

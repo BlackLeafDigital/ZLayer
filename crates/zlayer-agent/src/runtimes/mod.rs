@@ -23,11 +23,11 @@
 //! the artifact type and create the appropriate runtime:
 //!
 //! ```no_run
-//! use zlayer_agent::runtimes::create_runtime_for_image;
+//! use zlayer_agent_zql::runtimes::create_runtime_for_image;
 //! use zlayer_registry::{BlobCache, ImagePuller};
 //! use std::sync::Arc;
 //!
-//! # async fn example() -> Result<(), zlayer_agent::AgentError> {
+//! # async fn example() -> Result<(), zlayer_agent_zql::AgentError> {
 //! let cache = BlobCache::open("/tmp/blobs.redb").unwrap();
 //! let registry = Arc::new(ImagePuller::new(cache));
 //!
@@ -76,9 +76,9 @@
 //! # Examples
 //!
 //! ```no_run
-//! use zlayer_agent::{RuntimeConfig, create_runtime};
+//! use zlayer_agent_zql::{RuntimeConfig, create_runtime};
 //!
-//! # async fn example() -> Result<(), zlayer_agent::AgentError> {
+//! # async fn example() -> Result<(), zlayer_agent_zql::AgentError> {
 //! // Auto-select the best runtime for this platform
 //! let runtime = create_runtime(RuntimeConfig::Auto).await?;
 //!
@@ -88,7 +88,7 @@
 //!
 //! #[cfg(feature = "wasm")]
 //! {
-//!     use zlayer_agent::WasmConfig;
+//!     use zlayer_agent_zql::WasmConfig;
 //!     let wasm_runtime = create_runtime(RuntimeConfig::Wasm(WasmConfig::default())).await?;
 //! }
 //! # Ok(())
@@ -332,11 +332,11 @@ use zlayer_registry::ImagePuller;
 /// # Examples
 ///
 /// ```no_run
-/// use zlayer_agent::runtimes::create_runtime_for_image;
+/// use zlayer_agent_zql::runtimes::create_runtime_for_image;
 /// use zlayer_registry::{BlobCache, ImagePuller};
 /// use std::sync::Arc;
 ///
-/// # async fn example() -> Result<(), zlayer_agent::AgentError> {
+/// # async fn example() -> Result<(), zlayer_agent_zql::AgentError> {
 /// // Create a registry client
 /// let cache = BlobCache::open("/tmp/blobs.redb").unwrap();
 /// let registry = Arc::new(ImagePuller::new(cache));

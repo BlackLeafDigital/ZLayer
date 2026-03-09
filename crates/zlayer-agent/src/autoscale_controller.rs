@@ -19,8 +19,8 @@
 //! # Example
 //!
 //! ```ignore
-//! use zlayer_agent::autoscale_controller::AutoscaleController;
-//! use zlayer_agent::{ServiceManager, RuntimeConfig, create_runtime};
+//! use zlayer_agent_zql::autoscale_controller::AutoscaleController;
+//! use zlayer_agent_zql::{ServiceManager, RuntimeConfig, create_runtime};
 //! use std::sync::Arc;
 //! use std::time::Duration;
 //!

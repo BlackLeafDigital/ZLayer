@@ -35,7 +35,7 @@
 //! ## Usage
 //!
 //! ```no_run,ignore
-//! use zlayer_agent::runtimes::wasm_http::{WasmHttpRuntime, HttpRequest};
+//! use zlayer_agent_zql::runtimes::wasm_http::{WasmHttpRuntime, HttpRequest};
 //! use zlayer_spec::WasmConfig;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {

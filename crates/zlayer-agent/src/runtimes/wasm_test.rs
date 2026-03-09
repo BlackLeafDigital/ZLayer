@@ -18,7 +18,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use zlayer_agent::runtimes::wasm_test::TestHost;
+//! use zlayer_agent_zql::runtimes::wasm_test::TestHost;
 //!
 //! #[tokio::test]
 //! async fn test_my_plugin() {

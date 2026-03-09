@@ -17,7 +17,7 @@
 //! # Usage
 //!
 //! ```rust,ignore
-//! use zlayer_agent::runtimes::wasm_host::{add_to_linker, DefaultHost};
+//! use zlayer_agent_zql::runtimes::wasm_host::{add_to_linker, DefaultHost};
 //! use wasmtime::component::Linker;
 //!
 //! let mut linker = Linker::new(&engine);
@@ -916,7 +916,7 @@ impl ZLayerHost for DefaultHost {
 /// ```rust,ignore
 /// use wasmtime::component::{Component, Linker};
 /// use wasmtime::{Engine, Store, Config};
-/// use zlayer_agent::runtimes::wasm_host::{add_to_linker, DefaultHost};
+/// use zlayer_agent_zql::runtimes::wasm_host::{add_to_linker, DefaultHost};
 ///
 /// let mut config = Config::new();
 /// config.wasm_component_model(true);
@@ -978,7 +978,7 @@ where
 ///
 /// ```rust,ignore
 /// use zlayer_spec::WasmCapabilities;
-/// use zlayer_agent::runtimes::wasm_host::{add_to_linker_with_capabilities, DefaultHost};
+/// use zlayer_agent_zql::runtimes::wasm_host::{add_to_linker_with_capabilities, DefaultHost};
 ///
 /// let capabilities = WasmCapabilities {
 ///     config: true,

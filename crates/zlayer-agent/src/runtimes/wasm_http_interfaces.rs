@@ -20,7 +20,7 @@
 //! ## Usage
 //!
 //! ```ignore
-//! use zlayer_agent::runtimes::wasm_http_interfaces::*;
+//! use zlayer_agent_zql::runtimes::wasm_http_interfaces::*;
 //!
 //! // Example: Using router decision types
 //! let decision = RoutingDecision::Forward(Upstream {

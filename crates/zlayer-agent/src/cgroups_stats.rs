@@ -54,7 +54,7 @@ impl ContainerStats {
 /// # Example
 /// ```no_run
 /// use std::path::Path;
-/// use zlayer_agent::cgroups_stats::read_container_stats;
+/// use zlayer_agent_zql::cgroups_stats::read_container_stats;
 ///
 /// # async fn example() -> std::io::Result<()> {
 /// let cgroup_path = Path::new("/sys/fs/cgroup/system.slice/zlayer-mycontainer.scope");
@@ -121,7 +121,7 @@ pub async fn read_container_stats(cgroup_path: &Path) -> std::io::Result<Contain
 ///
 /// # Example
 /// ```
-/// use zlayer_agent::cgroups_stats::{ContainerStats, calculate_cpu_percent};
+/// use zlayer_agent_zql::cgroups_stats::{ContainerStats, calculate_cpu_percent};
 /// use std::time::Instant;
 ///
 /// let prev = ContainerStats {

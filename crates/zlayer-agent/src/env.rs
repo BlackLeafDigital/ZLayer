@@ -85,7 +85,7 @@ pub fn resolve_env_value(value: &str) -> Result<String, EnvResolutionError> {
 /// # Example
 /// ```
 /// use std::collections::HashMap;
-/// use zlayer_agent::env::resolve_env_vars;
+/// use zlayer_agent_zql::env::resolve_env_vars;
 ///
 /// std::env::set_var("MY_SECRET", "secret_value");
 ///
@@ -222,7 +222,7 @@ pub fn get_secret_references(env: &HashMap<String, String>) -> Vec<&str> {
 /// # Example
 /// ```rust,ignore
 /// use std::collections::HashMap;
-/// use zlayer_agent::env::resolve_env_with_secrets;
+/// use zlayer_agent_zql::env::resolve_env_with_secrets;
 /// use zlayer_secrets::PersistentSecretsStore;
 ///
 /// async fn example(provider: &PersistentSecretsStore) {

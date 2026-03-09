@@ -22,8 +22,8 @@ use zlayer_scheduler::metrics::{
 /// # Example
 ///
 /// ```ignore
-/// use zlayer_agent::metrics_providers::ServiceManagerContainerProvider;
-/// use zlayer_agent::ServiceManager;
+/// use zlayer_agent_zql::metrics_providers::ServiceManagerContainerProvider;
+/// use zlayer_agent_zql::ServiceManager;
 /// use zlayer_scheduler::metrics::CgroupsMetricsSource;
 /// use std::sync::Arc;
 ///
@@ -85,8 +85,8 @@ impl ServiceContainerProvider for ServiceManagerContainerProvider {
 /// # Example
 ///
 /// ```ignore
-/// use zlayer_agent::metrics_providers::RuntimeStatsProvider;
-/// use zlayer_agent::YoukiRuntime;
+/// use zlayer_agent_zql::metrics_providers::RuntimeStatsProvider;
+/// use zlayer_agent_zql::YoukiRuntime;
 /// use std::sync::Arc;
 ///
 /// let runtime = Arc::new(YoukiRuntime::with_defaults().await?);
