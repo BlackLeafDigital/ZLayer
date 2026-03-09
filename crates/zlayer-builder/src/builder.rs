@@ -1400,7 +1400,14 @@ impl ImageBuilder {
 
             // Track the current WORKDIR for this stage. Used to resolve relative paths
             // when this stage is used as a source for COPY --from in a later stage.
-            let mut current_workdir = String::from("/");
+            // If the base image is a previously-built stage, inherit its final workdir.
+            let mut current_workdir = match &stage.base_image {
+                ImageRef::Stage(name) => stage_workdirs
+                    .get(name)
+                    .cloned()
+                    .unwrap_or_else(|| String::from("/")),
+                _ => String::from("/"),
+            };
 
             // Execute instructions
             for (inst_idx, instruction) in stage.instructions.iter().enumerate() {
