@@ -347,7 +347,7 @@ services:
 "#
         );
 
-        serde_yml::from_str::<DeploymentSpec>(&yaml)
+        serde_yaml::from_str::<DeploymentSpec>(&yaml)
             .unwrap()
             .services
             .remove("cleanup")

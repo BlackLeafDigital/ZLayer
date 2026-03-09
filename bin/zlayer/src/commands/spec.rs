@@ -25,7 +25,7 @@ pub(crate) fn handle_spec(action: &SpecCommands) -> Result<()> {
                 _ => {
                     println!(
                         "{}",
-                        serde_yml::to_string(&parsed_spec)
+                        serde_yaml::to_string(&parsed_spec)
                             .context("Failed to serialize as YAML")?
                     );
                 }

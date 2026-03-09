@@ -18,7 +18,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_BUILD_JOBS: "2"
+  CARGO_BUILD_JOBS: "4"
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: "0"
 
@@ -89,7 +89,7 @@ jobs:
     runs-on: macos-latest
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     env:
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "4"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -127,6 +127,8 @@ jobs:
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          nextest: true
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
@@ -140,15 +142,12 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
-      - name: Run unit tests
-        run: cargo test --workspace --lib --bins
-
-      - name: Run integration tests
+      - name: Run unit and integration tests
         run: |
-          # Scheduler tests need test-skip-http feature to skip agent HTTP calls
-          cargo test -p zlayer-scheduler --features test-skip-http --test '*'
-          # Run all other integration tests
-          cargo test --workspace --test '*' --exclude zlayer-scheduler
+          # Scheduler tests need test-skip-http feature
+          cargo nextest run -p zlayer-scheduler --features test-skip-http
+          # Run all other tests (unit + integration)
+          cargo nextest run --workspace --exclude zlayer-scheduler
 
       - name: Run doc tests
         run: cargo test --workspace --doc
@@ -177,7 +176,7 @@ jobs:
     needs: check-macos
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     env:
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "4"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -254,7 +253,7 @@ jobs:
     runs-on: macos-latest
     needs: [test-macos]
     env:
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "4"
     if: |-
       ${{
         always() &&
@@ -344,33 +343,26 @@ jobs:
 
       - name: Calculate next version
         id: version
-        run: |
-          LATEST=$(git tag -l 'v*' --sort=-v:refname | head -n1)
-          if [[ -z "$LATEST" ]]; then
-            NEXT="v0.10.0"
-          else
-            VERSION="${LATEST#v}"
-            IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION"
-            PATCH=$((PATCH + 1))
-            NEXT="v${MAJOR}.${MINOR}.${PATCH}"
-          fi
-          echo "tag=$NEXT" >> $GITHUB_OUTPUT
-          echo "Next version: $NEXT"
+        uses: https://forge.blackleafdigital.com/Public/actions/resolve-version@main
+        with:
+          tag-prefix: v
+          bump: patch
 
       - name: Create and push tag
         run: |
+          TAG="v${{ steps.version.outputs.version }}"
           git config user.name "Zach Handley"
           git config user.email "zachhandley@gmail.com"
-          git tag -a "${{ steps.version.outputs.tag }}" -m "Auto-tagged from CI: ${{ steps.version.outputs.tag }}"
-          git push origin "${{ steps.version.outputs.tag }}"
+          git tag -a "$TAG" -m "Auto-tagged from CI: $TAG"
+          git push origin "$TAG"
 
-      - name: Trigger publish workflow
+      - name: Trigger build workflow
         run: |
           curl -X POST \
             -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
             -H "Content-Type: application/json" \
-            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/publish.yml/dispatches" \
-            -d '{"ref": "dev", "inputs": {"version": "${{ steps.version.outputs.tag }}", "sha": "${{ github.sha }}"}}'
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches" \
+            -d '{"ref": "dev", "inputs": {"version": "v${{ steps.version.outputs.version }}", "sha": "${{ github.sha }}"}}'
 
   # ===========================================
   # Trigger E2E Tests

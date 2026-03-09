@@ -107,7 +107,7 @@ use crate::error::{BuildError, Result};
 ///
 /// Returns an error if the YAML content cannot be parsed as a valid pipeline definition.
 pub fn parse_pipeline(content: &str) -> Result<ZPipeline> {
-    serde_yml::from_str(content)
+    serde_yaml::from_str(content)
         .map_err(|e| BuildError::zimagefile_parse(format!("Pipeline parse error: {e}")))
 }
 
@@ -278,7 +278,7 @@ images:
       - "myapp:latest"
 "#;
         let pipeline = parse_pipeline(yaml).unwrap();
-        let serialized = serde_yml::to_string(&pipeline).unwrap();
+        let serialized = serde_yaml::to_string(&pipeline).unwrap();
         let pipeline2 = parse_pipeline(&serialized).unwrap();
 
         assert_eq!(pipeline.version, pipeline2.version);

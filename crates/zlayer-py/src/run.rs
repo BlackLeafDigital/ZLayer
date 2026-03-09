@@ -70,7 +70,7 @@ pub fn run<'py>(
         let yaml = build_run_spec_yaml(&image, &container_name, &ports, &env, &command);
 
         // Parse the spec
-        let deployment: DeploymentSpec = serde_yml::from_str(&yaml).map_err(|e| {
+        let deployment: DeploymentSpec = serde_yaml::from_str(&yaml).map_err(|e| {
             ZLayerError::InvalidArgument(format!("Failed to create container spec: {e}"))
         })?;
 

@@ -39,7 +39,7 @@ oci-spec.workspace = true
 reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
-serde_yml.workspace = true
+serde_yaml.workspace = true
 zlayer-secrets.workspace = true
 zlayer-spec.workspace = true
 thiserror.workspace = true

@@ -63,8 +63,8 @@ impl From<zlayer_builder::BuildError> for ZLayerError {
     }
 }
 
-impl From<serde_yml::Error> for ZLayerError {
-    fn from(err: serde_yml::Error) -> Self {
+impl From<serde_yaml::Error> for ZLayerError {
+    fn from(err: serde_yaml::Error) -> Self {
         ZLayerError::Spec(err.to_string())
     }
 }

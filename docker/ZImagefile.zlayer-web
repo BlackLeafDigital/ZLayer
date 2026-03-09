@@ -1,7 +1,7 @@
 # ZLayer Web - Full-stack Leptos SSR + Hydration
 #
 # ZImagefile equivalent of Dockerfile.zlayer-web
-# Uses cache mounts instead of cargo-chef for dependency caching.
+# Uses cargo-chef for dependency layer caching + buildah cache mounts.
 #
 # Usage:
 #   zlayer build -f docker/ZImagefile.zlayer-web -t zlayer-web .
@@ -9,8 +9,19 @@
 version: "1"
 
 stages:
+  chef:
+    base: "lukemathwalker/cargo-chef:latest-rust-1.90"
+    workdir: "/build"
+
+  planner:
+    base: "chef"
+    steps:
+      - copy: "."
+        to: "/build"
+      - run: "cargo chef prepare --recipe-path recipe.json"
+
   builder:
-    base: "rust:1.90-bookworm"
+    base: "chef"
     workdir: "/build"
     steps:
       # Install system dependencies
@@ -23,35 +34,33 @@ stages:
             id: cargo-registry
             sharing: shared
 
-      # Copy full workspace source
+      # Cook dependencies (cached layer - only rebuilds when Cargo.lock changes)
+      - copy: "recipe.json"
+        from: planner
+        to: "/build/recipe.json"
+      - run: "cargo chef cook --release --recipe-path recipe.json"
+        cache:
+          - target: /usr/local/cargo/registry
+            id: cargo-registry
+            sharing: shared
+
+      # Copy full workspace source and build
       - copy: "."
         to: "/build"
-
-      # Build zlayer-web with cargo-leptos
       - run: "cd crates/zlayer-web && cargo leptos build --release"
         cache:
           - target: /usr/local/cargo/registry
             id: cargo-registry
             sharing: shared
-          - target: /build/target
-            id: cargo-target-web
+          - target: /root/.cache/cargo-leptos
+            id: cargo-leptos-cache
             sharing: shared
 
-      # Copy binary out of cached target dir
+      # Copy binary out of target dir
       - run: "cp target/release/zlayer-web /build/zlayer-web"
-        cache:
-          - target: /build/target
-            id: cargo-target-web
-            sharing: shared
-            readonly: true
 
-      # Copy site assets out of cached target dir
+      # Copy site assets out of target dir
       - run: "cp -r target/site /build/site"
-        cache:
-          - target: /build/target
-            id: cargo-target-web
-            sharing: shared
-            readonly: true
 
   runtime:
     base: "debian:bookworm-slim"

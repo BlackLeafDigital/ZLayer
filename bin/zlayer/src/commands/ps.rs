@@ -319,7 +319,7 @@ fn print_yaml(
             "services": rows,
         })
     };
-    println!("{}", serde_yml::to_string(&output)?);
+    println!("{}", serde_yaml::to_string(&output)?);
     Ok(())
 }
 

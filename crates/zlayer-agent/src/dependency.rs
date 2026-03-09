@@ -726,7 +726,7 @@ services:
         protocol: http
         port: 8080
 ";
-        let mut spec = serde_yml::from_str::<DeploymentSpec>(yaml)
+        let mut spec = serde_yaml::from_str::<DeploymentSpec>(yaml)
             .unwrap()
             .services
             .remove("test")

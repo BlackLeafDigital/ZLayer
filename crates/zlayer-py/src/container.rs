@@ -118,7 +118,7 @@ impl Container {
     ) -> PyResult<Self> {
         // Build a minimal ServiceSpec from the provided parameters
         let yaml = build_spec_yaml(image, ports.as_ref(), env.as_ref(), name);
-        let deployment: zlayer_spec::DeploymentSpec = serde_yml::from_str(&yaml)
+        let deployment: zlayer_spec::DeploymentSpec = serde_yaml::from_str(&yaml)
             .map_err(|e| ZLayerError::InvalidArgument(format!("Failed to create spec: {e}")))?;
 
         let container_name = name.unwrap_or("container").to_string();

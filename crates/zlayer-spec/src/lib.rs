@@ -18,7 +18,7 @@ use validator::Validate;
 ///
 /// Returns `SpecError` if parsing or validation fails.
 pub fn from_yaml_str(yaml: &str) -> Result<DeploymentSpec, SpecError> {
-    let spec: DeploymentSpec = serde_yml::from_str(yaml)?;
+    let spec: DeploymentSpec = serde_yaml::from_str(yaml)?;
 
     // Run validator crate validation
     spec.validate().map_err(|e| {

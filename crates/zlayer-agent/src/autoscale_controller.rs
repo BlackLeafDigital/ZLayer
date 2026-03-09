@@ -454,7 +454,7 @@ mod tests {
     use zlayer_spec::ScaleTargets;
 
     fn mock_spec() -> zlayer_spec::ServiceSpec {
-        serde_yml::from_str::<zlayer_spec::DeploymentSpec>(
+        serde_yaml::from_str::<zlayer_spec::DeploymentSpec>(
             r"
 version: v1
 deployment: test
