@@ -18,7 +18,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_BUILD_JOBS: "2"
+  CARGO_BUILD_JOBS: "4"
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: "0"
 
@@ -89,7 +89,7 @@ jobs:
     runs-on: macos-latest
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     env:
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "4"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -127,6 +127,8 @@ jobs:
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          nextest: true
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
@@ -140,15 +142,12 @@ jobs:
           access-key: ${{ secrets.S3_ACCESS_KEY }}
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
-      - name: Run unit tests
-        run: cargo test --workspace --lib --bins
-
-      - name: Run integration tests
+      - name: Run unit and integration tests
         run: |
-          # Scheduler tests need test-skip-http feature to skip agent HTTP calls
-          cargo test -p zlayer-scheduler --features test-skip-http --test '*'
-          # Run all other integration tests
-          cargo test --workspace --test '*' --exclude zlayer-scheduler
+          # Scheduler tests need test-skip-http feature
+          cargo nextest run -p zlayer-scheduler --features test-skip-http
+          # Run all other tests (unit + integration)
+          cargo nextest run --workspace --exclude zlayer-scheduler
 
       - name: Run doc tests
         run: cargo test --workspace --doc
@@ -177,7 +176,7 @@ jobs:
     needs: check-macos
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     env:
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "4"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -254,7 +253,7 @@ jobs:
     runs-on: macos-latest
     needs: [test-macos]
     env:
-      CARGO_BUILD_JOBS: "2"
+      CARGO_BUILD_JOBS: "4"
     if: |-
       ${{
         always() &&
