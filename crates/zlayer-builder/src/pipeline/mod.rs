@@ -51,11 +51,11 @@
 //! # Usage
 //!
 //! ```no_run
-//! use zlayer_builder::pipeline::{PipelineExecutor, parse_pipeline};
-//! use zlayer_builder::BuildahExecutor;
+//! use zlayer_builder_zql::pipeline::{PipelineExecutor, parse_pipeline};
+//! use zlayer_builder_zql::BuildahExecutor;
 //! use std::path::PathBuf;
 //!
-//! # async fn example() -> Result<(), zlayer_builder::BuildError> {
+//! # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
 //! let yaml = std::fs::read_to_string("ZPipeline.yaml")?;
 //! let pipeline = parse_pipeline(&yaml)?;
 //!
@@ -91,7 +91,7 @@ use crate::error::{BuildError, Result};
 /// # Example
 ///
 /// ```
-/// use zlayer_builder::pipeline::parse_pipeline;
+/// use zlayer_builder_zql::pipeline::parse_pipeline;
 ///
 /// let yaml = r#"
 /// images:

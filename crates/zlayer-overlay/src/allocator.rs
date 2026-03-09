@@ -42,7 +42,7 @@ impl IpAllocator {
     ///
     /// # Example
     /// ```
-    /// use zlayer_overlay::allocator::IpAllocator;
+    /// use zlayer_overlay_zql::allocator::IpAllocator;
     ///
     /// let allocator = IpAllocator::new("10.200.0.0/16").unwrap();
     /// ```
@@ -108,7 +108,7 @@ impl IpAllocator {
     ///
     /// # Example
     /// ```
-    /// use zlayer_overlay::allocator::IpAllocator;
+    /// use zlayer_overlay_zql::allocator::IpAllocator;
     ///
     /// let mut allocator = IpAllocator::new("10.200.0.0/24").unwrap();
     /// let ip = allocator.allocate().unwrap();
@@ -147,7 +147,7 @@ impl IpAllocator {
     ///
     /// # Example
     /// ```
-    /// use zlayer_overlay::allocator::IpAllocator;
+    /// use zlayer_overlay_zql::allocator::IpAllocator;
     ///
     /// let mut allocator = IpAllocator::new("10.200.0.0/24").unwrap();
     /// let ip = allocator.allocate_first().unwrap();

@@ -8,7 +8,7 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use zlayer_observability::{init_observability, ObservabilityConfig};
+//! use zlayer_observability_zql::{init_observability, ObservabilityConfig};
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -54,7 +54,7 @@ pub struct ObservabilityGuards {
 /// # Example
 ///
 /// ```no_run
-/// use zlayer_observability::{init_observability, ObservabilityConfig};
+/// use zlayer_observability_zql::{init_observability, ObservabilityConfig};
 ///
 /// #[tokio::main]
 /// async fn main() {

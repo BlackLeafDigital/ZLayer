@@ -16,7 +16,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use zlayer_builder::tui::{BuildTui, BuildEvent};
+//! use zlayer_builder_zql::tui::{BuildTui, BuildEvent};
 //! use std::sync::mpsc;
 //!
 //! # fn main() -> std::io::Result<()> {

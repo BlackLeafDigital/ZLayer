@@ -43,8 +43,8 @@ pub fn detect_color_support() -> bool {
 /// # Example
 ///
 /// ```
-/// use zlayer_tui::logger::colorize;
-/// use zlayer_tui::palette::ansi;
+/// use zlayer_tui_zql::logger::colorize;
+/// use zlayer_tui_zql::palette::ansi;
 ///
 /// let green = colorize("ok", ansi::GREEN, true);
 /// assert!(green.contains("\x1b[32m"));

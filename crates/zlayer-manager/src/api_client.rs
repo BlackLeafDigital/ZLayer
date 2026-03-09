@@ -489,7 +489,7 @@ impl ZLayerClient {
     /// # Examples
     ///
     /// ```no_run
-    /// use zlayer_manager::api_client::ZLayerClient;
+    /// use zlayer_manager_zql::api_client::ZLayerClient;
     ///
     /// // Without authentication
     /// let client = ZLayerClient::new("http://localhost:9090", None);

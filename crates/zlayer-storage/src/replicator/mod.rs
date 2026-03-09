@@ -27,8 +27,8 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use zlayer_storage::replicator::{SqliteReplicator, SqliteReplicatorConfig};
-//! use zlayer_storage::config::LayerStorageConfig;
+//! use zlayer_storage_zql::replicator::{SqliteReplicator, SqliteReplicatorConfig};
+//! use zlayer_storage_zql::config::LayerStorageConfig;
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {

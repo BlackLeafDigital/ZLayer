@@ -105,7 +105,7 @@ impl RegistryIndex {
 /// ## Example
 ///
 /// ```rust,no_run
-/// use zlayer_registry::local_registry::LocalRegistry;
+/// use zlayer_registry_zql::local_registry::LocalRegistry;
 /// use std::path::PathBuf;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {

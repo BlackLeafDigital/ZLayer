@@ -10,7 +10,7 @@
 //! stored in Axum's state layer or Leptos context for access in server functions.
 //!
 //! ```ignore
-//! use zlayer_web::server::state::WebState;
+//! use zlayer_web_zql::server::state::WebState;
 //! use std::sync::Arc;
 //! use tokio::sync::RwLock;
 //!

@@ -63,7 +63,7 @@ struct PendingConnection {
 /// ```rust,no_run
 /// use std::sync::Arc;
 /// use std::time::Duration;
-/// use zlayer_tunnel::{TunnelRegistry, ListenerManager};
+/// use zlayer_tunnel_zql::{TunnelRegistry, ListenerManager};
 ///
 /// async fn example() {
 ///     let registry = Arc::new(TunnelRegistry::default());

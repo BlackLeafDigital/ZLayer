@@ -9,7 +9,7 @@
 //! or provide helpful installation instructions when buildah is not found.
 //!
 //! ```no_run
-//! use zlayer_builder::buildah::{BuildahInstaller, BuildahExecutor};
+//! use zlayer_builder_zql::buildah::{BuildahInstaller, BuildahExecutor};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 //! // Ensure buildah is available

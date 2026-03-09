@@ -145,8 +145,8 @@ impl Instruction {
     /// # Example
     ///
     /// ```
-    /// use zlayer_builder::dockerfile::Instruction;
-    /// use zlayer_builder::dockerfile::RunInstruction;
+    /// use zlayer_builder_zql::dockerfile::Instruction;
+    /// use zlayer_builder_zql::dockerfile::RunInstruction;
     ///
     /// let run = Instruction::Run(RunInstruction::shell("echo hello"));
     /// let key = run.cache_key();
@@ -408,7 +408,7 @@ impl RunMount {
     /// # Examples
     ///
     /// ```
-    /// use zlayer_builder::dockerfile::{RunMount, CacheSharing};
+    /// use zlayer_builder_zql::dockerfile::{RunMount, CacheSharing};
     ///
     /// let cache_mount = RunMount::Cache {
     ///     target: "/var/cache/apt".to_string(),

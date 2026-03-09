@@ -18,9 +18,9 @@
 //!
 //! ```no_run
 //! use std::path::Path;
-//! use zlayer_builder::wasm_builder::{build_wasm, WasmBuildConfig, WasiTarget};
+//! use zlayer_builder_zql::wasm_builder::{build_wasm, WasmBuildConfig, WasiTarget};
 //!
-//! # async fn example() -> Result<(), zlayer_builder::wasm_builder::WasmBuildError> {
+//! # async fn example() -> Result<(), zlayer_builder_zql::wasm_builder::WasmBuildError> {
 //! let config = WasmBuildConfig {
 //!     language: None,  // Auto-detect
 //!     target: WasiTarget::Preview2,

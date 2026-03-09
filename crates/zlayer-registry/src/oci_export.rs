@@ -19,8 +19,8 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use zlayer_registry::oci_export::{export_image, import_image};
-//! use zlayer_registry::LocalRegistry;
+//! use zlayer_registry_zql::oci_export::{export_image, import_image};
+//! use zlayer_registry_zql::LocalRegistry;
 //! use std::path::Path;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -309,8 +309,8 @@ fn parse_image_reference(image: &str) -> Result<(String, String), ExportError> {
 /// # Example
 ///
 /// ```rust,no_run
-/// use zlayer_registry::oci_export::export_image;
-/// use zlayer_registry::LocalRegistry;
+/// use zlayer_registry_zql::oci_export::export_image;
+/// use zlayer_registry_zql::LocalRegistry;
 /// use std::path::Path;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -470,8 +470,8 @@ pub async fn export_image(
 /// # Example
 ///
 /// ```rust,no_run
-/// use zlayer_registry::oci_export::import_image;
-/// use zlayer_registry::LocalRegistry;
+/// use zlayer_registry_zql::oci_export::import_image;
+/// use zlayer_registry_zql::LocalRegistry;
 /// use std::path::Path;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {

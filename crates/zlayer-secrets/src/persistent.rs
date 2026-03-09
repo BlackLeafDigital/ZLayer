@@ -13,10 +13,10 @@
 //! # Example
 //!
 //! ```no_run
-//! use zlayer_secrets::{EncryptionKey, PersistentSecretsStore, Secret};
-//! use zlayer_secrets::{SecretsProvider, SecretsStore};
+//! use zlayer_secrets_zql::{EncryptionKey, PersistentSecretsStore, Secret};
+//! use zlayer_secrets_zql::{SecretsProvider, SecretsStore};
 //!
-//! # async fn example() -> zlayer_secrets::Result<()> {
+//! # async fn example() -> zlayer_secrets_zql::Result<()> {
 //! let key = EncryptionKey::generate();
 //! let store = PersistentSecretsStore::open("/var/lib/zlayer/secrets", key).await?;
 //!

@@ -209,7 +209,7 @@ pub type ConnectionCallback = Arc<dyn Fn(Uuid, Uuid, String) -> bool + Send + Sy
 /// # Example
 ///
 /// ```rust,no_run
-/// use zlayer_tunnel::{TunnelAgent, TunnelClientConfig, ServiceConfig};
+/// use zlayer_tunnel_zql::{TunnelAgent, TunnelClientConfig, ServiceConfig};
 /// use std::sync::Arc;
 ///
 /// #[tokio::main]

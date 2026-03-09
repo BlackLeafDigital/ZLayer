@@ -102,9 +102,9 @@ impl BuildahExecutor {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_builder::BuildahExecutor;
+    /// use zlayer_builder_zql::BuildahExecutor;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let executor = BuildahExecutor::new_async().await?;
     /// let version = executor.version().await?;
     /// println!("Using buildah version: {}", version);

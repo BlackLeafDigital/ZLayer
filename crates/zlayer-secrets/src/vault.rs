@@ -12,7 +12,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use zlayer_secrets::VaultSecretsProvider;
+//! use zlayer_secrets_zql::VaultSecretsProvider;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -88,7 +88,7 @@ struct VaultSecretData {
 /// # Example
 ///
 /// ```no_run
-/// use zlayer_secrets::{VaultSecretsProvider, SecretsProvider};
+/// use zlayer_secrets_zql::{VaultSecretsProvider, SecretsProvider};
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -134,14 +134,14 @@ impl VaultSecretsProvider {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_secrets::VaultSecretsProvider;
+    /// use zlayer_secrets_zql::VaultSecretsProvider;
     ///
     /// let provider = VaultSecretsProvider::new(
     ///     "https://vault.example.com:8200",
     ///     "hvs.your-token-here",
     ///     "secret",
     /// )?;
-    /// # Ok::<(), zlayer_secrets::SecretsError>(())
+    /// # Ok::<(), zlayer_secrets_zql::SecretsError>(())
     /// ```
     pub fn new(address: &str, token: &str, mount: &str) -> Result<Self> {
         let settings = VaultClientSettingsBuilder::default()
@@ -176,11 +176,11 @@ impl VaultSecretsProvider {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_secrets::VaultSecretsProvider;
+    /// use zlayer_secrets_zql::VaultSecretsProvider;
     ///
     /// // Requires VAULT_ADDR and VAULT_TOKEN environment variables
     /// let provider = VaultSecretsProvider::from_env()?;
-    /// # Ok::<(), zlayer_secrets::SecretsError>(())
+    /// # Ok::<(), zlayer_secrets_zql::SecretsError>(())
     /// ```
     pub fn from_env() -> Result<Self> {
         let address = std::env::var(ENV_VAULT_ADDR).map_err(|_| {

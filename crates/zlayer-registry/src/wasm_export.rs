@@ -14,8 +14,8 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use zlayer_registry::wasm_export::{WasmExportConfig, export_wasm_as_oci};
-//! use zlayer_registry::wasm::WasiVersion;
+//! use zlayer_registry_zql::wasm_export::{WasmExportConfig, export_wasm_as_oci};
+//! use zlayer_registry_zql::wasm::WasiVersion;
 //! use std::path::PathBuf;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -314,7 +314,7 @@ fn create_wasm_config_blob() -> Vec<u8> {
 /// # Example
 ///
 /// ```rust,no_run
-/// use zlayer_registry::wasm_export::{WasmExportConfig, export_wasm_as_oci};
+/// use zlayer_registry_zql::wasm_export::{WasmExportConfig, export_wasm_as_oci};
 /// use std::path::PathBuf;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {

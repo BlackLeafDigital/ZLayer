@@ -52,7 +52,7 @@ fn current_timestamp_ms() -> u64 {
 ///
 /// ```rust,no_run
 /// use std::sync::Arc;
-/// use zlayer_tunnel::{TunnelRegistry, TunnelServerConfig, ControlHandler, accept_all_tokens};
+/// use zlayer_tunnel_zql::{TunnelRegistry, TunnelServerConfig, ControlHandler, accept_all_tokens};
 ///
 /// async fn handle_client(stream: tokio::net::TcpStream, addr: std::net::SocketAddr) {
 ///     let registry = Arc::new(TunnelRegistry::default());
@@ -519,7 +519,7 @@ impl ControlHandler {
 /// # Example
 ///
 /// ```rust
-/// use zlayer_tunnel::hash_token;
+/// use zlayer_tunnel_zql::hash_token;
 ///
 /// let hash = hash_token("my-secret-token");
 /// assert_eq!(hash.len(), 64); // SHA256 produces 32 bytes = 64 hex chars
@@ -544,7 +544,7 @@ pub fn hash_token(token: &str) -> String {
 /// # Example
 ///
 /// ```rust
-/// use zlayer_tunnel::accept_all_tokens;
+/// use zlayer_tunnel_zql::accept_all_tokens;
 ///
 /// assert!(accept_all_tokens("valid-token").is_ok());
 /// assert!(accept_all_tokens("").is_err());

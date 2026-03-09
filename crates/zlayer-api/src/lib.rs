@@ -9,7 +9,7 @@
 //! # Quick Start
 //!
 //! ```no_run
-//! use zlayer_api::{ApiServer, ApiConfig};
+//! use zlayer_api_zql::{ApiServer, ApiConfig};
 //!
 //! #[tokio::main]
 //! async fn main() -> anyhow::Result<()> {

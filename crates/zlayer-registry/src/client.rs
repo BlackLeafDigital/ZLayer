@@ -683,8 +683,8 @@ impl ImagePuller {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use zlayer_registry::{ImagePuller, BlobCache};
-    /// use zlayer_registry::wasm_export::{WasmExportConfig, export_wasm_as_oci};
+    /// use zlayer_registry_zql::{ImagePuller, BlobCache};
+    /// use zlayer_registry_zql::wasm_export::{WasmExportConfig, export_wasm_as_oci};
     /// use oci_client::secrets::RegistryAuth;
     /// use std::path::PathBuf;
     ///

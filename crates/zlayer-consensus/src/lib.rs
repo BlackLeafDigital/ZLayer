@@ -9,9 +9,9 @@
 //! ## Quick Start
 //!
 //! ```ignore
-//! use zlayer_consensus::{ConsensusNodeBuilder, ConsensusConfig};
-//! use zlayer_consensus::storage::mem_store::{MemLogStore, MemStateMachine};
-//! use zlayer_consensus::network::http_client::HttpNetwork;
+//! use zlayer_consensus_zql::{ConsensusNodeBuilder, ConsensusConfig};
+//! use zlayer_consensus_zql::storage::mem_store::{MemLogStore, MemStateMachine};
+//! use zlayer_consensus_zql::network::http_client::HttpNetwork;
 //!
 //! // 1. Define your TypeConfig
 //! openraft::declare_raft_types!(

@@ -10,10 +10,10 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use zlayer_secrets::credentials::CredentialStore;
-//! use zlayer_secrets::{EncryptionKey, PersistentSecretsStore};
+//! use zlayer_secrets_zql::credentials::CredentialStore;
+//! use zlayer_secrets_zql::{EncryptionKey, PersistentSecretsStore};
 //!
-//! # async fn example() -> zlayer_secrets::Result<()> {
+//! # async fn example() -> zlayer_secrets_zql::Result<()> {
 //! let key = EncryptionKey::generate();
 //! let store = PersistentSecretsStore::open("/var/lib/zlayer/secrets", key).await?;
 //! let cred_store = CredentialStore::new(store);

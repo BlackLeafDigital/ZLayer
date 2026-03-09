@@ -15,7 +15,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use zlayer_proxy::{ProxyConfig, ProxyServer, ServiceRegistry, RouteEntry};
+//! use zlayer_proxy_zql::{ProxyConfig, ProxyServer, ServiceRegistry, RouteEntry};
 //! use std::sync::Arc;
 //!
 //! #[tokio::main]

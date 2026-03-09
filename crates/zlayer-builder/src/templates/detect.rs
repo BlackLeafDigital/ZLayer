@@ -16,7 +16,7 @@ use super::Runtime;
 /// # Examples
 ///
 /// ```no_run
-/// use zlayer_builder::templates::detect_runtime;
+/// use zlayer_builder_zql::templates::detect_runtime;
 ///
 /// let runtime = detect_runtime("/path/to/project");
 /// if let Some(rt) = runtime {

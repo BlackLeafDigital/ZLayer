@@ -13,7 +13,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use zlayer_scheduler::metrics::{MetricsCollector, CgroupsMetricsSource};
+//! use zlayer_scheduler_zql::metrics::{MetricsCollector, CgroupsMetricsSource};
 //! use std::sync::Arc;
 //!
 //! // Create a metrics source backed by agent runtime

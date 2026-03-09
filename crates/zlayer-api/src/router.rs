@@ -256,8 +256,8 @@ pub fn build_router_full(
 /// # Example
 ///
 /// ```no_run
-/// use zlayer_api::{ApiConfig, build_router_with_services};
-/// use zlayer_api::storage::InMemoryStorage;
+/// use zlayer_api_zql::{ApiConfig, build_router_with_services};
+/// use zlayer_api_zql::storage::InMemoryStorage;
 /// use zlayer_agent::{ServiceManager, MockRuntime};
 /// use std::sync::Arc;
 /// use tokio::sync::RwLock;
@@ -518,8 +518,8 @@ pub fn build_internal_routes(internal_state: InternalState) -> Router {
 /// # Example
 ///
 /// ```no_run
-/// use zlayer_api::{ApiConfig, build_router_with_internal};
-/// use zlayer_api::storage::InMemoryStorage;
+/// use zlayer_api_zql::{ApiConfig, build_router_with_internal};
+/// use zlayer_api_zql::storage::InMemoryStorage;
 /// use zlayer_agent::{ServiceManager, MockRuntime};
 /// use std::sync::Arc;
 /// use tokio::sync::RwLock;
@@ -591,8 +591,8 @@ pub fn build_secrets_routes(secrets_state: SecretsState) -> Router<()> {
 /// # Example
 ///
 /// ```no_run
-/// use zlayer_api::{ApiConfig, build_router_with_secrets};
-/// use zlayer_api::storage::InMemoryStorage;
+/// use zlayer_api_zql::{ApiConfig, build_router_with_secrets};
+/// use zlayer_api_zql::storage::InMemoryStorage;
 /// use zlayer_secrets::PersistentSecretsStore;
 /// use std::sync::Arc;
 ///

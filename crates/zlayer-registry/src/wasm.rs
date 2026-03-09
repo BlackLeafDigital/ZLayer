@@ -190,7 +190,7 @@ impl std::fmt::Display for WasiVersion {
 /// # Examples
 ///
 /// ```
-/// use zlayer_registry::wasm::validate_wasm_magic;
+/// use zlayer_registry_zql::wasm::validate_wasm_magic;
 ///
 /// // Valid WASM magic
 /// let wasm_bytes = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
@@ -241,7 +241,7 @@ pub fn validate_wasm_magic(bytes: &[u8]) -> bool {
 /// # Examples
 ///
 /// ```
-/// use zlayer_registry::wasm::{detect_wasm_version_from_binary, WasiVersion};
+/// use zlayer_registry_zql::wasm::{detect_wasm_version_from_binary, WasiVersion};
 ///
 /// // Core module with type section (0x01)
 /// let module_bytes = [
@@ -339,7 +339,7 @@ pub fn detect_wasm_version_from_binary(bytes: &[u8]) -> WasiVersion {
 /// # Examples
 ///
 /// ```
-/// use zlayer_registry::wasm::{extract_wasm_binary_info, WasiVersion};
+/// use zlayer_registry_zql::wasm::{extract_wasm_binary_info, WasiVersion};
 ///
 /// let module_bytes = [
 ///     0x00, 0x61, 0x73, 0x6d, // magic
@@ -403,7 +403,7 @@ pub fn extract_wasm_binary_info(bytes: &[u8]) -> Result<WasmBinaryInfo, WasmErro
 /// # Examples
 ///
 /// ```
-/// use zlayer_registry::wasm::{detect_artifact_type, ArtifactType, WasiVersion};
+/// use zlayer_registry_zql::wasm::{detect_artifact_type, ArtifactType, WasiVersion};
 /// use oci_client::manifest::OciImageManifest;
 ///
 /// // For a container image

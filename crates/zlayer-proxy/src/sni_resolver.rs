@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use zlayer_proxy::SniCertResolver;
+//! use zlayer_proxy_zql::SniCertResolver;
 //!
 //! let resolver = SniCertResolver::new();
 //!
@@ -53,7 +53,7 @@ impl SniCertResolver {
     /// # Example
     ///
     /// ```rust
-    /// use zlayer_proxy::SniCertResolver;
+    /// use zlayer_proxy_zql::SniCertResolver;
     ///
     /// let resolver = SniCertResolver::new();
     /// ```

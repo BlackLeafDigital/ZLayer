@@ -292,7 +292,7 @@ where
 /// # Example
 ///
 /// ```ignore
-/// use zlayer_consensus::ConsensusNodeBuilder;
+/// use zlayer_consensus_zql::ConsensusNodeBuilder;
 ///
 /// let node = ConsensusNodeBuilder::new(1, "127.0.0.1:9000".into())
 ///     .with_config(ConsensusConfig::default())

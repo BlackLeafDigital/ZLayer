@@ -29,7 +29,7 @@ use crate::palette::color::{ACCENT, TEXT};
 /// # Examples
 ///
 /// ```
-/// use zlayer_tui::widgets::progress_bar::ProgressBar;
+/// use zlayer_tui_zql::widgets::progress_bar::ProgressBar;
 ///
 /// // Minimal usage -- just a bar
 /// let bar = ProgressBar::new(3, 10);

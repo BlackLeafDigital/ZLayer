@@ -5,7 +5,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use zlayer_api::storage::{DeploymentStorage, ZqlStorage, StoredDeployment, DeploymentStatus};
+//! use zlayer_api_zql::storage::{DeploymentStorage, ZqlStorage, StoredDeployment, DeploymentStatus};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {

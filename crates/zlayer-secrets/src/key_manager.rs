@@ -36,7 +36,7 @@ const ENV_PASSWORD: &str = "ZLAYER_SECRETS_PASSWORD";
 /// # Example
 ///
 /// ```no_run
-/// use zlayer_secrets::KeyManager;
+/// use zlayer_secrets_zql::KeyManager;
 ///
 /// let manager = KeyManager::new();
 /// let key = manager.get_or_create_key("production").unwrap();
@@ -109,7 +109,7 @@ impl KeyManager {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_secrets::KeyManager;
+    /// use zlayer_secrets_zql::KeyManager;
     ///
     /// let manager = KeyManager::new();
     ///

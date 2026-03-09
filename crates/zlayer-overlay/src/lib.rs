@@ -22,7 +22,7 @@
 //! ## Initialize as cluster leader
 //!
 //! ```ignore
-//! use zlayer_overlay::bootstrap::OverlayBootstrap;
+//! use zlayer_overlay_zql::bootstrap::OverlayBootstrap;
 //! use std::path::Path;
 //!
 //! let bootstrap = OverlayBootstrap::init_leader(
@@ -41,7 +41,7 @@
 //! ## Join an existing overlay
 //!
 //! ```ignore
-//! use zlayer_overlay::bootstrap::OverlayBootstrap;
+//! use zlayer_overlay_zql::bootstrap::OverlayBootstrap;
 //! use std::path::Path;
 //!
 //! let bootstrap = OverlayBootstrap::join(
@@ -60,7 +60,7 @@
 //! ## With DNS service discovery
 //!
 //! ```ignore
-//! use zlayer_overlay::OverlayBootstrap;
+//! use zlayer_overlay_zql::OverlayBootstrap;
 //! use std::path::Path;
 //!
 //! // Enable DNS service discovery on the overlay
@@ -85,7 +85,7 @@
 //! ## Health checking
 //!
 //! ```ignore
-//! use zlayer_overlay::health::OverlayHealthChecker;
+//! use zlayer_overlay_zql::health::OverlayHealthChecker;
 //! use std::time::Duration;
 //!
 //! let checker = OverlayHealthChecker::new("zl-overlay0", Duration::from_secs(30));

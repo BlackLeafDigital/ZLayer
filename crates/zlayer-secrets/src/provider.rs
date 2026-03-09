@@ -25,7 +25,7 @@ use crate::{Result, Secret, SecretMetadata, SecretRef, SecretsError};
 /// # Example
 ///
 /// ```rust,ignore
-/// use zlayer_secrets::{SecretsProvider, Secret};
+/// use zlayer_secrets_zql::{SecretsProvider, Secret};
 ///
 /// async fn get_database_password(provider: &impl SecretsProvider) -> Result<Secret> {
 ///     provider.get_secret("my-deployment", "database-password").await
@@ -93,7 +93,7 @@ pub trait SecretsProvider: Send + Sync {
 /// # Example
 ///
 /// ```rust,ignore
-/// use zlayer_secrets::{SecretsStore, Secret};
+/// use zlayer_secrets_zql::{SecretsStore, Secret};
 ///
 /// async fn store_api_key(store: &impl SecretsStore, key: &str) -> Result<()> {
 ///     let secret = Secret::new(key);
@@ -181,7 +181,7 @@ impl<T: SecretsStore + ?Sized> SecretsStore for std::sync::Arc<T> {
 /// # Example
 ///
 /// ```rust,ignore
-/// use zlayer_secrets::{SecretsResolver, PersistentSecretsStore};
+/// use zlayer_secrets_zql::{SecretsResolver, PersistentSecretsStore};
 /// use std::collections::HashMap;
 ///
 /// async fn resolve_env_vars(

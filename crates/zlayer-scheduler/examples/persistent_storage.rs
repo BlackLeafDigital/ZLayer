@@ -4,8 +4,8 @@
 //! This example is kept as a placeholder to document the migration.
 //!
 //! To use persistent storage, enable the `redb-store` feature on `zlayer-consensus`
-//! and use `zlayer_consensus::storage::redb_store::RedbLogStore` and
-//! `zlayer_consensus::storage::redb_store::RedbStateMachine` instead of the
+//! and use `zlayer_consensus_zql::storage::redb_store::RedbLogStore` and
+//! `zlayer_consensus_zql::storage::redb_store::RedbStateMachine` instead of the
 //! in-memory variants.
 
 fn main() {

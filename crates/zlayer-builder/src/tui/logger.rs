@@ -16,7 +16,7 @@ use zlayer_tui::palette::ansi;
 /// # Example
 ///
 /// ```
-/// use zlayer_builder::tui::{PlainLogger, BuildEvent};
+/// use zlayer_builder_zql::tui::{PlainLogger, BuildEvent};
 ///
 /// let logger = PlainLogger::new(false); // quiet mode
 ///

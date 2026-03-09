@@ -30,7 +30,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use zlayer_tunnel::{TunnelClientConfig, ServiceConfig};
+//! use zlayer_tunnel_zql::{TunnelClientConfig, ServiceConfig};
 //!
 //! // Create a client configuration
 //! let config = TunnelClientConfig::new(
