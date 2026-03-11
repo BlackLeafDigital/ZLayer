@@ -591,7 +591,7 @@ pub(crate) async fn handle_node_join(
     println!("  Configuring overlay network...");
 
     // Parse the overlay IP assigned by the leader
-    let our_overlay_ip: std::net::Ipv4Addr = join_response
+    let our_overlay_ip: std::net::IpAddr = join_response
         .overlay_ip
         .parse()
         .context("Invalid overlay IP in join response")?;
@@ -618,7 +618,7 @@ pub(crate) async fn handle_node_join(
             );
             continue;
         }
-        let peer_overlay_ip: std::net::Ipv4Addr = match peer.overlay_ip.parse() {
+        let peer_overlay_ip: std::net::IpAddr = match peer.overlay_ip.parse() {
             Ok(ip) => ip,
             Err(e) => {
                 warn!(

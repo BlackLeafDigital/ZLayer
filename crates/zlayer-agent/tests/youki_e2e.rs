@@ -18,7 +18,7 @@
 //! sudo cargo test --package zlayer-agent --test youki_e2e -- --ignored --nocapture
 //! ```
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1143,7 +1143,7 @@ async fn test_dns_record_lifecycle() {
         let test_ip = Ipv4Addr::new(10, 200, 0, 42);
         let hostname = "myservice.service.local";
 
-        let add_result = dns_server.add_record(hostname, test_ip).await;
+        let add_result = dns_server.add_record(hostname, IpAddr::V4(test_ip)).await;
         assert!(
             add_result.is_ok(),
             "Failed to add DNS record: {:?}",
@@ -1154,7 +1154,9 @@ async fn test_dns_record_lifecycle() {
         // Add another record for a replica
         let replica_hostname = "1.myservice.service.local";
         let replica_ip = Ipv4Addr::new(10, 200, 0, 43);
-        let add_result = dns_server.add_record(replica_hostname, replica_ip).await;
+        let add_result = dns_server
+            .add_record(replica_hostname, IpAddr::V4(replica_ip))
+            .await;
         assert!(
             add_result.is_ok(),
             "Failed to add replica DNS record: {:?}",

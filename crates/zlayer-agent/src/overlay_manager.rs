@@ -2,7 +2,7 @@ use crate::error::AgentError;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::sync::RwLock;
 use zlayer_overlay::{OverlayConfig, OverlayTransport};
 
@@ -69,7 +69,7 @@ pub struct OverlayManager {
     ip_allocator: IpAllocator,
     /// This node's IP address on the global overlay network.
     /// Set after `setup_global_overlay()` succeeds.
-    node_ip: Option<Ipv4Addr>,
+    node_ip: Option<IpAddr>,
 }
 
 impl OverlayManager {
@@ -211,7 +211,7 @@ impl OverlayManager {
         container_pid: u32,
         service_name: &str,
         join_global: bool,
-    ) -> Result<Ipv4Addr, AgentError> {
+    ) -> Result<IpAddr, AgentError> {
         // Per-container overlay attachment uses Linux network namespaces.
         // On non-Linux platforms, return the node's overlay IP (or loopback).
         #[cfg(not(target_os = "linux"))]
@@ -223,7 +223,7 @@ impl OverlayManager {
                 "Skipping per-container overlay attachment (not supported on this platform). \
                  Containers will use the node's overlay IP via host networking."
             );
-            return Ok(self.node_ip.unwrap_or(Ipv4Addr::LOCALHOST));
+            return Ok(self.node_ip.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         }
 
         #[allow(unreachable_code)]
@@ -249,12 +249,14 @@ impl OverlayManager {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn attach_to_interface(
         &self,
         container_pid: u32,
         _interface: &str,
-        ip: Ipv4Addr,
+        ip: IpAddr,
     ) -> Result<(), AgentError> {
+        let is_v6 = ip.is_ipv6();
         let veth_host = format!("veth-{container_pid}");
         let veth_container = "eth0";
 
@@ -291,27 +293,28 @@ impl OverlayManager {
         )
         .await?;
 
-        self.run_command(
-            "nsenter",
-            &[
-                "-t",
-                &container_pid.to_string(),
-                "-n",
-                "ip",
-                "addr",
-                "add",
-                &format!("{ip}/24"),
-                "dev",
-                veth_container,
-            ],
-        )
-        .await?;
+        // IP assignment: /24 for IPv4, /64 for IPv6
+        let addr_cidr = if is_v6 {
+            format!("{ip}/64")
+        } else {
+            format!("{ip}/24")
+        };
+
+        // Use `ip -6` for IPv6 addresses
+        let ip_cmd_flag: &[&str] = if is_v6 { &["-6"] } else { &[] };
+
+        let pid_str = container_pid.to_string();
+        let mut nsenter_addr_args: Vec<&str> = vec!["-t", &pid_str, "-n", "ip"];
+        nsenter_addr_args.extend_from_slice(ip_cmd_flag);
+        nsenter_addr_args.extend_from_slice(&["addr", "add", &addr_cidr, "dev", veth_container]);
+
+        self.run_command("nsenter", &nsenter_addr_args).await?;
 
         self.run_command(
             "nsenter",
             &[
                 "-t",
-                &container_pid.to_string(),
+                &pid_str,
                 "-n",
                 "ip",
                 "link",
@@ -322,17 +325,73 @@ impl OverlayManager {
         )
         .await?;
 
+        // Bring up loopback inside the container namespace.
+        // New network namespaces start with `lo` in the DOWN state;
+        // services binding to 127.0.0.1 will fail without this.
+        self.run_command(
+            "nsenter",
+            &["-t", &pid_str, "-n", "ip", "link", "set", "lo", "up"],
+        )
+        .await?;
+
+        // Add a default route inside the container namespace so the container
+        // can respond to traffic from ANY source IP (not just its subnet).
+        // Without this, the container drops SYN-ACK responses when the host
+        // connects using its primary interface IP (outside the overlay subnet).
+        // No gateway is needed for veth point-to-point links.
+        let mut nsenter_route_args: Vec<&str> = vec!["-t", &pid_str, "-n", "ip"];
+        nsenter_route_args.extend_from_slice(ip_cmd_flag);
+        nsenter_route_args.extend_from_slice(&["route", "add", "default", "dev", veth_container]);
+
+        self.run_command("nsenter", &nsenter_route_args).await?;
+
         // Bring up host-side veth so traffic can flow
         self.run_command("ip", &["link", "set", &veth_host, "up"])
             .await?;
 
         // Use "replace" instead of "add" so stale routes from a previous
         // daemon run don't cause a failure (EEXIST).
-        self.run_command(
-            "ip",
-            &["route", "replace", &format!("{ip}/32"), "dev", &veth_host],
-        )
-        .await?;
+        // When the node has an overlay IP, set it as the source so the
+        // container sees a routable address in the overlay subnet.
+        //
+        // IPv4: `ip route replace {ip}/32 dev {veth} [src {node_ip}]`
+        // IPv6: `ip -6 route replace {ip}/128 dev {veth} [src {node_ip}]`
+        let host_route = if is_v6 {
+            format!("{ip}/128")
+        } else {
+            format!("{ip}/32")
+        };
+
+        if let Some(node_ip) = self.node_ip {
+            let src_str = node_ip.to_string();
+            let mut route_args: Vec<&str> = Vec::new();
+            route_args.extend_from_slice(ip_cmd_flag);
+            route_args.extend_from_slice(&[
+                "route",
+                "replace",
+                &host_route,
+                "dev",
+                &veth_host,
+                "src",
+                &src_str,
+            ]);
+            self.run_command("ip", &route_args).await?;
+        } else {
+            let mut route_args: Vec<&str> = Vec::new();
+            route_args.extend_from_slice(ip_cmd_flag);
+            route_args.extend_from_slice(&["route", "replace", &host_route, "dev", &veth_host]);
+            self.run_command("ip", &route_args).await?;
+        }
+
+        // Ensure IP forwarding is enabled so the kernel forwards packets
+        // between the veth pairs and the overlay TUN interface.
+        let _ = self
+            .run_command("sysctl", &["-w", "net.ipv4.ip_forward=1"])
+            .await;
+        // Also enable IPv6 forwarding for dual-stack support
+        let _ = self
+            .run_command("sysctl", &["-w", "net.ipv6.conf.all.forwarding=1"])
+            .await;
 
         Ok(())
     }
@@ -388,7 +447,7 @@ impl OverlayManager {
     /// Returns this node's IP on the global overlay network, if available.
     ///
     /// This is set after [`setup_global_overlay`] completes successfully.
-    pub fn node_ip(&self) -> Option<Ipv4Addr> {
+    pub fn node_ip(&self) -> Option<IpAddr> {
         self.node_ip
     }
 
@@ -397,12 +456,17 @@ impl OverlayManager {
         &self,
         private_key: String,
         public_key: String,
-        ip: Ipv4Addr,
+        ip: IpAddr,
         mask: u8,
         listen_port: u16,
     ) -> OverlayConfig {
+        // Bind to the correct address family for the overlay IP
+        let local_addr = match ip {
+            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        };
         OverlayConfig {
-            local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), listen_port),
+            local_endpoint: SocketAddr::new(local_addr, listen_port),
             private_key,
             public_key,
             overlay_cidr: format!("{ip}/{mask}"),
@@ -429,35 +493,49 @@ impl OverlayManager {
     }
 }
 
-/// Simple IP address allocator
+/// Simple IP address allocator supporting both IPv4 and IPv6.
+///
+/// For IPv4, the base address octets are incremented using a 32-bit offset.
+/// For IPv6, the base address segments are incremented using a 64-bit offset
+/// applied to the lower 64 bits (interface identifier portion).
 struct IpAllocator {
-    base: Ipv4Addr,
-    next_offset: std::sync::atomic::AtomicU32,
+    base: IpAddr,
+    next_offset: std::sync::atomic::AtomicU64,
 }
 
 impl IpAllocator {
-    fn new(cidr: ipnetwork::Ipv4Network) -> Self {
+    fn new(cidr: ipnetwork::IpNetwork) -> Self {
         Self {
             base: cidr.ip(),
-            next_offset: std::sync::atomic::AtomicU32::new(1),
+            next_offset: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::unnecessary_wraps)]
-    fn allocate(&self) -> Result<Ipv4Addr, AgentError> {
+    fn allocate(&self) -> Result<IpAddr, AgentError> {
         let offset = self
             .next_offset
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let octets = self.base.octets();
-        Ok(Ipv4Addr::new(
-            octets[0],
-            octets[1],
-            (u32::from(octets[2]) + (offset >> 8)) as u8,
-            (u32::from(octets[3]) + (offset & 0xFF)) as u8,
-        ))
+        match self.base {
+            IpAddr::V4(base_v4) => {
+                let octets = base_v4.octets();
+                let offset_u32 = offset as u32;
+                Ok(IpAddr::V4(Ipv4Addr::new(
+                    octets[0],
+                    octets[1],
+                    (u32::from(octets[2]) + (offset_u32 >> 8)) as u8,
+                    (u32::from(octets[3]) + (offset_u32 & 0xFF)) as u8,
+                )))
+            }
+            IpAddr::V6(base_v6) => {
+                let base_u128 = u128::from(base_v6);
+                let addr = base_u128.wrapping_add(u128::from(offset));
+                Ok(IpAddr::V6(Ipv6Addr::from(addr)))
+            }
+        }
     }
 
-    fn allocate_for_service(&self, _service: &str) -> Result<Ipv4Addr, AgentError> {
+    fn allocate_for_service(&self, _service: &str) -> Result<IpAddr, AgentError> {
         self.allocate()
     }
 }
