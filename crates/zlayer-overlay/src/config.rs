@@ -19,7 +19,7 @@ pub struct OverlayConfig {
     #[serde(default = "OverlayConfig::default_public_key")]
     pub public_key: String,
 
-    /// Overlay network CIDR
+    /// Overlay network CIDR (supports both IPv4 e.g. "10.0.0.0/8" and IPv6 e.g. "`fd00::/48`")
     #[serde(default = "OverlayConfig::default_cidr")]
     pub overlay_cidr: String,
 
@@ -134,5 +134,31 @@ mod tests {
         let config = OverlayConfig::default();
         assert_eq!(config.local_endpoint.port(), 51820);
         assert_eq!(config.overlay_cidr, "10.0.0.0/8");
+    }
+
+    #[test]
+    fn test_peer_info_to_peer_config_v6() {
+        use std::net::Ipv6Addr;
+
+        let peer = PeerInfo::new(
+            "public_key_here".to_string(),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51820),
+            "fd00::2/128",
+            Duration::from_secs(25),
+        );
+
+        let config = peer.to_peer_config();
+        assert!(config.contains("PublicKey = public_key_here"));
+        assert!(config.contains("Endpoint = [::1]:51820"));
+        assert!(config.contains("AllowedIPs = fd00::2/128"));
+    }
+
+    #[test]
+    fn test_overlay_config_accepts_ipv6_cidr() {
+        let config = OverlayConfig {
+            overlay_cidr: "fd00:200::/48".to_string(),
+            ..OverlayConfig::default()
+        };
+        assert_eq!(config.overlay_cidr, "fd00:200::/48");
     }
 }

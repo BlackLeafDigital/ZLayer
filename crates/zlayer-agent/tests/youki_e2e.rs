@@ -18,7 +18,7 @@
 //! sudo cargo test --package zlayer-agent --test youki_e2e -- --ignored --nocapture
 //! ```
 
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -1127,6 +1127,129 @@ async fn test_health_callback_updates_proxy() {
     });
 }
 
+/// Test that health callbacks update proxy backend health status with IPv6 backends
+#[tokio::test]
+async fn test_health_callback_updates_proxy_ipv6() {
+    with_timeout!(300, {
+        skip_without_root!();
+
+        let runtime = match create_e2e_runtime().await {
+            Ok(r) => Arc::new(r) as Arc<dyn Runtime + Send + Sync>,
+            Err(e) => {
+                eprintln!("Failed to create runtime: {e}");
+                return;
+            }
+        };
+
+        let proxy = create_test_proxy_manager();
+        let service_name = unique_name("health-cb-v6");
+        let spec = create_nginx_spec();
+
+        // Register service with proxy
+        proxy.add_service(&service_name, &spec).await;
+
+        // Create ServiceInstance with proxy manager
+        let mut instance =
+            ServiceInstance::new(service_name.clone(), spec.clone(), runtime.clone(), None);
+        instance.set_proxy_manager(proxy.clone());
+
+        // Scale up to 1 replica
+        instance.scale_to(1).await.expect("scale_to failed");
+
+        // Manually add an IPv6 backend to simulate dual-stack overlay networking
+        let test_backend: SocketAddr =
+            SocketAddr::new(IpAddr::V6("fd00:200::10".parse::<Ipv6Addr>().unwrap()), 80);
+        proxy.add_backend(&service_name, test_backend).await;
+
+        // Verify backend was added
+        let lb = proxy.load_balancer();
+        assert_eq!(
+            lb.backend_count(&service_name),
+            1,
+            "Should have 1 IPv6 backend"
+        );
+
+        // Simulate health callback marking backend as unhealthy
+        proxy
+            .update_backend_health(&service_name, test_backend, false)
+            .await;
+        assert_eq!(
+            lb.healthy_count(&service_name),
+            0,
+            "IPv6 backend should be marked as unhealthy"
+        );
+
+        // Simulate health callback marking backend as healthy again
+        proxy
+            .update_backend_health(&service_name, test_backend, true)
+            .await;
+        assert_eq!(
+            lb.healthy_count(&service_name),
+            1,
+            "IPv6 backend should be marked as healthy"
+        );
+
+        // Cleanup
+        instance.scale_to(0).await.expect("scale down failed");
+        proxy.remove_service(&service_name).await;
+    });
+}
+
+/// Test DNS record lifecycle with IPv6 AAAA records
+#[tokio::test]
+async fn test_dns_record_lifecycle_ipv6() {
+    with_timeout!(60, {
+        // This test doesn't require root - just tests DNS server operations
+        let Some((dns_server, dns_addr)) = create_test_dns_server() else {
+            eprintln!("Could not create DNS server, skipping test");
+            return;
+        };
+
+        println!("DNS server created at {dns_addr}");
+
+        // Test adding an AAAA record
+        let test_ip: IpAddr = "fd00:200::42".parse().unwrap();
+        let hostname = "myservice-v6.service.local";
+
+        let add_result = dns_server.add_record(hostname, test_ip).await;
+        assert!(
+            add_result.is_ok(),
+            "Failed to add IPv6 DNS record: {:?}",
+            add_result.err()
+        );
+        println!("Added AAAA DNS record: {hostname} -> {test_ip}");
+
+        // Add another AAAA record for a replica
+        let replica_hostname = "1.myservice-v6.service.local";
+        let replica_ip: IpAddr = "fd00:200::43".parse().unwrap();
+        let add_result = dns_server.add_record(replica_hostname, replica_ip).await;
+        assert!(
+            add_result.is_ok(),
+            "Failed to add replica IPv6 DNS record: {:?}",
+            add_result.err()
+        );
+        println!("Added replica AAAA DNS record: {replica_hostname} -> {replica_ip}");
+
+        // Test removing a record
+        let remove_result = dns_server.remove_record(replica_hostname).await;
+        assert!(
+            remove_result.is_ok(),
+            "Failed to remove IPv6 DNS record: {:?}",
+            remove_result.err()
+        );
+        println!("Removed IPv6 DNS record: {replica_hostname}");
+
+        // Remove service-level record
+        let remove_result = dns_server.remove_record(hostname).await;
+        assert!(
+            remove_result.is_ok(),
+            "Failed to remove service IPv6 DNS record: {:?}",
+            remove_result.err()
+        );
+        println!("Removed service IPv6 DNS record: {hostname}");
+    });
+}
+
 /// Test DNS record lifecycle: registration on scale up, removal on scale down
 #[tokio::test]
 async fn test_dns_record_lifecycle() {
@@ -1143,7 +1266,7 @@ async fn test_dns_record_lifecycle() {
         let test_ip = Ipv4Addr::new(10, 200, 0, 42);
         let hostname = "myservice.service.local";
 
-        let add_result = dns_server.add_record(hostname, test_ip).await;
+        let add_result = dns_server.add_record(hostname, IpAddr::V4(test_ip)).await;
         assert!(
             add_result.is_ok(),
             "Failed to add DNS record: {:?}",
@@ -1154,7 +1277,9 @@ async fn test_dns_record_lifecycle() {
         // Add another record for a replica
         let replica_hostname = "1.myservice.service.local";
         let replica_ip = Ipv4Addr::new(10, 200, 0, 43);
-        let add_result = dns_server.add_record(replica_hostname, replica_ip).await;
+        let add_result = dns_server
+            .add_record(replica_hostname, IpAddr::V4(replica_ip))
+            .await;
         assert!(
             add_result.is_ok(),
             "Failed to add replica DNS record: {:?}",
@@ -1289,6 +1414,145 @@ async fn test_proxy_backend_lifecycle() {
         // Remove service
         proxy.remove_service(&service_name).await;
         assert!(!proxy.has_service(&service_name).await);
+    });
+}
+
+/// Test proxy backend management with IPv6 overlay addresses
+#[tokio::test]
+async fn test_proxy_backend_lifecycle_ipv6() {
+    with_timeout!(60, {
+        // This test doesn't require root - just tests proxy operations with IPv6
+        let proxy = create_test_proxy_manager();
+        let service_name = unique_name("proxy-v6-lifecycle");
+        let spec = create_nginx_spec();
+
+        // Register service
+        proxy.add_service(&service_name, &spec).await;
+        assert!(proxy.has_service(&service_name).await);
+
+        // Add multiple IPv6 backends (simulating dual-stack overlay scale up)
+        let backend1: SocketAddr =
+            SocketAddr::new(IpAddr::V6("fd00:200::10".parse::<Ipv6Addr>().unwrap()), 80);
+        let backend2: SocketAddr =
+            SocketAddr::new(IpAddr::V6("fd00:200::11".parse::<Ipv6Addr>().unwrap()), 80);
+        let backend3: SocketAddr =
+            SocketAddr::new(IpAddr::V6("fd00:200::12".parse::<Ipv6Addr>().unwrap()), 80);
+
+        proxy.add_backend(&service_name, backend1).await;
+        proxy.add_backend(&service_name, backend2).await;
+        proxy.add_backend(&service_name, backend3).await;
+
+        let lb = proxy.load_balancer();
+        assert_eq!(
+            lb.backend_count(&service_name),
+            3,
+            "Should have 3 IPv6 backends"
+        );
+
+        // Mark one IPv6 backend as unhealthy
+        proxy
+            .update_backend_health(&service_name, backend2, false)
+            .await;
+        assert_eq!(
+            lb.healthy_count(&service_name),
+            2,
+            "Should have 2 healthy IPv6 backends"
+        );
+
+        // Remove one backend (simulating scale down)
+        proxy.remove_backend(&service_name, backend1).await;
+        assert_eq!(
+            lb.backend_count(&service_name),
+            2,
+            "Should have 2 IPv6 backends after removal"
+        );
+
+        // Remove unhealthy backend
+        proxy.remove_backend(&service_name, backend2).await;
+        assert_eq!(
+            lb.backend_count(&service_name),
+            1,
+            "Should have 1 IPv6 backend"
+        );
+        assert_eq!(
+            lb.healthy_count(&service_name),
+            1,
+            "Should have 1 healthy IPv6 backend"
+        );
+
+        // Remove service
+        proxy.remove_service(&service_name).await;
+        assert!(!proxy.has_service(&service_name).await);
+    });
+}
+
+/// Test proxy backend management with mixed IPv4 and IPv6 backends (dual-stack)
+#[tokio::test]
+async fn test_proxy_backend_lifecycle_dual_stack() {
+    with_timeout!(60, {
+        // This test doesn't require root - tests mixed IPv4/IPv6 proxy operations
+        let proxy = create_test_proxy_manager();
+        let service_name = unique_name("proxy-dualstack");
+        let spec = create_nginx_spec();
+
+        // Register service
+        proxy.add_service(&service_name, &spec).await;
+
+        // Add mixed IPv4 and IPv6 backends
+        let backend_v4: SocketAddr = "10.200.0.10:80".parse().unwrap();
+        let backend_v6: SocketAddr =
+            SocketAddr::new(IpAddr::V6("fd00:200::10".parse::<Ipv6Addr>().unwrap()), 80);
+
+        proxy.add_backend(&service_name, backend_v4).await;
+        proxy.add_backend(&service_name, backend_v6).await;
+
+        let lb = proxy.load_balancer();
+        assert_eq!(
+            lb.backend_count(&service_name),
+            2,
+            "Should have 2 backends (1 IPv4 + 1 IPv6)"
+        );
+        assert_eq!(
+            lb.healthy_count(&service_name),
+            2,
+            "Both backends should be healthy"
+        );
+
+        // Mark IPv6 backend unhealthy, IPv4 stays healthy
+        proxy
+            .update_backend_health(&service_name, backend_v6, false)
+            .await;
+        assert_eq!(
+            lb.healthy_count(&service_name),
+            1,
+            "Should have 1 healthy backend (IPv4)"
+        );
+
+        // Mark IPv4 backend unhealthy too
+        proxy
+            .update_backend_health(&service_name, backend_v4, false)
+            .await;
+        assert_eq!(
+            lb.healthy_count(&service_name),
+            0,
+            "Should have 0 healthy backends"
+        );
+
+        // Restore both
+        proxy
+            .update_backend_health(&service_name, backend_v4, true)
+            .await;
+        proxy
+            .update_backend_health(&service_name, backend_v6, true)
+            .await;
+        assert_eq!(
+            lb.healthy_count(&service_name),
+            2,
+            "Both backends should be healthy again"
+        );
+
+        // Cleanup
+        proxy.remove_service(&service_name).await;
     });
 }
 

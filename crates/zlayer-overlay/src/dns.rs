@@ -3,13 +3,13 @@
 use hickory_client::client::{Client, SyncClient};
 use hickory_client::udp::UdpClientConnection;
 use hickory_server::authority::{Catalog, ZoneType};
-use hickory_server::proto::rr::rdata::A;
+use hickory_server::proto::rr::rdata::{A, AAAA};
 use hickory_server::proto::rr::{DNSClass, Name, RData, Record, RecordType};
 use hickory_server::server::ServerFuture;
 use hickory_server::store::in_memory::InMemoryAuthority;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -49,13 +49,23 @@ impl DnsConfig {
     }
 }
 
-/// Generate a hostname from an IPv4 address for DNS registration
+/// Generate a hostname from an IP address for DNS registration
 ///
-/// Converts an IP like 10.200.0.5 to "node-0-5" (using last two octets)
+/// For IPv4: converts an IP like 10.200.0.5 to "node-0-5" (using last two octets).
+/// For IPv6: converts an IP like `fd00::abcd` to "node-abcd" (using last 4 hex chars).
 #[must_use]
-pub fn peer_hostname(ip: Ipv4Addr) -> String {
-    let octets = ip.octets();
-    format!("node-{}-{}", octets[2], octets[3])
+pub fn peer_hostname(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            format!("node-{}-{}", octets[2], octets[3])
+        }
+        IpAddr::V6(v6) => {
+            let segments = v6.segments();
+            let last_segment = segments[7];
+            format!("node-{last_segment:04x}")
+        }
+    }
 }
 
 /// Error type for DNS operations
@@ -88,12 +98,14 @@ pub struct DnsHandle {
 }
 
 impl DnsHandle {
-    /// Add a DNS A record for a hostname to IP mapping
+    /// Add a DNS record for a hostname to IP mapping
+    ///
+    /// Creates an A record for IPv4 addresses and an AAAA record for IPv6 addresses.
     ///
     /// # Errors
     ///
     /// Returns `DnsError::InvalidName` if the hostname is invalid.
-    pub async fn add_record(&self, hostname: &str, ip: Ipv4Addr) -> Result<(), DnsError> {
+    pub async fn add_record(&self, hostname: &str, ip: IpAddr) -> Result<(), DnsError> {
         // Create the fully qualified domain name
         let fqdn = if hostname.ends_with('.') {
             Name::from_str(hostname)
@@ -106,9 +118,11 @@ impl DnsHandle {
                 .map_err(|e| DnsError::InvalidName(format!("Failed to append zone: {e}")))?
         };
 
-        // Create the A record
-        let a_data = A::from(ip);
-        let rdata = RData::A(a_data);
+        // Create an A or AAAA record depending on address family
+        let rdata = match ip {
+            IpAddr::V4(v4) => RData::A(A::from(v4)),
+            IpAddr::V6(v6) => RData::AAAA(AAAA::from(v6)),
+        };
         let record = Record::from_rdata(fqdn, 300, rdata); // 300 second TTL
 
         // Get the current serial and increment it
@@ -125,7 +139,9 @@ impl DnsHandle {
         Ok(())
     }
 
-    /// Remove a DNS record for a hostname
+    /// Remove DNS records for a hostname (both A and AAAA)
+    ///
+    /// Tombstones both record types since we don't track which type was stored.
     ///
     /// # Errors
     ///
@@ -148,10 +164,14 @@ impl DnsHandle {
             current
         };
 
-        // Create an empty record to effectively "remove" by setting empty data
-        // Note: hickory-dns doesn't have a direct remove, so we create a tombstone
-        let record = Record::with(fqdn.clone(), RecordType::A, 0);
-        self.authority.upsert(record, serial).await;
+        // Create empty records to effectively "remove" by setting empty data.
+        // Note: hickory-dns doesn't have a direct remove, so we create tombstones.
+        // We tombstone both A and AAAA since we don't know which type was stored.
+        let a_record = Record::with(fqdn.clone(), RecordType::A, 0);
+        self.authority.upsert(a_record, serial).await;
+
+        let aaaa_record = Record::with(fqdn.clone(), RecordType::AAAA, 0);
+        self.authority.upsert(aaaa_record, serial).await;
 
         Ok(true)
     }
@@ -220,16 +240,18 @@ impl DnsServer {
         }
     }
 
-    /// Add a DNS A record for a hostname to IP mapping
+    /// Add a DNS record for a hostname to IP mapping
+    ///
+    /// Creates an A record for IPv4 addresses and an AAAA record for IPv6 addresses.
     ///
     /// # Errors
     ///
     /// Returns `DnsError::InvalidName` if the hostname is invalid.
-    pub async fn add_record(&self, hostname: &str, ip: Ipv4Addr) -> Result<(), DnsError> {
+    pub async fn add_record(&self, hostname: &str, ip: IpAddr) -> Result<(), DnsError> {
         self.handle().add_record(hostname, ip).await
     }
 
-    /// Remove a DNS record for a hostname
+    /// Remove DNS records for a hostname (both A and AAAA)
     ///
     /// # Errors
     ///
@@ -374,6 +396,55 @@ impl DnsClient {
 
         Ok(None)
     }
+
+    /// Query for an AAAA record (IPv6)
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DnsError` if the query fails or the hostname is invalid.
+    pub fn query_aaaa(&self, hostname: &str) -> Result<Option<Ipv6Addr>, DnsError> {
+        let name = Name::from_str(hostname)
+            .map_err(|e| DnsError::InvalidName(format!("{hostname}: {e}")))?;
+
+        let conn = UdpClientConnection::new(self.server_addr)
+            .map_err(|e| DnsError::Client(e.to_string()))?;
+
+        let client = SyncClient::new(conn);
+
+        let response = client
+            .query(&name, DNSClass::IN, RecordType::AAAA)
+            .map_err(|e| DnsError::Client(e.to_string()))?;
+
+        // Extract the AAAA record from the response
+        for answer in response.answers() {
+            if let Some(RData::AAAA(aaaa_record)) = answer.data() {
+                return Ok(Some((*aaaa_record).into()));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Query for any address record (A or AAAA), returning the first match
+    ///
+    /// Tries A first, then AAAA. Returns the first successful result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `DnsError` if both queries fail or the hostname is invalid.
+    pub fn query_addr(&self, hostname: &str) -> Result<Option<IpAddr>, DnsError> {
+        // Try A record first
+        if let Ok(Some(v4)) = self.query_a(hostname) {
+            return Ok(Some(IpAddr::V4(v4)));
+        }
+
+        // Then try AAAA
+        if let Ok(Some(v6)) = self.query_aaaa(hostname) {
+            return Ok(Some(IpAddr::V6(v6)));
+        }
+
+        Ok(None)
+    }
 }
 
 /// Service discovery with DNS
@@ -398,7 +469,10 @@ impl ServiceDiscovery {
         records.insert(name.to_string(), ip);
     }
 
-    /// Resolve a service to an IP
+    /// Resolve a service to an IP address
+    ///
+    /// Checks the local cache first, then queries the DNS server for both
+    /// A (IPv4) and AAAA (IPv6) records.
     pub async fn resolve(&self, name: &str) -> Option<IpAddr> {
         // First check local cache
         {
@@ -408,10 +482,10 @@ impl ServiceDiscovery {
             }
         }
 
-        // Query DNS server for IPv4 addresses
+        // Query DNS server for both A and AAAA records
         let client = DnsClient::new(self.dns_server);
-        if let Ok(Some(ipv4)) = client.query_a(name) {
-            return Some(IpAddr::V4(ipv4));
+        if let Ok(Some(addr)) = client.query_addr(name) {
+            return Some(addr);
         }
 
         None
@@ -440,14 +514,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_peer_hostname() {
-        // Test various IP addresses
-        assert_eq!(peer_hostname(Ipv4Addr::new(10, 200, 0, 1)), "node-0-1");
-        assert_eq!(peer_hostname(Ipv4Addr::new(10, 200, 0, 5)), "node-0-5");
-        assert_eq!(peer_hostname(Ipv4Addr::new(10, 200, 1, 100)), "node-1-100");
+    fn test_peer_hostname_v4() {
+        // Test various IPv4 addresses
         assert_eq!(
-            peer_hostname(Ipv4Addr::new(192, 168, 255, 254)),
+            peer_hostname(IpAddr::V4(Ipv4Addr::new(10, 200, 0, 1))),
+            "node-0-1"
+        );
+        assert_eq!(
+            peer_hostname(IpAddr::V4(Ipv4Addr::new(10, 200, 0, 5))),
+            "node-0-5"
+        );
+        assert_eq!(
+            peer_hostname(IpAddr::V4(Ipv4Addr::new(10, 200, 1, 100))),
+            "node-1-100"
+        );
+        assert_eq!(
+            peer_hostname(IpAddr::V4(Ipv4Addr::new(192, 168, 255, 254))),
             "node-255-254"
+        );
+    }
+
+    #[test]
+    fn test_peer_hostname_v6() {
+        // Test various IPv6 addresses
+        assert_eq!(
+            peer_hostname(IpAddr::V6("fd00::1".parse().unwrap())),
+            "node-0001"
+        );
+        assert_eq!(
+            peer_hostname(IpAddr::V6("fd00::abcd".parse().unwrap())),
+            "node-abcd"
+        );
+        assert_eq!(
+            peer_hostname(IpAddr::V6("fd00:200::ffff".parse().unwrap())),
+            "node-ffff"
+        );
+        // Zero last segment
+        assert_eq!(
+            peer_hostname(IpAddr::V6("fd00::1:0".parse().unwrap())),
+            "node-0000"
         );
     }
 
@@ -531,7 +636,7 @@ mod tests {
         let server = DnsServer::new(addr, "overlay.local.").unwrap();
 
         let result = server
-            .add_record("myservice", Ipv4Addr::new(10, 0, 0, 5))
+            .add_record("myservice", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)))
             .await;
         assert!(result.is_ok());
     }
@@ -545,12 +650,12 @@ mod tests {
         let handle = server.handle();
 
         let result = handle
-            .add_record("service1", Ipv4Addr::new(10, 0, 0, 1))
+            .add_record("service1", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)))
             .await;
         assert!(result.is_ok());
 
         let result = handle
-            .add_record("service2", Ipv4Addr::new(10, 0, 0, 2))
+            .add_record("service2", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)))
             .await;
         assert!(result.is_ok());
 
@@ -563,5 +668,135 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
         let client = DnsClient::new(addr);
         assert_eq!(client.server_addr, addr);
+    }
+
+    #[tokio::test]
+    async fn test_dns_handle_add_aaaa_record() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 15353);
+        let server = DnsServer::new(addr, "overlay.local.").unwrap();
+        let handle = server.handle();
+
+        // Add an AAAA record via IPv6 address
+        let ipv6: IpAddr = "fd00::1".parse().unwrap();
+        let result = handle.add_record("service-v6", ipv6).await;
+        assert!(result.is_ok());
+
+        // Add a second AAAA record
+        let ipv6_2: IpAddr = "fd00::abcd".parse().unwrap();
+        let result = handle.add_record("service-v6-2", ipv6_2).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dns_server_add_aaaa_record() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 15353);
+        let server = DnsServer::new(addr, "overlay.local.").unwrap();
+
+        // Add AAAA record through the server directly
+        let ipv6: IpAddr = "fd00::42".parse().unwrap();
+        let result = server.add_record("myservice-v6", ipv6).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_dns_handle_remove_record_covers_both_types() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 15353);
+        let server = DnsServer::new(addr, "overlay.local.").unwrap();
+        let handle = server.handle();
+
+        // Add an A record
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        handle.add_record("dual-service", ipv4).await.unwrap();
+
+        // Remove should succeed (tombstones both A and AAAA)
+        let removed = handle.remove_record("dual-service").await.unwrap();
+        assert!(removed);
+
+        // Add an AAAA record
+        let ipv6: IpAddr = "fd00::1".parse().unwrap();
+        handle.add_record("v6-service", ipv6).await.unwrap();
+
+        // Remove should also succeed for AAAA records
+        let removed = handle.remove_record("v6-service").await.unwrap();
+        assert!(removed);
+    }
+
+    #[tokio::test]
+    async fn test_service_discovery_local_cache_ipv6() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 15353);
+        let discovery = ServiceDiscovery::new(addr);
+
+        // Register an IPv6 service
+        let ipv6: IpAddr = "fd00::beef".parse().unwrap();
+        discovery.register("v6-service", ipv6).await;
+
+        // Should resolve from local cache
+        let resolved = discovery.resolve("v6-service").await;
+        assert_eq!(resolved, Some(ipv6));
+
+        // Unregister and verify
+        discovery.unregister("v6-service").await;
+        let services = discovery.list_services().await;
+        assert!(services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_service_discovery_mixed_v4_v6_cache() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 15353);
+        let discovery = ServiceDiscovery::new(addr);
+
+        let ipv4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let ipv6: IpAddr = "fd00::1".parse().unwrap();
+
+        discovery.register("svc-v4", ipv4).await;
+        discovery.register("svc-v6", ipv6).await;
+
+        assert_eq!(discovery.resolve("svc-v4").await, Some(ipv4));
+        assert_eq!(discovery.resolve("svc-v6").await, Some(ipv6));
+
+        let mut services = discovery.list_services().await;
+        services.sort();
+        assert_eq!(services, vec!["svc-v4", "svc-v6"]);
+    }
+
+    #[test]
+    fn test_dns_config_with_ipv6_bind_addr() {
+        let ipv6_bind: IpAddr = "fd00::1".parse().unwrap();
+        let config = DnsConfig::new("overlay.local.", ipv6_bind);
+        assert_eq!(config.bind_addr, ipv6_bind);
+        assert_eq!(config.port, DEFAULT_DNS_PORT);
+
+        // Serialization round-trip
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: DnsConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.bind_addr, ipv6_bind);
+    }
+
+    #[test]
+    fn test_dns_server_creation_ipv6_bind() {
+        let ipv6_addr: IpAddr = "::1".parse().unwrap();
+        let addr = SocketAddr::new(ipv6_addr, 15353);
+        let server = DnsServer::new(addr, "overlay.local.");
+
+        assert!(server.is_ok());
+        let server = server.unwrap();
+        assert_eq!(server.listen_addr(), addr);
+    }
+
+    #[test]
+    fn test_peer_hostname_uniqueness() {
+        // Different IPs should produce different hostnames
+        let v4_a = peer_hostname(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let v4_b = peer_hostname(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)));
+        assert_ne!(v4_a, v4_b);
+
+        let v6_a = peer_hostname(IpAddr::V6("fd00::1".parse().unwrap()));
+        let v6_b = peer_hostname(IpAddr::V6("fd00::2".parse().unwrap()));
+        assert_ne!(v6_a, v6_b);
+
+        // IPv4 and IPv6 hostname formats are distinct
+        let v4 = peer_hostname(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)));
+        let v6 = peer_hostname(IpAddr::V6("fd00::1".parse().unwrap()));
+        assert_ne!(v4, v6);
     }
 }

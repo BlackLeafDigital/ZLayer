@@ -650,10 +650,10 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                     RaftService::with_auth(Arc::clone(&coordinator), Some(internal_token.clone()));
 
                 let raft_bind_ip: std::net::IpAddr = if let Some(om) = &overlay {
-                    om.read().await.node_ip().map_or(
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-                        std::net::IpAddr::V4,
-                    )
+                    om.read()
+                        .await
+                        .node_ip()
+                        .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
                 } else {
                     std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
                 };
@@ -1334,7 +1334,7 @@ async fn restore_single_deployment(state: &DaemonState, stored: &StoredDeploymen
         //    Resolve the node's overlay IP so internal endpoints bind to
         //    the overlay interface instead of 0.0.0.0.
         let overlay_ip: Option<std::net::IpAddr> = if let Some(om) = &state.overlay {
-            om.read().await.node_ip().map(std::net::IpAddr::V4)
+            om.read().await.node_ip()
         } else {
             None
         };

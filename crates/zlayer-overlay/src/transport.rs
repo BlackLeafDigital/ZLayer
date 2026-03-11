@@ -276,30 +276,53 @@ impl OverlayTransport {
     }
 
     /// Platform-specific interface IP assignment and bring-up.
+    ///
+    /// Supports both IPv4 and IPv6 overlay CIDRs. For IPv4, uses `ifconfig inet`
+    /// with a netmask. For IPv6, uses `ifconfig inet6` with prefix length notation.
+    /// Routes are added with `-inet6` for IPv6 destinations.
     #[cfg(target_os = "macos")]
     async fn configure_interface(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let cidr: ipnet::Ipv4Net = self.config.overlay_cidr.parse().map_err(|e| {
+        let cidr: ipnet::IpNet = self.config.overlay_cidr.parse().map_err(|e| {
             format!(
                 "Failed to parse overlay CIDR '{}': {e}",
                 self.config.overlay_cidr
             )
         })?;
         let overlay_ip = cidr.addr().to_string();
-        let netmask = cidr.netmask().to_string();
 
-        // Configure point-to-point utun interface
-        let output = Command::new("ifconfig")
-            .args([
-                &self.interface_name,
-                "inet",
-                &overlay_ip,
-                &overlay_ip,
-                "netmask",
-                &netmask,
-                "up",
-            ])
-            .output()
-            .await?;
+        // Configure point-to-point utun interface (IPv4 vs IPv6 syntax differs)
+        let output = match &cidr {
+            ipnet::IpNet::V4(v4) => {
+                let netmask = v4.netmask().to_string();
+                Command::new("ifconfig")
+                    .args([
+                        &self.interface_name,
+                        "inet",
+                        &overlay_ip,
+                        &overlay_ip,
+                        "netmask",
+                        &netmask,
+                        "up",
+                    ])
+                    .output()
+                    .await?
+            }
+            ipnet::IpNet::V6(_v6) => {
+                // macOS ifconfig for IPv6: ifconfig <iface> inet6 <addr> prefixlen <len>
+                let prefixlen = cidr.prefix_len().to_string();
+                Command::new("ifconfig")
+                    .args([
+                        &self.interface_name,
+                        "inet6",
+                        &overlay_ip,
+                        "prefixlen",
+                        &prefixlen,
+                        "up",
+                    ])
+                    .output()
+                    .await?
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -308,17 +331,35 @@ impl OverlayTransport {
 
         // Add route for the overlay subnet
         let network_cidr = format!("{}/{}", cidr.network(), cidr.prefix_len());
-        let output = Command::new("route")
-            .args([
-                "-n",
-                "add",
-                "-net",
-                &network_cidr,
-                "-interface",
-                &self.interface_name,
-            ])
-            .output()
-            .await?;
+        let output = match &cidr {
+            ipnet::IpNet::V4(_) => {
+                Command::new("route")
+                    .args([
+                        "-n",
+                        "add",
+                        "-net",
+                        &network_cidr,
+                        "-interface",
+                        &self.interface_name,
+                    ])
+                    .output()
+                    .await?
+            }
+            ipnet::IpNet::V6(_) => {
+                // macOS route for IPv6: route -n add -inet6 <dest> -interface <iface>
+                Command::new("route")
+                    .args([
+                        "-n",
+                        "add",
+                        "-inet6",
+                        &network_cidr,
+                        "-interface",
+                        &self.interface_name,
+                    ])
+                    .output()
+                    .await?
+            }
+        };
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -332,9 +373,21 @@ impl OverlayTransport {
     }
 
     /// Platform-specific interface IP assignment and bring-up.
+    ///
+    /// Supports both IPv4 and IPv6 overlay CIDRs. The `ip addr add` command
+    /// handles both address families natively. For explicit route addition,
+    /// uses `ip -6 route add` for IPv6 and `ip route add` for IPv4.
     #[cfg(not(target_os = "macos"))]
     async fn configure_interface(&self) -> Result<(), Box<dyn std::error::Error>> {
-        // Assign overlay IP address
+        let cidr: ipnet::IpNet = self.config.overlay_cidr.parse().map_err(|e| {
+            format!(
+                "Failed to parse overlay CIDR '{}': {e}",
+                self.config.overlay_cidr
+            )
+        })?;
+        let is_ipv6 = cidr.addr().is_ipv6();
+
+        // Assign overlay IP address — `ip addr add` works for both IPv4 and IPv6
         let output = Command::new("ip")
             .args([
                 "addr",
@@ -366,6 +419,36 @@ impl OverlayTransport {
                 String::from_utf8_lossy(&output.stderr)
             )
             .into());
+        }
+
+        // Add explicit route for the overlay subnet.
+        // For IPv6 use `ip -6 route add`, for IPv4 use `ip route add`.
+        let network_cidr = format!("{}/{}", cidr.network(), cidr.prefix_len());
+        let output = if is_ipv6 {
+            Command::new("ip")
+                .args([
+                    "-6",
+                    "route",
+                    "add",
+                    &network_cidr,
+                    "dev",
+                    &self.interface_name,
+                ])
+                .output()
+                .await?
+        } else {
+            Command::new("ip")
+                .args(["route", "add", &network_cidr, "dev", &self.interface_name])
+                .output()
+                .await?
+        };
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            // Ignore "already exists" — idempotent (kernel may auto-add connected route)
+            if !stderr.contains("RTNETLINK answers: File exists") {
+                return Err(format!("Failed to add route: {stderr}").into());
+            }
         }
 
         Ok(())
@@ -547,7 +630,7 @@ impl Drop for OverlayTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
     use std::time::Duration;
 
     #[test]
@@ -562,6 +645,88 @@ mod tests {
         let config = peer.to_peer_config();
         assert!(config.contains("PublicKey = test_public_key"));
         assert!(config.contains("Endpoint = 10.0.0.1:51820"));
+    }
+
+    #[test]
+    fn test_peer_info_ipv6_to_config() {
+        let peer = PeerInfo::new(
+            "test_public_key_v6".to_string(),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
+                51820,
+            ),
+            "fd00::2/128",
+            Duration::from_secs(25),
+        );
+
+        let config = peer.to_peer_config();
+        assert!(config.contains("PublicKey = test_public_key_v6"));
+        // SocketAddr for IPv6 uses bracket notation: [fd00::1]:51820
+        assert!(
+            config.contains("Endpoint = [fd00::1]:51820"),
+            "IPv6 endpoint should use bracket notation, got: {config}"
+        );
+        assert!(config.contains("AllowedIPs = fd00::2/128"));
+    }
+
+    #[test]
+    fn test_overlay_cidr_parses_ipv4() {
+        let cidr: ipnet::IpNet = "10.200.0.1/24".parse().unwrap();
+        assert!(cidr.addr().is_ipv4());
+        assert_eq!(cidr.prefix_len(), 24);
+        assert_eq!(cidr.network().to_string(), "10.200.0.0");
+    }
+
+    #[test]
+    fn test_overlay_cidr_parses_ipv6() {
+        let cidr: ipnet::IpNet = "fd00::1/48".parse().unwrap();
+        assert!(cidr.addr().is_ipv6());
+        assert_eq!(cidr.prefix_len(), 48);
+        assert_eq!(cidr.network().to_string(), "fd00::");
+    }
+
+    #[test]
+    fn test_overlay_cidr_ipv6_host_address() {
+        // Verify /128 single-host prefix works (used in allowed_ips)
+        let cidr: ipnet::IpNet = "fd00::5/128".parse().unwrap();
+        assert!(cidr.addr().is_ipv6());
+        assert_eq!(cidr.prefix_len(), 128);
+        assert_eq!(cidr.addr().to_string(), "fd00::5");
+    }
+
+    #[test]
+    fn test_peer_info_ipv6_allowed_ips_format() {
+        // PeerInfo.allowed_ips is a String — verify both formats are valid
+        let peer_v4 = PeerInfo::new(
+            "key_v4".to_string(),
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51820),
+            "10.200.0.5/32",
+            Duration::from_secs(25),
+        );
+        assert_eq!(peer_v4.allowed_ips, "10.200.0.5/32");
+
+        let peer_v6 = PeerInfo::new(
+            "key_v6".to_string(),
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 5)),
+                51820,
+            ),
+            "fd00::5/128",
+            Duration::from_secs(25),
+        );
+        assert_eq!(peer_v6.allowed_ips, "fd00::5/128");
+    }
+
+    #[test]
+    fn test_uapi_body_format_ipv6_peer() {
+        // Verify that formatting an IPv6 SocketAddr for UAPI produces correct output.
+        // WireGuard UAPI expects [ipv6]:port format for endpoints.
+        let endpoint = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1)),
+            51820,
+        );
+        let formatted = format!("endpoint={endpoint}");
+        assert_eq!(formatted, "endpoint=[fd00::1]:51820");
     }
 
     #[tokio::test]
@@ -644,6 +809,53 @@ mod tests {
         let iface_name = "utun".to_string();
         #[cfg(not(target_os = "macos"))]
         let iface_name = "zl-bt-test0".to_string();
+
+        let mut transport = OverlayTransport::new(config, iface_name);
+        let result = transport.create_interface().await;
+
+        match result {
+            Ok(()) => {
+                #[cfg(target_os = "macos")]
+                assert!(
+                    transport.interface_name().starts_with("utun"),
+                    "macOS interface should be utunN, got: {}",
+                    transport.interface_name()
+                );
+                transport.shutdown();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("Attribute failed policy validation"),
+                    "create_interface should not produce kernel WireGuard errors. Got: {msg}",
+                );
+                assert!(
+                    msg.contains("boringtun")
+                        || msg.contains("CAP_NET_ADMIN")
+                        || msg.contains("sudo"),
+                    "Error should mention boringtun, CAP_NET_ADMIN, or sudo. Got: {msg}",
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "Requires root/CAP_NET_ADMIN"]
+    async fn test_create_interface_boringtun_ipv6() {
+        let config = OverlayConfig {
+            overlay_cidr: "fd00::1/48".to_string(),
+            private_key: "test_key".to_string(),
+            public_key: "test_pub".to_string(),
+            local_endpoint: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51820),
+            peer_discovery_interval: Duration::from_secs(30),
+            #[cfg(feature = "nat")]
+            nat: crate::nat::NatConfig::default(),
+        };
+
+        #[cfg(target_os = "macos")]
+        let iface_name = "utun".to_string();
+        #[cfg(not(target_os = "macos"))]
+        let iface_name = "zl-bt6-test0".to_string();
 
         let mut transport = OverlayTransport::new(config, iface_name);
         let result = transport.create_interface().await;

@@ -9,7 +9,7 @@ use crate::error::{OverlayError, Result};
 use crate::nat::ConnectionType;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
@@ -32,7 +32,7 @@ pub struct PeerStatus {
     pub public_key: String,
 
     /// Peer's overlay IP (if known)
-    pub overlay_ip: Option<Ipv4Addr>,
+    pub overlay_ip: Option<IpAddr>,
 
     /// Whether the peer is considered healthy
     pub healthy: bool,
@@ -190,10 +190,20 @@ impl OverlayHealthChecker {
                 healthy_count += 1;
             }
 
-            // Extract overlay IP from allowed IPs (first /32 address)
-            let overlay_ip = stat.allowed_ips.iter().find_map(|ip| {
-                if ip.ends_with("/32") {
-                    ip.trim_end_matches("/32").parse().ok()
+            // Extract overlay IP from allowed IPs (first /32 for IPv4, /128 for IPv6)
+            let overlay_ip: Option<IpAddr> = stat.allowed_ips.iter().find_map(|ip_str| {
+                if ip_str.ends_with("/32") {
+                    ip_str
+                        .trim_end_matches("/32")
+                        .parse::<IpAddr>()
+                        .ok()
+                        .filter(IpAddr::is_ipv4)
+                } else if ip_str.ends_with("/128") {
+                    ip_str
+                        .trim_end_matches("/128")
+                        .parse::<IpAddr>()
+                        .ok()
+                        .filter(IpAddr::is_ipv6)
                 } else {
                     None
                 }
@@ -237,12 +247,15 @@ impl OverlayHealthChecker {
 
     /// Ping a specific peer via its overlay IP
     ///
+    /// Supports both IPv4 and IPv6 overlay addresses. Uses `ping` for IPv4
+    /// and `ping6` (macOS) or `ping -6` (Linux) for IPv6.
+    ///
     /// Returns the RTT on success.
     ///
     /// # Errors
     ///
     /// Returns `OverlayError::PeerUnreachable` if the ping fails or times out.
-    pub async fn ping_peer(&self, overlay_ip: Ipv4Addr) -> Result<Duration> {
+    pub async fn ping_peer(&self, overlay_ip: IpAddr) -> Result<Duration> {
         let start = Instant::now();
 
         // Use ICMP ping via the ping command.
@@ -252,19 +265,33 @@ impl OverlayHealthChecker {
         #[cfg(not(target_os = "macos"))]
         let timeout_arg = PING_TIMEOUT_SECS.to_string();
 
-        let output = tokio::time::timeout(
-            Duration::from_secs(PING_TIMEOUT_SECS),
-            Command::new("ping")
-                .args([
-                    "-c",
-                    "1", // Single ping
-                    "-W",
-                    &timeout_arg,
-                    &overlay_ip.to_string(),
-                ])
-                .output(),
-        )
-        .await;
+        // Build the ping command based on address family and OS
+        let mut cmd = match overlay_ip {
+            IpAddr::V4(_) => Command::new("ping"),
+            IpAddr::V6(_) => {
+                #[cfg(target_os = "macos")]
+                {
+                    Command::new("ping6")
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let mut c = Command::new("ping");
+                    c.arg("-6");
+                    c
+                }
+            }
+        };
+
+        cmd.args([
+            "-c",
+            "1", // Single ping
+            "-W",
+            &timeout_arg,
+            &overlay_ip.to_string(),
+        ]);
+
+        let output =
+            tokio::time::timeout(Duration::from_secs(PING_TIMEOUT_SECS), cmd.output()).await;
 
         match output {
             Ok(Ok(result)) if result.status.success() => Ok(start.elapsed()),
@@ -290,12 +317,13 @@ impl OverlayHealthChecker {
     /// # Errors
     ///
     /// Returns `OverlayError::PeerUnreachable` if the connection fails or times out.
-    pub async fn tcp_check(&self, overlay_ip: Ipv4Addr, port: u16) -> Result<Duration> {
+    pub async fn tcp_check(&self, overlay_ip: IpAddr, port: u16) -> Result<Duration> {
         let start = Instant::now();
 
+        let addr = SocketAddr::new(overlay_ip, port);
         let result = tokio::time::timeout(
             Duration::from_secs(PING_TIMEOUT_SECS),
-            tokio::net::TcpStream::connect((overlay_ip, port)),
+            tokio::net::TcpStream::connect(addr),
         )
         .await;
 
@@ -472,10 +500,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_peer_status_serialization() {
+    fn test_peer_status_serialization_v4() {
         let status = PeerStatus {
             public_key: "test_key".to_string(),
-            overlay_ip: Some("10.200.0.5".parse().unwrap()),
+            overlay_ip: Some("10.200.0.5".parse::<IpAddr>().unwrap()),
             healthy: true,
             last_handshake_secs: Some(10),
             last_ping_ms: Some(5),
@@ -490,6 +518,35 @@ mod tests {
 
         assert_eq!(deserialized.public_key, "test_key");
         assert!(deserialized.healthy);
+        assert_eq!(
+            deserialized.overlay_ip,
+            Some("10.200.0.5".parse::<IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
+    fn test_peer_status_serialization_v6() {
+        let status = PeerStatus {
+            public_key: "test_key_v6".to_string(),
+            overlay_ip: Some("fd00::5".parse::<IpAddr>().unwrap()),
+            healthy: true,
+            last_handshake_secs: Some(10),
+            last_ping_ms: Some(5),
+            failure_count: 0,
+            last_check: 1_234_567_890,
+            #[cfg(feature = "nat")]
+            connection_type: ConnectionType::default(),
+        };
+
+        let json = serde_json::to_string(&status).unwrap();
+        let deserialized: PeerStatus = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.public_key, "test_key_v6");
+        assert!(deserialized.healthy);
+        assert_eq!(
+            deserialized.overlay_ip,
+            Some("fd00::5".parse::<IpAddr>().unwrap())
+        );
     }
 
     #[test]
