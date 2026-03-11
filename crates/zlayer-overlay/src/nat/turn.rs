@@ -24,7 +24,7 @@ use crate::error::OverlayError;
 use crate::nat::candidate::{Candidate, CandidateType};
 use crate::nat::config::TurnServerConfig;
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -84,6 +84,12 @@ pub(crate) const HEADER_LEN: usize = 3;
 
 /// Size of an encoded IPv4 peer address (4 IP + 2 port).
 pub(crate) const PEER_ADDR_LEN: usize = 6;
+
+/// Size of a family-tagged IPv4 peer address (1 family + 4 IP + 2 port).
+pub(crate) const PEER_ADDR_V4_TAGGED_LEN: usize = 7;
+
+/// Size of a family-tagged IPv6 peer address (1 family + 16 IP + 2 port).
+pub(crate) const PEER_ADDR_V6_TAGGED_LEN: usize = 19;
 
 // ---- Auth helpers -----------------------------------------------------------
 
@@ -147,6 +153,65 @@ pub fn decode_addr_v4(buf: &[u8]) -> Option<SocketAddrV4> {
     Some(SocketAddrV4::new(ip, port))
 }
 
+/// Encode a `SocketAddr` (IPv4 or IPv6) into a family-tagged byte sequence.
+///
+/// Layout: `[family: 1] [ip: 4 or 16] [port: 2]`
+///   - Family 0x01 = IPv4 (total 7 bytes)
+///   - Family 0x02 = IPv6 (total 19 bytes)
+#[must_use]
+pub fn encode_addr(addr: SocketAddr) -> Vec<u8> {
+    match addr {
+        SocketAddr::V4(v4) => {
+            let mut buf = Vec::with_capacity(PEER_ADDR_V4_TAGGED_LEN);
+            buf.push(0x01); // IPv4 family
+            buf.extend_from_slice(&v4.ip().octets());
+            buf.extend_from_slice(&v4.port().to_be_bytes());
+            buf
+        }
+        SocketAddr::V6(v6) => {
+            let mut buf = Vec::with_capacity(PEER_ADDR_V6_TAGGED_LEN);
+            buf.push(0x02); // IPv6 family
+            buf.extend_from_slice(&v6.ip().octets());
+            buf.extend_from_slice(&v6.port().to_be_bytes());
+            buf
+        }
+    }
+}
+
+/// Decode a family-tagged `SocketAddr` from bytes.
+///
+/// Returns `(decoded_addr, bytes_consumed)` or `None` if the buffer is too short
+/// or the family byte is unrecognized.
+#[must_use]
+pub fn decode_addr(buf: &[u8]) -> Option<(SocketAddr, usize)> {
+    if buf.is_empty() {
+        return None;
+    }
+    match buf[0] {
+        0x01 => {
+            // IPv4: 1 family + 4 IP + 2 port = 7 bytes
+            if buf.len() < PEER_ADDR_V4_TAGGED_LEN {
+                return None;
+            }
+            let ip = Ipv4Addr::new(buf[1], buf[2], buf[3], buf[4]);
+            let port = u16::from_be_bytes([buf[5], buf[6]]);
+            Some((SocketAddr::new(ip.into(), port), PEER_ADDR_V4_TAGGED_LEN))
+        }
+        0x02 => {
+            // IPv6: 1 family + 16 IP + 2 port = 19 bytes
+            if buf.len() < PEER_ADDR_V6_TAGGED_LEN {
+                return None;
+            }
+            let mut ip_bytes = [0u8; 16];
+            ip_bytes.copy_from_slice(&buf[1..17]);
+            let ip = Ipv6Addr::from(ip_bytes);
+            let port = u16::from_be_bytes([buf[17], buf[18]]);
+            Some((SocketAddr::new(ip.into(), port), PEER_ADDR_V6_TAGGED_LEN))
+        }
+        _ => None,
+    }
+}
+
 /// Build an authenticated control message.
 ///
 /// Layout: `[type: 1] [payload_len: 2] [payload] [auth_tag: 32]`
@@ -171,6 +236,9 @@ pub fn build_control_msg(msg_type: MsgType, payload: &[u8], key: &[u8; 32]) -> V
 /// Build a DATA message (no auth tag needed -- relay already authenticated).
 ///
 /// Layout: `[0x80: 1] [length: 2] [peer_addr: 6] [raw_data]`
+///
+/// This function accepts only IPv4 addresses. For dual-stack support, use
+/// [`build_data_msg_tagged`].
 #[must_use]
 #[allow(clippy::cast_possible_truncation)]
 pub fn build_data_msg(peer_addr: SocketAddrV4, data: &[u8]) -> Vec<u8> {
@@ -180,6 +248,23 @@ pub fn build_data_msg(peer_addr: SocketAddrV4, data: &[u8]) -> Vec<u8> {
     buf.push(MsgType::Data as u8);
     buf.extend_from_slice(&inner_len.to_be_bytes());
     buf.extend_from_slice(&encode_addr_v4(peer_addr));
+    buf.extend_from_slice(data);
+    buf
+}
+
+/// Build a DATA message with family-tagged peer address (IPv4 or IPv6).
+///
+/// Layout: `[0x80: 1] [length: 2] [peer_addr: 7 or 19] [raw_data]`
+#[must_use]
+#[allow(clippy::cast_possible_truncation)]
+pub fn build_data_msg_tagged(peer_addr: SocketAddr, data: &[u8]) -> Vec<u8> {
+    let encoded_addr = encode_addr(peer_addr);
+    let inner_len = (encoded_addr.len() + data.len()) as u16;
+    let total = HEADER_LEN + encoded_addr.len() + data.len();
+    let mut buf = Vec::with_capacity(total);
+    buf.push(MsgType::Data as u8);
+    buf.extend_from_slice(&inner_len.to_be_bytes());
+    buf.extend_from_slice(&encoded_addr);
     buf.extend_from_slice(data);
     buf
 }
@@ -242,6 +327,9 @@ pub fn parse_and_verify_control(buf: &[u8], key: &[u8; 32]) -> Option<(MsgType, 
 }
 
 /// Parse a DATA message payload into `(peer_addr, raw_data)`.
+///
+/// Expects the legacy 6-byte untagged IPv4 encoding. For dual-stack
+/// payloads, use [`parse_data_payload_tagged`].
 #[must_use]
 pub fn parse_data_payload(payload: &[u8]) -> Option<(SocketAddrV4, &[u8])> {
     if payload.len() < PEER_ADDR_LEN {
@@ -249,6 +337,15 @@ pub fn parse_data_payload(payload: &[u8]) -> Option<(SocketAddrV4, &[u8])> {
     }
     let addr = decode_addr_v4(&payload[..PEER_ADDR_LEN])?;
     Some((addr, &payload[PEER_ADDR_LEN..]))
+}
+
+/// Parse a family-tagged DATA message payload into `(peer_addr, raw_data)`.
+///
+/// Supports both IPv4 (family 0x01) and IPv6 (family 0x02) peer addresses.
+#[must_use]
+pub fn parse_data_payload_tagged(payload: &[u8]) -> Option<(SocketAddr, &[u8])> {
+    let (addr, consumed) = decode_addr(payload)?;
+    Some((addr, &payload[consumed..]))
 }
 
 // ---- Relay allocation -------------------------------------------------------
@@ -316,8 +413,14 @@ impl RelayClient {
     ///
     /// Returns [`OverlayError::TurnRelay`] on network or protocol errors.
     pub async fn allocate(&mut self) -> Result<SocketAddr, OverlayError> {
-        // Bind a UDP socket for communication with the relay server
-        let socket = UdpSocket::bind("0.0.0.0:0")
+        // Bind a UDP socket for communication with the relay server,
+        // matching the server's address family
+        let bind_addr = if self.server_addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| OverlayError::TurnRelay(format!("Failed to bind relay socket: {e}")))?;
 
@@ -352,29 +455,33 @@ impl RelayClient {
 
         match msg_type {
             MsgType::AllocateResp => {
-                // Payload: [relay_addr: 6] [allocation_id: 16] [lifetime: 4]
-                if resp_payload.len() < PEER_ADDR_LEN + 16 + 4 {
+                // Payload: [relay_addr: 7 or 19 (tagged)] [allocation_id: 16] [lifetime: 4]
+                // Minimum size: 7 (IPv4 tagged) + 16 + 4 = 27
+                if resp_payload.len() < PEER_ADDR_V4_TAGGED_LEN + 16 + 4 {
                     return Err(OverlayError::TurnRelay(
                         "AllocateResp payload too short".to_string(),
                     ));
                 }
 
-                let relay_sockaddr =
-                    decode_addr_v4(&resp_payload[..PEER_ADDR_LEN]).ok_or_else(|| {
-                        OverlayError::TurnRelay("Failed to decode relay address".to_string())
-                    })?;
+                let (relay_addr, addr_len) = decode_addr(&resp_payload).ok_or_else(|| {
+                    OverlayError::TurnRelay("Failed to decode relay address".to_string())
+                })?;
+
+                if resp_payload.len() < addr_len + 16 + 4 {
+                    return Err(OverlayError::TurnRelay(
+                        "AllocateResp payload too short for allocation data".to_string(),
+                    ));
+                }
 
                 let mut allocation_id = [0u8; 16];
-                allocation_id.copy_from_slice(&resp_payload[PEER_ADDR_LEN..PEER_ADDR_LEN + 16]);
+                allocation_id.copy_from_slice(&resp_payload[addr_len..addr_len + 16]);
 
                 let lifetime_secs = u32::from_be_bytes([
-                    resp_payload[PEER_ADDR_LEN + 16],
-                    resp_payload[PEER_ADDR_LEN + 17],
-                    resp_payload[PEER_ADDR_LEN + 18],
-                    resp_payload[PEER_ADDR_LEN + 19],
+                    resp_payload[addr_len + 16],
+                    resp_payload[addr_len + 17],
+                    resp_payload[addr_len + 18],
+                    resp_payload[addr_len + 19],
                 ]);
-
-                let relay_addr = SocketAddr::V4(relay_sockaddr);
 
                 debug!(
                     relay_addr = %relay_addr,
@@ -424,19 +531,11 @@ impl RelayClient {
             .as_ref()
             .ok_or_else(|| OverlayError::TurnRelay("No relay socket".to_string()))?;
 
-        let peer_v4 = match peer_addr {
-            SocketAddr::V4(v4) => v4,
-            SocketAddr::V6(_) => {
-                return Err(OverlayError::TurnRelay(
-                    "IPv6 peer addresses not supported".to_string(),
-                ));
-            }
-        };
-
-        // Payload: [allocation_id: 16] [peer_addr: 6]
-        let mut payload = Vec::with_capacity(16 + PEER_ADDR_LEN);
+        // Payload: [allocation_id: 16] [peer_addr: 7 or 19 (family-tagged)]
+        let encoded_peer = encode_addr(peer_addr);
+        let mut payload = Vec::with_capacity(16 + encoded_peer.len());
         payload.extend_from_slice(&allocation.allocation_id);
-        payload.extend_from_slice(&encode_addr_v4(peer_v4));
+        payload.extend_from_slice(&encoded_peer);
 
         let msg = build_control_msg(MsgType::PermissionReq, &payload, &self.auth_key);
         socket
@@ -497,7 +596,7 @@ impl RelayClient {
             .local_addr()
             .map_err(|e| OverlayError::TurnRelay(format!("Failed to get proxy addr: {e}")))?;
 
-        let wg_local = SocketAddrV4::new(Ipv4Addr::LOCALHOST, wg_port);
+        let wg_dest: SocketAddr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), wg_port);
 
         debug!(
             proxy_addr = %proxy_addr,
@@ -523,11 +622,7 @@ impl RelayClient {
                         match result {
                             Ok((n, _from)) => {
                                 // Destination is the relay_addr (the peer's relay allocation)
-                                let peer_v4 = match relay_addr {
-                                    SocketAddr::V4(v4) => v4,
-                                    SocketAddr::V6(_) => continue,
-                                };
-                                let data_msg = build_data_msg(peer_v4, &proxy_buf[..n]);
+                                let data_msg = build_data_msg_tagged(relay_addr, &proxy_buf[..n]);
                                 if let Err(e) = relay_read.send_to(&data_msg, server_addr).await {
                                     warn!(error = %e, "Failed to send data through relay");
                                 }
@@ -544,9 +639,8 @@ impl RelayClient {
                             Ok((n, _from)) => {
                                 if let Some(MsgType::Data) = relay_buf.first().and_then(|&b| MsgType::from_byte(b)) {
                                     if let Some((_, raw_data)) = parse_msg(&relay_buf[..n])
-                                        .and_then(|(_, payload)| parse_data_payload(payload))
+                                        .and_then(|(_, payload)| parse_data_payload_tagged(payload))
                                     {
-                                        let wg_dest = SocketAddr::V4(wg_local);
                                         if let Err(e) = proxy_read.send_to(raw_data, wg_dest).await {
                                             warn!(error = %e, "Failed to forward to WG");
                                         }
@@ -876,5 +970,105 @@ mod tests {
         let (_, payload) = parse_and_verify_control(&msg, &key).unwrap();
         assert_eq!(payload.len(), 16);
         assert_eq!(payload.as_slice(), &allocation_id);
+    }
+
+    // ---- IPv6 / dual-stack tests --------------------------------------------
+
+    #[test]
+    fn test_encode_decode_addr_ipv4() {
+        let addr = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 100).into(), 51820);
+        let encoded = encode_addr(addr);
+        assert_eq!(encoded.len(), PEER_ADDR_V4_TAGGED_LEN);
+        assert_eq!(encoded[0], 0x01); // IPv4 family
+        let (decoded, consumed) = decode_addr(&encoded).unwrap();
+        assert_eq!(decoded, addr);
+        assert_eq!(consumed, PEER_ADDR_V4_TAGGED_LEN);
+    }
+
+    #[test]
+    fn test_encode_decode_addr_ipv6() {
+        let addr = SocketAddr::new(
+            Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1).into(),
+            51820,
+        );
+        let encoded = encode_addr(addr);
+        assert_eq!(encoded.len(), PEER_ADDR_V6_TAGGED_LEN);
+        assert_eq!(encoded[0], 0x02); // IPv6 family
+        let (decoded, consumed) = decode_addr(&encoded).unwrap();
+        assert_eq!(decoded, addr);
+        assert_eq!(consumed, PEER_ADDR_V6_TAGGED_LEN);
+    }
+
+    #[test]
+    fn test_encode_decode_addr_ipv6_link_local() {
+        let addr = SocketAddr::new(Ipv6Addr::new(0xFE80, 0, 0, 0, 0, 0, 0, 1).into(), 3478);
+        let encoded = encode_addr(addr);
+        let (decoded, _) = decode_addr(&encoded).unwrap();
+        assert_eq!(decoded, addr);
+    }
+
+    #[test]
+    fn test_decode_addr_too_short() {
+        assert!(decode_addr(&[]).is_none());
+        // IPv4 family but only 3 bytes total (need 7)
+        assert!(decode_addr(&[0x01, 1, 2]).is_none());
+        // IPv6 family but only 5 bytes total (need 19)
+        assert!(decode_addr(&[0x02, 1, 2, 3, 4]).is_none());
+        // Unknown family
+        assert!(decode_addr(&[0x03, 1, 2, 3, 4, 5, 6]).is_none());
+    }
+
+    #[test]
+    fn test_build_and_parse_data_msg_tagged_ipv4() {
+        let peer_addr = SocketAddr::new(Ipv4Addr::new(10, 0, 0, 1).into(), 3478);
+        let raw_data = b"wireguard_packet_data";
+        let msg = build_data_msg_tagged(peer_addr, raw_data);
+
+        let (msg_type, payload) = parse_msg(&msg).unwrap();
+        assert_eq!(msg_type, MsgType::Data);
+
+        let (parsed_addr, parsed_data) = parse_data_payload_tagged(payload).unwrap();
+        assert_eq!(parsed_addr, peer_addr);
+        assert_eq!(parsed_data, raw_data);
+    }
+
+    #[test]
+    fn test_build_and_parse_data_msg_tagged_ipv6() {
+        let peer_addr = SocketAddr::new(
+            Ipv6Addr::new(0x2001, 0x0db8, 0xABCD, 0, 0, 0, 0, 0x42).into(),
+            51820,
+        );
+        let raw_data = b"wireguard_ipv6_packet_data";
+        let msg = build_data_msg_tagged(peer_addr, raw_data);
+
+        let (msg_type, payload) = parse_msg(&msg).unwrap();
+        assert_eq!(msg_type, MsgType::Data);
+
+        let (parsed_addr, parsed_data) = parse_data_payload_tagged(payload).unwrap();
+        assert_eq!(parsed_addr, peer_addr);
+        assert_eq!(parsed_data, raw_data);
+    }
+
+    #[test]
+    fn test_parse_data_payload_tagged_too_short() {
+        assert!(parse_data_payload_tagged(&[]).is_none());
+        assert!(parse_data_payload_tagged(&[0x01]).is_none());
+        assert!(parse_data_payload_tagged(&[0x02, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn test_relay_client_new_ipv6() {
+        let config = TurnServerConfig {
+            address: "[::1]:3478".to_string(),
+            username: "testuser".to_string(),
+            credential: "testpass".to_string(),
+            region: None,
+        };
+        let client = RelayClient::new(&config).unwrap();
+        assert_eq!(
+            client.server_addr,
+            SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 3478)
+        );
+        assert!(!client.is_active());
     }
 }

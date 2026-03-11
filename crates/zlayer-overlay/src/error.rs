@@ -1,6 +1,6 @@
 //! Error types for overlay network operations
 
-use std::net::Ipv4Addr;
+use std::net::IpAddr;
 use thiserror::Error;
 
 /// Errors that can occur during overlay network operations
@@ -28,11 +28,11 @@ pub enum OverlayError {
 
     /// IP address already allocated
     #[error("IP address {0} is already allocated")]
-    IpAlreadyAllocated(Ipv4Addr),
+    IpAlreadyAllocated(IpAddr),
 
     /// IP address not in CIDR range
     #[error("IP address {0} is not within CIDR range {1}")]
-    IpNotInRange(Ipv4Addr, String),
+    IpNotInRange(IpAddr, String),
 
     /// Interface already exists
     #[error("Overlay interface '{0}' already exists")]
@@ -48,7 +48,7 @@ pub enum OverlayError {
 
     /// Peer is unreachable
     #[error("Peer at {ip} is unreachable: {reason}")]
-    PeerUnreachable { ip: Ipv4Addr, reason: String },
+    PeerUnreachable { ip: IpAddr, reason: String },
 
     /// Configuration file error
     #[error("Configuration error: {0}")]

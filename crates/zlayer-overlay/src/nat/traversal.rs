@@ -71,16 +71,30 @@ impl NatTraversal {
     pub async fn gather_candidates(&mut self) -> Result<Vec<Candidate>> {
         let mut candidates = Vec::new();
 
-        // -- Host candidate via UDP socket trick --
+        // -- Host candidates via UDP socket trick --
+        // IPv4 host candidate
         match discover_local_ip() {
             Ok(local_ip) => {
                 let addr = SocketAddr::new(local_ip, self.wg_port);
                 let host = Candidate::new(CandidateType::Host, addr);
-                debug!(address = %addr, "Gathered host candidate");
+                debug!(address = %addr, "Gathered IPv4 host candidate");
                 candidates.push(host);
             }
             Err(e) => {
-                warn!(error = %e, "Failed to discover local IP for host candidate");
+                warn!(error = %e, "Failed to discover local IPv4 for host candidate");
+            }
+        }
+
+        // IPv6 host candidate
+        match discover_local_ipv6() {
+            Ok(local_ip) => {
+                let addr = SocketAddr::new(local_ip, self.wg_port);
+                let host = Candidate::new(CandidateType::Host, addr);
+                debug!(address = %addr, "Gathered IPv6 host candidate");
+                candidates.push(host);
+            }
+            Err(e) => {
+                debug!(error = %e, "No IPv6 host candidate (IPv6 may not be available)");
             }
         }
 
@@ -476,7 +490,7 @@ impl NatTraversal {
     }
 }
 
-/// Discover the local IP address via the UDP socket trick.
+/// Discover the local IPv4 address via the UDP socket trick.
 ///
 /// Creates a UDP socket, "connects" it to a public address (8.8.8.8:80),
 /// and reads the local address. No packets are sent because UDP `connect`
@@ -488,10 +502,20 @@ fn discover_local_ip() -> std::result::Result<std::net::IpAddr, std::io::Error> 
     Ok(socket.local_addr()?.ip())
 }
 
+/// Discover the local IPv6 address via the UDP socket trick.
+///
+/// Same approach as [`discover_local_ip`] but for IPv6. Connects to
+/// Google's public DNS IPv6 address (`[2001:4860:4860::8888]:80`).
+fn discover_local_ipv6() -> std::result::Result<std::net::IpAddr, std::io::Error> {
+    let socket = std::net::UdpSocket::bind("[::]:0")?;
+    socket.connect("[2001:4860:4860::8888]:80")?;
+    Ok(socket.local_addr()?.ip())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn test_discover_local_ip() {
@@ -626,5 +650,86 @@ mod tests {
         ];
         candidates.dedup_by_key(|c| c.address);
         assert_eq!(candidates.len(), 1);
+    }
+
+    // ---- IPv6 tests ---------------------------------------------------------
+
+    #[test]
+    fn test_discover_local_ipv6() {
+        // The IPv6 UDP socket trick may fail on systems without IPv6 connectivity.
+        match discover_local_ipv6() {
+            Ok(ip) => {
+                assert!(ip.is_ipv6(), "Should return an IPv6 address");
+                assert!(!ip.is_unspecified(), "IPv6 should not be [::]");
+                assert!(!ip.is_loopback(), "IPv6 should not be [::1]");
+            }
+            Err(e) => {
+                // IPv6 may not be available in all test environments
+                eprintln!("discover_local_ipv6 failed (IPv6 may not be available): {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_candidate_sorting_mixed_families() {
+        let host_v4 = Candidate::new(
+            CandidateType::Host,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 51820),
+        );
+        let host_v6 = Candidate::new(
+            CandidateType::Host,
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0xFD00, 0, 0, 0, 0, 0, 0, 1)),
+                51820,
+            ),
+        );
+        let reflexive_v6 = Candidate::new(
+            CandidateType::ServerReflexive,
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                51820,
+            ),
+        );
+
+        let mut candidates = vec![reflexive_v6, host_v4, host_v6];
+        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+        // Hosts (100) before ServerReflexive (50)
+        assert_eq!(candidates[0].candidate_type, CandidateType::Host);
+        assert_eq!(candidates[1].candidate_type, CandidateType::Host);
+        assert_eq!(candidates[2].candidate_type, CandidateType::ServerReflexive);
+    }
+
+    #[test]
+    fn test_candidate_dedup_ipv6() {
+        let addr = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+            51820,
+        );
+        let mut candidates = vec![
+            Candidate::new(CandidateType::Host, addr),
+            Candidate::new(CandidateType::Host, addr),
+        ];
+        candidates.dedup_by_key(|c| c.address);
+        assert_eq!(candidates.len(), 1);
+    }
+
+    #[test]
+    fn test_candidate_dedup_mixed_families_not_deduped() {
+        let addr_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 51820);
+        let addr_v6 = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xFD00, 0, 0, 0, 0, 0, 0, 1)),
+            51820,
+        );
+        let mut candidates = vec![
+            Candidate::new(CandidateType::Host, addr_v4),
+            Candidate::new(CandidateType::Host, addr_v6),
+        ];
+        candidates.dedup_by_key(|c| c.address);
+        assert_eq!(
+            candidates.len(),
+            2,
+            "IPv4 and IPv6 candidates should not be deduped"
+        );
     }
 }

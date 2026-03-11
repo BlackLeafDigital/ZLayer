@@ -13,7 +13,7 @@ use crate::overlay_manager::OverlayManager;
 use crate::proxy_manager::ProxyManager;
 use crate::runtime::{Container, ContainerId, ContainerState, Runtime};
 use std::collections::HashMap;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
@@ -236,7 +236,7 @@ impl ServiceInstance {
                                     }
                                 }
 
-                                Some(IpAddr::V4(ip))
+                                Some(ip)
                             }
                             Err(e) => {
                                 tracing::warn!(

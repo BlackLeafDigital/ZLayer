@@ -720,7 +720,7 @@ async fn orchestrate_deployment(
         // 3. Register proxy routes and ensure listening ports
         if let Some(proxy) = &state.proxy {
             let overlay_ip: Option<std::net::IpAddr> = if let Some(om) = &state.overlay {
-                om.read().await.node_ip().map(std::net::IpAddr::V4)
+                om.read().await.node_ip()
             } else {
                 None
             };

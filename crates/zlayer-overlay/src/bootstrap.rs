@@ -11,7 +11,7 @@ use crate::error::{OverlayError, Result};
 use crate::nat::{Candidate, ConnectionType, NatTraversal, RelayServer};
 use crate::transport::OverlayTransport;
 use serde::{Deserialize, Serialize};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
@@ -28,8 +28,14 @@ pub const DEFAULT_INTERFACE_NAME: &str = "zl-overlay0";
 /// Default overlay listen port
 pub const DEFAULT_WG_PORT: u16 = 51820;
 
-/// Default overlay network CIDR
+/// Default overlay network CIDR (IPv4)
 pub const DEFAULT_OVERLAY_CIDR: &str = "10.200.0.0/16";
+
+/// Default overlay network CIDR (IPv6)
+///
+/// Uses a ULA (Unique Local Address) prefix in the `fd00::/8` range.
+/// The `fd00:200::/48` prefix mirrors the IPv4 `10.200.0.0/16` convention.
+pub const DEFAULT_OVERLAY_CIDR_V6: &str = "fd00:200::/48";
 
 /// Default persistent keepalive interval (seconds)
 pub const DEFAULT_KEEPALIVE_SECS: u16 = 25;
@@ -43,8 +49,8 @@ pub struct BootstrapConfig {
     /// Network CIDR (e.g., "10.200.0.0/16")
     pub cidr: String,
 
-    /// This node's overlay IP address
-    pub node_ip: Ipv4Addr,
+    /// This node's overlay IP address (IPv4 or IPv6)
+    pub node_ip: IpAddr,
 
     /// Overlay interface name
     pub interface: String,
@@ -66,10 +72,16 @@ pub struct BootstrapConfig {
 }
 
 impl BootstrapConfig {
-    /// Get the overlay IP with /32 prefix for allowed IPs
+    /// Get the overlay IP with host prefix for allowed IPs
+    ///
+    /// Returns `/32` for IPv4 addresses and `/128` for IPv6 addresses.
     #[must_use]
     pub fn allowed_ip(&self) -> String {
-        format!("{}/32", self.node_ip)
+        let prefix = match self.node_ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
+        format!("{}/{}", self.node_ip, prefix)
     }
 }
 
@@ -85,8 +97,8 @@ pub struct PeerConfig {
     /// Peer's public endpoint (host:port)
     pub endpoint: String,
 
-    /// Peer's overlay IP address
-    pub overlay_ip: Ipv4Addr,
+    /// Peer's overlay IP address (IPv4 or IPv6)
+    pub overlay_ip: IpAddr,
 
     /// Optional persistent keepalive interval in seconds
     #[serde(default)]
@@ -112,12 +124,7 @@ pub struct PeerConfig {
 impl PeerConfig {
     /// Create a new peer configuration
     #[must_use]
-    pub fn new(
-        node_id: String,
-        public_key: String,
-        endpoint: String,
-        overlay_ip: Ipv4Addr,
-    ) -> Self {
+    pub fn new(node_id: String, public_key: String, endpoint: String, overlay_ip: IpAddr) -> Self {
         Self {
             node_id,
             public_key,
@@ -148,11 +155,15 @@ impl PeerConfig {
         let endpoint: SocketAddr = self.endpoint.parse()?;
         let keepalive =
             Duration::from_secs(u64::from(self.keepalive.unwrap_or(DEFAULT_KEEPALIVE_SECS)));
+        let prefix = match self.overlay_ip {
+            IpAddr::V4(_) => 32,
+            IpAddr::V6(_) => 128,
+        };
 
         Ok(PeerInfo::new(
             self.public_key.clone(),
             endpoint,
-            &format!("{}/32", self.overlay_ip),
+            &format!("{}/{}", self.overlay_ip, prefix),
             keepalive,
         ))
     }
@@ -310,8 +321,8 @@ impl OverlayBootstrap {
         leader_cidr: &str,
         leader_endpoint: &str,
         leader_public_key: &str,
-        leader_overlay_ip: Ipv4Addr,
-        allocated_ip: Ipv4Addr,
+        leader_overlay_ip: IpAddr,
+        allocated_ip: IpAddr,
         port: u16,
         data_dir: &Path,
     ) -> Result<Self> {
@@ -471,7 +482,7 @@ impl OverlayBootstrap {
         self.dns_config = Some(DnsConfig {
             zone: zone.to_string(),
             port,
-            bind_addr: IpAddr::V4(self.config.node_ip),
+            bind_addr: self.config.node_ip,
         });
         Ok(self)
     }
@@ -731,7 +742,7 @@ impl OverlayBootstrap {
     /// # Errors
     ///
     /// Returns an error if no IPs are available, DNS registration fails, or state cannot be saved.
-    pub async fn add_peer(&mut self, mut peer: PeerConfig) -> Result<Ipv4Addr> {
+    pub async fn add_peer(&mut self, mut peer: PeerConfig) -> Result<IpAddr> {
         // If we're the leader, allocate an IP for this peer
         let overlay_ip = if let Some(ref mut allocator) = self.allocator {
             let ip = allocator.allocate().ok_or(OverlayError::NoAvailableIps)?;
@@ -920,9 +931,9 @@ impl OverlayBootstrap {
         &self.config.public_key
     }
 
-    /// Get this node's overlay IP
+    /// Get this node's overlay IP (IPv4 or IPv6)
     #[must_use]
-    pub fn node_ip(&self) -> Ipv4Addr {
+    pub fn node_ip(&self) -> IpAddr {
         self.config.node_ip
     }
 
@@ -969,7 +980,7 @@ impl OverlayBootstrap {
     /// # Errors
     ///
     /// Returns an error if this node is not a leader or no IPs are available.
-    pub fn allocate_peer_ip(&mut self) -> Result<Ipv4Addr> {
+    pub fn allocate_peer_ip(&mut self) -> Result<IpAddr> {
         let allocator = self
             .allocator
             .as_mut()
@@ -1050,12 +1061,13 @@ fn current_timestamp() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
-    fn test_bootstrap_config_allowed_ip() {
+    fn test_bootstrap_config_allowed_ip_v4() {
         let config = BootstrapConfig {
             cidr: "10.200.0.0/16".to_string(),
-            node_ip: "10.200.0.1".parse().unwrap(),
+            node_ip: IpAddr::V4(Ipv4Addr::new(10, 200, 0, 1)),
             interface: DEFAULT_INTERFACE_NAME.to_string(),
             port: DEFAULT_WG_PORT,
             private_key: "test_private".to_string(),
@@ -1068,12 +1080,42 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_config_new() {
+    fn test_bootstrap_config_allowed_ip_v6() {
+        let config = BootstrapConfig {
+            cidr: "fd00:200::/48".to_string(),
+            node_ip: "fd00:200::1".parse::<IpAddr>().unwrap(),
+            interface: DEFAULT_INTERFACE_NAME.to_string(),
+            port: DEFAULT_WG_PORT,
+            private_key: "test_private".to_string(),
+            public_key: "test_public".to_string(),
+            is_leader: true,
+            created_at: 0,
+        };
+
+        assert_eq!(config.allowed_ip(), "fd00:200::1/128");
+    }
+
+    #[test]
+    fn test_peer_config_new_v4() {
         let peer = PeerConfig::new(
             "node-1".to_string(),
             "pubkey123".to_string(),
             "192.168.1.100:51820".to_string(),
-            "10.200.0.5".parse().unwrap(),
+            IpAddr::V4(Ipv4Addr::new(10, 200, 0, 5)),
+        );
+
+        assert_eq!(peer.node_id, "node-1");
+        assert_eq!(peer.keepalive, Some(DEFAULT_KEEPALIVE_SECS));
+        assert_eq!(peer.hostname, None);
+    }
+
+    #[test]
+    fn test_peer_config_new_v6() {
+        let peer = PeerConfig::new(
+            "node-1".to_string(),
+            "pubkey123".to_string(),
+            "[::1]:51820".to_string(),
+            "fd00:200::5".parse::<IpAddr>().unwrap(),
         );
 
         assert_eq!(peer.node_id, "node-1");
@@ -1087,7 +1129,7 @@ mod tests {
             "node-1".to_string(),
             "pubkey123".to_string(),
             "192.168.1.100:51820".to_string(),
-            "10.200.0.5".parse().unwrap(),
+            IpAddr::V4(Ipv4Addr::new(10, 200, 0, 5)),
         )
         .with_hostname("web-server");
 
@@ -1095,12 +1137,12 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_config_to_peer_info() {
+    fn test_peer_config_to_peer_info_v4() {
         let peer = PeerConfig::new(
             "node-1".to_string(),
             "pubkey123".to_string(),
             "192.168.1.100:51820".to_string(),
-            "10.200.0.5".parse().unwrap(),
+            IpAddr::V4(Ipv4Addr::new(10, 200, 0, 5)),
         );
 
         let peer_info = peer.to_peer_info().unwrap();
@@ -1109,10 +1151,24 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_state_serialization() {
+    fn test_peer_config_to_peer_info_v6() {
+        let peer = PeerConfig::new(
+            "node-1".to_string(),
+            "pubkey123".to_string(),
+            "[::1]:51820".to_string(),
+            "fd00:200::5".parse::<IpAddr>().unwrap(),
+        );
+
+        let peer_info = peer.to_peer_info().unwrap();
+        assert_eq!(peer_info.public_key, "pubkey123");
+        assert_eq!(peer_info.allowed_ips, "fd00:200::5/128");
+    }
+
+    #[test]
+    fn test_bootstrap_state_serialization_v4() {
         let config = BootstrapConfig {
             cidr: "10.200.0.0/16".to_string(),
-            node_ip: "10.200.0.1".parse().unwrap(),
+            node_ip: IpAddr::V4(Ipv4Addr::new(10, 200, 0, 1)),
             interface: DEFAULT_INTERFACE_NAME.to_string(),
             port: DEFAULT_WG_PORT,
             private_key: "private".to_string(),
@@ -1132,5 +1188,39 @@ mod tests {
 
         assert_eq!(deserialized.config.cidr, "10.200.0.0/16");
         assert_eq!(deserialized.config.node_ip.to_string(), "10.200.0.1");
+    }
+
+    #[test]
+    fn test_bootstrap_state_serialization_v6() {
+        let config = BootstrapConfig {
+            cidr: "fd00:200::/48".to_string(),
+            node_ip: "fd00:200::1".parse::<IpAddr>().unwrap(),
+            interface: DEFAULT_INTERFACE_NAME.to_string(),
+            port: DEFAULT_WG_PORT,
+            private_key: "private".to_string(),
+            public_key: "public".to_string(),
+            is_leader: true,
+            created_at: 1_234_567_890,
+        };
+
+        let state = BootstrapState {
+            config,
+            peers: vec![],
+            allocator_state: None,
+        };
+
+        let json = serde_json::to_string_pretty(&state).unwrap();
+        let deserialized: BootstrapState = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.config.cidr, "fd00:200::/48");
+        assert_eq!(deserialized.config.node_ip.to_string(), "fd00:200::1");
+    }
+
+    #[test]
+    fn test_default_overlay_cidr_v6_constant() {
+        // Verify the IPv6 CIDR constant is valid
+        let net: ipnet::IpNet = DEFAULT_OVERLAY_CIDR_V6.parse().unwrap();
+        assert!(matches!(net, ipnet::IpNet::V6(_)));
+        assert_eq!(net.prefix_len(), 48);
     }
 }

@@ -74,7 +74,7 @@ impl Candidate {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn test_candidate_new_host() {
@@ -141,5 +141,85 @@ mod tests {
             let deserialized: ConnectionType = serde_json::from_str(&json).unwrap();
             assert_eq!(ct, deserialized);
         }
+    }
+
+    // ---- IPv6 tests ---------------------------------------------------------
+
+    #[test]
+    fn test_candidate_new_host_ipv6() {
+        let addr = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
+            51820,
+        );
+        let candidate = Candidate::new(CandidateType::Host, addr);
+        assert_eq!(candidate.candidate_type, CandidateType::Host);
+        assert_eq!(candidate.priority, 100);
+        assert_eq!(candidate.address, addr);
+        assert!(candidate.address.is_ipv6());
+    }
+
+    #[test]
+    fn test_candidate_new_server_reflexive_ipv6() {
+        let addr = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 5)),
+            51820,
+        );
+        let candidate = Candidate::new(CandidateType::ServerReflexive, addr);
+        assert_eq!(candidate.priority, 50);
+        assert!(candidate.address.is_ipv6());
+    }
+
+    #[test]
+    fn test_candidate_new_relay_ipv6() {
+        let addr = SocketAddr::new(IpAddr::V6(Ipv6Addr::new(0xFD00, 0, 0, 0, 0, 0, 0, 1)), 3478);
+        let candidate = Candidate::new(CandidateType::Relay, addr);
+        assert_eq!(candidate.priority, 10);
+        assert!(candidate.address.is_ipv6());
+    }
+
+    #[test]
+    fn test_candidate_serialization_roundtrip_ipv6() {
+        let addr = SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1)),
+            51820,
+        );
+        let candidate = Candidate::new(CandidateType::Host, addr);
+        let json = serde_json::to_string(&candidate).unwrap();
+        let deserialized: Candidate = serde_json::from_str(&json).unwrap();
+        assert_eq!(candidate.candidate_type, deserialized.candidate_type);
+        assert_eq!(candidate.address, deserialized.address);
+        assert_eq!(candidate.priority, deserialized.priority);
+        assert!(deserialized.address.is_ipv6());
+    }
+
+    #[test]
+    fn test_candidate_sorting_mixed_v4_v6() {
+        // IPv4 and IPv6 candidates should sort by priority, not by family
+        let host_v4 = Candidate::new(
+            CandidateType::Host,
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 51820),
+        );
+        let host_v6 = Candidate::new(
+            CandidateType::Host,
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0xFD00, 0, 0, 0, 0, 0, 0, 1)),
+                51820,
+            ),
+        );
+        let relay_v6 = Candidate::new(
+            CandidateType::Relay,
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+                3478,
+            ),
+        );
+
+        let mut candidates = [relay_v6, host_v4, host_v6];
+        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+        // Both hosts (priority 100) should come before relay (priority 10)
+        assert_eq!(candidates[0].candidate_type, CandidateType::Host);
+        assert_eq!(candidates[1].candidate_type, CandidateType::Host);
+        assert_eq!(candidates[2].candidate_type, CandidateType::Relay);
     }
 }

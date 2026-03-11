@@ -11,12 +11,13 @@
 use crate::error::OverlayError;
 use crate::nat::config::RelayServerConfig;
 use crate::nat::turn::{
-    build_control_msg, build_data_msg, decode_addr_v4, derive_auth_key, encode_addr_v4,
-    parse_and_verify_control, parse_data_payload, parse_msg, MsgType, PEER_ADDR_LEN,
+    build_control_msg, build_data_msg_tagged, decode_addr, derive_auth_key, encode_addr,
+    parse_and_verify_control, parse_data_payload_tagged, parse_msg, MsgType,
+    PEER_ADDR_V4_TAGGED_LEN,
 };
 
 use std::collections::HashMap;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -43,9 +44,9 @@ struct Allocation {
     /// The relay socket bound for this allocation.
     relay_socket: Arc<UdpSocket>,
     /// The relay address (`external_addr:relay_port`).
-    relay_addr: SocketAddrV4,
+    relay_addr: SocketAddr,
     /// Permitted peer addresses that can send/receive through this allocation.
-    permissions: Vec<SocketAddrV4>,
+    permissions: Vec<IpAddr>,
     /// Allocation lifetime in seconds.
     lifetime_secs: u32,
     /// When this allocation was created or last refreshed.
@@ -100,10 +101,18 @@ impl RelayServer {
     ///
     /// Returns [`OverlayError::TurnRelay`] if the listen socket cannot be bound.
     pub async fn start(&self) -> Result<(), OverlayError> {
-        let listen_addr = SocketAddr::new(
-            std::net::IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            self.config.listen_port,
-        );
+        // Parse external_addr to determine the address family for binding
+        let external_addr: SocketAddr = self
+            .config
+            .external_addr
+            .parse()
+            .map_err(|e| OverlayError::TurnRelay(format!("Invalid external addr: {e}")))?;
+
+        let listen_addr = if external_addr.is_ipv6() {
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), self.config.listen_port)
+        } else {
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), self.config.listen_port)
+        };
 
         let socket = Arc::new(UdpSocket::bind(listen_addr).await.map_err(|e| {
             OverlayError::TurnRelay(format!("Failed to bind relay server on {listen_addr}: {e}"))
@@ -119,11 +128,6 @@ impl RelayServer {
         let allocations: AllocationTable = Arc::new(RwLock::new(HashMap::new()));
         let client_lookup: ClientLookup = Arc::new(RwLock::new(HashMap::new()));
         let auth_key = self.auth_key;
-        let external_addr: SocketAddr = self
-            .config
-            .external_addr
-            .parse()
-            .map_err(|e| OverlayError::TurnRelay(format!("Invalid external addr: {e}")))?;
         let max_sessions = self.config.max_sessions;
         let shutdown = self.shutdown.clone();
         let socket_clone = socket.clone();
@@ -269,8 +273,14 @@ async fn handle_allocate_req(
         }
     };
 
-    // Bind a new UDP socket for this allocation's relay port
-    let relay_socket = match UdpSocket::bind("0.0.0.0:0").await {
+    // Bind a new UDP socket for this allocation's relay port,
+    // matching the external address family
+    let relay_bind_addr = if external_addr.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let relay_socket = match UdpSocket::bind(relay_bind_addr).await {
         Ok(s) => Arc::new(s),
         Err(e) => {
             warn!(error = %e, "Failed to bind relay socket for allocation");
@@ -289,14 +299,7 @@ async fn handle_allocate_req(
     };
 
     // Build relay address using external_addr's IP + the relay port
-    let external_ip = match external_addr {
-        SocketAddr::V4(v4) => *v4.ip(),
-        SocketAddr::V6(_) => {
-            warn!("IPv6 external addr not supported for relay");
-            return;
-        }
-    };
-    let relay_addr = SocketAddrV4::new(external_ip, relay_port);
+    let relay_addr = SocketAddr::new(external_addr.ip(), relay_port);
 
     // Generate allocation ID
     let mut allocation_id = [0u8; 16];
@@ -321,11 +324,7 @@ async fn handle_allocate_req(
                     let permitted = {
                         let allocs = alloc_table_clone.read().await;
                         if let Some(alloc) = allocs.get(&alloc_id_copy) {
-                            let peer_v4 = match peer_from {
-                                SocketAddr::V4(v4) => v4,
-                                SocketAddr::V6(_) => continue,
-                            };
-                            alloc.permissions.iter().any(|p| p.ip() == peer_v4.ip())
+                            alloc.permissions.iter().any(|p| *p == peer_from.ip())
                         } else {
                             break; // Allocation removed
                         }
@@ -336,11 +335,7 @@ async fn handle_allocate_req(
                     }
 
                     // Wrap peer data as DATA message and send to client
-                    let peer_v4 = match peer_from {
-                        SocketAddr::V4(v4) => v4,
-                        SocketAddr::V6(_) => continue,
-                    };
-                    let data_msg = build_data_msg(peer_v4, &buf[..n]);
+                    let data_msg = build_data_msg_tagged(peer_from, &buf[..n]);
                     if let Err(e) = main_socket_clone.send_to(&data_msg, client_addr).await {
                         warn!(error = %e, "Failed to forward peer data to client");
                     }
@@ -374,9 +369,10 @@ async fn handle_allocate_req(
         lookup.insert(from, allocation_id);
     }
 
-    // Build AllocateResp: [relay_addr: 6] [allocation_id: 16] [lifetime: 4]
-    let mut resp_payload = Vec::with_capacity(PEER_ADDR_LEN + 16 + 4);
-    resp_payload.extend_from_slice(&encode_addr_v4(relay_addr));
+    // Build AllocateResp: [relay_addr: 7 or 19 (tagged)] [allocation_id: 16] [lifetime: 4]
+    let encoded_relay = encode_addr(relay_addr);
+    let mut resp_payload = Vec::with_capacity(encoded_relay.len() + 16 + 4);
+    resp_payload.extend_from_slice(&encoded_relay);
     resp_payload.extend_from_slice(&allocation_id);
     resp_payload.extend_from_slice(&DEFAULT_LIFETIME_SECS.to_be_bytes());
 
@@ -404,18 +400,20 @@ async fn handle_permission_req(
         return;
     };
 
-    if payload.len() < 16 + PEER_ADDR_LEN {
+    // Minimum: 16 (alloc_id) + 7 (smallest tagged addr, IPv4)
+    if payload.len() < 16 + PEER_ADDR_V4_TAGGED_LEN {
         return;
     }
 
     let mut alloc_id = [0u8; 16];
     alloc_id.copy_from_slice(&payload[..16]);
 
-    let Some(peer_addr) = decode_addr_v4(&payload[16..16 + PEER_ADDR_LEN]) else {
+    let Some((peer_addr, _)) = decode_addr(&payload[16..]) else {
         return;
     };
 
-    // Add permission
+    // Add permission (store IP only, not port -- matching by IP is sufficient)
+    let peer_ip = peer_addr.ip();
     {
         let mut allocs = allocations.write().await;
         if let Some(alloc) = allocs.get_mut(&alloc_id) {
@@ -423,8 +421,8 @@ async fn handle_permission_req(
                 debug!(from = %from, "PermissionReq from non-owner");
                 return;
             }
-            if !alloc.permissions.contains(&peer_addr) {
-                alloc.permissions.push(peer_addr);
+            if !alloc.permissions.contains(&peer_ip) {
+                alloc.permissions.push(peer_ip);
             }
         } else {
             debug!(from = %from, "PermissionReq for unknown allocation");
@@ -544,7 +542,7 @@ async fn handle_data(
     let Some((MsgType::Data, payload)) = parse_msg(packet) else {
         return;
     };
-    let Some((peer_addr, raw_data)) = parse_data_payload(payload) else {
+    let Some((peer_addr, raw_data)) = parse_data_payload_tagged(payload) else {
         return;
     };
 
@@ -552,13 +550,12 @@ async fn handle_data(
     let allocs = allocations.read().await;
     if let Some(alloc) = allocs.get(&alloc_id) {
         // Check permission
-        if !alloc.permissions.iter().any(|p| p.ip() == peer_addr.ip()) {
+        if !alloc.permissions.iter().any(|p| *p == peer_addr.ip()) {
             return;
         }
 
-        let dest = SocketAddr::V4(peer_addr);
-        if let Err(e) = alloc.relay_socket.send_to(raw_data, dest).await {
-            warn!(error = %e, dest = %dest, "Failed to relay data to peer");
+        if let Err(e) = alloc.relay_socket.send_to(raw_data, peer_addr).await {
+            warn!(error = %e, dest = %peer_addr, "Failed to relay data to peer");
         }
     }
 }
@@ -650,6 +647,76 @@ mod tests {
         assert!(client.is_active());
 
         // Clean up
+        let _ = client.deallocate().await;
+        server.shutdown();
+    }
+
+    #[test]
+    fn test_relay_server_new_ipv6_external() {
+        let config = RelayServerConfig {
+            listen_port: 3478,
+            external_addr: "[::1]:3478".to_string(),
+            max_sessions: 50,
+        };
+        let server = RelayServer::new(&config, "test_credential");
+        assert_eq!(server.config.listen_port, 3478);
+        assert_eq!(server.config.external_addr, "[::1]:3478");
+    }
+
+    #[tokio::test]
+    async fn test_relay_server_start_ipv6() {
+        // Verify the relay server can start with an IPv6 external address
+        let listen_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+        let listen_port = listen_socket.local_addr().unwrap().port();
+        drop(listen_socket);
+
+        let config = RelayServerConfig {
+            listen_port,
+            external_addr: format!("[::1]:{listen_port}"),
+            max_sessions: 10,
+        };
+
+        let server = RelayServer::new(&config, "ipv6_secret");
+        let result = server.start().await;
+        assert!(result.is_ok(), "IPv6 relay server should start: {result:?}");
+        server.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_relay_server_allocate_roundtrip_ipv6() {
+        let credential = "ipv6_test_secret";
+
+        let listen_socket = UdpSocket::bind("[::1]:0").await.unwrap();
+        let listen_port = listen_socket.local_addr().unwrap().port();
+        drop(listen_socket);
+
+        let real_config = RelayServerConfig {
+            listen_port,
+            external_addr: format!("[::1]:{listen_port}"),
+            max_sessions: 10,
+        };
+
+        let server = RelayServer::new(&real_config, credential);
+        server.start().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let client_config = TurnServerConfig {
+            address: format!("[::1]:{listen_port}"),
+            username: "testuser".to_string(),
+            credential: credential.to_string(),
+            region: None,
+        };
+
+        let mut client = crate::nat::turn::RelayClient::new(&client_config).unwrap();
+        let result = client.allocate().await;
+
+        assert!(result.is_ok(), "IPv6 allocation failed: {result:?}");
+        assert!(client.is_active());
+
+        let relay_addr = result.unwrap();
+        assert!(relay_addr.is_ipv6(), "Relay address should be IPv6");
+
         let _ = client.deallocate().await;
         server.shutdown();
     }

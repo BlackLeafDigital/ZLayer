@@ -12,13 +12,9 @@ use std::time::Duration;
 
 use zlayer_overlay::nat::stun::NatBehavior;
 use zlayer_overlay::nat::turn::{
-    build_control_msg, build_data_msg, decode_addr_v4, derive_auth_key, encode_addr_v4,
-    parse_and_verify_control, parse_data_payload, parse_msg, MsgType, RelayClient,
+    build_control_msg, build_data_msg_tagged, decode_addr, derive_auth_key, encode_addr,
+    parse_and_verify_control, parse_data_payload_tagged, parse_msg, MsgType, RelayClient,
 };
-
-/// Size of an encoded IPv4 peer address (4 IP + 2 port).
-/// Mirrors `PEER_ADDR_LEN` from `zlayer_overlay::nat::turn` which is `pub(crate)`.
-const PEER_ADDR_LEN: usize = 6;
 use zlayer_overlay::nat::{
     CandidateType, NatConfig, NatTraversal, RelayServer, RelayServerConfig, StunClient,
     StunServerConfig, TurnServerConfig,
@@ -391,9 +387,9 @@ async fn test_relay_server_data_forwarding() {
         .unwrap();
     let (msg_type, resp_a) = parse_and_verify_control(&buf[..n], &auth_key).unwrap();
     assert_eq!(msg_type, MsgType::AllocateResp);
-    let relay_addr_a = decode_addr_v4(&resp_a[..PEER_ADDR_LEN]).unwrap();
+    let (relay_addr_a, addr_len_a) = decode_addr(&resp_a).unwrap();
     let mut alloc_id_a = [0u8; 16];
-    alloc_id_a.copy_from_slice(&resp_a[PEER_ADDR_LEN..PEER_ADDR_LEN + 16]);
+    alloc_id_a.copy_from_slice(&resp_a[addr_len_a..addr_len_a + 16]);
 
     // -- Client B: allocate via raw protocol --
     let socket_b = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -411,15 +407,16 @@ async fn test_relay_server_data_forwarding() {
         .unwrap();
     let (msg_type, resp_b) = parse_and_verify_control(&buf[..n], &auth_key).unwrap();
     assert_eq!(msg_type, MsgType::AllocateResp);
-    let relay_addr_b = decode_addr_v4(&resp_b[..PEER_ADDR_LEN]).unwrap();
+    let (relay_addr_b, addr_len_b) = decode_addr(&resp_b).unwrap();
     let mut alloc_id_b = [0u8; 16];
-    alloc_id_b.copy_from_slice(&resp_b[PEER_ADDR_LEN..PEER_ADDR_LEN + 16]);
+    alloc_id_b.copy_from_slice(&resp_b[addr_len_b..addr_len_b + 16]);
 
     // -- Create mutual permissions --
     // A permits B's relay address
-    let mut perm_payload = Vec::with_capacity(16 + PEER_ADDR_LEN);
+    let encoded_b = encode_addr(relay_addr_b);
+    let mut perm_payload = Vec::with_capacity(16 + encoded_b.len());
     perm_payload.extend_from_slice(&alloc_id_a);
-    perm_payload.extend_from_slice(&encode_addr_v4(relay_addr_b));
+    perm_payload.extend_from_slice(&encoded_b);
     let perm_msg = build_control_msg(MsgType::PermissionReq, &perm_payload, &auth_key);
     socket_a.send_to(&perm_msg, server_addr).await.unwrap();
     let n = tokio::time::timeout(Duration::from_secs(5), socket_a.recv(&mut buf))
@@ -430,9 +427,10 @@ async fn test_relay_server_data_forwarding() {
     assert_eq!(msg_type, MsgType::PermissionResp);
 
     // B permits A's relay address
-    let mut perm_payload = Vec::with_capacity(16 + PEER_ADDR_LEN);
+    let encoded_a = encode_addr(relay_addr_a);
+    let mut perm_payload = Vec::with_capacity(16 + encoded_a.len());
     perm_payload.extend_from_slice(&alloc_id_b);
-    perm_payload.extend_from_slice(&encode_addr_v4(relay_addr_a));
+    perm_payload.extend_from_slice(&encoded_a);
     let perm_msg = build_control_msg(MsgType::PermissionReq, &perm_payload, &auth_key);
     socket_b.send_to(&perm_msg, server_addr).await.unwrap();
     let n = tokio::time::timeout(Duration::from_secs(5), socket_b.recv(&mut buf))
@@ -444,7 +442,7 @@ async fn test_relay_server_data_forwarding() {
 
     // -- A sends data addressed to B's relay address --
     let test_payload = b"hello from A to B via relay";
-    let data_msg = build_data_msg(relay_addr_b, test_payload);
+    let data_msg = build_data_msg_tagged(relay_addr_b, test_payload);
     socket_a.send_to(&data_msg, server_addr).await.unwrap();
 
     // B should receive the forwarded data wrapped as a DATA message
@@ -456,7 +454,7 @@ async fn test_relay_server_data_forwarding() {
             assert_eq!(msg_type, MsgType::Data, "Should receive a Data message");
 
             let (_from_addr, raw_data) =
-                parse_data_payload(payload).expect("Should parse data payload");
+                parse_data_payload_tagged(payload).expect("Should parse data payload");
             assert_eq!(
                 raw_data, test_payload,
                 "Received data should match sent data"

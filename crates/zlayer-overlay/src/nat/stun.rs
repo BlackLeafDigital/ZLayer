@@ -440,7 +440,7 @@ fn detect_nat_behavior(results: &[ReflexiveAddress]) -> NatBehavior {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddr};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 
     #[test]
     fn test_build_binding_request_header() {
@@ -703,5 +703,229 @@ mod tests {
         }];
         let client = StunClient::new(servers);
         assert_eq!(client.servers.len(), 1);
+    }
+
+    // ---- IPv6 tests ---------------------------------------------------------
+
+    #[test]
+    fn test_parse_xor_mapped_address_ipv6() {
+        // Test reflexive address: [2001:db8::1]:54321
+        let ip = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
+        let port: u16 = 54321;
+        let txn_id: [u8; 12] = [
+            0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x17, 0x28, 0x39, 0x4A, 0x5B, 0x6C,
+        ];
+
+        // XOR the port with high 16 bits of magic cookie
+        let xored_port = port ^ (MAGIC_COOKIE >> 16) as u16;
+
+        // XOR the IP: first 4 bytes with magic cookie, remaining 12 with txn_id
+        let ip_bytes = ip.octets();
+        let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
+        let mut xored_ip = [0u8; 16];
+        for i in 0..16 {
+            if i < 4 {
+                xored_ip[i] = ip_bytes[i] ^ cookie_bytes[i];
+            } else {
+                xored_ip[i] = ip_bytes[i] ^ txn_id[i - 4];
+            }
+        }
+
+        // Build attribute value: [reserved(1), family(1), port(2), ip(16)] = 20 bytes
+        let mut value = [0u8; 20];
+        value[0] = 0x00; // reserved
+        value[1] = 0x02; // IPv6
+        value[2..4].copy_from_slice(&xored_port.to_be_bytes());
+        value[4..20].copy_from_slice(&xored_ip);
+
+        let result = parse_xor_mapped_address(&value, &txn_id).unwrap();
+        assert_eq!(result.ip(), ip);
+        assert_eq!(result.port(), port);
+    }
+
+    #[test]
+    fn test_parse_xor_mapped_address_ipv6_all_ones() {
+        // Edge case: all-ones IPv6 address
+        let ip = Ipv6Addr::new(
+            0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,
+        );
+        let port: u16 = 65535;
+        let txn_id = [0xFF; 12];
+
+        let xored_port = port ^ (MAGIC_COOKIE >> 16) as u16;
+        let ip_bytes = ip.octets();
+        let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
+        let mut xored_ip = [0u8; 16];
+        for i in 0..16 {
+            if i < 4 {
+                xored_ip[i] = ip_bytes[i] ^ cookie_bytes[i];
+            } else {
+                xored_ip[i] = ip_bytes[i] ^ txn_id[i - 4];
+            }
+        }
+
+        let mut value = [0u8; 20];
+        value[0] = 0x00;
+        value[1] = 0x02;
+        value[2..4].copy_from_slice(&xored_port.to_be_bytes());
+        value[4..20].copy_from_slice(&xored_ip);
+
+        let result = parse_xor_mapped_address(&value, &txn_id).unwrap();
+        assert_eq!(result.ip(), ip);
+        assert_eq!(result.port(), port);
+    }
+
+    #[test]
+    fn test_parse_mapped_address_ipv6() {
+        let ip = Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1);
+        let port: u16 = 12345;
+
+        let mut value = [0u8; 20];
+        value[0] = 0x00; // reserved
+        value[1] = 0x02; // IPv6
+        value[2..4].copy_from_slice(&port.to_be_bytes());
+        value[4..20].copy_from_slice(&ip.octets());
+
+        let result = parse_mapped_address(&value).unwrap();
+        assert_eq!(result.ip(), ip);
+        assert_eq!(result.port(), port);
+    }
+
+    #[test]
+    fn test_parse_binding_response_xor_mapped_ipv6() {
+        // Full binding response with an IPv6 XOR-MAPPED-ADDRESS
+        let ip = Ipv6Addr::new(0x2001, 0x0db8, 0xABCD, 0, 0, 0, 0, 0x42);
+        let port: u16 = 9876;
+        let txn_id: [u8; 12] = [
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC,
+        ];
+
+        let xored_port = port ^ (MAGIC_COOKIE >> 16) as u16;
+        let ip_bytes = ip.octets();
+        let cookie_bytes = MAGIC_COOKIE.to_be_bytes();
+        let mut xored_ip = [0u8; 16];
+        for i in 0..16 {
+            if i < 4 {
+                xored_ip[i] = ip_bytes[i] ^ cookie_bytes[i];
+            } else {
+                xored_ip[i] = ip_bytes[i] ^ txn_id[i - 4];
+            }
+        }
+
+        // Build XOR-MAPPED-ADDRESS attribute value (20 bytes for IPv6)
+        let mut attr_value = [0u8; 20];
+        attr_value[0] = 0x00; // reserved
+        attr_value[1] = 0x02; // IPv6
+        attr_value[2..4].copy_from_slice(&xored_port.to_be_bytes());
+        attr_value[4..20].copy_from_slice(&xored_ip);
+
+        // Attribute: type(2) + length(2) + value(20) = 24 bytes
+        let attr_header_len: u16 = 4 + 20;
+        let mut response = Vec::with_capacity(STUN_HEADER_SIZE + attr_header_len as usize);
+
+        // Header
+        response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+        response.extend_from_slice(&attr_header_len.to_be_bytes());
+        response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        response.extend_from_slice(&txn_id);
+
+        // XOR-MAPPED-ADDRESS attribute
+        response.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        response.extend_from_slice(&20u16.to_be_bytes()); // value length = 20 for IPv6
+        response.extend_from_slice(&attr_value);
+
+        let result = parse_binding_response(&response, &txn_id).unwrap();
+        assert_eq!(result, SocketAddr::new(ip.into(), port));
+    }
+
+    #[test]
+    fn test_parse_binding_response_mapped_address_ipv6_fallback() {
+        // Test that MAPPED-ADDRESS (0x0001) with IPv6 is used as fallback
+        let ip = Ipv6Addr::new(0xFE80, 0, 0, 0, 0, 0, 0, 1);
+        let port: u16 = 40000;
+        let txn_id = [0u8; 12];
+
+        let mut attr_value = [0u8; 20];
+        attr_value[0] = 0x00;
+        attr_value[1] = 0x02; // IPv6
+        attr_value[2..4].copy_from_slice(&port.to_be_bytes());
+        attr_value[4..20].copy_from_slice(&ip.octets());
+
+        let attr_header_len: u16 = 4 + 20;
+        let mut response = Vec::with_capacity(STUN_HEADER_SIZE + attr_header_len as usize);
+
+        response.extend_from_slice(&BINDING_RESPONSE.to_be_bytes());
+        response.extend_from_slice(&attr_header_len.to_be_bytes());
+        response.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        response.extend_from_slice(&txn_id);
+
+        response.extend_from_slice(&ATTR_MAPPED_ADDRESS.to_be_bytes());
+        response.extend_from_slice(&20u16.to_be_bytes());
+        response.extend_from_slice(&attr_value);
+
+        let result = parse_binding_response(&response, &txn_id).unwrap();
+        assert_eq!(result, SocketAddr::new(ip.into(), port));
+    }
+
+    #[test]
+    fn test_symmetric_nat_detection_ipv6_same_ports() {
+        let results = vec![
+            ReflexiveAddress {
+                address: SocketAddr::new(
+                    Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+                    5000,
+                ),
+                server: "server1".to_string(),
+            },
+            ReflexiveAddress {
+                address: SocketAddr::new(
+                    Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2).into(),
+                    5000,
+                ),
+                server: "server2".to_string(),
+            },
+        ];
+        assert_eq!(
+            detect_nat_behavior(&results),
+            NatBehavior::EndpointIndependent
+        );
+    }
+
+    #[test]
+    fn test_symmetric_nat_detection_ipv6_different_ports() {
+        let results = vec![
+            ReflexiveAddress {
+                address: SocketAddr::new(
+                    Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+                    5000,
+                ),
+                server: "server1".to_string(),
+            },
+            ReflexiveAddress {
+                address: SocketAddr::new(
+                    Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1).into(),
+                    6000,
+                ),
+                server: "server2".to_string(),
+            },
+        ];
+        assert_eq!(detect_nat_behavior(&results), NatBehavior::Symmetric);
+    }
+
+    #[test]
+    fn test_parse_xor_mapped_address_ipv6_too_short() {
+        // IPv6 attribute value needs 20 bytes; provide only 18
+        let txn_id = [0u8; 12];
+        let mut value = [0u8; 18];
+        value[1] = 0x02; // IPv6 family
+        assert!(parse_xor_mapped_address(&value, &txn_id).is_none());
+    }
+
+    #[test]
+    fn test_parse_mapped_address_ipv6_too_short() {
+        // IPv6 mapped address needs 20 bytes; provide only 10
+        let mut value = [0u8; 10];
+        value[1] = 0x02; // IPv6 family
+        assert!(parse_mapped_address(&value).is_none());
     }
 }
