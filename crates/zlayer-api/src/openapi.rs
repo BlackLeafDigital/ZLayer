@@ -20,6 +20,10 @@ use crate::handlers::health::HealthResponse;
 // use crate::handlers::overlay::{
 //     DnsStatusResponse, IpAllocationResponse, OverlayStatusResponse, PeerInfo, PeerListResponse,
 // };
+use crate::handlers::containers::{
+    ContainerExecRequest, ContainerExecResponse, ContainerInfo, ContainerStateResponse,
+    ContainerStatsResponse, ContainerWaitResponse, CreateContainerRequest, CreateContainerResponse,
+};
 use crate::handlers::secrets::{CreateSecretRequest, SecretMetadataResponse};
 use crate::handlers::services::{
     ScaleRequest, ServiceDetails, ServiceEndpoint, ServiceMetrics, ServiceSummary,
@@ -34,6 +38,11 @@ use crate::handlers::build::{
     __path_get_build_logs, __path_get_build_status, __path_list_builds,
     __path_list_runtime_templates, __path_start_build, __path_start_build_json,
     __path_stream_build,
+};
+use crate::handlers::containers::{
+    __path_create_container, __path_delete_container, __path_exec_in_container,
+    __path_get_container, __path_get_container_logs, __path_get_container_stats,
+    __path_list_all_containers, __path_wait_container,
 };
 use crate::handlers::deployments::{
     __path_create_deployment, __path_delete_deployment, __path_get_deployment,
@@ -105,6 +114,15 @@ impl Modify for SecurityAddon {
         get_service,
         scale_service,
         get_service_logs,
+        // Containers
+        create_container,
+        list_all_containers,
+        get_container,
+        delete_container,
+        get_container_logs,
+        exec_in_container,
+        wait_container,
+        get_container_stats,
         // Build
         start_build,
         start_build_json,
@@ -135,6 +153,15 @@ impl Modify for SecurityAddon {
             ServiceEndpoint,
             ServiceMetrics,
             ScaleRequest,
+            // Container schemas
+            CreateContainerRequest,
+            CreateContainerResponse,
+            ContainerInfo,
+            ContainerStateResponse,
+            ContainerExecRequest,
+            ContainerExecResponse,
+            ContainerWaitResponse,
+            ContainerStatsResponse,
             // Build schemas
             BuildRequest,
             BuildRequestWithContext,
@@ -156,6 +183,7 @@ impl Modify for SecurityAddon {
         (name = "Authentication", description = "Authentication endpoints"),
         (name = "Deployments", description = "Deployment management"),
         (name = "Services", description = "Service management"),
+        (name = "Containers", description = "Raw container lifecycle management"),
         (name = "Build", description = "Container image building"),
         (name = "Internal", description = "Internal scheduler-to-agent communication"),
         (name = "Secrets", description = "Secrets management"),

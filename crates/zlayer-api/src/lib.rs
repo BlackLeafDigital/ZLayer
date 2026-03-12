@@ -39,8 +39,9 @@ pub use ratelimit::{
     IpRateLimiter, RateLimitState,
 };
 pub use router::{
-    build_cluster_routes, build_internal_routes, build_router, build_router_full,
-    build_router_with_builds, build_router_with_deployment_state, build_router_with_internal,
+    build_cluster_routes, build_container_routes, build_internal_routes, build_router,
+    build_router_full, build_router_with_builds, build_router_with_containers,
+    build_router_with_deployment_state, build_router_with_internal,
     build_router_with_internal_and_secrets, build_router_with_jobs, build_router_with_secrets,
     build_router_with_services, build_router_with_services_and_secrets, build_router_with_storage,
     build_router_with_tunnels, build_secrets_routes, build_storage_routes, build_tunnel_routes,
@@ -52,6 +53,11 @@ pub use handlers::build::{BuildManager, BuildState, BuildStateEnum, BuildStatus,
 pub use handlers::cluster::{
     ClusterApiState, ClusterJoinRequest, ClusterJoinResponse, ClusterNodeSummary, ClusterPeer,
     ForceLeaderRequest, ForceLeaderResponse,
+};
+pub use handlers::containers::{
+    ContainerApiState, ContainerExecRequest, ContainerExecResponse, ContainerInfo,
+    ContainerLogQuery, ContainerStateResponse, ContainerStatsResponse, ContainerWaitResponse,
+    CreateContainerRequest, CreateContainerResponse, ListContainersQuery,
 };
 pub use handlers::cron::CronState;
 pub use handlers::deployments::{DeploymentState, ServiceHealthInfo};

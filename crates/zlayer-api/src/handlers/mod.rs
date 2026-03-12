@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod build;
 pub mod cluster;
+pub mod containers;
 pub mod cron;
 pub mod deployments;
 pub mod health;
@@ -18,6 +19,7 @@ pub mod tunnels;
 pub use auth::*;
 pub use build::*;
 pub use cluster::*;
+pub use containers::*;
 pub use cron::*;
 pub use deployments::*;
 pub use health::*;
