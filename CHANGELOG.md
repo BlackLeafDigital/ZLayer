@@ -26,6 +26,14 @@ All notable changes to this project will be documented in this file.
   stale overlay layer errors (`no such file or directory` on `buildah pull`).
 
 ### Added
+- Raw container lifecycle REST API endpoints under `/api/v1/containers` for direct
+  container management independent of the deployment/service abstraction. Endpoints:
+  `POST /` (create+start), `GET /` (list with label filter), `GET /{id}` (inspect),
+  `DELETE /{id}` (stop+remove), `GET /{id}/logs` (tail or SSE stream),
+  `POST /{id}/exec` (execute command), `GET /{id}/wait` (block until exit),
+  `GET /{id}/stats` (CPU/memory stats). Includes OpenAPI documentation, JWT auth
+  (operator role for mutating operations, viewer for read operations), and a new
+  `ContainerApiState` + `build_router_with_containers()` router constructor.
 - Multi-platform build support for ZPipeline. Optional `platforms` field on pipeline
   defaults and per-image config enables building for multiple architectures (e.g.,
   linux/amd64, linux/arm64). Multi-arch builds create OCI manifest lists via buildah.
