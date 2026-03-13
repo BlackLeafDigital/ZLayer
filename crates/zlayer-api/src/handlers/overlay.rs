@@ -329,6 +329,132 @@ mod tests {
         assert!(json.contains("\"enabled\":true"));
     }
 
+    // =========================================================================
+    // IPv6 dual-stack serialization tests
+    // =========================================================================
+
+    #[test]
+    fn test_overlay_status_response_serialize_ipv6() {
+        let status = OverlayStatusResponse {
+            interface: "wg0".to_string(),
+            is_leader: false,
+            node_ip: "fd00:200::1".to_string(),
+            cidr: "fd00:200::/48".to_string(),
+            port: 51820,
+            total_peers: 3,
+            healthy_peers: 3,
+            unhealthy_peers: 0,
+            last_check: 1_706_900_000,
+        };
+        let json = serde_json::to_string(&status).unwrap();
+        assert!(json.contains("fd00:200::1"));
+        assert!(json.contains("fd00:200::/48"));
+
+        // Verify roundtrip
+        let parsed: OverlayStatusResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.node_ip, "fd00:200::1");
+        assert_eq!(parsed.cidr, "fd00:200::/48");
+    }
+
+    #[test]
+    fn test_peer_info_serialize_ipv6() {
+        let peer = PeerInfo {
+            public_key: "def456".to_string(),
+            overlay_ip: Some("fd00:200::2".to_string()),
+            healthy: true,
+            last_handshake_secs: Some(15),
+            last_ping_ms: Some(3),
+            failure_count: 0,
+            last_check: 1_706_900_000,
+        };
+        let json = serde_json::to_string(&peer).unwrap();
+        assert!(json.contains("def456"));
+        assert!(json.contains("fd00:200::2"));
+
+        // Verify roundtrip
+        let parsed: PeerInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.overlay_ip.as_deref(), Some("fd00:200::2"));
+    }
+
+    #[test]
+    fn test_ip_allocation_response_serialize_ipv6() {
+        let response = IpAllocationResponse {
+            cidr: "fd00:200::/48".to_string(),
+            total_ips: 65534,
+            allocated_count: 50,
+            available_count: 65484,
+            utilization_percent: 0.08,
+            allocated_ips: Some(vec!["fd00:200::1".to_string(), "fd00:200::2".to_string()]),
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("fd00:200::/48"));
+        assert!(json.contains("fd00:200::1"));
+        assert!(json.contains("fd00:200::2"));
+
+        // Verify roundtrip
+        let parsed: IpAllocationResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.cidr, "fd00:200::/48");
+        assert_eq!(parsed.allocated_ips.unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_dns_status_response_serialize_ipv6() {
+        let response = DnsStatusResponse {
+            enabled: true,
+            zone: Some("overlay.local.".to_string()),
+            port: Some(53),
+            bind_addr: Some("fd00:200::1".to_string()),
+            service_count: 2,
+            services: vec!["web-v6".to_string(), "api-v6".to_string()],
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("fd00:200::1"));
+        assert!(json.contains("web-v6"));
+
+        // Verify roundtrip
+        let parsed: DnsStatusResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.bind_addr.as_deref(), Some("fd00:200::1"));
+        assert_eq!(parsed.service_count, 2);
+    }
+
+    #[test]
+    fn test_overlay_status_response_dual_stack() {
+        // Verify both IPv4 and IPv6 representations work as node_ip
+        let v4_status = OverlayStatusResponse {
+            interface: "wg0".to_string(),
+            is_leader: true,
+            node_ip: "10.200.0.1".to_string(),
+            cidr: "10.200.0.0/16".to_string(),
+            port: 51820,
+            total_peers: 2,
+            healthy_peers: 2,
+            unhealthy_peers: 0,
+            last_check: 1_706_900_000,
+        };
+
+        let v6_status = OverlayStatusResponse {
+            interface: "wg0".to_string(),
+            is_leader: true,
+            node_ip: "fd00:200::1".to_string(),
+            cidr: "fd00:200::/48".to_string(),
+            port: 51820,
+            total_peers: 2,
+            healthy_peers: 2,
+            unhealthy_peers: 0,
+            last_check: 1_706_900_000,
+        };
+
+        let v4_json = serde_json::to_string(&v4_status).unwrap();
+        let v6_json = serde_json::to_string(&v6_status).unwrap();
+
+        // Both should be valid JSON
+        let _: OverlayStatusResponse = serde_json::from_str(&v4_json).unwrap();
+        let _: OverlayStatusResponse = serde_json::from_str(&v6_json).unwrap();
+
+        // They should be different
+        assert_ne!(v4_json, v6_json);
+    }
+
     #[test]
     fn test_overlay_api_state_default() {
         let state = OverlayApiState::default();

@@ -1209,6 +1209,84 @@ mod tests {
     }
 
     #[test]
+    fn test_force_leader_state_save_load_ipv6_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = ClusterState::new();
+        state.apply(&Request::UpdateServiceState {
+            service_name: "test-svc-v6".to_string(),
+            state: ServiceState {
+                current_replicas: 2,
+                desired_replicas: 4,
+                ..Default::default()
+            },
+        });
+        state.apply(&Request::RegisterNode {
+            node_id: 2,
+            address: "10.0.0.2:9000".to_string(),
+            wg_public_key: "wg-pub-key-v6".to_string(),
+            overlay_ip: "fd00:200::1".to_string(),
+            overlay_port: 51820,
+            advertise_addr: "10.0.0.2".to_string(),
+            api_port: 3669,
+            cpu_total: 16.0,
+            memory_total: 32_000_000_000,
+            disk_total: 1_000_000_000_000,
+            gpus: vec![],
+            mode: "full".to_string(),
+        });
+
+        // Save
+        save_force_leader_state(dir.path(), &state).unwrap();
+        assert!(force_leader_marker_path(dir.path()).exists());
+
+        // Load
+        let loaded = load_and_clear_force_leader_state(dir.path()).unwrap();
+        assert!(loaded.is_some());
+        let loaded = loaded.unwrap();
+        assert_eq!(loaded.services.len(), 1);
+        assert_eq!(loaded.nodes.len(), 1);
+        let node = loaded.get_node(2).unwrap();
+        assert_eq!(node.overlay_ip, "fd00:200::1");
+        assert_eq!(node.wg_public_key, "wg-pub-key-v6");
+        assert_eq!(
+            loaded.get_service("test-svc-v6").unwrap().current_replicas,
+            2
+        );
+
+        // Marker should be deleted
+        assert!(!force_leader_marker_path(dir.path()).exists());
+    }
+
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn test_node_registration_with_ipv6_overlay() {
+        let mut state = ClusterState::new();
+
+        state.apply(&Request::RegisterNode {
+            node_id: 3,
+            address: "192.168.1.3:8000".to_string(),
+            wg_public_key: "wg-key-node3".to_string(),
+            overlay_ip: "fd00:200::3".to_string(),
+            overlay_port: 51820,
+            advertise_addr: "192.168.1.3".to_string(),
+            api_port: 3669,
+            cpu_total: 4.0,
+            memory_total: 8_000_000_000,
+            disk_total: 250_000_000_000,
+            gpus: vec![],
+            mode: "full".to_string(),
+        });
+
+        let node = state.get_node(3).unwrap();
+        assert_eq!(node.address, "192.168.1.3:8000");
+        assert_eq!(node.overlay_ip, "fd00:200::3");
+        assert_eq!(node.overlay_port, 51820);
+        assert_eq!(node.wg_public_key, "wg-key-node3");
+        assert_eq!(node.cpu_total, 4.0);
+        assert_eq!(node.status, "ready");
+    }
+
+    #[test]
     fn test_force_leader_no_marker() {
         let dir = tempfile::tempdir().unwrap();
         let result = load_and_clear_force_leader_state(dir.path()).unwrap();

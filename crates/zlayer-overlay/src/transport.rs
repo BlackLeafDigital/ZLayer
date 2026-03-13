@@ -838,4 +838,51 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test]
+    #[ignore = "Requires root/CAP_NET_ADMIN"]
+    async fn test_create_interface_boringtun_ipv6() {
+        let config = OverlayConfig {
+            overlay_cidr: "fd00::1/48".to_string(),
+            private_key: "test_key".to_string(),
+            public_key: "test_pub".to_string(),
+            local_endpoint: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51820),
+            peer_discovery_interval: Duration::from_secs(30),
+            #[cfg(feature = "nat")]
+            nat: crate::nat::NatConfig::default(),
+        };
+
+        #[cfg(target_os = "macos")]
+        let iface_name = "utun".to_string();
+        #[cfg(not(target_os = "macos"))]
+        let iface_name = "zl-bt6-test0".to_string();
+
+        let mut transport = OverlayTransport::new(config, iface_name);
+        let result = transport.create_interface().await;
+
+        match result {
+            Ok(()) => {
+                #[cfg(target_os = "macos")]
+                assert!(
+                    transport.interface_name().starts_with("utun"),
+                    "macOS interface should be utunN, got: {}",
+                    transport.interface_name()
+                );
+                transport.shutdown();
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("Attribute failed policy validation"),
+                    "create_interface should not produce kernel WireGuard errors. Got: {msg}",
+                );
+                assert!(
+                    msg.contains("boringtun")
+                        || msg.contains("CAP_NET_ADMIN")
+                        || msg.contains("sudo"),
+                    "Error should mention boringtun, CAP_NET_ADMIN, or sudo. Got: {msg}",
+                );
+            }
+        }
+    }
 }

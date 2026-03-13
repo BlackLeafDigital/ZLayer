@@ -484,3 +484,64 @@ remote_port = 8080
         "Missing routing_mode should default to PreferOverlay"
     );
 }
+
+// =============================================================================
+// 9) test_routing_mode_config_roundtrip_ipv6_overlay_url
+// =============================================================================
+
+/// Verify that `TunnelClientConfig` with an IPv6 overlay server URL
+/// round-trips correctly through TOML serialization. IPv6 addresses in URLs
+/// use bracket notation (e.g., `ws://[fd00::5]:3669/tunnel/v1`).
+#[tokio::test]
+async fn test_routing_mode_config_roundtrip_ipv6_overlay_url() {
+    let ipv6_overlay_url = "ws://[fd00:200::5]:3669/tunnel/v1";
+
+    let client_config = TunnelClientConfig {
+        overlay_server_url: Some(ipv6_overlay_url.to_string()),
+        routing_mode: RoutingMode::OverlayOnly,
+        ..TunnelClientConfig::new("wss://tunnel.example.com/tunnel/v1", "my-token")
+    };
+
+    let client_toml = toml::to_string(&client_config).expect("serialize client config with IPv6");
+    let parsed_client: TunnelClientConfig =
+        toml::from_str(&client_toml).expect("deserialize client config with IPv6");
+
+    assert_eq!(parsed_client.routing_mode, RoutingMode::OverlayOnly);
+    assert_eq!(
+        parsed_client.overlay_server_url.as_deref(),
+        Some(ipv6_overlay_url),
+        "IPv6 overlay server URL should survive TOML roundtrip"
+    );
+    assert_eq!(parsed_client.server_url, client_config.server_url);
+    assert_eq!(parsed_client.token, client_config.token);
+}
+
+// =============================================================================
+// 10) test_connector_direct_only_mode_ipv6_url
+// =============================================================================
+
+/// Same as `test_connector_direct_only_mode` but with an IPv6 loopback URL.
+/// Verifies the connector handles IPv6 URLs without panicking.
+#[tokio::test]
+async fn test_connector_direct_only_mode_ipv6_url() {
+    let port = refused_port().await;
+    let url = format!("ws://[::1]:{port}/tunnel/v1");
+
+    let connector = OverlayAwareConnector::new(&url, None, RoutingMode::DirectOnly, None);
+
+    let result = tokio::time::timeout(TEST_TIMEOUT, connector.connect()).await;
+
+    match result {
+        Ok(Ok(_)) => panic!("Expected connection to fail (no server running)"),
+        Ok(Err(e)) => {
+            let err_msg = e.to_string();
+            assert!(
+                !err_msg.contains("overlay routing required"),
+                "DirectOnly with IPv6 URL should not produce overlay-policy errors, got: {err_msg}"
+            );
+        }
+        Err(_elapsed) => {
+            // Timeout is acceptable -- tried direct IPv6 and never got a response
+        }
+    }
+}

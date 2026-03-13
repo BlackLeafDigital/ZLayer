@@ -19,7 +19,7 @@ pub mod tunnels;
 pub use auth::*;
 pub use build::*;
 pub use cluster::*;
-pub use containers::*;
+pub use containers::ContainerApiState;
 pub use cron::*;
 pub use deployments::*;
 pub use health::*;

@@ -32,7 +32,7 @@ use crate::ratelimit::{rate_limit_middleware, IpRateLimiter, RateLimitState};
 use crate::storage::{DeploymentStorage, InMemoryStorage};
 
 use crate::handlers::build::{build_routes, BuildState};
-use zlayer_agent::{CronScheduler, JobExecutor, Runtime, ServiceManager};
+use zlayer_agent::{CronScheduler, JobExecutor, ServiceManager};
 use zlayer_secrets::SecretsStore;
 
 /// Build the API router with default in-memory storage
@@ -837,20 +837,21 @@ pub fn build_storage_routes(storage_state: StorageState) -> Router<()> {
         .with_state(storage_state)
 }
 
-/// Build routes for raw container lifecycle management.
+/// Build routes for raw container lifecycle management
 ///
-/// Creates routes for direct container operations (create, list, inspect,
-/// stop, logs, exec, wait, stats) independent of the service abstraction.
+/// Creates the routes for direct container creation, management, and inspection.
+/// These routes are intended for CI runners and tooling that need container
+/// access independent of the deployment/service abstraction.
 ///
 /// # Arguments
-/// * `container_state` - State containing the service manager and runtime
+/// * `container_state` - State containing the container runtime
 ///
 /// # Returns
 /// A Router with the container endpoints
 pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> {
     Router::new()
         .route("/", post(handlers::containers::create_container))
-        .route("/", get(handlers::containers::list_all_containers))
+        .route("/", get(handlers::containers::list_containers))
         .route("/{id}", get(handlers::containers::get_container))
         .route("/{id}", delete(handlers::containers::delete_container))
         .route("/{id}/logs", get(handlers::containers::get_container_logs))
@@ -863,47 +864,27 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
         .with_state(container_state)
 }
 
-/// Build the API router with raw container management capabilities.
+/// Build the API router with raw container management capabilities
 ///
 /// This extends the services router with endpoints for direct container
-/// lifecycle management at `/api/v1/containers`.
+/// lifecycle management, independent of deployments/services.
 ///
 /// # Arguments
 /// * `config` - API configuration
 /// * `storage` - Deployment storage backend
-/// * `service_manager` - `ServiceManager` for service and container operations
-/// * `runtime` - Container runtime for direct container lifecycle operations
-///
-/// # Example
-///
-/// ```no_run
-/// use zlayer_api_zql::{ApiConfig, build_router_with_containers};
-/// use zlayer_api_zql::storage::InMemoryStorage;
-/// use zlayer_agent::{ServiceManager, MockRuntime};
-/// use std::sync::Arc;
-/// use tokio::sync::RwLock;
-///
-/// # async fn example() -> anyhow::Result<()> {
-/// let config = ApiConfig::default();
-/// let storage = Arc::new(InMemoryStorage::new());
-/// let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> = Arc::new(MockRuntime::new());
-/// let service_manager = Arc::new(RwLock::new(ServiceManager::builder(runtime.clone()).build()));
-///
-/// let router = build_router_with_containers(&config, storage, service_manager, runtime);
-/// # Ok(())
-/// # }
-/// ```
+/// * `service_manager` - `ServiceManager` for service scaling operations
+/// * `runtime` - Container runtime for direct container management
 pub fn build_router_with_containers(
     config: &ApiConfig,
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
     service_manager: Arc<RwLock<ServiceManager>>,
-    runtime: Arc<dyn Runtime + Send + Sync>,
+    runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync>,
 ) -> Router {
     // Start with the services router
-    let base_router = build_router_with_services(config, storage, service_manager.clone());
+    let base_router = build_router_with_services(config, storage, service_manager);
 
     // Create container state
-    let container_state = ContainerApiState::new(service_manager, runtime);
+    let container_state = ContainerApiState::new(runtime);
 
     // Build container routes
     let container_routes = build_container_routes(container_state);
@@ -1071,10 +1052,7 @@ mod tests {
     #[test]
     fn test_build_container_routes() {
         let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> = Arc::new(MockRuntime::new());
-        let service_manager = Arc::new(RwLock::new(
-            ServiceManager::builder(runtime.clone()).build(),
-        ));
-        let container_state = ContainerApiState::new(service_manager, runtime);
+        let container_state = ContainerApiState::new(runtime);
         let _routes = build_container_routes(container_state);
         // Routes build without error
     }
@@ -1084,9 +1062,7 @@ mod tests {
         let config = ApiConfig::default();
         let storage: Arc<dyn DeploymentStorage + Send + Sync> = Arc::new(InMemoryStorage::new());
         let runtime: Arc<dyn zlayer_agent::Runtime + Send + Sync> = Arc::new(MockRuntime::new());
-        let service_manager = Arc::new(RwLock::new(
-            ServiceManager::builder(runtime.clone()).build(),
-        ));
+        let service_manager = Arc::new(RwLock::new(ServiceManager::new(runtime.clone())));
 
         let _router = build_router_with_containers(&config, storage, service_manager, runtime);
         // Router builds without error

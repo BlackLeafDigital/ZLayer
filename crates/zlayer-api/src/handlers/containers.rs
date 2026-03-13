@@ -1,12 +1,10 @@
-//! Raw container lifecycle REST API endpoints
+//! Raw container lifecycle endpoints
 //!
-//! Provides direct container management operations independent of the service
-//! abstraction. These endpoints allow creating, inspecting, stopping, and
-//! interacting with individual containers by ID.
-//!
-//! Container IDs follow the `{service}-rep-{replica}` format used throughout
-//! the `ZLayer` agent layer.
+//! Provides direct container management endpoints for use by CI runners and
+//! other tooling that needs to manage containers independently of the
+//! deployment/service abstraction.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,7 +25,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
-use zlayer_agent::{ContainerId, ContainerState, Runtime, ServiceManager};
+use zlayer_agent::runtime::{ContainerId, ContainerState, Runtime};
 
 // ---------------------------------------------------------------------------
 // State
@@ -35,96 +33,132 @@ use zlayer_agent::{ContainerId, ContainerState, Runtime, ServiceManager};
 
 /// State for raw container endpoints.
 ///
-/// Holds references to the `ServiceManager` (which owns the `Runtime`) so
-/// handlers can perform direct container lifecycle operations.
+/// Holds a reference to the container runtime so handlers can perform
+/// container lifecycle operations without going through the service manager.
 #[derive(Clone)]
 pub struct ContainerApiState {
-    /// Service manager — used to enumerate containers and delegate to the runtime.
-    pub service_manager: Arc<RwLock<ServiceManager>>,
-    /// Direct runtime reference for container lifecycle operations that bypass
-    /// the service layer (create, start, stop, remove, logs, exec, wait, stats).
+    /// Container runtime for lifecycle operations
     pub runtime: Arc<dyn Runtime + Send + Sync>,
+    /// In-memory tracking of standalone containers (id -> metadata)
+    pub containers: Arc<RwLock<HashMap<String, StandaloneContainer>>>,
+}
+
+/// Metadata for a standalone container (not managed by a deployment)
+#[derive(Debug, Clone)]
+pub struct StandaloneContainer {
+    /// Container identifier used by the runtime
+    pub container_id: ContainerId,
+    /// OCI image reference
+    pub image: String,
+    /// Human-readable name (if provided)
+    pub name: Option<String>,
+    /// Labels for filtering/grouping
+    pub labels: HashMap<String, String>,
+    /// When the container was created
+    pub created_at: String,
 }
 
 impl ContainerApiState {
-    /// Create a new container API state.
-    pub fn new(
-        service_manager: Arc<RwLock<ServiceManager>>,
-        runtime: Arc<dyn Runtime + Send + Sync>,
-    ) -> Self {
+    /// Create a new container API state with a runtime
+    pub fn new(runtime: Arc<dyn Runtime + Send + Sync>) -> Self {
         Self {
-            service_manager,
             runtime,
+            containers: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Types — requests, responses, query params
+// Request / Response types
 // ---------------------------------------------------------------------------
 
-/// Request body for creating a container.
+/// Resource limits for a container
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct ContainerResourceLimits {
+    /// CPU limit in cores (e.g., 0.5, 1.0, 2.0)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<f64>,
+    /// Memory limit (e.g., "256Mi", "1Gi")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+}
+
+/// Volume mount specification
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct VolumeMount {
+    /// Host path or volume name
+    pub source: String,
+    /// Container mount path
+    pub target: String,
+    /// Mount as read-only
+    #[serde(default)]
+    pub readonly: bool,
+}
+
+/// Request to create and start a container
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateContainerRequest {
-    /// Service name this container belongs to.
-    pub service: String,
-    /// Replica number (must be unique within the service).
-    pub replica: u32,
-    /// Image to use (e.g. `nginx:latest`). If omitted, the service spec's
-    /// image is used.
-    pub image: Option<String>,
+    /// OCI image reference (e.g., "nginx:latest", "ubuntu:22.04")
+    pub image: String,
+    /// Optional human-readable name
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Environment variables
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Command to run (overrides image entrypoint)
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// Labels for filtering and grouping
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    /// Resource limits (CPU, memory)
+    #[serde(default)]
+    pub resources: Option<ContainerResourceLimits>,
+    /// Volume mounts
+    #[serde(default)]
+    pub volumes: Vec<VolumeMount>,
+    /// Working directory inside the container
+    #[serde(default)]
+    pub work_dir: Option<String>,
 }
 
-/// Response after creating (and starting) a container.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CreateContainerResponse {
-    /// Container identifier (`{service}-rep-{replica}`).
-    pub id: String,
-    /// Current container state after creation.
-    pub state: String,
-    /// Process ID (if available immediately).
-    pub pid: Option<u32>,
-}
-
-/// Summary returned when listing containers.
+/// Container information returned by the API
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ContainerInfo {
-    /// Container identifier.
+    /// Container identifier
     pub id: String,
-    /// Service name.
-    pub service: String,
-    /// Replica number.
-    pub replica: u32,
-    /// Current state (`pending`, `running`, `exited`, `failed`, etc.).
+    /// Human-readable name (if set)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// OCI image reference
+    pub image: String,
+    /// Container state (pending, running, exited, failed)
     pub state: String,
-    /// Process ID (if running).
+    /// Labels
+    pub labels: HashMap<String, String>,
+    /// Creation timestamp (ISO 8601)
+    pub created_at: String,
+    /// Process ID (if running)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pid: Option<u32>,
-    /// Exit code (if exited).
-    pub exit_code: Option<i32>,
 }
 
-/// Detailed container state response.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ContainerStateResponse {
-    /// Container identifier.
-    pub id: String,
-    /// Current state string.
-    pub state: String,
-    /// Process ID (if running).
-    pub pid: Option<u32>,
-    /// Exit code (if exited).
-    pub exit_code: Option<i32>,
-    /// Failure reason (if failed).
-    pub reason: Option<String>,
+/// Query parameters for listing containers
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ListContainersQuery {
+    /// Filter by label (key=value format)
+    #[serde(default)]
+    pub label: Option<String>,
 }
 
-/// Query parameters for the logs endpoint.
+/// Query parameters for container logs
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ContainerLogQuery {
-    /// Number of lines to return (tail).
+    /// Number of tail lines to return
     #[serde(default = "default_tail")]
     pub tail: usize,
-    /// Follow logs via SSE stream.
+    /// Follow logs (SSE stream)
     #[serde(default)]
     pub follow: bool,
 }
@@ -133,77 +167,153 @@ fn default_tail() -> usize {
     100
 }
 
-/// Request body for executing a command in a container.
+/// Exec request for running a command in a container
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ContainerExecRequest {
-    /// Command and arguments.
+    /// Command and arguments to execute
     pub command: Vec<String>,
 }
 
-/// Response from executing a command in a container.
+/// Exec response with command output
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ContainerExecResponse {
-    /// Exit code from the command.
+    /// Exit code from the command
     pub exit_code: i32,
-    /// Standard output.
+    /// Standard output
     pub stdout: String,
-    /// Standard error.
+    /// Standard error
     pub stderr: String,
 }
 
-/// Response from waiting for a container to exit.
+/// Wait response with container exit code
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ContainerWaitResponse {
-    /// Container identifier.
+    /// Container identifier
     pub id: String,
-    /// Exit code.
+    /// Exit code (0 = success)
     pub exit_code: i32,
 }
 
-/// Container resource statistics.
+/// Container resource statistics
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ContainerStatsResponse {
-    /// Container identifier.
+    /// Container identifier
     pub id: String,
-    /// CPU usage in microseconds.
+    /// CPU usage in microseconds
     pub cpu_usage_usec: u64,
-    /// Current memory usage in bytes.
+    /// Current memory usage in bytes
     pub memory_bytes: u64,
-    /// Memory limit in bytes.
+    /// Memory limit in bytes (`u64::MAX` if unlimited)
     pub memory_limit: u64,
-    /// Memory usage as a percentage of the limit.
+    /// Memory usage as percentage of limit
     pub memory_percent: f64,
-}
-
-/// Query parameters for listing containers.
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct ListContainersQuery {
-    /// Filter by service name.
-    pub service: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Parse a container ID string (`{service}-rep-{replica}`) into a `ContainerId`.
-fn parse_container_id(id: &str) -> Result<ContainerId> {
-    // Format: {service}-rep-{replica}
-    let parts: Vec<&str> = id.rsplitn(3, '-').collect();
-    // rsplitn(3, '-') on "my-service-rep-2" yields ["2", "rep", "my-service"]
-    if parts.len() < 3 || parts[1] != "rep" {
-        return Err(ApiError::BadRequest(format!(
-            "Invalid container ID format '{id}': expected '{{service}}-rep-{{replica}}'"
-        )));
+/// Generate a unique container ID string for standalone containers.
+///
+/// Format: `standalone-{name_or_uuid}-rep-0`
+fn generate_container_id(name: Option<&str>) -> (String, ContainerId) {
+    let service_name = match name {
+        Some(n) => format!("standalone-{n}"),
+        None => format!("standalone-{}", uuid::Uuid::new_v4().as_simple()),
+    };
+    let cid = ContainerId {
+        service: service_name.clone(),
+        replica: 0,
+    };
+    (service_name, cid)
+}
+
+/// Build a minimal `ServiceSpec` from the create request.
+///
+/// This converts the simplified container request into the full `ServiceSpec`
+/// that the Runtime trait expects. Many fields default to sensible values
+/// since standalone containers don't need scaling, health checks, etc.
+fn build_service_spec(request: &CreateContainerRequest) -> zlayer_spec::ServiceSpec {
+    use zlayer_spec::{
+        CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NetworkSpec,
+        NodeMode, PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceSpec, ServiceType,
+        StorageSpec,
+    };
+
+    let command_spec = if let Some(ref cmd) = request.command {
+        CommandSpec {
+            entrypoint: if cmd.is_empty() {
+                None
+            } else {
+                Some(vec![cmd[0].clone()])
+            },
+            args: if cmd.len() > 1 {
+                Some(cmd[1..].to_vec())
+            } else {
+                None
+            },
+            workdir: request.work_dir.clone(),
+        }
+    } else {
+        CommandSpec {
+            entrypoint: None,
+            args: None,
+            workdir: request.work_dir.clone(),
+        }
+    };
+
+    let resources = match &request.resources {
+        Some(r) => ResourcesSpec {
+            cpu: r.cpu,
+            memory: r.memory.clone(),
+            gpu: None,
+        },
+        None => ResourcesSpec::default(),
+    };
+
+    let storage: Vec<StorageSpec> = request
+        .volumes
+        .iter()
+        .map(|v| StorageSpec::Bind {
+            source: v.source.clone(),
+            target: v.target.clone(),
+            readonly: v.readonly,
+        })
+        .collect();
+
+    ServiceSpec {
+        rtype: ResourceType::Service,
+        schedule: None,
+        image: ImageSpec {
+            name: request.image.clone(),
+            pull_policy: PullPolicy::IfNotPresent,
+        },
+        resources,
+        env: request.env.clone(),
+        command: command_spec,
+        network: NetworkSpec::default(),
+        endpoints: Vec::new(),
+        scale: ScaleSpec::Manual,
+        depends: Vec::new(),
+        health: HealthSpec {
+            start_grace: None,
+            interval: None,
+            timeout: None,
+            retries: 3,
+            check: HealthCheck::Tcp { port: 0 },
+        },
+        init: InitSpec::default(),
+        errors: ErrorsSpec::default(),
+        devices: Vec::new(),
+        storage,
+        capabilities: Vec::new(),
+        privileged: false,
+        node_mode: NodeMode::default(),
+        node_selector: None,
+        service_type: ServiceType::default(),
+        wasm: None,
+        host_network: false,
     }
-
-    let replica: u32 = parts[0].parse().map_err(|_| {
-        ApiError::BadRequest(format!("Invalid replica number in container ID '{id}'"))
-    })?;
-
-    let service = parts[2].to_string();
-
-    Ok(ContainerId { service, replica })
 }
 
 /// Convert a `ContainerState` to a human-readable string.
@@ -218,46 +328,28 @@ fn state_to_string(state: &ContainerState) -> String {
     }
 }
 
-/// Extract the exit code from a `ContainerState`, if applicable.
-fn state_exit_code(state: &ContainerState) -> Option<i32> {
-    match state {
-        ContainerState::Exited { code } => Some(*code),
-        _ => None,
-    }
-}
-
-/// Extract the failure reason from a `ContainerState`, if applicable.
-fn state_reason(state: &ContainerState) -> Option<String> {
-    match state {
-        ContainerState::Failed { reason } => Some(reason.clone()),
-        _ => None,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
 /// Create and start a container.
 ///
-/// Creates a new container using the runtime, then starts it. The container
-/// is identified by its service name and replica number. The caller must
-/// ensure the service is registered with the `ServiceManager` first (via the
-/// deployment or service endpoints), otherwise the image cannot be resolved.
+/// Pulls the image if needed, creates the container, and starts it.
+/// Returns the container info including its assigned ID.
 ///
 /// # Errors
 ///
-/// Returns an error if the service is unknown, the image cannot be pulled,
-/// container creation fails, or starting fails.
+/// Returns an error if image pull fails, container creation fails, or the
+/// user lacks the operator role.
 #[utoipa::path(
     post,
     path = "/api/v1/containers",
     request_body = CreateContainerRequest,
     responses(
-        (status = 201, description = "Container created and started", body = CreateContainerResponse),
+        (status = 201, description = "Container created and started", body = ContainerInfo),
         (status = 400, description = "Invalid request"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden — operator role required"),
+        (status = 403, description = "Forbidden - operator role required"),
         (status = 500, description = "Internal error"),
     ),
     security(("bearer_auth" = [])),
@@ -267,121 +359,130 @@ pub async fn create_container(
     user: AuthUser,
     State(state): State<ContainerApiState>,
     Json(request): Json<CreateContainerRequest>,
-) -> Result<(axum::http::StatusCode, Json<CreateContainerResponse>)> {
+) -> Result<(axum::http::StatusCode, Json<ContainerInfo>)> {
     user.require_role("operator")?;
 
-    if request.service.is_empty() {
-        return Err(ApiError::BadRequest(
-            "Service name cannot be empty".to_string(),
-        ));
-    }
-    if request.replica == 0 {
-        return Err(ApiError::BadRequest(
-            "Replica number must be >= 1".to_string(),
-        ));
+    // Validate image
+    if request.image.is_empty() {
+        return Err(ApiError::BadRequest("Image is required".to_string()));
     }
 
-    let cid = ContainerId {
-        service: request.service.clone(),
-        replica: request.replica,
-    };
+    // Validate name (if provided) - alphanumeric, hyphens, underscores only
+    if let Some(ref name) = request.name {
+        if name.is_empty() || name.len() > 128 {
+            return Err(ApiError::BadRequest(
+                "Name must be 1-128 characters".to_string(),
+            ));
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(ApiError::BadRequest(
+                "Name must contain only alphanumeric characters, hyphens, and underscores"
+                    .to_string(),
+            ));
+        }
 
-    info!(container = %cid, "Creating container via raw API");
-
-    // Resolve the service spec from the service manager so we can get the
-    // image and full spec to pass to create_container.
-    let manager = state.service_manager.read().await;
-    let services = manager.list_services().await;
-    drop(manager);
-
-    if !services.contains(&request.service) {
-        return Err(ApiError::NotFound(format!(
-            "Service '{}' not registered — deploy it first",
-            request.service
-        )));
+        // Check for duplicate name
+        let containers = state.containers.read().await;
+        let duplicate = containers
+            .values()
+            .any(|c| c.name.as_deref() == Some(name.as_str()));
+        if duplicate {
+            return Err(ApiError::Conflict(format!(
+                "Container with name '{name}' already exists"
+            )));
+        }
     }
 
-    // Pull image if explicitly provided, otherwise rely on the spec's image
-    // which was pulled during deployment.
-    if let Some(ref image) = request.image {
-        state
-            .runtime
-            .pull_image(image)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Failed to pull image: {e}")))?;
-    }
+    let (id_str, container_id) = generate_container_id(request.name.as_deref());
+    let spec = build_service_spec(&request);
 
-    // We need the service spec to create the container. The ServiceManager
-    // tracks ServiceInstances internally, but the Runtime.create_container
-    // needs a ServiceSpec. Get it via upsert — but since the service is
-    // already registered, we just need the spec.
-    //
-    // For now we ask the manager for containers on this service; if the
-    // replica already exists, fail with Conflict.
-    let manager = state.service_manager.read().await;
-    let existing = manager.get_service_containers(&request.service).await;
-    drop(manager);
+    info!(
+        container_id = %container_id,
+        image = %request.image,
+        name = ?request.name,
+        "Creating standalone container"
+    );
 
-    if existing.iter().any(|c| c.replica == request.replica) {
-        return Err(ApiError::Conflict(format!(
-            "Container {cid} already exists",
-        )));
-    }
-
-    // Use the runtime to create + start.  We need the ServiceSpec which is
-    // held inside ServiceInstance (not publicly accessible).  Since the raw
-    // container API is meant for low-level operations, we go through the
-    // service manager's scale path indirectly — but that doesn't give per-
-    // container control.
-    //
-    // Instead, get the ServiceSpec via the service manager. The manager
-    // doesn't expose specs directly, but we can read the replica count and
-    // scale up by 1.  This is intentional: the raw container API delegates
-    // to the same service infrastructure, ensuring init actions, overlay
-    // attachment, etc. are handled.
-    let manager = state.service_manager.read().await;
-    let current_count = manager
-        .service_replica_count(&request.service)
+    // Pull the image
+    state
+        .runtime
+        .pull_image(&request.image)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to get replica count: {e}")))?;
-    drop(manager);
+        .map_err(|e| {
+            ApiError::Internal(format!("Failed to pull image '{}': {e}", request.image))
+        })?;
 
-    // Scale up to include the new replica
-    #[allow(clippy::cast_possible_truncation)]
-    let target = current_count.max(request.replica as usize) as u32;
-    let manager = state.service_manager.read().await;
-    manager
-        .scale_service(&request.service, target)
+    // Create the container
+    state
+        .runtime
+        .create_container(&container_id, &spec)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to create container: {e}")))?;
-    drop(manager);
 
-    // Get the resulting state
-    let container_state = state
+    // Start the container
+    state
         .runtime
-        .container_state(&cid)
+        .start_container(&container_id)
         .await
-        .unwrap_or(ContainerState::Pending);
+        .map_err(|e| {
+            // Best-effort cleanup: remove the created-but-not-started container
+            let rt = state.runtime.clone();
+            let cid = container_id.clone();
+            tokio::spawn(async move {
+                let _ = rt.remove_container(&cid).await;
+            });
+            ApiError::Internal(format!("Failed to start container: {e}"))
+        })?;
 
-    let pid = state.runtime.get_container_pid(&cid).await.ok().flatten();
+    // Get PID
+    let pid = state
+        .runtime
+        .get_container_pid(&container_id)
+        .await
+        .ok()
+        .flatten();
 
-    info!(container = %cid, state = %state_to_string(&container_state), "Container created");
+    let now = chrono::Utc::now().to_rfc3339();
 
-    Ok((
-        axum::http::StatusCode::CREATED,
-        Json(CreateContainerResponse {
-            id: cid.to_string(),
-            state: state_to_string(&container_state),
-            pid,
-        }),
-    ))
+    // Track the container
+    let standalone = StandaloneContainer {
+        container_id: container_id.clone(),
+        image: request.image.clone(),
+        name: request.name.clone(),
+        labels: request.labels.clone(),
+        created_at: now.clone(),
+    };
+
+    state
+        .containers
+        .write()
+        .await
+        .insert(id_str.clone(), standalone);
+
+    let info = ContainerInfo {
+        id: id_str,
+        name: request.name,
+        image: request.image,
+        state: "running".to_string(),
+        labels: request.labels,
+        created_at: now,
+        pid,
+    };
+
+    Ok((axum::http::StatusCode::CREATED, Json(info)))
 }
 
-/// List all containers, optionally filtered by service.
+/// List standalone containers.
+///
+/// Returns all containers managed through this API. Optionally filter by
+/// label using the `label` query parameter in `key=value` format.
 ///
 /// # Errors
 ///
-/// Returns an error if the service manager is unavailable.
+/// Returns an error if the user is not authenticated.
 #[utoipa::path(
     get,
     path = "/api/v1/containers",
@@ -393,68 +494,77 @@ pub async fn create_container(
     security(("bearer_auth" = [])),
     tag = "Containers"
 )]
-pub async fn list_all_containers(
+pub async fn list_containers(
     _user: AuthUser,
     State(state): State<ContainerApiState>,
     Query(query): Query<ListContainersQuery>,
 ) -> Result<Json<Vec<ContainerInfo>>> {
-    let manager = state.service_manager.read().await;
-    let services = manager.list_services().await;
-    drop(manager);
+    let containers = state.containers.read().await;
 
-    let target_services: Vec<String> = if let Some(ref filter) = query.service {
-        if services.contains(filter) {
-            vec![filter.clone()]
+    // Parse label filter if provided
+    let label_filter: Option<(String, String)> = query.label.and_then(|l| {
+        let parts: Vec<&str> = l.splitn(2, '=').collect();
+        if parts.len() == 2 {
+            Some((parts[0].to_string(), parts[1].to_string()))
         } else {
-            return Ok(Json(Vec::new()));
+            None
         }
-    } else {
-        services
-    };
+    });
 
-    let mut containers = Vec::new();
-    let manager = state.service_manager.read().await;
+    let mut results = Vec::with_capacity(containers.len());
 
-    for svc in &target_services {
-        let cids = manager.get_service_containers(svc).await;
-        for cid in cids {
-            let container_state = state
-                .runtime
-                .container_state(&cid)
-                .await
-                .unwrap_or(ContainerState::Pending);
-            let pid = state.runtime.get_container_pid(&cid).await.ok().flatten();
+    for (id_str, meta) in containers.iter() {
+        // Apply label filter
+        if let Some((ref key, ref value)) = label_filter {
+            match meta.labels.get(key) {
+                Some(v) if v == value => {}
+                _ => continue,
+            }
+        }
 
-            containers.push(ContainerInfo {
-                id: cid.to_string(),
-                service: cid.service.clone(),
-                replica: cid.replica,
-                state: state_to_string(&container_state),
-                pid,
-                exit_code: state_exit_code(&container_state),
+        // Query runtime state
+        let runtime_state = state
+            .runtime
+            .container_state(&meta.container_id)
+            .await
+            .unwrap_or(ContainerState::Failed {
+                reason: "state unavailable".to_string(),
             });
-        }
+
+        let pid = state
+            .runtime
+            .get_container_pid(&meta.container_id)
+            .await
+            .ok()
+            .flatten();
+
+        results.push(ContainerInfo {
+            id: id_str.clone(),
+            name: meta.name.clone(),
+            image: meta.image.clone(),
+            state: state_to_string(&runtime_state),
+            labels: meta.labels.clone(),
+            created_at: meta.created_at.clone(),
+            pid,
+        });
     }
 
-    drop(manager);
-
-    Ok(Json(containers))
+    Ok(Json(results))
 }
 
-/// Get the state of a specific container.
+/// Get details for a specific container.
 ///
 /// # Errors
 ///
-/// Returns an error if the container ID is malformed or the container is not found.
+/// Returns an error if the container is not found or the user is not authenticated.
 #[utoipa::path(
     get,
     path = "/api/v1/containers/{id}",
     params(
-        ("id" = String, Path, description = "Container ID (e.g. my-service-rep-1)"),
+        ("id" = String, Path, description = "Container identifier"),
     ),
     responses(
-        (status = 200, description = "Container state", body = ContainerStateResponse),
-        (status = 400, description = "Invalid container ID format"),
+        (status = 200, description = "Container details", body = ContainerInfo),
         (status = 404, description = "Container not found"),
         (status = 401, description = "Unauthorized"),
     ),
@@ -465,51 +575,57 @@ pub async fn get_container(
     _user: AuthUser,
     State(state): State<ContainerApiState>,
     Path(id): Path<String>,
-) -> Result<Json<ContainerStateResponse>> {
-    let cid = parse_container_id(&id)?;
+) -> Result<Json<ContainerInfo>> {
+    let containers = state.containers.read().await;
+    let meta = containers
+        .get(&id)
+        .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
 
-    let container_state = state
+    let runtime_state = state
         .runtime
-        .container_state(&cid)
+        .container_state(&meta.container_id)
         .await
-        .map_err(|e| match e {
-            zlayer_agent::AgentError::NotFound { .. } => {
-                ApiError::NotFound(format!("Container '{id}' not found"))
-            }
-            other => ApiError::Internal(format!("Failed to get container state: {other}")),
-        })?;
+        .unwrap_or(ContainerState::Failed {
+            reason: "state unavailable".to_string(),
+        });
 
-    let pid = state.runtime.get_container_pid(&cid).await.ok().flatten();
+    let pid = state
+        .runtime
+        .get_container_pid(&meta.container_id)
+        .await
+        .ok()
+        .flatten();
 
-    Ok(Json(ContainerStateResponse {
-        id,
-        state: state_to_string(&container_state),
+    Ok(Json(ContainerInfo {
+        id: id.clone(),
+        name: meta.name.clone(),
+        image: meta.image.clone(),
+        state: state_to_string(&runtime_state),
+        labels: meta.labels.clone(),
+        created_at: meta.created_at.clone(),
         pid,
-        exit_code: state_exit_code(&container_state),
-        reason: state_reason(&container_state),
     }))
 }
 
 /// Stop and remove a container.
 ///
-/// Stops the container with a 10-second timeout, then removes it from the
-/// runtime. The container's resources (cgroups, filesystem) are cleaned up.
+/// Sends a stop signal (with a 30-second timeout), then removes the container.
 ///
 /// # Errors
 ///
-/// Returns an error if the container is not found or stop/remove fails.
+/// Returns an error if the container is not found, stop/remove fails, or the
+/// user lacks the operator role.
 #[utoipa::path(
     delete,
     path = "/api/v1/containers/{id}",
     params(
-        ("id" = String, Path, description = "Container ID (e.g. my-service-rep-1)"),
+        ("id" = String, Path, description = "Container identifier"),
     ),
     responses(
         (status = 204, description = "Container stopped and removed"),
-        (status = 400, description = "Invalid container ID format"),
         (status = 404, description = "Container not found"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden — operator role required"),
+        (status = 403, description = "Forbidden - operator role required"),
     ),
     security(("bearer_auth" = [])),
     tag = "Containers"
@@ -521,39 +637,42 @@ pub async fn delete_container(
 ) -> Result<axum::http::StatusCode> {
     user.require_role("operator")?;
 
-    let cid = parse_container_id(&id)?;
+    let container_id = {
+        let containers = state.containers.read().await;
+        let meta = containers
+            .get(&id)
+            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+        meta.container_id.clone()
+    };
 
-    info!(container = %cid, "Stopping and removing container via raw API");
+    info!(container_id = %container_id, "Stopping and removing standalone container");
 
-    // Stop with a 10-second timeout
+    // Stop with 30s timeout (ignore errors if container is already stopped)
+    let stop_result = state
+        .runtime
+        .stop_container(&container_id, Duration::from_secs(30))
+        .await;
+    if let Err(ref e) = stop_result {
+        debug!(error = %e, "Stop returned error (container may already be stopped)");
+    }
+
+    // Remove the container
     state
         .runtime
-        .stop_container(&cid, Duration::from_secs(10))
-        .await
-        .map_err(|e| match e {
-            zlayer_agent::AgentError::NotFound { .. } => {
-                ApiError::NotFound(format!("Container '{id}' not found"))
-            }
-            other => ApiError::Internal(format!("Failed to stop container: {other}")),
-        })?;
-
-    // Remove
-    state
-        .runtime
-        .remove_container(&cid)
+        .remove_container(&container_id)
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to remove container: {e}")))?;
 
-    info!(container = %cid, "Container removed");
+    // Remove from tracking
+    state.containers.write().await.remove(&id);
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 /// Get container logs.
 ///
-/// Returns the last N lines of logs as plain text (default: 100). When
-/// `follow=true`, returns a Server-Sent Events stream that continuously
-/// emits new log lines.
+/// Returns the last N lines of container logs as plain text, or streams
+/// logs as Server-Sent Events when `follow=true`.
 ///
 /// # Errors
 ///
@@ -562,12 +681,11 @@ pub async fn delete_container(
     get,
     path = "/api/v1/containers/{id}/logs",
     params(
-        ("id" = String, Path, description = "Container ID (e.g. my-service-rep-1)"),
+        ("id" = String, Path, description = "Container identifier"),
         ContainerLogQuery,
     ),
     responses(
         (status = 200, description = "Container logs (plain text or SSE stream)", body = String),
-        (status = 400, description = "Invalid container ID format"),
         (status = 404, description = "Container not found"),
         (status = 401, description = "Unauthorized"),
     ),
@@ -580,23 +698,17 @@ pub async fn get_container_logs(
     Path(id): Path<String>,
     Query(query): Query<ContainerLogQuery>,
 ) -> Result<Response> {
-    let cid = parse_container_id(&id)?;
-
-    // Verify the container exists
-    state
-        .runtime
-        .container_state(&cid)
-        .await
-        .map_err(|e| match e {
-            zlayer_agent::AgentError::NotFound { .. } => {
-                ApiError::NotFound(format!("Container '{id}' not found"))
-            }
-            other => ApiError::Internal(format!("Failed to verify container: {other}")),
-        })?;
+    let container_id = {
+        let containers = state.containers.read().await;
+        let meta = containers
+            .get(&id)
+            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+        meta.container_id.clone()
+    };
 
     if query.follow {
-        // SSE stream mode
-        let stream = log_follow_stream(state.runtime.clone(), cid, query.tail);
+        // SSE streaming mode
+        let stream = container_log_follow_stream(state.runtime.clone(), container_id, query.tail);
         let sse = Sse::new(stream).keep_alive(
             KeepAlive::new()
                 .interval(Duration::from_secs(15))
@@ -607,28 +719,33 @@ pub async fn get_container_logs(
         // Plain text mode
         let logs = state
             .runtime
-            .container_logs(&cid, query.tail)
+            .container_logs(&container_id, query.tail)
             .await
-            .map_err(|e| match e {
-                zlayer_agent::AgentError::NotFound { .. } => {
-                    ApiError::NotFound(format!("Container '{id}' not found"))
-                }
-                other => ApiError::Internal(format!("Failed to get logs: {other}")),
-            })?;
+            .map_err(|e| ApiError::Internal(format!("Failed to get logs: {e}")))?;
         Ok(logs.into_response())
     }
 }
 
-/// Build an SSE stream that polls for new container log lines.
-fn log_follow_stream(
+/// Internal state for the container log-follow polling stream.
+struct ContainerLogFollowState {
     runtime: Arc<dyn Runtime + Send + Sync>,
-    cid: ContainerId,
+    container_id: ContainerId,
+    tail: usize,
+    seen_line_count: usize,
+    initial: bool,
+    poll_interval: Duration,
+}
+
+/// Build an SSE stream that polls for new log output.
+fn container_log_follow_stream(
+    runtime: Arc<dyn Runtime + Send + Sync>,
+    container_id: ContainerId,
     tail: usize,
 ) -> impl Stream<Item = std::result::Result<Event, Infallible>> {
     futures_util::stream::unfold(
         ContainerLogFollowState {
             runtime,
-            cid,
+            container_id,
             tail,
             seen_line_count: 0,
             initial: true,
@@ -643,7 +760,7 @@ fn log_follow_stream(
 
             let logs = state
                 .runtime
-                .container_logs(&state.cid, fetch_tail)
+                .container_logs(&state.container_id, fetch_tail)
                 .await
                 .unwrap_or_default();
 
@@ -668,7 +785,7 @@ fn log_follow_stream(
                 .collect();
 
             debug!(
-                container = %state.cid,
+                container_id = %state.container_id,
                 new_events = events.len(),
                 total_seen = state.seen_line_count,
                 "container log follow poll"
@@ -680,27 +797,17 @@ fn log_follow_stream(
     .flatten()
 }
 
-/// Internal state for the container log-follow stream.
-struct ContainerLogFollowState {
-    runtime: Arc<dyn Runtime + Send + Sync>,
-    cid: ContainerId,
-    tail: usize,
-    seen_line_count: usize,
-    initial: bool,
-    poll_interval: Duration,
-}
-
-/// Execute a command inside a running container.
+/// Execute a command in a running container.
 ///
 /// # Errors
 ///
-/// Returns an error if the container is not found, the command is empty, or
-/// execution fails.
+/// Returns an error if the container is not found, the command is invalid,
+/// execution fails, or the user lacks the operator role.
 #[utoipa::path(
     post,
     path = "/api/v1/containers/{id}/exec",
     params(
-        ("id" = String, Path, description = "Container ID (e.g. my-service-rep-1)"),
+        ("id" = String, Path, description = "Container identifier"),
     ),
     request_body = ContainerExecRequest,
     responses(
@@ -708,7 +815,7 @@ struct ContainerLogFollowState {
         (status = 400, description = "Invalid request"),
         (status = 404, description = "Container not found"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden — admin role required"),
+        (status = 403, description = "Forbidden - operator role required"),
     ),
     security(("bearer_auth" = [])),
     tag = "Containers"
@@ -719,27 +826,30 @@ pub async fn exec_in_container(
     Path(id): Path<String>,
     Json(request): Json<ContainerExecRequest>,
 ) -> Result<Json<ContainerExecResponse>> {
-    user.require_role("admin")?;
+    user.require_role("operator")?;
 
     if request.command.is_empty() {
         return Err(ApiError::BadRequest("Command cannot be empty".to_string()));
     }
 
-    let cid = parse_container_id(&id)?;
+    let container_id = {
+        let containers = state.containers.read().await;
+        let meta = containers
+            .get(&id)
+            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+        meta.container_id.clone()
+    };
 
-    info!(container = %cid, command = ?request.command, "Executing command in container");
-
-    let (exit_code, stdout, stderr) =
-        state
-            .runtime
-            .exec(&cid, &request.command)
-            .await
-            .map_err(|e| match e {
-                zlayer_agent::AgentError::NotFound { .. } => {
-                    ApiError::NotFound(format!("Container '{id}' not found"))
-                }
-                other => ApiError::Internal(format!("Exec failed: {other}")),
-            })?;
+    let (exit_code, stdout, stderr) = state
+        .runtime
+        .exec(&container_id, &request.command)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            other => ApiError::Internal(format!("Exec failed: {other}")),
+        })?;
 
     Ok(Json(ContainerExecResponse {
         exit_code,
@@ -748,23 +858,22 @@ pub async fn exec_in_container(
     }))
 }
 
-/// Wait for a container to exit.
+/// Wait for a container to exit and return its exit code.
 ///
-/// Blocks until the container exits and returns the exit code. This is useful
-/// for job-style containers where the caller needs to wait for completion.
+/// This endpoint blocks until the container exits. Useful for CI runners
+/// that need to wait for a build/test container to complete.
 ///
 /// # Errors
 ///
-/// Returns an error if the container is not found or waiting fails.
+/// Returns an error if the container is not found or the wait fails.
 #[utoipa::path(
     get,
     path = "/api/v1/containers/{id}/wait",
     params(
-        ("id" = String, Path, description = "Container ID (e.g. my-service-rep-1)"),
+        ("id" = String, Path, description = "Container identifier"),
     ),
     responses(
         (status = 200, description = "Container exited", body = ContainerWaitResponse),
-        (status = 400, description = "Invalid container ID format"),
         (status = 404, description = "Container not found"),
         (status = 401, description = "Unauthorized"),
     ),
@@ -776,30 +885,31 @@ pub async fn wait_container(
     State(state): State<ContainerApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<ContainerWaitResponse>> {
-    let cid = parse_container_id(&id)?;
-
-    debug!(container = %cid, "Waiting for container to exit");
+    let container_id = {
+        let containers = state.containers.read().await;
+        let meta = containers
+            .get(&id)
+            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+        meta.container_id.clone()
+    };
 
     let exit_code = state
         .runtime
-        .wait_container(&cid)
+        .wait_container(&container_id)
         .await
         .map_err(|e| match e {
-            zlayer_agent::AgentError::NotFound { .. } => {
-                ApiError::NotFound(format!("Container '{id}' not found"))
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
             }
             other => ApiError::Internal(format!("Wait failed: {other}")),
         })?;
 
-    info!(container = %cid, exit_code, "Container exited");
-
     Ok(Json(ContainerWaitResponse { id, exit_code }))
 }
 
-/// Get resource statistics for a container.
+/// Get container resource statistics.
 ///
-/// Returns CPU and memory usage from cgroups. Only works for running
-/// containers on Linux with cgroups v2 enabled.
+/// Returns CPU and memory usage statistics for the specified container.
 ///
 /// # Errors
 ///
@@ -808,11 +918,10 @@ pub async fn wait_container(
     get,
     path = "/api/v1/containers/{id}/stats",
     params(
-        ("id" = String, Path, description = "Container ID (e.g. my-service-rep-1)"),
+        ("id" = String, Path, description = "Container identifier"),
     ),
     responses(
-        (status = 200, description = "Container resource statistics", body = ContainerStatsResponse),
-        (status = 400, description = "Invalid container ID format"),
+        (status = 200, description = "Container statistics", body = ContainerStatsResponse),
         (status = 404, description = "Container not found"),
         (status = 401, description = "Unauthorized"),
     ),
@@ -824,25 +933,31 @@ pub async fn get_container_stats(
     State(state): State<ContainerApiState>,
     Path(id): Path<String>,
 ) -> Result<Json<ContainerStatsResponse>> {
-    let cid = parse_container_id(&id)?;
+    let container_id = {
+        let containers = state.containers.read().await;
+        let meta = containers
+            .get(&id)
+            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+        meta.container_id.clone()
+    };
 
-    let cgroup_stats = state
+    let cstats = state
         .runtime
-        .get_container_stats(&cid)
+        .get_container_stats(&container_id)
         .await
         .map_err(|e| match e {
-            zlayer_agent::AgentError::NotFound { .. } => {
-                ApiError::NotFound(format!("Container '{id}' not found"))
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
             }
             other => ApiError::Internal(format!("Failed to get stats: {other}")),
         })?;
 
     Ok(Json(ContainerStatsResponse {
         id,
-        cpu_usage_usec: cgroup_stats.cpu_usage_usec,
-        memory_bytes: cgroup_stats.memory_bytes,
-        memory_limit: cgroup_stats.memory_limit,
-        memory_percent: cgroup_stats.memory_percent(),
+        cpu_usage_usec: cstats.cpu_usage_usec,
+        memory_bytes: cstats.memory_bytes,
+        memory_limit: cstats.memory_limit,
+        memory_percent: cstats.memory_percent(),
     }))
 }
 
@@ -855,148 +970,212 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_container_id_simple() {
-        let cid = parse_container_id("web-rep-1").unwrap();
-        assert_eq!(cid.service, "web");
-        assert_eq!(cid.replica, 1);
-    }
-
-    #[test]
-    fn test_parse_container_id_with_hyphens() {
-        let cid = parse_container_id("my-cool-service-rep-42").unwrap();
-        assert_eq!(cid.service, "my-cool-service");
-        assert_eq!(cid.replica, 42);
-    }
-
-    #[test]
-    fn test_parse_container_id_invalid_format() {
-        assert!(parse_container_id("invalid").is_err());
-        assert!(parse_container_id("no-replica").is_err());
-        assert!(parse_container_id("service-nope-1").is_err());
-    }
-
-    #[test]
-    fn test_parse_container_id_invalid_replica() {
-        assert!(parse_container_id("web-rep-abc").is_err());
-    }
-
-    #[test]
-    fn test_state_to_string_variants() {
-        assert_eq!(state_to_string(&ContainerState::Pending), "pending");
-        assert_eq!(
-            state_to_string(&ContainerState::Initializing),
-            "initializing"
-        );
-        assert_eq!(state_to_string(&ContainerState::Running), "running");
-        assert_eq!(state_to_string(&ContainerState::Stopping), "stopping");
-        assert_eq!(
-            state_to_string(&ContainerState::Exited { code: 0 }),
-            "exited(0)"
-        );
-        assert_eq!(
-            state_to_string(&ContainerState::Exited { code: 137 }),
-            "exited(137)"
-        );
-        assert_eq!(
-            state_to_string(&ContainerState::Failed {
-                reason: "OOM".to_string()
-            }),
-            "failed: OOM"
-        );
-    }
-
-    #[test]
-    fn test_state_exit_code() {
-        assert_eq!(
-            state_exit_code(&ContainerState::Exited { code: 42 }),
-            Some(42)
-        );
-        assert_eq!(state_exit_code(&ContainerState::Running), None);
-        assert_eq!(
-            state_exit_code(&ContainerState::Failed {
-                reason: "err".to_string()
-            }),
-            None
-        );
-    }
-
-    #[test]
-    fn test_state_reason() {
-        assert_eq!(
-            state_reason(&ContainerState::Failed {
-                reason: "out of memory".to_string()
-            }),
-            Some("out of memory".to_string())
-        );
-        assert_eq!(state_reason(&ContainerState::Running), None);
-    }
-
-    #[test]
     fn test_create_container_request_deserialize() {
-        let json = r#"{"service": "web", "replica": 3}"#;
-        let req: CreateContainerRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.service, "web");
-        assert_eq!(req.replica, 3);
-        assert!(req.image.is_none());
+        let json = r#"{
+            "image": "nginx:latest",
+            "name": "my-nginx",
+            "env": {"PORT": "8080"},
+            "command": ["nginx", "-g", "daemon off;"],
+            "labels": {"app": "web", "ci": "true"},
+            "resources": {"cpu": 0.5, "memory": "256Mi"},
+            "volumes": [{"source": "/data", "target": "/app/data", "readonly": true}],
+            "work_dir": "/app"
+        }"#;
+        let request: CreateContainerRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.image, "nginx:latest");
+        assert_eq!(request.name.as_deref(), Some("my-nginx"));
+        assert_eq!(request.env.get("PORT").unwrap(), "8080");
+        assert_eq!(request.command.as_ref().unwrap().len(), 3);
+        assert_eq!(request.labels.get("ci").unwrap(), "true");
+        assert!(request.resources.is_some());
+        assert_eq!(request.volumes.len(), 1);
+        assert!(request.volumes[0].readonly);
+        assert_eq!(request.work_dir.as_deref(), Some("/app"));
     }
 
     #[test]
-    fn test_create_container_request_with_image() {
-        let json = r#"{"service": "web", "replica": 1, "image": "nginx:latest"}"#;
-        let req: CreateContainerRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.image, Some("nginx:latest".to_string()));
+    fn test_create_container_request_minimal() {
+        let json = r#"{"image": "alpine:3.19"}"#;
+        let request: CreateContainerRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.image, "alpine:3.19");
+        assert!(request.name.is_none());
+        assert!(request.env.is_empty());
+        assert!(request.command.is_none());
+        assert!(request.labels.is_empty());
+        assert!(request.resources.is_none());
+        assert!(request.volumes.is_empty());
+        assert!(request.work_dir.is_none());
     }
 
     #[test]
     fn test_container_info_serialize() {
         let info = ContainerInfo {
-            id: "web-rep-1".to_string(),
-            service: "web".to_string(),
-            replica: 1,
+            id: "standalone-test-rep-0".to_string(),
+            name: Some("test".to_string()),
+            image: "nginx:latest".to_string(),
             state: "running".to_string(),
-            pid: Some(1234),
-            exit_code: None,
+            labels: HashMap::from([("app".to_string(), "web".to_string())]),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            pid: Some(12345),
         };
         let json = serde_json::to_string(&info).unwrap();
-        assert!(json.contains("web-rep-1"));
-        assert!(json.contains("1234"));
+        assert!(json.contains("standalone-test-rep-0"));
+        assert!(json.contains("running"));
+        assert!(json.contains("12345"));
     }
 
     #[test]
-    fn test_container_exec_request_deserialize() {
-        let json = r#"{"command": ["ls", "-la"]}"#;
-        let req: ContainerExecRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(req.command, vec!["ls", "-la"]);
+    fn test_container_info_serialize_no_optional() {
+        let info = ContainerInfo {
+            id: "standalone-abc-rep-0".to_string(),
+            name: None,
+            image: "alpine:latest".to_string(),
+            state: "exited(0)".to_string(),
+            labels: HashMap::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            pid: None,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        assert!(!json.contains("name"));
+        assert!(!json.contains("pid"));
     }
 
     #[test]
-    fn test_container_log_query_defaults() {
+    fn test_exec_request_deserialize() {
+        let json = r#"{"command": ["echo", "hello"]}"#;
+        let request: ContainerExecRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(request.command, vec!["echo", "hello"]);
+    }
+
+    #[test]
+    fn test_wait_response_serialize() {
+        let response = ContainerWaitResponse {
+            id: "test-container".to_string(),
+            exit_code: 0,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("test-container"));
+        assert!(json.contains('0'));
+    }
+
+    #[test]
+    fn test_stats_response_serialize() {
+        let response = ContainerStatsResponse {
+            id: "test-container".to_string(),
+            cpu_usage_usec: 1_000_000,
+            memory_bytes: 50 * 1024 * 1024,
+            memory_limit: 256 * 1024 * 1024,
+            memory_percent: 19.53125,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("cpu_usage_usec"));
+        assert!(json.contains("memory_percent"));
+    }
+
+    #[test]
+    fn test_state_to_string() {
+        assert_eq!(state_to_string(&ContainerState::Running), "running");
+        assert_eq!(state_to_string(&ContainerState::Pending), "pending");
+        assert_eq!(
+            state_to_string(&ContainerState::Exited { code: 0 }),
+            "exited(0)"
+        );
+        assert_eq!(
+            state_to_string(&ContainerState::Failed {
+                reason: "oom".to_string()
+            }),
+            "failed: oom"
+        );
+    }
+
+    #[test]
+    fn test_generate_container_id_with_name() {
+        let (id, cid) = generate_container_id(Some("myapp"));
+        assert_eq!(id, "standalone-myapp");
+        assert_eq!(cid.service, "standalone-myapp");
+        assert_eq!(cid.replica, 0);
+    }
+
+    #[test]
+    fn test_generate_container_id_without_name() {
+        let (id, cid) = generate_container_id(None);
+        assert!(id.starts_with("standalone-"));
+        assert_eq!(cid.service, id);
+        assert_eq!(cid.replica, 0);
+    }
+
+    #[test]
+    fn test_log_query_defaults() {
         let query: ContainerLogQuery = serde_json::from_str("{}").unwrap();
         assert_eq!(query.tail, 100);
         assert!(!query.follow);
     }
 
     #[test]
-    fn test_container_stats_response_serialize() {
-        let stats = ContainerStatsResponse {
-            id: "web-rep-1".to_string(),
-            cpu_usage_usec: 5_000_000,
-            memory_bytes: 100 * 1024 * 1024,
-            memory_limit: 256 * 1024 * 1024,
-            memory_percent: 39.0625,
-        };
-        let json = serde_json::to_string(&stats).unwrap();
-        assert!(json.contains("cpu_usage_usec"));
-        assert!(json.contains("memory_percent"));
+    fn test_list_containers_query_no_label() {
+        let query: ListContainersQuery = serde_json::from_str("{}").unwrap();
+        assert!(query.label.is_none());
     }
 
     #[test]
-    fn test_container_wait_response_serialize() {
-        let resp = ContainerWaitResponse {
-            id: "job-rep-1".to_string(),
-            exit_code: 0,
+    fn test_build_service_spec_minimal() {
+        let request = CreateContainerRequest {
+            image: "alpine:latest".to_string(),
+            name: None,
+            env: HashMap::new(),
+            command: None,
+            labels: HashMap::new(),
+            resources: None,
+            volumes: Vec::new(),
+            work_dir: None,
         };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("exit_code"));
+        let spec = build_service_spec(&request);
+        assert_eq!(spec.image.name, "alpine:latest");
+        assert!(spec.env.is_empty());
+        assert!(spec.storage.is_empty());
+    }
+
+    #[test]
+    fn test_build_service_spec_full() {
+        let request = CreateContainerRequest {
+            image: "node:20".to_string(),
+            name: Some("build-runner".to_string()),
+            env: HashMap::from([("NODE_ENV".to_string(), "production".to_string())]),
+            command: Some(vec!["node".to_string(), "server.js".to_string()]),
+            labels: HashMap::from([("ci".to_string(), "true".to_string())]),
+            resources: Some(ContainerResourceLimits {
+                cpu: Some(2.0),
+                memory: Some("1Gi".to_string()),
+            }),
+            volumes: vec![VolumeMount {
+                source: "/workspace".to_string(),
+                target: "/app".to_string(),
+                readonly: false,
+            }],
+            work_dir: Some("/app".to_string()),
+        };
+        let spec = build_service_spec(&request);
+        assert_eq!(spec.image.name, "node:20");
+        assert_eq!(spec.env.get("NODE_ENV").unwrap(), "production");
+        assert_eq!(
+            spec.command.entrypoint.as_deref(),
+            Some(["node".to_string()].as_slice())
+        );
+        assert_eq!(
+            spec.command.args.as_deref(),
+            Some(["server.js".to_string()].as_slice())
+        );
+        assert_eq!(spec.command.workdir.as_deref(), Some("/app"));
+        assert_eq!(spec.resources.cpu, Some(2.0));
+        assert_eq!(spec.resources.memory.as_deref(), Some("1Gi"));
+        assert_eq!(spec.storage.len(), 1);
+    }
+
+    #[test]
+    fn test_container_api_state_new() {
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(zlayer_agent::MockRuntime::new());
+        let state = ContainerApiState::new(runtime);
+        // State builds without error
+        assert!(Arc::strong_count(&state.containers) >= 1);
     }
 }

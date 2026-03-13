@@ -8,7 +8,7 @@
 //! ```
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::process::Command;
 use x25519_dalek::{PublicKey, StaticSecret};
@@ -545,5 +545,244 @@ async fn test_dual_overlay_connectivity() {
     assert!(
         !check_b.status.success(),
         "Interface {iface_b} should be removed after shutdown",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 6. IPv6 overlay config construction test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_overlay_config_and_peer_config_format_ipv6() {
+    let (private_key, public_key) = OverlayTransport::generate_keys()
+        .await
+        .expect("key generation should succeed");
+
+    // Build an OverlayConfig with IPv6 addressing
+    let config = OverlayConfig {
+        local_endpoint: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 51820),
+        private_key: private_key.clone(),
+        public_key: public_key.clone(),
+        overlay_cidr: "fd00:200::1/48".to_string(),
+        peer_discovery_interval: Duration::from_secs(30),
+        #[cfg(feature = "nat")]
+        nat: zlayer_overlay::nat::NatConfig::default(),
+    };
+
+    assert_eq!(config.local_endpoint.port(), 51820);
+    assert!(config.local_endpoint.ip().is_ipv6());
+    assert_eq!(config.overlay_cidr, "fd00:200::1/48");
+    assert_eq!(config.private_key, private_key);
+    assert_eq!(config.public_key, public_key);
+
+    // Build a PeerInfo with an IPv6 endpoint and verify its peer config block format
+    let peer = PeerInfo::new(
+        public_key.clone(),
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0x200, 0, 0, 0, 0, 0, 0x20)),
+            51820,
+        ),
+        "fd00:200::2/128",
+        Duration::from_secs(25),
+    );
+
+    let peer_config = peer.to_peer_config();
+
+    assert!(
+        peer_config.contains("[Peer]"),
+        "Peer config must contain [Peer] section header"
+    );
+    assert!(
+        peer_config.contains(&format!("PublicKey = {public_key}")),
+        "Peer config must contain the correct public key"
+    );
+    // IPv6 endpoints use bracket notation in WireGuard configs
+    assert!(
+        peer_config.contains("Endpoint = [fd00:200::20]:51820"),
+        "Peer config must contain the correctly formatted IPv6 endpoint, got: {peer_config}"
+    );
+    assert!(
+        peer_config.contains("AllowedIPs = fd00:200::2/128"),
+        "Peer config must contain the correct IPv6 allowed IPs"
+    );
+    assert!(
+        peer_config.contains("PersistentKeepalive = 25"),
+        "Peer config must contain the correct keepalive interval"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 7. Mixed IPv4/IPv6 peer config test
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_overlay_config_mixed_v4_v6_peers() {
+    let (private_key, public_key) = OverlayTransport::generate_keys()
+        .await
+        .expect("key generation should succeed");
+
+    let (_, peer_pub_v4) = OverlayTransport::generate_keys()
+        .await
+        .expect("key generation for v4 peer should succeed");
+
+    let (_, peer_pub_v6) = OverlayTransport::generate_keys()
+        .await
+        .expect("key generation for v6 peer should succeed");
+
+    // IPv4 peer
+    let peer_v4 = PeerInfo::new(
+        peer_pub_v4.clone(),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 20)), 51820),
+        "10.200.0.2/32",
+        Duration::from_secs(25),
+    );
+
+    // IPv6 peer
+    let peer_v6 = PeerInfo::new(
+        peer_pub_v6.clone(),
+        SocketAddr::new(
+            IpAddr::V6(Ipv6Addr::new(0xfd00, 0x200, 0, 0, 0, 0, 0, 0x20)),
+            51820,
+        ),
+        "fd00:200::20/128",
+        Duration::from_secs(25),
+    );
+
+    let config_v4 = peer_v4.to_peer_config();
+    let config_v6 = peer_v6.to_peer_config();
+
+    // Verify IPv4 peer config uses plain IP notation
+    assert!(
+        config_v4.contains("Endpoint = 192.168.1.20:51820"),
+        "IPv4 peer should have plain IP:port endpoint"
+    );
+    assert!(
+        config_v4.contains("AllowedIPs = 10.200.0.2/32"),
+        "IPv4 peer should have IPv4 allowed IPs"
+    );
+
+    // Verify IPv6 peer config uses bracket notation
+    assert!(
+        config_v6.contains("Endpoint = [fd00:200::20]:51820"),
+        "IPv6 peer should have [IP]:port endpoint"
+    );
+    assert!(
+        config_v6.contains("AllowedIPs = fd00:200::20/128"),
+        "IPv6 peer should have IPv6 allowed IPs"
+    );
+
+    // Both should have their own public keys
+    assert!(config_v4.contains(&format!("PublicKey = {peer_pub_v4}")));
+    assert!(config_v6.contains(&format!("PublicKey = {peer_pub_v6}")));
+
+    // The full config should be able to combine both peer blocks
+    let full_config = format!(
+        "[Interface]\nPrivateKey = {}\nListenPort = {}\n{}\n{}",
+        private_key, 51820, config_v4, config_v6,
+    );
+    assert!(full_config.starts_with("[Interface]"));
+    assert_eq!(
+        full_config.matches("[Peer]").count(),
+        2,
+        "Full config should contain exactly 2 [Peer] sections"
+    );
+    let _ = public_key; // used to generate config above
+}
+
+// ---------------------------------------------------------------------------
+// 8. IPv6 interface lifecycle test (requires root or CAP_NET_ADMIN)
+// ---------------------------------------------------------------------------
+// Run with: cargo test -p zlayer-overlay --test overlay_e2e -- --ignored
+
+#[tokio::test]
+#[ignore = "requires root or CAP_NET_ADMIN"]
+async fn test_overlay_interface_lifecycle_ipv6() {
+    let iface_name = "wg-test-v6";
+
+    // Generate keys for the interface
+    let (private_key, public_key) = OverlayTransport::generate_keys()
+        .await
+        .expect("key generation should succeed");
+
+    let config = OverlayConfig {
+        local_endpoint: SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 51850),
+        private_key,
+        public_key,
+        overlay_cidr: "fd00:250::1/48".to_string(),
+        peer_discovery_interval: Duration::from_secs(30),
+        #[cfg(feature = "nat")]
+        nat: zlayer_overlay::nat::NatConfig::default(),
+    };
+
+    let mut manager = OverlayTransport::new(config, iface_name.to_string());
+
+    // Cleanup any leftover interface from a previous failed run
+    let _ = Command::new("ip")
+        .args(["link", "del", "dev", iface_name])
+        .output()
+        .await;
+
+    // Create the overlay interface
+    manager
+        .create_interface()
+        .await
+        .expect("create_interface should succeed with IPv6 config");
+
+    // Verify the interface exists via `ip link show`
+    let link_output = Command::new("ip")
+        .args(["link", "show", "dev", iface_name])
+        .output()
+        .await
+        .expect("ip link show should execute");
+    assert!(
+        link_output.status.success(),
+        "Interface {} should exist after create_interface, stderr: {}",
+        iface_name,
+        String::from_utf8_lossy(&link_output.stderr)
+    );
+
+    // Configure the interface (assign IPv6, bring up)
+    manager
+        .configure(&[])
+        .await
+        .expect("configure_interface should succeed with IPv6 and no peers");
+
+    // Verify the interface is UP
+    let link_output = Command::new("ip")
+        .args(["link", "show", "dev", iface_name])
+        .output()
+        .await
+        .expect("ip link show should execute");
+    let link_stdout = String::from_utf8_lossy(&link_output.stdout);
+    assert!(
+        link_stdout.contains("UP") || link_stdout.contains("up"),
+        "Interface should be UP after configure_interface, got: {link_stdout}",
+    );
+
+    // Verify the IPv6 overlay address is assigned
+    let addr_output = Command::new("ip")
+        .args(["-6", "addr", "show", "dev", iface_name])
+        .output()
+        .await
+        .expect("ip -6 addr show should execute");
+    let addr_stdout = String::from_utf8_lossy(&addr_output.stdout);
+    assert!(
+        addr_stdout.contains("fd00:250::1"),
+        "Interface should have IPv6 overlay address fd00:250::1 assigned, got: {addr_stdout}",
+    );
+
+    // Tear down
+    manager.shutdown();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Verify the interface is gone
+    let link_output = Command::new("ip")
+        .args(["link", "show", "dev", iface_name])
+        .output()
+        .await
+        .expect("ip link show should execute");
+    assert!(
+        !link_output.status.success(),
+        "Interface {iface_name} should no longer exist after shutdown",
     );
 }

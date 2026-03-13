@@ -714,4 +714,38 @@ mod tests {
             "node_ip should be None before setup_global_overlay"
         );
     }
+
+    /// IPv4 allocator produces sequential addresses from the base.
+    #[test]
+    fn ip_allocator_v4_sequential() {
+        let alloc = IpAllocator::new("10.200.0.0/16".parse().unwrap());
+        let ip1 = alloc.allocate().unwrap();
+        let ip2 = alloc.allocate().unwrap();
+        let ip3 = alloc.allocate().unwrap();
+        assert_eq!(ip1, IpAddr::V4(Ipv4Addr::new(10, 200, 0, 1)));
+        assert_eq!(ip2, IpAddr::V4(Ipv4Addr::new(10, 200, 0, 2)));
+        assert_eq!(ip3, IpAddr::V4(Ipv4Addr::new(10, 200, 0, 3)));
+    }
+
+    /// IPv6 allocator produces sequential addresses from the base.
+    #[test]
+    fn ip_allocator_v6_sequential() {
+        let alloc = IpAllocator::new("fd00:200::0/48".parse().unwrap());
+        let ip1 = alloc.allocate().unwrap();
+        let ip2 = alloc.allocate().unwrap();
+        let ip3 = alloc.allocate().unwrap();
+        assert_eq!(ip1, "fd00:200::1".parse::<IpAddr>().unwrap());
+        assert_eq!(ip2, "fd00:200::2".parse::<IpAddr>().unwrap());
+        assert_eq!(ip3, "fd00:200::3".parse::<IpAddr>().unwrap());
+    }
+
+    /// `allocate_for_service` delegates to `allocate` regardless of IP version.
+    #[test]
+    fn ip_allocator_service_delegates() {
+        let alloc = IpAllocator::new("fd00:200::0/48".parse().unwrap());
+        let ip1 = alloc.allocate_for_service("web").unwrap();
+        let ip2 = alloc.allocate().unwrap();
+        assert_eq!(ip1, "fd00:200::1".parse::<IpAddr>().unwrap());
+        assert_eq!(ip2, "fd00:200::2".parse::<IpAddr>().unwrap());
+    }
 }
