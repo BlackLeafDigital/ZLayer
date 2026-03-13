@@ -1,0 +1,2391 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "ZLayer API",
+    "description": "Container orchestration API for ZLayer",
+    "contact": {
+      "name": "ZLayer",
+      "url": "https://zlayer.dev"
+    },
+    "license": {
+      "name": "MIT OR Apache-2.0"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/api/v1/build": {
+      "post": {
+        "tags": [
+          "Build"
+        ],
+        "summary": "POST /api/v1/build\nStart a new build from multipart upload (Dockerfile + context tarball)",
+        "description": "Accepts a multipart form with:\n- `dockerfile`: The Dockerfile content (optional if using runtime)\n- `context`: A tarball containing the build context\n- `config`: JSON configuration (`BuildRequest`)\n\n# Errors\n\nReturns an error if the request is invalid, context extraction fails, or the build\ncannot be started.",
+        "operationId": "start_build",
+        "requestBody": {
+          "description": "Build context with Dockerfile",
+          "content": {
+            "multipart/form-data": {}
+          }
+        },
+        "responses": {
+          "202": {
+            "description": "Build started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TriggerBuildResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/build/json": {
+      "post": {
+        "tags": [
+          "Build"
+        ],
+        "summary": "POST /api/v1/build/json\nStart a new build from JSON request with a context path on the server.",
+        "description": "# Errors\n\nReturns an error if the context path is invalid or the build cannot be started.",
+        "operationId": "start_build_json",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BuildRequestWithContext"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "description": "Build started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TriggerBuildResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/build/{id}": {
+      "get": {
+        "tags": [
+          "Build"
+        ],
+        "summary": "GET /api/v1/build/{id}\nGet build status.",
+        "description": "# Errors\n\nReturns an error if the build is not found.",
+        "operationId": "get_build_status",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Build ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Build status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BuildStatus"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Build not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/build/{id}/logs": {
+      "get": {
+        "tags": [
+          "Build"
+        ],
+        "summary": "GET /api/v1/build/{id}/logs\nGet build logs.",
+        "description": "# Errors\n\nReturns an error if the build is not found or logs cannot be read.",
+        "operationId": "get_build_logs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Build ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Build logs",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Build not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/build/{id}/stream": {
+      "get": {
+        "tags": [
+          "Build"
+        ],
+        "summary": "GET /api/v1/build/{id}/stream\nStream build progress via Server-Sent Events.",
+        "description": "# Errors\n\nReturns an error if the build is not found or not active.",
+        "operationId": "stream_build",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Build ID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE event stream"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Build not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/builds": {
+      "get": {
+        "tags": [
+          "Build"
+        ],
+        "summary": "GET /api/v1/builds\nList all builds.",
+        "description": "# Errors\n\nReturns an error if the user is not authenticated.",
+        "operationId": "list_builds",
+        "responses": {
+          "200": {
+            "description": "List of builds",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BuildStatus"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/containers": {
+      "get": {
+        "tags": [
+          "Containers"
+        ],
+        "summary": "List standalone containers.",
+        "description": "Returns all containers managed through this API. Optionally filter by\nlabel using the `label` query parameter in `key=value` format.\n\n# Errors\n\nReturns an error if the user is not authenticated.",
+        "operationId": "list_containers",
+        "parameters": [
+          {
+            "name": "label",
+            "in": "query",
+            "description": "Filter by label (key=value format)",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of containers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ContainerInfo"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Containers"
+        ],
+        "summary": "Create and start a container.",
+        "description": "Pulls the image if needed, creates the container, and starts it.\nReturns the container info including its assigned ID.\n\n# Errors\n\nReturns an error if image pull fails, container creation fails, or the\nuser lacks the operator role.",
+        "operationId": "create_container",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateContainerRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Container created and started",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden - operator role required"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/containers/{id}": {
+      "get": {
+        "tags": [
+          "Containers"
+        ],
+        "summary": "Get details for a specific container.",
+        "description": "# Errors\n\nReturns an error if the container is not found or the user is not authenticated.",
+        "operationId": "get_container",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Container identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Container details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Container not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Containers"
+        ],
+        "summary": "Stop and remove a container.",
+        "description": "Sends a stop signal (with a 30-second timeout), then removes the container.\n\n# Errors\n\nReturns an error if the container is not found, stop/remove fails, or the\nuser lacks the operator role.",
+        "operationId": "delete_container",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Container identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Container stopped and removed"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden - operator role required"
+          },
+          "404": {
+            "description": "Container not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/containers/{id}/exec": {
+      "post": {
+        "tags": [
+          "Containers"
+        ],
+        "summary": "Execute a command in a running container.",
+        "description": "# Errors\n\nReturns an error if the container is not found, the command is invalid,\nexecution fails, or the user lacks the operator role.",
+        "operationId": "exec_in_container",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Container identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ContainerExecRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Command executed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerExecResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden - operator role required"
+          },
+          "404": {
+            "description": "Container not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/containers/{id}/logs": {
+      "get": {
+        "tags": [
+          "Containers"
+        ],
+        "summary": "Get container logs.",
+        "description": "Returns the last N lines of container logs as plain text, or streams\nlogs as Server-Sent Events when `follow=true`.\n\n# Errors\n\nReturns an error if the container is not found or log retrieval fails.",
+        "operationId": "get_container_logs",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Container identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "tail",
+            "in": "query",
+            "description": "Number of tail lines to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "follow",
+            "in": "query",
+            "description": "Follow logs (SSE stream)",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Container logs (plain text or SSE stream)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Container not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/containers/{id}/stats": {
+      "get": {
+        "tags": [
+          "Containers"
+        ],
+        "summary": "Get container resource statistics.",
+        "description": "Returns CPU and memory usage statistics for the specified container.\n\n# Errors\n\nReturns an error if the container is not found or stats retrieval fails.",
+        "operationId": "get_container_stats",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Container identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Container statistics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerStatsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Container not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/containers/{id}/wait": {
+      "get": {
+        "tags": [
+          "Containers"
+        ],
+        "summary": "Wait for a container to exit and return its exit code.",
+        "description": "This endpoint blocks until the container exits. Useful for CI runners\nthat need to wait for a build/test container to complete.\n\n# Errors\n\nReturns an error if the container is not found or the wait fails.",
+        "operationId": "wait_container",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Container identifier",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Container exited",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerWaitResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Container not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/deployments": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "List all deployments.",
+        "description": "# Errors\n\nReturns an error if storage access fails.",
+        "operationId": "list_deployments",
+        "responses": {
+          "200": {
+            "description": "List of deployments",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DeploymentSummary"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "Create a new deployment.",
+        "description": "When the daemon has orchestration wired (service manager, proxy, overlay),\nthis handler:\n 1. Parses and validates the spec YAML\n 2. Stores the deployment with status `Deploying`\n 3. Spawns an async task that registers services, sets up overlays,\n    configures the proxy, and scales services\n 4. Returns immediately with `Deploying` status\n 5. The async task updates the stored status to `Running` or `Failed`\n\nWithout orchestration wired, it stores the spec with `Pending` status.\n\n# Errors\n\nReturns an error if the spec is invalid or storage fails.",
+        "operationId": "create_deployment",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateDeploymentRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Deployment created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentDetails"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid specification"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/deployments/{deployment}/services": {
+      "get": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "List services in a deployment.",
+        "description": "# Errors\n\nReturns an error if the deployment is not found or storage access fails.",
+        "operationId": "list_services",
+        "parameters": [
+          {
+            "name": "deployment",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of services",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ServiceSummary"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Deployment not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/deployments/{deployment}/services/{service}": {
+      "get": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "Get service details.",
+        "description": "# Errors\n\nReturns an error if the deployment or service is not found.",
+        "operationId": "get_service",
+        "parameters": [
+          {
+            "name": "deployment",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "service",
+            "in": "path",
+            "description": "Service name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Service details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Service not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/deployments/{deployment}/services/{service}/logs": {
+      "get": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "Get service logs.",
+        "description": "Returns service logs as plain text when `follow=false`, or as a Server-Sent\nEvents stream when `follow=true`.  In follow mode the server first emits the\nlast N lines (controlled by the `lines` parameter) and then continuously\npolls for new output, emitting each new line as a `data:` SSE event.\n\n# Errors\n\nReturns an error if the deployment or service is not found, or the service\nmanager is not available.",
+        "operationId": "get_service_logs",
+        "parameters": [
+          {
+            "name": "deployment",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "service",
+            "in": "path",
+            "description": "Service name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "lines",
+            "in": "query",
+            "description": "Number of lines to return",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "follow",
+            "in": "query",
+            "description": "Follow logs (streaming)",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "instance",
+            "in": "query",
+            "description": "Filter by container/instance",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Service logs (plain text or SSE stream)",
+            "content": {
+              "text/plain": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Service not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/deployments/{deployment}/services/{service}/scale": {
+      "post": {
+        "tags": [
+          "Services"
+        ],
+        "summary": "Scale a service.",
+        "description": "# Errors\n\nReturns an error if the deployment or service is not found, scaling fails,\nor the user lacks permission.",
+        "operationId": "scale_service",
+        "parameters": [
+          {
+            "name": "deployment",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "service",
+            "in": "path",
+            "description": "Service name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScaleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Service scaled",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceDetails"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid scale request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Service not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/deployments/{name}": {
+      "get": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "Get deployment details (with live per-service health when available).",
+        "description": "# Errors\n\nReturns an error if the deployment is not found or storage access fails.",
+        "operationId": "get_deployment",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deployment details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DeploymentDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Deployment not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Deployments"
+        ],
+        "summary": "Delete a deployment.",
+        "description": "# Errors\n\nReturns an error if the deployment is not found, storage access fails, or teardown\nencounters critical failures.",
+        "operationId": "delete_deployment",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Deployment name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deployment deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Deployment not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/internal/replicas/{service}": {
+      "get": {
+        "tags": [
+          "Internal"
+        ],
+        "summary": "Get the current replica count for a service.",
+        "description": "This endpoint allows the scheduler to query the current state of a service.\n\n# Errors\n\nReturns an error if the service is not found or authentication is invalid.",
+        "operationId": "get_replicas_internal",
+        "parameters": [
+          {
+            "name": "service",
+            "in": "path",
+            "description": "Service name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Current replica count",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalScaleResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - invalid or missing internal token"
+          },
+          "404": {
+            "description": "Service not found"
+          }
+        }
+      }
+    },
+    "/api/v1/internal/scale": {
+      "post": {
+        "tags": [
+          "Internal"
+        ],
+        "summary": "Scale a service via internal scheduler request.",
+        "description": "This endpoint is called by the distributed scheduler leader to trigger\nscaling operations on agent nodes. It uses a shared secret for authentication.\n\n# Errors\n\nReturns an error if the service is not found, scaling fails, or authentication\nis invalid.",
+        "operationId": "scale_service_internal",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InternalScaleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Service scaled successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InternalScaleResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized - invalid or missing internal token"
+          },
+          "404": {
+            "description": "Service not found"
+          },
+          "500": {
+            "description": "Internal error"
+          }
+        }
+      }
+    },
+    "/api/v1/secrets": {
+      "get": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "List all secrets for the authenticated user.",
+        "description": "Returns metadata for all secrets in the user's scope. Secret values are\nnever exposed through this endpoint.\n\n# Errors\n\nReturns an error if storage access fails.",
+        "operationId": "list_secrets",
+        "responses": {
+          "200": {
+            "description": "List of secret metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SecretMetadataResponse"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "Create or update a secret.",
+        "description": "Stores a new secret or updates an existing one. The secret value is encrypted\nat rest and the version number is incremented on updates.\n\n# Errors\n\nReturns an error if validation fails, storage operations fail, or the user\nlacks permission.",
+        "operationId": "create_secret",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateSecretRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Secret updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretMetadataResponse"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Secret created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretMetadataResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/secrets/{name}": {
+      "get": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "Get metadata for a specific secret.",
+        "description": "Returns metadata for a single secret. The secret value is never exposed\nthrough this endpoint.\n\n# Errors\n\nReturns an error if the secret is not found or storage access fails.",
+        "operationId": "get_secret_metadata",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Secret name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Secret metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SecretMetadataResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Secret not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "Delete a secret.",
+        "description": "Permanently removes a secret from the store.\n\n# Errors\n\nReturns an error if the secret is not found, storage access fails, or\nthe user lacks permission.",
+        "operationId": "delete_secret",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Secret name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Secret deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Secret not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/templates": {
+      "get": {
+        "tags": [
+          "Build"
+        ],
+        "summary": "GET /api/v1/templates\nList available runtime templates",
+        "operationId": "list_runtime_templates",
+        "responses": {
+          "200": {
+            "description": "List of templates",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TemplateInfo"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/token": {
+      "post": {
+        "tags": [
+          "Authentication"
+        ],
+        "summary": "Get an access token.",
+        "description": "# Errors\n\nReturns an error if credentials are invalid or token creation fails.",
+        "operationId": "get_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Token created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid credentials"
+          }
+        }
+      }
+    },
+    "/health/live": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Liveness probe - basic health check",
+        "operationId": "liveness",
+        "responses": {
+          "200": {
+            "description": "Service is alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "tags": [
+          "Health"
+        ],
+        "summary": "Readiness probe - full health check",
+        "operationId": "readiness",
+        "responses": {
+          "200": {
+            "description": "Service is ready",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Service not ready"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "BuildRequest": {
+        "type": "object",
+        "description": "Build request for JSON API",
+        "properties": {
+          "build_args": {
+            "type": "object",
+            "description": "Build arguments (ARG values)",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "no_cache": {
+            "type": "boolean",
+            "description": "Disable cache"
+          },
+          "push": {
+            "type": "boolean",
+            "description": "Push to registry after build"
+          },
+          "runtime": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Use runtime template instead of Dockerfile"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Tags to apply to the image"
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Target stage for multi-stage builds"
+          }
+        }
+      },
+      "BuildRequestWithContext": {
+        "type": "object",
+        "description": "Build request with server-side context path",
+        "required": [
+          "context_path"
+        ],
+        "properties": {
+          "build_args": {
+            "type": "object",
+            "description": "Build arguments",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "context_path": {
+            "type": "string",
+            "description": "Path to the build context on the server"
+          },
+          "no_cache": {
+            "type": "boolean",
+            "description": "Disable cache"
+          },
+          "push": {
+            "type": "boolean",
+            "description": "Push after build"
+          },
+          "runtime": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Use runtime template instead of Dockerfile"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Tags to apply"
+          },
+          "target": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Target stage"
+          }
+        }
+      },
+      "BuildStateEnum": {
+        "type": "string",
+        "description": "Build state enumeration",
+        "enum": [
+          "pending",
+          "running",
+          "complete",
+          "failed"
+        ]
+      },
+      "BuildStatus": {
+        "type": "object",
+        "description": "Build status response",
+        "required": [
+          "id",
+          "status",
+          "started_at"
+        ],
+        "properties": {
+          "completed_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the build completed (ISO 8601)"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Error message (if failed)"
+          },
+          "id": {
+            "type": "string",
+            "description": "Unique build ID"
+          },
+          "image_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Image ID (if completed)"
+          },
+          "started_at": {
+            "type": "string",
+            "description": "When the build started (ISO 8601)"
+          },
+          "status": {
+            "$ref": "#/components/schemas/BuildStateEnum",
+            "description": "Current build status"
+          }
+        }
+      },
+      "ContainerExecRequest": {
+        "type": "object",
+        "description": "Exec request for running a command in a container",
+        "required": [
+          "command"
+        ],
+        "properties": {
+          "command": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Command and arguments to execute"
+          }
+        }
+      },
+      "ContainerExecResponse": {
+        "type": "object",
+        "description": "Exec response with command output",
+        "required": [
+          "exit_code",
+          "stdout",
+          "stderr"
+        ],
+        "properties": {
+          "exit_code": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Exit code from the command"
+          },
+          "stderr": {
+            "type": "string",
+            "description": "Standard error"
+          },
+          "stdout": {
+            "type": "string",
+            "description": "Standard output"
+          }
+        }
+      },
+      "ContainerInfo": {
+        "type": "object",
+        "description": "Container information returned by the API",
+        "required": [
+          "id",
+          "image",
+          "state",
+          "labels",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "Creation timestamp (ISO 8601)"
+          },
+          "id": {
+            "type": "string",
+            "description": "Container identifier"
+          },
+          "image": {
+            "type": "string",
+            "description": "OCI image reference"
+          },
+          "labels": {
+            "type": "object",
+            "description": "Labels",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Human-readable name (if set)"
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Process ID (if running)",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "Container state (pending, running, exited, failed)"
+          }
+        }
+      },
+      "ContainerResourceLimits": {
+        "type": "object",
+        "description": "Resource limits for a container",
+        "properties": {
+          "cpu": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "CPU limit in cores (e.g., 0.5, 1.0, 2.0)"
+          },
+          "memory": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Memory limit (e.g., \"256Mi\", \"1Gi\")"
+          }
+        }
+      },
+      "ContainerStatsResponse": {
+        "type": "object",
+        "description": "Container resource statistics",
+        "required": [
+          "id",
+          "cpu_usage_usec",
+          "memory_bytes",
+          "memory_limit",
+          "memory_percent"
+        ],
+        "properties": {
+          "cpu_usage_usec": {
+            "type": "integer",
+            "format": "int64",
+            "description": "CPU usage in microseconds",
+            "minimum": 0
+          },
+          "id": {
+            "type": "string",
+            "description": "Container identifier"
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Current memory usage in bytes",
+            "minimum": 0
+          },
+          "memory_limit": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Memory limit in bytes (`u64::MAX` if unlimited)",
+            "minimum": 0
+          },
+          "memory_percent": {
+            "type": "number",
+            "format": "double",
+            "description": "Memory usage as percentage of limit"
+          }
+        }
+      },
+      "ContainerWaitResponse": {
+        "type": "object",
+        "description": "Wait response with container exit code",
+        "required": [
+          "id",
+          "exit_code"
+        ],
+        "properties": {
+          "exit_code": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Exit code (0 = success)"
+          },
+          "id": {
+            "type": "string",
+            "description": "Container identifier"
+          }
+        }
+      },
+      "CreateContainerRequest": {
+        "type": "object",
+        "description": "Request to create and start a container",
+        "required": [
+          "image"
+        ],
+        "properties": {
+          "command": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Command to run (overrides image entrypoint)"
+          },
+          "env": {
+            "type": "object",
+            "description": "Environment variables",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "image": {
+            "type": "string",
+            "description": "OCI image reference (e.g., \"nginx:latest\", \"ubuntu:22.04\")"
+          },
+          "labels": {
+            "type": "object",
+            "description": "Labels for filtering and grouping",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional human-readable name"
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContainerResourceLimits",
+                "description": "Resource limits (CPU, memory)"
+              }
+            ]
+          },
+          "volumes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VolumeMount"
+            },
+            "description": "Volume mounts"
+          },
+          "work_dir": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Working directory inside the container"
+          }
+        }
+      },
+      "CreateDeploymentRequest": {
+        "type": "object",
+        "description": "Create deployment request",
+        "required": [
+          "spec"
+        ],
+        "properties": {
+          "spec": {
+            "type": "string",
+            "description": "Deployment specification (YAML content)"
+          }
+        }
+      },
+      "CreateSecretRequest": {
+        "type": "object",
+        "description": "Request to create or update a secret",
+        "required": [
+          "name",
+          "value"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The name of the secret"
+          },
+          "value": {
+            "type": "string",
+            "description": "The secret value (will be encrypted at rest)"
+          }
+        }
+      },
+      "DeploymentDetails": {
+        "type": "object",
+        "description": "Deployment details (enhanced with per-service health and endpoints)",
+        "required": [
+          "name",
+          "status",
+          "services",
+          "service_health",
+          "created_at",
+          "updated_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "Created timestamp"
+          },
+          "name": {
+            "type": "string",
+            "description": "Deployment name"
+          },
+          "service_health": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServiceHealthInfo"
+            },
+            "description": "Per-service health and endpoint info"
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Service names (for backwards compatibility)"
+          },
+          "status": {
+            "type": "string",
+            "description": "Deployment status"
+          },
+          "updated_at": {
+            "type": "string",
+            "description": "Updated timestamp"
+          }
+        }
+      },
+      "DeploymentSummary": {
+        "type": "object",
+        "description": "Deployment summary",
+        "required": [
+          "name",
+          "status",
+          "service_count",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "Created timestamp"
+          },
+          "name": {
+            "type": "string",
+            "description": "Deployment name"
+          },
+          "service_count": {
+            "type": "integer",
+            "description": "Number of services",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string",
+            "description": "Deployment status"
+          }
+        }
+      },
+      "HealthResponse": {
+        "type": "object",
+        "description": "Health check response",
+        "required": [
+          "status",
+          "version"
+        ],
+        "properties": {
+          "runtime_name": {
+            "type": "string",
+            "description": "Container runtime name (e.g. \"youki\", \"mac-sandbox\", \"docker\")"
+          },
+          "status": {
+            "type": "string",
+            "description": "Service status"
+          },
+          "uptime_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Uptime in seconds",
+            "minimum": 0
+          },
+          "version": {
+            "type": "string",
+            "description": "Service version"
+          }
+        }
+      },
+      "InternalScaleRequest": {
+        "type": "object",
+        "description": "Request to scale a service",
+        "required": [
+          "service",
+          "replicas"
+        ],
+        "properties": {
+          "replicas": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Target replica count",
+            "minimum": 0
+          },
+          "service": {
+            "type": "string",
+            "description": "Service name to scale"
+          }
+        }
+      },
+      "InternalScaleResponse": {
+        "type": "object",
+        "description": "Response from internal scale operation",
+        "required": [
+          "success",
+          "service",
+          "replicas"
+        ],
+        "properties": {
+          "message": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional message"
+          },
+          "replicas": {
+            "type": "integer",
+            "format": "int32",
+            "description": "New replica count",
+            "minimum": 0
+          },
+          "service": {
+            "type": "string",
+            "description": "Service name that was scaled"
+          },
+          "success": {
+            "type": "boolean",
+            "description": "Whether the operation succeeded"
+          }
+        }
+      },
+      "ScaleRequest": {
+        "type": "object",
+        "description": "Scale request",
+        "required": [
+          "replicas"
+        ],
+        "properties": {
+          "replicas": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Target replica count",
+            "minimum": 0
+          }
+        }
+      },
+      "SecretMetadataResponse": {
+        "type": "object",
+        "description": "Response containing secret metadata (never the value)",
+        "required": [
+          "name",
+          "created_at",
+          "updated_at",
+          "version"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp when the secret was created"
+          },
+          "name": {
+            "type": "string",
+            "description": "The name/identifier of the secret"
+          },
+          "updated_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Unix timestamp when the secret was last updated"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Version number of the secret (incremented on each update)",
+            "minimum": 0
+          }
+        }
+      },
+      "ServiceDetails": {
+        "type": "object",
+        "description": "Service details",
+        "required": [
+          "name",
+          "deployment",
+          "status",
+          "replicas",
+          "desired_replicas",
+          "endpoints",
+          "metrics"
+        ],
+        "properties": {
+          "deployment": {
+            "type": "string",
+            "description": "Deployment name"
+          },
+          "desired_replicas": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Desired replica count",
+            "minimum": 0
+          },
+          "endpoints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServiceEndpoint"
+            },
+            "description": "Service endpoints"
+          },
+          "metrics": {
+            "$ref": "#/components/schemas/ServiceMetrics",
+            "description": "Service metrics"
+          },
+          "name": {
+            "type": "string",
+            "description": "Service name"
+          },
+          "replicas": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Current replica count",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string",
+            "description": "Service status"
+          }
+        }
+      },
+      "ServiceEndpoint": {
+        "type": "object",
+        "description": "Service endpoint",
+        "required": [
+          "name",
+          "protocol",
+          "port"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Endpoint name"
+          },
+          "port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Port",
+            "minimum": 0
+          },
+          "protocol": {
+            "type": "string",
+            "description": "Protocol"
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "URL (if public)"
+          }
+        }
+      },
+      "ServiceHealthInfo": {
+        "type": "object",
+        "description": "Per-service health info included in deployment details",
+        "required": [
+          "name",
+          "replicas_running",
+          "replicas_desired",
+          "health",
+          "endpoints"
+        ],
+        "properties": {
+          "endpoints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Endpoint URLs for this service"
+          },
+          "health": {
+            "type": "string",
+            "description": "Health status (\"healthy\", \"unhealthy\", \"unknown\")"
+          },
+          "name": {
+            "type": "string",
+            "description": "Service name"
+          },
+          "replicas_desired": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Desired replica count",
+            "minimum": 0
+          },
+          "replicas_running": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Running replica count",
+            "minimum": 0
+          }
+        }
+      },
+      "ServiceMetrics": {
+        "type": "object",
+        "description": "Service metrics",
+        "required": [
+          "cpu_percent",
+          "memory_percent"
+        ],
+        "properties": {
+          "cpu_percent": {
+            "type": "number",
+            "format": "double",
+            "description": "CPU usage percentage"
+          },
+          "memory_percent": {
+            "type": "number",
+            "format": "double",
+            "description": "Memory usage percentage"
+          },
+          "rps": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Requests per second"
+          }
+        }
+      },
+      "ServiceSummary": {
+        "type": "object",
+        "description": "Service summary",
+        "required": [
+          "name",
+          "deployment",
+          "status",
+          "replicas",
+          "desired_replicas",
+          "endpoints"
+        ],
+        "properties": {
+          "deployment": {
+            "type": "string",
+            "description": "Deployment name"
+          },
+          "desired_replicas": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Desired replica count",
+            "minimum": 0
+          },
+          "endpoints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ServiceEndpoint"
+            },
+            "description": "Service endpoints"
+          },
+          "name": {
+            "type": "string",
+            "description": "Service name"
+          },
+          "replicas": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Current replica count",
+            "minimum": 0
+          },
+          "status": {
+            "type": "string",
+            "description": "Service status"
+          }
+        }
+      },
+      "TemplateInfo": {
+        "type": "object",
+        "description": "Runtime template information",
+        "required": [
+          "name",
+          "description",
+          "detect_files"
+        ],
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Human-readable description"
+          },
+          "detect_files": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Files that indicate this runtime should be used"
+          },
+          "name": {
+            "type": "string",
+            "description": "Template name (e.g., \"node20\")"
+          }
+        }
+      },
+      "TokenRequest": {
+        "type": "object",
+        "description": "Token request",
+        "required": [
+          "api_key",
+          "api_secret"
+        ],
+        "properties": {
+          "api_key": {
+            "type": "string",
+            "description": "API key or username"
+          },
+          "api_secret": {
+            "type": "string",
+            "description": "API secret or password"
+          }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "description": "Token response",
+        "required": [
+          "access_token",
+          "token_type",
+          "expires_in"
+        ],
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "description": "JWT access token"
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Expiration in seconds",
+            "minimum": 0
+          },
+          "token_type": {
+            "type": "string",
+            "description": "Token type (always \"Bearer\")"
+          }
+        }
+      },
+      "TriggerBuildResponse": {
+        "type": "object",
+        "description": "Trigger build response",
+        "required": [
+          "build_id",
+          "message"
+        ],
+        "properties": {
+          "build_id": {
+            "type": "string",
+            "description": "Unique build ID for tracking"
+          },
+          "message": {
+            "type": "string",
+            "description": "Human-readable message"
+          }
+        }
+      },
+      "VolumeMount": {
+        "type": "object",
+        "description": "Volume mount specification",
+        "required": [
+          "source",
+          "target"
+        ],
+        "properties": {
+          "readonly": {
+            "type": "boolean",
+            "description": "Mount as read-only"
+          },
+          "source": {
+            "type": "string",
+            "description": "Host path or volume name"
+          },
+          "target": {
+            "type": "string",
+            "description": "Container mount path"
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "bearer_auth": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "JWT"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "Health",
+      "description": "Health check endpoints"
+    },
+    {
+      "name": "Authentication",
+      "description": "Authentication endpoints"
+    },
+    {
+      "name": "Deployments",
+      "description": "Deployment management"
+    },
+    {
+      "name": "Services",
+      "description": "Service management"
+    },
+    {
+      "name": "Build",
+      "description": "Container image building"
+    },
+    {
+      "name": "Containers",
+      "description": "Raw container lifecycle management"
+    },
+    {
+      "name": "Internal",
+      "description": "Internal scheduler-to-agent communication"
+    },
+    {
+      "name": "Secrets",
+      "description": "Secrets management"
+    }
+  ]
+}

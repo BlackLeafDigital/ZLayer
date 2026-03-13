@@ -11,6 +11,10 @@ keywords = ["container", "api", "rest", "axum", "orchestration"]
 categories = ["web-programming::http-server"]
 readme = "README.md"
 
+[[bin]]
+name = "openapi-spec"
+path = "src/bin/openapi_spec.rs"
+
 [dependencies]
 # Internal crates
 zlayer-agent.workspace = true

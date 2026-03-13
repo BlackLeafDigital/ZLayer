@@ -20,6 +20,10 @@ use crate::handlers::health::HealthResponse;
 // use crate::handlers::overlay::{
 //     DnsStatusResponse, IpAllocationResponse, OverlayStatusResponse, PeerInfo, PeerListResponse,
 // };
+use crate::handlers::containers::{
+    ContainerExecRequest, ContainerExecResponse, ContainerInfo, ContainerResourceLimits,
+    ContainerStatsResponse, ContainerWaitResponse, CreateContainerRequest, VolumeMount,
+};
 use crate::handlers::secrets::{CreateSecretRequest, SecretMetadataResponse};
 use crate::handlers::services::{
     ScaleRequest, ServiceDetails, ServiceEndpoint, ServiceMetrics, ServiceSummary,
@@ -50,6 +54,11 @@ use crate::handlers::internal::{__path_get_replicas_internal, __path_scale_servi
 //     __path_get_dns_status, __path_get_ip_allocation, __path_get_overlay_peers,
 //     __path_get_overlay_status,
 // };
+use crate::handlers::containers::{
+    __path_create_container, __path_delete_container, __path_exec_in_container,
+    __path_get_container, __path_get_container_logs, __path_get_container_stats,
+    __path_list_containers, __path_wait_container,
+};
 use crate::handlers::secrets::{
     __path_create_secret, __path_delete_secret, __path_get_secret_metadata, __path_list_secrets,
 };
@@ -113,6 +122,15 @@ impl Modify for SecurityAddon {
         get_build_logs,
         list_builds,
         list_runtime_templates,
+        // Containers (raw lifecycle)
+        create_container,
+        list_containers,
+        get_container,
+        delete_container,
+        get_container_logs,
+        exec_in_container,
+        wait_container,
+        get_container_stats,
         // Internal (scheduler-to-agent)
         scale_service_internal,
         get_replicas_internal,
@@ -145,6 +163,15 @@ impl Modify for SecurityAddon {
             // Internal schemas
             InternalScaleRequest,
             InternalScaleResponse,
+            // Container schemas
+            CreateContainerRequest,
+            ContainerInfo,
+            ContainerResourceLimits,
+            VolumeMount,
+            ContainerExecRequest,
+            ContainerExecResponse,
+            ContainerWaitResponse,
+            ContainerStatsResponse,
             // Secrets schemas
             CreateSecretRequest,
             SecretMetadataResponse,
@@ -157,6 +184,7 @@ impl Modify for SecurityAddon {
         (name = "Deployments", description = "Deployment management"),
         (name = "Services", description = "Service management"),
         (name = "Build", description = "Container image building"),
+        (name = "Containers", description = "Raw container lifecycle management"),
         (name = "Internal", description = "Internal scheduler-to-agent communication"),
         (name = "Secrets", description = "Secrets management"),
     )

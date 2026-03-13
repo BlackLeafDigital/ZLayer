@@ -1,0 +1,1933 @@
+openapi: 3.1.0
+info:
+  contact:
+    name: ZLayer
+    url: https://zlayer.dev
+  description: Container orchestration API for ZLayer
+  license:
+    name: MIT OR Apache-2.0
+  title: ZLayer API
+  version: 0.1.0
+servers:
+- url: /
+tags:
+- description: Health check endpoints
+  name: Health
+- description: Authentication endpoints
+  name: Authentication
+- description: Deployment management
+  name: Deployments
+- description: Service management
+  name: Services
+- description: Container image building
+  name: Build
+- description: Raw container lifecycle management
+  name: Containers
+- description: Internal scheduler-to-agent communication
+  name: Internal
+- description: Secrets management
+  name: Secrets
+paths:
+  /api/v1/build:
+    post:
+      description: |-
+        Accepts a multipart form with:
+        - `dockerfile`: The Dockerfile content (optional if using runtime)
+        - `context`: A tarball containing the build context
+        - `config`: JSON configuration (`BuildRequest`)
+
+        # Errors
+
+        Returns an error if the request is invalid, context extraction fails, or the build
+        cannot be started.
+      operationId: start_build
+      requestBody:
+        content:
+          multipart/form-data: {}
+        description: Build context with Dockerfile
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TriggerBuildResponse"
+          description: Build started
+        "400":
+          description: Invalid request
+        "401":
+          description: Unauthorized
+        "500":
+          description: Internal error
+      security:
+      - bearer_auth: []
+      summary: |-
+        POST /api/v1/build
+        Start a new build from multipart upload (Dockerfile + context tarball)
+      tags:
+      - Build
+  /api/v1/build/json:
+    post:
+      description: |-
+        # Errors
+
+        Returns an error if the context path is invalid or the build cannot be started.
+      operationId: start_build_json
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BuildRequestWithContext"
+        required: true
+      responses:
+        "202":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TriggerBuildResponse"
+          description: Build started
+        "400":
+          description: Invalid request
+        "401":
+          description: Unauthorized
+        "500":
+          description: Internal error
+      security:
+      - bearer_auth: []
+      summary: |-
+        POST /api/v1/build/json
+        Start a new build from JSON request with a context path on the server.
+      tags:
+      - Build
+  /api/v1/build/{id}:
+    get:
+      description: |-
+        # Errors
+
+        Returns an error if the build is not found.
+      operationId: get_build_status
+      parameters:
+      - description: Build ID
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BuildStatus"
+          description: Build status
+        "401":
+          description: Unauthorized
+        "404":
+          description: Build not found
+      security:
+      - bearer_auth: []
+      summary: |-
+        GET /api/v1/build/{id}
+        Get build status.
+      tags:
+      - Build
+  /api/v1/build/{id}/logs:
+    get:
+      description: |-
+        # Errors
+
+        Returns an error if the build is not found or logs cannot be read.
+      operationId: get_build_logs
+      parameters:
+      - description: Build ID
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            text/plain:
+              schema:
+                type: string
+          description: Build logs
+        "401":
+          description: Unauthorized
+        "404":
+          description: Build not found
+      security:
+      - bearer_auth: []
+      summary: |-
+        GET /api/v1/build/{id}/logs
+        Get build logs.
+      tags:
+      - Build
+  /api/v1/build/{id}/stream:
+    get:
+      description: |-
+        # Errors
+
+        Returns an error if the build is not found or not active.
+      operationId: stream_build
+      parameters:
+      - description: Build ID
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          description: SSE event stream
+        "401":
+          description: Unauthorized
+        "404":
+          description: Build not found
+      security:
+      - bearer_auth: []
+      summary: |-
+        GET /api/v1/build/{id}/stream
+        Stream build progress via Server-Sent Events.
+      tags:
+      - Build
+  /api/v1/builds:
+    get:
+      description: |-
+        # Errors
+
+        Returns an error if the user is not authenticated.
+      operationId: list_builds
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: "#/components/schemas/BuildStatus"
+                type: array
+          description: List of builds
+        "401":
+          description: Unauthorized
+      security:
+      - bearer_auth: []
+      summary: |-
+        GET /api/v1/builds
+        List all builds.
+      tags:
+      - Build
+  /api/v1/containers:
+    get:
+      description: |-
+        Returns all containers managed through this API. Optionally filter by
+        label using the `label` query parameter in `key=value` format.
+
+        # Errors
+
+        Returns an error if the user is not authenticated.
+      operationId: list_containers
+      parameters:
+      - description: Filter by label (key=value format)
+        explode: true
+        in: query
+        name: label
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: "#/components/schemas/ContainerInfo"
+                type: array
+          description: List of containers
+        "401":
+          description: Unauthorized
+      security:
+      - bearer_auth: []
+      summary: List standalone containers.
+      tags:
+      - Containers
+    post:
+      description: |-
+        Pulls the image if needed, creates the container, and starts it.
+        Returns the container info including its assigned ID.
+
+        # Errors
+
+        Returns an error if image pull fails, container creation fails, or the
+        user lacks the operator role.
+      operationId: create_container
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateContainerRequest"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContainerInfo"
+          description: Container created and started
+        "400":
+          description: Invalid request
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden - operator role required
+        "500":
+          description: Internal error
+      security:
+      - bearer_auth: []
+      summary: Create and start a container.
+      tags:
+      - Containers
+  /api/v1/containers/{id}:
+    delete:
+      description: |-
+        Sends a stop signal (with a 30-second timeout), then removes the container.
+
+        # Errors
+
+        Returns an error if the container is not found, stop/remove fails, or the
+        user lacks the operator role.
+      operationId: delete_container
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "204":
+          description: Container stopped and removed
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden - operator role required
+        "404":
+          description: Container not found
+      security:
+      - bearer_auth: []
+      summary: Stop and remove a container.
+      tags:
+      - Containers
+    get:
+      description: |-
+        # Errors
+
+        Returns an error if the container is not found or the user is not authenticated.
+      operationId: get_container
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContainerInfo"
+          description: Container details
+        "401":
+          description: Unauthorized
+        "404":
+          description: Container not found
+      security:
+      - bearer_auth: []
+      summary: Get details for a specific container.
+      tags:
+      - Containers
+  /api/v1/containers/{id}/exec:
+    post:
+      description: |-
+        # Errors
+
+        Returns an error if the container is not found, the command is invalid,
+        execution fails, or the user lacks the operator role.
+      operationId: exec_in_container
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContainerExecRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContainerExecResponse"
+          description: Command executed
+        "400":
+          description: Invalid request
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden - operator role required
+        "404":
+          description: Container not found
+      security:
+      - bearer_auth: []
+      summary: Execute a command in a running container.
+      tags:
+      - Containers
+  /api/v1/containers/{id}/logs:
+    get:
+      description: |-
+        Returns the last N lines of container logs as plain text, or streams
+        logs as Server-Sent Events when `follow=true`.
+
+        # Errors
+
+        Returns an error if the container is not found or log retrieval fails.
+      operationId: get_container_logs
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: Number of tail lines to return
+        explode: true
+        in: query
+        name: tail
+        required: false
+        schema:
+          minimum: 0
+          type: integer
+        style: form
+      - description: Follow logs (SSE stream)
+        explode: true
+        in: query
+        name: follow
+        required: false
+        schema:
+          type: boolean
+        style: form
+      responses:
+        "200":
+          content:
+            text/plain:
+              schema:
+                type: string
+          description: Container logs (plain text or SSE stream)
+        "401":
+          description: Unauthorized
+        "404":
+          description: Container not found
+      security:
+      - bearer_auth: []
+      summary: Get container logs.
+      tags:
+      - Containers
+  /api/v1/containers/{id}/stats:
+    get:
+      description: |-
+        Returns CPU and memory usage statistics for the specified container.
+
+        # Errors
+
+        Returns an error if the container is not found or stats retrieval fails.
+      operationId: get_container_stats
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContainerStatsResponse"
+          description: Container statistics
+        "401":
+          description: Unauthorized
+        "404":
+          description: Container not found
+      security:
+      - bearer_auth: []
+      summary: Get container resource statistics.
+      tags:
+      - Containers
+  /api/v1/containers/{id}/wait:
+    get:
+      description: |-
+        This endpoint blocks until the container exits. Useful for CI runners
+        that need to wait for a build/test container to complete.
+
+        # Errors
+
+        Returns an error if the container is not found or the wait fails.
+      operationId: wait_container
+      parameters:
+      - description: Container identifier
+        explode: false
+        in: path
+        name: id
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContainerWaitResponse"
+          description: Container exited
+        "401":
+          description: Unauthorized
+        "404":
+          description: Container not found
+      security:
+      - bearer_auth: []
+      summary: Wait for a container to exit and return its exit code.
+      tags:
+      - Containers
+  /api/v1/deployments:
+    get:
+      description: |-
+        # Errors
+
+        Returns an error if storage access fails.
+      operationId: list_deployments
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: "#/components/schemas/DeploymentSummary"
+                type: array
+          description: List of deployments
+        "401":
+          description: Unauthorized
+      security:
+      - bearer_auth: []
+      summary: List all deployments.
+      tags:
+      - Deployments
+    post:
+      description: |-
+        When the daemon has orchestration wired (service manager, proxy, overlay),
+        this handler:
+         1. Parses and validates the spec YAML
+         2. Stores the deployment with status `Deploying`
+         3. Spawns an async task that registers services, sets up overlays,
+            configures the proxy, and scales services
+         4. Returns immediately with `Deploying` status
+         5. The async task updates the stored status to `Running` or `Failed`
+
+        Without orchestration wired, it stores the spec with `Pending` status.
+
+        # Errors
+
+        Returns an error if the spec is invalid or storage fails.
+      operationId: create_deployment
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateDeploymentRequest"
+        required: true
+      responses:
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentDetails"
+          description: Deployment created
+        "400":
+          description: Invalid specification
+        "401":
+          description: Unauthorized
+      security:
+      - bearer_auth: []
+      summary: Create a new deployment.
+      tags:
+      - Deployments
+  /api/v1/deployments/{deployment}/services:
+    get:
+      description: |-
+        # Errors
+
+        Returns an error if the deployment is not found or storage access fails.
+      operationId: list_services
+      parameters:
+      - description: Deployment name
+        explode: false
+        in: path
+        name: deployment
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: "#/components/schemas/ServiceSummary"
+                type: array
+          description: List of services
+        "401":
+          description: Unauthorized
+        "404":
+          description: Deployment not found
+      security:
+      - bearer_auth: []
+      summary: List services in a deployment.
+      tags:
+      - Services
+  /api/v1/deployments/{deployment}/services/{service}:
+    get:
+      description: |-
+        # Errors
+
+        Returns an error if the deployment or service is not found.
+      operationId: get_service
+      parameters:
+      - description: Deployment name
+        explode: false
+        in: path
+        name: deployment
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: Service name
+        explode: false
+        in: path
+        name: service
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceDetails"
+          description: Service details
+        "401":
+          description: Unauthorized
+        "404":
+          description: Service not found
+      security:
+      - bearer_auth: []
+      summary: Get service details.
+      tags:
+      - Services
+  /api/v1/deployments/{deployment}/services/{service}/logs:
+    get:
+      description: |-
+        Returns service logs as plain text when `follow=false`, or as a Server-Sent
+        Events stream when `follow=true`.  In follow mode the server first emits the
+        last N lines (controlled by the `lines` parameter) and then continuously
+        polls for new output, emitting each new line as a `data:` SSE event.
+
+        # Errors
+
+        Returns an error if the deployment or service is not found, or the service
+        manager is not available.
+      operationId: get_service_logs
+      parameters:
+      - description: Deployment name
+        explode: false
+        in: path
+        name: deployment
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: Service name
+        explode: false
+        in: path
+        name: service
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: Number of lines to return
+        explode: true
+        in: query
+        name: lines
+        required: false
+        schema:
+          format: int32
+          minimum: 0
+          type: integer
+        style: form
+      - description: Follow logs (streaming)
+        explode: true
+        in: query
+        name: follow
+        required: false
+        schema:
+          type: boolean
+        style: form
+      - description: Filter by container/instance
+        explode: true
+        in: query
+        name: instance
+        required: false
+        schema:
+          nullable: true
+          type: string
+        style: form
+      responses:
+        "200":
+          content:
+            text/plain:
+              schema:
+                type: string
+          description: Service logs (plain text or SSE stream)
+        "401":
+          description: Unauthorized
+        "404":
+          description: Service not found
+      security:
+      - bearer_auth: []
+      summary: Get service logs.
+      tags:
+      - Services
+  /api/v1/deployments/{deployment}/services/{service}/scale:
+    post:
+      description: |-
+        # Errors
+
+        Returns an error if the deployment or service is not found, scaling fails,
+        or the user lacks permission.
+      operationId: scale_service
+      parameters:
+      - description: Deployment name
+        explode: false
+        in: path
+        name: deployment
+        required: true
+        schema:
+          type: string
+        style: simple
+      - description: Service name
+        explode: false
+        in: path
+        name: service
+        required: true
+        schema:
+          type: string
+        style: simple
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ScaleRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceDetails"
+          description: Service scaled
+        "400":
+          description: Invalid scale request
+        "401":
+          description: Unauthorized
+        "404":
+          description: Service not found
+      security:
+      - bearer_auth: []
+      summary: Scale a service.
+      tags:
+      - Services
+  /api/v1/deployments/{name}:
+    delete:
+      description: |-
+        # Errors
+
+        Returns an error if the deployment is not found, storage access fails, or teardown
+        encounters critical failures.
+      operationId: delete_deployment
+      parameters:
+      - description: Deployment name
+        explode: false
+        in: path
+        name: name
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "204":
+          description: Deployment deleted
+        "401":
+          description: Unauthorized
+        "404":
+          description: Deployment not found
+      security:
+      - bearer_auth: []
+      summary: Delete a deployment.
+      tags:
+      - Deployments
+    get:
+      description: |-
+        # Errors
+
+        Returns an error if the deployment is not found or storage access fails.
+      operationId: get_deployment
+      parameters:
+      - description: Deployment name
+        explode: false
+        in: path
+        name: name
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DeploymentDetails"
+          description: Deployment details
+        "401":
+          description: Unauthorized
+        "404":
+          description: Deployment not found
+      security:
+      - bearer_auth: []
+      summary: Get deployment details (with live per-service health when available).
+      tags:
+      - Deployments
+  /api/v1/internal/replicas/{service}:
+    get:
+      description: |-
+        This endpoint allows the scheduler to query the current state of a service.
+
+        # Errors
+
+        Returns an error if the service is not found or authentication is invalid.
+      operationId: get_replicas_internal
+      parameters:
+      - description: Service name
+        explode: false
+        in: path
+        name: service
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalScaleResponse"
+          description: Current replica count
+        "401":
+          description: Unauthorized - invalid or missing internal token
+        "404":
+          description: Service not found
+      summary: Get the current replica count for a service.
+      tags:
+      - Internal
+  /api/v1/internal/scale:
+    post:
+      description: |-
+        This endpoint is called by the distributed scheduler leader to trigger
+        scaling operations on agent nodes. It uses a shared secret for authentication.
+
+        # Errors
+
+        Returns an error if the service is not found, scaling fails, or authentication
+        is invalid.
+      operationId: scale_service_internal
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InternalScaleRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InternalScaleResponse"
+          description: Service scaled successfully
+        "401":
+          description: Unauthorized - invalid or missing internal token
+        "404":
+          description: Service not found
+        "500":
+          description: Internal error
+      summary: Scale a service via internal scheduler request.
+      tags:
+      - Internal
+  /api/v1/secrets:
+    get:
+      description: |-
+        Returns metadata for all secrets in the user's scope. Secret values are
+        never exposed through this endpoint.
+
+        # Errors
+
+        Returns an error if storage access fails.
+      operationId: list_secrets
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: "#/components/schemas/SecretMetadataResponse"
+                type: array
+          description: List of secret metadata
+        "401":
+          description: Unauthorized
+      security:
+      - bearer_auth: []
+      summary: List all secrets for the authenticated user.
+      tags:
+      - Secrets
+    post:
+      description: |-
+        Stores a new secret or updates an existing one. The secret value is encrypted
+        at rest and the version number is incremented on updates.
+
+        # Errors
+
+        Returns an error if validation fails, storage operations fail, or the user
+        lacks permission.
+      operationId: create_secret
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateSecretRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretMetadataResponse"
+          description: Secret updated
+        "201":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretMetadataResponse"
+          description: Secret created
+        "400":
+          description: Invalid request
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden
+      security:
+      - bearer_auth: []
+      summary: Create or update a secret.
+      tags:
+      - Secrets
+  /api/v1/secrets/{name}:
+    delete:
+      description: |-
+        Permanently removes a secret from the store.
+
+        # Errors
+
+        Returns an error if the secret is not found, storage access fails, or
+        the user lacks permission.
+      operationId: delete_secret
+      parameters:
+      - description: Secret name
+        explode: false
+        in: path
+        name: name
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "204":
+          description: Secret deleted
+        "401":
+          description: Unauthorized
+        "403":
+          description: Forbidden
+        "404":
+          description: Secret not found
+      security:
+      - bearer_auth: []
+      summary: Delete a secret.
+      tags:
+      - Secrets
+    get:
+      description: |-
+        Returns metadata for a single secret. The secret value is never exposed
+        through this endpoint.
+
+        # Errors
+
+        Returns an error if the secret is not found or storage access fails.
+      operationId: get_secret_metadata
+      parameters:
+      - description: Secret name
+        explode: false
+        in: path
+        name: name
+        required: true
+        schema:
+          type: string
+        style: simple
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretMetadataResponse"
+          description: Secret metadata
+        "401":
+          description: Unauthorized
+        "404":
+          description: Secret not found
+      security:
+      - bearer_auth: []
+      summary: Get metadata for a specific secret.
+      tags:
+      - Secrets
+  /api/v1/templates:
+    get:
+      operationId: list_runtime_templates
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                items:
+                  $ref: "#/components/schemas/TemplateInfo"
+                type: array
+          description: List of templates
+      summary: |-
+        GET /api/v1/templates
+        List available runtime templates
+      tags:
+      - Build
+  /auth/token:
+    post:
+      description: |-
+        # Errors
+
+        Returns an error if credentials are invalid or token creation fails.
+      operationId: get_token
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TokenRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenResponse"
+          description: Token created
+        "401":
+          description: Invalid credentials
+      summary: Get an access token.
+      tags:
+      - Authentication
+  /health/live:
+    get:
+      operationId: liveness
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+          description: Service is alive
+      summary: Liveness probe - basic health check
+      tags:
+      - Health
+  /health/ready:
+    get:
+      operationId: readiness
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+          description: Service is ready
+        "503":
+          description: Service not ready
+      summary: Readiness probe - full health check
+      tags:
+      - Health
+components:
+  schemas:
+    BuildRequest:
+      description: Build request for JSON API
+      properties:
+        build_args:
+          additionalProperties:
+            type: string
+          description: Build arguments (ARG values)
+        no_cache:
+          description: Disable cache
+          type: boolean
+        push:
+          description: Push to registry after build
+          type: boolean
+        runtime:
+          description: Use runtime template instead of Dockerfile
+          nullable: true
+          type: string
+        tags:
+          description: Tags to apply to the image
+          items:
+            type: string
+          type: array
+        target:
+          description: Target stage for multi-stage builds
+          nullable: true
+          type: string
+    BuildRequestWithContext:
+      description: Build request with server-side context path
+      example:
+        build_args:
+          key: build_args
+        context_path: context_path
+        no_cache: true
+        runtime: runtime
+        push: true
+        tags:
+        - tags
+        - tags
+        target: target
+      properties:
+        build_args:
+          additionalProperties:
+            type: string
+          description: Build arguments
+        context_path:
+          description: Path to the build context on the server
+          type: string
+        no_cache:
+          description: Disable cache
+          type: boolean
+        push:
+          description: Push after build
+          type: boolean
+        runtime:
+          description: Use runtime template instead of Dockerfile
+          nullable: true
+          type: string
+        tags:
+          description: Tags to apply
+          items:
+            type: string
+          type: array
+        target:
+          description: Target stage
+          nullable: true
+          type: string
+      required:
+      - context_path
+    BuildStateEnum:
+      description: Build state enumeration
+      enum:
+      - pending
+      - running
+      - complete
+      - failed
+      type: string
+    BuildStatus:
+      description: Build status response
+      example:
+        completed_at: completed_at
+        started_at: started_at
+        id: id
+        error: error
+        image_id: image_id
+        status: ""
+      properties:
+        completed_at:
+          description: When the build completed (ISO 8601)
+          nullable: true
+          type: string
+        error:
+          description: Error message (if failed)
+          nullable: true
+          type: string
+        id:
+          description: Unique build ID
+          type: string
+        image_id:
+          description: Image ID (if completed)
+          nullable: true
+          type: string
+        started_at:
+          description: When the build started (ISO 8601)
+          type: string
+        status:
+          allOf:
+          - $ref: "#/components/schemas/BuildStateEnum"
+          description: Current build status
+      required:
+      - id
+      - started_at
+      - status
+    ContainerExecRequest:
+      description: Exec request for running a command in a container
+      example:
+        command:
+        - command
+        - command
+      properties:
+        command:
+          description: Command and arguments to execute
+          items:
+            type: string
+          type: array
+      required:
+      - command
+    ContainerExecResponse:
+      description: Exec response with command output
+      example:
+        stdout: stdout
+        exit_code: 0
+        stderr: stderr
+      properties:
+        exit_code:
+          description: Exit code from the command
+          format: int32
+          type: integer
+        stderr:
+          description: Standard error
+          type: string
+        stdout:
+          description: Standard output
+          type: string
+      required:
+      - exit_code
+      - stderr
+      - stdout
+    ContainerInfo:
+      description: Container information returned by the API
+      example:
+        image: image
+        name: name
+        created_at: created_at
+        pid: 0
+        id: id
+        state: state
+        labels:
+          key: labels
+      properties:
+        created_at:
+          description: Creation timestamp (ISO 8601)
+          type: string
+        id:
+          description: Container identifier
+          type: string
+        image:
+          description: OCI image reference
+          type: string
+        labels:
+          additionalProperties:
+            type: string
+          description: Labels
+        name:
+          description: Human-readable name (if set)
+          nullable: true
+          type: string
+        pid:
+          description: Process ID (if running)
+          format: int32
+          minimum: 0
+          nullable: true
+          type: integer
+        state:
+          description: "Container state (pending, running, exited, failed)"
+          type: string
+      required:
+      - created_at
+      - id
+      - image
+      - labels
+      - state
+    ContainerResourceLimits:
+      description: Resource limits for a container
+      properties:
+        cpu:
+          description: "CPU limit in cores (e.g., 0.5, 1.0, 2.0)"
+          format: double
+          nullable: true
+          type: number
+        memory:
+          description: "Memory limit (e.g., \"256Mi\", \"1Gi\")"
+          nullable: true
+          type: string
+    ContainerStatsResponse:
+      description: Container resource statistics
+      example:
+        cpu_usage_usec: 0
+        memory_percent: 5.962133916683182
+        id: id
+        memory_limit: 0
+        memory_bytes: 0
+      properties:
+        cpu_usage_usec:
+          description: CPU usage in microseconds
+          format: int64
+          minimum: 0
+          type: integer
+        id:
+          description: Container identifier
+          type: string
+        memory_bytes:
+          description: Current memory usage in bytes
+          format: int64
+          minimum: 0
+          type: integer
+        memory_limit:
+          description: Memory limit in bytes (`u64::MAX` if unlimited)
+          format: int64
+          minimum: 0
+          type: integer
+        memory_percent:
+          description: Memory usage as percentage of limit
+          format: double
+          type: number
+      required:
+      - cpu_usage_usec
+      - id
+      - memory_bytes
+      - memory_limit
+      - memory_percent
+    ContainerWaitResponse:
+      description: Wait response with container exit code
+      example:
+        exit_code: 0
+        id: id
+      properties:
+        exit_code:
+          description: Exit code (0 = success)
+          format: int32
+          type: integer
+        id:
+          description: Container identifier
+          type: string
+      required:
+      - exit_code
+      - id
+    CreateContainerRequest:
+      description: Request to create and start a container
+      example:
+        image: image
+        work_dir: work_dir
+        name: name
+        volumes:
+        - readonly: true
+          source: source
+          target: target
+        - readonly: true
+          source: source
+          target: target
+        resources: ""
+        env:
+          key: env
+        command:
+        - command
+        - command
+        labels:
+          key: labels
+      properties:
+        command:
+          description: Command to run (overrides image entrypoint)
+          items:
+            type: string
+          nullable: true
+          type: array
+        env:
+          additionalProperties:
+            type: string
+          description: Environment variables
+        image:
+          description: "OCI image reference (e.g., \"nginx:latest\", \"ubuntu:22.04\"\
+            )"
+          type: string
+        labels:
+          additionalProperties:
+            type: string
+          description: Labels for filtering and grouping
+        name:
+          description: Optional human-readable name
+          nullable: true
+          type: string
+        resources:
+          allOf:
+          - $ref: "#/components/schemas/ContainerResourceLimits"
+          description: "Resource limits (CPU, memory)"
+          nullable: true
+        volumes:
+          description: Volume mounts
+          items:
+            $ref: "#/components/schemas/VolumeMount"
+          type: array
+        work_dir:
+          description: Working directory inside the container
+          nullable: true
+          type: string
+      required:
+      - image
+    CreateDeploymentRequest:
+      description: Create deployment request
+      example:
+        spec: spec
+      properties:
+        spec:
+          description: Deployment specification (YAML content)
+          type: string
+      required:
+      - spec
+    CreateSecretRequest:
+      description: Request to create or update a secret
+      example:
+        name: name
+        value: value
+      properties:
+        name:
+          description: The name of the secret
+          type: string
+        value:
+          description: The secret value (will be encrypted at rest)
+          type: string
+      required:
+      - name
+      - value
+    DeploymentDetails:
+      description: Deployment details (enhanced with per-service health and endpoints)
+      example:
+        updated_at: updated_at
+        name: name
+        created_at: created_at
+        services:
+        - services
+        - services
+        service_health:
+        - endpoints:
+          - endpoints
+          - endpoints
+          replicas_desired: 0
+          name: name
+          replicas_running: 0
+          health: health
+        - endpoints:
+          - endpoints
+          - endpoints
+          replicas_desired: 0
+          name: name
+          replicas_running: 0
+          health: health
+        status: status
+      properties:
+        created_at:
+          description: Created timestamp
+          type: string
+        name:
+          description: Deployment name
+          type: string
+        service_health:
+          description: Per-service health and endpoint info
+          items:
+            $ref: "#/components/schemas/ServiceHealthInfo"
+          type: array
+        services:
+          description: Service names (for backwards compatibility)
+          items:
+            type: string
+          type: array
+        status:
+          description: Deployment status
+          type: string
+        updated_at:
+          description: Updated timestamp
+          type: string
+      required:
+      - created_at
+      - name
+      - service_health
+      - services
+      - status
+      - updated_at
+    DeploymentSummary:
+      description: Deployment summary
+      example:
+        service_count: 0
+        name: name
+        created_at: created_at
+        status: status
+      properties:
+        created_at:
+          description: Created timestamp
+          type: string
+        name:
+          description: Deployment name
+          type: string
+        service_count:
+          description: Number of services
+          minimum: 0
+          type: integer
+        status:
+          description: Deployment status
+          type: string
+      required:
+      - created_at
+      - name
+      - service_count
+      - status
+    HealthResponse:
+      description: Health check response
+      example:
+        version: version
+        runtime_name: runtime_name
+        status: status
+        uptime_secs: 0
+      properties:
+        runtime_name:
+          description: "Container runtime name (e.g. \"youki\", \"mac-sandbox\", \"\
+            docker\")"
+          type: string
+        status:
+          description: Service status
+          type: string
+        uptime_secs:
+          description: Uptime in seconds
+          format: int64
+          minimum: 0
+          nullable: true
+          type: integer
+        version:
+          description: Service version
+          type: string
+      required:
+      - status
+      - version
+    InternalScaleRequest:
+      description: Request to scale a service
+      example:
+        replicas: 0
+        service: service
+      properties:
+        replicas:
+          description: Target replica count
+          format: int32
+          minimum: 0
+          type: integer
+        service:
+          description: Service name to scale
+          type: string
+      required:
+      - replicas
+      - service
+    InternalScaleResponse:
+      description: Response from internal scale operation
+      example:
+        replicas: 0
+        service: service
+        success: true
+        message: message
+      properties:
+        message:
+          description: Optional message
+          nullable: true
+          type: string
+        replicas:
+          description: New replica count
+          format: int32
+          minimum: 0
+          type: integer
+        service:
+          description: Service name that was scaled
+          type: string
+        success:
+          description: Whether the operation succeeded
+          type: boolean
+      required:
+      - replicas
+      - service
+      - success
+    ScaleRequest:
+      description: Scale request
+      example:
+        replicas: 0
+      properties:
+        replicas:
+          description: Target replica count
+          format: int32
+          minimum: 0
+          type: integer
+      required:
+      - replicas
+    SecretMetadataResponse:
+      description: Response containing secret metadata (never the value)
+      example:
+        updated_at: 6
+        name: name
+        created_at: 0
+        version: 0
+      properties:
+        created_at:
+          description: Unix timestamp when the secret was created
+          format: int64
+          type: integer
+        name:
+          description: The name/identifier of the secret
+          type: string
+        updated_at:
+          description: Unix timestamp when the secret was last updated
+          format: int64
+          type: integer
+        version:
+          description: Version number of the secret (incremented on each update)
+          format: int32
+          minimum: 0
+          type: integer
+      required:
+      - created_at
+      - name
+      - updated_at
+      - version
+    ServiceDetails:
+      description: Service details
+      example:
+        endpoints:
+        - protocol: protocol
+          port: 0
+          name: name
+          url: url
+        - protocol: protocol
+          port: 0
+          name: name
+          url: url
+        desired_replicas: 0
+        replicas: 0
+        name: name
+        metrics: ""
+        deployment: deployment
+        status: status
+      properties:
+        deployment:
+          description: Deployment name
+          type: string
+        desired_replicas:
+          description: Desired replica count
+          format: int32
+          minimum: 0
+          type: integer
+        endpoints:
+          description: Service endpoints
+          items:
+            $ref: "#/components/schemas/ServiceEndpoint"
+          type: array
+        metrics:
+          allOf:
+          - $ref: "#/components/schemas/ServiceMetrics"
+          description: Service metrics
+        name:
+          description: Service name
+          type: string
+        replicas:
+          description: Current replica count
+          format: int32
+          minimum: 0
+          type: integer
+        status:
+          description: Service status
+          type: string
+      required:
+      - deployment
+      - desired_replicas
+      - endpoints
+      - metrics
+      - name
+      - replicas
+      - status
+    ServiceEndpoint:
+      description: Service endpoint
+      example:
+        protocol: protocol
+        port: 0
+        name: name
+        url: url
+      properties:
+        name:
+          description: Endpoint name
+          type: string
+        port:
+          description: Port
+          format: int32
+          minimum: 0
+          type: integer
+        protocol:
+          description: Protocol
+          type: string
+        url:
+          description: URL (if public)
+          nullable: true
+          type: string
+      required:
+      - name
+      - port
+      - protocol
+    ServiceHealthInfo:
+      description: Per-service health info included in deployment details
+      example:
+        endpoints:
+        - endpoints
+        - endpoints
+        replicas_desired: 0
+        name: name
+        replicas_running: 0
+        health: health
+      properties:
+        endpoints:
+          description: Endpoint URLs for this service
+          items:
+            type: string
+          type: array
+        health:
+          description: "Health status (\"healthy\", \"unhealthy\", \"unknown\")"
+          type: string
+        name:
+          description: Service name
+          type: string
+        replicas_desired:
+          description: Desired replica count
+          format: int32
+          minimum: 0
+          type: integer
+        replicas_running:
+          description: Running replica count
+          format: int32
+          minimum: 0
+          type: integer
+      required:
+      - endpoints
+      - health
+      - name
+      - replicas_desired
+      - replicas_running
+    ServiceMetrics:
+      description: Service metrics
+      properties:
+        cpu_percent:
+          description: CPU usage percentage
+          format: double
+          type: number
+        memory_percent:
+          description: Memory usage percentage
+          format: double
+          type: number
+        rps:
+          description: Requests per second
+          format: double
+          nullable: true
+          type: number
+      required:
+      - cpu_percent
+      - memory_percent
+    ServiceSummary:
+      description: Service summary
+      example:
+        endpoints:
+        - protocol: protocol
+          port: 0
+          name: name
+          url: url
+        - protocol: protocol
+          port: 0
+          name: name
+          url: url
+        desired_replicas: 0
+        replicas: 0
+        name: name
+        deployment: deployment
+        status: status
+      properties:
+        deployment:
+          description: Deployment name
+          type: string
+        desired_replicas:
+          description: Desired replica count
+          format: int32
+          minimum: 0
+          type: integer
+        endpoints:
+          description: Service endpoints
+          items:
+            $ref: "#/components/schemas/ServiceEndpoint"
+          type: array
+        name:
+          description: Service name
+          type: string
+        replicas:
+          description: Current replica count
+          format: int32
+          minimum: 0
+          type: integer
+        status:
+          description: Service status
+          type: string
+      required:
+      - deployment
+      - desired_replicas
+      - endpoints
+      - name
+      - replicas
+      - status
+    TemplateInfo:
+      description: Runtime template information
+      example:
+        detect_files:
+        - detect_files
+        - detect_files
+        name: name
+        description: description
+      properties:
+        description:
+          description: Human-readable description
+          type: string
+        detect_files:
+          description: Files that indicate this runtime should be used
+          items:
+            type: string
+          type: array
+        name:
+          description: "Template name (e.g., \"node20\")"
+          type: string
+      required:
+      - description
+      - detect_files
+      - name
+    TokenRequest:
+      description: Token request
+      example:
+        api_key: api_key
+        api_secret: api_secret
+      properties:
+        api_key:
+          description: API key or username
+          type: string
+        api_secret:
+          description: API secret or password
+          type: string
+      required:
+      - api_key
+      - api_secret
+    TokenResponse:
+      description: Token response
+      example:
+        access_token: access_token
+        token_type: token_type
+        expires_in: 0
+      properties:
+        access_token:
+          description: JWT access token
+          type: string
+        expires_in:
+          description: Expiration in seconds
+          format: int64
+          minimum: 0
+          type: integer
+        token_type:
+          description: Token type (always "Bearer")
+          type: string
+      required:
+      - access_token
+      - expires_in
+      - token_type
+    TriggerBuildResponse:
+      description: Trigger build response
+      example:
+        build_id: build_id
+        message: message
+      properties:
+        build_id:
+          description: Unique build ID for tracking
+          type: string
+        message:
+          description: Human-readable message
+          type: string
+      required:
+      - build_id
+      - message
+    VolumeMount:
+      description: Volume mount specification
+      example:
+        readonly: true
+        source: source
+        target: target
+      properties:
+        readonly:
+          description: Mount as read-only
+          type: boolean
+        source:
+          description: Host path or volume name
+          type: string
+        target:
+          description: Container mount path
+          type: string
+      required:
+      - source
+      - target
+  securitySchemes:
+    bearer_auth:
+      bearerFormat: JWT
+      scheme: bearer
+      type: http
