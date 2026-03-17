@@ -113,7 +113,7 @@ fn create_e2e_runtime(gpu_access: bool) -> Result<SandboxRuntime, AgentError> {
         log_dir: test_dir.join("logs"),
         gpu_access,
     };
-    SandboxRuntime::new(config)
+    SandboxRuntime::new(config, None)
 }
 
 /// Create a `ServiceSpec` that runs a macOS-native binary.

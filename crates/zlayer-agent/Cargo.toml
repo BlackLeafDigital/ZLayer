@@ -54,6 +54,7 @@ num_cpus.workspace = true
 zlayer-scheduler.workspace = true
 zlayer-storage = { workspace = true, optional = true }
 ulid = "1.2.1"
+jsonwebtoken.workspace = true
 
 # Streaming utilities (needed for Docker streaming)
 futures-util.workspace = true

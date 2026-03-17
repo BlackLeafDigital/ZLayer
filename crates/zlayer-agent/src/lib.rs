@@ -2,6 +2,7 @@
 //!
 //! Manages container lifecycle, health checking, init actions, and proxy integration.
 
+pub mod auth;
 pub mod autoscale_controller;
 pub mod bundle;
 pub mod cgroups_stats;
@@ -230,35 +231,38 @@ pub fn is_wasm_available() -> bool {
 /// use zlayer_agent_zql::{RuntimeConfig, create_runtime};
 ///
 /// # async fn example() -> Result<(), zlayer_agent_zql::AgentError> {
-/// let runtime = create_runtime(RuntimeConfig::Auto).await?;
+/// let runtime = create_runtime(RuntimeConfig::Auto, None).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub async fn create_runtime(config: RuntimeConfig) -> Result<Arc<dyn Runtime + Send + Sync>> {
+pub async fn create_runtime(
+    config: RuntimeConfig,
+    auth_ctx: Option<ContainerAuthContext>,
+) -> Result<Arc<dyn Runtime + Send + Sync>> {
     match config {
-        RuntimeConfig::Auto => create_auto_runtime().await,
+        RuntimeConfig::Auto => create_auto_runtime(auth_ctx).await,
         RuntimeConfig::Mock => Ok(Arc::new(MockRuntime::new())),
         #[cfg(target_os = "linux")]
         RuntimeConfig::Youki(youki_config) => {
-            let runtime = YoukiRuntime::new(youki_config).await?;
+            let runtime = YoukiRuntime::new(youki_config, auth_ctx).await?;
             Ok(Arc::new(runtime))
         }
         #[cfg(feature = "docker")]
         RuntimeConfig::Docker => {
-            let runtime = DockerRuntime::new().await?;
+            let runtime = DockerRuntime::new(auth_ctx).await?;
             Ok(Arc::new(runtime))
         }
         #[cfg(feature = "wasm")]
         RuntimeConfig::Wasm(wasm_config) => {
-            let runtime = WasmRuntime::new(wasm_config).await?;
+            let runtime = WasmRuntime::new(wasm_config, auth_ctx).await?;
             Ok(Arc::new(runtime))
         }
         #[cfg(target_os = "macos")]
         RuntimeConfig::MacSandbox(config) => Ok(Arc::new(
-            runtimes::macos_sandbox::SandboxRuntime::new(config)?,
+            runtimes::macos_sandbox::SandboxRuntime::new(config, auth_ctx)?,
         )),
         #[cfg(target_os = "macos")]
-        RuntimeConfig::MacVm => Ok(Arc::new(runtimes::macos_vm::VmRuntime::new()?)),
+        RuntimeConfig::MacVm => Ok(Arc::new(runtimes::macos_vm::VmRuntime::new(auth_ctx)?)),
         #[cfg(target_os = "windows")]
         RuntimeConfig::Wsl2 => Err(AgentError::Configuration(
             "WSL2 runtime is not yet implemented. Use Docker Desktop with WSL2 backend."
@@ -274,13 +278,15 @@ pub async fn create_runtime(config: RuntimeConfig) -> Result<Arc<dyn Runtime + S
 /// - On macOS: `SandboxRuntime` (native Metal/MPS) → `VmRuntime` (libkrun Linux compat with GPU) → Docker
 /// - On Windows: Use Docker directly
 /// - Returns an error if no runtime can be initialized
-async fn create_auto_runtime() -> Result<Arc<dyn Runtime + Send + Sync>> {
+async fn create_auto_runtime(
+    auth_ctx: Option<ContainerAuthContext>,
+) -> Result<Arc<dyn Runtime + Send + Sync>> {
     tracing::info!("Auto-selecting container runtime");
 
     // On Linux, use bundled libcontainer runtime (no daemon overhead, no external binary needed)
     #[cfg(target_os = "linux")]
     {
-        match YoukiRuntime::new(YoukiConfig::default()).await {
+        match YoukiRuntime::new(YoukiConfig::default(), auth_ctx.clone()).await {
             Ok(runtime) => {
                 tracing::info!("Using bundled libcontainer runtime (Linux-native, no daemon)");
                 return Ok(Arc::new(runtime));
@@ -295,12 +301,15 @@ async fn create_auto_runtime() -> Result<Arc<dyn Runtime + Send + Sync>> {
     #[cfg(target_os = "macos")]
     {
         // Try sandbox first (native Metal/MPS performance)
-        match runtimes::macos_sandbox::SandboxRuntime::new(MacSandboxConfig::default()) {
+        match runtimes::macos_sandbox::SandboxRuntime::new(
+            MacSandboxConfig::default(),
+            auth_ctx.clone(),
+        ) {
             Ok(rt) => return Ok(Arc::new(rt)),
             Err(e) => tracing::warn!("macOS sandbox runtime unavailable: {e}"),
         }
         // Fall back to VM runtime (Linux container compat with GPU forwarding)
-        match runtimes::macos_vm::VmRuntime::new() {
+        match runtimes::macos_vm::VmRuntime::new(auth_ctx.clone()) {
             Ok(rt) => return Ok(Arc::new(rt)),
             Err(e) => tracing::warn!("macOS VM runtime (libkrun) unavailable: {e}"),
         }
@@ -317,7 +326,7 @@ async fn create_auto_runtime() -> Result<Arc<dyn Runtime + Send + Sync>> {
     {
         if is_docker_available().await {
             tracing::info!("Selected Docker runtime");
-            let runtime = DockerRuntime::new().await?;
+            let runtime = DockerRuntime::new(auth_ctx).await?;
             return Ok(Arc::new(runtime));
         }
         tracing::debug!("Docker daemon not available");

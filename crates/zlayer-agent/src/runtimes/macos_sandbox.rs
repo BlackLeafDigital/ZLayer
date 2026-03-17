@@ -1072,6 +1072,7 @@ struct SandboxSpawnParams {
     spec: ServiceSpec,
     sandbox_config: SandboxConfig,
     assigned_port: u16,
+    auth_env: Option<(String, String, String)>, // (api_url, token, socket_path)
 }
 
 /// Spawn a sandboxed process using `fork()` + `sandbox_init()` + `exec()`.
@@ -1118,6 +1119,13 @@ fn spawn_sandboxed_process(params: &SandboxSpawnParams) -> Result<u32> {
         env_vars.push(("PORT".to_string(), port_str.clone()));
     }
     env_vars.push(("ZLAYER_PORT".to_string(), port_str));
+
+    // Inject ZLayer API credentials for container-to-host communication
+    if let Some((ref api_url, ref token, ref socket)) = params.auth_env {
+        env_vars.push(("ZLAYER_API_URL".to_string(), api_url.clone()));
+        env_vars.push(("ZLAYER_TOKEN".to_string(), token.clone()));
+        env_vars.push(("ZLAYER_SOCKET".to_string(), socket.clone()));
+    }
 
     // Open log files for stdout/stderr redirection
     let stdout_file =
@@ -1266,6 +1274,8 @@ pub struct SandboxRuntime {
     containers: Arc<RwLock<HashMap<String, SandboxContainer>>>,
     /// Pulled image rootfs paths keyed by sanitized image name.
     image_rootfs: Arc<RwLock<HashMap<String, PathBuf>>>,
+    /// Auth context for container-to-host API authentication.
+    auth_context: Option<crate::runtime::ContainerAuthContext>,
 }
 
 impl std::fmt::Debug for SandboxRuntime {
@@ -1286,7 +1296,10 @@ impl SandboxRuntime {
     /// # Errors
     ///
     /// Returns an error if the required directories cannot be created.
-    pub fn new(config: MacSandboxConfig) -> Result<Self> {
+    pub fn new(
+        config: MacSandboxConfig,
+        auth_context: Option<crate::runtime::ContainerAuthContext>,
+    ) -> Result<Self> {
         std::fs::create_dir_all(&config.data_dir).map_err(|e| {
             AgentError::Configuration(format!(
                 "Failed to create data dir {}: {e}",
@@ -1315,6 +1328,7 @@ impl SandboxRuntime {
             config,
             containers: Arc::new(RwLock::new(HashMap::new())),
             image_rootfs: Arc::new(RwLock::new(HashMap::new())),
+            auth_context,
         })
     }
 
@@ -1714,7 +1728,7 @@ impl Runtime for SandboxRuntime {
             .as_ref()
             .and_then(|m| parse_memory_string(m));
 
-        let sandbox_config = SandboxConfig {
+        let mut sandbox_config = SandboxConfig {
             rootfs_dir: rootfs_dir.clone(),
             workspace_dir: container_dir.clone(),
             gpu_access,
@@ -1725,6 +1739,14 @@ impl Runtime for SandboxRuntime {
             cpu_time_limit: None,
             memory_limit,
         };
+
+        // Allow sandbox write access to the API socket so the container can
+        // communicate back to the host ZLayer API over the Unix domain socket.
+        if let Some(ref auth_ctx) = self.auth_context {
+            sandbox_config
+                .writable_dirs
+                .push(PathBuf::from(&auth_ctx.socket_path));
+        }
 
         // Generate Seatbelt profile
         let profile = generate_sandbox_profile(&sandbox_config);
@@ -1862,6 +1884,19 @@ impl Runtime for SandboxRuntime {
             }
         }
 
+        // Mint a per-container JWT so the sandboxed process can authenticate
+        // back to the host ZLayer API.
+        let auth_env = self.auth_context.as_ref().map(|ctx| {
+            let token = crate::auth::mint_container_token(
+                &ctx.jwt_secret,
+                &id.service,
+                &format!("{}-{}", id.service, id.replica),
+                std::time::Duration::from_secs(86400 * 365),
+            )
+            .unwrap_or_default();
+            (ctx.api_url.clone(), token, ctx.socket_path.clone())
+        });
+
         // Spawn the sandboxed process in a blocking task so that the fork+exec
         // does not block the tokio reactor (which would prevent timers and other
         // futures from making progress on a current_thread runtime).
@@ -1877,6 +1912,7 @@ impl Runtime for SandboxRuntime {
                 spec,
                 sandbox_config,
                 assigned_port,
+                auth_env,
             })
         })
         .await

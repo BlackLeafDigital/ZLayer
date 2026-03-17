@@ -1137,6 +1137,9 @@ pub(crate) enum TokenCommands {
 
     /// List token capabilities and available roles
     Info,
+
+    /// Show admin API credentials
+    Show,
 }
 
 /// Spec inspection subcommands

@@ -43,7 +43,7 @@ const SHORT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Attempt to connect to Docker. Returns None if Docker is not available.
 async fn skip_if_no_docker() -> Option<DockerRuntime> {
-    DockerRuntime::new().await.ok()
+    DockerRuntime::new(None).await.ok()
 }
 
 /// Generate a unique container name with random suffix to avoid conflicts

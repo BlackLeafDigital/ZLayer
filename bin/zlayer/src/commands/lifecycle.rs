@@ -292,7 +292,7 @@ pub(crate) async fn stop(
     let spec = spec_path.as_ref().and_then(|p| parse_spec(p).ok());
 
     // Create a runtime to interact with containers
-    let runtime = zlayer_agent::create_runtime(RuntimeConfig::Auto)
+    let runtime = zlayer_agent::create_runtime(RuntimeConfig::Auto, None)
         .await
         .context("Failed to create container runtime")?;
 

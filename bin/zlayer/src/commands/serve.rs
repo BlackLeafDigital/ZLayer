@@ -418,10 +418,11 @@ pub(crate) async fn serve(
     host_network: bool,
     data_dir: std::path::PathBuf,
 ) -> Result<()> {
-    let jwt_secret = SecretString::from(jwt_secret.unwrap_or_else(|| {
+    let jwt_secret_raw = jwt_secret.unwrap_or_else(|| {
         warn!("Using default JWT secret - NOT SAFE FOR PRODUCTION");
         "CHANGE_ME_IN_PRODUCTION".to_string()
-    }));
+    });
+    let jwt_secret = SecretString::from(jwt_secret_raw.clone());
 
     let bind_addr: std::net::SocketAddr = bind
         .parse()
@@ -452,6 +453,11 @@ pub(crate) async fn serve(
         log_dir,
         run_dir,
         s3_storage,
+        auth_context: Some(zlayer_agent::ContainerAuthContext {
+            api_url: format!("http://{bind}"),
+            jwt_secret: jwt_secret_raw.clone(),
+            socket_path: socket_path.to_string(),
+        }),
         ..Default::default()
     };
 

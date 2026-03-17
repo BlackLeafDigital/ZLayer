@@ -80,16 +80,16 @@
 //!
 //! # async fn example() -> Result<(), zlayer_agent_zql::AgentError> {
 //! // Auto-select the best runtime for this platform
-//! let runtime = create_runtime(RuntimeConfig::Auto).await?;
+//! let runtime = create_runtime(RuntimeConfig::Auto, None).await?;
 //!
 //! // Or explicitly choose a runtime
 //! #[cfg(feature = "docker")]
-//! let docker_runtime = create_runtime(RuntimeConfig::Docker).await?;
+//! let docker_runtime = create_runtime(RuntimeConfig::Docker, None).await?;
 //!
 //! #[cfg(feature = "wasm")]
 //! {
 //!     use zlayer_agent_zql::WasmConfig;
-//!     let wasm_runtime = create_runtime(RuntimeConfig::Wasm(WasmConfig::default())).await?;
+//!     let wasm_runtime = create_runtime(RuntimeConfig::Wasm(WasmConfig::default()), None).await?;
 //! }
 //! # Ok(())
 //! # }
@@ -388,7 +388,7 @@ pub async fn create_runtime_for_image(
             #[cfg(feature = "wasm")]
             {
                 // Create WASM runtime
-                let runtime = WasmRuntime::new(WasmConfig::default()).await?;
+                let runtime = WasmRuntime::new(WasmConfig::default(), None).await?;
                 Ok(Arc::new(runtime))
             }
 
@@ -404,7 +404,7 @@ pub async fn create_runtime_for_image(
             tracing::info!(image = %image, "detected container image");
 
             // Use standard auto-selection for container images
-            crate::create_runtime(crate::RuntimeConfig::Auto).await
+            crate::create_runtime(crate::RuntimeConfig::Auto, None).await
         }
     }
 }

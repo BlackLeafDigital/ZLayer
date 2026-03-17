@@ -259,7 +259,7 @@ fn create_e2e_runtime(gpu_access: bool) -> Result<SandboxRuntime, AgentError> {
         log_dir: test_dir.join("logs"),
         gpu_access,
     };
-    SandboxRuntime::new(config)
+    SandboxRuntime::new(config, None)
 }
 
 /// Compile a Swift source file into a binary using swiftc.

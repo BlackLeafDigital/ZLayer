@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Containers automatically receive `ZLAYER_API_URL`, `ZLAYER_TOKEN`, and
+  `ZLAYER_SOCKET` environment variables for authenticated API access
+- Unix socket bind-mounted into containers for local auth bypass (Linux/Docker)
+- macOS sandbox containers get socket path in writable dirs for local access
+- `zlayer token show` command to retrieve admin API credentials
+- Admin password persisted to `{data_dir}/admin_password` (mode 0600) on first bootstrap
+
 ### Fixed
 - Overlay networking now auto-starts reliably on daemon restart by waiting for
   the WireGuard UDP port (51820) to be freed after killing the old daemon
@@ -17,96 +25,6 @@ All notable changes to this project will be documented in this file.
   on every restart with persistent storage).
 - Overlay warning messages no longer reference Linux-only concepts (veth pairs)
   on macOS. macOS hint now directs users to `sudo` or `zlayer daemon install`.
-- Windows compilation for the `zlayer` binary: moved Unix-only crate dependencies
-  (`zlayer-agent`, `zlayer-overlay`, `zlayer-api`, `zlayer-proxy`, `zlayer-scheduler`,
-  `zlayer-secrets`, `zlayer-storage`, `zlayer-init-actions`, `secrecy`) behind
-  `[target.'cfg(unix)'.dependencies]`. Gate Unix-only modules (`daemon`, `daemon_client`,
-  `config`) and command modules (`deploy`, `exec`, `join`, `node`, `ps`, `serve`, `token`)
-  with `#[cfg(unix)]`. Disk detection in `resources.rs` stubbed to 0 on non-Unix platforms.
-  Cross-platform commands (build, validate, pipeline, spec, wasm, tunnel, manager, registry)
-  remain available on Windows. Runtime commands bail with a helpful error on Windows.
-  CI Windows build changed from `--features wsl,docker` to `--features wsl`.
-- CI: Windows build packaging replaced `pwsh`/`Compress-Archive` with `bash`/`7z`
-  to fix `Cannot find: pwsh in PATH` on Forgejo runners without PowerShell.
-- CI: Upload script now collects `.zip` artifacts (Windows builds) in addition to
-  `.tar.gz`, fixing 404 errors when the release workflow tried to download them.
-- CI: Release workflow sanitizes version numbers to strip leading zeros from
-  semver components, preventing `invalid leading zero in patch version` cargo errors.
-- CI: `[np]` flag in commit messages skips the auto-tag and publish workflow while
-  still running checks, tests, and builds.
-- CI: Release workflow cleans buildah storage before loading OCI archives to prevent
-  stale overlay layer errors (`no such file or directory` on `buildah pull`).
-
-### Added
-- `zlayer daemon` subcommand for service lifecycle management:
-  - `install` -- Register as system service (launchd on macOS, systemd on Linux)
-  - `uninstall` -- Remove service registration
-  - `start` / `stop` / `restart` -- Control the daemon
-  - `status` -- Show daemon and service registration status
-  - `reset` -- Wipe Raft state and node identity for clean reinitialization
-- Multi-platform build support for ZPipeline. Optional `platforms` field on pipeline
-  defaults and per-image config enables building for multiple architectures (e.g.,
-  linux/amd64, linux/arm64). Multi-arch builds create OCI manifest lists via buildah.
-  CLI `--platform` flag overrides platforms for all images. Requires `qemu-user-static`
-  for cross-architecture emulation.
-- Dynamic Raft voter management: the cluster now maintains an optimal odd number
-  of voters for fault tolerance. The formula is `min(7, largest_odd <= eligible)`,
-  so 1 node = 1 voter, 2 nodes = 1 voter + 1 learner (first-up-wins), 3 nodes =
-  3 voters, 5 nodes = 5 voters, 7+ nodes = 7 voters with the rest as learners.
-  Nodes with `mode=replicate` are always learners regardless of cluster size.
-  When voters die, `rebalance_voters()` automatically promotes eligible learners
-  to maintain the target count.
-- `MemberRole` enum (`Voter`/`Learner`) returned from `RaftCoordinator::add_member()`.
-  The cluster join response now includes a `role` field indicating the assigned role.
-  `GET /api/v1/cluster/nodes` now shows "leader", "voter", or "learner" per node.
-- `mode` field on `NodeInfo`, `AddMemberParams`, and `RegisterNode` request. Nodes
-  joining with `mode=replicate` are always learners; `mode=full` nodes are eligible
-  for voter promotion via the dynamic voter management logic.
-- `RaftCoordinator::rebalance_voters()` method to adjust the voter set after node
-  joins, deaths, or removals. Called automatically during `add_member()`,
-  `remove_member()`, and the dead-node detection loop.
-- `RaftCoordinator::remove_member()` method to fully remove a node from Raft
-  membership and deregister it from the cluster state machine.
-- `ConsensusNode` helper methods: `voter_ids()`, `voter_count()`, `learner_ids()`,
-  `all_member_ids()` for querying Raft membership from OpenRaft metrics.
-- `target_voters()` utility function for computing the optimal voter count.
-- Force-leader disaster recovery feature for Raft consensus. When the original
-  cluster leader is permanently lost, a surviving node can be promoted via
-  `POST /api/v1/cluster/force-leader` or `zlayer node force-leader`. This saves
-  the current cluster state to a recovery marker, shuts down Raft, and on daemon
-  restart wipes Raft storage and re-bootstraps as a single-node leader replaying
-  preserved service state. Safety checks prevent accidental use when the leader
-  is still reachable (<30s quorum ack).
-- `zlayer node force-leader` CLI subcommand for disaster recovery.
-- NAT traversal Phase 4: Custom ZLayer relay protocol with BLAKE2b-256 authentication.
-  - `RelayClient` (`nat/turn.rs`): Allocates relay addresses, creates permissions,
-    and runs a local UDP proxy bridging WireGuard traffic through the relay server.
-  - `RelayServer` (`nat/relay.rs`): Built-in UDP relay server with per-allocation
-    relay ports, permission-based forwarding, and session management.
-  - `RelayDiscovery` (`nat/discovery.rs`): Static configuration-based relay server
-    discovery from `NatConfig::turn_servers`.
-  - `NatTraversal` now gathers relay candidates after STUN reflexive candidates and
-    refreshes relay allocations during periodic maintenance.
-  - `OverlayBootstrap` optionally starts the built-in relay server during NAT
-    traversal initialization when `relay_server` config is present.
-- macOS overlay networking support: boringtun now creates `utun` devices on macOS
-  via kernel control sockets (same mechanism as Tailscale CLI and wireguard-go).
-  Interface configuration uses `ifconfig`/`route` instead of Linux `ip` commands.
-  The kernel auto-assigns `utunN` names, which are discovered after creation via
-  UAPI socket scanning. Requires `sudo` on macOS (equivalent to Linux `CAP_NET_ADMIN`).
-- `OverlayTransport::interface_name()` getter to retrieve the resolved interface name
-  (useful on macOS where the kernel assigns the actual `utunN` name).
-- Platform-appropriate ping timeout args in overlay health checker (macOS `-W` uses
-  milliseconds vs Linux seconds).
-- Storage replication status API endpoint (`GET /api/v1/storage/status`): returns
-  SQLite-to-S3 replication state including enabled flag, active/disabled/error status,
-  last sync timestamp, and pending change count. Requires authentication (read-only).
-- S3-backed volume sync for container named volumes (`zlayer-agent`, `s3` feature):
-  `StorageManager` now accepts an optional `LayerSyncManager` for automatic backup/restore
-  of named volumes to S3. Volumes are registered and restored from S3 on first creation,
-  and synced on container stop via the new `Runtime::sync_container_volumes()` trait method.
-  New methods: `set_layer_sync()`, `ensure_volume_with_sync()`, `sync_volume()`,
-  `sync_all_volumes()`.
 
 ## [0.9.990]
 

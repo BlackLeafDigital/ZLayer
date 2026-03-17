@@ -304,7 +304,7 @@ mod component_loading_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -337,7 +337,7 @@ mod component_loading_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -424,7 +424,7 @@ mod wasi_interface_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -453,7 +453,7 @@ mod wasi_interface_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -483,7 +483,7 @@ mod wasi_interface_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -513,7 +513,7 @@ mod wasi_interface_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -548,7 +548,7 @@ mod component_execution_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -584,7 +584,7 @@ mod component_execution_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -608,7 +608,7 @@ mod component_execution_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -644,7 +644,7 @@ mod component_execution_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -684,7 +684,7 @@ mod error_handling_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -726,7 +726,7 @@ mod error_handling_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -759,7 +759,7 @@ mod error_handling_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -793,7 +793,7 @@ mod error_handling_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -825,7 +825,7 @@ mod error_handling_tests {
     async fn test_error_nonexistent_container() {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
-        let runtime = WasmRuntime::new(config)
+        let runtime = WasmRuntime::new(config, None)
             .await
             .expect("Failed to create runtime");
 
@@ -865,7 +865,7 @@ mod error_handling_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -1037,7 +1037,7 @@ mod runtime_config_tests {
             cache_type: None,
         };
 
-        let runtime = WasmRuntime::new(config).await;
+        let runtime = WasmRuntime::new(config, None).await;
         assert!(runtime.is_ok(), "Runtime creation should succeed");
         assert!(nested_cache.exists(), "Cache directory should be created");
     }
@@ -1054,7 +1054,7 @@ mod runtime_config_tests {
         };
 
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -1123,7 +1123,7 @@ mod container_stats_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -1154,7 +1154,7 @@ mod container_stats_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -1193,7 +1193,7 @@ mod logs_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -1221,7 +1221,7 @@ mod logs_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -1248,7 +1248,7 @@ mod logs_tests {
     async fn test_logs_not_found() {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
-        let runtime = WasmRuntime::new(config)
+        let runtime = WasmRuntime::new(config, None)
             .await
             .expect("Failed to create runtime");
 
@@ -1277,7 +1277,7 @@ mod concurrent_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );
@@ -1327,7 +1327,7 @@ mod concurrent_tests {
         let cache_dir = create_test_cache_dir();
         let config = create_test_config(&cache_dir);
         let runtime = Arc::new(
-            WasmRuntime::new(config)
+            WasmRuntime::new(config, None)
                 .await
                 .expect("Failed to create runtime"),
         );

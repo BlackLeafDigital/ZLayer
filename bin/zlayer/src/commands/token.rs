@@ -117,5 +117,26 @@ pub(crate) fn handle_token(action: &TokenCommands) -> Result<()> {
             println!("  ZLAYER_TOKEN      - Bearer token for API requests");
             Ok(())
         }
+
+        TokenCommands::Show => {
+            let data_dir = crate::cli::default_data_dir();
+            let pw_path = data_dir.join("admin_password");
+            if pw_path.exists() {
+                let password = std::fs::read_to_string(&pw_path)
+                    .context("Failed to read admin password file")?
+                    .trim()
+                    .to_string();
+                println!("API Key:    admin");
+                println!("API Secret: {password}");
+                println!();
+                println!("Get a token:");
+                println!("  curl -X POST http://localhost:3669/auth/token \\");
+                println!("    -H 'Content-Type: application/json' \\");
+                println!("    -d '{{\"api_key\":\"admin\",\"api_secret\":\"{password}\"}}'");
+            } else {
+                println!("No admin credentials found. Start the daemon first.");
+            }
+            Ok(())
+        }
     }
 }

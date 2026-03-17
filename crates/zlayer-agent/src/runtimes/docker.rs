@@ -25,6 +25,8 @@ use zlayer_spec::{PullPolicy, ServiceSpec};
 /// by connecting to the Docker daemon.
 pub struct DockerRuntime {
     docker: Docker,
+    /// Auth context for container-to-host API authentication.
+    auth_context: Option<crate::runtime::ContainerAuthContext>,
 }
 
 impl std::fmt::Debug for DockerRuntime {
@@ -47,7 +49,7 @@ impl DockerRuntime {
     /// - The Docker daemon is not running
     /// - The connection to the daemon fails
     /// - The ping to verify connectivity fails
-    pub async fn new() -> Result<Self> {
+    pub async fn new(auth_context: Option<crate::runtime::ContainerAuthContext>) -> Result<Self> {
         let docker = Docker::connect_with_local_defaults()
             .map_err(|e| AgentError::Internal(format!("Failed to connect to Docker: {e}")))?;
 
@@ -58,7 +60,10 @@ impl DockerRuntime {
             .map_err(|e| AgentError::Internal(format!("Docker ping failed: {e}")))?;
 
         tracing::info!("Connected to Docker daemon");
-        Ok(Self { docker })
+        Ok(Self {
+            docker,
+            auth_context,
+        })
     }
 
     /// Create a new Docker runtime with custom connection options
@@ -68,7 +73,10 @@ impl DockerRuntime {
     /// * `docker` - A pre-configured bollard Docker client
     #[must_use]
     pub fn with_client(docker: Docker) -> Self {
-        Self { docker }
+        Self {
+            docker,
+            auth_context: None,
+        }
     }
 }
 
@@ -107,7 +115,7 @@ fn build_exposed_ports(spec: &ServiceSpec) -> Vec<String> {
 
 /// Build host configuration for Docker container
 #[allow(clippy::too_many_lines)]
-fn build_host_config(spec: &ServiceSpec) -> HostConfig {
+fn build_host_config(spec: &ServiceSpec, auth_socket_path: Option<&str>) -> HostConfig {
     let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
 
     for endpoint in &spec.endpoints {
@@ -231,6 +239,12 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
         Some(spec.capabilities.clone())
     };
 
+    // Build bind mounts (e.g. ZLayer auth socket)
+    let mut binds: Vec<String> = Vec::new();
+    if let Some(socket) = auth_socket_path {
+        binds.push(format!("{socket}:/var/run/zlayer.sock:ro"));
+    }
+
     HostConfig {
         port_bindings: Some(port_bindings),
         privileged: Some(spec.privileged),
@@ -243,6 +257,7 @@ fn build_host_config(spec: &ServiceSpec) -> HostConfig {
         },
         device_requests,
         cap_add,
+        binds: if binds.is_empty() { None } else { Some(binds) },
         ..Default::default()
     }
 }
@@ -403,13 +418,34 @@ impl Runtime for DockerRuntime {
         }
 
         // Build environment variables
-        let env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut env: Vec<String> = spec.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+
+        // Inject auth env vars if auth context is configured
+        if let Some(ref auth_ctx) = self.auth_context {
+            let token = crate::auth::mint_container_token(
+                &auth_ctx.jwt_secret,
+                &id.service,
+                &format!("{}-{}", id.service, id.replica),
+                std::time::Duration::from_secs(86400 * 365),
+            )
+            .map_err(|e| crate::error::AgentError::CreateFailed {
+                id: id.to_string(),
+                reason: format!("Failed to mint container token: {e}"),
+            })?;
+            env.push(format!("ZLAYER_API_URL={}", auth_ctx.api_url));
+            env.push(format!("ZLAYER_TOKEN={token}"));
+            env.push("ZLAYER_SOCKET=/var/run/zlayer.sock".to_string());
+        }
 
         // Build exposed ports
         let exposed_ports = build_exposed_ports(spec);
 
-        // Build host config
-        let host_config = build_host_config(spec);
+        // Build host config (pass socket path for bind mount when auth is configured)
+        let auth_socket = self
+            .auth_context
+            .as_ref()
+            .map(|ctx| ctx.socket_path.as_str());
+        let host_config = build_host_config(spec, auth_socket);
 
         // Build command/entrypoint
         let cmd = spec.command.args.clone();
@@ -1079,7 +1115,7 @@ mod tests {
     #[test]
     fn test_build_host_config_ports() {
         let spec = create_test_spec(vec![8080]);
-        let host_config = build_host_config(&spec);
+        let host_config = build_host_config(&spec, None);
 
         let port_bindings = host_config.port_bindings.unwrap();
         let bindings = port_bindings.get("8080/tcp").unwrap().as_ref().unwrap();
@@ -1092,7 +1128,7 @@ mod tests {
     fn test_build_host_config_privileged() {
         let mut spec = create_test_spec(vec![]);
         spec.privileged = true;
-        let host_config = build_host_config(&spec);
+        let host_config = build_host_config(&spec, None);
         assert_eq!(host_config.privileged, Some(true));
     }
 
