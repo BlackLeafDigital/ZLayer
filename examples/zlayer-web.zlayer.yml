@@ -1,0 +1,51 @@
+# zlayer-web.zlayer.yml - ZLayer Web Frontend
+#
+# Deploys the Leptos SSR + Hydration web UI.
+#
+# Build the image first:
+#   zlayer build -f docker/ZImagefile.zlayer-web -t zlayer-web:latest .
+#
+# Then deploy:
+#   zlayer deploy -f examples/zlayer-web.zlayer.yml
+
+version: v1
+deployment: zlayer-web
+
+services:
+  web:
+    rtype: service
+    image:
+      name: zlayer-web:latest
+      pull_policy: if_not_present
+
+    resources:
+      cpu: 1.0
+      memory: 512Mi
+
+    env:
+      ZLAYER_WEB_ADDR: "0.0.0.0:3000"
+      LEPTOS_SITE_ROOT: "/app/target/site"
+      RUST_LOG: info
+
+    endpoints:
+      - name: http
+        protocol: http
+        port: 3000
+        expose: public
+
+    scale:
+      mode: fixed
+      replicas: 2
+
+    health:
+      start_grace: 15s
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      check:
+        type: tcp
+        port: 3000
+
+    errors:
+      on_panic:
+        action: restart

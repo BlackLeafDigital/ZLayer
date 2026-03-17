@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [2026-03-17]
 
 ### Added
+- `examples/zlayer-web.zlayer.yml` deployment spec for the Leptos web frontend
+
+### Fixed
+- GitHub Actions E2E workflow aligned with Forgejo: added `CARGO_BUILD_JOBS: "4"`,
+  `--test-threads=1` for Youki tests, Docker Hub login, and post-sudo permission fix
+  to resolve SQLite "database is locked" contention and test timeouts
+
+### Previously added
 - Containers automatically receive `ZLAYER_API_URL`, `ZLAYER_TOKEN`, and
   `ZLAYER_SOCKET` environment variables for authenticated API access
 - Unix socket bind-mounted into containers for local auth bypass (Linux/Docker)

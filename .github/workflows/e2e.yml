@@ -20,6 +20,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "4"
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: "0"
 
@@ -53,16 +54,25 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev
 
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u zachhandley --password-stdin
+
       - name: Setup E2E environment
         run: |
           sudo rm -rf /tmp/zlayer-youki-e2e-test 2>/dev/null || true
           mkdir -p /tmp/zlayer-youki-e2e-test/{state,rootfs,bundles,cache}
 
       - name: Run E2E tests
-        run: sudo -E env "PATH=$PATH" cargo test --package zlayer-agent --test youki_e2e -- --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test --package zlayer-agent --test youki_e2e -- --nocapture --test-threads=1
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
+
+      - name: Fix permissions after sudo test
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" ~/.cargo 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" target 2>/dev/null || true
 
       - name: Cleanup
         if: always()
@@ -133,6 +143,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev
+
+      - name: Login to Docker Hub
+        run: echo "${{ secrets.DOCKERHUB_TOKEN }}" | docker login -u zachhandley --password-stdin
 
       - name: Run Docker E2E tests
         run: cargo test --package zlayer-agent --features docker --test docker_runtime_test -- --nocapture
