@@ -180,6 +180,8 @@ pub struct BundleBuilder {
     secrets_provider: Option<Arc<dyn SecretsProvider>>,
     /// Deployment scope for secret lookups (e.g., deployment name)
     deployment_scope: Option<String>,
+    /// Host-side Unix socket path to bind-mount into the container
+    socket_path: Option<String>,
 }
 
 impl std::fmt::Debug for BundleBuilder {
@@ -196,6 +198,7 @@ impl std::fmt::Debug for BundleBuilder {
             .field("host_network", &self.host_network)
             .field("secrets_provider", &self.secrets_provider.is_some())
             .field("deployment_scope", &self.deployment_scope)
+            .field("socket_path", &self.socket_path)
             .finish()
     }
 }
@@ -224,6 +227,7 @@ impl BundleBuilder {
             host_network: false,
             secrets_provider: None,
             deployment_scope: None,
+            socket_path: None,
         }
     }
 
@@ -319,6 +323,14 @@ impl BundleBuilder {
     #[must_use]
     pub fn with_deployment_scope(mut self, scope: String) -> Self {
         self.deployment_scope = Some(scope);
+        self
+    }
+
+    /// Set a host-side Unix socket path to bind-mount into the container at
+    /// `/var/run/zlayer.sock` (read-only).
+    #[must_use]
+    pub fn with_socket_mount(mut self, path: impl Into<String>) -> Self {
+        self.socket_path = Some(path.into());
         self
     }
 
@@ -584,6 +596,19 @@ impl BundleBuilder {
         // Add storage mounts from spec
         let storage_mounts = self.build_storage_mounts(spec, volume_paths)?;
         mounts.extend(storage_mounts);
+
+        // Add ZLayer API socket bind-mount if configured
+        if let Some(ref socket_path) = self.socket_path {
+            mounts.push(
+                MountBuilder::default()
+                    .destination("/var/run/zlayer.sock")
+                    .typ("none")
+                    .source(socket_path.clone())
+                    .options(vec!["rbind".into(), "ro".into()])
+                    .build()
+                    .expect("valid socket mount"),
+            );
+        }
 
         // Build Linux-specific config
         let linux = self.build_linux_config(spec)?;

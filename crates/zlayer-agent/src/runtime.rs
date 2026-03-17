@@ -157,6 +157,19 @@ pub trait Runtime: Send + Sync {
     }
 }
 
+/// Auth context injected into every container so it can talk back to the host
+/// API without needing external credentials.
+#[derive(Debug, Clone)]
+pub struct ContainerAuthContext {
+    /// Base URL of the `ZLayer` API, e.g. `"http://127.0.0.1:3669"`.
+    pub api_url: String,
+    /// JWT signing secret — used to mint per-container tokens at start time.
+    pub jwt_secret: String,
+    /// Absolute path of the Unix socket on the host (bind-mounted into Linux
+    /// containers; added to `writable_dirs` for macOS sandbox).
+    pub socket_path: String,
+}
+
 /// In-memory mock runtime for testing and development
 pub struct MockRuntime {
     containers: tokio::sync::RwLock<std::collections::HashMap<ContainerId, Container>>,

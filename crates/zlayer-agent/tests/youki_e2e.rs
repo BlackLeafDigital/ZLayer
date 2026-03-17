@@ -168,7 +168,7 @@ async fn create_e2e_runtime() -> Result<YoukiRuntime, AgentError> {
         log_base_dir: Some(test_dir.join("logs")),
         deployment_name: Some("e2e-test".to_string()),
     };
-    YoukiRuntime::new(config).await
+    YoukiRuntime::new(config, None).await
 }
 
 /// Create a minimal `ServiceSpec` for testing with the given image

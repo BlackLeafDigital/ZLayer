@@ -62,6 +62,10 @@ pub struct DaemonConfig {
 
     /// S3 configuration for `SQLite` replication (None = disabled).
     pub s3_storage: Option<zlayer_storage::LayerStorageConfig>,
+
+    /// Auth context injected into every container so it can call back to the
+    /// host API.  Built from the JWT secret and bind address in `serve()`.
+    pub auth_context: Option<zlayer_agent::ContainerAuthContext>,
 }
 
 impl Default for DaemonConfig {
@@ -78,6 +82,7 @@ impl Default for DaemonConfig {
             log_dir,
             run_dir,
             s3_storage: None,
+            auth_context: None,
         }
     }
 }
@@ -312,7 +317,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         }
     };
 
-    let runtime = zlayer_agent::create_runtime(runtime_config)
+    let runtime = zlayer_agent::create_runtime(runtime_config, config.auth_context.clone())
         .await
         .context("Failed to create container runtime")?;
 
@@ -518,6 +523,18 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 "Admin API credential bootstrapped. \
                  Generated password: {admin_password}"
             );
+            let pw_path = config.data_dir.join("admin_password");
+            if let Err(e) = std::fs::write(&pw_path, &admin_password) {
+                warn!(error = %e, "Failed to persist admin password");
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o600));
+                }
+                info!("Admin password persisted to {}", pw_path.display());
+            }
         }
         Ok(false) => {
             info!("Admin API credential already exists");
