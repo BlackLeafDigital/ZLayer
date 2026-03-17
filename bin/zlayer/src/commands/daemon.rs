@@ -396,7 +396,6 @@ async fn install(
     jwt_secret: Option<&str>,
     no_swagger: bool,
 ) -> Result<()> {
-    use std::fmt::Write as _;
     use tokio::process::Command;
 
     let exe = std::env::current_exe().context("Cannot determine zlayer binary path")?;
