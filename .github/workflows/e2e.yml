@@ -20,6 +20,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: "4"
   RUST_BACKTRACE: 1
   CARGO_INCREMENTAL: "0"
 
@@ -59,10 +60,16 @@ jobs:
           mkdir -p /tmp/zlayer-youki-e2e-test/{state,rootfs,bundles,cache}
 
       - name: Run E2E tests
-        run: sudo -E env "PATH=$PATH" cargo test --package zlayer-agent --test youki_e2e -- --nocapture
+        run: sudo -E env "PATH=$PATH" cargo test --package zlayer-agent --test youki_e2e -- --nocapture --test-threads=1
         env:
           RUST_BACKTRACE: 1
           RUST_LOG: debug
+
+      - name: Fix permissions after sudo test
+        if: always()
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" ~/.cargo 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" target 2>/dev/null || true
 
       - name: Cleanup
         if: always()
