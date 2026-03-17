@@ -328,17 +328,14 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         match OverlayManager::new(config.deployment_name.clone()).await {
             Ok(mut om) => {
                 if let Err(e) = om.setup_global_overlay().await {
-                    warn!(
-                        "Global overlay failed (cross-node disabled): {e}. \
-                         Container networking via veth pairs still available."
-                    );
+                    warn!("Global overlay failed (cross-node networking disabled): {e}");
                 } else {
                     info!("Global overlay network created");
                 }
                 Some(Arc::new(RwLock::new(om)))
             }
             Err(e) => {
-                warn!("Overlay networks disabled: {e}");
+                warn!("Overlay manager init failed: {e}");
                 None
             }
         }
@@ -583,6 +580,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             node_id: node_config.raft_node_id,
             address: format!("{}:{}", node_config.advertise_addr, node_config.raft_port),
             raft_port: node_config.raft_port,
+            data_dir: config.data_dir.join("raft"),
             ..Default::default()
         };
 
@@ -592,7 +590,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 if node_config.is_leader {
                     if let Err(e) = coordinator.bootstrap().await {
                         // Already bootstrapped is fine (idempotent restart)
-                        warn!("Raft bootstrap: {e} (may already be bootstrapped)");
+                        info!("Raft bootstrap: {e} (already bootstrapped — resuming)");
                     } else {
                         info!("Raft single-node cluster bootstrapped");
                     }

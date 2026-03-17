@@ -196,7 +196,7 @@ impl OverlayTransport {
             .map_err(|e| format!("spawn_blocking join error: {e}"))?
             .map_err(|e| {
                 #[cfg(target_os = "macos")]
-                let hint = "Ensure running with sudo.";
+                let hint = "Requires root. Run with sudo or install as a system service (zlayer daemon install).";
                 #[cfg(not(target_os = "macos"))]
                 let hint = "Ensure CAP_NET_ADMIN capability is available.";
                 format!("Failed to create boringtun device '{iface_name_for_err}': {e}. {hint}")

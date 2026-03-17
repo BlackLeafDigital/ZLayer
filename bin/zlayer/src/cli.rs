@@ -566,16 +566,21 @@ pub(crate) enum Commands {
         socket: Option<String>,
     },
 
+    /// Manage the zlayer background daemon
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 32)]
+    Daemon(DaemonAction),
+
     /// Tunnel management commands
     ///
     /// Create, manage, and connect tunnels for secure access to services.
-    #[command(subcommand, display_order = 32)]
+    #[command(subcommand, display_order = 33)]
     Tunnel(TunnelCommands),
 
     /// `ZLayer` Manager commands
     ///
     /// Initialize, configure, and manage the `ZLayer` Manager web UI.
-    #[command(subcommand, display_order = 33)]
+    #[command(subcommand, display_order = 34)]
     Manager(ManagerCommands),
 
     // ── Inspection & Configuration ────────────────────────────────────
@@ -609,6 +614,52 @@ pub(crate) enum Commands {
         /// Build context directory
         #[arg(short = 'c', long)]
         context: Option<PathBuf>,
+    },
+}
+
+/// Daemon lifecycle actions
+#[cfg(unix)]
+#[derive(Subcommand)]
+pub(crate) enum DaemonAction {
+    /// Install zlayer as a system service (launchd on macOS, systemd on Linux)
+    Install {
+        /// Don't start the service after installing
+        #[arg(long)]
+        no_start: bool,
+
+        /// API bind address for the daemon
+        #[arg(long, default_value = "0.0.0.0:3669")]
+        bind: String,
+
+        /// JWT secret for API authentication
+        #[arg(long, env = "ZLAYER_JWT_SECRET")]
+        jwt_secret: Option<String>,
+
+        /// Disable Swagger UI
+        #[arg(long)]
+        no_swagger: bool,
+    },
+
+    /// Uninstall the zlayer system service
+    Uninstall,
+
+    /// Start the daemon service
+    Start,
+
+    /// Stop the daemon service
+    Stop,
+
+    /// Restart the daemon service
+    Restart,
+
+    /// Show daemon and service status
+    Status,
+
+    /// Reset daemon state (wipes Raft storage for clean reinit)
+    Reset {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
     },
 }
 
