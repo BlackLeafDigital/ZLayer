@@ -1543,8 +1543,8 @@ mod tests {
         }"#;
         let metadata: SecretMetadata = serde_json::from_str(json).unwrap();
         assert_eq!(metadata.name, "api-key");
-        assert_eq!(metadata.created_at, 1234567890);
-        assert_eq!(metadata.updated_at, 1234567900);
+        assert_eq!(metadata.created_at, 1_234_567_890);
+        assert_eq!(metadata.updated_at, 1_234_567_900);
         assert_eq!(metadata.version, 3);
     }
 
@@ -1699,7 +1699,7 @@ mod tests {
         assert_eq!(response.total_peers, 5);
         assert_eq!(response.healthy_peers, 4);
         assert_eq!(response.unhealthy_peers, 1);
-        assert_eq!(response.last_check, 1706745600);
+        assert_eq!(response.last_check, 1_706_745_600);
     }
 
     #[test]
@@ -1713,7 +1713,7 @@ mod tests {
             total_peers: 3,
             healthy_peers: 3,
             unhealthy_peers: 0,
-            last_check: 1706745600,
+            last_check: 1_706_745_600,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("wg0"));
@@ -1767,7 +1767,7 @@ mod tests {
             last_handshake_secs: Some(15),
             last_ping_ms: Some(2),
             failure_count: 0,
-            last_check: 1706745600,
+            last_check: 1_706_745_600,
         };
         let json = serde_json::to_string(&peer).unwrap();
         assert!(json.contains("test-key="));
@@ -1945,7 +1945,7 @@ mod tests {
             total_peers: 5,
             healthy_peers: 4,
             unhealthy_peers: 1,
-            last_check: 1706745600,
+            last_check: 1_706_745_600,
         };
         let json = serde_json::to_string(&original).unwrap();
         let restored: OverlayStatusResponse = serde_json::from_str(&json).unwrap();

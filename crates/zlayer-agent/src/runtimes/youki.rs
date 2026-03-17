@@ -300,6 +300,7 @@ impl YoukiRuntime {
             storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
             blob_cache,
             image_configs: RwLock::new(HashMap::new()),
+            auth_context: None,
         })
     }
 

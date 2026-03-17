@@ -54,7 +54,6 @@ async fn start_server(
     use axum::{routing::get, Router};
     use leptos::config::get_configuration;
     use leptos_axum::{generate_route_list, LeptosRoutes};
-    use std::net::SocketAddr;
     use tower_http::services::ServeDir;
     use zlayer_manager::app::shell;
 
@@ -118,10 +117,7 @@ async fn start_server(
     tracing::info!("Binding TCP listener to {}", addr);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
 
-    tracing::info!(
-        "ZLayer Manager Server listening on http://{}",
-        SocketAddr::from(addr)
-    );
+    tracing::info!("ZLayer Manager Server listening on http://{}", addr);
 
     axum::serve(listener, app).await?;
 

@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2026-03-17]
 
 ### Added
 - Containers automatically receive `ZLAYER_API_URL`, `ZLAYER_TOKEN`, and
@@ -58,28 +58,6 @@ All notable changes to this project will be documented in this file.
   automatically proposes `UpdateNodeStatus { status: "ready" }` to recover it.
 - Internal authentication token is now generated during daemon init and shared between the
   scheduler and API InternalState, ensuring consistent auth across the system.
-
-### Changed
-- zlayer-consensus: replaced serde_json round-trip in state machine apply with direct
-  `EntryPayload` matching (~10x faster apply). Switched to consistent bincode serialization
-  for snapshots. Removed unnecessary serde_json dependency.
-
-### Fixed
-- zlayer-consensus: `handle_full_snapshot` was a no-op (snapshot data was received but never
-  installed into the state machine). Now correctly deserializes and installs snapshot state.
-- zlayer-consensus: `snapshot_logs_since_last` and `enable_prevote` config settings were silently
-  ignored during Raft node initialization. Both are now applied to the openraft `Config`.
-- Overlay container attachment: added platform guard (`#[cfg(not(target_os = "linux"))]`) to
-  `OverlayManager::attach_container()` so non-Linux platforms skip veth/nsenter commands and
-  return the node's overlay IP directly, eliminating noisy error logs on macOS.
-- macOS sandbox networking: multiple replicas of the same service no longer conflict on ports.
-  Each sandbox container is assigned a unique dynamic port (via OS port-0 allocation), passed
-  to the process as `PORT` / `ZLAYER_PORT` environment variables. The proxy routes to each
-  replica's unique `127.0.0.1:{assigned_port}` backend address instead of all replicas sharing
-  the same port. Port guard listeners prevent TOCTOU races between `create_container()` and
-  `start_container()`.
-
-### Added
 - `Runtime::get_container_port_override()` trait method: allows runtimes to report a
   dynamically assigned port for containers that share the host network. Default returns
   `None` (no override). macOS sandbox runtime returns the assigned port.
@@ -168,6 +146,9 @@ All notable changes to this project will be documented in this file.
 - Per-crate log filtering: default verbosity reduced to WARN for internal crates, use `-v` for old behavior
 
 ### Changed
+- zlayer-consensus: replaced serde_json round-trip in state machine apply with direct
+  `EntryPayload` matching (~10x faster apply). Switched to consistent bincode serialization
+  for snapshots. Removed unnecessary serde_json dependency.
 - Replaced kernel WireGuard with boringtun (Cloudflare's Rust userspace WireGuard implementation) for overlay networking
   - No longer requires WireGuard kernel module (`modprobe wireguard` / kernel 5.6+)
   - No longer requires `wireguard-tools` package (`wg` binary)
@@ -181,6 +162,19 @@ All notable changes to this project will be documented in this file.
 - Overlay network failure is now fatal when services require networking (use `--host-network` to bypass)
 
 ### Fixed
+- zlayer-consensus: `handle_full_snapshot` was a no-op (snapshot data was received but never
+  installed into the state machine). Now correctly deserializes and installs snapshot state.
+- zlayer-consensus: `snapshot_logs_since_last` and `enable_prevote` config settings were silently
+  ignored during Raft node initialization. Both are now applied to the openraft `Config`.
+- Overlay container attachment: added platform guard (`#[cfg(not(target_os = "linux"))]`) to
+  `OverlayManager::attach_container()` so non-Linux platforms skip veth/nsenter commands and
+  return the node's overlay IP directly, eliminating noisy error logs on macOS.
+- macOS sandbox networking: multiple replicas of the same service no longer conflict on ports.
+  Each sandbox container is assigned a unique dynamic port (via OS port-0 allocation), passed
+  to the process as `PORT` / `ZLAYER_PORT` environment variables. The proxy routes to each
+  replica's unique `127.0.0.1:{assigned_port}` backend address instead of all replicas sharing
+  the same port. Port guard listeners prevent TOCTOU races between `create_container()` and
+  `start_container()`.
 - Proxy backend registration: containers are now registered with the load balancer on startup (previously backends were never added, causing "No healthy backends" errors)
 - Health check target address: TCP and HTTP health checks now connect to the container's overlay IP instead of 127.0.0.1
 - Error reporting now includes service names and error details in deploy output

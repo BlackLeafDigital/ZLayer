@@ -667,14 +667,11 @@ pub async fn reset_cluster() -> Result<String, ServerFnError> {
 
     if errors.is_empty() {
         Ok(format!(
-            "Cluster reset complete. Deleted {} deployment(s) and {} secret(s).",
-            deleted_deployments, deleted_secrets
+            "Cluster reset complete. Deleted {deleted_deployments} deployment(s) and {deleted_secrets} secret(s).",
         ))
     } else {
         Err(ServerFnError::new(format!(
-            "Partial reset: deleted {} deployment(s) and {} secret(s), but {} error(s) occurred: {}",
-            deleted_deployments,
-            deleted_secrets,
+            "Partial reset: deleted {deleted_deployments} deployment(s) and {deleted_secrets} secret(s), but {} error(s) occurred: {}",
             errors.len(),
             errors.join("; ")
         )))

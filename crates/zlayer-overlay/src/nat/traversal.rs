@@ -128,6 +128,31 @@ impl NatTraversal {
         }
 
         // -- Relay candidates --
+        self.gather_relay_candidates(&mut candidates).await;
+
+        // Deduplicate by address
+        candidates.dedup_by_key(|c| c.address);
+
+        // Sort by priority descending (highest priority first)
+        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
+
+        self.local_candidates.clone_from(&candidates);
+
+        if self.local_candidates.is_empty() {
+            return Err(OverlayError::StunDiscovery(
+                "No candidates gathered (local IP discovery and STUN both failed)".to_string(),
+            ));
+        }
+
+        Ok(self.local_candidates.clone())
+    }
+
+    /// Gather relay candidates from configured TURN servers.
+    ///
+    /// For each relay server, attempts to create a client, allocate a relay
+    /// address, and start a local proxy. Successful candidates are added to
+    /// the provided `candidates` vec and relay clients are stored for later use.
+    async fn gather_relay_candidates(&mut self, candidates: &mut Vec<Candidate>) {
         for server_config in self.relay_discovery.servers().to_vec() {
             match RelayClient::new(&server_config) {
                 Ok(mut client) => {
@@ -172,22 +197,6 @@ impl NatTraversal {
                 }
             }
         }
-
-        // Deduplicate by address
-        candidates.dedup_by_key(|c| c.address);
-
-        // Sort by priority descending (highest priority first)
-        candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
-
-        self.local_candidates.clone_from(&candidates);
-
-        if self.local_candidates.is_empty() {
-            return Err(OverlayError::StunDiscovery(
-                "No candidates gathered (local IP discovery and STUN both failed)".to_string(),
-            ));
-        }
-
-        Ok(self.local_candidates.clone())
     }
 
     /// Get our local candidates.
@@ -691,7 +700,7 @@ mod tests {
             ),
         );
 
-        let mut candidates = vec![reflexive_v6, host_v4, host_v6];
+        let mut candidates = [reflexive_v6, host_v4, host_v6];
         candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
 
         // Hosts (100) before ServerReflexive (50)
