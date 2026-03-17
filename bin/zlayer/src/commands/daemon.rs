@@ -88,15 +88,16 @@ async fn install(
     let socket_path = run_dir.join("zlayer.sock");
 
     // Build ProgramArguments
+    // --data-dir is a top-level Cli arg, so it must come BEFORE the subcommand.
     let mut args = vec![
         format!("        <string>{exe_str}</string>"),
+        "        <string>--data-dir</string>".to_string(),
+        format!("        <string>{}</string>", data_dir.display()),
         "        <string>serve</string>".to_string(),
         "        <string>--bind</string>".to_string(),
         format!("        <string>{bind}</string>"),
         "        <string>--socket</string>".to_string(),
         format!("        <string>{}</string>", socket_path.display()),
-        "        <string>--data-dir</string>".to_string(),
-        format!("        <string>{}</string>", data_dir.display()),
     ];
 
     if let Some(secret) = jwt_secret {
@@ -400,8 +401,12 @@ async fn install(
 
     let exe = std::env::current_exe().context("Cannot determine zlayer binary path")?;
 
-    let mut exec_start = format!("{} serve --bind {bind}", exe.display());
-    write!(exec_start, " --data-dir {}", data_dir.display()).unwrap();
+    // --data-dir is a top-level Cli arg, so it must come BEFORE the subcommand.
+    let mut exec_start = format!(
+        "{} --data-dir {} serve --bind {bind}",
+        exe.display(),
+        data_dir.display()
+    );
     if no_swagger {
         exec_start.push_str(" --no-swagger");
     }
