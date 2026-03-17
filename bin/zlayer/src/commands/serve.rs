@@ -228,32 +228,67 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     }
 
     // -----------------------------------------------------------------------
-    // 2. Clean up stale network interfaces (veth-* and zl-*)
+    // 2. Clean up stale network interfaces
     // -----------------------------------------------------------------------
-    if let Ok(output) = tokio::process::Command::new("ip")
-        .args(["-br", "link"])
-        .output()
-        .await
+    #[cfg(target_os = "linux")]
     {
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            for line in stdout.lines() {
-                // `ip -br link` format: "NAME  STATE  ..."
-                let Some(iface) = line.split_whitespace().next() else {
-                    continue;
-                };
+        // Linux: use `ip` to find and delete stale veth-* and zl-* interfaces.
+        if let Ok(output) = tokio::process::Command::new("ip")
+            .args(["-br", "link"])
+            .output()
+            .await
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for line in stdout.lines() {
+                    // `ip -br link` format: "NAME  STATE  ..."
+                    let Some(iface) = line.split_whitespace().next() else {
+                        continue;
+                    };
 
-                if iface.starts_with("veth-") || iface.starts_with("zl-") {
-                    warn!(interface = %iface, "Deleting stale network interface");
-                    let _ = tokio::process::Command::new("ip")
-                        .args(["link", "delete", iface])
-                        .output()
-                        .await;
+                    if iface.starts_with("veth-") || iface.starts_with("zl-") {
+                        warn!(interface = %iface, "Deleting stale network interface");
+                        let _ = tokio::process::Command::new("ip")
+                            .args(["link", "delete", iface])
+                            .output()
+                            .await;
+                    }
                 }
             }
+        } else {
+            warn!("Failed to list network interfaces for stale cleanup");
         }
-    } else {
-        warn!("Failed to list network interfaces for stale cleanup");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // macOS: use `ifconfig` to find stale utun devices that have a matching
+        // WireGuard UAPI socket in /var/run/wireguard/, indicating they belong
+        // to a previous zlayer run.
+        let wg_sock_dir = std::path::Path::new("/var/run/wireguard");
+        if let Ok(output) = tokio::process::Command::new("ifconfig")
+            .args(["-l"])
+            .output()
+            .await
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                for iface in stdout.split_whitespace() {
+                    if iface.starts_with("utun") {
+                        let sock_path = wg_sock_dir.join(format!("{iface}.sock"));
+                        if sock_path.exists() {
+                            warn!(interface = %iface, "Destroying stale utun interface");
+                            let _ = tokio::process::Command::new("ifconfig")
+                                .args([iface, "destroy"])
+                                .output()
+                                .await;
+                            let _ = tokio::fs::remove_file(&sock_path).await;
+                        }
+                    }
+                }
+            }
+        } else {
+            warn!("Failed to list network interfaces for stale cleanup");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -304,6 +339,41 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
             warn!(
                 port = api_port,
                 "API port still in use after 5 seconds — startup may fail with 'Address already in use'"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 4b. Wait for WireGuard UDP port to be free (DEFAULT_WG_PORT in bootstrap.rs)
+    // -----------------------------------------------------------------------
+    {
+        let wg_port: u16 = 51820;
+        let wg_addr: std::net::SocketAddr = ([0, 0, 0, 0], wg_port).into();
+        let mut wg_free = false;
+        for attempt in 1..=50 {
+            if std::net::UdpSocket::bind(wg_addr).is_ok() {
+                if attempt > 1 {
+                    info!(
+                        port = wg_port,
+                        attempts = attempt,
+                        "WireGuard UDP port is now free"
+                    );
+                }
+                wg_free = true;
+                break;
+            }
+            if attempt == 1 {
+                warn!(
+                    port = wg_port,
+                    "WireGuard UDP port still in use, waiting..."
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if !wg_free {
+            warn!(
+                port = wg_port,
+                "WireGuard UDP port still in use after 5s — overlay may fail"
             );
         }
     }

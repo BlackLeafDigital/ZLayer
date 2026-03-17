@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Overlay networking now auto-starts reliably on daemon restart by waiting for
+  the WireGuard UDP port (51820) to be freed after killing the old daemon
+  (fixes `errno=48` / EADDRINUSE on restart).
+- Stale network interface cleanup uses `ifconfig` on macOS instead of Linux-only
+  `ip` command, properly destroying orphaned utun devices with matching WireGuard
+  sockets.
+- Raft data directory now uses platform-specific data dir instead of hardcoded
+  `/var/lib/zlayer/raft` (fixes "Permission denied" on macOS without root).
+- Raft bootstrap "already bootstrapped" message downgraded to `info!` (expected
+  on every restart with persistent storage).
+- Overlay warning messages no longer reference Linux-only concepts (veth pairs)
+  on macOS. macOS hint now directs users to `sudo` or `zlayer daemon install`.
 - Windows compilation for the `zlayer` binary: moved Unix-only crate dependencies
   (`zlayer-agent`, `zlayer-overlay`, `zlayer-api`, `zlayer-proxy`, `zlayer-scheduler`,
   `zlayer-secrets`, `zlayer-storage`, `zlayer-init-actions`, `secrecy`) behind
@@ -26,6 +38,12 @@ All notable changes to this project will be documented in this file.
   stale overlay layer errors (`no such file or directory` on `buildah pull`).
 
 ### Added
+- `zlayer daemon` subcommand for service lifecycle management:
+  - `install` -- Register as system service (launchd on macOS, systemd on Linux)
+  - `uninstall` -- Remove service registration
+  - `start` / `stop` / `restart` -- Control the daemon
+  - `status` -- Show daemon and service registration status
+  - `reset` -- Wipe Raft state and node identity for clean reinitialization
 - Multi-platform build support for ZPipeline. Optional `platforms` field on pipeline
   defaults and per-image config enables building for multiple architectures (e.g.,
   linux/amd64, linux/arm64). Multi-arch builds create OCI manifest lists via buildah.

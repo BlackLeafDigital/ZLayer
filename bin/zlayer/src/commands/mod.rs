@@ -10,6 +10,8 @@ pub mod wasm;
 
 // Unix-only commands (depend on zlayer-agent, zlayer-overlay, zlayer-api, etc.)
 #[cfg(unix)]
+pub mod daemon;
+#[cfg(unix)]
 pub mod deploy;
 #[cfg(unix)]
 pub mod exec;
