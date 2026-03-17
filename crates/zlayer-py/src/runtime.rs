@@ -143,13 +143,13 @@ impl Runtime {
                         zlayer_agent::YoukiConfig::default()
                     };
 
-                    zlayer_agent::create_runtime(RuntimeConfig::Youki(config))
+                    zlayer_agent::create_runtime(RuntimeConfig::Youki(config), None)
                         .await
                         .map_err(ZLayerError::from)?
                 }
                 #[cfg(not(target_os = "linux"))]
                 {
-                    zlayer_agent::create_runtime(RuntimeConfig::Auto)
+                    zlayer_agent::create_runtime(RuntimeConfig::Auto, None)
                         .await
                         .map_err(ZLayerError::from)?
                 }

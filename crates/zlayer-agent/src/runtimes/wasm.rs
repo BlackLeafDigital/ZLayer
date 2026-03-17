@@ -408,7 +408,10 @@ impl WasmRuntime {
     ///
     /// Returns an error if the cache directory cannot be created, the wasmtime engine
     /// cannot be initialized, or the blob cache cannot be opened.
-    pub async fn new(config: WasmConfig) -> Result<Self> {
+    pub async fn new(
+        config: WasmConfig,
+        _auth_ctx: Option<crate::runtime::ContainerAuthContext>,
+    ) -> Result<Self> {
         // Create cache directory
         tokio::fs::create_dir_all(&config.cache_dir)
             .await
@@ -486,7 +489,7 @@ impl WasmRuntime {
     ///
     /// Returns an error if the runtime cannot be initialized.
     pub async fn with_defaults() -> Result<Self> {
-        Self::new(WasmConfig::default()).await
+        Self::new(WasmConfig::default(), None).await
     }
 
     /// Create a new `WasmRuntime` with custom auth configuration
@@ -498,7 +501,7 @@ impl WasmRuntime {
         config: WasmConfig,
         auth_config: zlayer_core::AuthConfig,
     ) -> Result<Self> {
-        let mut runtime = Self::new(config).await?;
+        let mut runtime = Self::new(config, None).await?;
         runtime.auth_resolver = zlayer_core::AuthResolver::new(auth_config);
         Ok(runtime)
     }

@@ -151,7 +151,7 @@ pub(crate) async fn join(
     let runtime_config = build_runtime_config(cli);
     info!(runtime = ?cli.runtime, "Creating container runtime");
 
-    let runtime = zlayer_agent::create_runtime(runtime_config)
+    let runtime = zlayer_agent::create_runtime(runtime_config, None)
         .await
         .context("Failed to create container runtime")?;
     info!("Runtime created successfully");

@@ -626,6 +626,10 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Node(node_cmd) => {
             commands::node::handle_node(node_cmd, &cli.effective_data_dir()).await
         }
+        #[cfg(unix)]
+        Commands::Daemon(action) => {
+            commands::daemon::handle_daemon(action, &cli.effective_data_dir()).await
+        }
 
         // On non-Unix platforms, runtime commands are not available
         #[cfg(not(unix))]

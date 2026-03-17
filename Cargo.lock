@@ -10040,6 +10040,7 @@ dependencies = [
  "http-body-util",
  "hyper 1.8.1",
  "ipnetwork",
+ "jsonwebtoken",
  "libc",
  "libcontainer",
  "libloading",

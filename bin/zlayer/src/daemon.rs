@@ -62,6 +62,10 @@ pub struct DaemonConfig {
 
     /// S3 configuration for `SQLite` replication (None = disabled).
     pub s3_storage: Option<zlayer_storage::LayerStorageConfig>,
+
+    /// Auth context injected into every container so it can call back to the
+    /// host API.  Built from the JWT secret and bind address in `serve()`.
+    pub auth_context: Option<zlayer_agent::ContainerAuthContext>,
 }
 
 impl Default for DaemonConfig {
@@ -78,6 +82,7 @@ impl Default for DaemonConfig {
             log_dir,
             run_dir,
             s3_storage: None,
+            auth_context: None,
         }
     }
 }
@@ -312,7 +317,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         }
     };
 
-    let runtime = zlayer_agent::create_runtime(runtime_config)
+    let runtime = zlayer_agent::create_runtime(runtime_config, config.auth_context.clone())
         .await
         .context("Failed to create container runtime")?;
 
@@ -328,17 +333,14 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         match OverlayManager::new(config.deployment_name.clone()).await {
             Ok(mut om) => {
                 if let Err(e) = om.setup_global_overlay().await {
-                    warn!(
-                        "Global overlay failed (cross-node disabled): {e}. \
-                         Container networking via veth pairs still available."
-                    );
+                    warn!("Global overlay failed (cross-node networking disabled): {e}");
                 } else {
                     info!("Global overlay network created");
                 }
                 Some(Arc::new(RwLock::new(om)))
             }
             Err(e) => {
-                warn!("Overlay networks disabled: {e}");
+                warn!("Overlay manager init failed: {e}");
                 None
             }
         }
@@ -521,6 +523,18 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 "Admin API credential bootstrapped. \
                  Generated password: {admin_password}"
             );
+            let pw_path = config.data_dir.join("admin_password");
+            if let Err(e) = std::fs::write(&pw_path, &admin_password) {
+                warn!(error = %e, "Failed to persist admin password");
+            } else {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o600));
+                }
+                info!("Admin password persisted to {}", pw_path.display());
+            }
         }
         Ok(false) => {
             info!("Admin API credential already exists");
@@ -583,6 +597,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             node_id: node_config.raft_node_id,
             address: format!("{}:{}", node_config.advertise_addr, node_config.raft_port),
             raft_port: node_config.raft_port,
+            data_dir: config.data_dir.join("raft"),
             ..Default::default()
         };
 
@@ -592,7 +607,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 if node_config.is_leader {
                     if let Err(e) = coordinator.bootstrap().await {
                         // Already bootstrapped is fine (idempotent restart)
-                        warn!("Raft bootstrap: {e} (may already be bootstrapped)");
+                        info!("Raft bootstrap: {e} (already bootstrapped — resuming)");
                     } else {
                         info!("Raft single-node cluster bootstrapped");
                     }

@@ -681,6 +681,7 @@ pub(crate) async fn handle_node_join(
     // This gives the joining node immediate overlay connectivity.
     // The TUN device will be cleaned up when this process exits; the daemon
     // will re-create it from the persisted bootstrap state on next start.
+    #[allow(clippy::needless_update)]
     let overlay_config = zlayer_overlay::OverlayConfig {
         local_endpoint: std::net::SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -690,6 +691,7 @@ pub(crate) async fn handle_node_join(
         public_key: node_config.wireguard_public_key.clone(),
         overlay_cidr: overlay_ip_cidr,
         peer_discovery_interval: Duration::from_secs(30),
+        ..zlayer_overlay::OverlayConfig::default()
     };
 
     // Convert PeerConfig to PeerInfo for the transport layer

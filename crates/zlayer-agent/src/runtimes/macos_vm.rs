@@ -328,7 +328,7 @@ impl VmRuntime {
     ///
     /// Returns an error if the required directories cannot be created.
     #[allow(unsafe_code)]
-    pub fn new() -> Result<Self> {
+    pub fn new(_auth_ctx: Option<crate::runtime::ContainerAuthContext>) -> Result<Self> {
         let data_dir = PathBuf::from("/var/lib/zlayer");
         let log_dir = PathBuf::from("/var/log/zlayer");
 

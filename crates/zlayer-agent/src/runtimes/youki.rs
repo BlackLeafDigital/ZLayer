@@ -133,6 +133,8 @@ pub struct YoukiRuntime {
     blob_cache: std::sync::Arc<Box<dyn zlayer_registry::BlobCacheBackend>>,
     /// Cached image configs (entrypoint, cmd, env, etc.) keyed by image reference
     image_configs: RwLock<HashMap<String, zlayer_registry::ImageConfig>>,
+    /// Auth context for container-to-host API authentication.
+    auth_context: Option<crate::runtime::ContainerAuthContext>,
 }
 
 impl std::fmt::Debug for YoukiRuntime {
@@ -148,7 +150,10 @@ impl YoukiRuntime {
     ///
     /// # Errors
     /// Returns an error if the required directories cannot be created.
-    pub async fn new(config: YoukiConfig) -> Result<Self> {
+    pub async fn new(
+        config: YoukiConfig,
+        auth_context: Option<crate::runtime::ContainerAuthContext>,
+    ) -> Result<Self> {
         // Ensure directories exist
         for dir in [
             &config.state_dir,
@@ -212,6 +217,7 @@ impl YoukiRuntime {
             storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
             blob_cache,
             image_configs: RwLock::new(HashMap::new()),
+            auth_context,
         })
     }
 
@@ -220,7 +226,7 @@ impl YoukiRuntime {
     /// # Errors
     /// Returns an error if the runtime cannot be initialized.
     pub async fn with_defaults() -> Result<Self> {
-        Self::new(YoukiConfig::default()).await
+        Self::new(YoukiConfig::default(), None).await
     }
 
     /// Create a new `YoukiRuntime` with custom auth configuration
@@ -294,6 +300,7 @@ impl YoukiRuntime {
             storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
             blob_cache,
             image_configs: RwLock::new(HashMap::new()),
+            auth_context: None,
         })
     }
 
@@ -817,6 +824,29 @@ impl Runtime for YoukiRuntime {
         if let Some(config) = img_config {
             bundle_builder = bundle_builder.with_image_config(config);
         }
+
+        // Inject auth env vars and socket mount so the container can talk to the host API
+        if let Some(ref auth_ctx) = self.auth_context {
+            let token = crate::auth::mint_container_token(
+                &auth_ctx.jwt_secret,
+                &id.service,
+                &format!("{}-{}", id.service, id.replica),
+                std::time::Duration::from_secs(86400 * 365),
+            )
+            .map_err(|e| crate::error::AgentError::CreateFailed {
+                id: id.to_string(),
+                reason: format!("Failed to mint container token: {e}"),
+            })?;
+            bundle_builder = bundle_builder
+                .with_env("ZLAYER_API_URL".to_string(), auth_ctx.api_url.clone())
+                .with_env("ZLAYER_TOKEN".to_string(), token)
+                .with_env(
+                    "ZLAYER_SOCKET".to_string(),
+                    "/var/run/zlayer.sock".to_string(),
+                )
+                .with_socket_mount(&auth_ctx.socket_path);
+        }
+
         bundle_builder.write_config(id, spec).await?;
 
         // Create log files
@@ -1782,7 +1812,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temp_base);
 
         // This should succeed and create all directories
-        let result = YoukiRuntime::new(config.clone()).await;
+        let result = YoukiRuntime::new(config.clone(), None).await;
 
         assert!(
             result.is_ok(),

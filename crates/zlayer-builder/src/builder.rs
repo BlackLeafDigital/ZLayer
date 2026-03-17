@@ -208,7 +208,7 @@ pub enum CacheBackendConfig {
         bucket: String,
         /// AWS region (optional, uses SDK default if not set)
         region: Option<String>,
-        /// Custom endpoint URL (for S3-compatible services like R2, B2, MinIO)
+        /// Custom endpoint URL (for S3-compatible services like R2, B2, `MinIO`)
         endpoint: Option<String>,
         /// Key prefix for cached blobs (default: "zlayer/layers/")
         prefix: Option<String>,
@@ -446,14 +446,14 @@ pub struct BuildOptions {
     ///
     /// When configured, the builder will store layer data in the specified
     /// cache backend for faster subsequent builds. This is separate from
-    /// buildah's native caching and operates at the ZLayer level.
+    /// buildah's native caching and operates at the `ZLayer` level.
     ///
     /// # Integration Points
     ///
     /// The cache backend is used at several points during the build:
     ///
     /// 1. **Before instruction execution**: Check if a cached layer exists
-    ///    for the (instruction_hash, base_layer) tuple
+    ///    for the (`instruction_hash`, `base_layer`) tuple
     /// 2. **After instruction execution**: Store the resulting layer data
     ///    in the cache for future builds
     /// 3. **Base image layers**: Cache pulled base image layers to avoid
@@ -986,6 +986,7 @@ impl ImageBuilder {
     /// When set, the builder checks the local registry for cached images
     /// before pulling from remote registries.
     #[cfg(feature = "local-registry")]
+    #[must_use]
     pub fn with_local_registry(mut self, registry: LocalRegistry) -> Self {
         self.local_registry = Some(registry);
         self
@@ -1090,6 +1091,7 @@ impl ImageBuilder {
     /// - Storing layer data after successful execution
     /// - Caching base image layers from registry pulls
     #[cfg(feature = "cache-persistent")]
+    #[must_use]
     pub fn with_cache_dir(mut self, path: impl AsRef<Path>) -> Self {
         self.options.cache_backend_config = Some(CacheBackendConfig::Persistent {
             path: path.as_ref().to_path_buf(),
@@ -1127,6 +1129,7 @@ impl ImageBuilder {
     /// TODO: The cache backend is currently stored but not actively used
     /// during builds. See `with_cache_dir` for integration status details.
     #[cfg(feature = "cache")]
+    #[must_use]
     pub fn with_memory_cache(mut self) -> Self {
         self.options.cache_backend_config = Some(CacheBackendConfig::Memory);
         debug!("Configured in-memory cache");
@@ -1137,7 +1140,7 @@ impl ImageBuilder {
     ///
     /// This is useful for distributed build systems where multiple build
     /// machines need to share a layer cache. Supports AWS S3, Cloudflare R2,
-    /// Backblaze B2, MinIO, and other S3-compatible services.
+    /// Backblaze B2, `MinIO`, and other S3-compatible services.
     ///
     /// Requires the `cache-s3` feature to be enabled.
     ///
@@ -1164,6 +1167,7 @@ impl ImageBuilder {
     /// TODO: The cache backend is currently stored but not actively used
     /// during builds. See `with_cache_dir` for integration status details.
     #[cfg(feature = "cache-s3")]
+    #[must_use]
     pub fn with_s3_cache(mut self, bucket: impl Into<String>, region: Option<String>) -> Self {
         self.options.cache_backend_config = Some(CacheBackendConfig::S3 {
             bucket: bucket.into(),
@@ -1178,7 +1182,7 @@ impl ImageBuilder {
     /// Configure an S3-compatible storage backend with custom endpoint.
     ///
     /// Use this method for S3-compatible services that require a custom
-    /// endpoint URL (e.g., Cloudflare R2, MinIO, local development).
+    /// endpoint URL (e.g., Cloudflare R2, `MinIO`, local development).
     ///
     /// Requires the `cache-s3` feature to be enabled.
     ///
@@ -1206,6 +1210,7 @@ impl ImageBuilder {
     /// # }
     /// ```
     #[cfg(feature = "cache-s3")]
+    #[must_use]
     pub fn with_s3_cache_endpoint(
         mut self,
         bucket: impl Into<String>,
@@ -1242,6 +1247,7 @@ impl ImageBuilder {
     /// # }
     /// ```
     #[cfg(feature = "cache")]
+    #[must_use]
     pub fn with_cache_config(mut self, config: CacheBackendConfig) -> Self {
         self.options.cache_backend_config = Some(config);
         debug!("Configured custom cache backend");
@@ -1273,6 +1279,7 @@ impl ImageBuilder {
     /// # }
     /// ```
     #[cfg(feature = "cache")]
+    #[must_use]
     pub fn with_cache_backend(mut self, backend: Arc<Box<dyn BlobCacheBackend>>) -> Self {
         self.cache_backend = Some(backend);
         debug!("Configured pre-initialized cache backend");
