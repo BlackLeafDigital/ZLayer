@@ -363,6 +363,7 @@ async fn status(data_dir: &Path) -> Result<()> {
 const UNIT_NAME: &str = "zlayer.service";
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn unit_path() -> std::path::PathBuf {
     let is_root = unsafe { libc::geteuid() } == 0;
     if is_root {
@@ -374,13 +375,14 @@ fn unit_path() -> std::path::PathBuf {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
 fn systemctl_args(base_args: &[&str]) -> Vec<String> {
     let is_root = unsafe { libc::geteuid() } == 0;
     if is_root {
-        base_args.iter().map(|s| s.to_string()).collect()
+        base_args.iter().copied().map(ToString::to_string).collect()
     } else {
         let mut args = vec!["--user".to_string()];
-        args.extend(base_args.iter().map(|s| s.to_string()));
+        args.extend(base_args.iter().copied().map(ToString::to_string));
         args
     }
 }
@@ -393,12 +395,13 @@ async fn install(
     jwt_secret: Option<&str>,
     no_swagger: bool,
 ) -> Result<()> {
+    use std::fmt::Write as _;
     use tokio::process::Command;
 
     let exe = std::env::current_exe().context("Cannot determine zlayer binary path")?;
 
     let mut exec_start = format!("{} serve --bind {bind}", exe.display());
-    exec_start.push_str(&format!(" --data-dir {}", data_dir.display()));
+    write!(exec_start, " --data-dir {}", data_dir.display()).unwrap();
     if no_swagger {
         exec_start.push_str(" --no-swagger");
     }
@@ -410,7 +413,7 @@ async fn install(
     };
 
     let unit = format!(
-        r#"[Unit]
+        r"[Unit]
 Description=ZLayer Container Orchestration Daemon
 Documentation=https://zlayer.dev
 After=network-online.target
@@ -428,7 +431,7 @@ LimitCORE=infinity
 {env_line}
 [Install]
 WantedBy=multi-user.target
-"#,
+",
     );
 
     let path = unit_path();
@@ -558,10 +561,10 @@ async fn status(data_dir: &Path) -> Result<()> {
         .context("Failed to query service status")?;
 
     let stdout = String::from_utf8_lossy(&out.stdout);
-    if !stdout.is_empty() {
-        println!("{stdout}");
-    } else {
+    if stdout.is_empty() {
         println!("Service: not installed");
+    } else {
+        println!("{stdout}");
     }
 
     // Check daemon.json for extra info
