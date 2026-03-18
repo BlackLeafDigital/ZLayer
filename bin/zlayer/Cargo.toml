@@ -31,7 +31,7 @@ observability = ["zlayer-observability/axum", "zlayer-observability/propagation"
 # Internal crates (cross-platform)
 zlayer-spec.workspace = true
 zlayer-observability.workspace = true
-zlayer-builder.workspace = true
+zlayer-builder = { workspace = true, features = ["cache"] }
 zlayer-core.workspace = true
 zlayer-tunnel.workspace = true
 zlayer-registry = { workspace = true, features = ["local"] }
