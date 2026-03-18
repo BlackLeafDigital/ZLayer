@@ -142,82 +142,12 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     }
 
     // -----------------------------------------------------------------------
-    // 1b. pkill fallback — if daemon.json was missing or unparseable, use
-    //     pgrep to find any orphaned zlayer processes.  Skip our own PID
-    //     and the spawner PID (parent process that launched us, e.g.
-    //     `zlayer deploy`).
+    // 1b. No pgrep fallback — if daemon.json was missing, we simply proceed.
+    //     The old daemon is either gone or will be replaced when we bind the
+    //     port/socket. Never kill arbitrary zlayer CLI processes.
     // -----------------------------------------------------------------------
     if !pid_kill_conclusive {
-        warn!("daemon.json not found or unparseable, attempting targeted kill fallback");
-
-        // Find all zlayer processes EXCEPT ourselves and our spawner, then
-        // kill them.  The spawner PID is passed via ZLAYER_SPAWNER_PID so
-        // that `zlayer deploy` (or any parent CLI command) is never
-        // accidentally killed by the daemon cleanup.
-        let my_pid = std::process::id();
-        let spawner_pid: Option<u32> = std::env::var("ZLAYER_SPAWNER_PID")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .or_else(|| {
-                let marker = config.data_dir.join("spawner.pid");
-                std::fs::read_to_string(&marker).ok()?.trim().parse().ok()
-            });
-
-        let is_protected_pid =
-            |pid: u32| -> bool { pid == my_pid || spawner_pid.is_some_and(|sp| sp == pid) };
-
-        if let Ok(output) = tokio::process::Command::new("pgrep")
-            .args(["-x", "zlayer"])
-            .output()
-            .await
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                let mut killed_any = false;
-                for line in stdout.lines() {
-                    if let Ok(pid) = line.trim().parse::<u32>() {
-                        if !is_protected_pid(pid) {
-                            info!(pid = pid, "Sending SIGTERM to stale zlayer process");
-                            unsafe { libc::kill(pid as i32, libc::SIGTERM) };
-                            killed_any = true;
-                        }
-                    }
-                }
-
-                if killed_any {
-                    // Poll for up to 5 seconds for foreign processes to die.
-                    for _ in 0..50 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        let check = tokio::process::Command::new("pgrep")
-                            .args(["-x", "zlayer"])
-                            .output()
-                            .await;
-                        match check {
-                            Ok(out) if out.status.success() => {
-                                // Check if the only remaining PIDs are protected
-                                let remaining = String::from_utf8_lossy(&out.stdout);
-                                let foreign = remaining.lines().any(|l| {
-                                    l.trim().parse::<u32>().is_ok_and(|p| !is_protected_pid(p))
-                                });
-                                if !foreign {
-                                    info!("All stale zlayer processes exited");
-                                    break;
-                                }
-                            }
-                            Ok(_) => {
-                                info!("All stale zlayer processes exited");
-                                break;
-                            }
-                            Err(_) => {}
-                        }
-                    }
-                } else {
-                    info!("No foreign zlayer processes found");
-                }
-            } else {
-                info!("pgrep found no zlayer processes");
-            }
-        }
+        info!("No daemon.json found, proceeding without killing any processes");
     }
 
     // -----------------------------------------------------------------------
