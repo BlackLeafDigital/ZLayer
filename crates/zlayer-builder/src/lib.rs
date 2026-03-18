@@ -21,7 +21,7 @@
 //! The recommended way to build images is using the [`ImageBuilder`] API:
 //!
 //! ```no_run
-//! use zlayer_builder::{ImageBuilder, Runtime};
+//! use zlayer_builder_zql::{ImageBuilder, Runtime};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,7 +42,7 @@
 //! Build images without writing a Dockerfile using runtime templates:
 //!
 //! ```no_run
-//! use zlayer_builder::{ImageBuilder, Runtime};
+//! use zlayer_builder_zql::{ImageBuilder, Runtime};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +64,7 @@
 //! can point to one explicitly with [`ImageBuilder::zimagefile`]:
 //!
 //! ```no_run
-//! use zlayer_builder::ImageBuilder;
+//! use zlayer_builder_zql::ImageBuilder;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -88,9 +88,9 @@
 //! buildah command generation APIs directly:
 //!
 //! ```no_run
-//! use zlayer_builder::{Dockerfile, BuildahCommand, BuildahExecutor};
+//! use zlayer_builder_zql::{Dockerfile, BuildahCommand, BuildahExecutor};
 //!
-//! # async fn example() -> Result<(), zlayer_builder::BuildError> {
+//! # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
 //! // Parse a Dockerfile
 //! let dockerfile = Dockerfile::parse(r#"
 //!     FROM alpine:3.18

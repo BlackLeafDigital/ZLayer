@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use zlayer_builder::{ImageBuilder, Runtime};
+//! use zlayer_builder_zql::{ImageBuilder, Runtime};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,7 +26,7 @@
 //! # Using Runtime Templates
 //!
 //! ```no_run
-//! use zlayer_builder::{ImageBuilder, Runtime};
+//! use zlayer_builder_zql::{ImageBuilder, Runtime};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,7 +45,7 @@
 //! # Multi-stage Builds with Target
 //!
 //! ```no_run
-//! use zlayer_builder::ImageBuilder;
+//! use zlayer_builder_zql::ImageBuilder;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +64,7 @@
 //! # With TUI Progress Updates
 //!
 //! ```no_run
-//! use zlayer_builder::{ImageBuilder, BuildEvent};
+//! use zlayer_builder_zql::{ImageBuilder, BuildEvent};
 //! use std::sync::mpsc;
 //!
 //! #[tokio::main]
@@ -92,7 +92,7 @@
 //! # With Cache Backend (requires `cache` feature)
 //!
 //! ```no_run,ignore
-//! use zlayer_builder::ImageBuilder;
+//! use zlayer_builder_zql::ImageBuilder;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -164,9 +164,9 @@ pub enum BuildOutput {
 /// # Example
 ///
 /// ```no_run,ignore
-/// use zlayer_builder::{ImageBuilder, CacheBackendConfig};
+/// use zlayer_builder_zql::{ImageBuilder, CacheBackendConfig};
 ///
-/// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+/// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
 /// // Use persistent disk cache
 /// let builder = ImageBuilder::new("./my-app").await?
 ///     .with_cache_config(CacheBackendConfig::Persistent {
@@ -532,7 +532,7 @@ impl Default for BuildOptions {
 /// cached layer data to speed up subsequent builds:
 ///
 /// ```no_run,ignore
-/// use zlayer_builder::ImageBuilder;
+/// use zlayer_builder_zql::ImageBuilder;
 ///
 /// let builder = ImageBuilder::new("./my-app").await?
 ///     .with_cache_dir("/var/cache/zlayer")
@@ -583,9 +583,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_builder::ImageBuilder;
+    /// use zlayer_builder_zql::ImageBuilder;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?;
     /// # Ok(())
     /// # }
@@ -674,8 +674,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # use zlayer_builder_zql::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .dockerfile("./my-project/Dockerfile.prod");
     /// # Ok(())
@@ -696,8 +696,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # use zlayer_builder_zql::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .zimagefile("./my-project/ZImagefile");
     /// # Ok(())
@@ -717,9 +717,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_builder::{ImageBuilder, Runtime};
+    /// use zlayer_builder_zql::{ImageBuilder, Runtime};
     ///
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-node-app").await?
     ///     .runtime(Runtime::Node20);
     /// # Ok(())
@@ -739,8 +739,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # use zlayer_builder_zql::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .build_arg("VERSION", "1.0.0")
     ///     .build_arg("DEBUG", "false");
@@ -768,8 +768,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # use zlayer_builder_zql::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// // Dockerfile:
     /// // FROM node:20 AS builder
     /// // ...
@@ -796,8 +796,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # use zlayer_builder_zql::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .tag("myapp:latest")
     ///     .tag("myapp:v1.0.0")
@@ -839,8 +839,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # use zlayer_builder_zql::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .layers(false)  // Disable layer caching
     ///     .tag("myapp:latest");
@@ -869,8 +869,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # use zlayer_builder_zql::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .cache_from("registry.example.com/myapp:cache")
     ///     .tag("myapp:latest");
@@ -899,8 +899,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # use zlayer_builder_zql::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .cache_to("registry.example.com/myapp:cache")
     ///     .tag("myapp:latest");
@@ -929,9 +929,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder::ImageBuilder;
+    /// # use zlayer_builder_zql::ImageBuilder;
     /// # use std::time::Duration;
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .cache_ttl(Duration::from_secs(3600 * 24))  // 24 hours
     ///     .tag("myapp:latest");
@@ -953,9 +953,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_builder::{ImageBuilder, RegistryAuth};
+    /// use zlayer_builder_zql::{ImageBuilder, RegistryAuth};
     ///
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .tag("registry.example.com/myapp:v1.0.0")
     ///     .push(RegistryAuth::new("user", "password"));
@@ -1050,10 +1050,10 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_builder::{ImageBuilder, BuildEvent};
+    /// use zlayer_builder_zql::{ImageBuilder, BuildEvent};
     /// use std::sync::mpsc;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let (tx, rx) = mpsc::channel::<BuildEvent>();
     ///
     /// let builder = ImageBuilder::new("./my-project").await?
@@ -1084,9 +1084,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder::ImageBuilder;
+    /// use zlayer_builder_zql::ImageBuilder;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .with_cache_dir("/var/cache/zlayer")
     ///     .tag("myapp:latest");
@@ -1125,9 +1125,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder::ImageBuilder;
+    /// use zlayer_builder_zql::ImageBuilder;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .with_memory_cache()
     ///     .tag("myapp:latest");
@@ -1163,9 +1163,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder::ImageBuilder;
+    /// use zlayer_builder_zql::ImageBuilder;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .with_s3_cache("my-build-cache", Some("us-west-2"))
     ///     .tag("myapp:latest");
@@ -1206,9 +1206,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder::ImageBuilder;
+    /// use zlayer_builder_zql::ImageBuilder;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// // Cloudflare R2
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .with_s3_cache_endpoint(
@@ -1248,9 +1248,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder::{ImageBuilder, CacheBackendConfig};
+    /// use zlayer_builder_zql::{ImageBuilder, CacheBackendConfig};
     ///
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .with_cache_config(CacheBackendConfig::Memory)
     ///     .tag("myapp:latest");
@@ -1276,11 +1276,11 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder::ImageBuilder;
+    /// use zlayer_builder_zql::ImageBuilder;
     /// use zlayer_registry::cache::BlobCache;
     /// use std::sync::Arc;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
     /// let cache = Arc::new(Box::new(BlobCache::new()?) as Box<dyn zlayer_registry::cache::BlobCacheBackend>);
     ///
     /// let builder = ImageBuilder::new("./my-project").await?
