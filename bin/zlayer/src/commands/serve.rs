@@ -157,7 +157,11 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
         let my_pid = std::process::id();
         let spawner_pid: Option<u32> = std::env::var("ZLAYER_SPAWNER_PID")
             .ok()
-            .and_then(|v| v.parse().ok());
+            .and_then(|v| v.parse().ok())
+            .or_else(|| {
+                let marker = config.data_dir.join("spawner.pid");
+                std::fs::read_to_string(&marker).ok()?.trim().parse().ok()
+            });
 
         let is_protected_pid =
             |pid: u32| -> bool { pid == my_pid || spawner_pid.is_some_and(|sp| sp == pid) };
@@ -504,6 +508,7 @@ pub(crate) async fn serve(
         dead_node_detection_handle,
         scheduler: _scheduler,
         internal_token: daemon_internal_token,
+        replicator,
     } = state;
 
     // -----------------------------------------------------------------------
@@ -670,8 +675,8 @@ pub(crate) async fn serve(
     let tunnel_routes = build_tunnel_routes(tunnel_state);
     router = router.nest("/api/v1/tunnels", tunnel_routes);
 
-    // Merge storage replication status routes (always disabled on ZQL)
-    let storage_api_state = zlayer_api::StorageState::new();
+    // Merge storage replication status routes
+    let storage_api_state = zlayer_api::StorageState::new(replicator);
     let storage_routes = zlayer_api::build_storage_routes(storage_api_state);
     router = router.nest("/api/v1/storage", storage_routes);
 

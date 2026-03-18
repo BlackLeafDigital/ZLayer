@@ -60,7 +60,7 @@ pub struct DaemonConfig {
     /// Runtime directory (sockets, PID files).  Default: `{data_dir}/run` on macOS, `/var/run/zlayer` on Linux.
     pub run_dir: PathBuf,
 
-    /// S3 configuration for layer storage (None = disabled).
+    /// S3 configuration for `SQLite` replication (None = disabled).
     pub s3_storage: Option<zlayer_storage::LayerStorageConfig>,
 
     /// Auth context injected into every container so it can call back to the
@@ -124,7 +124,7 @@ pub struct DaemonState {
     /// Persistent deployment storage (ZQL).
     pub storage: Arc<ZqlStorage>,
 
-    /// Persistent encrypted secrets store (`SQLite` + XChaCha20-Poly1305).
+    /// Persistent encrypted secrets store (ZQL + XChaCha20-Poly1305).
     pub secrets: Arc<PersistentSecretsStore>,
 
     /// Credential store for API key authentication.
@@ -164,6 +164,10 @@ pub struct DaemonState {
     /// Internal authentication token shared between the scheduler and the API.
     /// Needed by serve.rs to create `InternalState` with the same token.
     pub internal_token: String,
+
+    /// ZQL replicator for deployment DB backup to S3.
+    /// `None` when S3 storage is not configured.
+    pub replicator: Option<Arc<zlayer_storage::ZqlReplicator>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +258,7 @@ pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Resu
 ///
 /// # Errors
 ///
-/// Returns an error if any critical infrastructure phase fails (e.g. directory
-/// creation, runtime init, storage open, secrets store open, or node config).
+/// Returns an error if any infrastructure phase fails to initialize.
 #[allow(clippy::too_many_lines)]
 pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
@@ -440,12 +443,57 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
     // Phase 9: Persistent deployment storage (ZQL)
     // -----------------------------------------------------------------------
-    let db_path = config.data_dir.join("deployments_zql");
+    let db_path = config.data_dir.join("deployments.db");
     let storage =
         Arc::new(ZqlStorage::open(&db_path).await.with_context(|| {
             format!("Failed to open deployment storage at {}", db_path.display())
         })?);
     info!(path = %db_path.display(), "Deployment storage opened");
+
+    // -----------------------------------------------------------------------
+    // Phase 9b: ZQL replication to S3
+    // -----------------------------------------------------------------------
+    let replicator = if let Some(ref s3_config) = config.s3_storage {
+        let replicator_config = zlayer_storage::ZqlReplicatorConfig::new(
+            &db_path,
+            &s3_config.bucket,
+            format!("{}/deployments/", config.deployment_name),
+        )
+        .with_auto_restore(true)
+        .with_cache_dir(config.data_dir.join("replicator-cache"));
+
+        match zlayer_storage::ZqlReplicator::new(replicator_config, s3_config).await {
+            Ok(replicator) => {
+                // Register dirty-flag listener on the deployment database so
+                // the replicator knows when data has been mutated.
+                let listener = zlayer_storage::DirtyFlagListener::new(replicator.dirty_flag());
+                if let Err(e) = storage.add_change_listener(Box::new(listener)).await {
+                    warn!("Failed to register replicator change listener: {e}");
+                }
+
+                // Auto-restore on startup if backup exists
+                match replicator.restore().await {
+                    Ok(true) => info!("Deployment DB restored from S3 backup"),
+                    Ok(false) => info!("No S3 backup found, starting fresh"),
+                    Err(e) => warn!("S3 restore failed (non-fatal): {e}"),
+                }
+                // Start background snapshot replication
+                if let Err(e) = replicator.start().await {
+                    warn!("Failed to start ZQL replicator (non-fatal): {e}");
+                    None
+                } else {
+                    info!("ZQL replication to S3 started");
+                    Some(Arc::new(replicator))
+                }
+            }
+            Err(e) => {
+                warn!("Failed to create ZQL replicator (non-fatal): {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // -----------------------------------------------------------------------
     // Phase 10: Persistent secrets store
@@ -496,7 +544,44 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             }
         }
         Ok(false) => {
-            info!("Admin API credential already exists");
+            let pw_path = config.data_dir.join("admin_password");
+            if pw_path.exists() {
+                info!("Admin API credential already exists");
+            } else {
+                warn!("Admin credential exists but password file is missing — regenerating");
+                let new_password = generate_admin_password();
+
+                if let Err(e) = credential_store.delete_api_key("admin").await {
+                    warn!(error = %e, "Failed to delete old admin credential");
+                }
+
+                match credential_store
+                    .create_api_key("admin", &new_password, &["admin"])
+                    .await
+                {
+                    Ok(()) => {
+                        if let Err(e) = std::fs::write(&pw_path, &new_password) {
+                            warn!(error = %e, "Failed to persist regenerated admin password");
+                        } else {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = std::fs::set_permissions(
+                                    &pw_path,
+                                    std::fs::Permissions::from_mode(0o600),
+                                );
+                            }
+                            info!(
+                                "Admin password regenerated and persisted to {}",
+                                pw_path.display()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to recreate admin credential");
+                    }
+                }
+            }
         }
         Err(e) => {
             warn!(error = %e, "Failed to bootstrap admin credential (non-fatal)");
@@ -551,6 +636,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // Phase 15: Raft distributed consensus
     // -----------------------------------------------------------------------
     let (raft, raft_server_handle) = {
+        let _raft_db_path = config.data_dir.join("raft.db");
         let raft_cfg = RaftConfig {
             node_id: node_config.raft_node_id,
             address: format!("{}:{}", node_config.advertise_addr, node_config.raft_port),
@@ -671,7 +757,6 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             raft: RaftConfig {
                 node_id: node_config.raft_node_id,
                 address: format!("{}:{}", node_config.advertise_addr, node_config.raft_port),
-                data_dir: config.data_dir.join("raft"),
                 ..Default::default()
             },
             ..Default::default()
@@ -747,6 +832,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         dead_node_detection_handle,
         scheduler,
         internal_token,
+        replicator,
     })
 }
 
@@ -818,6 +904,7 @@ async fn heartbeat_loop(
 ///
 /// When a scheduler is provided, the loop also triggers rescheduling of the
 /// dead node's containers to remaining live nodes.
+#[allow(clippy::cast_possible_truncation)]
 async fn dead_node_detection_loop(
     raft: Arc<zlayer_scheduler::RaftCoordinator>,
     scheduler: Option<Arc<Scheduler>>,
@@ -832,13 +919,10 @@ async fn dead_node_detection_loop(
         }
 
         let state = raft.read_state().await;
-        let now = u64::try_from(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis(),
-        )
-        .unwrap_or(u64::MAX);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64; // milliseconds since epoch fits in u64
 
         let self_id = raft.node_id();
 
@@ -848,9 +932,7 @@ async fn dead_node_detection_loop(
                 continue;
             }
 
-            if now.saturating_sub(node_info.last_heartbeat)
-                > u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX)
-            {
+            if now.saturating_sub(node_info.last_heartbeat) > timeout.as_millis() as u64 {
                 warn!(
                     node_id = id,
                     last_heartbeat_ms = node_info.last_heartbeat,
@@ -1171,7 +1253,7 @@ async fn cleanup_old_logs_walk(
 ///
 /// # Errors
 ///
-/// Returns an error if the deployment list cannot be read from storage.
+/// Returns an error if listing deployments from storage fails.
 pub async fn restore_deployments(state: &DaemonState) -> Result<()> {
     let deployments = state
         .storage

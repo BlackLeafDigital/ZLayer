@@ -14,10 +14,12 @@
 
 pub mod config;
 pub mod error;
+pub mod replicator;
 pub mod snapshot;
 pub mod sync;
 pub mod types;
 
 pub use config::*;
 pub use error::*;
+pub use replicator::{DirtyFlagListener, ZqlReplicator, ZqlReplicatorConfig};
 pub use types::*;

@@ -1037,14 +1037,14 @@ mod tests {
 
     #[test]
     fn test_build_storage_routes() {
-        let storage_state = StorageState::new();
+        let storage_state = StorageState::new(None);
         let _routes = build_storage_routes(storage_state);
         // Routes build without error
     }
 
     #[test]
     fn test_build_storage_routes_default() {
-        let storage_state = StorageState;
+        let storage_state = StorageState::default();
         let _routes = build_storage_routes(storage_state);
         // Routes build without error (disabled replicator)
     }

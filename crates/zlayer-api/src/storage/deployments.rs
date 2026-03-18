@@ -84,6 +84,22 @@ impl ZqlStorage {
         })
     }
 
+    /// Register a change listener on the underlying ZQL database.
+    ///
+    /// This allows external components (e.g. the replicator) to be notified
+    /// when the database is mutated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StorageError`] if the database lock cannot be acquired.
+    pub async fn add_change_listener(
+        &self,
+        listener: Box<dyn zql::events::ChangeListener>,
+    ) -> Result<usize, StorageError> {
+        let mut db = self.db.lock().await;
+        Ok(db.add_change_listener(listener))
+    }
+
     /// Create a ZQL database in a temporary directory (useful for testing)
     ///
     /// # Errors

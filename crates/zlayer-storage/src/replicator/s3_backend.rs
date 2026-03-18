@@ -1,8 +1,7 @@
-//! S3 upload/download for `SQLite` backups
+//! S3 upload/download for ZQL database backups
 //!
-//! Handles uploading snapshots and WAL segments to S3, and downloading for restore.
+//! Handles uploading compressed snapshots to S3 and downloading for restore.
 
-use super::cache::CacheEntry;
 use crate::error::{LayerStorageError, Result};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
@@ -17,8 +16,6 @@ pub struct ReplicationMetadata {
     pub latest_snapshot: Option<String>,
     /// Timestamp of latest snapshot
     pub latest_snapshot_time: Option<chrono::DateTime<chrono::Utc>>,
-    /// Highest WAL sequence uploaded
-    pub latest_wal_sequence: Option<u64>,
     /// Total number of snapshots stored
     pub snapshot_count: u64,
     /// Database identifier (for validation)
@@ -32,7 +29,6 @@ impl Default for ReplicationMetadata {
         Self {
             latest_snapshot: None,
             latest_snapshot_time: None,
-            latest_wal_sequence: None,
             snapshot_count: 0,
             db_identifier: None,
             last_modified: chrono::Utc::now(),
@@ -40,7 +36,7 @@ impl Default for ReplicationMetadata {
     }
 }
 
-/// S3 backend for `SQLite` replication
+/// S3 backend for ZQL database replication
 pub struct S3Backend {
     client: S3Client,
     bucket: String,
@@ -69,15 +65,10 @@ impl S3Backend {
     /// Build the S3 key for a snapshot
     fn snapshot_key(&self, timestamp: &chrono::DateTime<chrono::Utc>) -> String {
         format!(
-            "{}snapshots/{}.sqlite.zst",
+            "{}snapshots/{}.zql.tar.zst",
             self.prefix,
             timestamp.format("%Y%m%d_%H%M%S")
         )
-    }
-
-    /// Build the S3 key for a WAL segment
-    fn wal_key(&self, sequence: u64) -> String {
-        format!("{}wal/{:020}.wal.zst", self.prefix, sequence)
     }
 
     /// Build the S3 key for metadata
@@ -85,7 +76,7 @@ impl S3Backend {
         format!("{}metadata.json", self.prefix)
     }
 
-    /// Upload a database snapshot
+    /// Upload a database snapshot (tar+zstd archive of the ZQL data directory)
     pub async fn upload_snapshot(&self, data: &[u8]) -> Result<()> {
         let timestamp = chrono::Utc::now();
         let key = self.snapshot_key(&timestamp);
@@ -101,7 +92,11 @@ impl S3Backend {
         let compressed = self.compress(data)?;
 
         #[allow(clippy::cast_precision_loss)]
-        let reduction_pct = (1.0 - (compressed.len() as f64 / data.len() as f64)) * 100.0;
+        let reduction_pct = if data.is_empty() {
+            0.0
+        } else {
+            (1.0 - (compressed.len() as f64 / data.len() as f64)) * 100.0
+        };
         info!(
             "Compressed {} bytes to {} bytes ({:.1}% reduction)",
             data.len(),
@@ -124,40 +119,6 @@ impl S3Backend {
         Ok(())
     }
 
-    /// Upload a WAL segment
-    pub async fn upload_wal_segment(&self, entry: &CacheEntry) -> Result<()> {
-        let key = self.wal_key(entry.sequence);
-
-        debug!(
-            "Uploading WAL segment {} to s3://{}/{} ({} bytes)",
-            entry.sequence,
-            self.bucket,
-            key,
-            entry.data.len()
-        );
-
-        // Compress the data
-        let compressed = self.compress(&entry.data)?;
-        let compressed_len = compressed.len();
-
-        // Upload to S3
-        self.client
-            .put_object()
-            .bucket(&self.bucket)
-            .key(&key)
-            .body(ByteStream::from(compressed))
-            .content_type("application/zstd")
-            .send()
-            .await
-            .map_err(|e| LayerStorageError::S3(e.to_string()))?;
-
-        debug!(
-            "WAL segment {} uploaded ({} bytes compressed)",
-            entry.sequence, compressed_len
-        );
-        Ok(())
-    }
-
     /// Download the latest snapshot
     pub async fn download_latest_snapshot(&self) -> Result<Option<Vec<u8>>> {
         // Get metadata to find latest snapshot
@@ -171,7 +132,8 @@ impl S3Backend {
             if snapshots.is_empty() {
                 return Ok(None);
             }
-            snapshots.last().unwrap().clone()
+            // Safe: we just checked `is_empty()`
+            snapshots.into_iter().last().unwrap_or_default()
         };
 
         info!("Downloading snapshot: {}", snapshot_key);
@@ -204,97 +166,6 @@ impl S3Backend {
         Ok(Some(decompressed))
     }
 
-    /// Download WAL segments since a given sequence
-    pub async fn download_wal_segments_since(&self, sequence: u64) -> Result<Vec<CacheEntry>> {
-        let prefix = format!("{}wal/", self.prefix);
-
-        let mut segments = Vec::new();
-        let mut continuation_token: Option<String> = None;
-
-        loop {
-            let mut request = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(&prefix);
-
-            if let Some(token) = &continuation_token {
-                request = request.continuation_token(token);
-            }
-
-            let response = request
-                .send()
-                .await
-                .map_err(|e| LayerStorageError::S3(e.to_string()))?;
-
-            for object in response.contents() {
-                if let Some(key) = object.key() {
-                    // Parse sequence from key
-                    if let Some(seq) = Self::parse_wal_sequence(key) {
-                        if seq > sequence {
-                            // Download this segment
-                            let entry = self.download_wal_segment(key, seq).await?;
-                            segments.push(entry);
-                        }
-                    }
-                }
-            }
-
-            if response.is_truncated().unwrap_or(false) {
-                continuation_token = response.next_continuation_token().map(String::from);
-            } else {
-                break;
-            }
-        }
-
-        // Sort by sequence
-        segments.sort_by_key(|e| e.sequence);
-
-        info!(
-            "Downloaded {} WAL segments since sequence {}",
-            segments.len(),
-            sequence
-        );
-
-        Ok(segments)
-    }
-
-    /// Download a single WAL segment
-    async fn download_wal_segment(&self, key: &str, sequence: u64) -> Result<CacheEntry> {
-        let response = self
-            .client
-            .get_object()
-            .bucket(&self.bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| LayerStorageError::S3(e.to_string()))?;
-
-        let compressed_bytes = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| LayerStorageError::S3(e.to_string()))?
-            .into_bytes();
-
-        let data = self.decompress(&compressed_bytes)?;
-
-        Ok(CacheEntry {
-            sequence,
-            data,
-            cached_at: chrono::Utc::now(),
-            attempts: 0,
-        })
-    }
-
-    /// Parse sequence number from WAL key
-    fn parse_wal_sequence(key: &str) -> Option<u64> {
-        // Key format: {prefix}wal/{sequence:020}.wal.zst
-        let filename = key.rsplit('/').next()?;
-        let sequence_str = filename.strip_suffix(".wal.zst")?;
-        sequence_str.parse().ok()
-    }
-
     /// List all snapshot keys
     pub async fn list_snapshots(&self) -> Result<Vec<String>> {
         let prefix = format!("{}snapshots/", self.prefix);
@@ -320,7 +191,7 @@ impl S3Backend {
 
             for object in response.contents() {
                 if let Some(key) = object.key() {
-                    if key.ends_with(".sqlite.zst") {
+                    if key.ends_with(".zql.tar.zst") {
                         keys.push(key.to_string());
                     }
                 }
@@ -374,7 +245,7 @@ impl S3Backend {
     }
 
     /// Update replication metadata in S3
-    pub async fn update_metadata(&self, wal_sequence: Option<u64>) -> Result<()> {
+    pub async fn update_metadata(&self) -> Result<()> {
         let key = self.metadata_key();
 
         // Get current metadata
@@ -387,12 +258,6 @@ impl S3Backend {
             metadata.latest_snapshot_time = Some(chrono::Utc::now());
         }
         metadata.snapshot_count = snapshots.len() as u64;
-
-        // Update WAL sequence if provided
-        if let Some(seq) = wal_sequence {
-            metadata.latest_wal_sequence = Some(seq);
-        }
-
         metadata.last_modified = chrono::Utc::now();
 
         // Upload metadata
@@ -461,63 +326,6 @@ impl S3Backend {
         info!("Cleaned up {} old snapshots", deleted);
         Ok(deleted)
     }
-
-    /// Delete WAL segments older than a given sequence
-    #[allow(dead_code)]
-    pub async fn cleanup_old_wal(&self, before_sequence: u64) -> Result<usize> {
-        let prefix = format!("{}wal/", self.prefix);
-
-        let mut deleted = 0;
-        let mut continuation_token: Option<String> = None;
-
-        loop {
-            let mut request = self
-                .client
-                .list_objects_v2()
-                .bucket(&self.bucket)
-                .prefix(&prefix);
-
-            if let Some(token) = &continuation_token {
-                request = request.continuation_token(token);
-            }
-
-            let response = request
-                .send()
-                .await
-                .map_err(|e| LayerStorageError::S3(e.to_string()))?;
-
-            for object in response.contents() {
-                if let Some(key) = object.key() {
-                    if let Some(seq) = Self::parse_wal_sequence(key) {
-                        if seq < before_sequence
-                            && self
-                                .client
-                                .delete_object()
-                                .bucket(&self.bucket)
-                                .key(key)
-                                .send()
-                                .await
-                                .is_ok()
-                        {
-                            deleted += 1;
-                        }
-                    }
-                }
-            }
-
-            if response.is_truncated().unwrap_or(false) {
-                continuation_token = response.next_continuation_token().map(String::from);
-            } else {
-                break;
-            }
-        }
-
-        info!(
-            "Cleaned up {} WAL segments older than sequence {}",
-            deleted, before_sequence
-        );
-        Ok(deleted)
-    }
 }
 
 #[cfg(test)]
@@ -525,27 +333,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_wal_sequence() {
-        assert_eq!(
-            S3Backend::parse_wal_sequence("prefix/wal/00000000000000000001.wal.zst"),
-            Some(1)
-        );
-        assert_eq!(
-            S3Backend::parse_wal_sequence("prefix/wal/00000000000000000100.wal.zst"),
-            Some(100)
-        );
-        assert_eq!(S3Backend::parse_wal_sequence("invalid"), None);
-        assert_eq!(
-            S3Backend::parse_wal_sequence("prefix/wal/abc.wal.zst"),
-            None
-        );
-    }
-
-    #[test]
     fn test_metadata_default() {
         let metadata = ReplicationMetadata::default();
         assert!(metadata.latest_snapshot.is_none());
-        assert!(metadata.latest_wal_sequence.is_none());
         assert_eq!(metadata.snapshot_count, 0);
     }
 }

@@ -83,6 +83,92 @@ impl Default for LayerStorageConfig {
     }
 }
 
+// ============================================================================
+// ZQL Replicator Configuration
+// ============================================================================
+
+/// Configuration for ZQL database replication to S3
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ZqlReplicatorConfig {
+    /// Path to the ZQL database data directory
+    pub data_dir: PathBuf,
+    /// S3 bucket for storing backups
+    pub s3_bucket: String,
+    /// S3 key prefix for backup objects
+    pub s3_prefix: String,
+    /// Local directory for staging/caching snapshots
+    pub cache_dir: PathBuf,
+    /// Maximum cache size in bytes
+    #[serde(default = "default_max_cache_size")]
+    pub max_cache_size: u64,
+    /// Whether to automatically restore from S3 on startup if no local DB
+    #[serde(default)]
+    pub auto_restore: bool,
+    /// Interval in seconds between periodic snapshots
+    #[serde(default = "default_snapshot_interval")]
+    pub snapshot_interval_secs: u64,
+}
+
+fn default_max_cache_size() -> u64 {
+    100 * 1024 * 1024 // 100MB
+}
+
+fn default_snapshot_interval() -> u64 {
+    3600 // 1 hour
+}
+
+impl ZqlReplicatorConfig {
+    /// Create a new replicator config with required fields
+    pub fn new(
+        data_dir: impl Into<PathBuf>,
+        s3_bucket: impl Into<String>,
+        s3_prefix: impl Into<String>,
+    ) -> Self {
+        let data_dir = data_dir.into();
+        let cache_dir = data_dir.parent().map_or_else(
+            || PathBuf::from("/tmp/zlayer-replicator/cache"),
+            |p| p.join("replicator-cache"),
+        );
+        Self {
+            data_dir,
+            s3_bucket: s3_bucket.into(),
+            s3_prefix: s3_prefix.into(),
+            cache_dir,
+            max_cache_size: default_max_cache_size(),
+            auto_restore: false,
+            snapshot_interval_secs: default_snapshot_interval(),
+        }
+    }
+
+    /// Enable automatic restore from S3 on startup
+    #[must_use]
+    pub fn with_auto_restore(mut self, auto_restore: bool) -> Self {
+        self.auto_restore = auto_restore;
+        self
+    }
+
+    /// Set the local cache directory for staging snapshots
+    #[must_use]
+    pub fn with_cache_dir(mut self, cache_dir: impl Into<PathBuf>) -> Self {
+        self.cache_dir = cache_dir.into();
+        self
+    }
+
+    /// Set the maximum cache size in bytes
+    #[must_use]
+    pub fn with_max_cache_size(mut self, max_cache_size: u64) -> Self {
+        self.max_cache_size = max_cache_size;
+        self
+    }
+
+    /// Set the snapshot interval in seconds
+    #[must_use]
+    pub fn with_snapshot_interval(mut self, secs: u64) -> Self {
+        self.snapshot_interval_secs = secs;
+        self
+    }
+}
+
 impl LayerStorageConfig {
     /// Create a new config with the required bucket name
     pub fn new(bucket: impl Into<String>) -> Self {

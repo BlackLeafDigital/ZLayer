@@ -7,7 +7,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use zlayer_builder_zql::{ImageBuilder, Runtime};
+//! use zlayer_builder::{ImageBuilder, Runtime};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,7 +26,7 @@
 //! # Using Runtime Templates
 //!
 //! ```no_run
-//! use zlayer_builder_zql::{ImageBuilder, Runtime};
+//! use zlayer_builder::{ImageBuilder, Runtime};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -45,7 +45,7 @@
 //! # Multi-stage Builds with Target
 //!
 //! ```no_run
-//! use zlayer_builder_zql::ImageBuilder;
+//! use zlayer_builder::ImageBuilder;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +64,7 @@
 //! # With TUI Progress Updates
 //!
 //! ```no_run
-//! use zlayer_builder_zql::{ImageBuilder, BuildEvent};
+//! use zlayer_builder::{ImageBuilder, BuildEvent};
 //! use std::sync::mpsc;
 //!
 //! #[tokio::main]
@@ -92,7 +92,7 @@
 //! # With Cache Backend (requires `cache` feature)
 //!
 //! ```no_run,ignore
-//! use zlayer_builder_zql::ImageBuilder;
+//! use zlayer_builder::ImageBuilder;
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -164,9 +164,9 @@ pub enum BuildOutput {
 /// # Example
 ///
 /// ```no_run,ignore
-/// use zlayer_builder_zql::{ImageBuilder, CacheBackendConfig};
+/// use zlayer_builder::{ImageBuilder, CacheBackendConfig};
 ///
-/// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+/// # async fn example() -> Result<(), zlayer_builder::BuildError> {
 /// // Use persistent disk cache
 /// let builder = ImageBuilder::new("./my-app").await?
 ///     .with_cache_config(CacheBackendConfig::Persistent {
@@ -208,7 +208,7 @@ pub enum CacheBackendConfig {
         bucket: String,
         /// AWS region (optional, uses SDK default if not set)
         region: Option<String>,
-        /// Custom endpoint URL (for S3-compatible services like R2, B2, MinIO)
+        /// Custom endpoint URL (for S3-compatible services like R2, B2, `MinIO`)
         endpoint: Option<String>,
         /// Key prefix for cached blobs (default: "zlayer/layers/")
         prefix: Option<String>,
@@ -446,14 +446,14 @@ pub struct BuildOptions {
     ///
     /// When configured, the builder will store layer data in the specified
     /// cache backend for faster subsequent builds. This is separate from
-    /// buildah's native caching and operates at the ZLayer level.
+    /// buildah's native caching and operates at the `ZLayer` level.
     ///
     /// # Integration Points
     ///
     /// The cache backend is used at several points during the build:
     ///
     /// 1. **Before instruction execution**: Check if a cached layer exists
-    ///    for the (instruction_hash, base_layer) tuple
+    ///    for the (`instruction_hash`, `base_layer`) tuple
     /// 2. **After instruction execution**: Store the resulting layer data
     ///    in the cache for future builds
     /// 3. **Base image layers**: Cache pulled base image layers to avoid
@@ -532,7 +532,7 @@ impl Default for BuildOptions {
 /// cached layer data to speed up subsequent builds:
 ///
 /// ```no_run,ignore
-/// use zlayer_builder_zql::ImageBuilder;
+/// use zlayer_builder::ImageBuilder;
 ///
 /// let builder = ImageBuilder::new("./my-app").await?
 ///     .with_cache_dir("/var/cache/zlayer")
@@ -583,9 +583,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_builder_zql::ImageBuilder;
+    /// use zlayer_builder::ImageBuilder;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?;
     /// # Ok(())
     /// # }
@@ -605,8 +605,19 @@ impl ImageBuilder {
             });
         }
 
-        // Initialize buildah executor
-        let executor = BuildahExecutor::new_async().await?;
+        // Initialize buildah executor.
+        // On macOS, if buildah is not found we fall back to a default executor
+        // and use the native sandbox builder instead during build().
+        let executor = match BuildahExecutor::new_async().await {
+            Ok(exec) => exec,
+            #[cfg(target_os = "macos")]
+            Err(_) => {
+                info!("Buildah not found on macOS; will use native sandbox builder");
+                BuildahExecutor::default()
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err(e) => return Err(e),
+        };
 
         debug!("Created ImageBuilder for context: {}", context.display());
 
@@ -663,8 +674,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder_zql::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # use zlayer_builder::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .dockerfile("./my-project/Dockerfile.prod");
     /// # Ok(())
@@ -685,8 +696,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder_zql::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # use zlayer_builder::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .zimagefile("./my-project/ZImagefile");
     /// # Ok(())
@@ -706,9 +717,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_builder_zql::{ImageBuilder, Runtime};
+    /// use zlayer_builder::{ImageBuilder, Runtime};
     ///
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-node-app").await?
     ///     .runtime(Runtime::Node20);
     /// # Ok(())
@@ -728,8 +739,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder_zql::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # use zlayer_builder::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .build_arg("VERSION", "1.0.0")
     ///     .build_arg("DEBUG", "false");
@@ -757,8 +768,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder_zql::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # use zlayer_builder::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// // Dockerfile:
     /// // FROM node:20 AS builder
     /// // ...
@@ -785,8 +796,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder_zql::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # use zlayer_builder::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .tag("myapp:latest")
     ///     .tag("myapp:v1.0.0")
@@ -828,8 +839,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder_zql::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # use zlayer_builder::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .layers(false)  // Disable layer caching
     ///     .tag("myapp:latest");
@@ -858,8 +869,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder_zql::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # use zlayer_builder::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .cache_from("registry.example.com/myapp:cache")
     ///     .tag("myapp:latest");
@@ -888,8 +899,8 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder_zql::ImageBuilder;
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # use zlayer_builder::ImageBuilder;
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .cache_to("registry.example.com/myapp:cache")
     ///     .tag("myapp:latest");
@@ -918,9 +929,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// # use zlayer_builder_zql::ImageBuilder;
+    /// # use zlayer_builder::ImageBuilder;
     /// # use std::time::Duration;
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .cache_ttl(Duration::from_secs(3600 * 24))  // 24 hours
     ///     .tag("myapp:latest");
@@ -942,9 +953,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_builder_zql::{ImageBuilder, RegistryAuth};
+    /// use zlayer_builder::{ImageBuilder, RegistryAuth};
     ///
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .tag("registry.example.com/myapp:v1.0.0")
     ///     .push(RegistryAuth::new("user", "password"));
@@ -986,6 +997,7 @@ impl ImageBuilder {
     /// When set, the builder checks the local registry for cached images
     /// before pulling from remote registries.
     #[cfg(feature = "local-registry")]
+    #[must_use]
     pub fn with_local_registry(mut self, registry: LocalRegistry) -> Self {
         self.local_registry = Some(registry);
         self
@@ -1038,10 +1050,10 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run
-    /// use zlayer_builder_zql::{ImageBuilder, BuildEvent};
+    /// use zlayer_builder::{ImageBuilder, BuildEvent};
     /// use std::sync::mpsc;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let (tx, rx) = mpsc::channel::<BuildEvent>();
     ///
     /// let builder = ImageBuilder::new("./my-project").await?
@@ -1072,9 +1084,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder_zql::ImageBuilder;
+    /// use zlayer_builder::ImageBuilder;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .with_cache_dir("/var/cache/zlayer")
     ///     .tag("myapp:latest");
@@ -1090,6 +1102,7 @@ impl ImageBuilder {
     /// - Storing layer data after successful execution
     /// - Caching base image layers from registry pulls
     #[cfg(feature = "cache-persistent")]
+    #[must_use]
     pub fn with_cache_dir(mut self, path: impl AsRef<Path>) -> Self {
         self.options.cache_backend_config = Some(CacheBackendConfig::Persistent {
             path: path.as_ref().to_path_buf(),
@@ -1112,9 +1125,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder_zql::ImageBuilder;
+    /// use zlayer_builder::ImageBuilder;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .with_memory_cache()
     ///     .tag("myapp:latest");
@@ -1127,6 +1140,7 @@ impl ImageBuilder {
     /// TODO: The cache backend is currently stored but not actively used
     /// during builds. See `with_cache_dir` for integration status details.
     #[cfg(feature = "cache")]
+    #[must_use]
     pub fn with_memory_cache(mut self) -> Self {
         self.options.cache_backend_config = Some(CacheBackendConfig::Memory);
         debug!("Configured in-memory cache");
@@ -1137,7 +1151,7 @@ impl ImageBuilder {
     ///
     /// This is useful for distributed build systems where multiple build
     /// machines need to share a layer cache. Supports AWS S3, Cloudflare R2,
-    /// Backblaze B2, MinIO, and other S3-compatible services.
+    /// Backblaze B2, `MinIO`, and other S3-compatible services.
     ///
     /// Requires the `cache-s3` feature to be enabled.
     ///
@@ -1149,9 +1163,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder_zql::ImageBuilder;
+    /// use zlayer_builder::ImageBuilder;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .with_s3_cache("my-build-cache", Some("us-west-2"))
     ///     .tag("myapp:latest");
@@ -1164,6 +1178,7 @@ impl ImageBuilder {
     /// TODO: The cache backend is currently stored but not actively used
     /// during builds. See `with_cache_dir` for integration status details.
     #[cfg(feature = "cache-s3")]
+    #[must_use]
     pub fn with_s3_cache(mut self, bucket: impl Into<String>, region: Option<String>) -> Self {
         self.options.cache_backend_config = Some(CacheBackendConfig::S3 {
             bucket: bucket.into(),
@@ -1178,7 +1193,7 @@ impl ImageBuilder {
     /// Configure an S3-compatible storage backend with custom endpoint.
     ///
     /// Use this method for S3-compatible services that require a custom
-    /// endpoint URL (e.g., Cloudflare R2, MinIO, local development).
+    /// endpoint URL (e.g., Cloudflare R2, `MinIO`, local development).
     ///
     /// Requires the `cache-s3` feature to be enabled.
     ///
@@ -1191,9 +1206,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder_zql::ImageBuilder;
+    /// use zlayer_builder::ImageBuilder;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// // Cloudflare R2
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .with_s3_cache_endpoint(
@@ -1206,6 +1221,7 @@ impl ImageBuilder {
     /// # }
     /// ```
     #[cfg(feature = "cache-s3")]
+    #[must_use]
     pub fn with_s3_cache_endpoint(
         mut self,
         bucket: impl Into<String>,
@@ -1232,9 +1248,9 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder_zql::{ImageBuilder, CacheBackendConfig};
+    /// use zlayer_builder::{ImageBuilder, CacheBackendConfig};
     ///
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let builder = ImageBuilder::new("./my-project").await?
     ///     .with_cache_config(CacheBackendConfig::Memory)
     ///     .tag("myapp:latest");
@@ -1242,6 +1258,7 @@ impl ImageBuilder {
     /// # }
     /// ```
     #[cfg(feature = "cache")]
+    #[must_use]
     pub fn with_cache_config(mut self, config: CacheBackendConfig) -> Self {
         self.options.cache_backend_config = Some(config);
         debug!("Configured custom cache backend");
@@ -1259,11 +1276,11 @@ impl ImageBuilder {
     /// # Example
     ///
     /// ```no_run,ignore
-    /// use zlayer_builder_zql::ImageBuilder;
+    /// use zlayer_builder::ImageBuilder;
     /// use zlayer_registry::cache::BlobCache;
     /// use std::sync::Arc;
     ///
-    /// # async fn example() -> Result<(), zlayer_builder_zql::BuildError> {
+    /// # async fn example() -> Result<(), zlayer_builder::BuildError> {
     /// let cache = Arc::new(Box::new(BlobCache::new()?) as Box<dyn zlayer_registry::cache::BlobCacheBackend>);
     ///
     /// let builder = ImageBuilder::new("./my-project").await?
@@ -1273,6 +1290,7 @@ impl ImageBuilder {
     /// # }
     /// ```
     #[cfg(feature = "cache")]
+    #[must_use]
     pub fn with_cache_backend(mut self, backend: Arc<Box<dyn BlobCacheBackend>>) -> Self {
         self.cache_backend = Some(backend);
         debug!("Configured pre-initialized cache backend");
@@ -1354,6 +1372,13 @@ impl ImageBuilder {
             unreachable!("WasmArtifact case handled above");
         };
         debug!("Parsed Dockerfile with {} stages", dockerfile.stages.len());
+
+        // On macOS, if buildah is not available, fall back to the native sandbox builder.
+        #[cfg(target_os = "macos")]
+        if !self.buildah_available().await {
+            info!("Buildah not available on macOS, falling back to native sandbox builder");
+            return self.build_with_sandbox(&dockerfile, start_time).await;
+        }
 
         // 2. Determine stages to build
         let stages = self.resolve_stages(&dockerfile)?;
@@ -1725,6 +1750,66 @@ impl ImageBuilder {
 
     /// Get a parsed build output from the configured source.
     ///
+    /// Check if the buildah executor is actually functional.
+    ///
+    /// This is used on macOS to determine whether to fall back to the sandbox builder.
+    #[cfg(target_os = "macos")]
+    async fn buildah_available(&self) -> bool {
+        self.executor.is_available().await
+    }
+
+    /// Build using the macOS native sandbox builder (no buildah required).
+    ///
+    /// This is called as a fallback on macOS when buildah is not installed.
+    /// The sandbox builder creates raw rootfs directories with config.json files
+    /// rather than OCI tar layers.
+    #[cfg(target_os = "macos")]
+    async fn build_with_sandbox(
+        &self,
+        dockerfile: &Dockerfile,
+        start_time: std::time::Instant,
+    ) -> Result<BuiltImage> {
+        use crate::sandbox_builder::SandboxImageBuilder;
+
+        // Determine the data directory for storing images.
+        // Default: ~/.zlayer (same as the agent runtime).
+        let data_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".zlayer");
+
+        let mut sandbox = SandboxImageBuilder::new(self.context.clone(), data_dir)
+            .with_build_args(self.options.build_args.clone());
+
+        if let Some(ref tx) = self.event_tx {
+            sandbox = sandbox.with_events(tx.clone());
+        }
+
+        let result = sandbox.build(dockerfile, &self.options.tags).await?;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let build_time_ms = start_time.elapsed().as_millis() as u64;
+
+        self.send_event(BuildEvent::BuildComplete {
+            image_id: result.image_id.clone(),
+        });
+
+        info!(
+            "Sandbox build completed in {}ms: {} -> {}",
+            build_time_ms,
+            result.image_id,
+            result.image_dir.display()
+        );
+
+        Ok(BuiltImage {
+            image_id: result.image_id,
+            tags: result.tags,
+            layer_count: 1, // sandbox builds produce a single rootfs "layer"
+            size: 0,        // not computed for sandbox builds
+            build_time_ms,
+            is_manifest: false,
+        })
+    }
+
     /// Detection order:
     /// 1. If `runtime` is set -> use template string -> parse as Dockerfile
     /// 2. If `zimagefile` is explicitly set -> read & parse `ZImagefile` -> convert

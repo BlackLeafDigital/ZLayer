@@ -127,7 +127,7 @@ postcard2 = { version = "0.2.1", features = ["alloc"] }
 # Storage
 redb = "2.2"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
-zql = { version = "0.3.22", registry = "forgejo", default-features = false, features = ["sql-compat", "native-storage"] }
+zql = { version = "0.4", registry = "forgejo", default-features = false, features = ["sql-compat", "native-storage"] }
 
 # Config
 config = "0.15"
@@ -143,10 +143,13 @@ futures-util = "0.3"
 # Archive handling
 tar = "0.4"
 flate2 = "1"
+bzip2 = "0.5"
+xz2 = "0.1"
+zip = "2"
 
 # Unix/Linux system calls
 libc = "0.2"
-nix = { version = "0.31", features = ["fs", "signal", "process"] }
+nix = { version = "0.31", features = ["fs", "signal", "process", "user"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

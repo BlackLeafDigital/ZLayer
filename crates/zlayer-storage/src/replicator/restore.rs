@@ -1,21 +1,22 @@
 //! Auto-restore from S3
 //!
-//! Handles restoring `SQLite` databases from S3 backups, including both snapshots
-//! and WAL segments.
+//! Handles restoring ZQL databases from S3 backups. Downloads the latest
+//! snapshot (a tar+zstd archive of the ZQL data directory) and extracts it
+//! to reconstruct the database.
 
 use super::s3_backend::S3Backend;
-use crate::error::{LayerStorageError, Result};
+use crate::error::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{debug, info, warn};
+use tracing::info;
 
-/// Manager for database restoration from S3
+/// Manager for ZQL database restoration from S3
 pub struct RestoreManager {
-    /// Path to the local database file
-    db_path: PathBuf,
+    /// Path to the ZQL data directory
+    data_dir: PathBuf,
     /// S3 backend for downloads
     s3_backend: Arc<S3Backend>,
-    /// Temporary directory for restoration
+    /// Temporary directory for intermediate files
     temp_dir: PathBuf,
 }
 
@@ -24,23 +25,21 @@ impl RestoreManager {
     ///
     /// # Arguments
     ///
-    /// * `db_path` - Path where the database should be restored
+    /// * `data_dir` - Path to the ZQL data directory to restore into
     /// * `s3_backend` - S3 backend for downloading backups
     /// * `temp_dir` - Temporary directory for intermediate files
-    pub fn new(db_path: PathBuf, s3_backend: Arc<S3Backend>, temp_dir: PathBuf) -> Self {
+    pub fn new(data_dir: PathBuf, s3_backend: Arc<S3Backend>, temp_dir: PathBuf) -> Self {
         Self {
-            db_path,
+            data_dir,
             s3_backend,
             temp_dir,
         }
     }
 
-    /// Restore the database from S3
+    /// Restore the ZQL database from S3
     ///
-    /// This will:
-    /// 1. Download the latest snapshot
-    /// 2. Download any WAL segments since the snapshot
-    /// 3. Apply WAL segments to reconstruct the database
+    /// Downloads the latest snapshot (a tar+zstd archive) and extracts it
+    /// into the configured data directory.
     ///
     /// # Returns
     ///
@@ -48,7 +47,7 @@ impl RestoreManager {
     /// - `Ok(false)` if no backup was found
     /// - `Err(_)` if restoration failed
     pub async fn restore(&self) -> Result<bool> {
-        info!("Starting database restoration from S3");
+        info!("Starting ZQL database restoration from S3");
 
         // Ensure temp directory exists
         tokio::fs::create_dir_all(&self.temp_dir).await?;
@@ -61,173 +60,43 @@ impl RestoreManager {
 
         info!("Downloaded snapshot: {} bytes", snapshot_data.len());
 
-        // Write snapshot to temp file
-        let temp_db_path = self.temp_dir.join("restore.sqlite");
-        tokio::fs::write(&temp_db_path, &snapshot_data).await?;
+        // Write snapshot to a temp file
+        let temp_tarball = self.temp_dir.join("restore.zql.tar.zst");
+        tokio::fs::write(&temp_tarball, &snapshot_data).await?;
 
-        // Get metadata to find WAL sequence at snapshot time
-        let metadata = self.s3_backend.get_metadata().await?;
-        let snapshot_wal_sequence = metadata.latest_wal_sequence.unwrap_or(0);
+        // Ensure target data directory exists
+        tokio::fs::create_dir_all(&self.data_dir).await?;
 
-        // Download WAL segments since snapshot
-        let wal_segments = self
-            .s3_backend
-            .download_wal_segments_since(snapshot_wal_sequence)
-            .await?;
+        // Extract the tarball into the data directory
+        let tarball_path = temp_tarball.clone();
+        let target_dir = self.data_dir.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::snapshot::extract_snapshot(tarball_path, target_dir, None)
+        })
+        .await
+        .map_err(|e| {
+            crate::error::LayerStorageError::RestoreFailed(format!("extract task panicked: {e}"))
+        })??;
 
-        if !wal_segments.is_empty() {
-            info!("Downloaded {} WAL segments to apply", wal_segments.len());
-
-            // Apply WAL segments
-            self.apply_wal_segments(&temp_db_path, wal_segments).await?;
-        }
-
-        // Ensure target directory exists
-        if let Some(parent) = self.db_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        // Move restored database to target location
-        // First, remove any existing database files
-        if self.db_path.exists() {
-            tokio::fs::remove_file(&self.db_path).await?;
-        }
-
-        let wal_path = self.wal_path();
-        if wal_path.exists() {
-            tokio::fs::remove_file(&wal_path).await?;
-        }
-
-        let shm_path = self.shm_path();
-        if shm_path.exists() {
-            tokio::fs::remove_file(&shm_path).await?;
-        }
-
-        // Move temp database to final location
-        tokio::fs::rename(&temp_db_path, &self.db_path).await?;
-
-        // Clean up temp WAL files if any
-        let temp_wal = temp_db_path.with_extension("sqlite-wal");
-        if temp_wal.exists() {
-            let _ = tokio::fs::remove_file(&temp_wal).await;
-        }
-
-        let temp_shm = temp_db_path.with_extension("sqlite-shm");
-        if temp_shm.exists() {
-            let _ = tokio::fs::remove_file(&temp_shm).await;
-        }
+        // Clean up temp file
+        let _ = tokio::fs::remove_file(&temp_tarball).await;
 
         info!(
-            "Database restored successfully to {}",
-            self.db_path.display()
+            "ZQL database restored successfully to {}",
+            self.data_dir.display()
         );
 
         Ok(true)
-    }
-
-    /// Apply WAL segments to a database
-    ///
-    /// This uses `SQLite`'s ability to recover from WAL files by:
-    /// 1. Writing WAL data to the WAL file location
-    /// 2. Opening the database to trigger WAL recovery
-    async fn apply_wal_segments(
-        &self,
-        db_path: &std::path::Path,
-        segments: Vec<super::cache::CacheEntry>,
-    ) -> Result<()> {
-        if segments.is_empty() {
-            return Ok(());
-        }
-
-        info!("Applying {} WAL segments", segments.len());
-
-        // For each WAL segment, we need to apply it using rusqlite
-        // The segments contain complete WAL files, so we use the last one
-        // (which should contain all the frames from previous segments plus new ones)
-
-        // Actually, in our implementation, each "segment" is a snapshot of the WAL file
-        // at a point in time. The latest segment should contain the most recent state.
-        // We take the segment with the highest sequence number.
-
-        if let Some(latest_segment) = segments.last() {
-            // Write the WAL file
-            let wal_path = format!("{}-wal", db_path.display());
-            tokio::fs::write(&wal_path, &latest_segment.data).await?;
-
-            debug!(
-                "Wrote WAL file ({} bytes) for recovery",
-                latest_segment.data.len()
-            );
-
-            // Open the database with rusqlite to trigger WAL recovery
-            // We need to do this in a blocking context since rusqlite is sync
-            let db_path_clone = db_path.to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                let conn = rusqlite::Connection::open(&db_path_clone)
-                    .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-
-                // Force a checkpoint to apply WAL
-                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                    .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-
-                // Verify database is intact
-                let integrity: String = conn
-                    .query_row("PRAGMA integrity_check;", [], |row| row.get(0))
-                    .map_err(|e| LayerStorageError::Database(e.to_string()))?;
-
-                if integrity != "ok" {
-                    warn!("Database integrity check returned: {}", integrity);
-                }
-
-                Ok::<_, LayerStorageError>(())
-            })
-            .await
-            .map_err(|e| LayerStorageError::Io(std::io::Error::other(e)))??;
-
-            info!("WAL recovery completed");
-        }
-
-        Ok(())
-    }
-
-    /// Get the WAL file path
-    fn wal_path(&self) -> PathBuf {
-        let mut path = self.db_path.clone();
-        let filename = path.file_name().unwrap_or_default().to_string_lossy();
-        path.set_file_name(format!("{filename}-wal"));
-        path
-    }
-
-    /// Get the SHM file path
-    fn shm_path(&self) -> PathBuf {
-        let mut path = self.db_path.clone();
-        let filename = path.file_name().unwrap_or_default().to_string_lossy();
-        path.set_file_name(format!("{filename}-shm"));
-        path
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
 
     #[test]
-    fn test_wal_path_derivation() {
-        // Test the path derivation logic directly without needing a full RestoreManager
-        let db_path = PathBuf::from("/var/lib/app/data.sqlite");
-
-        // Derive WAL path
-        let mut wal_path = db_path.clone();
-        let filename = wal_path.file_name().unwrap_or_default().to_string_lossy();
-        wal_path.set_file_name(format!("{filename}-wal"));
-
-        assert_eq!(wal_path, PathBuf::from("/var/lib/app/data.sqlite-wal"));
-
-        // Derive SHM path
-        let mut shm_path = db_path.clone();
-        let filename = shm_path.file_name().unwrap_or_default().to_string_lossy();
-        shm_path.set_file_name(format!("{filename}-shm"));
-
-        assert_eq!(shm_path, PathBuf::from("/var/lib/app/data.sqlite-shm"));
+    fn test_data_dir_path() {
+        let data_dir = PathBuf::from("/var/lib/app/zql-data");
+        assert_eq!(data_dir.file_name().unwrap().to_str().unwrap(), "zql-data");
     }
 }

@@ -24,9 +24,9 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
             .await
         }
         DaemonAction::Uninstall => uninstall().await,
-        DaemonAction::Start => start().await,
+        DaemonAction::Start => start(data_dir).await,
         DaemonAction::Stop => stop().await,
-        DaemonAction::Restart => restart().await,
+        DaemonAction::Restart => restart(data_dir).await,
         DaemonAction::Status => status(data_dir).await,
         DaemonAction::Reset { force } => reset(data_dir, *force),
     }
@@ -179,6 +179,11 @@ async fn install(
     println!("Installed launchd plist: {}", path.display());
 
     if !no_start {
+        // Write spawner PID so the new daemon's cleanup_stale_daemon() won't
+        // kill this CLI process while we wait for readiness.
+        let spawner_pid_path = data_dir.join("spawner.pid");
+        std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
+
         // Use modern launchctl bootstrap, fall back to legacy load
         let out = Command::new("launchctl")
             .args(["bootstrap", &target, &path_str])
@@ -194,13 +199,25 @@ async fn install(
                 .context("Failed to run launchctl load")?;
             if !out.status.success() {
                 let stderr = String::from_utf8_lossy(&out.stderr);
+                let _ = std::fs::remove_file(&spawner_pid_path);
                 bail!("launchctl failed to load the service: {stderr}");
             }
         }
 
-        println!("Daemon started via launchd");
-        println!("  Logs: {log_path_str}");
-        println!("  Stop: zlayer daemon stop");
+        print!("Daemon starting...");
+        match wait_for_daemon_ready(data_dir, 15).await {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&spawner_pid_path);
+                println!(" started");
+                println!("  Logs: {log_path_str}");
+                println!("  Stop: zlayer daemon stop");
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&spawner_pid_path);
+                println!(" failed");
+                return Err(e);
+            }
+        }
     }
 
     Ok(())
@@ -233,7 +250,7 @@ async fn uninstall() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn start() -> Result<()> {
+async fn start(data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
     let (plist_dir, target) = launchd_context()?;
@@ -243,6 +260,11 @@ async fn start() -> Result<()> {
     if !path.exists() {
         bail!("Daemon not installed. Run `zlayer daemon install` first.");
     }
+
+    // Write spawner PID so the new daemon's cleanup_stale_daemon() won't
+    // kill this CLI process while we wait for readiness.
+    let spawner_pid_path = data_dir.join("spawner.pid");
+    std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
 
     let out = Command::new("launchctl")
         .args(["bootstrap", &target, &path_str])
@@ -257,11 +279,23 @@ async fn start() -> Result<()> {
             .await
             .context("Failed to run launchctl load")?;
         if !out.status.success() {
+            let _ = std::fs::remove_file(&spawner_pid_path);
             bail!("Failed to start daemon");
         }
     }
 
-    println!("Daemon started");
+    print!("Daemon starting...");
+    match wait_for_daemon_ready(data_dir, 15).await {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&spawner_pid_path);
+            println!(" started");
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&spawner_pid_path);
+            println!(" failed");
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
@@ -291,7 +325,7 @@ async fn stop() -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-async fn restart() -> Result<()> {
+async fn restart(data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
     let (_plist_dir, target) = launchd_context()?;
@@ -304,7 +338,7 @@ async fn restart() -> Result<()> {
 
     if !out.status.success() {
         stop().await.ok();
-        return start().await;
+        return start(data_dir).await;
     }
 
     println!("Daemon restarted");
@@ -455,6 +489,11 @@ WantedBy=multi-user.target
     let _ = Command::new("systemctl").args(&enable_args).output().await;
 
     if !no_start {
+        // Write spawner PID so the new daemon's cleanup_stale_daemon() won't
+        // kill this CLI process while we wait for readiness.
+        let spawner_pid_path = data_dir.join("spawner.pid");
+        std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
+
         let start_args = systemctl_args(&["start", UNIT_NAME]);
         let out = Command::new("systemctl")
             .args(&start_args)
@@ -463,9 +502,22 @@ WantedBy=multi-user.target
             .context("Failed to start service")?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
+            let _ = std::fs::remove_file(&spawner_pid_path);
             bail!("systemctl start failed: {stderr}");
         }
-        println!("Daemon started via systemd");
+
+        print!("Daemon starting...");
+        match wait_for_daemon_ready(data_dir, 15).await {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&spawner_pid_path);
+                println!(" started via systemd");
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&spawner_pid_path);
+                println!(" failed");
+                return Err(e);
+            }
+        }
     }
 
     Ok(())
@@ -495,13 +547,18 @@ async fn uninstall() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn start() -> Result<()> {
+async fn start(data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
     let path = unit_path();
     if !path.exists() {
         bail!("Daemon not installed. Run `zlayer daemon install` first.");
     }
+
+    // Write spawner PID so the new daemon's cleanup_stale_daemon() won't
+    // kill this CLI process while we wait for readiness.
+    let spawner_pid_path = data_dir.join("spawner.pid");
+    std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
 
     let args = systemctl_args(&["start", UNIT_NAME]);
     let out = Command::new("systemctl")
@@ -511,9 +568,22 @@ async fn start() -> Result<()> {
         .context("Failed to start service")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
+        let _ = std::fs::remove_file(&spawner_pid_path);
         bail!("systemctl start failed: {stderr}");
     }
-    println!("Daemon started");
+
+    print!("Daemon starting...");
+    match wait_for_daemon_ready(data_dir, 15).await {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&spawner_pid_path);
+            println!(" started");
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&spawner_pid_path);
+            println!(" failed");
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
@@ -536,7 +606,7 @@ async fn stop() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-async fn restart() -> Result<()> {
+async fn restart(_data_dir: &Path) -> Result<()> {
     use tokio::process::Command;
 
     let args = systemctl_args(&["restart", UNIT_NAME]);
@@ -587,6 +657,54 @@ async fn status(data_dir: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Readiness check (shared across platforms)
+// ---------------------------------------------------------------------------
+
+/// Poll for daemon readiness by watching for `daemon.json` to appear.
+///
+/// The `zlayer serve` process writes `daemon.json` after all infrastructure
+/// phases complete successfully. If it crashes during init, the file is never
+/// created. On timeout, the last 20 lines of `daemon.log` are included in the
+/// error to surface the actual failure reason.
+async fn wait_for_daemon_ready(data_dir: &Path, timeout_secs: u64) -> Result<()> {
+    let metadata_path = data_dir.join("daemon.json");
+    let poll_interval = std::time::Duration::from_millis(250);
+    let max_attempts = (timeout_secs * 1000) / 250;
+
+    for _ in 0..max_attempts {
+        tokio::time::sleep(poll_interval).await;
+        if metadata_path.exists() {
+            return Ok(());
+        }
+    }
+
+    // Daemon didn't come up — surface the error from the log
+    let log_dir = crate::cli::default_log_dir(data_dir);
+    let log_path = log_dir.join("daemon.log");
+    let tail = if log_path.exists() {
+        std::fs::read_to_string(&log_path)
+            .ok()
+            .map(|content| {
+                let lines: Vec<&str> = content.lines().collect();
+                let start = lines.len().saturating_sub(20);
+                lines[start..].join("\n")
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    if tail.is_empty() {
+        bail!(
+            "Daemon failed to start within {timeout_secs}s (no log output found at {})",
+            log_path.display()
+        );
+    }
+
+    bail!("Daemon failed to start within {timeout_secs}s. Last log output:\n{tail}");
 }
 
 // ---------------------------------------------------------------------------

@@ -1,12 +1,15 @@
 //! Storage replication status endpoint
 //!
 //! Provides a read-only endpoint for querying the storage replication status.
-//! On the ZQL branch, `SQLite` WAL replication is not used, so this always
-//! returns a "disabled" status while preserving the API contract.
+//! When a [`ZqlReplicator`](zlayer_storage::ZqlReplicator) is configured, this
+//! returns live replication metrics; otherwise it reports "disabled".
+
+use std::sync::Arc;
 
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use zlayer_storage::ZqlReplicator;
 
 use crate::auth::AuthUser;
 use crate::error::Result;
@@ -34,26 +37,32 @@ pub struct StorageStatusResponse {
 
 /// State for storage status endpoint
 #[derive(Clone)]
-pub struct StorageState;
+pub struct StorageState {
+    replicator: Option<Arc<ZqlReplicator>>,
+}
 
 impl Default for StorageState {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
 impl StorageState {
-    /// Create a new storage state (replication is always disabled on ZQL)
+    /// Create a new storage state.
+    ///
+    /// Pass `Some(replicator)` to report live replication metrics, or `None`
+    /// to report replication as disabled.
     #[must_use]
-    pub fn new() -> Self {
-        Self
+    pub fn new(replicator: Option<Arc<ZqlReplicator>>) -> Self {
+        Self { replicator }
     }
 }
 
 /// Get storage replication status
 ///
-/// Returns the current state of storage replication. On the ZQL backend
-/// this always reports "disabled" since `SQLite` WAL replication is not used.
+/// Returns the current state of storage replication. When a
+/// [`ZqlReplicator`] is configured, this returns live metrics;
+/// otherwise it reports "disabled".
 ///
 /// # Errors
 ///
@@ -70,13 +79,27 @@ impl StorageState {
 )]
 pub async fn get_storage_status(
     _user: AuthUser,
-    State(_state): State<StorageState>,
+    State(state): State<StorageState>,
 ) -> Result<Json<StorageStatusResponse>> {
-    let replication = ReplicationInfo {
-        enabled: false,
-        status: "disabled".to_string(),
-        last_sync: None,
-        pending_changes: 0,
+    let replication = if let Some(ref replicator) = state.replicator {
+        let rs = replicator.status();
+        ReplicationInfo {
+            enabled: true,
+            status: if rs.running {
+                "active".to_string()
+            } else {
+                "disabled".to_string()
+            },
+            last_sync: rs.last_snapshot.map(|t| t.to_rfc3339()),
+            pending_changes: rs.pending_entries,
+        }
+    } else {
+        ReplicationInfo {
+            enabled: false,
+            status: "disabled".to_string(),
+            last_sync: None,
+            pending_changes: 0,
+        }
     };
 
     Ok(Json(StorageStatusResponse { replication }))
@@ -89,12 +112,12 @@ mod tests {
     #[test]
     #[allow(clippy::no_effect_underscore_binding)]
     fn test_storage_state_default() {
-        let _state = StorageState;
+        let _state = StorageState::default();
     }
 
     #[test]
     fn test_storage_state_new() {
-        let _state = StorageState::new();
+        let _state = StorageState::new(None);
     }
 
     #[test]

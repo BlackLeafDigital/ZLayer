@@ -1,6 +1,6 @@
 //! Local write cache for network tolerance
 //!
-//! Buffers WAL segments locally when network is unavailable, maintaining FIFO order
+//! Buffers snapshots locally when network is unavailable, maintaining FIFO order
 //! for upload and respecting configurable size limits.
 
 use crate::error::Result;
@@ -12,13 +12,12 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
-/// A cached WAL segment entry
+/// A cached snapshot entry
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
-    /// Sequence number (frame count at time of capture)
+    /// Sequence number (timestamp-based identifier)
     pub sequence: u64,
-    /// WAL data
-    #[serde(with = "serde_bytes")]
+    /// Snapshot data (tar+zstd compressed)
     pub data: Vec<u8>,
     /// Timestamp when cached
     pub cached_at: chrono::DateTime<chrono::Utc>,
@@ -45,9 +44,9 @@ impl CacheEntry {
     }
 }
 
-/// Local write cache for WAL segments
+/// Local write cache for snapshots
 ///
-/// Provides network tolerance by buffering WAL segments locally when S3 is
+/// Provides network tolerance by buffering snapshots locally when S3 is
 /// unavailable. Entries are stored in FIFO order and persisted to disk for
 /// crash recovery.
 pub struct WriteCache {
@@ -158,7 +157,7 @@ impl WriteCache {
         self.entry_count.fetch_add(1, Ordering::SeqCst);
 
         debug!(
-            "Cached WAL segment {} ({} bytes, {} total entries)",
+            "Cached snapshot {} ({} bytes, {} total entries)",
             sequence,
             entry_size,
             entries.len()
