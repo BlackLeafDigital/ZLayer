@@ -690,6 +690,8 @@ pub(crate) async fn handle_node_join(
         public_key: node_config.wireguard_public_key.clone(),
         overlay_cidr: overlay_ip_cidr,
         peer_discovery_interval: Duration::from_secs(30),
+        #[cfg(feature = "nat")]
+        nat: zlayer_overlay::nat::NatConfig::default(),
     };
 
     // Convert PeerConfig to PeerInfo for the transport layer

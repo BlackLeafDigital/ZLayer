@@ -68,6 +68,7 @@ impl NatTraversal {
     ///
     /// Returns [`OverlayError::StunDiscovery`] if STUN discovery fails
     /// and no host candidates could be gathered.
+    #[allow(clippy::too_many_lines)]
     pub async fn gather_candidates(&mut self) -> Result<Vec<Candidate>> {
         let mut candidates = Vec::new();
 
@@ -691,7 +692,7 @@ mod tests {
             ),
         );
 
-        let mut candidates = vec![reflexive_v6, host_v4, host_v6];
+        let mut candidates = [reflexive_v6, host_v4, host_v6];
         candidates.sort_by(|a, b| b.priority.cmp(&a.priority));
 
         // Hosts (100) before ServerReflexive (50)

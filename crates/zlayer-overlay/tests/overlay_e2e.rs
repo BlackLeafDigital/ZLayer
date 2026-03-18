@@ -208,7 +208,7 @@ async fn test_overlay_config_and_peer_config_format() {
         overlay_cidr: "10.200.0.1/16".to_string(),
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
-        nat: zlayer_overlay::nat::NatConfig::default(),
+        nat: zlayer_overlay_zql::nat::NatConfig::default(),
     };
 
     assert_eq!(config.local_endpoint.port(), 51820);
@@ -295,7 +295,7 @@ async fn test_overlay_interface_lifecycle() {
         overlay_cidr: "10.250.0.1/24".to_string(),
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
-        nat: zlayer_overlay::nat::NatConfig::default(),
+        nat: zlayer_overlay_zql::nat::NatConfig::default(),
     };
 
     let mut manager = OverlayTransport::new(config, iface_name.to_string());
@@ -410,7 +410,7 @@ async fn test_dual_overlay_connectivity() {
         overlay_cidr: format!("{ip_a}{subnet}"),
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
-        nat: zlayer_overlay::nat::NatConfig::default(),
+        nat: zlayer_overlay_zql::nat::NatConfig::default(),
     };
 
     let config_b = OverlayConfig {
@@ -420,7 +420,7 @@ async fn test_dual_overlay_connectivity() {
         overlay_cidr: format!("{ip_b}{subnet}"),
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
-        nat: zlayer_overlay::nat::NatConfig::default(),
+        nat: zlayer_overlay_zql::nat::NatConfig::default(),
     };
 
     let mut manager_a = OverlayTransport::new(config_a, iface_a.to_string());
@@ -566,7 +566,7 @@ async fn test_overlay_config_and_peer_config_format_ipv6() {
         overlay_cidr: "fd00:200::1/48".to_string(),
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
-        nat: zlayer_overlay::nat::NatConfig::default(),
+        nat: zlayer_overlay_zql::nat::NatConfig::default(),
     };
 
     assert_eq!(config.local_endpoint.port(), 51820);
@@ -711,7 +711,7 @@ async fn test_overlay_interface_lifecycle_ipv6() {
         overlay_cidr: "fd00:250::1/48".to_string(),
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
-        nat: zlayer_overlay::nat::NatConfig::default(),
+        nat: zlayer_overlay_zql::nat::NatConfig::default(),
     };
 
     let mut manager = OverlayTransport::new(config, iface_name.to_string());
