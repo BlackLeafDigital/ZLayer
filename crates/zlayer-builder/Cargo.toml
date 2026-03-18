@@ -44,6 +44,19 @@ zlayer-tui.workspace = true
 # Cache backend (optional)
 zlayer-registry = { workspace = true, optional = true }
 
+# HTTP client (for ADD URL support)
+reqwest.workspace = true
+
+# Archive handling (for ADD auto-extraction)
+tar.workspace = true
+flate2.workspace = true
+bzip2.workspace = true
+xz2.workspace = true
+zip.workspace = true
+
+# Unix system calls (for chown)
+nix.workspace = true
+
 [dev-dependencies]
 tempfile = "3"
 

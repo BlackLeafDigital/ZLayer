@@ -537,7 +537,44 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             }
         }
         Ok(false) => {
-            info!("Admin API credential already exists");
+            let pw_path = config.data_dir.join("admin_password");
+            if pw_path.exists() {
+                info!("Admin API credential already exists");
+            } else {
+                warn!("Admin credential exists but password file is missing — regenerating");
+                let new_password = generate_admin_password();
+
+                if let Err(e) = credential_store.delete_api_key("admin").await {
+                    warn!(error = %e, "Failed to delete old admin credential");
+                }
+
+                match credential_store
+                    .create_api_key("admin", &new_password, &["admin"])
+                    .await
+                {
+                    Ok(()) => {
+                        if let Err(e) = std::fs::write(&pw_path, &new_password) {
+                            warn!(error = %e, "Failed to persist regenerated admin password");
+                        } else {
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = std::fs::set_permissions(
+                                    &pw_path,
+                                    std::fs::Permissions::from_mode(0o600),
+                                );
+                            }
+                            info!(
+                                "Admin password regenerated and persisted to {}",
+                                pw_path.display()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to recreate admin credential");
+                    }
+                }
+            }
         }
         Err(e) => {
             warn!(error = %e, "Failed to bootstrap admin credential (non-fatal)");

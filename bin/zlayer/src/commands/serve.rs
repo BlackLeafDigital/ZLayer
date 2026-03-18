@@ -149,7 +149,11 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
         let my_pid = std::process::id();
         let spawner_pid: Option<u32> = std::env::var("ZLAYER_SPAWNER_PID")
             .ok()
-            .and_then(|s| s.parse().ok());
+            .and_then(|s| s.parse().ok())
+            .or_else(|| {
+                let marker = config.data_dir.join("spawner.pid");
+                std::fs::read_to_string(&marker).ok()?.trim().parse().ok()
+            });
         let is_protected = |pid: u32| pid == my_pid || Some(pid) == spawner_pid;
 
         if let Ok(output) = tokio::process::Command::new("pgrep")

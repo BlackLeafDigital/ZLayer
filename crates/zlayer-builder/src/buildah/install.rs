@@ -344,8 +344,9 @@ pub fn install_instructions() -> String {
                     .to_string()
             }
         }
-        "macos" => "Install with: brew install buildah\n\
-             Note: Buildah on macOS requires a Linux VM for container operations."
+        "macos" => "Buildah is not required on macOS -- ZLayer uses the native \
+             sandbox builder instead. If you prefer buildah, install with: \
+             brew install buildah (requires a Linux VM for container operations)."
             .to_string(),
         "windows" => "Buildah is not natively supported on Windows.\n\
              Consider using WSL2 with a Linux distribution and installing buildah there."

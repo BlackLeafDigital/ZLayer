@@ -605,8 +605,19 @@ impl ImageBuilder {
             });
         }
 
-        // Initialize buildah executor
-        let executor = BuildahExecutor::new_async().await?;
+        // Initialize buildah executor.
+        // On macOS, if buildah is not found we fall back to a default executor
+        // and use the native sandbox builder instead during build().
+        let executor = match BuildahExecutor::new_async().await {
+            Ok(exec) => exec,
+            #[cfg(target_os = "macos")]
+            Err(_) => {
+                info!("Buildah not found on macOS; will use native sandbox builder");
+                BuildahExecutor::default()
+            }
+            #[cfg(not(target_os = "macos"))]
+            Err(e) => return Err(e),
+        };
 
         debug!("Created ImageBuilder for context: {}", context.display());
 
@@ -1362,6 +1373,13 @@ impl ImageBuilder {
         };
         debug!("Parsed Dockerfile with {} stages", dockerfile.stages.len());
 
+        // On macOS, if buildah is not available, fall back to the native sandbox builder.
+        #[cfg(target_os = "macos")]
+        if !self.buildah_available().await {
+            info!("Buildah not available on macOS, falling back to native sandbox builder");
+            return self.build_with_sandbox(&dockerfile, start_time).await;
+        }
+
         // 2. Determine stages to build
         let stages = self.resolve_stages(&dockerfile)?;
         debug!("Building {} stages", stages.len());
@@ -1732,6 +1750,65 @@ impl ImageBuilder {
 
     /// Get a parsed build output from the configured source.
     ///
+    /// Check if the buildah executor is actually functional.
+    ///
+    /// This is used on macOS to determine whether to fall back to the sandbox builder.
+    async fn buildah_available(&self) -> bool {
+        self.executor.is_available().await
+    }
+
+    /// Build using the macOS native sandbox builder (no buildah required).
+    ///
+    /// This is called as a fallback on macOS when buildah is not installed.
+    /// The sandbox builder creates raw rootfs directories with config.json files
+    /// rather than OCI tar layers.
+    #[cfg(target_os = "macos")]
+    async fn build_with_sandbox(
+        &self,
+        dockerfile: &Dockerfile,
+        start_time: std::time::Instant,
+    ) -> Result<BuiltImage> {
+        use crate::sandbox_builder::SandboxImageBuilder;
+
+        // Determine the data directory for storing images.
+        // Default: ~/.zlayer (same as the agent runtime).
+        let data_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".zlayer");
+
+        let mut sandbox = SandboxImageBuilder::new(self.context.clone(), data_dir)
+            .with_build_args(self.options.build_args.clone());
+
+        if let Some(ref tx) = self.event_tx {
+            sandbox = sandbox.with_events(tx.clone());
+        }
+
+        let result = sandbox.build(dockerfile, &self.options.tags).await?;
+
+        #[allow(clippy::cast_possible_truncation)]
+        let build_time_ms = start_time.elapsed().as_millis() as u64;
+
+        self.send_event(BuildEvent::BuildComplete {
+            image_id: result.image_id.clone(),
+        });
+
+        info!(
+            "Sandbox build completed in {}ms: {} -> {}",
+            build_time_ms,
+            result.image_id,
+            result.image_dir.display()
+        );
+
+        Ok(BuiltImage {
+            image_id: result.image_id,
+            tags: result.tags,
+            layer_count: 1, // sandbox builds produce a single rootfs "layer"
+            size: 0,        // not computed for sandbox builds
+            build_time_ms,
+            is_manifest: false,
+        })
+    }
+
     /// Detection order:
     /// 1. If `runtime` is set -> use template string -> parse as Dockerfile
     /// 2. If `zimagefile` is explicitly set -> read & parse `ZImagefile` -> convert

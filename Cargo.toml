@@ -142,10 +142,13 @@ futures-util = "0.3"
 # Archive handling
 tar = "0.4"
 flate2 = "1"
+bzip2 = "0.5"
+xz2 = "0.1"
+zip = "2"
 
 # Unix/Linux system calls
 libc = "0.2"
-nix = { version = "0.31", features = ["fs", "signal", "process"] }
+nix = { version = "0.31", features = ["fs", "signal", "process", "user"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

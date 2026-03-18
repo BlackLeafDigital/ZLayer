@@ -28,6 +28,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aes"
+version = "0.8.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b169f7a6d4742236a0a00c541b845991d0ac43e546831af1249753ab4c3aa3a0"
+dependencies = [
+ "cfg-if",
+ "cipher",
+ "cpufeatures",
+]
+
+[[package]]
 name = "ahash"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1154,6 +1165,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "bzip2"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49ecfb22d906f800d4fe833b6282cf4dc1c298f5057ca0b5445e5c209735ca47"
+dependencies = [
+ "bzip2-sys",
+]
+
+[[package]]
+name = "bzip2-sys"
+version = "0.1.13+1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "225bff33b2141874fe80d71e07d6eec4f85c5c216453dd96388240f96e1acc14"
+dependencies = [
+ "cc",
+ "pkg-config",
+]
+
+[[package]]
 name = "camino"
 version = "1.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1561,6 +1591,12 @@ name = "const_str_slice_concat"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f67855af358fcb20fac58f9d714c94e2b228fe5694c1c9b4ead4a366343eda1b"
+
+[[package]]
+name = "constant_time_eq"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c74b8349d32d297c9134b8c88677813a227df8f779daa29bfc29c183fe3dca6"
 
 [[package]]
 name = "convert_case"
@@ -2106,6 +2142,12 @@ dependencies = [
  "quote",
  "syn 2.0.117",
 ]
+
+[[package]]
+name = "deflate64"
+version = "0.1.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "807800ff3288b621186fe0a8f3392c4652068257302709c24efd918c3dffcdc2"
 
 [[package]]
 name = "der"
@@ -4308,6 +4350,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
 
 [[package]]
+name = "lzma-rs"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "297e814c836ae64db86b36cf2a557ba54368d03f6afcd7d947c266692f71115e"
+dependencies = [
+ "byteorder",
+ "crc",
+]
+
+[[package]]
+name = "lzma-sys"
+version = "0.1.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fda04ab3764e6cde78b9974eec4f779acaba7c4e84b36eca3cf77c581b85d27"
+dependencies = [
+ "cc",
+ "libc",
+ "pkg-config",
+]
+
+[[package]]
 name = "mach2"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5029,6 +5092,16 @@ dependencies = [
  "static_assertions",
  "tempfile",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pbkdf2"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8ed6a7761f76e3b9f92dfb0a60a6a6477c61024b775147ff0973a02653abaf2"
+dependencies = [
+ "digest",
+ "hmac",
 ]
 
 [[package]]
@@ -8379,7 +8452,7 @@ dependencies = [
  "serde_json",
  "url",
  "utoipa",
- "zip",
+ "zip 3.0.0",
 ]
 
 [[package]]
@@ -9819,6 +9892,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
 
 [[package]]
+name = "xz2"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "388c44dc09d76f1536602ead6d325eb532f5c122f17782bd57fb47baeeb767e2"
+dependencies = [
+ "lzma-sys",
+]
+
+[[package]]
 name = "yaml-rust2"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9960,6 +10042,36 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
+]
+
+[[package]]
+name = "zip"
+version = "2.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fabe6324e908f85a1c52063ce7aa26b68dcb7eb6dbc83a2d148403c9bc3eba50"
+dependencies = [
+ "aes",
+ "arbitrary",
+ "bzip2",
+ "constant_time_eq",
+ "crc32fast",
+ "crossbeam-utils",
+ "deflate64",
+ "displaydoc",
+ "flate2",
+ "getrandom 0.3.4",
+ "hmac",
+ "indexmap 2.13.0",
+ "lzma-rs",
+ "memchr",
+ "pbkdf2",
+ "sha1",
+ "thiserror 2.0.18",
+ "time",
+ "xz2",
+ "zeroize",
+ "zopfli",
+ "zstd",
 ]
 
 [[package]]
@@ -10127,21 +10239,28 @@ name = "zlayer-builder"
 version = "0.0.0-dev"
 dependencies = [
  "anyhow",
+ "bzip2",
  "crossterm",
  "dirs",
  "dockerfile-parser",
+ "flate2",
  "hex",
  "humantime",
  "indexmap 2.13.0",
+ "nix 0.31.2",
  "ratatui",
+ "reqwest 0.13.2",
  "serde",
  "serde_json",
  "serde_yaml",
  "sha2",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "xz2",
+ "zip 2.4.2",
  "zlayer-registry",
  "zlayer-tui",
 ]
