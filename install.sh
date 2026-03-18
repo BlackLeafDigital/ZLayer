@@ -90,51 +90,13 @@ fi
 
 # --- Stop running zlayer before overwriting binary ---
 if [ -f "${INSTALL_DIR}/${BINARY}" ]; then
-    NEED_SUDO=false
-    if [ ! -w "$INSTALL_DIR" ] && command -v sudo >/dev/null 2>&1; then
-        NEED_SUDO=true
-    fi
-
-    case "$OS" in
-        linux)
-            if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet zlayer 2>/dev/null; then
-                echo "Stopping zlayer..."
-                if [ "$NEED_SUDO" = true ]; then
-                    sudo systemctl stop zlayer
-                else
-                    systemctl stop zlayer
-                fi
-            elif pgrep -x "$BINARY" >/dev/null 2>&1; then
-                echo "Stopping zlayer..."
-                if [ "$NEED_SUDO" = true ]; then
-                    sudo pkill -x "$BINARY" 2>/dev/null || true
-                else
-                    pkill -x "$BINARY" 2>/dev/null || true
-                fi
-                for i in $(seq 1 50); do
-                    pgrep -x "$BINARY" >/dev/null 2>&1 || break
-                    sleep 0.1
-                done
-            fi
-            rm -f /var/run/zlayer.sock
-            ;;
-        darwin)
-            PLIST="com.zlayer.daemon"
-            if launchctl list "$PLIST" >/dev/null 2>&1; then
-                echo "Stopping zlayer..."
-                if [ "$NEED_SUDO" = true ]; then
-                    sudo launchctl stop "$PLIST" 2>/dev/null || true
-                else
-                    launchctl stop "$PLIST" 2>/dev/null || true
-                fi
-                sleep 1
-            elif pgrep -x "$BINARY" >/dev/null 2>&1; then
-                echo "Stopping zlayer..."
-                pkill -x "$BINARY" 2>/dev/null || true
-                sleep 1
-            fi
-            ;;
-    esac
+    echo "Stopping zlayer..."
+    "${INSTALL_DIR}/${BINARY}" daemon uninstall >/dev/null 2>&1 || true
+    # Clean up stale state
+    rm -f "${HOME}/.local/share/zlayer/daemon.json" 2>/dev/null || true
+    rm -f "${HOME}/.local/share/zlayer/run/zlayer.sock" 2>/dev/null || true
+    rm -f /var/run/zlayer.sock 2>/dev/null || true
+    sleep 2
 fi
 
 if [ -w "$INSTALL_DIR" ]; then
@@ -162,62 +124,17 @@ esac
 # --- Install and start service ---
 SKIP_SERVICE="${ZLAYER_NO_SERVICE:-}"
 if [ -z "$SKIP_SERVICE" ]; then
+    echo ""
+    echo "Starting zlayer daemon..."
+    "${INSTALL_DIR}/${BINARY}" daemon install >/dev/null 2>&1 || true
+
     case "$OS" in
         linux)
-            if command -v systemctl >/dev/null 2>&1; then
-                echo ""
-                echo "Setting up systemd service..."
-
-                UNIT_FILE="/etc/systemd/system/zlayer.service"
-                UNIT_CONTENT="[Unit]
-Description=ZLayer Container Runtime
-Documentation=https://zlayer.dev
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${INSTALL_DIR}/${BINARY} serve
-ExecReload=/bin/kill -HUP \$MAINPID
-Restart=always
-RestartSec=5
-LimitNOFILE=1048576
-LimitNPROC=infinity
-LimitCORE=infinity
-Environment=ZLAYER_DATA_DIR=/var/lib/zlayer
-
-[Install]
-WantedBy=multi-user.target"
-
-                if [ -w "/etc/systemd/system" ]; then
-                    printf '%s\n' "$UNIT_CONTENT" > "$UNIT_FILE"
-                    systemctl daemon-reload
-                    systemctl enable zlayer >/dev/null 2>&1
-                    systemctl start zlayer
-                elif command -v sudo >/dev/null 2>&1; then
-                    printf '%s\n' "$UNIT_CONTENT" | sudo tee "$UNIT_FILE" >/dev/null
-                    sudo systemctl daemon-reload
-                    sudo systemctl enable zlayer >/dev/null 2>&1
-                    sudo systemctl start zlayer
-                else
-                    echo "Warning: Cannot install systemd service (no write access to /etc/systemd/system)"
-                    echo "Run manually: zlayer serve"
-                fi
-
-                if systemctl is-active --quiet zlayer 2>/dev/null; then
-                    echo "zlayer service started (systemd)"
-                fi
-            else
-                echo ""
-                echo "No systemd found. Start manually: zlayer serve --daemon"
+            if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet zlayer 2>/dev/null; then
+                echo "zlayer service started (systemd)"
             fi
             ;;
         darwin)
-            echo ""
-            echo "Starting zlayer daemon..."
-            # The binary handles launchd plist generation and loading
-            ("${INSTALL_DIR}/${BINARY}" serve --daemon >/dev/null 2>&1 || true) 2>/dev/null
-
             PLIST="com.zlayer.daemon"
             if launchctl list "$PLIST" >/dev/null 2>&1; then
                 echo "zlayer service started (launchd: ${PLIST})"
