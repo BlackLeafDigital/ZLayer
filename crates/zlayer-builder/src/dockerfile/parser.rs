@@ -374,25 +374,16 @@ impl Dockerfile {
 
                 let link = copy.flags.iter().any(|f| f.name.content.as_str() == "link");
 
-                // Get all paths
-                let all_paths: Vec<String> = copy
+                // The external parser separates sources and destination already.
+                let sources: Vec<String> = copy
                     .sources
                     .iter()
                     .map(std::string::ToString::to_string)
                     .collect();
-
-                if all_paths.is_empty() {
-                    return Err(BuildError::InvalidInstruction {
-                        instruction: "COPY".to_string(),
-                        reason: "COPY requires at least one source and a destination".to_string(),
-                    });
-                }
-
-                let (sources, dest) = all_paths.split_at(all_paths.len().saturating_sub(1));
-                let destination = dest.first().cloned().unwrap_or_default();
+                let destination = copy.destination.to_string();
 
                 Instruction::Copy(CopyInstruction {
-                    sources: sources.to_vec(),
+                    sources,
                     destination,
                     from,
                     chown,

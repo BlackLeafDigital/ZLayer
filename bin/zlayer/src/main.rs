@@ -273,9 +273,14 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
 
     let resolved_socket = cli.effective_socket_path();
 
-    // Build the ProgramArguments array entries
+    // Build the ProgramArguments array entries.
+    // IMPORTANT: --data-dir is a top-level Cli arg and MUST come before the
+    // subcommand, otherwise clap rejects it as an unknown serve flag.
+    let effective_data_dir = cli.effective_data_dir();
     let mut args = vec![
         format!("        <string>{}</string>", exe_str),
+        "        <string>--data-dir</string>".to_string(),
+        format!("        <string>{}</string>", effective_data_dir.display()),
         "        <string>serve</string>".to_string(),
         "        <string>--bind</string>".to_string(),
         format!("        <string>{}</string>", bind),
@@ -285,14 +290,6 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
             socket.as_deref().unwrap_or(&resolved_socket)
         ),
     ];
-
-    // Always forward --data-dir with the effective value
-    let effective_data_dir = cli.effective_data_dir();
-    args.push("        <string>--data-dir</string>".to_string());
-    args.push(format!(
-        "        <string>{}</string>",
-        effective_data_dir.display()
-    ));
 
     if let Some(ref secret) = jwt_secret {
         args.push("        <string>--jwt-secret</string>".to_string());

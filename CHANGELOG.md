@@ -2,12 +2,57 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Sandbox builder: registry image pull via `zlayer-registry` (ImagePuller + LayerUnpacker)
+  when the `cache` feature is enabled, instead of requiring pre-pulled base images
+- Sandbox builder: multi-stage build support -- all stages are built sequentially and
+  `COPY --from=stage` resolves files from previously-built stage rootfs directories
+- Sandbox builder: ARG/ENV variable substitution (`${VAR}`, `${VAR:-default}`, `$VAR`)
+  applied to RUN commands, COPY/ADD sources and destinations, ENV values, WORKDIR,
+  LABEL values, and USER instructions
+- Sandbox builder: ADD URL sources -- downloads via `reqwest` with automatic archive
+  extraction for `.tar`, `.tar.gz`, `.tgz`, `.tar.bz2`, `.tar.xz`, and `.zip` files
+- Sandbox builder: ADD local archive auto-extraction for tar/gzip/bzip2/xz/zip formats
+- Sandbox builder: SHELL instruction support -- custom shell stored in config and used
+  for subsequent RUN shell-form commands
+- Sandbox builder: HEALTHCHECK instruction -- stores command, interval, timeout,
+  start_period, and retries in `SandboxImageConfig`
+- Sandbox builder: USER instruction now sets the USER environment variable for RUN
+  commands and resolves usernames from the rootfs `/etc/passwd`
+- Sandbox builder: COPY/ADD `--chown` and `--chmod` flags applied after file operations
+  using `nix::unistd::chown` and `std::os::unix::fs::PermissionsExt`
+
+### Fixed
+- Dockerfile COPY parser: fixed source/destination extraction to use the external
+  parser's separated `destination` field instead of incorrectly splitting the
+  `sources` vector (which already excluded the destination)
+- Sandbox builder: COPY/ADD destination path handling now correctly distinguishes
+  file targets from directory targets (`.`, trailing `/`, multiple sources)
+
 ## [2026-03-17]
 
 ### Added
+- macOS-native image builder (`SandboxImageBuilder`) that uses the Seatbelt sandbox
+  instead of buildah, enabling `zlayer build` on macOS without requiring buildah or
+  a Linux VM. Supports FROM, RUN, COPY, ADD, ENV, WORKDIR, ENTRYPOINT, CMD, EXPOSE,
+  ARG, LABEL, USER, VOLUME, and STOPSIGNAL instructions (single-stage builds).
+- `ImageBuilder` automatically falls back to the sandbox builder on macOS when buildah
+  is not installed, instead of failing with a "buildah not found" error.
 - `examples/zlayer-web.zlayer.yml` deployment spec for the Leptos web frontend
 
 ### Fixed
+- Daemon now regenerates the admin password if the `admin_password` file was
+  deleted while the credential store still has the (Argon2id-hashed) entry,
+  preventing permanently unrecoverable admin credentials
+- `zlayer daemon install` and `zlayer daemon start` now write a `spawner.pid`
+  marker file before launching the daemon via launchctl/systemctl, so the new
+  daemon's `cleanup_stale_daemon()` skips killing the spawning CLI process
+  (previously caused SIGTERM / exit 143)
+- `cleanup_stale_daemon()` now reads `{data_dir}/spawner.pid` as a fallback when
+  `ZLAYER_SPAWNER_PID` env var is not set (e.g., when launched via launchd/systemd),
+  preventing the daemon from killing the `zlayer daemon install/start` CLI process
 - GitHub Actions E2E workflow aligned with Forgejo: added `CARGO_BUILD_JOBS: "4"`,
   `--test-threads=1` for Youki tests, and post-sudo permission fix to resolve
   SQLite "database is locked" contention and test timeouts

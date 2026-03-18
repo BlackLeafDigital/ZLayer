@@ -188,6 +188,8 @@ pub mod builder;
 pub mod dockerfile;
 pub mod error;
 pub mod pipeline;
+#[cfg(target_os = "macos")]
+pub mod sandbox_builder;
 pub mod templates;
 pub mod tui;
 pub mod wasm_builder;
@@ -234,6 +236,10 @@ pub use templates::{
     list_templates, resolve_runtime, Runtime, RuntimeInfo,
 };
 pub use tui::{BuildEvent, BuildTui, InstructionStatus, PlainLogger};
+
+// macOS sandbox builder re-exports
+#[cfg(target_os = "macos")]
+pub use sandbox_builder::{SandboxBuildResult, SandboxImageBuilder, SandboxImageConfig};
 
 // Pipeline re-exports
 pub use pipeline::{
