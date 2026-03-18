@@ -216,7 +216,7 @@ WantedBy=multi-user.target"
             echo ""
             echo "Starting zlayer daemon..."
             # The binary handles launchd plist generation and loading
-            "${INSTALL_DIR}/${BINARY}" serve --daemon >/dev/null 2>&1 || true
+            ("${INSTALL_DIR}/${BINARY}" serve --daemon >/dev/null 2>&1 || true) 2>/dev/null
 
             PLIST="com.zlayer.daemon"
             if launchctl list "$PLIST" >/dev/null 2>&1; then

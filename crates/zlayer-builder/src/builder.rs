@@ -1373,14 +1373,17 @@ impl ImageBuilder {
         };
         debug!("Parsed Dockerfile with {} stages", dockerfile.stages.len());
 
-        // On macOS, if buildah is not available, fall back to the native sandbox builder.
+        // On macOS, always use the native sandbox builder. Buildah cannot perform
+        // container operations on macOS without a Linux VM, even if the binary is
+        // installed (e.g., via Homebrew) and `buildah version` succeeds.
         #[cfg(target_os = "macos")]
-        if !self.buildah_available().await {
-            info!("Buildah not available on macOS, falling back to native sandbox builder");
+        {
+            info!("Using native sandbox builder on macOS");
             return self.build_with_sandbox(&dockerfile, start_time).await;
         }
 
-        // 2. Determine stages to build
+        // 2. Determine stages to build (Linux/buildah path)
+        #[allow(unreachable_code)]
         let stages = self.resolve_stages(&dockerfile)?;
         debug!("Building {} stages", stages.len());
 
@@ -1746,16 +1749,6 @@ impl ImageBuilder {
             build_time_ms,
             is_manifest: false,
         })
-    }
-
-    /// Get a parsed build output from the configured source.
-    ///
-    /// Check if the buildah executor is actually functional.
-    ///
-    /// This is used on macOS to determine whether to fall back to the sandbox builder.
-    #[cfg(target_os = "macos")]
-    async fn buildah_available(&self) -> bool {
-        self.executor.is_available().await
     }
 
     /// Build using the macOS native sandbox builder (no buildah required).
