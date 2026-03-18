@@ -1753,6 +1753,7 @@ impl ImageBuilder {
     /// Check if the buildah executor is actually functional.
     ///
     /// This is used on macOS to determine whether to fall back to the sandbox builder.
+    #[cfg(target_os = "macos")]
     async fn buildah_available(&self) -> bool {
         self.executor.is_available().await
     }
