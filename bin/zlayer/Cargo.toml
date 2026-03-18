@@ -15,7 +15,7 @@ path = "src/main.rs"
 [features]
 default = ["full"]
 # Full runtime with all CLI commands and capabilities
-full = ["docker", "wasm", "s3", "persistent", "observability"]
+full = ["docker", "wasm", "s3", "persistent", "observability", "nat"]
 
 # WSL2 backend (Windows-only, thin CLI proxies to daemon in WSL2)
 wsl = ["dep:zlayer-wsl"]
@@ -26,12 +26,13 @@ wasm = ["zlayer-agent/wasm"]
 s3 = ["zlayer-agent/s3", "zlayer-registry/s3"]
 persistent = ["zlayer-scheduler/persistent", "zlayer-registry/persistent"]
 observability = ["zlayer-observability/axum", "zlayer-observability/propagation"]
+nat = ["zlayer-overlay/nat"]
 
 [dependencies]
 # Internal crates (cross-platform)
 zlayer-spec.workspace = true
 zlayer-observability.workspace = true
-zlayer-builder = { workspace = true, features = ["cache"] }
+zlayer-builder = { workspace = true, features = ["cache", "cache-persistent", "local-registry"] }
 zlayer-core.workspace = true
 zlayer-tunnel.workspace = true
 zlayer-registry = { workspace = true, features = ["local"] }
