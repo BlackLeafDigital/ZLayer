@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Sandbox builder: end-to-end integration tests (`sandbox_build_e2e.rs`) covering
+  manifest pull, layer pull, simple build, and ENV/WORKDIR build verification
 - Sandbox builder: registry image pull via `zlayer-registry` (ImagePuller + LayerUnpacker)
   when the `cache` feature is enabled, instead of requiring pre-pulled base images
 - Sandbox builder: multi-stage build support -- all stages are built sequentially and
@@ -25,6 +27,10 @@ All notable changes to this project will be documented in this file.
   using `nix::unistd::chown` and `std::os::unix::fs::PermissionsExt`
 
 ### Fixed
+- Registry client: use `linux/{arch}` platform resolution on macOS instead of
+  `darwin/{arch}`, fixing "no entry found in image index manifest" errors when
+  pulling standard Docker images (e.g. `golang:1.23-alpine`) that only ship
+  Linux platform entries
 - Dockerfile COPY parser: fixed source/destination extraction to use the external
   parser's separated `destination` field instead of incorrectly splitting the
   `sources` vector (which already excluded the destination)

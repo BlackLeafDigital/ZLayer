@@ -59,6 +59,8 @@ nix.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+zlayer-registry = { workspace = true }
+tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }
 
 [features]
 default = []
