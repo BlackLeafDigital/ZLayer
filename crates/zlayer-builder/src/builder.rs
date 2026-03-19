@@ -1770,8 +1770,15 @@ impl ImageBuilder {
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join(".zlayer");
 
-        let mut sandbox = SandboxImageBuilder::new(self.context.clone(), data_dir)
+        let mut sandbox = SandboxImageBuilder::new(self.context.clone(), data_dir.clone())
             .with_build_args(self.options.build_args.clone());
+
+        #[cfg(feature = "local-registry")]
+        if let Some(registry_path) = self.local_registry.as_ref().map(|r| r.root().to_path_buf()) {
+            if let Ok(registry) = LocalRegistry::new(registry_path).await {
+                sandbox = sandbox.with_local_registry(registry);
+            }
+        }
 
         if let Some(ref tx) = self.event_tx {
             sandbox = sandbox.with_events(tx.clone());

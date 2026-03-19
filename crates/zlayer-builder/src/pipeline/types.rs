@@ -73,6 +73,11 @@ pub struct ZPipeline {
     /// Keys are image names used for `depends_on` references.
     pub images: IndexMap<String, PipelineImage>,
 
+    /// Cache configuration for storing built image layers.
+    /// Enables pipeline-built images to be used as bases by downstream images.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<PipelineCacheConfig>,
+
     /// Push configuration.
     #[serde(default)]
     pub push: PushConfig,
@@ -202,6 +207,50 @@ pub struct PushConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Cache configuration
+// ---------------------------------------------------------------------------
+
+/// Cache backend configuration for the build pipeline.
+///
+/// Controls how built image layers are stored between pipeline stages.
+/// When set, pipeline-built images are registered in a local OCI registry
+/// so downstream images can reference them as base images.
+///
+/// # YAML Example
+///
+/// ```yaml
+/// cache:
+///   type: persistent
+///   path: ~/.zlayer/cache
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PipelineCacheConfig {
+    /// Cache type: "memory", "persistent", or "s3"
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub cache_type: Option<String>,
+
+    /// Path for persistent cache (only used when type is "persistent")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+
+    /// S3 bucket name (only used when type is "s3")
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<String>,
+
+    /// S3 region
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+
+    /// S3 endpoint URL
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+
+    /// S3 key prefix for cache objects
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -284,6 +333,23 @@ no_cache: true
         let yaml = "after_all: true";
         let push: PushConfig = serde_yaml::from_str(yaml).unwrap();
         assert!(push.after_all);
+    }
+
+    #[test]
+    fn test_pipeline_cache_config() {
+        let yaml = r"
+version: '1'
+cache:
+  type: persistent
+  path: /tmp/test-cache
+images:
+  test:
+    file: Dockerfile
+";
+        let pipeline: ZPipeline = serde_yaml::from_str(yaml).unwrap();
+        let cache = pipeline.cache.unwrap();
+        assert_eq!(cache.cache_type.as_deref(), Some("persistent"));
+        assert_eq!(cache.path, Some(PathBuf::from("/tmp/test-cache")));
     }
 
     #[test]
