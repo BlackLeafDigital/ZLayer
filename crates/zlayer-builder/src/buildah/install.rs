@@ -249,6 +249,9 @@ impl BuildahInstaller {
                 Err(InstallError::VersionTooOld { found, required })
             }
             Err(InstallError::NotFound) => {
+                #[cfg(target_os = "macos")]
+                debug!("Buildah not available on macOS; will use native sandbox builder");
+                #[cfg(not(target_os = "macos"))]
                 warn!("Buildah not found on system");
                 Err(InstallError::NotFound)
             }
