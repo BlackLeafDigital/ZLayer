@@ -43,12 +43,13 @@ jobs:
       - name: Detect latest SDK versions
         id: detect
         run: |
-          GO=$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r '.[0].version' | sed 's/go//' || echo "1.23.0")
-          RUST=$(curl -fsSL 'https://static.rust-lang.org/dist/channel-rust-stable.toml' | grep -m1 '^version' | cut -d'"' -f2 | cut -d' ' -f1 || echo "1.82.0")
-          NODE=$(curl -fsSL 'https://nodejs.org/dist/index.json' | jq -r '[.[] | select(.lts != false)][0].version' | sed 's/v//' || echo "22.0.0")
-          PYTHON=$(curl -fsSL 'https://endoflife.date/api/python.json' | jq -r '.[0].latest' || echo "3.13.0")
-          DENO=$(curl -fsSL 'https://api.github.com/repos/denoland/deno/releases/latest' | jq -r '.tag_name' | sed 's/^v//' || echo "2.0.0")
-          BUN=$(curl -fsSL 'https://api.github.com/repos/oven-sh/bun/releases/latest' | jq -r '.tag_name' | sed 's/^bun-v//' || echo "1.0.0")
+          fetch_version() { curl -fsSL "$1" 2>/dev/null; }
+          GO=$(fetch_version 'https://go.dev/dl/?mode=json' | jq -r '.[0].version' | sed 's/go//' || echo "1.23.0")
+          RUST=$(fetch_version 'https://api.github.com/repos/rust-lang/rust/releases/latest' | jq -r '.tag_name' || echo "1.82.0")
+          NODE=$(fetch_version 'https://nodejs.org/dist/index.json' | jq -r '[.[] | select(.lts != false)][0].version' | sed 's/v//' || echo "22.0.0")
+          PYTHON=$(fetch_version 'https://endoflife.date/api/python.json' | jq -r '.[0].latest' || echo "3.13.0")
+          DENO=$(fetch_version 'https://api.github.com/repos/denoland/deno/releases/latest' | jq -r '.tag_name' | sed 's/^v//' || echo "2.0.0")
+          BUN=$(fetch_version 'https://api.github.com/repos/oven-sh/bun/releases/latest' | jq -r '.tag_name' | sed 's/^bun-v//' || echo "1.0.0")
 
           echo "go=${GO}" >> "$GITHUB_OUTPUT"
           echo "rust=${RUST}" >> "$GITHUB_OUTPUT"
