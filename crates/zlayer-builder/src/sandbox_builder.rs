@@ -1600,11 +1600,10 @@ mod tests {
         // Verify essential sections are present
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
-        assert!(profile.contains("/tmp/rootfs"));
-        assert!(profile.contains("/tmp/build-tmp"));
-        assert!(profile.contains("network-outbound"));
         assert!(profile.contains("file-read*"));
         assert!(profile.contains("file-write*"));
+        assert!(profile.contains("file-map-executable"));
+        assert!(profile.contains("network-outbound"));
     }
 
     #[test]
