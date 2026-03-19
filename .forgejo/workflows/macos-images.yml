@@ -126,4 +126,4 @@ jobs:
 
       - name: Build and push macOS sandbox images
         run: |
-          ./target/release/zlayer pipeline -f images/macos/ZPipeline.yaml --push --no-tui
+          ./target/release/zlayer pipeline -f images/macos/ZPipeline.yaml --push

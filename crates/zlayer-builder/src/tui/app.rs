@@ -6,7 +6,7 @@
 use std::io::{self, Stdout};
 use std::sync::mpsc::{Receiver, TryRecvError};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::prelude::*;
 use ratatui::Terminal;
 use zlayer_tui::terminal::{restore_terminal, setup_terminal, POLL_DURATION};
@@ -105,18 +105,19 @@ impl BuildTui {
             // Render the UI
             terminal.draw(|frame| self.render(frame))?;
 
+            // Auto-exit when build completes (success or failure).
+            // The TUI disappears and the caller prints a summary to stdout.
+            if self.state.completed {
+                break;
+            }
+
             // Handle keyboard input with a short timeout
             if event::poll(POLL_DURATION)? {
                 if let Event::Key(key) = event::read()? {
                     if key.kind == KeyEventKind::Press {
-                        self.handle_input(key.code);
+                        self.handle_input(key.code, key.modifiers);
                     }
                 }
-            }
-
-            // Stop if build completed and user acknowledged
-            if self.state.completed && !self.running {
-                break;
             }
         }
 
@@ -256,9 +257,12 @@ impl BuildTui {
     }
 
     /// Handle keyboard input
-    fn handle_input(&mut self, key: KeyCode) {
+    fn handle_input(&mut self, key: KeyCode, modifiers: KeyModifiers) {
         match key {
             KeyCode::Char('q') | KeyCode::Esc => {
+                self.running = false;
+            }
+            KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
                 self.running = false;
             }
             KeyCode::Up | KeyCode::Char('k') => {
