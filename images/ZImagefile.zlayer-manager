@@ -6,7 +6,7 @@
 # is configured in Leptos.toml, so no manual Tailwind installation is needed.
 #
 # Usage:
-#   zlayer build -f docker/ZImagefile.zlayer-manager -t zlayer-manager .
+#   zlayer build -f images/ZImagefile.zlayer-manager -t zlayer-manager .
 
 version: "1"
 

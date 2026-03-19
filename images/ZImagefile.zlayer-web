@@ -4,7 +4,7 @@
 # Uses cargo-chef for dependency layer caching + buildah cache mounts.
 #
 # Usage:
-#   zlayer build -f docker/ZImagefile.zlayer-web -t zlayer-web .
+#   zlayer build -f images/ZImagefile.zlayer-web -t zlayer-web .
 
 version: "1"
 

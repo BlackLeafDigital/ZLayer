@@ -1,7 +1,7 @@
 # ZLayer Manager - Management UI (Leptos SSR + Hydration + Tailwind v4)
 #
 # Usage:
-#   docker build -f docker/Dockerfile.zlayer-manager -t zlayer-manager .
+#   docker build -f images/Dockerfile.zlayer-manager -t zlayer-manager .
 
 # Stage 1: Chef base
 FROM lukemathwalker/cargo-chef:latest-rust-1.90 AS chef
