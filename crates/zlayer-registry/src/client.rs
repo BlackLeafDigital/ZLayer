@@ -94,10 +94,11 @@ fn go_os_name() -> &'static str {
 
 /// Platform resolver that works correctly on macOS.
 ///
-/// On macOS, Docker images almost never contain `darwin/*` platform entries.
-/// Instead they contain `linux/*` entries, which is what Docker Desktop and
-/// other container runtimes actually run (inside a Linux VM). This resolver
-/// matches `linux/{native_arch}` on macOS so that pulls succeed.
+/// On macOS, this performs a two-pass search:
+/// 1. First tries `darwin/{arch}` for native macOS sandbox images from the
+///    zlayer registry.
+/// 2. Falls back to `linux/{arch}` for standard Docker Hub images (which run
+///    inside a Linux VM via Docker Desktop or similar).
 ///
 /// On all other platforms this behaves identically to oci-client's
 /// `current_platform_resolver`: it matches `{os}/{arch}` using the runtime
@@ -105,19 +106,39 @@ fn go_os_name() -> &'static str {
 fn zlayer_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
     let target_arch = go_arch_name();
 
-    // On macOS, look for linux images instead of darwin images.
-    let target_os = if cfg!(target_os = "macos") {
-        "linux"
-    } else {
-        go_os_name()
-    };
+    // On macOS, try darwin first (for native zlayer sandbox images),
+    // then fall back to linux (for standard Docker Hub images).
+    if cfg!(target_os = "macos") {
+        // Pass 1: darwin/{arch} (native macOS images)
+        if let Some(entry) = manifests.iter().find(|entry| {
+            entry
+                .platform
+                .as_ref()
+                .is_some_and(|p| p.os == "darwin" && p.architecture == target_arch)
+        }) {
+            return Some(entry.digest.clone());
+        }
+        // Pass 2: linux/{arch} (standard container images for VM runtime)
+        return manifests
+            .iter()
+            .find(|entry| {
+                entry
+                    .platform
+                    .as_ref()
+                    .is_some_and(|p| p.os == "linux" && p.architecture == target_arch)
+            })
+            .map(|entry| entry.digest.clone());
+    }
 
+    // Non-macOS: match native platform
+    let target_os = go_os_name();
     manifests
         .iter()
         .find(|entry| {
-            entry.platform.as_ref().is_some_and(|platform| {
-                platform.os == target_os && platform.architecture == target_arch
-            })
+            entry
+                .platform
+                .as_ref()
+                .is_some_and(|p| p.os == target_os && p.architecture == target_arch)
         })
         .map(|entry| entry.digest.clone())
 }

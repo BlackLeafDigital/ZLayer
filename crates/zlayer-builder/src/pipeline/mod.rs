@@ -35,11 +35,11 @@
 //!
 //! images:
 //!   base:
-//!     file: docker/Dockerfile.base
+//!     file: images/Dockerfile.base
 //!     tags:
 //!       - "${REGISTRY}/base:${VERSION}"
 //!   app:
-//!     file: docker/Dockerfile.app
+//!     file: images/Dockerfile.app
 //!     depends_on: [base]
 //!     tags:
 //!       - "${REGISTRY}/app:${VERSION}"
@@ -137,11 +137,11 @@ defaults:
   format: oci
 images:
   base:
-    file: docker/Dockerfile.base
+    file: images/Dockerfile.base
     tags:
       - "myapp/base:${VERSION}"
   app:
-    file: docker/Dockerfile.app
+    file: images/Dockerfile.app
     context: "."
     depends_on: [base]
     tags:
@@ -221,7 +221,7 @@ images:
         let yaml = r#"
 images:
   app:
-    file: docker/Dockerfile.app
+    file: images/Dockerfile.app
     context: "./app"
     tags:
       - "myapp:latest"
@@ -238,7 +238,7 @@ images:
         let pipeline = parse_pipeline(yaml).unwrap();
         let app = &pipeline.images["app"];
 
-        assert_eq!(app.file.to_string_lossy(), "docker/Dockerfile.app");
+        assert_eq!(app.file.to_string_lossy(), "images/Dockerfile.app");
         assert_eq!(app.context.to_string_lossy(), "./app");
         assert_eq!(app.tags.len(), 2);
         assert_eq!(
