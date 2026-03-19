@@ -1,0 +1,59 @@
+version: "1"
+
+vars:
+  REGISTRY: ghcr.io/blackleafdigital/zlayer
+
+images:
+  base:
+    file: images/macos/ZImagefile.base
+    context: .
+    tags:
+      - "${REGISTRY}/base:latest"
+
+  golang:
+    file: images/macos/ZImagefile.golang
+    context: .
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/golang:1.23"
+      - "${REGISTRY}/golang:latest"
+
+  rust:
+    file: images/macos/ZImagefile.rust
+    context: .
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/rust:latest"
+
+  node:
+    file: images/macos/ZImagefile.node
+    context: .
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/node:22"
+      - "${REGISTRY}/node:latest"
+
+  python:
+    file: images/macos/ZImagefile.python
+    context: .
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/python:3.13"
+      - "${REGISTRY}/python:latest"
+
+  deno:
+    file: images/macos/ZImagefile.deno
+    context: .
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/deno:latest"
+
+  bun:
+    file: images/macos/ZImagefile.bun
+    context: .
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/bun:latest"
+
+push:
+  after_all: true

@@ -1,0 +1,24 @@
+base: scratch
+workdir: /
+
+steps:
+  - run: |
+      mkdir -p bin usr/bin usr/local/bin usr/local/lib
+      mkdir -p etc/ssl tmp var/tmp var/log opt
+      for bin in sh bash cat cp echo ls mkdir mv rm sleep chmod ln test expr date dd ps kill hostname; do
+        [ -f "/bin/$bin" ] && cp "/bin/$bin" "bin/$bin"
+      done
+
+  - run: |
+      for bin in env which xargs tar gzip curl git make true false head tail grep sed awk sort uniq wc find tee touch cut tr dirname basename install id whoami zip unzip openssl; do
+        [ -f "/usr/bin/$bin" ] && cp "/usr/bin/$bin" "usr/bin/$bin"
+      done
+
+  - run: |
+      cp -R /etc/ssl/certs etc/ssl/ 2>/dev/null || true
+      cp /etc/ssl/cert.pem etc/ssl/ 2>/dev/null || true
+
+labels:
+  org.opencontainers.image.title: "ZLayer macOS Base"
+  org.opencontainers.image.description: "macOS-native base image with coreutils for sandbox builds"
+  org.opencontainers.image.vendor: "Black Leaf Digital"

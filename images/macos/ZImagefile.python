@@ -1,0 +1,23 @@
+base: zlayer/base:latest
+
+steps:
+  - run: |
+      ARCH="$(uname -m)"
+      [ "$ARCH" = "arm64" ] && UV_ARCH="aarch64" || UV_ARCH="x86_64"
+      mkdir -p usr/local/bin
+      curl -fsSL "https://github.com/astral-sh/uv/releases/latest/download/uv-${UV_ARCH}-apple-darwin.tar.gz" \
+        | tar -xz -C usr/local/bin/ --strip-components=1
+
+  - run: |
+      PYPREFIX="$(python3 -c 'import sys; print(sys.prefix)' 2>/dev/null || echo '')"
+      if [ -n "$PYPREFIX" ] && [ -d "$PYPREFIX" ]; then
+        mkdir -p usr/local/python
+        cp -R "$PYPREFIX"/* usr/local/python/ 2>/dev/null || true
+        mkdir -p usr/local/bin
+        [ -f "usr/local/python/bin/python3" ] && ln -sf ../python/bin/python3 usr/local/bin/python3
+        ln -sf python3 usr/local/bin/python
+      fi
+
+labels:
+  org.opencontainers.image.title: "ZLayer macOS Python"
+  org.opencontainers.image.vendor: "Black Leaf Digital"

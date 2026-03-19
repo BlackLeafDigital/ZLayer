@@ -9,7 +9,7 @@ Run ZLayer with embedded containerd inside a Docker container (similar to how KI
 cargo build --release --package zlayer
 
 # Build the Docker image
-docker build -f docker/Dockerfile.zlayer-node -t zlayer-node .
+docker build -f images/Dockerfile.zlayer-node -t zlayer-node .
 
 # Run ZLayer (privileged required for nested containerd)
 docker run --privileged -d --name zlayer \
@@ -85,13 +85,13 @@ By default, containers created inside ZLayer-in-Docker use the container's netwo
 ```bash
 # Debug build (faster, larger)
 cargo build --package zlayer
-docker build -f docker/Dockerfile.zlayer-node \
+docker build -f images/Dockerfile.zlayer-node \
   --build-arg BINARY_PATH=target/debug/zlayer \
   -t zlayer-node:dev .
 
 # Release build (slower, optimized)
 cargo build --release --package zlayer
-docker build -f docker/Dockerfile.zlayer-node -t zlayer-node .
+docker build -f images/Dockerfile.zlayer-node -t zlayer-node .
 ```
 
 ### Debugging Inside the Container
@@ -142,10 +142,10 @@ These use declarative YAML syntax with cache mounts instead of the `cargo-chef` 
 
 ```bash
 # Build the web frontend using ZImagefile
-zlayer build -f docker/ZImagefile.zlayer-web -t zlayer-web .
+zlayer build -f images/ZImagefile.zlayer-web -t zlayer-web .
 
 # Build the manager UI using ZImagefile
-zlayer build -f docker/ZImagefile.zlayer-manager -t zlayer-manager .
+zlayer build -f images/ZImagefile.zlayer-manager -t zlayer-manager .
 ```
 
 See the root [README](../README.md#zimagefile) for full ZImagefile format documentation.
@@ -228,7 +228,7 @@ defaults:
 
 images:
   base:
-    file: docker/Dockerfile.base
+    file: images/Dockerfile.base
     context: "."
     tags:
       - "${REGISTRY}/base:${VERSION}"
@@ -237,7 +237,7 @@ images:
       EXTRA_ARG: "value"
 
   app:
-    file: docker/ZImagefile.app
+    file: images/ZImagefile.app
     context: "."
     depends_on: [base]
     tags:
@@ -282,10 +282,10 @@ Images are built in "waves" based on dependency depth:
 
 ```bash
 # Build from ZImagefile (auto-detected)
-zlayer build -f docker/ZImagefile.zlayer-web -t zlayer-web .
+zlayer build -f images/ZImagefile.zlayer-web -t zlayer-web .
 
 # Build from Dockerfile
-zlayer build -f docker/Dockerfile.zlayer-node -t zlayer-node .
+zlayer build -f images/Dockerfile.zlayer-node -t zlayer-node .
 ```
 
 ### Multiple Images with Pipeline

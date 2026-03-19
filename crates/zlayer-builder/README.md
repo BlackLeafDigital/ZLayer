@@ -224,12 +224,12 @@ defaults:
 
 images:
   base:
-    file: docker/Dockerfile.base
+    file: images/Dockerfile.base
     tags:
       - "${REGISTRY}/base:${VERSION}"
 
   app:
-    file: docker/ZImagefile.app
+    file: images/ZImagefile.app
     depends_on: [base]
     tags:
       - "${REGISTRY}/app:${VERSION}"

@@ -1,7 +1,7 @@
-# ZLayer Web - Full-stack Leptos SSR + Hydration
+# ZLayer Manager - Management UI (Leptos SSR + Hydration + Tailwind v4)
 #
 # Usage:
-#   docker build -f docker/Dockerfile.zlayer-web -t zlayer-web .
+#   docker build -f images/Dockerfile.zlayer-manager -t zlayer-manager .
 
 # Stage 1: Chef base
 FROM lukemathwalker/cargo-chef:latest-rust-1.90 AS chef
@@ -25,6 +25,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install wasm target and cargo-leptos
+# cargo-leptos auto-downloads the Tailwind v4 CLI when tailwind-input-file
+# is configured in Leptos.toml, so no manual Tailwind installation is needed.
 RUN rustup target add wasm32-unknown-unknown && \
     cargo install cargo-leptos
 
@@ -35,7 +37,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 # Copy source and build
 COPY . .
 RUN --mount=type=cache,target=/root/.cache/cargo-leptos,id=cargo-leptos-cache \
-    cd crates/zlayer-web && cargo leptos build --release
+    cd crates/zlayer-manager && cargo leptos build --release
 
 # Runtime stage
 FROM debian:bookworm-slim
@@ -47,15 +49,15 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy the binary
-COPY --from=builder /build/target/release/zlayer-web-zql /app/zlayer-web
+COPY --from=builder /build/target/release/zlayer-manager-zql /app/zlayer-manager
 
-# Copy the site assets (WASM, CSS, etc.)
+# Copy the site assets (WASM, CSS, JS, etc.)
 COPY --from=builder /build/target/site /app/target/site
 
-ENV ZLAYER_WEB_ADDR=0.0.0.0:3000
+ENV ZLAYER_MANAGER_ADDR=0.0.0.0:9120
 ENV LEPTOS_SITE_ROOT=/app/target/site
 ENV RUST_LOG=info
 
-EXPOSE 3000
+EXPOSE 9120
 
-CMD ["/app/zlayer-web"]
+CMD ["/app/zlayer-manager"]

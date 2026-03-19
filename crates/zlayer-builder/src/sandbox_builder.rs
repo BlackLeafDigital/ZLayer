@@ -717,9 +717,17 @@ impl SandboxImageBuilder {
                 env_map.insert(k.to_string(), v.to_string());
             }
         }
-        // Set PATH if not already set
+        // Set PATH if not already set — include rootfs bin dirs so that
+        // binaries installed in the image layer are found, plus Homebrew paths
+        // for macOS host tooling.
         env_map.entry("PATH".to_string()).or_insert_with(|| {
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string()
+            format!(
+                "{rootfs}/usr/local/bin:{rootfs}/usr/bin:{rootfs}/bin:\
+                 /opt/homebrew/bin:/opt/homebrew/sbin:\
+                 /usr/local/bin:/usr/local/sbin:\
+                 /usr/bin:/usr/sbin:/bin:/sbin",
+                rootfs = rootfs_dir.display()
+            )
         });
         // Set HOME
         env_map
@@ -752,13 +760,6 @@ impl SandboxImageBuilder {
                     .join(" ")
             }
         };
-
-        // Prefix PATH with rootfs bin directories so that binaries installed
-        // in the rootfs (e.g., from `apt-get install`) are found first.
-        let rootfs_display = rootfs_dir.display();
-        let wrapped_cmd = format!(
-            "export PATH='{rootfs_display}/usr/local/sbin:{rootfs_display}/usr/local/bin:{rootfs_display}/usr/sbin:{rootfs_display}/usr/bin:{rootfs_display}/sbin:{rootfs_display}/bin'\"${{PATH:+:$PATH}}\"; {shell_cmd}"
-        );
 
         // Determine working directory
         let workdir = if config.working_dir.is_empty() || config.working_dir == "/" {
@@ -796,7 +797,7 @@ impl SandboxImageBuilder {
         for flag in &shell_flag {
             cmd.arg(flag);
         }
-        cmd.arg(&wrapped_cmd);
+        cmd.arg(&shell_cmd);
 
         cmd.current_dir(&workdir)
             .stdout(Stdio::piped())
@@ -836,6 +837,38 @@ impl SandboxImageBuilder {
 
         if !output.status.success() {
             let exit_code = output.status.code().unwrap_or(-1);
+
+            // Detect Linux ELF binaries that can't execute on macOS
+            if cfg!(target_os = "macos") && (exit_code == 126 || exit_code == 127) {
+                let first_word = command_str.split_whitespace().next().unwrap_or("");
+                // Check rootfs for the binary (both absolute and relative to rootfs)
+                let check_path = if first_word.starts_with('/') {
+                    rootfs_dir.join(first_word.trim_start_matches('/'))
+                } else {
+                    rootfs_dir.join("usr/bin").join(first_word)
+                };
+                if check_path.exists() {
+                    if let Ok(bytes) = std::fs::read(&check_path) {
+                        if bytes.len() >= 4 && bytes[..4] == [0x7f, b'E', b'L', b'F'] {
+                            warn!(
+                                "Linux ELF binary detected: {} — cannot execute on macOS. \
+                                 Use zlayer/ base images (e.g., zlayer/golang, zlayer/rust) \
+                                 instead of Alpine/Debian for macOS sandbox builds.",
+                                first_word
+                            );
+                            return Err(BuildError::RunFailed {
+                                command: format!(
+                                    "{command_str} \
+                                     (Linux binary cannot execute on macOS — \
+                                     use zlayer/ base images instead of Alpine/Debian)"
+                                ),
+                                exit_code,
+                            });
+                        }
+                    }
+                }
+            }
+
             return Err(BuildError::RunFailed {
                 command: command_str,
                 exit_code,
