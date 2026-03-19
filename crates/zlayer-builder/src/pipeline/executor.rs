@@ -48,6 +48,9 @@ use crate::error::{BuildError, Result};
 
 use super::types::{PipelineDefaults, PipelineImage, ZPipeline};
 
+#[cfg(feature = "local-registry")]
+use zlayer_registry::LocalRegistry;
+
 /// Result of a pipeline execution
 #[derive(Debug)]
 pub struct PipelineResult {
@@ -88,6 +91,9 @@ pub struct PipelineExecutor {
     fail_fast: bool,
     /// Whether to push images after building
     push_enabled: bool,
+    /// Optional local registry for sharing built images between pipeline stages
+    #[cfg(feature = "local-registry")]
+    local_registry: Option<Arc<LocalRegistry>>,
 }
 
 impl PipelineExecutor {
@@ -109,6 +115,8 @@ impl PipelineExecutor {
             executor,
             fail_fast: true,
             push_enabled,
+            #[cfg(feature = "local-registry")]
+            local_registry: None,
         }
     }
 
@@ -130,6 +138,18 @@ impl PipelineExecutor {
     #[must_use]
     pub fn push(mut self, enabled: bool) -> Self {
         self.push_enabled = enabled;
+        self
+    }
+
+    /// Set a local registry for sharing built images between pipeline stages.
+    ///
+    /// When set, each image build receives a fresh [`LocalRegistry`] handle
+    /// pointing at the same on-disk root, so downstream images can resolve
+    /// base images that were built by earlier waves.
+    #[cfg(feature = "local-registry")]
+    #[must_use]
+    pub fn with_local_registry(mut self, registry: Arc<LocalRegistry>) -> Self {
+        self.local_registry = Some(registry);
         self
     }
 
@@ -300,6 +320,14 @@ impl PipelineExecutor {
         let base_dir = Arc::new(self.base_dir.clone());
         let executor = self.executor.clone();
 
+        // Extract local registry root path (if configured) so spawned tasks
+        // can create their own LocalRegistry handles pointing at the same store.
+        #[cfg(feature = "local-registry")]
+        let registry_root: Option<PathBuf> =
+            self.local_registry.as_ref().map(|r| r.root().to_path_buf());
+        #[cfg(not(feature = "local-registry"))]
+        let registry_root: Option<PathBuf> = None;
+
         let mut set = JoinSet::new();
 
         for name in wave {
@@ -307,6 +335,7 @@ impl PipelineExecutor {
             let pipeline = Arc::clone(&pipeline);
             let base_dir = Arc::clone(&base_dir);
             let executor = executor.clone();
+            let registry_root = registry_root.clone();
 
             set.spawn(async move {
                 let platforms = {
@@ -316,17 +345,41 @@ impl PipelineExecutor {
 
                 let result = match platforms.len() {
                     // No platforms specified — native build (existing behavior)
-                    0 => build_single_image(&name, &pipeline, &base_dir, executor, None).await,
+                    0 => {
+                        build_single_image(
+                            &name,
+                            &pipeline,
+                            &base_dir,
+                            executor,
+                            None,
+                            registry_root.as_deref(),
+                        )
+                        .await
+                    }
                     // Single platform — use build_single_image with platform set
                     1 => {
                         let platform = platforms[0].clone();
-                        build_single_image(&name, &pipeline, &base_dir, executor, Some(&platform))
-                            .await
+                        build_single_image(
+                            &name,
+                            &pipeline,
+                            &base_dir,
+                            executor,
+                            Some(&platform),
+                            registry_root.as_deref(),
+                        )
+                        .await
                     }
                     // Multiple platforms — build each, then create manifest list
                     _ => {
-                        build_multiplatform_image(&name, &pipeline, &base_dir, executor, &platforms)
-                            .await
+                        build_multiplatform_image(
+                            &name,
+                            &pipeline,
+                            &base_dir,
+                            executor,
+                            &platforms,
+                            registry_root.as_deref(),
+                        )
+                        .await
                     }
                 };
 
@@ -481,6 +534,7 @@ async fn build_single_image(
     base_dir: &Path,
     executor: BuildahExecutor,
     platform: Option<&str>,
+    registry_root: Option<&Path>,
 ) -> Result<BuiltImage> {
     let image_config = &pipeline.images[name];
     let context = base_dir.join(&image_config.context);
@@ -505,6 +559,18 @@ async fn build_single_image(
     // Apply shared pipeline config (build_args, format, no_cache, cache_mounts, retries)
     builder = apply_pipeline_config(builder, image_config, &pipeline.defaults);
 
+    // Wire up local registry so this build can resolve images from earlier waves
+    #[cfg(feature = "local-registry")]
+    if let Some(root) = registry_root {
+        let shared_registry = LocalRegistry::new(root.to_path_buf()).await.map_err(|e| {
+            BuildError::invalid_instruction(
+                "pipeline",
+                format!("failed to open local registry: {e}"),
+            )
+        })?;
+        builder = builder.with_local_registry(shared_registry);
+    }
+
     builder.build().await
 }
 
@@ -519,6 +585,7 @@ async fn build_multiplatform_image(
     base_dir: &Path,
     executor: BuildahExecutor,
     platforms: &[String],
+    registry_root: Option<&Path>,
 ) -> Result<BuiltImage> {
     let image_config = &pipeline.images[name];
     let start_time = std::time::Instant::now();
@@ -568,6 +635,18 @@ async fn build_multiplatform_image(
 
         // Apply shared config (build_args, format, no_cache, cache_mounts, retries)
         builder = apply_pipeline_config(builder, image_config, &pipeline.defaults);
+
+        // Wire up local registry so this build can resolve images from earlier waves
+        #[cfg(feature = "local-registry")]
+        if let Some(root) = registry_root {
+            let shared_registry = LocalRegistry::new(root.to_path_buf()).await.map_err(|e| {
+                BuildError::invalid_instruction(
+                    "pipeline",
+                    format!("failed to open local registry: {e}"),
+                )
+            })?;
+            builder = builder.with_local_registry(shared_registry);
+        }
 
         let built = builder.build().await?;
         total_layers += built.layer_count;

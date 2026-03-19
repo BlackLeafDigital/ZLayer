@@ -41,6 +41,9 @@ use crate::dockerfile::{
 use crate::error::{BuildError, Result};
 use crate::tui::BuildEvent;
 
+#[cfg(feature = "local-registry")]
+use zlayer_registry::LocalRegistry;
+
 // ---------------------------------------------------------------------------
 // OCI-like image config (stored as config.json alongside the rootfs)
 // ---------------------------------------------------------------------------
@@ -175,6 +178,9 @@ pub struct SandboxImageBuilder {
     build_args: HashMap<String, String>,
     /// Event sender for TUI progress updates.
     event_tx: Option<std::sync::mpsc::Sender<BuildEvent>>,
+    /// Local OCI registry for resolving pipeline-built base images.
+    #[cfg(feature = "local-registry")]
+    local_registry: Option<LocalRegistry>,
 }
 
 impl SandboxImageBuilder {
@@ -191,6 +197,8 @@ impl SandboxImageBuilder {
             data_dir,
             build_args: HashMap::new(),
             event_tx: None,
+            #[cfg(feature = "local-registry")]
+            local_registry: None,
         }
     }
 
@@ -205,6 +213,14 @@ impl SandboxImageBuilder {
     #[must_use]
     pub fn with_events(mut self, tx: std::sync::mpsc::Sender<BuildEvent>) -> Self {
         self.event_tx = Some(tx);
+        self
+    }
+
+    /// Set a local registry for resolving base images from pipeline-built images.
+    #[cfg(feature = "local-registry")]
+    #[must_use]
+    pub fn with_local_registry(mut self, registry: LocalRegistry) -> Self {
+        self.local_registry = Some(registry);
         self
     }
 
@@ -438,13 +454,13 @@ impl SandboxImageBuilder {
                 }
             }
             ImageRef::Registry { .. } => {
+                let raw_ref = image_ref.to_string_ref();
                 let qualified = image_ref.qualify();
                 let full_ref = qualified.to_string_ref();
 
-                // Check if we already have this image extracted locally
+                // Check 1: exact qualified name in local cache
                 let sanitized = sanitize_image_name(&full_ref);
                 let cached_rootfs = self.data_dir.join("images").join(&sanitized).join("rootfs");
-
                 if cached_rootfs.exists() && has_content(&cached_rootfs) {
                     info!(
                         "Using cached base image rootfs: {}",
@@ -454,11 +470,142 @@ impl SandboxImageBuilder {
                     return Ok(());
                 }
 
-                // Pull via zlayer-registry
+                // Check 2: Local OCI registry (for pipeline-built images)
+                #[cfg(feature = "local-registry")]
+                if let Some(ref registry) = self.local_registry {
+                    // Try the raw (unqualified) reference first
+                    let (name, tag) = parse_image_name_tag(&raw_ref);
+                    if registry.has_manifest(&name, &tag).await {
+                        info!("Found '{}' in local registry, extracting layers", raw_ref);
+                        return self
+                            .extract_from_local_registry(registry, &name, &tag, rootfs_dir)
+                            .await;
+                    }
+                    // Also try the fully-qualified reference
+                    let (qname, qtag) = parse_image_name_tag(&full_ref);
+                    if (qname != name || qtag != tag) && registry.has_manifest(&qname, &qtag).await
+                    {
+                        info!("Found '{}' in local registry, extracting layers", full_ref);
+                        return self
+                            .extract_from_local_registry(registry, &qname, &qtag, rootfs_dir)
+                            .await;
+                    }
+                }
+
+                // Check 3: unqualified name in local cache (before Docker Hub
+                // qualification, e.g. "zlayer/base:latest" → "zlayer_base_latest")
+                let raw_sanitized = sanitize_image_name(&raw_ref);
+                if raw_sanitized != sanitized {
+                    let raw_cached = self
+                        .data_dir
+                        .join("images")
+                        .join(&raw_sanitized)
+                        .join("rootfs");
+                    if raw_cached.exists() && has_content(&raw_cached) {
+                        info!("Using cached base image rootfs: {}", raw_cached.display());
+                        copy_directory_recursive(&raw_cached, rootfs_dir).await?;
+                        return Ok(());
+                    }
+                }
+
+                // Check 4: scan local images for a pipeline-built image whose
+                // sanitized name ends with the unqualified portion. This handles
+                // e.g. "zlayer/base:latest" matching a locally-built image tagged
+                // "ghcr.io/blackleafdigital/zlayer/base:latest".
+                let images_dir = self.data_dir.join("images");
+                if images_dir.exists() {
+                    if let Ok(entries) = std::fs::read_dir(&images_dir) {
+                        for entry in entries.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            if name.ends_with(&raw_sanitized) && name != raw_sanitized {
+                                let candidate = entry.path().join("rootfs");
+                                if candidate.exists() && has_content(&candidate) {
+                                    info!(
+                                        "Using locally-built image '{}' for base '{}'",
+                                        name, raw_ref
+                                    );
+                                    copy_directory_recursive(&candidate, rootfs_dir).await?;
+                                    return Ok(());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Fall back to pulling from registry
                 self.pull_and_extract_image(&full_ref, &cached_rootfs, rootfs_dir)
                     .await
             }
         }
+    }
+
+    /// Extract an image from the local registry into a rootfs directory.
+    #[cfg(feature = "local-registry")]
+    async fn extract_from_local_registry(
+        &self,
+        registry: &LocalRegistry,
+        name: &str,
+        tag: &str,
+        rootfs_dir: &Path,
+    ) -> Result<()> {
+        use zlayer_registry::LayerUnpacker;
+
+        // Get the manifest
+        let manifest_data =
+            registry
+                .get_manifest(name, tag)
+                .await
+                .map_err(|e| BuildError::BaseImageNotFound {
+                    image: format!("{name}:{tag}: {e}"),
+                })?;
+
+        // Parse manifest to get layer digests
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&manifest_data).map_err(|e| BuildError::BaseImageNotFound {
+                image: format!("{name}:{tag}: invalid manifest: {e}"),
+            })?;
+
+        let layer_descriptors = manifest
+            .get("layers")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| BuildError::BaseImageNotFound {
+                image: format!("{name}:{tag}: manifest has no layers array"),
+            })?;
+
+        // Extract each layer from the registry
+        let mut layers = Vec::new();
+        for layer_desc in layer_descriptors {
+            let digest = layer_desc
+                .get("digest")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| BuildError::RegistryError {
+                    message: format!("layer descriptor missing digest in {name}:{tag}"),
+                })?;
+
+            let media_type = layer_desc
+                .get("mediaType")
+                .and_then(|v| v.as_str())
+                .unwrap_or("application/vnd.oci.image.layer.v1.tar+gzip");
+
+            let blob = registry
+                .get_blob(digest)
+                .await
+                .map_err(|e| BuildError::RegistryError {
+                    message: format!("failed to get layer blob {digest}: {e}"),
+                })?;
+            layers.push((blob, media_type.to_string()));
+        }
+
+        // Unpack layers to rootfs
+        let mut unpacker = LayerUnpacker::new(rootfs_dir.to_path_buf());
+        unpacker
+            .unpack_layers(&layers)
+            .await
+            .map_err(|e| BuildError::RegistryError {
+                message: format!("failed to unpack layers: {e}"),
+            })?;
+
+        Ok(())
     }
 
     /// Pull a registry image and extract its layers to the rootfs.
@@ -1492,6 +1639,15 @@ fn resolve_dest_path(rootfs_dir: &Path, working_dir: &str, dest: &str) -> PathBu
 /// Sanitize an image name for use as a filesystem directory name.
 fn sanitize_image_name(image: &str) -> String {
     image.replace(['/', ':', '@'], "_")
+}
+
+/// Parse an image reference into (name, tag) parts.
+fn parse_image_name_tag(reference: &str) -> (String, String) {
+    if let Some((name, tag)) = reference.rsplit_once(':') {
+        (name.to_string(), tag.to_string())
+    } else {
+        (reference.to_string(), "latest".to_string())
+    }
 }
 
 /// Generate a short build ID for unique naming.

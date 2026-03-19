@@ -12,6 +12,13 @@ All notable changes to this project will be documented in this file.
   write to absolute host paths since there is no chroot on macOS)
 
 ### Added
+- Sandbox builder: `LocalRegistry` integration for base image resolution — pipeline-built
+  images stored in the local OCI registry can now be resolved as base images by
+  `SandboxImageBuilder`, with fallback to filesystem scan and remote pull
+- Pipeline cache config: `PipelineCacheConfig` type for configuring cache backends
+  (memory, persistent, s3) in ZPipeline.yaml via a top-level `cache:` field
+- Pipeline executor: `LocalRegistry` wiring so pipeline-built images from earlier waves
+  can be resolved as base images by downstream builds (behind `local-registry` feature)
 - macOS-native base images defined as ZImagefiles (`images/macos/`):
   `zlayer/base`, `zlayer/golang`, `zlayer/rust`, `zlayer/node`, `zlayer/python` (with uv),
   `zlayer/deno`, `zlayer/bun` — containing macOS Mach-O binaries for sandbox builds

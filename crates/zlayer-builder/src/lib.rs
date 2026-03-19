@@ -243,8 +243,8 @@ pub use sandbox_builder::{SandboxBuildResult, SandboxImageBuilder, SandboxImageC
 
 // Pipeline re-exports
 pub use pipeline::{
-    parse_pipeline, PipelineDefaults, PipelineExecutor, PipelineImage, PipelineResult, PushConfig,
-    ZPipeline,
+    parse_pipeline, PipelineCacheConfig, PipelineDefaults, PipelineExecutor, PipelineImage,
+    PipelineResult, PushConfig, ZPipeline,
 };
 
 #[cfg(test)]

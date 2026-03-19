@@ -74,7 +74,7 @@ pub mod executor;
 pub mod types;
 
 pub use executor::{PipelineExecutor, PipelineResult};
-pub use types::{PipelineDefaults, PipelineImage, PushConfig, ZPipeline};
+pub use types::{PipelineCacheConfig, PipelineDefaults, PipelineImage, PushConfig, ZPipeline};
 
 use crate::error::{BuildError, Result};
 
