@@ -6,7 +6,7 @@ use crate::image_config::{ImageConfig, OciImageConfigRoot};
 use crate::wasm::{detect_artifact_type, extract_wasm_info, ArtifactType, WasmArtifactInfo};
 use oci_client::{
     client::{ClientConfig, ClientProtocol},
-    manifest::{OciImageManifest, OciManifest},
+    manifest::{ImageIndexEntry, OciImageManifest, OciManifest},
     secrets::RegistryAuth,
     Reference, RegistryOperation,
 };
@@ -73,6 +73,67 @@ pub struct PushResult {
     pub reference: String,
 }
 
+/// Map Rust architecture names to Go/OCI architecture names.
+fn go_arch_name() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "amd64",
+        "x86" => "amd",
+        "aarch64" => "arm64",
+        "powerpc64" => "ppc64le",
+        other => other,
+    }
+}
+
+/// Map Rust OS names to Go/OCI OS names.
+fn go_os_name() -> &'static str {
+    match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    }
+}
+
+/// Platform resolver that works correctly on macOS.
+///
+/// On macOS, Docker images almost never contain `darwin/*` platform entries.
+/// Instead they contain `linux/*` entries, which is what Docker Desktop and
+/// other container runtimes actually run (inside a Linux VM). This resolver
+/// matches `linux/{native_arch}` on macOS so that pulls succeed.
+///
+/// On all other platforms this behaves identically to oci-client's
+/// `current_platform_resolver`: it matches `{os}/{arch}` using the runtime
+/// values (with the standard Rust-to-Go name mapping).
+fn zlayer_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
+    let target_arch = go_arch_name();
+
+    // On macOS, look for linux images instead of darwin images.
+    let target_os = if cfg!(target_os = "macos") {
+        "linux"
+    } else {
+        go_os_name()
+    };
+
+    manifests
+        .iter()
+        .find(|entry| {
+            entry.platform.as_ref().is_some_and(|platform| {
+                platform.os == target_os && platform.architecture == target_arch
+            })
+        })
+        .map(|entry| entry.digest.clone())
+}
+
+/// Build a [`ClientConfig`] with the zlayer platform resolver and sensible
+/// defaults for timeouts and protocol.
+fn build_client_config() -> ClientConfig {
+    ClientConfig {
+        protocol: ClientProtocol::Https,
+        connect_timeout: Some(std::time::Duration::from_secs(30)),
+        read_timeout: Some(std::time::Duration::from_secs(300)), // 5 minutes for large layers
+        platform_resolver: Some(Box::new(zlayer_platform_resolver)),
+        ..Default::default()
+    }
+}
+
 /// OCI image puller with caching
 pub struct ImagePuller {
     client: oci_client::Client,
@@ -83,13 +144,7 @@ pub struct ImagePuller {
 impl ImagePuller {
     /// Create a new image puller with any cache backend
     pub fn new<C: BlobCacheBackend + 'static>(cache: C) -> Self {
-        let config = ClientConfig {
-            protocol: ClientProtocol::Https,
-            connect_timeout: Some(std::time::Duration::from_secs(30)),
-            read_timeout: Some(std::time::Duration::from_secs(300)), // 5 minutes for large layers
-            ..Default::default()
-        };
-        let client = oci_client::Client::new(config);
+        let client = oci_client::Client::new(build_client_config());
 
         Self {
             client,
@@ -101,13 +156,7 @@ impl ImagePuller {
     /// Create a new image puller with boxed cache backend
     #[must_use]
     pub fn with_cache(cache: Arc<Box<dyn BlobCacheBackend>>) -> Self {
-        let config = ClientConfig {
-            protocol: ClientProtocol::Https,
-            connect_timeout: Some(std::time::Duration::from_secs(30)),
-            read_timeout: Some(std::time::Duration::from_secs(300)), // 5 minutes for large layers
-            ..Default::default()
-        };
-        let client = oci_client::Client::new(config);
+        let client = oci_client::Client::new(build_client_config());
 
         Self {
             client,

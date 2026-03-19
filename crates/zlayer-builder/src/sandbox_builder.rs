@@ -27,7 +27,6 @@
 //! This module is only compiled on macOS (`#[cfg(target_os = "macos")]`).
 
 use std::collections::HashMap;
-use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -100,7 +99,7 @@ pub struct SandboxHealthcheck {
 /// This profile is more permissive than the runtime profile because build commands
 /// need network access (e.g., `apt-get update`, `pip install`) and write access to
 /// the entire rootfs plus common system paths.
-fn generate_build_seatbelt_profile(rootfs_dir: &Path, tmp_dir: &Path) -> String {
+fn generate_build_seatbelt_profile(_rootfs_dir: &Path, _tmp_dir: &Path) -> String {
     let mut profile = String::with_capacity(2048);
 
     // Header
@@ -116,40 +115,17 @@ fn generate_build_seatbelt_profile(rootfs_dir: &Path, tmp_dir: &Path) -> String 
     profile.push_str("(allow process-info-pidinfo)\n");
     profile.push_str("(allow process-info-rusage)\n\n");
 
-    // System libraries (required for any process to run)
-    profile.push_str("; --- System libraries ---\n");
-    profile.push_str("(allow file-read*\n");
-    profile.push_str("  (subpath \"/usr/lib\")\n");
-    profile.push_str("  (subpath \"/usr/bin\")\n");
-    profile.push_str("  (subpath \"/usr/sbin\")\n");
-    profile.push_str("  (subpath \"/usr/share\")\n");
-    profile.push_str("  (subpath \"/usr/local\")\n");
-    profile.push_str("  (subpath \"/bin\")\n");
-    profile.push_str("  (subpath \"/sbin\")\n");
-    profile.push_str("  (subpath \"/etc\")\n");
-    profile.push_str("  (subpath \"/var\")\n");
-    profile.push_str("  (subpath \"/private/etc\")\n");
-    profile.push_str("  (subpath \"/private/var\")\n");
-    profile.push_str("  (subpath \"/opt\")\n");
-    profile.push_str("  (subpath \"/System/Library/Frameworks\")\n");
-    profile.push_str("  (subpath \"/System/Library/PrivateFrameworks\")\n");
-    profile.push_str("  (subpath \"/System/Library/Extensions\")\n");
-    profile.push_str("  (subpath \"/System/Library/ColorSync\")\n");
-    profile.push_str("  (subpath \"/Library\")\n");
-    profile.push_str("  (literal \"/\")\n");
-    profile.push_str("  (literal \"/dev/random\")\n");
-    profile.push_str("  (literal \"/dev/urandom\")\n");
-    profile.push_str("  (literal \"/dev/null\"))\n\n");
-
-    // Executable mapping
-    profile.push_str("; --- Executable mapping ---\n");
-    profile.push_str("(allow file-map-executable\n");
-    profile.push_str("  (subpath \"/usr/lib\")\n");
-    profile.push_str("  (subpath \"/usr/local\")\n");
-    profile.push_str("  (subpath \"/opt\")\n");
-    profile.push_str("  (subpath \"/System/Library/Frameworks\")\n");
-    profile.push_str("  (subpath \"/System/Library/PrivateFrameworks\")\n");
-    profile.push_str("  (subpath \"/System/Library/Extensions\"))\n\n");
+    // Filesystem (build-time: broad access)
+    // RUN instructions use absolute host paths since there is no chroot on
+    // macOS.  Build-time FS isolation is not a security goal — the sandbox
+    // prevents accidental mach/IPC/keychain abuse, not file writes.
+    profile.push_str("; --- Filesystem (build-time: broad access) ---\n");
+    profile.push_str("; RUN instructions use absolute host paths since there is no chroot on\n");
+    profile.push_str("; macOS.  Build-time FS isolation is not a security goal — the sandbox\n");
+    profile.push_str("; prevents accidental mach/IPC/keychain abuse, not file writes.\n");
+    profile.push_str("(allow file-read* file-write* file-map-executable)\n");
+    profile.push_str("(allow pseudo-tty)\n");
+    profile.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))\n\n");
 
     // System info
     profile.push_str("; --- System info ---\n");
@@ -163,44 +139,12 @@ fn generate_build_seatbelt_profile(rootfs_dir: &Path, tmp_dir: &Path) -> String 
     profile.push_str("  (global-name \"com.apple.SecurityServer\")\n");
     profile.push_str("  (global-name \"com.apple.system.notification_center\"))\n\n");
 
-    // Container rootfs (full read/write/execute)
-    profile.push_str("; --- Container rootfs (build target) ---\n");
-    let _ = writeln!(
-        profile,
-        "(allow file-read* file-write* (subpath \"{}\"))",
-        rootfs_dir.display()
-    );
-    let _ = writeln!(
-        profile,
-        "(allow file-map-executable (subpath \"{}\"))",
-        rootfs_dir.display()
-    );
-    profile.push('\n');
-
-    // Tmp directory
-    profile.push_str("; --- Temp directory ---\n");
-    let _ = writeln!(
-        profile,
-        "(allow file-read* file-write* (subpath \"{}\"))",
-        tmp_dir.display()
-    );
-    profile.push('\n');
-
     // Network: full access for build-time operations (package managers, etc.)
     profile.push_str("; --- Network: full access (build-time) ---\n");
     profile.push_str("(allow network-outbound)\n");
     profile.push_str("(allow network-inbound)\n");
     profile.push_str("(allow network-bind)\n");
     profile.push_str("(allow system-socket)\n\n");
-
-    // I/O essentials
-    profile.push_str("; --- I/O essentials ---\n");
-    profile.push_str("(allow file-write-data\n");
-    profile.push_str("  (require-all (literal \"/dev/null\") (vnode-type CHARACTER-DEVICE)))\n");
-    profile.push_str("(allow file-read-data\n");
-    profile.push_str("  (require-all (literal \"/dev/null\") (vnode-type CHARACTER-DEVICE)))\n");
-    profile.push_str("(allow pseudo-tty)\n");
-    profile.push_str("(allow file-read* file-write* file-ioctl (literal \"/dev/ptmx\"))\n\n");
 
     // IPC
     profile.push_str("; --- IPC ---\n");
@@ -809,6 +753,13 @@ impl SandboxImageBuilder {
             }
         };
 
+        // Prefix PATH with rootfs bin directories so that binaries installed
+        // in the rootfs (e.g., from `apt-get install`) are found first.
+        let rootfs_display = rootfs_dir.display();
+        let wrapped_cmd = format!(
+            "export PATH='{rootfs_display}/usr/local/sbin:{rootfs_display}/usr/local/bin:{rootfs_display}/usr/sbin:{rootfs_display}/usr/bin:{rootfs_display}/sbin:{rootfs_display}/bin'\"${{PATH:+:$PATH}}\"; {shell_cmd}"
+        );
+
         // Determine working directory
         let workdir = if config.working_dir.is_empty() || config.working_dir == "/" {
             rootfs_dir.to_path_buf()
@@ -845,7 +796,7 @@ impl SandboxImageBuilder {
         for flag in &shell_flag {
             cmd.arg(flag);
         }
-        cmd.arg(&shell_cmd);
+        cmd.arg(&wrapped_cmd);
 
         cmd.current_dir(&workdir)
             .stdout(Stdio::piped())
@@ -1649,11 +1600,10 @@ mod tests {
         // Verify essential sections are present
         assert!(profile.contains("(version 1)"));
         assert!(profile.contains("(deny default)"));
-        assert!(profile.contains("/tmp/rootfs"));
-        assert!(profile.contains("/tmp/build-tmp"));
-        assert!(profile.contains("network-outbound"));
         assert!(profile.contains("file-read*"));
         assert!(profile.contains("file-write*"));
+        assert!(profile.contains("file-map-executable"));
+        assert!(profile.contains("network-outbound"));
     }
 
     #[test]
