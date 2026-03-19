@@ -47,17 +47,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install jq
+        run: |
+          if ! command -v jq &>/dev/null; then
+            brew install jq
+          fi
+
       - name: Check latest SDK versions
         id: versions
         run: |
-          # Fetch latest stable versions from official APIs
-          GO=$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r '.[0].version' | sed 's/go//')
-          RUST=$(curl -fsSL 'https://static.rust-lang.org/dist/channel-rust-stable.toml' | grep -m1 '^version' | cut -d'"' -f2 | cut -d' ' -f1)
-          NODE=$(curl -fsSL 'https://nodejs.org/dist/index.json' | jq -r '[.[] | select(.lts != false)][0].version' | sed 's/v//')
-          PYTHON=$(curl -fsSL 'https://endoflife.date/api/python.json' | jq -r '.[0].latest')
-          UV=$(curl -fsSL 'https://api.github.com/repos/astral-sh/uv/releases/latest' | jq -r '.tag_name' | sed 's/^v//' || echo "0.6.9")
-          DENO=$(curl -fsSL 'https://api.github.com/repos/denoland/deno/releases/latest' | jq -r '.tag_name' | sed 's/^v//')
-          BUN=$(curl -fsSL 'https://api.github.com/repos/oven-sh/bun/releases/latest' | jq -r '.tag_name' | sed 's/^bun-v//')
+          GO=$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r '.[0].version' | sed 's/go//' || echo "unknown")
+          RUST=$(curl -fsSL 'https://static.rust-lang.org/dist/channel-rust-stable.toml' | grep -m1 '^version' | cut -d'"' -f2 | cut -d' ' -f1 || echo "unknown")
+          NODE=$(curl -fsSL 'https://nodejs.org/dist/index.json' | jq -r '[.[] | select(.lts != false)][0].version' | sed 's/v//' || echo "unknown")
+          PYTHON=$(curl -fsSL 'https://endoflife.date/api/python.json' | jq -r '.[0].latest' || echo "unknown")
+          UV=$(curl -fsSL 'https://api.github.com/repos/astral-sh/uv/releases/latest' | jq -r '.tag_name' | sed 's/^v//' || echo "unknown")
+          DENO=$(curl -fsSL 'https://api.github.com/repos/denoland/deno/releases/latest' | jq -r '.tag_name' | sed 's/^v//' || echo "unknown")
+          BUN=$(curl -fsSL 'https://api.github.com/repos/oven-sh/bun/releases/latest' | jq -r '.tag_name' | sed 's/^bun-v//' || echo "unknown")
 
           echo "go=${GO}" >> "$GITHUB_OUTPUT"
           echo "rust=${RUST}" >> "$GITHUB_OUTPUT"
@@ -71,30 +76,24 @@ jobs:
 
           # Check if GHCR already has these versions (skip rebuild if unchanged)
           ANY_CHANGED="false"
-          check_tag() {
-            local image="$1" tag="$2" output_name="$3"
-            # Try to pull manifest — if it fails, image doesn't exist
-            if ! docker manifest inspect "${REGISTRY}/${image}:${tag}" > /dev/null 2>&1; then
-              echo "${output_name}_changed=true" >> "$GITHUB_OUTPUT"
-              ANY_CHANGED="true"
-            else
-              echo "${output_name}_changed=false" >> "$GITHUB_OUTPUT"
-            fi
-          }
-
           if [[ "${{ inputs.force_rebuild }}" == "true" ]]; then
-            for name in go rust node python uv deno bun; do
-              echo "${name}_changed=true" >> "$GITHUB_OUTPUT"
-            done
+            ANY_CHANGED="true"
+          elif ! command -v docker &>/dev/null; then
+            # No docker available to check manifests — rebuild all
             ANY_CHANGED="true"
           else
-            check_tag "golang" "${GO}" "go"
-            check_tag "rust" "${RUST}" "rust"
-            check_tag "node" "${NODE}" "node"
-            check_tag "python" "${PYTHON}" "python"
-            check_tag "python" "uv-${UV}" "uv"
-            check_tag "deno" "${DENO}" "deno"
-            check_tag "bun" "${BUN}" "bun"
+            check_tag() {
+              local image="$1" tag="$2"
+              if ! docker manifest inspect "${REGISTRY}/${image}:${tag}" > /dev/null 2>&1; then
+                ANY_CHANGED="true"
+              fi
+            }
+            check_tag "golang" "${GO}"
+            check_tag "rust" "${RUST}"
+            check_tag "node" "${NODE}"
+            check_tag "python" "${PYTHON}"
+            check_tag "deno" "${DENO}"
+            check_tag "bun" "${BUN}"
           fi
 
           echo "any_changed=${ANY_CHANGED}" >> "$GITHUB_OUTPUT"
