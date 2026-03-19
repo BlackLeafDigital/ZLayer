@@ -6,7 +6,7 @@
 # with containerd, runc, and networking tools.
 #
 # Usage:
-#   zlayer build -f docker/ZImagefile.zlayer-node -t zlayer-node .
+#   zlayer build -f images/ZImagefile.zlayer-node -t zlayer-node .
 
 version: "1"
 
@@ -33,7 +33,7 @@ steps:
     to: "/usr/local/bin/zlayer"
 
   # Copy entrypoint script
-  - copy: "docker/entrypoint.sh"
+  - copy: "images/entrypoint.sh"
     to: "/entrypoint.sh"
     chmod: "755"
 

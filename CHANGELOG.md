@@ -4,7 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Moved `docker/` directory to `images/` and updated all references across the codebase
+  (ZPipeline.yaml, CLAUDE.md, Dockerfiles, ZImagefiles, pipeline module docs, builder README)
+- Buildah "not found" warning suppressed on macOS (now debug-level); non-macOS unchanged
+- Sandbox builder: broadened Seatbelt FS rules for build-time (allows RUN commands to
+  write to absolute host paths since there is no chroot on macOS)
+
 ### Added
+- macOS-native base images defined as ZImagefiles (`images/macos/`):
+  `zlayer/base`, `zlayer/golang`, `zlayer/rust`, `zlayer/node`, `zlayer/python` (with uv),
+  `zlayer/deno`, `zlayer/bun` — containing macOS Mach-O binaries for sandbox builds
+- macOS base image ZPipeline (`images/macos/ZPipeline.yaml`) orchestrating all 7 images
+  with dependency ordering, tagged for `ghcr.io/blackleafdigital/zlayer/`
+- macOS image builder script (`scripts/build-macos-images.sh`) for bootstrapping native
+  rootfs images with architecture detection (arm64/x86_64)
+- Registry client: two-pass platform resolver on macOS — prefers `darwin/{arch}` for
+  native ZLayer sandbox images, falls back to `linux/{arch}` for Docker Hub images
+- Sandbox builder: ELF binary detection on macOS — when a RUN command fails with exit
+  126/127, checks if the binary is a Linux ELF and produces a clear error message
+  suggesting zlayer/ base images instead of Alpine/Debian
+- Sandbox builder: PATH includes rootfs bin dirs + Homebrew paths (`/opt/homebrew/bin`)
+  so that macOS-native binaries installed in the image are found
+- Sandbox builder: end-to-end integration tests (`sandbox_build_e2e.rs`) covering
+  manifest pull, layer pull, simple build, and ENV/WORKDIR build verification
 - Sandbox builder: registry image pull via `zlayer-registry` (ImagePuller + LayerUnpacker)
   when the `cache` feature is enabled, instead of requiring pre-pulled base images
 - Sandbox builder: multi-stage build support -- all stages are built sequentially and

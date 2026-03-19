@@ -33,7 +33,7 @@ crates/
   zlayer-tunnel/   # Secure tunneling for node-to-node access
   zlayer-web/      # Web frontend (Leptos SSR + hydration)
 
-docker/            # Container build files (Dockerfiles, ZImagefiles)
+images/            # Container build files (Dockerfiles, ZImagefiles)
 examples/          # Example deployments and ZImagefiles
 wit/               # WebAssembly interface definitions
 ```
@@ -101,7 +101,7 @@ cargo test --workspace
 ```
 
 ### ZImagefiles
-YAML-based alternative to Dockerfiles. Located in `docker/` directory:
+YAML-based alternative to Dockerfiles. Located in `images/` directory:
 - `ZImagefile.zlayer-node` - Node with embedded containerd
 - `ZImagefile.zlayer-web` - Leptos web frontend
 - `ZImagefile.zlayer-manager` - Management UI

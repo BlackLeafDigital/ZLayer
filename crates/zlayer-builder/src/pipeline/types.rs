@@ -40,11 +40,11 @@ use serde::{Deserialize, Serialize};
 ///
 /// images:
 ///   base:
-///     file: docker/Dockerfile.base
+///     file: images/Dockerfile.base
 ///     tags:
 ///       - "${REGISTRY}/base:${VERSION}"
 ///   app:
-///     file: docker/Dockerfile.app
+///     file: images/Dockerfile.app
 ///     depends_on: [base]
 ///     tags:
 ///       - "${REGISTRY}/app:${VERSION}"
@@ -125,7 +125,7 @@ pub struct PipelineDefaults {
 ///
 /// ```yaml
 /// zlayer-app:
-///   file: docker/ZImagefile.app
+///   file: images/ZImagefile.app
 ///   context: "."
 ///   tags:
 ///     - "${REGISTRY}/app:${VERSION}"

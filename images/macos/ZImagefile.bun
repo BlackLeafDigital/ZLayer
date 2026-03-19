@@ -1,0 +1,17 @@
+base: zlayer/base:latest
+
+steps:
+  - run: |
+      ARCH="$(uname -m)"
+      [ "$ARCH" = "arm64" ] && BUN_ARCH="aarch64" || BUN_ARCH="x64"
+      mkdir -p usr/local/bin
+      curl -fsSL "https://github.com/oven-sh/bun/releases/latest/download/bun-darwin-${BUN_ARCH}.zip" \
+        -o /tmp/bun.zip
+      unzip -o /tmp/bun.zip -d /tmp/bun-extract/
+      cp /tmp/bun-extract/*/bun usr/local/bin/bun
+      ln -sf bun usr/local/bin/bunx
+      rm -rf /tmp/bun.zip /tmp/bun-extract
+
+labels:
+  org.opencontainers.image.title: "ZLayer macOS Bun"
+  org.opencontainers.image.vendor: "Black Leaf Digital"

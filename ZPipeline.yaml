@@ -23,21 +23,21 @@ defaults:
 
 images:
   zlayer-node:
-    file: docker/ZImagefile.zlayer-node
+    file: images/ZImagefile.zlayer-node
     context: "."
     tags:
       - "${REGISTRY}/zlayer-node:${VERSION}"
       - "${REGISTRY}/zlayer-node:latest"
 
   zlayer-web:
-    file: docker/ZImagefile.zlayer-web
+    file: images/ZImagefile.zlayer-web
     context: "."
     tags:
       - "${REGISTRY}/zlayer-web:${VERSION}"
       - "${REGISTRY}/zlayer-web:latest"
 
   zlayer-manager:
-    file: docker/ZImagefile.zlayer-manager
+    file: images/ZImagefile.zlayer-manager
     context: "."
     tags:
       - "${REGISTRY}/zlayer-manager:${VERSION}"
