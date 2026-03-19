@@ -55,5 +55,26 @@ images:
     tags:
       - "${REGISTRY}/bun:latest"
 
+  swift:
+    file: images/macos/ZImagefile.swift
+    context: .
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/swift:latest"
+
+  zig:
+    file: images/macos/ZImagefile.zig
+    context: .
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/zig:latest"
+
+  graalvm:
+    file: images/macos/ZImagefile.graalvm
+    context: .
+    depends_on: [base]
+    tags:
+      - "${REGISTRY}/graalvm:latest"
+
 push:
   after_all: true

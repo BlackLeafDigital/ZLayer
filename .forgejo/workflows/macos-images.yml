@@ -1,13 +1,8 @@
 name: macOS Sandbox Images
 
 on:
-  # Triggered by release workflow
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version tag for images (e.g., 1.0.0)'
-        required: false
-        type: string
       force_rebuild:
         description: 'Force rebuild all images even if versions unchanged'
         required: false
@@ -20,94 +15,16 @@ on:
 
 env:
   REGISTRY: ghcr.io/blackleafdigital/zlayer
+  CARGO_TERM_COLOR: always
 
 jobs:
   # ===========================================
-  # Check for SDK version updates
-  # ===========================================
-  check-versions:
-    name: Check SDK Versions
-    runs-on: macos-latest
-    outputs:
-      go_version: ${{ steps.versions.outputs.go }}
-      go_changed: ${{ steps.versions.outputs.go_changed }}
-      rust_version: ${{ steps.versions.outputs.rust }}
-      rust_changed: ${{ steps.versions.outputs.rust_changed }}
-      node_version: ${{ steps.versions.outputs.node }}
-      node_changed: ${{ steps.versions.outputs.node_changed }}
-      python_version: ${{ steps.versions.outputs.python }}
-      python_changed: ${{ steps.versions.outputs.python_changed }}
-      uv_version: ${{ steps.versions.outputs.uv }}
-      uv_changed: ${{ steps.versions.outputs.uv_changed }}
-      deno_version: ${{ steps.versions.outputs.deno }}
-      deno_changed: ${{ steps.versions.outputs.deno_changed }}
-      bun_version: ${{ steps.versions.outputs.bun }}
-      bun_changed: ${{ steps.versions.outputs.bun_changed }}
-      any_changed: ${{ steps.versions.outputs.any_changed }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install jq
-        run: |
-          if ! command -v jq &>/dev/null; then
-            brew install jq
-          fi
-
-      - name: Check latest SDK versions
-        id: versions
-        run: |
-          GO=$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r '.[0].version' | sed 's/go//' || echo "unknown")
-          RUST=$(curl -fsSL 'https://static.rust-lang.org/dist/channel-rust-stable.toml' | grep -m1 '^version' | cut -d'"' -f2 | cut -d' ' -f1 || echo "unknown")
-          NODE=$(curl -fsSL 'https://nodejs.org/dist/index.json' | jq -r '[.[] | select(.lts != false)][0].version' | sed 's/v//' || echo "unknown")
-          PYTHON=$(curl -fsSL 'https://endoflife.date/api/python.json' | jq -r '.[0].latest' || echo "unknown")
-          UV=$(curl -fsSL 'https://api.github.com/repos/astral-sh/uv/releases/latest' | jq -r '.tag_name' | sed 's/^v//' || echo "unknown")
-          DENO=$(curl -fsSL 'https://api.github.com/repos/denoland/deno/releases/latest' | jq -r '.tag_name' | sed 's/^v//' || echo "unknown")
-          BUN=$(curl -fsSL 'https://api.github.com/repos/oven-sh/bun/releases/latest' | jq -r '.tag_name' | sed 's/^bun-v//' || echo "unknown")
-
-          echo "go=${GO}" >> "$GITHUB_OUTPUT"
-          echo "rust=${RUST}" >> "$GITHUB_OUTPUT"
-          echo "node=${NODE}" >> "$GITHUB_OUTPUT"
-          echo "python=${PYTHON}" >> "$GITHUB_OUTPUT"
-          echo "uv=${UV}" >> "$GITHUB_OUTPUT"
-          echo "deno=${DENO}" >> "$GITHUB_OUTPUT"
-          echo "bun=${BUN}" >> "$GITHUB_OUTPUT"
-
-          echo "Latest versions: Go=${GO} Rust=${RUST} Node=${NODE} Python=${PYTHON} uv=${UV} Deno=${DENO} Bun=${BUN}"
-
-          # Check if GHCR already has these versions (skip rebuild if unchanged)
-          ANY_CHANGED="false"
-          if [[ "${{ inputs.force_rebuild }}" == "true" ]]; then
-            ANY_CHANGED="true"
-          elif ! command -v docker &>/dev/null; then
-            # No docker available to check manifests — rebuild all
-            ANY_CHANGED="true"
-          else
-            check_tag() {
-              local image="$1" tag="$2"
-              if ! docker manifest inspect "${REGISTRY}/${image}:${tag}" > /dev/null 2>&1; then
-                ANY_CHANGED="true"
-              fi
-            }
-            check_tag "golang" "${GO}"
-            check_tag "rust" "${RUST}"
-            check_tag "node" "${NODE}"
-            check_tag "python" "${PYTHON}"
-            check_tag "deno" "${DENO}"
-            check_tag "bun" "${BUN}"
-          fi
-
-          echo "any_changed=${ANY_CHANGED}" >> "$GITHUB_OUTPUT"
-
-  # ===========================================
-  # Build & Push all macOS images via ZPipeline
+  # Build & Push macOS sandbox images
   # ===========================================
   build-and-push:
     name: Build & Push macOS Images
-    needs: [check-versions]
-    if: needs.check-versions.outputs.any_changed == 'true' || inputs.force_rebuild == true
     runs-on: macos-latest
     env:
-      CARGO_TERM_COLOR: always
       FORGEJO_REGISTRIES: '[{"name":"forgejo","index":"sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/","token":"${{ secrets.FORGEJO_ACTIONS_TOKEN }}"}]'
     steps:
       - uses: actions/checkout@v4

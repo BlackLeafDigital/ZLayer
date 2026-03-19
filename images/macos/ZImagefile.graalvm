@@ -1,0 +1,39 @@
+base: zlayer/base:latest
+
+steps:
+  - run: |
+      ARCH="$(uname -m)"
+      [ "$ARCH" = "arm64" ] && GVM_ARCH="aarch64" || GVM_ARCH="amd64"
+      # Check if GraalVM is installed locally
+      JAVA_HOME_LOCAL="$(java -XshowSettings:property -version 2>&1 | grep 'java.home' | awk '{print $3}' || echo '')"
+      if [ -n "$JAVA_HOME_LOCAL" ] && echo "$JAVA_HOME_LOCAL" | grep -qi graalvm; then
+        GVM_ROOT="$(dirname "$JAVA_HOME_LOCAL")"
+        mkdir -p usr/local/graalvm
+        cp -R "$GVM_ROOT"/* usr/local/graalvm/
+      else
+        # Download GraalVM CE from GitHub releases
+        GVM_VERSION=$(curl -fsSL 'https://api.github.com/repos/graalvm/graalvm-ce-builds/releases/latest' | grep '"tag_name"' | sed 's/.*"jdk-\(.*\)".*/\1/' || echo "24")
+        GVM_URL="https://github.com/graalvm/graalvm-ce-builds/releases/latest/download/graalvm-community-jdk-${GVM_VERSION}_macos-${GVM_ARCH}_bin.tar.gz"
+        mkdir -p usr/local/graalvm
+        curl -fsSL "$GVM_URL" | tar -xz -C usr/local/graalvm --strip-components=1
+        # GraalVM macOS tarballs have Contents/Home structure
+        if [ -d "usr/local/graalvm/Contents/Home" ]; then
+          mv usr/local/graalvm/Contents/Home usr/local/graalvm-tmp
+          rm -rf usr/local/graalvm
+          mv usr/local/graalvm-tmp usr/local/graalvm
+        fi
+      fi
+
+  - run: |
+      mkdir -p usr/local/bin
+      for bin in java javac native-image jar jlink; do
+        [ -f "usr/local/graalvm/bin/$bin" ] && ln -sf ../graalvm/bin/$bin usr/local/bin/$bin
+      done
+
+env:
+  JAVA_HOME: /usr/local/graalvm
+  GRAALVM_HOME: /usr/local/graalvm
+
+labels:
+  org.opencontainers.image.title: "ZLayer macOS GraalVM"
+  org.opencontainers.image.vendor: "Black Leaf Digital"
