@@ -74,7 +74,7 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "Downloading ${BINARY} ${TAG} (${OS}/${ARCH})..."
-if ! curl -fsSL "$URL" -o "${TMPDIR}/archive.tar.gz"; then
+if ! curl -fsSL --connect-timeout 30 --max-time 120 "$URL" -o "${TMPDIR}/archive.tar.gz"; then
     echo "Error: Download failed from ${URL}" >&2
     exit 1
 fi
