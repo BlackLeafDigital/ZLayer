@@ -864,18 +864,40 @@ impl SandboxImageBuilder {
                 env_map.insert(k.to_string(), v.to_string());
             }
         }
-        // Set PATH if not already set — include rootfs bin dirs so that
-        // binaries installed in the image layer are found, plus Homebrew paths
-        // for macOS host tooling.
-        env_map.entry("PATH".to_string()).or_insert_with(|| {
-            format!(
-                "{rootfs}/usr/local/bin:{rootfs}/usr/bin:{rootfs}/bin:\
-                 /opt/homebrew/bin:/opt/homebrew/sbin:\
+        // Build PATH: always include rootfs bin dirs (so binaries installed in
+        // the image layer are found) and Homebrew/system paths for macOS host
+        // tooling. If the image already defines PATH, prefix it with rootfs
+        // equivalents of each component and append macOS host paths.
+        {
+            let rootfs = rootfs_dir.display();
+            let macos_host_paths = "/opt/homebrew/bin:/opt/homebrew/sbin:\
                  /usr/local/bin:/usr/local/sbin:\
-                 /usr/bin:/usr/sbin:/bin:/sbin",
-                rootfs = rootfs_dir.display()
-            )
-        });
+                 /usr/bin:/usr/sbin:/bin:/sbin";
+            let path_value = if let Some(image_path) = env_map.remove("PATH") {
+                // Prefix each image PATH component with the rootfs directory so
+                // that binaries from the extracted image layers are found first.
+                let rootfs_prefixed: Vec<String> = image_path
+                    .split(':')
+                    .map(|component| {
+                        let stripped = component.strip_prefix('/').unwrap_or(component);
+                        format!("{rootfs}/{stripped}")
+                    })
+                    .collect();
+                format!(
+                    "{}:{}:{}",
+                    rootfs_prefixed.join(":"),
+                    image_path,
+                    macos_host_paths,
+                )
+            } else {
+                format!(
+                    "{rootfs}/usr/local/bin:{rootfs}/usr/bin:{rootfs}/bin:\
+                     {rootfs}/usr/sbin:{rootfs}/sbin:\
+                     {macos_host_paths}",
+                )
+            };
+            env_map.insert("PATH".to_string(), path_value);
+        }
         // Set HOME
         env_map
             .entry("HOME".to_string())
@@ -936,6 +958,16 @@ impl SandboxImageBuilder {
             ("/bin/sh".to_string(), vec!["-c".to_string()])
         };
 
+        // Translate Linux-specific commands (package managers, user mgmt) to
+        // macOS equivalents before execution.
+        let translated = crate::macos_compat::translate_linux_command(&shell_cmd);
+        if translated.was_modified {
+            for msg in &translated.translations {
+                info!("macOS compat: {}", msg);
+            }
+        }
+        let final_cmd = &translated.command;
+
         // Run through the configured shell (both shell and exec forms use it
         // since we have already assembled shell_cmd as a single string)
         let mut cmd = Command::new("sandbox-exec");
@@ -944,7 +976,7 @@ impl SandboxImageBuilder {
         for flag in &shell_flag {
             cmd.arg(flag);
         }
-        cmd.arg(&shell_cmd);
+        cmd.arg(final_cmd);
 
         cmd.current_dir(&workdir)
             .stdout(Stdio::piped())
