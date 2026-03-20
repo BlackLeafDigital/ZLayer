@@ -1,13 +1,8 @@
 name: macOS Sandbox Images
 
 on:
-  # Triggered by release workflow
   workflow_dispatch:
     inputs:
-      version:
-        description: 'Version tag for images (e.g., 1.0.0)'
-        required: false
-        type: string
       force_rebuild:
         description: 'Force rebuild all images even if versions unchanged'
         required: false
@@ -20,6 +15,7 @@ on:
 
 env:
   REGISTRY: ghcr.io/blackleafdigital/zlayer
+  CARGO_TERM_COLOR: always
 
 jobs:
   # ===========================================
@@ -29,101 +25,98 @@ jobs:
     name: Check SDK Versions
     runs-on: macos-latest
     outputs:
-      go_version: ${{ steps.versions.outputs.go }}
-      go_changed: ${{ steps.versions.outputs.go_changed }}
-      rust_version: ${{ steps.versions.outputs.rust }}
-      rust_changed: ${{ steps.versions.outputs.rust_changed }}
-      node_version: ${{ steps.versions.outputs.node }}
-      node_changed: ${{ steps.versions.outputs.node_changed }}
-      python_version: ${{ steps.versions.outputs.python }}
-      python_changed: ${{ steps.versions.outputs.python_changed }}
-      uv_version: ${{ steps.versions.outputs.uv }}
-      uv_changed: ${{ steps.versions.outputs.uv_changed }}
-      deno_version: ${{ steps.versions.outputs.deno }}
-      deno_changed: ${{ steps.versions.outputs.deno_changed }}
-      bun_version: ${{ steps.versions.outputs.bun }}
-      bun_changed: ${{ steps.versions.outputs.bun_changed }}
-      any_changed: ${{ steps.versions.outputs.any_changed }}
+      any_changed: ${{ steps.check.outputs.any_changed }}
+      go_version: ${{ steps.detect.outputs.go }}
+      rust_version: ${{ steps.detect.outputs.rust }}
+      node_version: ${{ steps.detect.outputs.node }}
+      python_version: ${{ steps.detect.outputs.python }}
+      deno_version: ${{ steps.detect.outputs.deno }}
+      bun_version: ${{ steps.detect.outputs.bun }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Check latest SDK versions
-        id: versions
+      - name: Install jq
+        run: command -v jq &>/dev/null || brew install jq
+
+      - name: Detect latest SDK versions
+        id: detect
         run: |
-          # Fetch latest stable versions from official APIs
-          GO=$(curl -fsSL 'https://go.dev/dl/?mode=json' | jq -r '.[0].version' | sed 's/go//')
-          RUST=$(curl -fsSL 'https://static.rust-lang.org/dist/channel-rust-stable.toml' | grep -m1 '^version' | cut -d'"' -f2 | cut -d' ' -f1)
-          NODE=$(curl -fsSL 'https://nodejs.org/dist/index.json' | jq -r '[.[] | select(.lts != false)][0].version' | sed 's/v//')
-          PYTHON=$(curl -fsSL 'https://endoflife.date/api/python.json' | jq -r '.[0].latest')
-          UV=$(curl -fsSL 'https://api.github.com/repos/astral-sh/uv/releases/latest' | jq -r '.tag_name' | sed 's/^v//' || echo "0.6.9")
-          DENO=$(curl -fsSL 'https://api.github.com/repos/denoland/deno/releases/latest' | jq -r '.tag_name' | sed 's/^v//')
-          BUN=$(curl -fsSL 'https://api.github.com/repos/oven-sh/bun/releases/latest' | jq -r '.tag_name' | sed 's/^bun-v//')
+          fetch_version() { curl -fsSL "$1" 2>/dev/null; }
+          GO=$(fetch_version 'https://go.dev/dl/?mode=json' | jq -r '.[0].version' | sed 's/go//' || echo "1.23.0")
+          RUST=$(fetch_version 'https://api.github.com/repos/rust-lang/rust/releases/latest' | jq -r '.tag_name' || echo "1.82.0")
+          NODE=$(fetch_version 'https://nodejs.org/dist/index.json' | jq -r '[.[] | select(.lts != false)][0].version' | sed 's/v//' || echo "22.0.0")
+          PYTHON=$(fetch_version 'https://endoflife.date/api/python.json' | jq -r '.[0].latest' || echo "3.13.0")
+          DENO=$(fetch_version 'https://api.github.com/repos/denoland/deno/releases/latest' | jq -r '.tag_name' | sed 's/^v//' || echo "2.0.0")
+          BUN=$(fetch_version 'https://api.github.com/repos/oven-sh/bun/releases/latest' | jq -r '.tag_name' | sed 's/^bun-v//' || echo "1.0.0")
 
           echo "go=${GO}" >> "$GITHUB_OUTPUT"
           echo "rust=${RUST}" >> "$GITHUB_OUTPUT"
           echo "node=${NODE}" >> "$GITHUB_OUTPUT"
           echo "python=${PYTHON}" >> "$GITHUB_OUTPUT"
-          echo "uv=${UV}" >> "$GITHUB_OUTPUT"
           echo "deno=${DENO}" >> "$GITHUB_OUTPUT"
           echo "bun=${BUN}" >> "$GITHUB_OUTPUT"
+          echo "Latest: Go=${GO} Rust=${RUST} Node=${NODE} Python=${PYTHON} Deno=${DENO} Bun=${BUN}"
 
-          echo "Latest versions: Go=${GO} Rust=${RUST} Node=${NODE} Python=${PYTHON} uv=${UV} Deno=${DENO} Bun=${BUN}"
+      # Use resolve-version to check if each image already exists in GHCR
+      - name: Check golang
+        id: check-go
+        if: inputs.force_rebuild != true
+        uses: https://forge.blackleafdigital.com/Public/actions/resolve-version@main
+        with:
+          version: ${{ steps.detect.outputs.go }}
+          registry: ghcr.io
+          registry-type: docker
+          image-name: blackleafdigital/zlayer/golang
+          registry-user: ${{ github.actor }}
+          registry-password: ${{ secrets.GH_ACCESS_TOKEN }}
 
-          # Check if GHCR already has these versions (skip rebuild if unchanged)
-          ANY_CHANGED="false"
-          check_tag() {
-            local image="$1" tag="$2" output_name="$3"
-            # Try to pull manifest — if it fails, image doesn't exist
-            if ! docker manifest inspect "${REGISTRY}/${image}:${tag}" > /dev/null 2>&1; then
-              echo "${output_name}_changed=true" >> "$GITHUB_OUTPUT"
-              ANY_CHANGED="true"
-            else
-              echo "${output_name}_changed=false" >> "$GITHUB_OUTPUT"
-            fi
-          }
+      - name: Check node
+        id: check-node
+        if: inputs.force_rebuild != true
+        uses: https://forge.blackleafdigital.com/Public/actions/resolve-version@main
+        with:
+          version: ${{ steps.detect.outputs.node }}
+          registry: ghcr.io
+          registry-type: docker
+          image-name: blackleafdigital/zlayer/node
+          registry-user: ${{ github.actor }}
+          registry-password: ${{ secrets.GH_ACCESS_TOKEN }}
 
+      - name: Determine if rebuild needed
+        id: check
+        run: |
           if [[ "${{ inputs.force_rebuild }}" == "true" ]]; then
-            for name in go rust node python uv deno bun; do
-              echo "${name}_changed=true" >> "$GITHUB_OUTPUT"
-            done
-            ANY_CHANGED="true"
+            echo "any_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Force rebuild requested"
+          elif [[ "${{ steps.check-go.outputs.is-new }}" == "true" ]] || \
+               [[ "${{ steps.check-node.outputs.is-new }}" == "true" ]]; then
+            echo "any_changed=true" >> "$GITHUB_OUTPUT"
+            echo "New SDK versions detected"
           else
-            check_tag "golang" "${GO}" "go"
-            check_tag "rust" "${RUST}" "rust"
-            check_tag "node" "${NODE}" "node"
-            check_tag "python" "${PYTHON}" "python"
-            check_tag "python" "uv-${UV}" "uv"
-            check_tag "deno" "${DENO}" "deno"
-            check_tag "bun" "${BUN}" "bun"
+            # Default to true — better to rebuild than miss updates
+            echo "any_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Defaulting to rebuild"
           fi
 
-          echo "any_changed=${ANY_CHANGED}" >> "$GITHUB_OUTPUT"
-
   # ===========================================
-  # Build & Push all macOS images via ZPipeline
+  # Build & Push macOS sandbox images
   # ===========================================
   build-and-push:
     name: Build & Push macOS Images
     needs: [check-versions]
-    if: needs.check-versions.outputs.any_changed == 'true' || inputs.force_rebuild == true
+    if: needs.check-versions.outputs.any_changed == 'true'
     runs-on: macos-latest
     env:
-      CARGO_TERM_COLOR: always
       FORGEJO_REGISTRIES: '[{"name":"forgejo","index":"sparse+https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/","token":"${{ secrets.FORGEJO_ACTIONS_TOKEN }}"}]'
     steps:
       - uses: actions/checkout@v4
-
-      - name: Setup Rust
-        uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
-        with:
-          registries: ${{ env.FORGEJO_REGISTRIES }}
-
-      - name: Build zlayer CLI
-        run: cargo build --release -p zlayer
 
       - name: Login to GHCR
         run: echo "${{ secrets.GH_ACCESS_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Build and push macOS sandbox images
-        run: |
-          ./target/release/zlayer pipeline -f images/macos/ZPipeline.yaml --push
+        uses: ./
+        with:
+          command: "pipeline -f images/macos/ZPipeline.yaml --push"
