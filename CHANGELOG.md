@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Sandbox builder: added macOS command translation layer (`macos_compat.rs`) that converts
+  Linux package manager commands (`apk add`, `apt-get install`, `yum/dnf install`) to
+  `brew install` equivalents, skips user/group management commands (`adduser`, `addgroup`),
+  and handles package cache cleanup patterns — fixes exit code 127 failures on macOS builds
+- Sandbox builder: PATH augmentation now always includes rootfs-prefixed paths and Homebrew
+  paths, even when the base image already defines its own PATH (e.g. golang images)
+
 ### Changed
 - Moved `docker/` directory to `images/` and updated all references across the codebase
   (ZPipeline.yaml, CLAUDE.md, Dockerfiles, ZImagefiles, pipeline module docs, builder README)
