@@ -187,6 +187,8 @@ pub mod buildah;
 pub mod builder;
 pub mod dockerfile;
 pub mod error;
+#[cfg(target_os = "macos")]
+pub mod macos_compat;
 pub mod pipeline;
 #[cfg(target_os = "macos")]
 pub mod sandbox_builder;
