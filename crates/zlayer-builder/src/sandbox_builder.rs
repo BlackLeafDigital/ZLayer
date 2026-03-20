@@ -135,12 +135,11 @@ fn generate_build_seatbelt_profile(_rootfs_dir: &Path, _tmp_dir: &Path) -> Strin
     profile.push_str("(allow sysctl-read)\n");
     profile.push_str("(allow system-info)\n\n");
 
-    // Mach basics (DNS, etc.)
-    profile.push_str("; --- Mach basics ---\n");
-    profile.push_str("(allow mach-lookup\n");
-    profile.push_str("  (global-name \"com.apple.system.opendirectoryd.libinfo\")\n");
-    profile.push_str("  (global-name \"com.apple.SecurityServer\")\n");
-    profile.push_str("  (global-name \"com.apple.system.notification_center\"))\n\n");
+    // Mach IPC (build-time: broad access)
+    // Brew, ruby, git, and many macOS tools use XPC / CoreFoundation services.
+    // Enumerating every required mach service is fragile; allow all during build.
+    profile.push_str("; --- Mach IPC (build-time: broad access) ---\n");
+    profile.push_str("(allow mach-lookup)\n\n");
 
     // Network: full access for build-time operations (package managers, etc.)
     profile.push_str("; --- Network: full access (build-time) ---\n");
@@ -269,21 +268,27 @@ impl SandboxImageBuilder {
         let rootfs_dir = image_dir.join("rootfs");
         let tmp_dir = image_dir.join("tmp");
 
-        // Clean up any previous build
+        // Clean up any previous build. Use `rm -rf` because Go's module cache
+        // sets files read-only, which prevents tokio::fs::remove_dir_all.
         if image_dir.exists() {
-            tokio::fs::remove_dir_all(&image_dir).await.map_err(|e| {
-                BuildError::IoError(std::io::Error::new(
-                    e.kind(),
-                    format!(
-                        "failed to clean previous build at {}: {e}",
-                        image_dir.display()
-                    ),
-                ))
-            })?;
+            let status = tokio::process::Command::new("rm")
+                .args(["-rf"])
+                .arg(&image_dir)
+                .status()
+                .await?;
+            if !status.success() {
+                return Err(BuildError::IoError(std::io::Error::other(format!(
+                    "failed to clean previous build at {}",
+                    image_dir.display()
+                ))));
+            }
         }
+
+        let home_dir = image_dir.join("home");
 
         tokio::fs::create_dir_all(&rootfs_dir).await?;
         tokio::fs::create_dir_all(&tmp_dir).await?;
+        tokio::fs::create_dir_all(&home_dir).await?;
 
         // Track stage rootfs directories for COPY --from resolution
         let mut stage_rootfs_map: HashMap<String, PathBuf> = HashMap::new();
@@ -324,11 +329,40 @@ impl SandboxImageBuilder {
             self.setup_base_image(&stage.base_image, &stage_rootfs)
                 .await?;
 
-            // Step 2: Process each instruction
-            let mut config = SandboxImageConfig {
-                working_dir: "/".to_string(),
-                ..Default::default()
-            };
+            // Step 1b: Load base image config (ENV, WORKDIR, USER, etc.)
+            let mut config = self
+                .load_base_image_config(&stage.base_image)
+                .await
+                .unwrap_or_else(|e| {
+                    debug!("Could not load base image config: {e}");
+                    SandboxImageConfig {
+                        working_dir: "/".to_string(),
+                        ..Default::default()
+                    }
+                });
+
+            // If this stage uses a toolchain, inject its env vars into the config.
+            if let Some(spec) =
+                crate::macos_toolchain::detect_toolchain(&stage.base_image.to_string_ref())
+            {
+                for (key, value) in &spec.env {
+                    config.env.push(format!("{key}={value}"));
+                }
+                // Add toolchain PATH dirs to the config's PATH
+                for dir in &spec.path_dirs {
+                    let existing_path = config
+                        .env
+                        .iter()
+                        .find(|e| e.starts_with("PATH="))
+                        .map(|e| e.strip_prefix("PATH=").unwrap_or("").to_string());
+                    if let Some(path) = existing_path {
+                        config.env.retain(|e| !e.starts_with("PATH="));
+                        config.env.push(format!("PATH={dir}:{path}"));
+                    } else {
+                        config.env.push(format!("PATH={dir}"));
+                    }
+                }
+            }
 
             // Track ARG values for variable expansion
             let mut arg_values = self.build_args.clone();
@@ -340,8 +374,13 @@ impl SandboxImageBuilder {
                 }
             }
 
-            // Build env map from config for variable expansion
+            // Build env map from base config for variable expansion
             let mut env_values: HashMap<String, String> = HashMap::new();
+            for env_entry in &config.env {
+                if let Some((k, v)) = env_entry.split_once('=') {
+                    env_values.insert(k.to_string(), v.to_string());
+                }
+            }
 
             for (inst_idx, instruction) in stage.instructions.iter().enumerate() {
                 self.send_event(BuildEvent::InstructionStarted {
@@ -354,6 +393,7 @@ impl SandboxImageBuilder {
                     instruction,
                     &stage_rootfs,
                     &tmp_dir,
+                    &home_dir,
                     &mut config,
                     &mut arg_values,
                     &mut env_values,
@@ -392,12 +432,28 @@ impl SandboxImageBuilder {
         })?;
         tokio::fs::write(&config_path, config_json).await?;
 
-        // Clean up tmp dir and intermediate stage directories
-        let _ = tokio::fs::remove_dir_all(&tmp_dir).await;
+        // Clean up tmp dir, home dir, and intermediate stage directories.
+        // Use `rm -rf` because Go module cache sets files read-only.
+        let _ = tokio::process::Command::new("rm")
+            .args(["-rf"])
+            .arg(&tmp_dir)
+            .arg(&home_dir)
+            .status()
+            .await;
         for stage_path in stage_rootfs_map.values() {
             if *stage_path != rootfs_dir {
                 if let Some(parent) = stage_path.parent() {
-                    let _ = tokio::fs::remove_dir_all(parent).await;
+                    // chmod first — Go module cache sets files read-only
+                    let _ = tokio::process::Command::new("chmod")
+                        .args(["-R", "u+w"])
+                        .arg(parent)
+                        .status()
+                        .await;
+                    let _ = tokio::process::Command::new("rm")
+                        .args(["-rf"])
+                        .arg(parent)
+                        .status()
+                        .await;
                 }
             }
         }
@@ -430,6 +486,7 @@ impl SandboxImageBuilder {
     ///
     /// For `scratch`, creates an empty rootfs. For registry images, checks if
     /// we already have the image locally; otherwise pulls via `zlayer-registry`.
+    #[allow(clippy::too_many_lines)]
     async fn setup_base_image(&self, image_ref: &ImageRef, rootfs_dir: &Path) -> Result<()> {
         match image_ref {
             ImageRef::Scratch => {
@@ -457,6 +514,56 @@ impl SandboxImageBuilder {
                 let raw_ref = image_ref.to_string_ref();
                 let qualified = image_ref.qualify();
                 let full_ref = qualified.to_string_ref();
+
+                // macOS toolchain provisioning: if the base image is a known
+                // language image (golang, node, etc.), provision the toolchain
+                // directly into the rootfs instead of pulling a Linux image.
+                if let Some(spec) = crate::macos_toolchain::detect_toolchain(&raw_ref) {
+                    info!(
+                        "Detected {} {} toolchain from base image '{}'",
+                        spec.language, spec.version, raw_ref
+                    );
+
+                    // Check if we already have a cached toolchain rootfs
+                    let toolchain_cache = self.data_dir.join("toolchains");
+                    let arch = crate::macos_toolchain::host_arch();
+                    let cache_key = format!("{}-{}-{}", spec.language, spec.version, arch);
+                    let cached_rootfs_dir = toolchain_cache.join(&cache_key).join("rootfs");
+
+                    if cached_rootfs_dir.exists() && has_content(&cached_rootfs_dir) {
+                        info!(
+                            "Using cached toolchain rootfs: {}",
+                            cached_rootfs_dir.display()
+                        );
+                        copy_directory_recursive(&cached_rootfs_dir, rootfs_dir).await?;
+                        return Ok(());
+                    }
+
+                    // Bootstrap with host binaries (like zlayer/base)
+                    crate::macos_toolchain::ensure_base_rootfs(rootfs_dir).await?;
+
+                    // Provision the language toolchain
+                    let tmp = self.data_dir.join("tmp");
+                    tokio::fs::create_dir_all(&tmp).await?;
+                    tokio::fs::create_dir_all(&toolchain_cache).await?;
+
+                    crate::macos_toolchain::provision_toolchain(
+                        &spec,
+                        rootfs_dir,
+                        &toolchain_cache,
+                        &tmp,
+                    )
+                    .await?;
+
+                    // Cache the fully-provisioned rootfs for next time
+                    if let Some(parent) = cached_rootfs_dir.parent() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                    tokio::fs::create_dir_all(&cached_rootfs_dir).await?;
+                    copy_directory_recursive(rootfs_dir, &cached_rootfs_dir).await?;
+
+                    return Ok(());
+                }
 
                 // Check 1: exact qualified name in local cache
                 let sanitized = sanitize_image_name(&full_ref);
@@ -658,6 +765,18 @@ impl SandboxImageBuilder {
                 message: format!("failed to unpack layers: {e}"),
             })?;
 
+        // Also pull and cache the image config (ENV, WORKDIR, etc.)
+        if let Some(parent) = cached_rootfs.parent() {
+            match puller.pull_image_config(image_ref, &auth).await {
+                Ok(ic) => {
+                    if let Ok(json) = serde_json::to_string_pretty(&ic) {
+                        let _ = tokio::fs::write(parent.join("image_config.json"), json).await;
+                    }
+                }
+                Err(e) => debug!("Could not pull image config for caching: {e}"),
+            }
+        }
+
         // Copy from cache to the actual rootfs
         copy_directory_recursive(cached_rootfs, rootfs_dir).await?;
 
@@ -682,6 +801,84 @@ impl SandboxImageBuilder {
         })
     }
 
+    /// Load the base image's OCI config and convert it to a `SandboxImageConfig`.
+    ///
+    /// Checks for a cached `image_config.json` alongside the rootfs first;
+    /// falls back to pulling from the registry when the `cache` feature is
+    /// enabled.
+    async fn load_base_image_config(&self, image_ref: &ImageRef) -> Result<SandboxImageConfig> {
+        match image_ref {
+            ImageRef::Scratch => Ok(SandboxImageConfig {
+                working_dir: "/".to_string(),
+                ..Default::default()
+            }),
+            ImageRef::Stage { .. } => {
+                // For stage references, there's no external config to load —
+                // the config is built up from Dockerfile instructions.
+                Ok(SandboxImageConfig {
+                    working_dir: "/".to_string(),
+                    ..Default::default()
+                })
+            }
+            ImageRef::Registry { .. } => {
+                let raw_ref = image_ref.to_string_ref();
+                let qualified = image_ref.qualify();
+                let full_ref = qualified.to_string_ref();
+
+                // Check for cached config (qualified name first, then raw)
+                for name in [&full_ref, &raw_ref] {
+                    let sanitized = sanitize_image_name(name);
+                    let config_path = self
+                        .data_dir
+                        .join("images")
+                        .join(&sanitized)
+                        .join("image_config.json");
+                    if config_path.exists() {
+                        if let Ok(data) = tokio::fs::read_to_string(&config_path).await {
+                            if let Ok(ic) =
+                                serde_json::from_str::<zlayer_registry::ImageConfig>(&data)
+                            {
+                                debug!("Loaded base image config from cache: {}", name);
+                                return Ok(image_config_to_sandbox(&ic));
+                            }
+                        }
+                    }
+                }
+
+                // Try pulling config from the registry
+                #[cfg(feature = "cache")]
+                {
+                    use zlayer_registry::{BlobCache, ImagePuller, RegistryAuth};
+
+                    if let Ok(cache) = BlobCache::new() {
+                        let puller = ImagePuller::new(cache);
+                        let auth = RegistryAuth::Anonymous;
+                        if let Ok(ic) = puller.pull_image_config(&full_ref, &auth).await {
+                            debug!("Pulled base image config from registry: {}", full_ref);
+                            // Cache it for next time
+                            let sanitized = sanitize_image_name(&full_ref);
+                            let cache_dir = self.data_dir.join("images").join(&sanitized);
+                            if cache_dir.exists() {
+                                if let Ok(json) = serde_json::to_string_pretty(&ic) {
+                                    let _ =
+                                        tokio::fs::write(cache_dir.join("image_config.json"), json)
+                                            .await;
+                                }
+                            }
+                            return Ok(image_config_to_sandbox(&ic));
+                        }
+                    }
+                }
+
+                debug!("No base image config found for {}, using defaults", raw_ref);
+                Ok(SandboxImageConfig {
+                    working_dir: "/".to_string(),
+                    ..Default::default()
+                })
+            }
+        }
+    }
+
     /// Execute a single Dockerfile instruction against the rootfs.
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     async fn execute_instruction(
@@ -689,6 +886,7 @@ impl SandboxImageBuilder {
         instruction: &Instruction,
         rootfs_dir: &Path,
         tmp_dir: &Path,
+        home_dir: &Path,
         config: &mut SandboxImageConfig,
         arg_values: &mut HashMap<String, String>,
         env_values: &mut HashMap<String, String>,
@@ -696,8 +894,10 @@ impl SandboxImageBuilder {
     ) -> Result<()> {
         match instruction {
             Instruction::Run(run) => {
-                self.execute_run(run, rootfs_dir, tmp_dir, config, arg_values, env_values)
-                    .await
+                self.execute_run(
+                    run, rootfs_dir, tmp_dir, home_dir, config, arg_values, env_values,
+                )
+                .await
             }
             Instruction::Copy(copy) => {
                 self.execute_copy(
@@ -831,12 +1031,13 @@ impl SandboxImageBuilder {
     }
 
     /// Execute a RUN instruction by spawning a sandboxed process.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     async fn execute_run(
         &self,
         run: &crate::dockerfile::RunInstruction,
         rootfs_dir: &Path,
         tmp_dir: &Path,
+        home_dir: &Path,
         config: &SandboxImageConfig,
         arg_values: &HashMap<String, String>,
         env_values: &HashMap<String, String>,
@@ -898,16 +1099,51 @@ impl SandboxImageBuilder {
             };
             env_map.insert("PATH".to_string(), path_value);
         }
-        // Set HOME
-        env_map
-            .entry("HOME".to_string())
-            .or_insert_with(|| "/root".to_string());
+        // Always use the build-scoped home directory. Image configs often set
+        // HOME=/root which doesn't exist on macOS and isn't writable.
+        env_map.insert("HOME".to_string(), home_dir.display().to_string());
 
         // If USER is set, inject it as an environment variable for RUN commands
         if let Some(ref user) = config.user {
             env_map
                 .entry("USER".to_string())
                 .or_insert_with(|| resolve_user_name(user, rootfs_dir));
+        }
+
+        // Resolve all absolute-path env values to rootfs-relative paths.
+        // Container paths like "/usr/local/go" → "{rootfs}/usr/local/go".
+        // Skip PATH (colon-separated, already handled) and HOME (build-scoped).
+        let rootfs_str = rootfs_dir.display().to_string();
+        let home_str = home_dir.display().to_string();
+        let tmp_str = tmp_dir.display().to_string();
+        let skip_keys: std::collections::HashSet<&str> =
+            ["PATH", "HOME", "USER", "TMPDIR"].into_iter().collect();
+        for (key, value) in &mut env_map {
+            if skip_keys.contains(key.as_str()) {
+                continue;
+            }
+            if value.starts_with('/')
+                && !value.starts_with(&rootfs_str)
+                && !value.starts_with(&home_str)
+                && !value.starts_with(&tmp_str)
+                && !value.starts_with("/opt/homebrew")
+                && !value.starts_with("/usr/local/bin")
+                && !value.contains(':')
+            {
+                let resolved = rootfs_dir
+                    .join(value.strip_prefix('/').unwrap_or(value))
+                    .display()
+                    .to_string();
+                *value = resolved;
+            }
+        }
+
+        // Ensure directories exist for resolved path-like env values
+        // (GOPATH, CARGO_HOME, JAVA_HOME, etc.)
+        for value in env_map.values() {
+            if value.starts_with(&rootfs_str) && !value.contains(':') {
+                let _ = tokio::fs::create_dir_all(value).await;
+            }
         }
 
         // Execute the command under the sandbox
@@ -968,6 +1204,22 @@ impl SandboxImageBuilder {
         }
         let final_cmd = &translated.command;
 
+        // Rewrite absolute paths in the command to rootfs-relative paths.
+        // This makes `/out/foo` -> `{rootfs}/out/foo` so container paths work
+        // without chroot.
+        let final_cmd = rewrite_command_paths(final_cmd, rootfs_dir);
+
+        // Pre-create directories for rewritten output paths
+        // (e.g., {rootfs}/out/ for `-o /out/task-executor`)
+        let rootfs_prefix = rootfs_dir.display().to_string();
+        for segment in final_cmd.split_whitespace() {
+            if segment.starts_with(&rootfs_prefix) && segment.contains('/') {
+                if let Some(parent) = std::path::Path::new(segment).parent() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+            }
+        }
+
         // Run through the configured shell (both shell and exec forms use it
         // since we have already assembled shell_cmd as a single string)
         let mut cmd = Command::new("sandbox-exec");
@@ -976,7 +1228,7 @@ impl SandboxImageBuilder {
         for flag in &shell_flag {
             cmd.arg(flag);
         }
-        cmd.arg(final_cmd);
+        cmd.arg(&final_cmd);
 
         cmd.current_dir(&workdir)
             .stdout(Stdio::piped())
@@ -1049,7 +1301,11 @@ impl SandboxImageBuilder {
             }
 
             return Err(BuildError::RunFailed {
-                command: command_str,
+                command: if stderr.is_empty() {
+                    command_str
+                } else {
+                    format!("{command_str}\n  stderr: {}", stderr.trim())
+                },
                 exit_code,
             });
         }
@@ -1313,6 +1569,37 @@ pub struct SandboxBuildResult {
 // ---------------------------------------------------------------------------
 // ARG/ENV variable substitution
 // ---------------------------------------------------------------------------
+
+/// Convert an OCI `ImageConfig` to the sandbox builder's `SandboxImageConfig`.
+fn image_config_to_sandbox(ic: &zlayer_registry::ImageConfig) -> SandboxImageConfig {
+    SandboxImageConfig {
+        env: ic.env.clone().unwrap_or_default(),
+        working_dir: ic.working_dir.clone().unwrap_or_else(|| "/".to_string()),
+        entrypoint: ic.entrypoint.clone(),
+        cmd: ic.cmd.clone(),
+        exposed_ports: ic.exposed_ports.clone().unwrap_or_default(),
+        labels: ic.labels.clone().unwrap_or_default(),
+        user: ic.user.clone(),
+        volumes: ic
+            .volumes
+            .as_ref()
+            .map(|v| v.keys().cloned().collect())
+            .unwrap_or_default(),
+        stop_signal: ic.stop_signal.clone(),
+        shell: ic.shell.clone(),
+        healthcheck: ic.healthcheck.as_ref().map(|hc| {
+            // OCI spec stores durations in nanoseconds; convert to seconds.
+            const NS_PER_SEC: u64 = 1_000_000_000;
+            SandboxHealthcheck {
+                command: hc.test.clone().unwrap_or_default(),
+                interval_secs: hc.interval.map(|ns| ns / NS_PER_SEC),
+                timeout_secs: hc.timeout.map(|ns| ns / NS_PER_SEC),
+                start_period_secs: hc.start_period.map(|ns| ns / NS_PER_SEC),
+                retries: hc.retries,
+            }
+        }),
+    }
+}
 
 /// Substitute `${VAR}`, `${VAR:-default}`, and `$VAR` patterns in a string
 /// using the current ARG values and ENV values. Delegates to the existing
@@ -1756,6 +2043,81 @@ async fn copy_directory_recursive(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite absolute paths in a shell command to rootfs-relative paths.
+///
+/// Scans for absolute paths (starting with `/`) in the command string and
+/// prefixes them with the rootfs directory. Skips paths that are already
+/// rootfs-relative, well-known host paths, or inside common prefixes that
+/// should remain as-is.
+fn rewrite_command_paths(cmd: &str, rootfs_dir: &Path) -> String {
+    let rootfs_str = rootfs_dir.display().to_string();
+
+    // Paths to NOT rewrite (host system paths, already-resolved paths)
+    let skip_prefixes = [
+        &rootfs_str as &str,
+        "/dev/",
+        "/proc/",
+        "/sys/",
+        "/bin/",
+        "/usr/bin/",
+        "/usr/local/bin/",
+        "/opt/homebrew/",
+        "/tmp/", // macOS tmp
+        "/var/",
+        "/etc/",
+        "//", // protocol-relative URLs
+    ];
+
+    let mut result = String::with_capacity(cmd.len() + 128);
+    let chars: Vec<char> = cmd.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+
+    while i < len {
+        // Look for absolute paths: a '/' preceded by whitespace, '=', or start of string,
+        // followed by a letter (not another /)
+        let is_path_start = chars[i] == '/'
+            && i + 1 < len
+            && chars[i + 1].is_ascii_alphanumeric()
+            && (i == 0 || matches!(chars[i - 1], ' ' | '=' | '\t' | '"' | '\''));
+
+        if is_path_start {
+            // Extract the full path (until whitespace, quote, or semicolon)
+            let path_start = i;
+            let mut path_end = i + 1;
+            while path_end < len
+                && !matches!(
+                    chars[path_end],
+                    ' ' | '\t' | '"' | '\'' | ';' | ')' | '|' | '&' | '\n'
+                )
+            {
+                path_end += 1;
+            }
+
+            let path: String = chars[path_start..path_end].iter().collect();
+
+            // Check if this path should be skipped
+            let should_skip = skip_prefixes.iter().any(|prefix| path.starts_with(prefix));
+
+            if should_skip {
+                result.push_str(&path);
+            } else {
+                // Rewrite to rootfs-relative
+                let stripped = path.strip_prefix('/').unwrap_or(&path);
+                let resolved = format!("{rootfs_str}/{stripped}");
+                result.push_str(&resolved);
+            }
+
+            i = path_end;
+        } else {
+            result.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -2139,6 +2501,43 @@ LABEL shell_test=true
                 "pipefail".to_string(),
                 "-c".to_string()
             ])
+        );
+    }
+
+    #[test]
+    fn test_rewrite_command_paths_basic() {
+        let rootfs = std::path::Path::new("/build/rootfs");
+        assert_eq!(
+            rewrite_command_paths("go build -o /out/binary ./cmd/main/", rootfs),
+            "go build -o /build/rootfs/out/binary ./cmd/main/"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_command_paths_skips_host() {
+        let rootfs = std::path::Path::new("/build/rootfs");
+        // /usr/bin/ and /bin/ should NOT be rewritten
+        assert_eq!(
+            rewrite_command_paths("/usr/bin/env go build", rootfs),
+            "/usr/bin/env go build"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_command_paths_env_assignment() {
+        let rootfs = std::path::Path::new("/build/rootfs");
+        assert_eq!(
+            rewrite_command_paths("CGO_ENABLED=0 go build -o /out/app", rootfs),
+            "CGO_ENABLED=0 go build -o /build/rootfs/out/app"
+        );
+    }
+
+    #[test]
+    fn test_rewrite_command_paths_no_change() {
+        let rootfs = std::path::Path::new("/build/rootfs");
+        assert_eq!(
+            rewrite_command_paths("echo hello world", rootfs),
+            "echo hello world"
         );
     }
 }

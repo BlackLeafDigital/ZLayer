@@ -52,18 +52,26 @@ runs:
         PLATFORM="${{ steps.platform.outputs.platform }}"
 
         if [ "$VERSION" = "latest" ]; then
-          # Get latest version from GitHub releases
-          VERSION=$(curl -fsSL https://api.github.com/repos/BlackLeafDigital/ZLayer/releases/latest | jq -r .tag_name)
+          VERSION=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+            https://api.github.com/repos/BlackLeafDigital/ZLayer/releases/latest | jq -r .tag_name)
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Error: Could not determine latest version"
+            exit 1
+          fi
         fi
 
-        # Strip 'v' prefix for download URL
         DL_VERSION="${VERSION#v}"
-
         echo "Installing ZLayer $VERSION for $PLATFORM..."
 
-        # Download from GitHub releases
-        curl -fsSL "https://github.com/BlackLeafDigital/ZLayer/releases/download/${VERSION}/zlayer-${DL_VERSION}-${PLATFORM}.tar.gz" \
-          -o zlayer.tar.gz
+        ARTIFACT="zlayer-${DL_VERSION}-${PLATFORM}.tar.gz"
+        URL="https://github.com/BlackLeafDigital/ZLayer/releases/download/${VERSION}/${ARTIFACT}"
+
+        if ! curl -fsSL --connect-timeout 30 --max-time 120 \
+            "$URL" -o zlayer.tar.gz; then
+          echo "Error: Failed to download ZLayer ${VERSION} for ${PLATFORM}"
+          echo "URL: ${URL}"
+          exit 1
+        fi
 
         tar xzf zlayer.tar.gz
         sudo mv zlayer /usr/local/bin/

@@ -4,13 +4,64 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- GraalVM CE toolchain resolver for macOS sandbox builds — resolves exact versions
+  (`21.0.5`), partial/major versions (`21` -> latest 21.x.y), and `latest` by scanning
+  GitHub releases from `graalvm/graalvm-ce-builds`. Downloads macOS tarballs and
+  extracts with `--strip-components=3` (same JDK structure as Adoptium). Sets both
+  `JAVA_HOME` and `GRAALVM_HOME` environment variables. Detects base images containing
+  "graalvm" in the name (e.g., `graalvm-ce`, `graalvm/graalvm-ce`).
+- Swift toolchain resolver for macOS sandbox builds — provisions Swift from the host
+  system's Xcode Command Line Tools rather than downloading. Locates the toolchain via
+  `xcrun --find swiftc`, copies it into the cache keyed by the detected version, and
+  symlinks into the build rootfs at `/usr/local/swift`. Detects `swift` base images.
+- Java (Adoptium/Temurin) toolchain resolver for macOS sandbox builds — resolves `latest`
+  (fetches most recent LTS from Adoptium API), exact feature versions (`21`, `17`, `8`),
+  and dotted versions (`21.0.5` strips to major `21`). Uses the Adoptium binary API which
+  redirects to `.tar.gz` downloads. Extracts with `--strip-components=3` to handle the
+  macOS `jdk-X/Contents/Home/` tarball structure. Detects `eclipse-temurin`, `amazoncorretto`,
+  and `openjdk` base images.
+- Bun toolchain resolver for macOS sandbox builds — resolves exact versions (`1.2.3`),
+  partial versions (`1` -> latest 1.x.y), and `latest` by scanning GitHub releases from
+  `oven-sh/bun`. Downloads `bun-darwin-{arch}.zip` assets and extracts the binary into
+  the `bin/` directory structure for proper PATH integration.
+- Python toolchain resolver for macOS sandbox builds — uses standalone builds from
+  `astral-sh/python-build-standalone` on GitHub. Resolves exact versions (`3.12.1`),
+  partial versions (`3.12` -> latest 3.12.x), and `latest` by scanning GitHub release
+  assets. Downloads `install_only_stripped` tarballs for the host architecture.
+- Rust toolchain resolver for macOS sandbox builds — resolves exact versions (e.g. `1.82.0`),
+  partial versions (`1.82` -> `1.82.0`), and `latest` (fetches stable channel TOML). Downloads
+  standalone installer tarballs from `static.rust-lang.org`, extracts, and runs `install.sh`
+  with `--prefix` to provision rustc + cargo into the build cache.
+
+### Changed
+- Sandbox builder: macOS toolchain provisioning now symlinks cached toolchains into the
+  build rootfs instead of copying. The cache at `~/.zlayer/toolchains/{lang}-{version}-{arch}/`
+  is the immutable source; each build gets a symlink to it, saving disk space and build time.
+
 ### Fixed
-- Sandbox builder: added macOS command translation layer (`macos_compat.rs`) that converts
-  Linux package manager commands (`apk add`, `apt-get install`, `yum/dnf install`) to
-  `brew install` equivalents, skips user/group management commands (`adduser`, `addgroup`),
-  and handles package cache cleanup patterns — fixes exit code 127 failures on macOS builds
+- Sandbox builder: macOS toolchain provisioning (`macos_toolchain.rs`) — auto-detects
+  language from base image (e.g. `golang:1.23-alpine` → Go 1.23), downloads self-contained
+  macOS binaries from official APIs (go.dev, nodejs.org, etc.), and provisions them directly
+  into the build rootfs. No brew, no global state, parallel-build safe. Supports Go + Node
+  initially, with version resolution for any published version.
+- Sandbox builder: `macos_compat.rs` package manager commands (`apk add`, `apt-get install`)
+  are now no-ops — toolchains are provisioned in rootfs, so Linux package installs are skipped
 - Sandbox builder: PATH augmentation now always includes rootfs-prefixed paths and Homebrew
   paths, even when the base image already defines its own PATH (e.g. golang images)
+- Sandbox builder: broadened Seatbelt mach-lookup to allow all services during build-time,
+  fixing brew/ruby/git failures caused by restricted XPC access
+- Sandbox builder: RunFailed errors now include stderr output for better diagnostics
+- action.yml: added curl timeouts (`--connect-timeout 30 --max-time 120`) to prevent
+  indefinite hangs when downloading ZLayer binaries from GitHub releases
+- install.sh: added curl timeouts to binary download
+- Sandbox builder: per-build HOME directory (`{image_dir}/home/`) instead of hardcoded
+  `/root` — fixes `Read-only file system @ dir_s_mkdir - /root` errors from brew/git
+- Sandbox builder: base image config (ENV, WORKDIR, USER, ENTRYPOINT, CMD, Shell,
+  Healthcheck) is now loaded from OCI image metadata and merged into the build config —
+  previously all base image config was silently discarded
+- Sandbox builder: base image config is cached alongside rootfs as `image_config.json`
+- Registry: `ImageConfig` now parses Shell and Healthcheck fields from OCI image config
 
 ### Changed
 - Moved `docker/` directory to `images/` and updated all references across the codebase

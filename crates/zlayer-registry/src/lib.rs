@@ -35,7 +35,7 @@ pub use cache::*;
 pub use cache_config::CacheType;
 pub use client::*;
 pub use error::*;
-pub use image_config::ImageConfig;
+pub use image_config::{ImageConfig, ImageHealthcheck};
 pub use unpack::*;
 pub use wasm::*;
 
