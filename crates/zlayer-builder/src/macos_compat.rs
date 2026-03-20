@@ -314,62 +314,6 @@ fn translate_yum_dnf(cmd: &str) -> (String, Option<String>) {
 // Package name mapping
 // ---------------------------------------------------------------------------
 
-/// Map a Linux package name to its macOS/brew equivalent.
-/// Returns `None` if the package should be skipped (already on macOS or not applicable).
-fn map_package_name(linux_pkg: &str) -> Option<String> {
-    match linux_pkg {
-        // Skip: Xcode CLT provides build toolchains, system libs already on
-        // macOS, Linux-specific packages have no equivalent, and package
-        // manager meta-packages are irrelevant.
-        "build-base"
-        | "build-essential"
-        | "gcc"
-        | "g++"
-        | "make"
-        | "patch"
-        | "binutils"
-        | "ca-certificates"
-        | "musl-dev"
-        | "musl-tools"
-        | "linux-headers"
-        | "libc-dev"
-        | "libc6-dev"
-        | "glibc-devel"
-        | "libseccomp-dev"
-        | "libseccomp2"
-        | "containerd"
-        | "runc"
-        | "iptables"
-        | "iproute2"
-        | "iputils"
-        | "procps"
-        | "kmod"
-        | "systemd"
-        | "dbus"
-        | "apt-utils"
-        | "apt-transport-https"
-        | "software-properties-common"
-        | "gnupg2"
-        | "gnupg"
-        | "lsb-release" => None,
-
-        // Name translations
-        "libssl-dev" | "openssl-dev" => Some("openssl".to_string()),
-        "protobuf-compiler" | "protobuf-dev" => Some("protobuf".to_string()),
-        "nodejs" => Some("node".to_string()),
-        "python3-dev" | "python3-pip" => Some("python3".to_string()),
-        "libffi-dev" => Some("libffi".to_string()),
-        "zlib-dev" | "zlib1g-dev" => Some("zlib".to_string()),
-        "libpq-dev" | "postgresql-dev" => Some("libpq".to_string()),
-        "libsqlite3-dev" | "sqlite-dev" => Some("sqlite".to_string()),
-        "libcurl4-openssl-dev" | "curl-dev" => Some("curl".to_string()),
-        "libxml2-dev" => Some("libxml2".to_string()),
-
-        // Pass through as-is (git, curl, bash, cmake, pkg-config, wget, etc.)
-        other => Some(other.to_string()),
-    }
-}
-
 /// Extract package names from args, skipping flags (anything starting with `-`).
 fn extract_packages_after_flags<'a>(args: &[&'a str]) -> Vec<&'a str> {
     args.iter()
@@ -378,44 +322,16 @@ fn extract_packages_after_flags<'a>(args: &[&'a str]) -> Vec<&'a str> {
         .collect()
 }
 
-/// Build a `brew install` command from mapped packages, or `true` if all were skipped.
+/// Skip package install commands — toolchains are provisioned directly into
+/// the rootfs by `macos_toolchain.rs`, so package manager invocations are
+/// no-ops on macOS sandbox builds.
 fn brew_install_from(original: &str, linux_packages: &[&str]) -> (String, Option<String>) {
-    let mut brew_packages: Vec<String> = Vec::new();
-    let mut skipped: Vec<&str> = Vec::new();
-
-    for &pkg in linux_packages {
-        match map_package_name(pkg) {
-            Some(mapped) => brew_packages.push(mapped),
-            None => skipped.push(pkg),
-        }
-    }
-
-    // Deduplicate
-    brew_packages.sort_unstable();
-    brew_packages.dedup();
-
-    let joined = brew_packages.join(" ");
-    let log = if skipped.is_empty() && brew_packages.is_empty() {
-        format!("Skipped all packages in: {original}")
-    } else if skipped.is_empty() {
-        format!("Translated to: brew install {joined}")
-    } else if brew_packages.is_empty() {
-        format!("Skipped all packages ({}): {original}", skipped.join(", "))
-    } else {
-        format!(
-            "Translated to: brew install {joined} (skipped: {})",
-            skipped.join(", ")
-        )
-    };
-
+    let log = format!(
+        "Skipped package install (toolchain provisioned in rootfs): {original} [{}]",
+        linux_packages.join(", ")
+    );
     debug!("{}", log);
-
-    if brew_packages.is_empty() {
-        ("true".to_string(), Some(log))
-    } else {
-        let cmd = format!("brew install --quiet --formula {joined}");
-        (cmd, Some(log))
-    }
+    ("true".to_string(), Some(log))
 }
 
 // ---------------------------------------------------------------------------
@@ -426,11 +342,13 @@ fn brew_install_from(original: &str, linux_packages: &[&str]) -> (String, Option
 mod tests {
     use super::*;
 
+    // All package manager commands become no-ops (toolchains provisioned in rootfs)
+
     #[test]
     fn test_simple_apk_add() {
         let result = translate_linux_command("apk add --no-cache git curl");
         assert!(result.was_modified);
-        assert_eq!(result.command, "brew install --quiet --formula curl git");
+        assert_eq!(result.command, "true");
     }
 
     #[test]
@@ -447,11 +365,7 @@ mod tests {
             "apt-get install -y --no-install-recommends protobuf-compiler libseccomp-dev pkg-config cmake",
         );
         assert!(result.was_modified);
-        assert!(result.command.contains("brew install --quiet --formula"));
-        assert!(result.command.contains("cmake"));
-        assert!(result.command.contains("pkg-config"));
-        assert!(result.command.contains("protobuf"));
-        assert!(!result.command.contains("libseccomp-dev"));
+        assert_eq!(result.command, "true");
     }
 
     #[test]
@@ -460,10 +374,7 @@ mod tests {
             "apt-get update && apt-get install -y curl && rm -rf /var/lib/apt/lists/*",
         );
         assert!(result.was_modified);
-        assert_eq!(
-            result.command,
-            "true && brew install --quiet --formula curl && true"
-        );
+        assert_eq!(result.command, "true && true && true");
     }
 
     #[test]
@@ -480,10 +391,7 @@ mod tests {
         let result =
             translate_linux_command("apk add --no-cache git && mkdir -p /app && adduser -S app");
         assert!(result.was_modified);
-        assert_eq!(
-            result.command,
-            "brew install --quiet --formula git && mkdir -p /app && true"
-        );
+        assert_eq!(result.command, "true && mkdir -p /app && true");
     }
 
     #[test]
@@ -499,24 +407,21 @@ mod tests {
             "apt-get update && apt-get install -y --no-install-recommends containerd runc iptables iproute2 ca-certificates wireguard-tools curl && apt-get clean && rm -rf /var/lib/apt/lists/*",
         );
         assert!(result.was_modified);
-        assert_eq!(
-            result.command,
-            "true && brew install --quiet --formula curl wireguard-tools && true && true"
-        );
+        assert_eq!(result.command, "true && true && true && true");
     }
 
     #[test]
     fn test_semicolon_separator() {
         let result = translate_linux_command("apk update; apk add git");
         assert!(result.was_modified);
-        assert_eq!(result.command, "true ; brew install --quiet --formula git");
+        assert_eq!(result.command, "true ; true");
     }
 
     #[test]
     fn test_sudo_stripped() {
         let result = translate_linux_command("sudo apt-get install -y curl");
         assert!(result.was_modified);
-        assert_eq!(result.command, "brew install --quiet --formula curl");
+        assert_eq!(result.command, "true");
     }
 
     #[test]
@@ -537,24 +442,21 @@ mod tests {
     fn test_yum_install() {
         let result = translate_linux_command("yum install -y git cmake");
         assert!(result.was_modified);
-        assert_eq!(result.command, "brew install --quiet --formula cmake git");
+        assert_eq!(result.command, "true");
     }
 
     #[test]
     fn test_real_world_zarcrunner_zimage() {
         let result = translate_linux_command("apk add --no-cache git build-base");
         assert!(result.was_modified);
-        assert_eq!(result.command, "brew install --quiet --formula git");
+        assert_eq!(result.command, "true");
     }
 
     #[test]
     fn test_real_world_zarcrunner_runtime() {
         let result = translate_linux_command("apk add --no-cache ca-certificates git bash curl");
         assert!(result.was_modified);
-        assert_eq!(
-            result.command,
-            "brew install --quiet --formula bash curl git"
-        );
+        assert_eq!(result.command, "true");
     }
 
     #[test]
@@ -563,17 +465,14 @@ mod tests {
             "apk add --no-cache ca-certificates git bash && addgroup -S zarcrunner && adduser -S -G zarcrunner -h /data zarcrunner",
         );
         assert!(result.was_modified);
-        assert_eq!(
-            result.command,
-            "brew install --quiet --formula bash git && true && true"
-        );
+        assert_eq!(result.command, "true && true && true");
     }
 
     #[test]
     fn test_openssl_dev_mapping() {
         let result = translate_linux_command("apt-get install -y libssl-dev");
         assert!(result.was_modified);
-        assert_eq!(result.command, "brew install --quiet --formula openssl");
+        assert_eq!(result.command, "true");
     }
 
     #[test]
@@ -586,10 +485,7 @@ mod tests {
     fn test_or_separator() {
         let result = translate_linux_command("apk add git || apt-get install -y git");
         assert!(result.was_modified);
-        assert_eq!(
-            result.command,
-            "brew install --quiet --formula git || brew install --quiet --formula git"
-        );
+        assert_eq!(result.command, "true || true");
     }
 
     #[test]
@@ -619,9 +515,6 @@ mod tests {
             "apt-get update && apt-get install -y protobuf-compiler libseccomp-dev pkg-config cmake libssl-dev && rm -rf /var/lib/apt/lists/*",
         );
         assert!(result.was_modified);
-        assert_eq!(
-            result.command,
-            "true && brew install --quiet --formula cmake openssl pkg-config protobuf && true"
-        );
+        assert_eq!(result.command, "true && true && true");
     }
 }

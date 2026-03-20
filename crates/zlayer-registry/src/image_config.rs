@@ -21,14 +21,14 @@
 //! }
 //! ```
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Container runtime configuration extracted from an OCI image config blob.
 ///
 /// This represents the `config` object inside the OCI image configuration JSON.
 /// Fields map to the corresponding Docker/OCI image config spec fields.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ImageConfig {
     /// The entrypoint for the container (e.g., `["/usr/bin/myapp"]`).
     ///
@@ -73,6 +73,37 @@ pub struct ImageConfig {
     /// Signal to send to the container to stop it (e.g., `"SIGTERM"`).
     #[serde(rename = "StopSignal")]
     pub stop_signal: Option<String>,
+
+    /// Custom shell for RUN instructions (SHELL instruction).
+    /// Format: `["/bin/bash", "-c"]`.
+    #[serde(rename = "Shell")]
+    pub shell: Option<Vec<String>>,
+
+    /// Healthcheck configuration.
+    #[serde(rename = "Healthcheck")]
+    pub healthcheck: Option<ImageHealthcheck>,
+}
+
+/// Healthcheck configuration from OCI image config.
+///
+/// Durations are stored in nanoseconds (matching the OCI/Docker spec).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ImageHealthcheck {
+    /// Test command. First element is the test type: `"CMD"`, `"CMD-SHELL"`, or `"NONE"`.
+    #[serde(rename = "Test")]
+    pub test: Option<Vec<String>>,
+    /// Interval between checks in nanoseconds.
+    #[serde(rename = "Interval")]
+    pub interval: Option<u64>,
+    /// Timeout per check in nanoseconds.
+    #[serde(rename = "Timeout")]
+    pub timeout: Option<u64>,
+    /// Start period in nanoseconds.
+    #[serde(rename = "StartPeriod")]
+    pub start_period: Option<u64>,
+    /// Retries before marking unhealthy.
+    #[serde(rename = "Retries")]
+    pub retries: Option<u32>,
 }
 
 impl ImageConfig {
@@ -349,6 +380,8 @@ mod tests {
             volumes: None,
             labels: Some(HashMap::from([("key".to_string(), "value".to_string())])),
             stop_signal: None,
+            shell: None,
+            healthcheck: None,
         };
 
         let cloned = config.clone();

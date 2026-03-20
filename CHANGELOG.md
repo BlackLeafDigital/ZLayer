@@ -4,13 +4,31 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Sandbox builder: macOS toolchain provisioning now symlinks cached toolchains into the
+  build rootfs instead of copying. The cache at `~/.zlayer/toolchains/{lang}-{version}-{arch}/`
+  is the immutable source; each build gets a symlink to it, saving disk space and build time.
+
 ### Fixed
-- Sandbox builder: added macOS command translation layer (`macos_compat.rs`) that converts
-  Linux package manager commands (`apk add`, `apt-get install`, `yum/dnf install`) to
-  `brew install` equivalents, skips user/group management commands (`adduser`, `addgroup`),
-  and handles package cache cleanup patterns — fixes exit code 127 failures on macOS builds
+- Sandbox builder: macOS toolchain provisioning (`macos_toolchain.rs`) — auto-detects
+  language from base image (e.g. `golang:1.23-alpine` -> Go 1.23), downloads self-contained
+  macOS binaries from official APIs (go.dev, nodejs.org, etc.), and provisions them directly
+  into the build rootfs. No brew, no global state, parallel-build safe. Supports Go + Node
+  initially, with version resolution for any published version.
+- Sandbox builder: `macos_compat.rs` package manager commands (`apk add`, `apt-get install`)
+  are now no-ops — toolchains are provisioned in rootfs, so Linux package installs are skipped
 - Sandbox builder: PATH augmentation now always includes rootfs-prefixed paths and Homebrew
   paths, even when the base image already defines its own PATH (e.g. golang images)
+- Sandbox builder: broadened Seatbelt mach-lookup to allow all services during build-time,
+  fixing brew/ruby/git failures caused by restricted XPC access
+- Sandbox builder: RunFailed errors now include stderr output for better diagnostics
+- Sandbox builder: per-build HOME directory (`{image_dir}/home/`) instead of hardcoded
+  `/root` — fixes `Read-only file system @ dir_s_mkdir - /root` errors from brew/git
+- Sandbox builder: base image config (ENV, WORKDIR, USER, ENTRYPOINT, CMD, Shell,
+  Healthcheck) is now loaded from OCI image metadata and merged into the build config —
+  previously all base image config was silently discarded
+- Sandbox builder: base image config is cached alongside rootfs as `image_config.json`
+- Registry: `ImageConfig` now parses Shell and Healthcheck fields from OCI image config
 
 ### Changed
 - Moved `docker/` directory to `images/` and updated all references across the codebase
