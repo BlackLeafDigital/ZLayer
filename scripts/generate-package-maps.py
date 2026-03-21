@@ -58,32 +58,53 @@ def run(cmd, **kwargs):
     return subprocess.run(cmd, shell=isinstance(cmd, str), check=True, **kwargs)
 
 
+def run_as_postgres(cmd, **kwargs):
+    """Run a command as the postgres user (initdb/pg_ctl refuse to run as root)."""
+    if os.getuid() == 0:
+        wrapped = f"su-exec postgres {cmd}" if isinstance(cmd, str) else ["su-exec", "postgres"] + cmd
+    else:
+        wrapped = cmd
+    return run(wrapped, **kwargs)
+
+
 def setup_postgres(tmpdir):
     """Initialize a temporary PostgreSQL instance."""
     pgdata = os.path.join(tmpdir, "pgdata")
     print("Setting up temporary PostgreSQL...")
 
-    run(f"initdb -D {pgdata} --auth=trust --no-locale -E UTF8",
-        capture_output=True)
+    # Ensure postgres user owns the tmpdir
+    if os.getuid() == 0:
+        run(f"chown -R postgres:postgres {tmpdir}", capture_output=True)
+
+    run_as_postgres(f"initdb -D {pgdata} --auth=trust --no-locale -E UTF8",
+                    capture_output=True)
 
     # Start PostgreSQL on a random port
     port = 15432
     logfile = os.path.join(tmpdir, "pg.log")
-    run(f"pg_ctl -D {pgdata} -l {logfile} -o '-p {port} -k {tmpdir}' start",
-        capture_output=True)
+    run_as_postgres(
+        f"pg_ctl -D {pgdata} -l {logfile} -o '-p {port} -k {tmpdir}' start",
+        capture_output=True,
+    )
 
     # Create repology user and database
-    run(f"createuser -h {tmpdir} -p {port} repology", capture_output=True)
-    run(f"createdb -h {tmpdir} -p {port} -O repology repology", capture_output=True)
+    run_as_postgres(f"createuser -h {tmpdir} -p {port} repology",
+                    capture_output=True)
+    run_as_postgres(f"createdb -h {tmpdir} -p {port} -O repology repology",
+                    capture_output=True)
 
-    # Create required extensions
-    run(f'psql -h {tmpdir} -p {port} -d repology -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"',
-        capture_output=True)
+    # Create required extensions (must run as superuser = postgres)
+    run_as_postgres(
+        f'psql -h {tmpdir} -p {port} -d repology -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"',
+        capture_output=True,
+    )
 
     # Try to create libversion extension (may not be available)
     try:
-        run(f'psql -h {tmpdir} -p {port} -d repology -c "CREATE EXTENSION IF NOT EXISTS libversion;"',
-            capture_output=True)
+        run_as_postgres(
+            f'psql -h {tmpdir} -p {port} -d repology -c "CREATE EXTENSION IF NOT EXISTS libversion;"',
+            capture_output=True,
+        )
     except subprocess.CalledProcessError:
         print("  Warning: libversion extension not available, continuing without it")
 
@@ -95,7 +116,7 @@ def stop_postgres(tmpdir, pgdata=None):
     if pgdata is None:
         pgdata = os.path.join(tmpdir, "pgdata")
     try:
-        run(f"pg_ctl -D {pgdata} stop -m fast", capture_output=True)
+        run_as_postgres(f"pg_ctl -D {pgdata} stop -m fast", capture_output=True)
     except subprocess.CalledProcessError:
         pass
 
@@ -105,12 +126,13 @@ def load_dump(tmpdir, port):
     print(f"Downloading Repology dump from {DUMP_URL}...")
     print("  (This may take a few minutes...)")
 
-    # Stream: curl → zstd -d → psql
-    cmd = (
-        f"curl -sL {DUMP_URL} | zstd -d | "
-        f"psql -h {tmpdir} -p {port} -U repology -d repology "
-        f"-v ON_ERROR_STOP=0 2>&1 | tail -5"
-    )
+    # Stream: curl → zstd -d → psql (psql runs as repology user)
+    if os.getuid() == 0:
+        psql_cmd = f"su-exec postgres psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=0"
+    else:
+        psql_cmd = f"psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=0"
+
+    cmd = f"curl -sL {DUMP_URL} | zstd -d | {psql_cmd} 2>&1 | tail -5"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     print(f"  Load output: {result.stdout.strip()}")
     if result.stderr:
@@ -125,8 +147,13 @@ def extract_mappings(tmpdir, port, distro_repo):
         distro_repo=distro_repo,
     )
 
+    if os.getuid() == 0:
+        psql_cmd = f"su-exec postgres psql -h {tmpdir} -p {port} -U repology -d repology -t -A"
+    else:
+        psql_cmd = f"psql -h {tmpdir} -p {port} -U repology -d repology -t -A"
+
     result = subprocess.run(
-        f'psql -h {tmpdir} -p {port} -U repology -d repology -t -A',
+        psql_cmd,
         shell=True,
         input=query,
         capture_output=True,
