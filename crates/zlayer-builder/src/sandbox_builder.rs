@@ -313,7 +313,17 @@ impl SandboxImageBuilder {
                     .join("images")
                     .join(format!("__stage_{sanitized}_{stage_id}"));
                 if stage_dir.exists() {
-                    tokio::fs::remove_dir_all(&stage_dir).await?;
+                    // chmod first — Go module cache sets files read-only
+                    let _ = tokio::process::Command::new("chmod")
+                        .args(["-R", "u+w"])
+                        .arg(&stage_dir)
+                        .status()
+                        .await;
+                    let _ = tokio::process::Command::new("rm")
+                        .args(["-rf"])
+                        .arg(&stage_dir)
+                        .status()
+                        .await;
                 }
                 tokio::fs::create_dir_all(stage_dir.join("rootfs")).await?;
                 stage_dir.join("rootfs")
