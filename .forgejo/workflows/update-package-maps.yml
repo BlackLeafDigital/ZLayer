@@ -16,7 +16,7 @@ jobs:
       image: postgres:17-alpine
     steps:
       - name: Install deps
-        run: apk add --no-cache nodejs python3 curl git zstd
+        run: apk add --no-cache nodejs python3 curl git zstd su-exec
 
       - uses: https://code.forgejo.org/actions/checkout@v4
 
