@@ -4,7 +4,49 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- `map_linux_packages()` in `macos_image_resolver` is now async and fetches
+  package mappings from RepoSources (`zachhandley.github.io/RepoSources/maps/`)
+  with a 7-day local cache at `{data_dir}/cache/package-maps/{distro}.json`.
+  Resolution order: cached/fetched RepoSources map, name transformation
+  heuristics (strip `-dev`, `lib` prefix, version digits), then hardcoded
+  fallback. The original hardcoded mapping is preserved as `map_single_package_hardcoded()`.
+- Homebrew bottle install success log now includes the formula version
+  (`versions.stable`) from the Homebrew API.
+
+- Refactored `fetch_and_extract_bottle()` in `macos_image_resolver` to resolve
+  the full Homebrew dependency tree (BFS) before installing a formula. Split into
+  three functions: `fetch_formula_info()`, `install_single_bottle()`, and the
+  public `fetch_and_extract_bottle()` entry point. Added `dependencies` and
+  `versions` fields to `BrewFormulaInfo`. Formulas already present in the rootfs
+  Cellar are skipped, and individual dependency failures are logged as warnings
+  without aborting the overall installation.
+- Refactored `sandbox_builder::setup_base_image()` to use the 3-tier macOS image
+  resolution from `macos_image_resolver`. Old inline toolchain provisioning block
+  replaced with Tier 1 (local cache), Tier 2 (GHCR pull), Tier 3 (local build)
+  pipeline. Non-rewritable images retain existing cache/pull logic.
+- `sandbox_builder::load_base_image_config()` now checks for rewritten macOS image
+  `config.json` before falling through to the existing `image_config.json` / registry
+  pull path.
+- Toolchain env injection in `build()` now guards against duplicating env vars that
+  are already present in the config (e.g., when loaded from a cached image config).
+- `sandbox_builder::execute_run()` now intercepts Linux package manager install
+  commands (`apt-get install`, `apk add`, `yum install`, `dnf install`) and fetches
+  Homebrew bottles into the sandbox rootfs before the translated (no-op) command runs.
+
 ### Added
+- `extract_package_install_packages()` helper: parses package names from apt-get,
+  apk, yum, and dnf install commands, handling flags, sudo, and `&&`-compound
+  commands.
+- `find_after_subcommand()` helper: locates the argument tail after a subcommand
+  keyword, skipping leading flags.
+- 3-tier macOS image resolution system (`macos_image_resolver`) — rewrites Docker Hub
+  image references to macOS-native equivalents. Tier 1: pulls pre-built sandbox images
+  from `ghcr.io/blackleafdigital/zlayer`. Tier 2: builds toolchain images locally via
+  `macos_toolchain`. Tier 3: creates minimal base rootfs for distro images. Includes
+  GHCR auth resolution (GHCR_TOKEN, GITHUB_TOKEN, Docker config), Homebrew bottle
+  fetching for installing packages into sandbox rootfs, and Linux-to-brew package
+  name mapping.
 - GraalVM CE toolchain resolver for macOS sandbox builds — resolves exact versions
   (`21.0.5`), partial/major versions (`21` -> latest 21.x.y), and `latest` by scanning
   GitHub releases from `graalvm/graalvm-ce-builds`. Downloads macOS tarballs and

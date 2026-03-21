@@ -233,7 +233,7 @@ fn split_image_name_tag(image_ref: &str) -> (String, String) {
 /// - `"3.12.1-bookworm"` → `"3.12.1"`
 /// - `"latest"` → `"latest"`
 /// - `"alpine"` → `"latest"` (no version component)
-fn extract_version_from_tag(tag: &str) -> String {
+pub(crate) fn extract_version_from_tag(tag: &str) -> String {
     if tag == "latest" {
         return "latest".to_string();
     }

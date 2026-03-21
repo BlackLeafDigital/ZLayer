@@ -22,7 +22,7 @@ DUMP_URL = "https://dumps.repology.org/repology-database-dump-latest.sql.zst"
 HOMEBREW_REPO = "homebrew"
 
 OUTPUT_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "maps"
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "public", "maps"
 )
 
 
@@ -203,16 +203,31 @@ def get_all_distro_repos(tmpdir, port):
 
 
 def extract_mappings(tmpdir, port, distro_repo):
-    """Extract distro→homebrew mappings for a single repo."""
+    """Extract distro→homebrew mappings for a single repo.
+
+    Captures all name variants: visiblename, srcname, binname, and
+    individual entries from the binnames array.
+    """
     result = psql_query(tmpdir, port, f"""
-        SELECT DISTINCT d.visiblename, h.visiblename
-        FROM repology.packages d
-        JOIN packages h ON d.effname = h.effname
+        SELECT DISTINCT d_name, h.visiblename
+        FROM (
+            SELECT effname, visiblename AS d_name
+            FROM repology.packages WHERE repo = '{distro_repo}'
+            UNION
+            SELECT effname, srcname
+            FROM repology.packages WHERE repo = '{distro_repo}' AND srcname IS NOT NULL
+            UNION
+            SELECT effname, binname
+            FROM repology.packages WHERE repo = '{distro_repo}' AND binname IS NOT NULL
+            UNION
+            SELECT effname, unnest(binnames)
+            FROM repology.packages WHERE repo = '{distro_repo}' AND binnames IS NOT NULL
+        ) d
+        JOIN repology.packages h ON d.effname = h.effname
         WHERE h.repo = 'homebrew'
-        AND d.repo = '{distro_repo}'
-        AND d.visiblename IS NOT NULL
+        AND d_name IS NOT NULL
         AND h.visiblename IS NOT NULL
-        ORDER BY d.visiblename;
+        ORDER BY d_name;
     """)
 
     mappings = {}

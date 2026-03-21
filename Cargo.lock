@@ -10239,6 +10239,7 @@ name = "zlayer-builder"
 version = "0.0.0-dev"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bzip2",
  "crossterm",
  "dirs",

@@ -48,8 +48,8 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
         run: |
           git clone --depth=1 https://x-access-token:${GH_TOKEN}@github.com/ZachHandley/RepoSources.git /tmp/repo
-          mkdir -p /tmp/repo/docs/maps
-          cp -f docs/maps/*.json /tmp/repo/docs/maps/
+          mkdir -p /tmp/repo/public/maps
+          cp -f public/maps/*.json /tmp/repo/public/maps/
           cd /tmp/repo
           git config user.name "ZLayer Bot"
           git config user.email "bot@blackleafdigital.com"
