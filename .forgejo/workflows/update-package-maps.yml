@@ -1,0 +1,42 @@
+name: Update Package Maps
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'  # Weekly Sunday 4am
+  workflow_dispatch:
+
+concurrency:
+  group: package-maps
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    runs-on: [self-hosted]
+    container:
+      image: alpine:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install deps
+        run: apk add --no-cache python3 py3-requests git curl
+
+      - name: Generate maps
+        run: |
+          mkdir -p docs/maps
+          python3 scripts/generate-package-maps.py
+
+      - name: Push to GitHub RepoSources
+        env:
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+        run: |
+          git clone --depth=1 https://x-access-token:${GH_TOKEN}@github.com/ZachHandley/RepoSources.git /tmp/repo
+          mkdir -p /tmp/repo/docs/maps
+          cp -f docs/maps/*.json /tmp/repo/docs/maps/
+          cd /tmp/repo
+          git config user.name "ZLayer Bot"
+          git config user.email "bot@blackleafdigital.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes" || {
+            git commit -m "Update package maps $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push origin main
+          }
