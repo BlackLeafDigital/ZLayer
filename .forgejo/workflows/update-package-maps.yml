@@ -13,7 +13,7 @@ jobs:
   generate:
     runs-on: beastpc
     container:
-      image: alpine:latest
+      image: node:20-alpine
     steps:
       - uses: actions/checkout@v4
 
