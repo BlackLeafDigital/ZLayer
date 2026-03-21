@@ -28,11 +28,11 @@ jobs:
           make && make install
           cd /
 
-          # Build postgresql-libversion extension
+          # Build postgresql-libversion extension (skip LLVM/JIT bitcode)
           cd /tmp
           git clone --depth=1 https://github.com/repology/postgresql-libversion.git
           cd postgresql-libversion
-          make && make install
+          make with_llvm=no && make with_llvm=no install
           cd / && rm -rf /tmp/libversion /tmp/postgresql-libversion
 
       - uses: https://code.forgejo.org/actions/checkout@v4
