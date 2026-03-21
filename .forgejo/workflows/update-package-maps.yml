@@ -18,12 +18,22 @@ jobs:
       - name: Install deps
         run: |
           apk add --no-cache nodejs python3 curl git zstd su-exec
-          apk add --no-cache build-base postgresql17-dev
+          apk add --no-cache build-base postgresql17-dev cmake
+
+          # Build libversion (C library that postgresql-libversion depends on)
+          cd /tmp
+          git clone --depth=1 https://github.com/repology/libversion.git
+          cd libversion
+          cmake -DCMAKE_INSTALL_PREFIX=/usr .
+          make && make install
+          cd /
+
+          # Build postgresql-libversion extension
           cd /tmp
           git clone --depth=1 https://github.com/repology/postgresql-libversion.git
           cd postgresql-libversion
           make && make install
-          cd / && rm -rf /tmp/postgresql-libversion
+          cd / && rm -rf /tmp/libversion /tmp/postgresql-libversion
 
       - uses: https://code.forgejo.org/actions/checkout@v4
 

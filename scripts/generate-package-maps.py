@@ -99,14 +99,19 @@ def setup_postgres(tmpdir):
         capture_output=True,
     )
 
-    # Try to create libversion extension (may not be available)
+    # Create libversion extension (required for Repology dump)
     try:
         run_as_postgres(
             f'psql -h {tmpdir} -p {port} -d repology -c "CREATE EXTENSION IF NOT EXISTS libversion;"',
             capture_output=True,
         )
+        print("  libversion extension loaded")
     except subprocess.CalledProcessError:
-        print("  Warning: libversion extension not available, continuing without it")
+        print("  ERROR: libversion extension not available!")
+        print("  The Repology dump requires libversion. Install it first:")
+        print("    git clone https://github.com/repology/libversion && cd libversion && cmake . && make && make install")
+        print("    git clone https://github.com/repology/postgresql-libversion && cd postgresql-libversion && make && make install")
+        sys.exit(1)
 
     return tmpdir, port
 
