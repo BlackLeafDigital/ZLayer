@@ -1305,7 +1305,7 @@ mod tests {
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].0, "curl");
         assert!(!result[0].1);
-        assert_eq!(result[1].0, "openssl");
+        assert_eq!(result[1].0, "openssl@3");
         assert!(!result[1].1);
         assert_eq!(result[2].0, "musl-dev");
         assert!(result[2].1);
