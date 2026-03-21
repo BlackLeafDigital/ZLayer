@@ -1,26 +1,32 @@
 #!/usr/bin/env python3
 """
-Generate package name mapping files from the Repology API.
+Generate package name mapping files from the Repology database dump.
 
-Paginates through projects that exist in both Homebrew and various Linux distro
-repositories, then outputs JSON mapping files (distro package name -> Homebrew
-formula name) to docs/maps/.
+Downloads the Repology PostgreSQL dump, loads it, queries for
+Linux distro → Homebrew formula mappings, and outputs JSON files.
+
+Requires: PostgreSQL, zstd, psql in PATH.
 
 Usage:
-    python3 scripts/generate-maps.py
+    python3 scripts/generate-package-maps.py
 """
 
 import json
 import os
+import subprocess
 import sys
-import time
+import tempfile
 from datetime import datetime, timezone
 
-import requests
+sys.stdout.reconfigure(line_buffering=True)
+sys.stderr.reconfigure(line_buffering=True)
 
-API_BASE = "https://repology.org/api/v1/projects/"
+DUMP_URL = "https://dumps.repology.org/repology-database-dump-latest.sql.zst"
 
-# Repology repo identifiers
+OUTPUT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "maps"
+)
+
 DISTRO_REPOS = {
     "debian": "debian_12",
     "ubuntu": "ubuntu_24_04",
@@ -29,154 +35,113 @@ DISTRO_REPOS = {
 
 HOMEBREW_REPO = "homebrew"
 
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "maps")
-
-# Rate limiting
-REQUEST_DELAY = 1.0  # seconds between API requests
-MAX_RETRIES = 5
-INITIAL_BACKOFF = 2.0  # seconds, doubles on each retry
-
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": "RepoSources/1.0 (https://github.com/ZachHandley/RepoSources; package mapping generator)",
-})
-
-
-def fetch_page(name_after=None):
-    """Fetch one page of projects from Repology, with retry and backoff."""
-    params = {
-        "inrepo": HOMEBREW_REPO,
-    }
-
-    url = API_BASE
-    if name_after:
-        url = f"{API_BASE}?name_after={name_after}"
-        # inrepo still needs to be passed
-        params = {}
-        url += f"&inrepo={HOMEBREW_REPO}"
-
-    backoff = INITIAL_BACKOFF
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            resp = SESSION.get(url if name_after else API_BASE, params=params if not name_after else None, timeout=30)
-
-            if resp.status_code == 200:
-                return resp.json()
-
-            if resp.status_code in (403, 429, 500, 502, 503):
-                wait = backoff * attempt
-                print(f"  HTTP {resp.status_code} on attempt {attempt}/{MAX_RETRIES}, retrying in {wait:.0f}s...")
-                time.sleep(wait)
-                backoff *= 2
-                continue
-
-            # Other errors: log and return empty to skip this page
-            print(f"  Unexpected HTTP {resp.status_code}, skipping page (attempt {attempt})")
-            if attempt == MAX_RETRIES:
-                return {}
-            time.sleep(backoff)
-            continue
-
-        except requests.exceptions.RequestException as exc:
-            wait = backoff * attempt
-            print(f"  Request error on attempt {attempt}/{MAX_RETRIES}: {exc}, retrying in {wait:.0f}s...")
-            time.sleep(wait)
-            backoff *= 2
-            if attempt == MAX_RETRIES:
-                print("  Max retries reached, skipping page.")
-                return {}
-
-    return {}
+# SQL query to extract mappings for a given distro repo
+MAPPING_QUERY = """
+COPY (
+    SELECT DISTINCT
+        dp.name AS linux_name,
+        hp.name AS brew_formula
+    FROM packages dp
+    JOIN packages hp ON dp.effname = hp.effname
+    WHERE hp.repo = '{homebrew_repo}'
+    AND dp.repo = '{distro_repo}'
+    AND dp.name IS NOT NULL
+    AND hp.name IS NOT NULL
+    ORDER BY dp.name
+) TO STDOUT WITH (FORMAT csv, HEADER false);
+"""
 
 
-def extract_mappings(projects_data, distro_repo):
-    """
-    Given a page of Repology project data, extract distro->homebrew mappings.
+def run(cmd, **kwargs):
+    """Run a command, printing it first."""
+    print(f"  $ {cmd if isinstance(cmd, str) else ' '.join(cmd)}")
+    return subprocess.run(cmd, shell=isinstance(cmd, str), check=True, **kwargs)
 
-    Returns a dict of {distro_package_name: homebrew_formula_name}.
-    """
+
+def setup_postgres(tmpdir):
+    """Initialize a temporary PostgreSQL instance."""
+    pgdata = os.path.join(tmpdir, "pgdata")
+    print("Setting up temporary PostgreSQL...")
+
+    run(f"initdb -D {pgdata} --auth=trust --no-locale -E UTF8",
+        capture_output=True)
+
+    # Start PostgreSQL on a random port
+    port = 15432
+    logfile = os.path.join(tmpdir, "pg.log")
+    run(f"pg_ctl -D {pgdata} -l {logfile} -o '-p {port} -k {tmpdir}' start",
+        capture_output=True)
+
+    # Create repology user and database
+    run(f"createuser -h {tmpdir} -p {port} repology", capture_output=True)
+    run(f"createdb -h {tmpdir} -p {port} -O repology repology", capture_output=True)
+
+    # Create required extensions
+    run(f'psql -h {tmpdir} -p {port} -d repology -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"',
+        capture_output=True)
+
+    # Try to create libversion extension (may not be available)
+    try:
+        run(f'psql -h {tmpdir} -p {port} -d repology -c "CREATE EXTENSION IF NOT EXISTS libversion;"',
+            capture_output=True)
+    except subprocess.CalledProcessError:
+        print("  Warning: libversion extension not available, continuing without it")
+
+    return tmpdir, port
+
+
+def stop_postgres(tmpdir, pgdata=None):
+    """Stop the temporary PostgreSQL instance."""
+    if pgdata is None:
+        pgdata = os.path.join(tmpdir, "pgdata")
+    try:
+        run(f"pg_ctl -D {pgdata} stop -m fast", capture_output=True)
+    except subprocess.CalledProcessError:
+        pass
+
+
+def load_dump(tmpdir, port):
+    """Download and load the Repology database dump."""
+    print(f"Downloading Repology dump from {DUMP_URL}...")
+    print("  (This may take a few minutes...)")
+
+    # Stream: curl → zstd -d → psql
+    cmd = (
+        f"curl -sL {DUMP_URL} | zstd -d | "
+        f"psql -h {tmpdir} -p {port} -U repology -d repology "
+        f"-v ON_ERROR_STOP=0 2>&1 | tail -5"
+    )
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print(f"  Load output: {result.stdout.strip()}")
+    if result.stderr:
+        print(f"  Stderr: {result.stderr.strip()[:200]}")
+    print("  Dump loaded.")
+
+
+def extract_mappings(tmpdir, port, distro_repo):
+    """Extract Linux→Homebrew mappings for a distro from the database."""
+    query = MAPPING_QUERY.format(
+        homebrew_repo=HOMEBREW_REPO,
+        distro_repo=distro_repo,
+    )
+
+    result = subprocess.run(
+        f'psql -h {tmpdir} -p {port} -U repology -d repology -t -A',
+        shell=True,
+        input=query,
+        capture_output=True,
+        text=True,
+    )
+
     mappings = {}
+    for line in result.stdout.strip().split("\n"):
+        if "," in line:
+            parts = line.split(",", 1)
+            if len(parts) == 2 and parts[0] and parts[1]:
+                linux_name, brew_formula = parts
+                if linux_name not in mappings:
+                    mappings[linux_name] = brew_formula
 
-    for project_name, packages in projects_data.items():
-        homebrew_names = set()
-        distro_names = set()
-
-        for pkg in packages:
-            repo = pkg.get("repo", "")
-            name = pkg.get("srcname") or pkg.get("binname") or pkg.get("name", "")
-            if not name:
-                continue
-
-            if repo == HOMEBREW_REPO:
-                # Use visiblename for Homebrew since it reflects the actual formula
-                visible = pkg.get("visiblename") or name
-                homebrew_names.add(visible)
-            elif repo == distro_repo:
-                # Collect both srcname and binnames for distro packages
-                if pkg.get("srcname"):
-                    distro_names.add(pkg["srcname"])
-                if pkg.get("binname"):
-                    distro_names.add(pkg["binname"])
-                if not pkg.get("srcname") and not pkg.get("binname"):
-                    distro_names.add(name)
-
-        # Create mappings: each distro name maps to the first homebrew name
-        if homebrew_names and distro_names:
-            brew_name = sorted(homebrew_names)[0]  # deterministic pick
-            for dname in distro_names:
-                if dname not in mappings:
-                    mappings[dname] = brew_name
-
-    return mappings
-
-
-def paginate_all():
-    """
-    Paginate through the entire Repology API for Homebrew projects.
-
-    Returns all project data as a combined dict.
-    """
-    all_projects = {}
-    name_after = None
-    page_num = 0
-
-    print("Starting Repology API pagination...")
-    print(f"Fetching projects present in {HOMEBREW_REPO}...")
-
-    while True:
-        page_num += 1
-        if name_after:
-            print(f"  Page {page_num}, after '{name_after}', {len(all_projects)} projects so far...")
-        else:
-            print(f"  Page {page_num} (first page)...")
-
-        data = fetch_page(name_after)
-
-        if not data:
-            print("  Empty response, pagination complete.")
-            break
-
-        all_projects.update(data)
-
-        # Repology returns up to 200 projects per page.
-        # If we get fewer, we're done.
-        project_names = sorted(data.keys())
-        if len(project_names) < 200:
-            print(f"  Got {len(project_names)} projects (< 200), pagination complete.")
-            break
-
-        name_after = project_names[-1]
-        time.sleep(REQUEST_DELAY)
-
-    print(f"Total projects fetched: {len(all_projects)}")
-    return all_projects
-
-
-def build_distro_map(all_projects, distro_key, distro_repo):
-    """Build the mapping dict for a single distro."""
-    print(f"Building mappings for {distro_key} ({distro_repo})...")
-    mappings = extract_mappings(all_projects, distro_repo)
-    print(f"  {len(mappings)} mappings found.")
     return mappings
 
 
@@ -186,7 +151,7 @@ def write_map_file(filepath, distro_repo, mappings):
     doc = {
         "metadata": {
             "generated_at": now,
-            "source": "repology",
+            "source": "repology-dump",
             "distro": distro_repo,
             "total_mappings": len(mappings),
         },
@@ -214,7 +179,7 @@ def write_all_file(filepath, distro_maps):
     doc = {
         "metadata": {
             "generated_at": now,
-            "source": "repology",
+            "source": "repology-dump",
             "distros": list(DISTRO_REPOS.values()),
             "total_mappings": total,
         },
@@ -224,37 +189,45 @@ def write_all_file(filepath, distro_maps):
     with open(filepath, "w") as f:
         json.dump(doc, f, indent=2)
     size_kb = os.path.getsize(filepath) / 1024
-    print(f"  Wrote {filepath} ({size_kb:.1f} KB, {total} total mappings across all distros)")
+    print(f"  Wrote {filepath} ({size_kb:.1f} KB, {total} total mappings)")
 
 
 def main():
     print("=" * 60)
-    print("RepoSources - Package Map Generator")
+    print("RepoSources - Package Map Generator (dump method)")
     print("=" * 60)
 
-    # Fetch all project data from Repology
-    all_projects = paginate_all()
+    with tempfile.TemporaryDirectory(prefix="repology-") as tmpdir:
+        try:
+            # Set up PostgreSQL
+            sock_dir, port = setup_postgres(tmpdir)
+            print(f"PostgreSQL running on port {port}")
 
-    if not all_projects:
-        print("ERROR: No project data retrieved from Repology. Exiting.")
-        sys.exit(1)
+            # Load the dump
+            load_dump(sock_dir, port)
 
-    # Build per-distro mappings
-    distro_maps = {}
-    for distro_key, distro_repo in DISTRO_REPOS.items():
-        distro_maps[distro_key] = build_distro_map(all_projects, distro_key, distro_repo)
+            # Extract per-distro mappings
+            distro_maps = {}
+            for distro_key, distro_repo in DISTRO_REPOS.items():
+                print(f"\nExtracting mappings for {distro_key} ({distro_repo})...")
+                mappings = extract_mappings(sock_dir, port, distro_repo)
+                distro_maps[distro_key] = mappings
+                print(f"  {len(mappings)} mappings found")
 
-    # Write individual distro files
-    print("\nWriting output files...")
-    for distro_key, mappings in distro_maps.items():
-        filepath = os.path.join(OUTPUT_DIR, f"{distro_key}.json")
-        write_map_file(filepath, DISTRO_REPOS[distro_key], mappings)
+            # Write output files
+            print("\nWriting output files...")
+            for distro_key, mappings in distro_maps.items():
+                filepath = os.path.join(OUTPUT_DIR, f"{distro_key}.json")
+                write_map_file(filepath, DISTRO_REPOS[distro_key], mappings)
 
-    # Write combined file
-    all_filepath = os.path.join(OUTPUT_DIR, "all.json")
-    write_all_file(all_filepath, distro_maps)
+            all_filepath = os.path.join(OUTPUT_DIR, "all.json")
+            write_all_file(all_filepath, distro_maps)
 
-    print("\nDone!")
+            print("\nDone!")
+
+        finally:
+            print("\nCleaning up PostgreSQL...")
+            stop_postgres(tmpdir)
 
 
 if __name__ == "__main__":

@@ -13,16 +13,17 @@ jobs:
   generate:
     runs-on: beastpc
     container:
-      image: node:20-alpine
+      image: postgres:17-alpine
     steps:
-      - uses: actions/checkout@v4
-
       - name: Install deps
-        run: apk add --no-cache python3 py3-requests git curl
+        run: apk add --no-cache nodejs python3 curl git zstd
 
-      - name: Generate maps
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Generate maps from Repology dump
+        env:
+          PGDATA: /tmp/pgdata
         run: |
-          mkdir -p docs/maps
           python3 scripts/generate-package-maps.py
 
       - name: Push to GitHub RepoSources
