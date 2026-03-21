@@ -190,6 +190,8 @@ pub mod error;
 #[cfg(target_os = "macos")]
 pub mod macos_compat;
 #[cfg(target_os = "macos")]
+pub mod macos_image_resolver;
+#[cfg(target_os = "macos")]
 pub mod macos_toolchain;
 pub mod pipeline;
 #[cfg(target_os = "macos")]
