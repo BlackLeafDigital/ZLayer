@@ -352,24 +352,31 @@ impl SandboxImageBuilder {
                 });
 
             // If this stage uses a toolchain, inject its env vars into the config.
+            // Skip if the config already has these vars (e.g., loaded from cached image config.json).
             if let Some(spec) =
                 crate::macos_toolchain::detect_toolchain(&stage.base_image.to_string_ref())
             {
-                for (key, value) in &spec.env {
-                    config.env.push(format!("{key}={value}"));
-                }
-                // Add toolchain PATH dirs to the config's PATH
-                for dir in &spec.path_dirs {
-                    let existing_path = config
-                        .env
-                        .iter()
-                        .find(|e| e.starts_with("PATH="))
-                        .map(|e| e.strip_prefix("PATH=").unwrap_or("").to_string());
-                    if let Some(path) = existing_path {
-                        config.env.retain(|e| !e.starts_with("PATH="));
-                        config.env.push(format!("PATH={dir}:{path}"));
-                    } else {
-                        config.env.push(format!("PATH={dir}"));
+                let has_toolchain_env = spec
+                    .env
+                    .keys()
+                    .any(|key| config.env.iter().any(|e| e.starts_with(&format!("{key}="))));
+                if !has_toolchain_env {
+                    for (key, value) in &spec.env {
+                        config.env.push(format!("{key}={value}"));
+                    }
+                    // Add toolchain PATH dirs to the config's PATH
+                    for dir in &spec.path_dirs {
+                        let existing_path = config
+                            .env
+                            .iter()
+                            .find(|e| e.starts_with("PATH="))
+                            .map(|e| e.strip_prefix("PATH=").unwrap_or("").to_string());
+                        if let Some(path) = existing_path {
+                            config.env.retain(|e| !e.starts_with("PATH="));
+                            config.env.push(format!("PATH={dir}:{path}"));
+                        } else {
+                            config.env.push(format!("PATH={dir}"));
+                        }
                     }
                 }
             }
@@ -443,7 +450,12 @@ impl SandboxImageBuilder {
         tokio::fs::write(&config_path, config_json).await?;
 
         // Clean up tmp dir, home dir, and intermediate stage directories.
-        // Use `rm -rf` because Go module cache sets files read-only.
+        // chmod first — Go module cache sets files read-only.
+        let _ = tokio::process::Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&home_dir)
+            .status()
+            .await;
         let _ = tokio::process::Command::new("rm")
             .args(["-rf"])
             .arg(&tmp_dir)
@@ -522,58 +534,75 @@ impl SandboxImageBuilder {
             }
             ImageRef::Registry { .. } => {
                 let raw_ref = image_ref.to_string_ref();
-                let qualified = image_ref.qualify();
-                let full_ref = qualified.to_string_ref();
 
-                // macOS toolchain provisioning: if the base image is a known
-                // language image (golang, node, etc.), provision the toolchain
-                // directly into the rootfs instead of pulling a Linux image.
-                if let Some(spec) = crate::macos_toolchain::detect_toolchain(&raw_ref) {
-                    info!(
-                        "Detected {} {} toolchain from base image '{}'",
-                        spec.language, spec.version, raw_ref
-                    );
+                // macOS 3-tier resolution for known images
+                #[cfg(target_os = "macos")]
+                if let Some(rewritten) =
+                    crate::macos_image_resolver::rewrite_image_for_macos(&raw_ref)
+                {
+                    info!("macOS image rewrite: {} -> {}", raw_ref, rewritten);
+                    let sanitized = sanitize_image_name(&rewritten);
+                    let cached_image = self.data_dir.join("images").join(&sanitized);
+                    let cached_rootfs = cached_image.join("rootfs");
 
-                    // Check if we already have a cached toolchain rootfs
-                    let toolchain_cache = self.data_dir.join("toolchains");
-                    let arch = crate::macos_toolchain::host_arch();
-                    let cache_key = format!("{}-{}-{}", spec.language, spec.version, arch);
-                    let cached_rootfs_dir = toolchain_cache.join(&cache_key).join("rootfs");
-
-                    if cached_rootfs_dir.exists() && has_content(&cached_rootfs_dir) {
-                        info!(
-                            "Using cached toolchain rootfs: {}",
-                            cached_rootfs_dir.display()
-                        );
-                        copy_directory_recursive(&cached_rootfs_dir, rootfs_dir).await?;
+                    // TIER 1: Local image cache
+                    if cached_rootfs.exists() && has_content(&cached_rootfs) {
+                        info!("Tier 1: using cached macOS image {}", rewritten);
+                        copy_directory_recursive(&cached_rootfs, rootfs_dir).await?;
                         return Ok(());
                     }
 
-                    // Bootstrap with host binaries (like zlayer/base)
-                    crate::macos_toolchain::ensure_base_rootfs(rootfs_dir).await?;
-
-                    // Provision the language toolchain
-                    let tmp = self.data_dir.join("tmp");
-                    tokio::fs::create_dir_all(&tmp).await?;
-                    tokio::fs::create_dir_all(&toolchain_cache).await?;
-
-                    crate::macos_toolchain::provision_toolchain(
-                        &spec,
-                        rootfs_dir,
-                        &toolchain_cache,
-                        &tmp,
-                    )
-                    .await?;
-
-                    // Cache the fully-provisioned rootfs for next time
-                    if let Some(parent) = cached_rootfs_dir.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
+                    // TIER 2: Pull from GHCR
+                    #[cfg(feature = "cache")]
+                    {
+                        match crate::macos_image_resolver::try_pull_zlayer_image(
+                            &rewritten,
+                            &cached_image,
+                            rootfs_dir,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                info!("Tier 2: pulled {} from GHCR", rewritten);
+                                return Ok(());
+                            }
+                            Ok(false) => {
+                                info!("Tier 2: {} not on GHCR, building locally", rewritten);
+                            }
+                            Err(e) => {
+                                warn!("Tier 2 error for {}: {}, building locally", rewritten, e);
+                            }
+                        }
                     }
-                    tokio::fs::create_dir_all(&cached_rootfs_dir).await?;
-                    copy_directory_recursive(rootfs_dir, &cached_rootfs_dir).await?;
 
+                    // TIER 3: Build locally
+                    if let Some(spec) = crate::macos_toolchain::detect_toolchain(&raw_ref) {
+                        info!(
+                            "Tier 3: building {} locally ({} {})",
+                            rewritten, spec.language, spec.version
+                        );
+                        let image_dir = crate::macos_image_resolver::build_toolchain_as_image(
+                            &spec,
+                            &rewritten,
+                            &self.data_dir,
+                        )
+                        .await?;
+                        copy_directory_recursive(&image_dir.join("rootfs"), rootfs_dir).await?;
+                        return Ok(());
+                    }
+
+                    // Base distro (ubuntu/alpine/debian) — just build base rootfs
+                    info!("Tier 3: building base image for {}", rewritten);
+                    let image_dir =
+                        crate::macos_image_resolver::build_base_image(&rewritten, &self.data_dir)
+                            .await?;
+                    copy_directory_recursive(&image_dir.join("rootfs"), rootfs_dir).await?;
                     return Ok(());
                 }
+
+                // --- NOT a rewritable image: existing resolution logic ---
+                let qualified = image_ref.qualify();
+                let full_ref = qualified.to_string_ref();
 
                 // Check 1: exact qualified name in local cache
                 let sanitized = sanitize_image_name(&full_ref);
@@ -832,6 +861,28 @@ impl SandboxImageBuilder {
             }
             ImageRef::Registry { .. } => {
                 let raw_ref = image_ref.to_string_ref();
+
+                // Check rewritten macOS image config first
+                #[cfg(target_os = "macos")]
+                if let Some(rewritten) =
+                    crate::macos_image_resolver::rewrite_image_for_macos(&raw_ref)
+                {
+                    let sanitized = sanitize_image_name(&rewritten);
+                    let config_path = self
+                        .data_dir
+                        .join("images")
+                        .join(&sanitized)
+                        .join("config.json");
+                    if config_path.exists() {
+                        if let Ok(data) = tokio::fs::read_to_string(&config_path).await {
+                            if let Ok(config) = serde_json::from_str::<SandboxImageConfig>(&data) {
+                                debug!("Loaded config from macOS image: {}", rewritten);
+                                return Ok(config);
+                            }
+                        }
+                    }
+                }
+
                 let qualified = image_ref.qualify();
                 let full_ref = qualified.to_string_ref();
 
@@ -1203,6 +1254,38 @@ impl SandboxImageBuilder {
         } else {
             ("/bin/sh".to_string(), vec!["-c".to_string()])
         };
+
+        // macOS: intercept package manager installs and fetch Homebrew bottles
+        #[cfg(target_os = "macos")]
+        {
+            let trimmed = shell_cmd.trim();
+            let (packages, distro) = extract_package_install_packages(trimmed);
+            if !packages.is_empty() {
+                let mapped = crate::macos_image_resolver::map_linux_packages(
+                    &packages.iter().map(String::as_str).collect::<Vec<_>>(),
+                    distro,
+                    &self.data_dir.join("cache"),
+                )
+                .await;
+                for (formula, skipped) in &mapped {
+                    if *skipped {
+                        debug!("Skipping Linux-only package: {}", formula);
+                        continue;
+                    }
+                    info!("Installing {} via Homebrew bottle", formula);
+                    match crate::macos_image_resolver::fetch_and_extract_bottle(
+                        formula, rootfs_dir, tmp_dir,
+                    )
+                    .await
+                    {
+                        Ok(()) => info!("Installed {} successfully", formula),
+                        Err(e) => warn!("Failed to install {}: {} (continuing)", formula, e),
+                    }
+                }
+                // Still run the translated command (which will be "true"/no-op)
+                // so the RUN instruction completes successfully
+            }
+        }
 
         // Translate Linux-specific commands (package managers, user mgmt) to
         // macOS equivalents before execution.
@@ -1995,6 +2078,104 @@ fn has_content(path: &Path) -> bool {
     path.read_dir()
         .map(|mut entries| entries.next().is_some())
         .unwrap_or(false)
+}
+
+/// Extract package names from a Linux package manager install command.
+///
+/// Parses commands like:
+/// - `apt-get install -y curl git nginx` -> `["curl", "git", "nginx"]`
+/// - `apk add --no-cache python3 py3-pip` -> `["python3", "py3-pip"]`
+/// - `yum install -y wget` -> `["wget"]`
+///
+/// Handles compound commands (separated by `&&`), strips `sudo`, and ignores
+/// flags (words starting with `-`). Returns an empty vec if the command does
+/// not contain a recognized package manager install invocation.
+/// Returns `(packages, distro_hint)` — the packages to install and a hint
+/// for which Repology distro map to use.
+fn extract_package_install_packages(cmd: &str) -> (Vec<String>, &'static str) {
+    let mut packages = Vec::new();
+    let mut distro = "debian_12"; // default
+
+    for segment in cmd.split("&&") {
+        let segment = segment.trim();
+        // Strip leading sudo
+        let segment = segment
+            .strip_prefix("sudo ")
+            .unwrap_or(segment)
+            .trim_start();
+
+        // Detect package manager install commands and find where the package
+        // list begins.
+        let tail = if let Some(rest) = segment.strip_prefix("apt-get ") {
+            distro = "debian_12";
+            find_after_subcommand(rest.trim(), "install")
+        } else if let Some(rest) = segment.strip_prefix("apt ") {
+            distro = "debian_12";
+            find_after_subcommand(rest.trim(), "install")
+        } else if let Some(rest) = segment.strip_prefix("apk ") {
+            distro = "alpine_3_20";
+            find_after_subcommand(rest.trim(), "add")
+        } else if let Some(rest) = segment.strip_prefix("yum ") {
+            distro = "centos_8";
+            find_after_subcommand(rest.trim(), "install")
+        } else if let Some(rest) = segment.strip_prefix("dnf ") {
+            distro = "fedora_42";
+            find_after_subcommand(rest.trim(), "install")
+        } else {
+            None
+        };
+
+        if let Some(args) = tail {
+            for word in args.split_whitespace() {
+                // Skip flags
+                if word.starts_with('-') {
+                    continue;
+                }
+                // Skip redirections and pipes
+                if word == "|" || word == ">" || word == ">>" || word == "2>&1" || word == ";" {
+                    break;
+                }
+                packages.push(word.to_string());
+            }
+        }
+    }
+
+    (packages, distro)
+}
+
+/// Find the portion of a command string after the given subcommand keyword.
+///
+/// Skips any leading flags before the subcommand. For example, given
+/// `"-y install curl git"` and subcommand `"install"`, returns `Some("curl git")`.
+fn find_after_subcommand<'a>(args: &'a str, subcommand: &str) -> Option<&'a str> {
+    let mut remaining = args;
+    loop {
+        let word_end = remaining
+            .find(char::is_whitespace)
+            .unwrap_or(remaining.len());
+        let word = &remaining[..word_end];
+
+        if word == subcommand {
+            let after = &remaining[word_end..];
+            let trimmed = after.trim_start();
+            if trimmed.is_empty() {
+                return None;
+            }
+            return Some(trimmed);
+        }
+
+        // If the word is a flag, skip it and continue looking for the subcommand
+        if word.starts_with('-') {
+            remaining = remaining[word_end..].trim_start();
+            if remaining.is_empty() {
+                return None;
+            }
+            continue;
+        }
+
+        // Non-flag, non-matching word — not a recognized install command
+        return None;
+    }
 }
 
 /// Recursively copy a directory tree.

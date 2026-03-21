@@ -33,6 +33,9 @@ hex.workspace = true
 indexmap = { version = "2", features = ["serde"] }
 humantime = "2"
 
+# Base64 decoding (docker config auth)
+base64.workspace = true
+
 # Platform detection
 dirs = "5"
 

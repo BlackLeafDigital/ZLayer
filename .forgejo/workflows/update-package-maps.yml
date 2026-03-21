@@ -1,0 +1,70 @@
+name: Update Package Maps
+
+on:
+  schedule:
+    - cron: '0 4 * * 0'  # Weekly Sunday 4am
+  workflow_dispatch:
+
+concurrency:
+  group: package-maps
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    runs-on: beastpc
+    container:
+      image: postgres:17-alpine
+    steps:
+      - name: Install deps
+        run: |
+          apk add --no-cache nodejs python3 curl git zstd su-exec
+          apk add --no-cache build-base postgresql17-dev cmake
+
+          # Build libversion (C library that postgresql-libversion depends on)
+          cd /tmp
+          git clone --depth=1 https://github.com/repology/libversion.git
+          cd libversion
+          cmake -DCMAKE_INSTALL_PREFIX=/usr .
+          make && make install
+          cd /
+
+          # Build postgresql-libversion extension (skip LLVM/JIT bitcode)
+          cd /tmp
+          git clone --depth=1 https://github.com/repology/postgresql-libversion.git
+          cd postgresql-libversion
+          make with_llvm=no && make with_llvm=no install
+          cd / && rm -rf /tmp/libversion /tmp/postgresql-libversion
+
+      - uses: https://code.forgejo.org/actions/checkout@v4
+
+      - name: Generate maps from Repology dump
+        env:
+          PGDATA: /tmp/pgdata
+        run: |
+          python3 scripts/generate-package-maps.py
+
+      - name: Push to GitHub RepoSources
+        env:
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+        run: |
+          git clone --depth=1 https://x-access-token:${GH_TOKEN}@github.com/ZachHandley/RepoSources.git /tmp/repo
+          mkdir -p /tmp/repo/public/maps
+          cp -f public/maps/*.json /tmp/repo/public/maps/
+          cd /tmp/repo
+          git config user.name "ZLayer Bot"
+          git config user.email "bot@blackleafdigital.com"
+          git add -A
+          git diff --cached --quiet && echo "No changes" || {
+            git commit -m "Update package maps $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            git push origin main
+          }
+
+      - name: Trigger GitHub Pages deploy
+        env:
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/ZachHandley/RepoSources/actions/workflows/pages.yml/dispatches \
+            -d '{"ref":"main"}'
