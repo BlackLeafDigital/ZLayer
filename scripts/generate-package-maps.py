@@ -3,12 +3,9 @@
 Generate package name mapping files from the Repology database dump.
 
 Downloads the Repology PostgreSQL dump, loads it, queries for
-Linux distro → Homebrew formula mappings, and outputs JSON files.
+ALL distro → Homebrew formula mappings, and outputs one JSON file per distro.
 
 Requires: PostgreSQL, zstd, psql in PATH.
-
-Usage:
-    python3 scripts/generate-package-maps.py
 """
 
 import json
@@ -22,163 +19,180 @@ sys.stdout.reconfigure(line_buffering=True)
 sys.stderr.reconfigure(line_buffering=True)
 
 DUMP_URL = "https://dumps.repology.org/repology-database-dump-latest.sql.zst"
+HOMEBREW_REPO = "homebrew"
 
 OUTPUT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "docs", "maps"
 )
 
-DISTRO_REPOS = {
-    "debian": "debian_12",
-    "ubuntu": "ubuntu_24_04",
-    "alpine": "alpine_3_20",
-}
-
-HOMEBREW_REPO = "homebrew"
-
-# SQL query to extract mappings for a given distro repo
-MAPPING_QUERY = """
-COPY (
-    SELECT DISTINCT
-        dp.name AS linux_name,
-        hp.name AS brew_formula
-    FROM packages dp
-    JOIN packages hp ON dp.effname = hp.effname
-    WHERE hp.repo = '{homebrew_repo}'
-    AND dp.repo = '{distro_repo}'
-    AND dp.name IS NOT NULL
-    AND hp.name IS NOT NULL
-    ORDER BY dp.name
-) TO STDOUT WITH (FORMAT csv, HEADER false);
-"""
-
 
 def run(cmd, **kwargs):
-    """Run a command, printing it first."""
     print(f"  $ {cmd if isinstance(cmd, str) else ' '.join(cmd)}")
     return subprocess.run(cmd, shell=isinstance(cmd, str), check=True, **kwargs)
 
 
-def run_as_postgres(cmd, **kwargs):
-    """Run a command as the postgres user (initdb/pg_ctl refuse to run as root)."""
+def pg_cmd(tmpdir, port, cmd):
+    """Build a psql/createuser/etc command with su-exec if root."""
     if os.getuid() == 0:
-        wrapped = f"su-exec postgres {cmd}" if isinstance(cmd, str) else ["su-exec", "postgres"] + cmd
-    else:
-        wrapped = cmd
-    return run(wrapped, **kwargs)
+        return f"su-exec postgres {cmd}"
+    return cmd
+
+
+def psql(tmpdir, port, sql, db="repology", user="repology", capture=True):
+    """Run a SQL query via psql, return stdout."""
+    cmd = pg_cmd(tmpdir, port,
+                 f"psql -h {tmpdir} -p {port} -U {user} -d {db} -t -A -c \"{sql}\"")
+    result = subprocess.run(cmd, shell=True, capture_output=capture, text=True)
+    return result.stdout.strip() if capture else ""
+
+
+def psql_query(tmpdir, port, sql, db="repology", user="repology"):
+    """Run a SQL query via psql with stdin, return stdout."""
+    base = f"psql -h {tmpdir} -p {port} -U {user} -d {db} -t -A"
+    cmd = pg_cmd(tmpdir, port, base)
+    result = subprocess.run(cmd, shell=True, input=sql, capture_output=True, text=True)
+    return result.stdout.strip()
 
 
 def setup_postgres(tmpdir):
-    """Initialize a temporary PostgreSQL instance."""
     pgdata = os.path.join(tmpdir, "pgdata")
     print("Setting up temporary PostgreSQL...")
 
-    # Ensure postgres user owns the tmpdir
     if os.getuid() == 0:
         run(f"chown -R postgres:postgres {tmpdir}", capture_output=True)
 
-    run_as_postgres(f"initdb -D {pgdata} --auth=trust --no-locale -E UTF8",
-                    capture_output=True)
+    run(pg_cmd(tmpdir, 0, f"initdb -D {pgdata} --auth=trust --no-locale -E UTF8"),
+        capture_output=True)
 
-    # Start PostgreSQL on a random port
     port = 15432
     logfile = os.path.join(tmpdir, "pg.log")
-    run_as_postgres(
-        f"pg_ctl -D {pgdata} -l {logfile} -o '-p {port} -k {tmpdir}' start",
-        capture_output=True,
-    )
+    run(pg_cmd(tmpdir, port,
+               f"pg_ctl -D {pgdata} -l {logfile} -o '-p {port} -k {tmpdir}' start"),
+        capture_output=True)
 
-    # Create repology user and database
-    run_as_postgres(f"createuser -h {tmpdir} -p {port} repology",
-                    capture_output=True)
-    run_as_postgres(f"createdb -h {tmpdir} -p {port} -O repology repology",
-                    capture_output=True)
+    run(pg_cmd(tmpdir, port, f"createuser -h {tmpdir} -p {port} repology"),
+        capture_output=True)
+    run(pg_cmd(tmpdir, port, f"createdb -h {tmpdir} -p {port} -O repology repology"),
+        capture_output=True)
 
-    # Create required extensions (must run as superuser = postgres)
-    run_as_postgres(
-        f'psql -h {tmpdir} -p {port} -d repology -c "CREATE EXTENSION IF NOT EXISTS pg_trgm;"',
-        capture_output=True,
-    )
+    # Extensions (run as postgres superuser)
+    psql(tmpdir, port, "CREATE EXTENSION IF NOT EXISTS pg_trgm;",
+         user="postgres", capture=False)
 
-    # Create libversion extension (required for Repology dump)
     try:
-        run_as_postgres(
-            f'psql -h {tmpdir} -p {port} -d repology -c "CREATE EXTENSION IF NOT EXISTS libversion;"',
-            capture_output=True,
-        )
+        run(pg_cmd(tmpdir, port,
+                   f'psql -h {tmpdir} -p {port} -U postgres -d repology -c "CREATE EXTENSION IF NOT EXISTS libversion;"'),
+            capture_output=True)
         print("  libversion extension loaded")
     except subprocess.CalledProcessError:
         print("  ERROR: libversion extension not available!")
-        print("  The Repology dump requires libversion. Install it first:")
-        print("    git clone https://github.com/repology/libversion && cd libversion && cmake . && make && make install")
-        print("    git clone https://github.com/repology/postgresql-libversion && cd postgresql-libversion && make && make install")
         sys.exit(1)
 
     return tmpdir, port
 
 
-def stop_postgres(tmpdir, pgdata=None):
-    """Stop the temporary PostgreSQL instance."""
-    if pgdata is None:
-        pgdata = os.path.join(tmpdir, "pgdata")
+def stop_postgres(tmpdir):
+    pgdata = os.path.join(tmpdir, "pgdata")
     try:
-        run_as_postgres(f"pg_ctl -D {pgdata} stop -m fast", capture_output=True)
+        run(pg_cmd(tmpdir, 0, f"pg_ctl -D {pgdata} stop -m fast"), capture_output=True)
     except subprocess.CalledProcessError:
         pass
 
 
 def load_dump(tmpdir, port):
-    """Download and load the Repology database dump."""
-    print(f"Downloading Repology dump from {DUMP_URL}...")
-    print("  (This may take a few minutes...)")
+    print(f"Downloading and loading Repology dump...")
+    print("  (This may take several minutes...)")
 
-    # Stream: curl → zstd -d → psql (psql runs as repology user)
-    if os.getuid() == 0:
-        psql_cmd = f"su-exec postgres psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=0"
-    else:
-        psql_cmd = f"psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=0"
-
+    psql_cmd = pg_cmd(tmpdir, port,
+                      f"psql -h {tmpdir} -p {port} -U repology -d repology -v ON_ERROR_STOP=0")
     cmd = f"curl -sL {DUMP_URL} | zstd -d | {psql_cmd} 2>&1 | tail -5"
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    print(f"  Load output: {result.stdout.strip()}")
-    if result.stderr:
-        print(f"  Stderr: {result.stderr.strip()[:200]}")
+    print(f"  Last lines: {result.stdout.strip()}")
     print("  Dump loaded.")
 
 
-def extract_mappings(tmpdir, port, distro_repo):
-    """Extract Linux→Homebrew mappings for a distro from the database."""
-    query = MAPPING_QUERY.format(
-        homebrew_repo=HOMEBREW_REPO,
-        distro_repo=distro_repo,
-    )
+def diagnose(tmpdir, port):
+    """Print diagnostic info about the loaded database."""
+    print("\nDiagnostics:")
 
-    if os.getuid() == 0:
-        psql_cmd = f"su-exec postgres psql -h {tmpdir} -p {port} -U repology -d repology -t -A"
+    # List tables
+    tables = psql(tmpdir, port,
+                  "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename;",
+                  user="postgres")
+    print(f"  Tables: {tables.replace(chr(10), ', ')}")
+
+    # Check packages table
+    if "packages" in tables:
+        count = psql(tmpdir, port, "SELECT count(*) FROM packages;", user="postgres")
+        print(f"  packages row count: {count}")
+
+        cols = psql(tmpdir, port,
+                    "SELECT column_name FROM information_schema.columns WHERE table_name='packages' ORDER BY ordinal_position;",
+                    user="postgres")
+        print(f"  packages columns: {cols.replace(chr(10), ', ')}")
+
+        # Sample repos
+        repos = psql(tmpdir, port,
+                     "SELECT DISTINCT repo FROM packages WHERE repo LIKE 'homebrew%' OR repo LIKE 'debian%' OR repo LIKE 'ubuntu%' OR repo LIKE 'alpine%' LIMIT 20;",
+                     user="postgres")
+        print(f"  Sample repos: {repos.replace(chr(10), ', ')}")
+
+        # Sample homebrew entries
+        sample = psql(tmpdir, port,
+                      "SELECT effname, repo, visiblename FROM packages WHERE repo='homebrew' LIMIT 5;",
+                      user="postgres")
+        print(f"  Sample homebrew: {sample}")
     else:
-        psql_cmd = f"psql -h {tmpdir} -p {port} -U repology -d repology -t -A"
+        print("  WARNING: packages table not found!")
+        # Check if there's a different table
+        all_tables = psql(tmpdir, port,
+                          "SELECT tablename FROM pg_tables WHERE schemaname='public';",
+                          user="postgres")
+        print(f"  Available tables: {all_tables}")
 
-    result = subprocess.run(
-        psql_cmd,
-        shell=True,
-        input=query,
-        capture_output=True,
-        text=True,
-    )
+
+def get_all_distro_repos(tmpdir, port):
+    """Get all non-homebrew repos that have packages also in homebrew."""
+    result = psql(tmpdir, port, """
+        SELECT DISTINCT d.repo
+        FROM packages d
+        JOIN packages h ON d.effname = h.effname
+        WHERE h.repo = 'homebrew'
+        AND d.repo != 'homebrew'
+        ORDER BY d.repo;
+    """, user="postgres")
+
+    if not result:
+        return []
+    return [r.strip() for r in result.split("\n") if r.strip()]
+
+
+def extract_mappings(tmpdir, port, distro_repo):
+    """Extract distro→homebrew mappings for a single repo."""
+    result = psql_query(tmpdir, port, f"""
+        SELECT DISTINCT d.visiblename, h.visiblename
+        FROM packages d
+        JOIN packages h ON d.effname = h.effname
+        WHERE h.repo = 'homebrew'
+        AND d.repo = '{distro_repo}'
+        AND d.visiblename IS NOT NULL
+        AND h.visiblename IS NOT NULL
+        ORDER BY d.visiblename;
+    """)
 
     mappings = {}
-    for line in result.stdout.strip().split("\n"):
-        if "," in line:
-            parts = line.split(",", 1)
-            if len(parts) == 2 and parts[0] and parts[1]:
-                linux_name, brew_formula = parts
+    for line in result.split("\n"):
+        if "|" in line:
+            parts = line.split("|", 1)
+            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                linux_name = parts[0].strip()
+                brew_name = parts[1].strip()
                 if linux_name not in mappings:
-                    mappings[linux_name] = brew_formula
-
+                    mappings[linux_name] = brew_name
     return mappings
 
 
 def write_map_file(filepath, distro_repo, mappings):
-    """Write a single mapping JSON file."""
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     doc = {
         "metadata": {
@@ -193,35 +207,7 @@ def write_map_file(filepath, distro_repo, mappings):
     with open(filepath, "w") as f:
         json.dump(doc, f, indent=2)
     size_kb = os.path.getsize(filepath) / 1024
-    print(f"  Wrote {filepath} ({size_kb:.1f} KB, {len(mappings)} mappings)")
-
-
-def write_all_file(filepath, distro_maps):
-    """Write the combined all.json file."""
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    combined = {}
-    for distro_key, mappings in distro_maps.items():
-        combined[distro_key] = {
-            "distro": DISTRO_REPOS[distro_key],
-            "mappings": dict(sorted(mappings.items())),
-            "total_mappings": len(mappings),
-        }
-
-    total = sum(len(m) for m in distro_maps.values())
-    doc = {
-        "metadata": {
-            "generated_at": now,
-            "source": "repology-dump",
-            "distros": list(DISTRO_REPOS.values()),
-            "total_mappings": total,
-        },
-        "distros": combined,
-    }
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "w") as f:
-        json.dump(doc, f, indent=2)
-    size_kb = os.path.getsize(filepath) / 1024
-    print(f"  Wrote {filepath} ({size_kb:.1f} KB, {total} total mappings)")
+    print(f"  {distro_repo}: {len(mappings)} mappings ({size_kb:.1f} KB)")
 
 
 def main():
@@ -231,31 +217,35 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="repology-") as tmpdir:
         try:
-            # Set up PostgreSQL
             sock_dir, port = setup_postgres(tmpdir)
             print(f"PostgreSQL running on port {port}")
 
-            # Load the dump
             load_dump(sock_dir, port)
+            diagnose(sock_dir, port)
 
-            # Extract per-distro mappings
-            distro_maps = {}
-            for distro_key, distro_repo in DISTRO_REPOS.items():
-                print(f"\nExtracting mappings for {distro_key} ({distro_repo})...")
-                mappings = extract_mappings(sock_dir, port, distro_repo)
-                distro_maps[distro_key] = mappings
-                print(f"  {len(mappings)} mappings found")
+            # Get ALL distro repos that have homebrew equivalents
+            print("\nFinding all distro repos with Homebrew mappings...")
+            repos = get_all_distro_repos(sock_dir, port)
+            print(f"  Found {len(repos)} repos")
 
-            # Write output files
-            print("\nWriting output files...")
-            for distro_key, mappings in distro_maps.items():
-                filepath = os.path.join(OUTPUT_DIR, f"{distro_key}.json")
-                write_map_file(filepath, DISTRO_REPOS[distro_key], mappings)
+            if not repos:
+                print("ERROR: No repos found. Check diagnostics above.")
+                sys.exit(1)
 
-            all_filepath = os.path.join(OUTPUT_DIR, "all.json")
-            write_all_file(all_filepath, distro_maps)
+            # Extract and write per-repo mapping files
+            print(f"\nExtracting mappings for {len(repos)} repos...")
+            os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-            print("\nDone!")
+            total = 0
+            for repo in repos:
+                mappings = extract_mappings(sock_dir, port, repo)
+                if mappings:
+                    filepath = os.path.join(OUTPUT_DIR, f"{repo}.json")
+                    write_map_file(filepath, repo, mappings)
+                    total += len(mappings)
+
+            print(f"\nTotal: {total} mappings across {len(repos)} repos")
+            print("Done!")
 
         finally:
             print("\nCleaning up PostgreSQL...")
