@@ -268,9 +268,14 @@ impl SandboxImageBuilder {
         let rootfs_dir = image_dir.join("rootfs");
         let tmp_dir = image_dir.join("tmp");
 
-        // Clean up any previous build. Use `rm -rf` because Go's module cache
-        // sets files read-only, which prevents tokio::fs::remove_dir_all.
+        // Clean up any previous build. chmod first because Go's module cache
+        // sets files read-only, which prevents both rm and remove_dir_all.
         if image_dir.exists() {
+            let _ = tokio::process::Command::new("chmod")
+                .args(["-R", "u+w"])
+                .arg(&image_dir)
+                .status()
+                .await;
             let status = tokio::process::Command::new("rm")
                 .args(["-rf"])
                 .arg(&image_dir)
