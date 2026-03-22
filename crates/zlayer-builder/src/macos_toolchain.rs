@@ -378,6 +378,7 @@ async fn resolve_download_url(spec: &ToolchainSpec, arch: &str) -> Result<(Strin
 /// 2. Derives the toolchain root (the `usr/` parent of the `bin/` directory)
 /// 3. Copies the toolchain into the cache keyed by the detected version
 /// 4. Symlinks the cached toolchain into the rootfs at `/usr/local/swift`
+#[allow(clippy::too_many_lines)]
 async fn provision_swift_from_host(
     spec: &ToolchainSpec,
     rootfs_dir: &Path,
@@ -478,7 +479,16 @@ async fn provision_swift_from_host(
 
         if !cp_output.status.success() {
             let stderr = String::from_utf8_lossy(&cp_output.stderr);
-            let _ = tokio::fs::remove_dir_all(&cached_toolchain).await;
+            let _ = tokio::process::Command::new("chmod")
+                .args(["-R", "u+w"])
+                .arg(&cached_toolchain)
+                .status()
+                .await;
+            let _ = tokio::process::Command::new("rm")
+                .args(["-rf"])
+                .arg(&cached_toolchain)
+                .status()
+                .await;
             return Err(BuildError::RegistryError {
                 message: format!("Failed to copy Swift toolchain: {stderr}"),
             });
@@ -1613,7 +1623,16 @@ async fn extract_toolchain(language: &str, archive: &Path, target_dir: &Path) ->
 
             if !tar_out.status.success() {
                 let stderr = String::from_utf8_lossy(&tar_out.stderr);
-                let _ = tokio::fs::remove_dir_all(&extract_tmp).await;
+                let _ = tokio::process::Command::new("chmod")
+                    .args(["-R", "u+w"])
+                    .arg(&extract_tmp)
+                    .status()
+                    .await;
+                let _ = tokio::process::Command::new("rm")
+                    .args(["-rf"])
+                    .arg(&extract_tmp)
+                    .status()
+                    .await;
                 return Err(BuildError::RegistryError {
                     message: format!("Failed to extract Rust tarball: {stderr}"),
                 });
@@ -1629,7 +1648,16 @@ async fn extract_toolchain(language: &str, archive: &Path, target_dir: &Path) ->
                 .await?;
 
             // Clean up the temporary extraction directory regardless of outcome
-            let _ = tokio::fs::remove_dir_all(&extract_tmp).await;
+            let _ = tokio::process::Command::new("chmod")
+                .args(["-R", "u+w"])
+                .arg(&extract_tmp)
+                .status()
+                .await;
+            let _ = tokio::process::Command::new("rm")
+                .args(["-rf"])
+                .arg(&extract_tmp)
+                .status()
+                .await;
 
             if !install_out.status.success() {
                 let stderr = String::from_utf8_lossy(&install_out.stderr);
@@ -1716,7 +1744,16 @@ async fn extract_toolchain(language: &str, archive: &Path, target_dir: &Path) ->
                             let bun_binary = entry.path().join("bun");
                             if bun_binary.exists() {
                                 tokio::fs::rename(&bun_binary, bin_dir.join("bun")).await?;
-                                let _ = tokio::fs::remove_dir_all(entry.path()).await;
+                                let _ = tokio::process::Command::new("chmod")
+                                    .args(["-R", "u+w"])
+                                    .arg(entry.path())
+                                    .status()
+                                    .await;
+                                let _ = tokio::process::Command::new("rm")
+                                    .args(["-rf"])
+                                    .arg(entry.path())
+                                    .status()
+                                    .await;
                             }
                         }
                     }
@@ -1772,8 +1809,16 @@ async fn copy_toolchain_to_rootfs(
 
     // Remove existing target if present — symlink creation fails otherwise
     if install_target.exists() || install_target.symlink_metadata().is_ok() {
-        let _ = tokio::fs::remove_dir_all(&install_target).await;
-        let _ = tokio::fs::remove_file(&install_target).await;
+        let _ = tokio::process::Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&install_target)
+            .status()
+            .await;
+        let _ = tokio::process::Command::new("rm")
+            .args(["-rf"])
+            .arg(&install_target)
+            .status()
+            .await;
     }
 
     // Symlink the toolchain from cache — read-only, shared across builds
