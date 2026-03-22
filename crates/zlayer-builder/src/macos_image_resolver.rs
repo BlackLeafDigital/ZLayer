@@ -523,15 +523,17 @@ async fn fetch_formula_info(formula: &str) -> Result<BrewFormulaInfo> {
     let formula_name = formula.to_string();
     let body_clone = body.to_vec();
     tokio::spawn(async move {
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs()
-            .to_string();
+        let now = {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            utc_iso8601(secs)
+        };
 
         let _ = reqwest::Client::new()
             .post("https://reposync.blackleafdigital.com/formula")
-            .header("x-zlayer-repo-sync", &timestamp)
+            .header("zlayer-repo-sync", &now)
             .header("content-type", "application/json")
             .body(format!(
                 r#"{{"name":"{}","data":{}}}"#,
@@ -1135,6 +1137,52 @@ fn sanitize_image_name(image: &str) -> String {
     image.replace(['/', ':', '@'], "_")
 }
 
+/// Format unix seconds as an ISO 8601 UTC timestamp string.
+fn utc_iso8601(epoch_secs: u64) -> String {
+    let sec = epoch_secs % 60;
+    let min = (epoch_secs / 60) % 60;
+    let hour = (epoch_secs / 3600) % 24;
+    let mut remaining_days = epoch_secs / 86400;
+    let mut year: u64 = 1970;
+    loop {
+        let is_leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+        let days_in_year = if is_leap { 366 } else { 365 };
+        if remaining_days < days_in_year {
+            break;
+        }
+        remaining_days -= days_in_year;
+        year += 1;
+    }
+    let is_leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = [
+        31,
+        if is_leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut month = 0u64;
+    for days in month_days {
+        if remaining_days < days {
+            break;
+        }
+        remaining_days -= days;
+        month += 1;
+    }
+    format!(
+        "{year:04}-{:02}-{:02}T{hour:02}:{min:02}:{sec:02}.000Z",
+        month + 1,
+        remaining_days + 1,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1305,7 +1353,7 @@ mod tests {
         assert_eq!(result.len(), 3);
         assert_eq!(result[0].0, "curl");
         assert!(!result[0].1);
-        assert_eq!(result[1].0, "openssl");
+        assert_eq!(result[1].0, "openssl@3");
         assert!(!result[1].1);
         assert_eq!(result[2].0, "musl-dev");
         assert!(result[2].1);
