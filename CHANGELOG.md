@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Register container lifecycle routes (`/api/v1/containers`) in the daemon API
+  server, enabling direct container creation, inspection, logs, exec, and stats
+  endpoints independent of the deployment/service abstraction.
+
+### Fixed
+- macOS sandbox runtime default data directory changed from `~/.local/share/zlayer`
+  to `~/.zlayer` to match the builder and other components.
+
 ### Changed
 - Sandbox builder: macOS toolchain provisioning now symlinks cached toolchains into the
   build rootfs instead of copying. The cache at `~/.zlayer/toolchains/{lang}-{version}-{arch}/`

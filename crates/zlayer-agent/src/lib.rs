@@ -96,7 +96,7 @@ impl Default for MacSandboxConfig {
     fn default() -> Self {
         let base = std::env::var("HOME").map_or_else(
             |_| PathBuf::from("/var/lib/zlayer"),
-            |h| PathBuf::from(h).join(".local/share/zlayer"),
+            |h| PathBuf::from(h).join(".zlayer"),
         );
         let log_dir = base.join("logs");
         Self {

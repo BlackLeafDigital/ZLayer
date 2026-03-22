@@ -12,9 +12,12 @@ use zlayer_api::handlers::cluster::ClusterApiState;
 use zlayer_api::handlers::nodes::NodeApiState;
 use zlayer_api::handlers::overlay::OverlayApiState;
 use zlayer_api::router::{
-    build_cluster_routes, build_node_routes, build_overlay_routes, build_tunnel_routes,
+    build_cluster_routes, build_container_routes, build_cron_routes, build_job_routes,
+    build_node_routes, build_overlay_routes, build_tunnel_routes,
 };
-use zlayer_api::{ApiConfig, ApiServer, BuildState, TunnelApiState};
+use zlayer_api::{
+    ApiConfig, ApiServer, BuildState, ContainerApiState, CronState, JobState, TunnelApiState,
+};
 use zlayer_overlay::IpAllocator;
 
 /// Daemon metadata written to `{data_dir}/daemon.json`.
@@ -416,7 +419,7 @@ pub(crate) async fn serve(
     // Destructure the state so we can rewrap the ServiceManager for the router
     // while keeping shutdown-relevant handles separate.
     let crate::daemon::DaemonState {
-        runtime: _runtime,
+        runtime,
         overlay,
         dns,
         dns_handle,
@@ -439,6 +442,8 @@ pub(crate) async fn serve(
         scheduler: _scheduler,
         internal_token: daemon_internal_token,
         replicator,
+        job_executor,
+        cron_scheduler,
     } = state;
 
     // -----------------------------------------------------------------------
@@ -672,6 +677,23 @@ pub(crate) async fn serve(
     let build_state = BuildState::new(build_dir);
     let build_api_routes = build_routes().with_state(build_state);
     router = router.nest("/api/v1", build_api_routes);
+
+    // Merge container lifecycle routes
+    let container_state = ContainerApiState::new(runtime);
+    let container_routes = build_container_routes(container_state);
+    router = router.nest("/api/v1/containers", container_routes);
+
+    // Merge job routes
+    let job_state = JobState {
+        executor: job_executor,
+    };
+    router = router.nest("/api/v1/jobs", build_job_routes(job_state));
+
+    // Merge cron routes
+    let cron_state = CronState {
+        scheduler: cron_scheduler,
+    };
+    router = router.nest("/api/v1/cron", build_cron_routes(cron_state));
 
     info!(
         bind = %bind_addr,

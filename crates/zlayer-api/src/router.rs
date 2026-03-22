@@ -893,6 +893,54 @@ pub fn build_router_with_containers(
     base_router.nest("/api/v1/containers", container_routes)
 }
 
+/// Build standalone routes for job execution
+///
+/// Creates the routes for triggering jobs and querying execution status.
+/// These routes can be nested under `/api/v1/jobs`.
+///
+/// # Arguments
+/// * `job_state` - State containing the job executor
+///
+/// # Returns
+/// A Router with the job endpoints
+pub fn build_job_routes(job_state: JobState) -> Router<()> {
+    Router::new()
+        .route("/{name}/trigger", post(handlers::jobs::trigger_job))
+        .route(
+            "/{execution_id}/status",
+            get(handlers::jobs::get_execution_status),
+        )
+        .route(
+            "/{name}/executions",
+            get(handlers::jobs::list_job_executions),
+        )
+        .route(
+            "/{execution_id}/cancel",
+            post(handlers::jobs::cancel_execution),
+        )
+        .with_state(job_state)
+}
+
+/// Build standalone routes for cron job management
+///
+/// Creates the routes for listing, querying, triggering, enabling, and disabling
+/// cron jobs. These routes can be nested under `/api/v1/cron`.
+///
+/// # Arguments
+/// * `cron_state` - State containing the cron scheduler
+///
+/// # Returns
+/// A Router with the cron endpoints
+pub fn build_cron_routes(cron_state: CronState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::cron::list_cron_jobs))
+        .route("/{name}", get(handlers::cron::get_cron_job))
+        .route("/{name}/trigger", post(handlers::cron::trigger_cron_job))
+        .route("/{name}/enable", put(handlers::cron::enable_cron_job))
+        .route("/{name}/disable", put(handlers::cron::disable_cron_job))
+        .with_state(cron_state)
+}
+
 fn build_cors_layer(config: &ApiConfig) -> CorsLayer {
     let cors = CorsLayer::new().max_age(std::time::Duration::from_secs(config.cors.max_age));
 
