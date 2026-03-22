@@ -16,8 +16,8 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use zlayer_agent::{
-    ContainerSupervisor, OverlayManager, ProxyManager, ProxyManagerConfig, Runtime, RuntimeConfig,
-    ServiceManager,
+    ContainerSupervisor, CronScheduler, JobExecutor, OverlayManager, ProxyManager,
+    ProxyManagerConfig, Runtime, RuntimeConfig, ServiceManager,
 };
 use zlayer_api::{DeploymentStatus, DeploymentStorage, SqlxStorage, StoredDeployment};
 use zlayer_overlay::{DnsHandle, DnsServer, OverlayTransport};
@@ -168,6 +168,12 @@ pub struct DaemonState {
     /// `SQLite` replicator for deployment DB backup to S3.
     /// `None` when S3 storage is not configured.
     pub replicator: Option<Arc<zlayer_storage::SqliteReplicator>>,
+
+    /// Job executor for running one-off and triggered jobs.
+    pub job_executor: Arc<JobExecutor>,
+
+    /// Cron scheduler for managing scheduled/recurring jobs.
+    pub cron_scheduler: Arc<CronScheduler>,
 }
 
 // ---------------------------------------------------------------------------
@@ -802,6 +808,9 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
     // -----------------------------------------------------------------------
     info!("Daemon infrastructure initialisation complete");
 
+    let job_executor = Arc::new(JobExecutor::new(Arc::clone(&runtime)));
+    let cron_scheduler = Arc::new(CronScheduler::new(Arc::clone(&job_executor)));
+
     Ok(DaemonState {
         runtime,
         overlay,
@@ -826,6 +835,8 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         scheduler,
         internal_token,
         replicator,
+        job_executor,
+        cron_scheduler,
     })
 }
 
