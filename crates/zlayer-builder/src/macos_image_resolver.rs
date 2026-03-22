@@ -708,7 +708,16 @@ async fn install_single_bottle(
     }
 
     // Cleanup temp files
-    let _ = tokio::fs::remove_dir_all(&extract_tmp).await;
+    let _ = tokio::process::Command::new("chmod")
+        .args(["-R", "u+w"])
+        .arg(&extract_tmp)
+        .status()
+        .await;
+    let _ = tokio::process::Command::new("rm")
+        .args(["-rf"])
+        .arg(&extract_tmp)
+        .status()
+        .await;
     let _ = tokio::fs::remove_file(&tarball_path).await;
 
     Ok(())
@@ -1346,7 +1355,16 @@ mod tests {
     #[tokio::test]
     async fn test_map_linux_packages_with_empty_cache() {
         let tmp = std::env::temp_dir().join("zlayer-test-pkg-map");
-        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        let _ = tokio::process::Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&tmp)
+            .status()
+            .await;
+        let _ = tokio::process::Command::new("rm")
+            .args(["-rf"])
+            .arg(&tmp)
+            .status()
+            .await;
 
         let result =
             map_linux_packages(&["curl", "libssl-dev", "musl-dev"], "debian_12", &tmp).await;
@@ -1358,7 +1376,16 @@ mod tests {
         assert_eq!(result[2].0, "musl-dev");
         assert!(result[2].1);
 
-        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        let _ = tokio::process::Command::new("chmod")
+            .args(["-R", "u+w"])
+            .arg(&tmp)
+            .status()
+            .await;
+        let _ = tokio::process::Command::new("rm")
+            .args(["-rf"])
+            .arg(&tmp)
+            .status()
+            .await;
     }
 
     // -- bottle_platform_tag test --
