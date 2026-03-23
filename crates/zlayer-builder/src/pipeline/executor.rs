@@ -591,11 +591,9 @@ async fn build_single_image(
     let context = base_dir.join(&image_config.context);
     let file_path = base_dir.join(&image_config.file);
 
-    let mut builder = if let Some(backend) = backend {
-        ImageBuilder::with_backend(&context, backend)?
-    } else {
-        ImageBuilder::with_executor(&context, executor)?
-    };
+    let effective_backend: Arc<dyn BuildBackend> = backend
+        .unwrap_or_else(|| Arc::new(crate::backend::BuildahBackend::with_executor(executor)));
+    let mut builder = ImageBuilder::with_backend(&context, effective_backend)?;
 
     // Determine if this is a ZImagefile or Dockerfile based on extension/name
     builder = apply_build_file(builder, &file_path);
@@ -676,11 +674,13 @@ async fn build_multiplatform_image(
         let context = base_dir.join(&image_config.context);
         let file_path = base_dir.join(&image_config.file);
 
-        let mut builder = if let Some(ref backend) = backend {
-            ImageBuilder::with_backend(&context, Arc::clone(backend))?
-        } else {
-            ImageBuilder::with_executor(&context, executor.clone())?
+        let effective_backend: Arc<dyn BuildBackend> = match backend {
+            Some(ref b) => Arc::clone(b),
+            None => Arc::new(crate::backend::BuildahBackend::with_executor(
+                executor.clone(),
+            )),
         };
+        let mut builder = ImageBuilder::with_backend(&context, effective_backend)?;
 
         // Determine file type (same detection as build_single_image)
         builder = apply_build_file(builder, &file_path);
