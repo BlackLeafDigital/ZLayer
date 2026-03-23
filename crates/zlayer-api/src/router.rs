@@ -864,6 +864,34 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
         .with_state(container_state)
 }
 
+pub fn build_job_routes(job_state: JobState) -> Router<()> {
+    Router::new()
+        .route("/{name}/trigger", post(handlers::jobs::trigger_job))
+        .route(
+            "/{execution_id}/status",
+            get(handlers::jobs::get_execution_status),
+        )
+        .route(
+            "/{name}/executions",
+            get(handlers::jobs::list_job_executions),
+        )
+        .route(
+            "/{execution_id}/cancel",
+            post(handlers::jobs::cancel_execution),
+        )
+        .with_state(job_state)
+}
+
+pub fn build_cron_routes(cron_state: CronState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::cron::list_cron_jobs))
+        .route("/{name}", get(handlers::cron::get_cron_job))
+        .route("/{name}/trigger", post(handlers::cron::trigger_cron_job))
+        .route("/{name}/enable", put(handlers::cron::enable_cron_job))
+        .route("/{name}/disable", put(handlers::cron::disable_cron_job))
+        .with_state(cron_state)
+}
+
 /// Build the API router with raw container management capabilities
 ///
 /// This extends the services router with endpoints for direct container

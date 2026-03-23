@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Register container lifecycle routes (`/api/v1/containers`) in the daemon API
+  server, enabling direct container creation, inspection, logs, exec, and stats
+  endpoints independent of the deployment/service abstraction.
+
+### Fixed
+- macOS sandbox runtime default data directory changed from `~/.local/share/zlayer`
+  to `~/.zlayer` to match the builder and other components.
+- macOS images CI workflow (`macos-images.yml`): replaced `uses: ./` action
+  reference (which tried to download from GitHub and hung) with building zlayer
+  from source and running the pipeline directly.
+
 ### Changed
 - `map_linux_packages()` in `macos_image_resolver` is now async and fetches
   package mappings from RepoSources (`zachhandley.github.io/RepoSources/maps/`)
