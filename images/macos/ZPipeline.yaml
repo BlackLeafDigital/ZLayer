@@ -5,13 +5,13 @@ vars:
 
 images:
   base:
-    file: images/macos/ZImagefile.base
+    file: ZImagefile.base
     context: .
     tags:
       - "${REGISTRY}/base:latest"
 
   golang:
-    file: images/macos/ZImagefile.golang
+    file: ZImagefile.golang
     context: .
     depends_on: [base]
     tags:
@@ -19,14 +19,14 @@ images:
       - "${REGISTRY}/golang:latest"
 
   rust:
-    file: images/macos/ZImagefile.rust
+    file: ZImagefile.rust
     context: .
     depends_on: [base]
     tags:
       - "${REGISTRY}/rust:latest"
 
   node:
-    file: images/macos/ZImagefile.node
+    file: ZImagefile.node
     context: .
     depends_on: [base]
     tags:
@@ -34,7 +34,7 @@ images:
       - "${REGISTRY}/node:latest"
 
   python:
-    file: images/macos/ZImagefile.python
+    file: ZImagefile.python
     context: .
     depends_on: [base]
     tags:
@@ -42,35 +42,35 @@ images:
       - "${REGISTRY}/python:latest"
 
   deno:
-    file: images/macos/ZImagefile.deno
+    file: ZImagefile.deno
     context: .
     depends_on: [base]
     tags:
       - "${REGISTRY}/deno:latest"
 
   bun:
-    file: images/macos/ZImagefile.bun
+    file: ZImagefile.bun
     context: .
     depends_on: [base]
     tags:
       - "${REGISTRY}/bun:latest"
 
   swift:
-    file: images/macos/ZImagefile.swift
+    file: ZImagefile.swift
     context: .
     depends_on: [base]
     tags:
       - "${REGISTRY}/swift:latest"
 
   zig:
-    file: images/macos/ZImagefile.zig
+    file: ZImagefile.zig
     context: .
     depends_on: [base]
     tags:
       - "${REGISTRY}/zig:latest"
 
   graalvm:
-    file: images/macos/ZImagefile.graalvm
+    file: ZImagefile.graalvm
     context: .
     depends_on: [base]
     tags:

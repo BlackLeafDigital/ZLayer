@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `BuildBackend` trait in `zlayer-builder::backend` providing a pluggable
+  abstraction over container build tooling. Includes `BuildahBackend` (wraps
+  buildah CLI) and `SandboxBackend` (macOS Seatbelt, cfg-gated). Added
+  `detect_backend()` for runtime auto-detection with `ZLAYER_BACKEND` env
+  override support. Added `BuildError::NotSupported` variant for unsupported
+  backend operations.
+- `ImageBuilder::with_backend()` constructor for creating a builder with an
+  explicit `BuildBackend`. `ImageBuilder::new()` now auto-detects the backend
+  via `detect_backend()`. `with_executor()` wraps the executor in a
+  `BuildahBackend` for trait-based dispatch.
+- `PipelineExecutor::with_backend()` constructor for creating a pipeline
+  executor with an explicit `BuildBackend`. Push, manifest, and per-image
+  build operations delegate to the backend when set.
+
+### Refactored
+- Extracted the buildah build orchestration loop (stage walking, container
+  creation, instruction execution, COPY --from resolution, cache tracking,
+  commit, cleanup) from `ImageBuilder::build()` into
+  `BuildahBackend::build_image()`. `ImageBuilder::build()` is now a thin
+  coordinator: parse Dockerfile/ZImagefile/template, handle WASM early return,
+  delegate to the backend. `LayerCacheTracker` moved to `backend/buildah.rs`.
+  Removed inline `build_with_sandbox()`, `resolve_stages()`,
+  `resolve_base_image()`, `create_container()`, `commit_container()`,
+  `tag_image()`, `push_image()`, and `generate_build_id()` from `builder.rs`.
+- Pipeline executor (`pipeline/executor.rs`) now always uses
+  `ImageBuilder::with_backend()` instead of falling back to
+  `ImageBuilder::with_executor()`, wrapping a bare executor in a
+  `BuildahBackend` when no explicit backend is provided.
+
+### Changed
+- CLI `pipeline` command now uses `detect_backend()` + `PipelineExecutor::with_backend()`
+  instead of directly creating a `BuildahExecutor`, enabling automatic sandbox
+  fallback on macOS.
 - Register container lifecycle routes (`/api/v1/containers`) in the daemon API
   server, enabling direct container creation, inspection, logs, exec, and stats
   endpoints independent of the deployment/service abstraction.

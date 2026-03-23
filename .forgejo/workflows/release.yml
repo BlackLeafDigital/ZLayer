@@ -242,10 +242,6 @@ jobs:
           VERSION="${{ needs.detect.outputs.version }}"
           echo "Setting all crate versions to ${VERSION}"
           sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
-          # Restore publish=false crates to 0.0.0-dev so they don't break dep resolution
-          for crate in zlayer-wsl zlayer-agent zlayer-api zlayer-proxy zlayer-web zlayer-manager zlayer-secrets zlayer-py; do
-            sed -i "s|${crate} = { version = \"${VERSION}\"|${crate} = { version = \"0.0.0-dev\"|g" Cargo.toml
-          done
       - name: Publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -284,10 +280,6 @@ jobs:
           VERSION="${{ needs.detect.outputs.version }}"
           echo "Setting all crate versions to ${VERSION}"
           sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
-          # Restore publish=false crates to 0.0.0-dev so they don't break dep resolution
-          for crate in zlayer-wsl zlayer-agent zlayer-api zlayer-proxy zlayer-web zlayer-manager zlayer-secrets zlayer-py; do
-            sed -i "s|${crate} = { version = \"${VERSION}\"|${crate} = { version = \"0.0.0-dev\"|g" Cargo.toml
-          done
       - name: Publish crates that need updating
         if: steps.check.outputs.completed != 'true'
         env:
