@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Extracted buildah build orchestration logic from `ImageBuilder::build()` into
+  `BuildahBackend::build_image()`. The `build()` method now simply parses the
+  Dockerfile/ZImagefile and delegates to the backend. This removes the inline
+  buildah loop, the macOS sandbox fallback branch, and all buildah helper methods
+  (`resolve_stages`, `resolve_base_image`, `create_container`, `commit_container`,
+  `tag_image`, `push_image`) from `builder.rs`.
+- `LayerCacheTracker` moved from `builder.rs` to `backend/buildah.rs`.
+- Pipeline executor's `build_single_image` and `build_multiplatform_image` now
+  use `effective_backend` pattern (wrapping executor in `BuildahBackend`) instead
+  of branching on `Option<Arc<dyn BuildBackend>>`.
+
 ### Added
 - Register container lifecycle routes (`/api/v1/containers`) in the daemon API
   server, enabling direct container creation, inspection, logs, exec, and stats
