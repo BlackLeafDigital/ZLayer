@@ -160,6 +160,13 @@ pub enum BuildError {
     /// WASM build failed
     #[error("WASM build error: {0}")]
     WasmBuild(#[from] crate::wasm_builder::WasmBuildError),
+
+    /// Operation not supported by this backend
+    #[error("Operation '{operation}' is not supported by this backend")]
+    NotSupported {
+        /// The operation that was attempted
+        operation: String,
+    },
 }
 
 impl BuildError {

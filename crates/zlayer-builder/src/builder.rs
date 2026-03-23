@@ -110,19 +110,17 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use tokio::fs;
 use tracing::{debug, info, instrument};
 
+use crate::backend::BuildBackend;
 use crate::buildah::{BuildahCommand, BuildahExecutor};
 use crate::dockerfile::{Dockerfile, ImageRef, Instruction, RunMount, Stage};
 use crate::error::{BuildError, Result};
 use crate::templates::{get_template, Runtime};
 use crate::tui::BuildEvent;
-
-// Cache backend integration (optional, requires `cache` feature)
-#[cfg(feature = "cache")]
-use std::sync::Arc;
 
 #[cfg(feature = "cache")]
 use zlayer_registry::cache::BlobCacheBackend;
@@ -547,6 +545,12 @@ pub struct ImageBuilder {
     executor: BuildahExecutor,
     /// Event sender for TUI updates
     event_tx: Option<mpsc::Sender<BuildEvent>>,
+    /// Pluggable build backend (buildah, sandbox, etc.).
+    ///
+    /// When set, the `build()` method delegates to this backend instead of
+    /// using the inline buildah logic. Set automatically by `new()` via
+    /// `detect_backend()`, or explicitly via `with_backend()`.
+    backend: Option<Arc<dyn BuildBackend>>,
     /// Cache backend for layer caching (requires `cache` feature).
     ///
     /// When set, the builder will attempt to retrieve cached layers before
@@ -605,14 +609,17 @@ impl ImageBuilder {
             });
         }
 
+        // Detect the best available build backend for this platform.
+        let backend = crate::backend::detect_backend().await.ok();
+
         // Initialize buildah executor.
         // On macOS, if buildah is not found we fall back to a default executor
-        // and use the native sandbox builder instead during build().
+        // (the backend will handle the actual build dispatch).
         let executor = match BuildahExecutor::new_async().await {
             Ok(exec) => exec,
             #[cfg(target_os = "macos")]
             Err(_) => {
-                info!("Buildah not found on macOS; will use native sandbox builder");
+                info!("Buildah not found on macOS; backend will handle build dispatch");
                 BuildahExecutor::default()
             }
             #[cfg(not(target_os = "macos"))]
@@ -626,6 +633,7 @@ impl ImageBuilder {
             options: BuildOptions::default(),
             executor,
             event_tx: None,
+            backend,
             #[cfg(feature = "cache")]
             cache_backend: None,
             #[cfg(feature = "local-registry")]
@@ -636,7 +644,9 @@ impl ImageBuilder {
     /// Create an `ImageBuilder` with a custom buildah executor
     ///
     /// This is useful for testing or when you need to configure
-    /// the executor with specific storage options.
+    /// the executor with specific storage options. The executor is
+    /// wrapped in a [`BuildahBackend`] so the build dispatches through
+    /// the [`BuildBackend`] trait.
     ///
     /// # Errors
     ///
@@ -654,11 +664,51 @@ impl ImageBuilder {
             });
         }
 
+        let backend: Arc<dyn BuildBackend> = Arc::new(
+            crate::backend::BuildahBackend::with_executor(executor.clone()),
+        );
+
         Ok(Self {
             context,
             options: BuildOptions::default(),
             executor,
             event_tx: None,
+            backend: Some(backend),
+            #[cfg(feature = "cache")]
+            cache_backend: None,
+            #[cfg(feature = "local-registry")]
+            local_registry: None,
+        })
+    }
+
+    /// Create an `ImageBuilder` with an explicit [`BuildBackend`].
+    ///
+    /// The backend is used for all build, push, tag, and manifest
+    /// operations. The internal `BuildahExecutor` is set to the default
+    /// (it is only used if no backend is set).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context directory does not exist.
+    pub fn with_backend(context: impl AsRef<Path>, backend: Arc<dyn BuildBackend>) -> Result<Self> {
+        let context = context.as_ref().to_path_buf();
+
+        if !context.exists() {
+            return Err(BuildError::ContextRead {
+                path: context,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "Build context directory not found",
+                ),
+            });
+        }
+
+        Ok(Self {
+            context,
+            options: BuildOptions::default(),
+            executor: BuildahExecutor::default(),
+            event_tx: None,
+            backend: Some(backend),
             #[cfg(feature = "cache")]
             cache_backend: None,
             #[cfg(feature = "local-registry")]
@@ -1372,6 +1422,20 @@ impl ImageBuilder {
             unreachable!("WasmArtifact case handled above");
         };
         debug!("Parsed Dockerfile with {} stages", dockerfile.stages.len());
+
+        // If we have a pluggable backend, delegate the entire build to it.
+        if let Some(ref backend) = self.backend {
+            info!("Delegating build to {} backend", backend.name());
+            let result = backend
+                .build_image(
+                    &self.context,
+                    &dockerfile,
+                    &self.options,
+                    self.event_tx.clone(),
+                )
+                .await?;
+            return Ok(result);
+        }
 
         // On macOS, always use the native sandbox builder. Buildah cannot perform
         // container operations on macOS without a Linux VM, even if the binary is
@@ -2494,6 +2558,7 @@ mod tests {
             options: BuildOptions::default(),
             executor: BuildahExecutor::with_path("/usr/bin/buildah"),
             event_tx: None,
+            backend: None,
             #[cfg(feature = "cache")]
             cache_backend: None,
             #[cfg(feature = "local-registry")]

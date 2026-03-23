@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `BuildBackend` trait in `zlayer-builder::backend` providing a pluggable
+  abstraction over container build tooling. Includes `BuildahBackend` (wraps
+  buildah CLI) and `SandboxBackend` (macOS Seatbelt, cfg-gated). Added
+  `detect_backend()` for runtime auto-detection with `ZLAYER_BACKEND` env
+  override support. Added `BuildError::NotSupported` variant for unsupported
+  backend operations.
+- `ImageBuilder::with_backend()` constructor for creating a builder with an
+  explicit `BuildBackend`. `ImageBuilder::new()` now auto-detects the backend
+  via `detect_backend()`. `with_executor()` wraps the executor in a
+  `BuildahBackend` for trait-based dispatch.
+- `PipelineExecutor::with_backend()` constructor for creating a pipeline
+  executor with an explicit `BuildBackend`. Push, manifest, and per-image
+  build operations delegate to the backend when set.
+
+### Changed
+- CLI `pipeline` command now uses `detect_backend()` + `PipelineExecutor::with_backend()`
+  instead of directly creating a `BuildahExecutor`, enabling automatic sandbox
+  fallback on macOS.
 - Register container lifecycle routes (`/api/v1/containers`) in the daemon API
   server, enabling direct container creation, inspection, logs, exec, and stats
   endpoints independent of the deployment/service abstraction.
