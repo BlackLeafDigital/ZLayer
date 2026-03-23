@@ -42,6 +42,7 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
+use crate::backend::BuildBackend;
 use crate::buildah::{BuildahCommand, BuildahExecutor};
 use crate::builder::{BuiltImage, ImageBuilder};
 use crate::error::{BuildError, Result};
@@ -87,6 +88,11 @@ pub struct PipelineExecutor {
     base_dir: PathBuf,
     /// Buildah executor (shared across all builds)
     executor: BuildahExecutor,
+    /// Pluggable build backend (buildah, sandbox, etc.).
+    ///
+    /// When set, builds delegate to this backend instead of using the
+    /// `executor` field directly.
+    backend: Option<Arc<dyn BuildBackend>>,
     /// Whether to abort on first failure
     fail_fast: bool,
     /// Whether to push images after building
@@ -113,6 +119,38 @@ impl PipelineExecutor {
             pipeline,
             base_dir,
             executor,
+            backend: None,
+            fail_fast: true,
+            push_enabled,
+            #[cfg(feature = "local-registry")]
+            local_registry: None,
+        }
+    }
+
+    /// Create a new pipeline executor with an explicit [`BuildBackend`].
+    ///
+    /// The backend is used for all build, push, and manifest operations.
+    /// A default `BuildahExecutor` is kept for backwards compatibility but
+    /// is not used when a backend is set.
+    ///
+    /// # Arguments
+    ///
+    /// * `pipeline` - The parsed `ZPipeline` configuration
+    /// * `base_dir` - Base directory for resolving relative paths in the pipeline
+    /// * `backend`  - The build backend to use for all operations
+    #[must_use]
+    pub fn with_backend(
+        pipeline: ZPipeline,
+        base_dir: PathBuf,
+        backend: Arc<dyn BuildBackend>,
+    ) -> Self {
+        let push_enabled = pipeline.push.after_all;
+
+        Self {
+            pipeline,
+            base_dir,
+            executor: BuildahExecutor::default(),
+            backend: Some(backend),
             fail_fast: true,
             push_enabled,
             #[cfg(feature = "local-registry")]
@@ -319,6 +357,7 @@ impl PipelineExecutor {
         let pipeline = Arc::new(self.pipeline.clone());
         let base_dir = Arc::new(self.base_dir.clone());
         let executor = self.executor.clone();
+        let backend = self.backend.clone();
 
         // Extract local registry root path (if configured) so spawned tasks
         // can create their own LocalRegistry handles pointing at the same store.
@@ -335,6 +374,7 @@ impl PipelineExecutor {
             let pipeline = Arc::clone(&pipeline);
             let base_dir = Arc::clone(&base_dir);
             let executor = executor.clone();
+            let backend = backend.clone();
             let registry_root = registry_root.clone();
 
             set.spawn(async move {
@@ -351,6 +391,7 @@ impl PipelineExecutor {
                             &pipeline,
                             &base_dir,
                             executor,
+                            backend.as_ref().map(Arc::clone),
                             None,
                             registry_root.as_deref(),
                         )
@@ -364,6 +405,7 @@ impl PipelineExecutor {
                             &pipeline,
                             &base_dir,
                             executor,
+                            backend.as_ref().map(Arc::clone),
                             Some(&platform),
                             registry_root.as_deref(),
                         )
@@ -376,6 +418,7 @@ impl PipelineExecutor {
                             &pipeline,
                             &base_dir,
                             executor,
+                            backend.as_ref().map(Arc::clone),
                             &platforms,
                             registry_root.as_deref(),
                         )
@@ -413,6 +456,9 @@ impl PipelineExecutor {
 
     /// Push a regular image to its registry
     async fn push_image(&self, tag: &str) -> Result<()> {
+        if let Some(ref backend) = self.backend {
+            return backend.push_image(tag, None).await;
+        }
         let cmd = BuildahCommand::push(tag);
         self.executor.execute_checked(&cmd).await?;
         Ok(())
@@ -420,6 +466,10 @@ impl PipelineExecutor {
 
     /// Push a manifest list (and all referenced images) to its registry
     async fn push_manifest(&self, tag: &str) -> Result<()> {
+        if let Some(ref backend) = self.backend {
+            let destination = format!("docker://{tag}");
+            return backend.manifest_push(tag, &destination).await;
+        }
         let destination = format!("docker://{tag}");
         let cmd = BuildahCommand::manifest_push(tag, &destination);
         self.executor.execute_checked(&cmd).await?;
@@ -533,6 +583,7 @@ async fn build_single_image(
     pipeline: &ZPipeline,
     base_dir: &Path,
     executor: BuildahExecutor,
+    backend: Option<Arc<dyn BuildBackend>>,
     platform: Option<&str>,
     registry_root: Option<&Path>,
 ) -> Result<BuiltImage> {
@@ -540,7 +591,11 @@ async fn build_single_image(
     let context = base_dir.join(&image_config.context);
     let file_path = base_dir.join(&image_config.file);
 
-    let mut builder = ImageBuilder::with_executor(&context, executor)?;
+    let mut builder = if let Some(backend) = backend {
+        ImageBuilder::with_backend(&context, backend)?
+    } else {
+        ImageBuilder::with_executor(&context, executor)?
+    };
 
     // Determine if this is a ZImagefile or Dockerfile based on extension/name
     builder = apply_build_file(builder, &file_path);
@@ -584,6 +639,7 @@ async fn build_multiplatform_image(
     pipeline: &ZPipeline,
     base_dir: &Path,
     executor: BuildahExecutor,
+    backend: Option<Arc<dyn BuildBackend>>,
     platforms: &[String],
     registry_root: Option<&Path>,
 ) -> Result<BuiltImage> {
@@ -620,7 +676,11 @@ async fn build_multiplatform_image(
         let context = base_dir.join(&image_config.context);
         let file_path = base_dir.join(&image_config.file);
 
-        let mut builder = ImageBuilder::with_executor(&context, executor.clone())?;
+        let mut builder = if let Some(ref backend) = backend {
+            ImageBuilder::with_backend(&context, Arc::clone(backend))?
+        } else {
+            ImageBuilder::with_executor(&context, executor.clone())?
+        };
 
         // Determine file type (same detection as build_single_image)
         builder = apply_build_file(builder, &file_path);
@@ -657,29 +717,16 @@ async fn build_multiplatform_image(
         }
     }
 
-    // Create manifest list
-    info!("[{name}] Creating manifest: {manifest_name}");
-    executor
-        .execute_checked(&BuildahCommand::manifest_create(&manifest_name))
-        .await
-        .map_err(|e| BuildError::pipeline_error(format!("manifest create failed: {e}")))?;
-
-    // Add each arch image to the manifest
-    for arch_tag in &arch_tags {
-        info!("[{name}] Adding to manifest: {arch_tag}");
-        executor
-            .execute_checked(&BuildahCommand::manifest_add(&manifest_name, arch_tag))
-            .await
-            .map_err(|e| BuildError::pipeline_error(format!("manifest add failed: {e}")))?;
-    }
-
-    // Tag the manifest with additional tags
-    for tag in expanded_tags.iter().skip(1) {
-        executor
-            .execute_checked(&BuildahCommand::tag(&manifest_name, tag))
-            .await
-            .map_err(|e| BuildError::pipeline_error(format!("manifest tag failed: {e}")))?;
-    }
+    // Assemble the manifest list from per-platform images
+    assemble_manifest(
+        name,
+        &manifest_name,
+        &arch_tags,
+        &expanded_tags,
+        backend.as_ref(),
+        &executor,
+    )
+    .await?;
 
     #[allow(clippy::cast_possible_truncation)]
     let build_time_ms = start_time.elapsed().as_millis() as u64;
@@ -692,6 +739,66 @@ async fn build_multiplatform_image(
         build_time_ms,
         is_manifest: true,
     })
+}
+
+/// Create a manifest list, add per-platform images, and apply additional tags.
+///
+/// This is a helper extracted from [`build_multiplatform_image`] to keep that
+/// function under the line-count limit.
+async fn assemble_manifest(
+    name: &str,
+    manifest_name: &str,
+    arch_tags: &[String],
+    expanded_tags: &[String],
+    backend: Option<&Arc<dyn BuildBackend>>,
+    executor: &BuildahExecutor,
+) -> Result<()> {
+    // Create manifest list -- delegate to backend if available
+    info!("[{name}] Creating manifest: {manifest_name}");
+    if let Some(backend) = backend {
+        backend
+            .manifest_create(manifest_name)
+            .await
+            .map_err(|e| BuildError::pipeline_error(format!("manifest create failed: {e}")))?;
+    } else {
+        executor
+            .execute_checked(&BuildahCommand::manifest_create(manifest_name))
+            .await
+            .map_err(|e| BuildError::pipeline_error(format!("manifest create failed: {e}")))?;
+    }
+
+    // Add each arch image to the manifest
+    for arch_tag in arch_tags {
+        info!("[{name}] Adding to manifest: {arch_tag}");
+        if let Some(backend) = backend {
+            backend
+                .manifest_add(manifest_name, arch_tag)
+                .await
+                .map_err(|e| BuildError::pipeline_error(format!("manifest add failed: {e}")))?;
+        } else {
+            executor
+                .execute_checked(&BuildahCommand::manifest_add(manifest_name, arch_tag))
+                .await
+                .map_err(|e| BuildError::pipeline_error(format!("manifest add failed: {e}")))?;
+        }
+    }
+
+    // Tag the manifest with additional tags
+    for tag in expanded_tags.iter().skip(1) {
+        if let Some(backend) = backend {
+            backend
+                .tag_image(manifest_name, tag)
+                .await
+                .map_err(|e| BuildError::pipeline_error(format!("manifest tag failed: {e}")))?;
+        } else {
+            executor
+                .execute_checked(&BuildahCommand::tag(manifest_name, tag))
+                .await
+                .map_err(|e| BuildError::pipeline_error(format!("manifest tag failed: {e}")))?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Expand variables in a tag string

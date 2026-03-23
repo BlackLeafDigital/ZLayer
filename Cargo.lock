@@ -10163,6 +10163,7 @@ name = "zlayer-builder-zql"
 version = "0.0.0-dev"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "bzip2",
  "crossterm",

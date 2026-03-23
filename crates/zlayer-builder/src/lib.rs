@@ -183,6 +183,7 @@
 //! - `${VAR-default}` - Default only if unset
 //! - `${VAR+alternate}` - Alternate if set (including empty)
 
+pub mod backend;
 pub mod buildah;
 pub mod builder;
 pub mod dockerfile;
@@ -252,6 +253,11 @@ pub use pipeline::{
     parse_pipeline, PipelineCacheConfig, PipelineDefaults, PipelineExecutor, PipelineImage,
     PipelineResult, PushConfig, ZPipeline,
 };
+
+// Backend re-exports
+#[cfg(target_os = "macos")]
+pub use backend::SandboxBackend;
+pub use backend::{detect_backend, BuildBackend, BuildahBackend};
 
 #[cfg(test)]
 mod tests {

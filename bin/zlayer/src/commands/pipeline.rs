@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use tracing::info;
 
-use zlayer_builder::{parse_pipeline, BuildahExecutor, PipelineExecutor};
+use zlayer_builder::{detect_backend, parse_pipeline, PipelineExecutor};
 
 /// Discover pipeline file from explicit path or well-known defaults.
 fn discover_pipeline_file(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -76,10 +76,10 @@ pub async fn cmd_pipeline(
         }
     }
 
-    // 4. Create executor
-    let buildah = BuildahExecutor::new_async()
+    // 4. Detect build backend
+    let backend = detect_backend()
         .await
-        .context("Failed to initialize buildah")?;
+        .context("Failed to initialize build backend")?;
 
     let base_dir = file
         .parent()
@@ -95,7 +95,7 @@ pub async fn cmd_pipeline(
         file.display()
     );
 
-    let executor = PipelineExecutor::new(pipeline, base_dir, buildah)
+    let executor = PipelineExecutor::with_backend(pipeline, base_dir, backend)
         .fail_fast(fail_fast)
         .push(push);
 

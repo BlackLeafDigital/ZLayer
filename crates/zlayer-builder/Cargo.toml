@@ -16,6 +16,7 @@ dockerfile-parser = "0.9"
 
 # Core
 anyhow.workspace = true
+async-trait.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["full", "process"] }
 tracing.workspace = true
