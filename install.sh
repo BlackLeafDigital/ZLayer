@@ -125,20 +125,13 @@ esac
 SKIP_SERVICE="${ZLAYER_NO_SERVICE:-}"
 if [ -z "$SKIP_SERVICE" ]; then
     echo ""
-    echo "Starting zlayer daemon..."
-    "${INSTALL_DIR}/${BINARY}" daemon install >/dev/null 2>&1 || true
-
+    echo "Installing zlayer daemon..."
     case "$OS" in
         linux)
-            if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet zlayer 2>/dev/null; then
-                echo "zlayer service started (systemd)"
-            fi
+            sudo "${INSTALL_DIR}/${BINARY}" daemon install
             ;;
         darwin)
-            PLIST="com.zlayer.daemon"
-            if launchctl list "$PLIST" >/dev/null 2>&1; then
-                echo "zlayer service started (launchd: ${PLIST})"
-            fi
+            "${INSTALL_DIR}/${BINARY}" daemon install
             ;;
     esac
 fi

@@ -484,9 +484,26 @@ WantedBy=multi-user.target
     println!("Installed systemd unit: {}", path.display());
 
     let reload_args = systemctl_args(&["daemon-reload"]);
-    let _ = Command::new("systemctl").args(&reload_args).output().await;
+    let reload_out = Command::new("systemctl")
+        .args(&reload_args)
+        .output()
+        .await
+        .context("Failed to run systemctl daemon-reload")?;
+    if !reload_out.status.success() {
+        let stderr = String::from_utf8_lossy(&reload_out.stderr);
+        bail!("systemctl daemon-reload failed: {stderr}");
+    }
+
     let enable_args = systemctl_args(&["enable", UNIT_NAME]);
-    let _ = Command::new("systemctl").args(&enable_args).output().await;
+    let enable_out = Command::new("systemctl")
+        .args(&enable_args)
+        .output()
+        .await
+        .context("Failed to run systemctl enable")?;
+    if !enable_out.status.success() {
+        let stderr = String::from_utf8_lossy(&enable_out.stderr);
+        bail!("systemctl enable failed: {stderr}");
+    }
 
     if !no_start {
         // Write spawner PID so the new daemon's cleanup_stale_daemon() won't

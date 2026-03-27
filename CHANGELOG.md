@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- Container, job, cron, and build API routes were missing the `AuthState`
+  extension because it was applied inside `build_router_with_deployment_state()`
+  before routes were nested in `serve.rs`. The `Extension(auth_state)` layer is
+  now re-applied after all `.nest()` calls so every route receives auth context.
+- `install.sh`: daemon install output was silently discarded (`>/dev/null 2>&1`).
+  Now shows output so users can see what happened. Linux installs use `sudo`,
+  macOS installs do not. Removed redundant post-install status checks that
+  duplicated the daemon's own readiness reporting.
+- Linux `daemon install`: `systemctl daemon-reload` and `systemctl enable` exit
+  codes were silently discarded (`let _ = ...`). They now propagate errors and
+  bail with the stderr message on failure.
 - Non-deterministic sandbox builder cache hash. `compute_dockerfile_hash()` used
   `format!("{:?}", dockerfile)` which produced different hashes across runs due to
   `HashMap` randomized iteration order. Replaced with deterministic per-instruction
