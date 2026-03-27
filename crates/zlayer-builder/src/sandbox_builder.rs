@@ -76,6 +76,12 @@ pub struct SandboxImageConfig {
     pub shell: Option<Vec<String>>,
     /// Healthcheck configuration.
     pub healthcheck: Option<SandboxHealthcheck>,
+    /// SHA-256 hash of the source Dockerfile/ZImagefile used to build this image.
+    ///
+    /// When present, the sandbox builder can skip a rebuild if the cached image
+    /// was built from identical source content.
+    #[serde(default)]
+    pub source_hash: Option<String>,
 }
 
 /// Healthcheck configuration stored in the image config.
@@ -177,6 +183,11 @@ pub struct SandboxImageBuilder {
     build_args: HashMap<String, String>,
     /// Event sender for TUI progress updates.
     event_tx: Option<std::sync::mpsc::Sender<BuildEvent>>,
+    /// Pre-computed source hash for content-based cache invalidation.
+    ///
+    /// When set (e.g. by the pipeline executor), this hash is used directly
+    /// instead of computing one from the parsed Dockerfile.
+    source_hash: Option<String>,
     /// Local OCI registry for resolving pipeline-built base images.
     #[cfg(feature = "local-registry")]
     local_registry: Option<LocalRegistry>,
@@ -196,6 +207,7 @@ impl SandboxImageBuilder {
             data_dir,
             build_args: HashMap::new(),
             event_tx: None,
+            source_hash: None,
             #[cfg(feature = "local-registry")]
             local_registry: None,
         }
@@ -212,6 +224,17 @@ impl SandboxImageBuilder {
     #[must_use]
     pub fn with_events(mut self, tx: std::sync::mpsc::Sender<BuildEvent>) -> Self {
         self.event_tx = Some(tx);
+        self
+    }
+
+    /// Set a pre-computed source hash for content-based cache invalidation.
+    ///
+    /// When set, the builder uses this hash directly instead of computing one
+    /// from the parsed Dockerfile. This is used by the pipeline executor which
+    /// hashes the raw file contents for a deterministic result.
+    #[must_use]
+    pub fn with_source_hash(mut self, hash: String) -> Self {
+        self.source_hash = Some(hash);
         self
     }
 
@@ -267,6 +290,46 @@ impl SandboxImageBuilder {
         let image_dir = self.data_dir.join("images").join(&sanitized);
         let rootfs_dir = image_dir.join("rootfs");
         let tmp_dir = image_dir.join("tmp");
+
+        // Compute source hash from the Dockerfile for content-based cache invalidation.
+        // Prefer a pre-computed hash (e.g. from the pipeline executor which hashes
+        // raw file contents). Fall back to a deterministic hash built from the
+        // individual instruction cache keys — unlike `format!("{:?}", dockerfile)`,
+        // this is not affected by HashMap iteration order.
+        let source_hash = self.source_hash.clone().unwrap_or_else(|| {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            for stage in &dockerfile.stages {
+                hasher.update(format!("{:?}", stage.base_image).as_bytes());
+                for instruction in &stage.instructions {
+                    hasher.update(instruction.cache_key().as_bytes());
+                }
+            }
+            format!("{:x}", hasher.finalize())
+        });
+
+        // Check if existing cached image has a matching source hash — skip rebuild
+        // if the source content has not changed.
+        let config_path = image_dir.join("config.json");
+        if config_path.exists() {
+            if let Ok(data) = tokio::fs::read_to_string(&config_path).await {
+                if let Ok(existing_config) = serde_json::from_str::<SandboxImageConfig>(&data) {
+                    if existing_config.source_hash.as_deref() == Some(&source_hash) {
+                        info!("Image {} unchanged (hash match), using cached", sanitized);
+                        return Ok(SandboxBuildResult {
+                            image_id: sanitized,
+                            image_dir: image_dir.clone(),
+                            rootfs_dir: rootfs_dir.clone(),
+                            config_path,
+                            tags: tags.to_vec(),
+                            build_time_ms: 0,
+                        });
+                    }
+                }
+            }
+        }
+
+        // Hash differs or no cached image — proceed with rebuild.
 
         // Clean up any previous build. chmod first because Go's module cache
         // sets files read-only, which prevents both rm and remove_dir_all.
@@ -445,7 +508,8 @@ impl SandboxImageBuilder {
             }
         }
 
-        // Step 3: Write config.json
+        // Step 3: Write config.json (include source hash for cache invalidation)
+        final_config.source_hash = Some(source_hash);
         let config_path = image_dir.join("config.json");
         let config_json = serde_json::to_string_pretty(&final_config).map_err(|e| {
             BuildError::IoError(std::io::Error::other(format!(
@@ -1278,7 +1342,7 @@ impl SandboxImageBuilder {
                         continue;
                     }
                     info!("Installing {} via Homebrew bottle", formula);
-                    match crate::macos_image_resolver::fetch_and_extract_bottle(
+                    match crate::macos_image_resolver::install_with_deps(
                         formula, rootfs_dir, tmp_dir,
                     )
                     .await
@@ -1696,6 +1760,7 @@ fn image_config_to_sandbox(ic: &zlayer_registry::ImageConfig) -> SandboxImageCon
                 retries: hc.retries,
             }
         }),
+        source_hash: None,
     }
 }
 

@@ -32,9 +32,9 @@ impl SandboxBackend {
 
 impl Default for SandboxBackend {
     fn default() -> Self {
-        let data_dir = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp/zlayer"))
-            .join("zlayer");
+        let data_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".zlayer");
         Self { data_dir }
     }
 }
@@ -58,6 +58,11 @@ impl BuildBackend for SandboxBackend {
         // Attach event channel if provided
         if let Some(tx) = event_tx {
             builder = builder.with_events(tx);
+        }
+
+        // Forward pre-computed source hash for deterministic cache invalidation
+        if let Some(ref hash) = options.source_hash {
+            builder = builder.with_source_hash(hash.clone());
         }
 
         // Run the build

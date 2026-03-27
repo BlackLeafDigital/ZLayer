@@ -4,7 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Non-deterministic sandbox builder cache hash. `compute_dockerfile_hash()` used
+  `format!("{:?}", dockerfile)` which produced different hashes across runs due to
+  `HashMap` randomized iteration order. Replaced with deterministic per-instruction
+  `cache_key()` hashing. Also fixed `SandboxBackend::build_image()` not forwarding
+  `options.source_hash` to `SandboxImageBuilder`, so pipeline-provided hashes were
+  being silently ignored.
+
 ### Added
+- Content-based cache invalidation for the sandbox builder. `SandboxImageConfig`
+  now carries a `source_hash` field (SHA-256 of the Dockerfile/ZImagefile). When
+  a cached image exists with a matching hash, the rebuild is skipped entirely.
+  Pipeline builds (`build_single_image`) also compute a file hash up front and
+  short-circuit before even creating an `ImageBuilder` when the output image is
+  unchanged. `BuildOptions` and `ImageBuilder` gain a `source_hash` setter.
+  `build_toolchain_as_image()` and `build_base_image()` in `macos_image_resolver`
+  now embed source hashes in their cached configs.
+- Multi-version builds in `scripts/build-macos-images.sh` — e.g.
+  `./scripts/build-macos-images.sh node 18 20 22 24` builds Node 18, 20, 22, 24.
+  Partial versions auto-resolve to latest patch via upstream APIs. Environment
+  variable overrides (`GO_VERSION`, `NODE_VERSION`, `PYTHON_VERSION`, etc.) take
+  precedence over API resolution. Output directories are now versioned
+  (`$BUILD_DIR/golang-1.23.6/rootfs/`). OCI config.json includes version labels.
 - `BuildBackend` trait in `zlayer-builder::backend` providing a pluggable
   abstraction over container build tooling. Includes `BuildahBackend` (wraps
   buildah CLI) and `SandboxBackend` (macOS Seatbelt, cfg-gated). Added
@@ -20,6 +42,16 @@ All notable changes to this project will be documented in this file.
   build operations delegate to the backend when set.
 
 ### Refactored
+- Refactored package installer in `macos_image_resolver` to use a `ResolvedPackage`
+  enum (`HomebrewBottle`, `DirectRelease`, `Tap`, `UvPython`) instead of
+  shoehorning everything into `BrewFormulaInfo`. Renamed `fetch_formula_info()`
+  to `resolve_package()`, `install_single_bottle()` to `install_package()`, and
+  `fetch_and_extract_bottle()` to `install_with_deps()`. Added
+  `install_direct_release()` for downloading and extracting forge release assets,
+  `install_uv_python()` for Python provisioning via uv, and `DiscoveryResponse`
+  for structured RepoSourceSyncer discovery. Dependency BFS walk now only recurses
+  for `HomebrewBottle` variants. Added `"golang"` -> `("go", false)` to
+  `map_single_package_hardcoded()`.
 - Extracted the buildah build orchestration loop (stage walking, container
   creation, instruction execution, COPY --from resolution, cache tracking,
   commit, cleanup) from `ImageBuilder::build()` into

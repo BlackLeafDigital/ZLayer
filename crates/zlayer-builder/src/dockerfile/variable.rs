@@ -55,8 +55,12 @@ pub fn expand_variables(
                     let var_name = consume_var_name(&mut chars);
                     if let Some(value) = lookup_variable(&var_name, args, env) {
                         result.push_str(&value);
+                    } else {
+                        // Variable not found — preserve as-is so shell variables
+                        // (like $bin in for-loops) pass through to the shell.
+                        result.push('$');
+                        result.push_str(&var_name);
                     }
-                    // If variable not found, expand to empty string (Docker behavior)
                 } else {
                     // Just a dollar sign
                     result.push(c);
@@ -187,9 +191,11 @@ fn expand_braced_variable(
             }
         }
         None | Some(_) => {
-            // Simple ${VAR}
-            let is_set = value.is_some();
-            (value.unwrap_or_default(), is_set)
+            // Simple ${VAR} — preserve as-is if not defined
+            match value {
+                Some(v) => (v, true),
+                None => (format!("${{{var_name}}}"), false),
+            }
         }
     }
 }
@@ -308,8 +314,11 @@ mod tests {
         let args = HashMap::new();
         let env = HashMap::new();
 
-        assert_eq!(expand_variables("$UNDEFINED", &args, &env), "");
-        assert_eq!(expand_variables("${UNDEFINED}", &args, &env), "");
+        assert_eq!(expand_variables("$UNDEFINED", &args, &env), "$UNDEFINED");
+        assert_eq!(
+            expand_variables("${UNDEFINED}", &args, &env),
+            "${UNDEFINED}"
+        );
     }
 
     #[test]

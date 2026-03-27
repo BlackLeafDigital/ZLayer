@@ -1,30 +1,7 @@
-base: zlayer/base:latest
+base: ghcr.io/blackleafdigital/zlayer/base:latest
 
 steps:
-  - run: |
-      SYSROOT="$(rustc --print sysroot 2>/dev/null || echo '')"
-      if [ -n "$SYSROOT" ] && [ -d "$SYSROOT" ]; then
-        mkdir -p usr/local/rust
-        cp -R "$SYSROOT"/* usr/local/rust/
-        mkdir -p usr/local/bin
-        for bin in rustc cargo rustfmt clippy-driver cargo-fmt cargo-clippy; do
-          [ -f "$SYSROOT/bin/$bin" ] && ln -sf ../rust/bin/$bin usr/local/bin/$bin
-        done
-      else
-        ARCH="$(uname -m)"
-        [ "$ARCH" = "arm64" ] && TARGET="aarch64-apple-darwin" || TARGET="x86_64-apple-darwin"
-        curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal --no-modify-path
-        mkdir -p usr/local/rust
-        cp -R "$HOME/.rustup/toolchains/stable-${TARGET}"/* usr/local/rust/
-        mkdir -p usr/local/bin
-        for bin in rustc cargo rustfmt clippy-driver; do
-          ln -sf ../rust/bin/$bin usr/local/bin/$bin
-        done
-      fi
-
-env:
-  CARGO_HOME: /usr/local/cargo
-  RUSTUP_HOME: /usr/local/rustup
+  - run: apt-get install -y rust
 
 labels:
   org.opencontainers.image.title: "ZLayer macOS Rust"

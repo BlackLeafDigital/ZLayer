@@ -1,14 +1,7 @@
-base: zlayer/base:latest
+base: ghcr.io/blackleafdigital/zlayer/base:latest
 
 steps:
-  - run: |
-      ARCH="$(uname -m)"
-      [ "$ARCH" = "arm64" ] && DENO_ARCH="aarch64" || DENO_ARCH="x86_64"
-      mkdir -p usr/local/bin
-      curl -fsSL "https://github.com/denoland/deno/releases/latest/download/deno-${DENO_ARCH}-apple-darwin.zip" \
-        -o /tmp/deno.zip
-      unzip -o /tmp/deno.zip -d usr/local/bin/
-      rm -f /tmp/deno.zip
+  - run: apt-get install -y deno
 
 labels:
   org.opencontainers.image.title: "ZLayer macOS Deno"

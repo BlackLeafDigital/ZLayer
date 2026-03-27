@@ -1,25 +1,7 @@
-base: zlayer/base:latest
+base: ghcr.io/blackleafdigital/zlayer/base:latest
 
 steps:
-  - run: |
-      GOROOT="$(go env GOROOT 2>/dev/null || echo '')"
-      if [ -n "$GOROOT" ] && [ -d "$GOROOT" ]; then
-        mkdir -p usr/local/go
-        cp -R "$GOROOT"/* usr/local/go/
-      else
-        ARCH="$(uname -m)"
-        [ "$ARCH" = "arm64" ] && GOARCH="arm64" || GOARCH="amd64"
-        curl -fsSL "https://go.dev/dl/go1.23.6.darwin-${GOARCH}.tar.gz" | tar -xz -C usr/local/
-      fi
-
-  - run: |
-      mkdir -p usr/local/bin
-      ln -sf ../go/bin/go usr/local/bin/go
-      ln -sf ../go/bin/gofmt usr/local/bin/gofmt
-
-env:
-  GOROOT: /usr/local/go
-  GOPATH: /go
+  - run: apt-get install -y golang
 
 labels:
   org.opencontainers.image.title: "ZLayer macOS Go"

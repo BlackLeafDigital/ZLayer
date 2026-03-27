@@ -330,8 +330,14 @@ pub async fn build_toolchain_as_image(
 
     provision_toolchain(spec, &rootfs_dir, &cache_dir, &tmp_dir).await?;
 
-    // Write config.json
-    let config = toolchain_spec_to_config(spec);
+    // Write config.json (include source hash for cache invalidation)
+    let mut config = toolchain_spec_to_config(spec);
+    {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(format!("{spec:?}").as_bytes());
+        config.source_hash = Some(format!("{:x}", hasher.finalize()));
+    }
     let config_json =
         serde_json::to_string_pretty(&config).map_err(|e| BuildError::CacheError {
             message: format!("failed to serialise image config: {e}"),
@@ -369,7 +375,13 @@ pub async fn build_base_image(image_ref: &str, data_dir: &Path) -> Result<PathBu
     // Lay down the base rootfs
     ensure_base_rootfs(&rootfs_dir).await?;
 
-    // Write a default config.json
+    // Write a default config.json (include source hash for cache invalidation)
+    let source_hash = {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(format!("base_image:{image_ref}").as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
     let config = SandboxImageConfig {
         env: vec![
             "PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin".to_string(),
@@ -385,6 +397,7 @@ pub async fn build_base_image(image_ref: &str, data_dir: &Path) -> Result<PathBu
         stop_signal: None,
         shell: None,
         healthcheck: None,
+        source_hash: Some(source_hash),
     };
     let config_json =
         serde_json::to_string_pretty(&config).map_err(|e| BuildError::CacheError {
@@ -429,6 +442,7 @@ pub fn toolchain_spec_to_config(spec: &ToolchainSpec) -> SandboxImageConfig {
         stop_signal: None,
         shell: None,
         healthcheck: None,
+        source_hash: None,
     }
 }
 
@@ -468,22 +482,69 @@ struct BrewBottleFile {
     url: String,
 }
 
-/// Fetch formula metadata, checking `RepoSources` cache first, then Homebrew API.
+/// A resolved package from any source -- not just Homebrew.
+#[derive(Debug)]
+enum ResolvedPackage {
+    /// Standard Homebrew bottle from homebrew-core
+    HomebrewBottle(BrewFormulaInfo),
+    /// Direct download from a forge release (GitHub, GitLab, Codeberg, Forgejo)
+    DirectRelease {
+        name: String,
+        #[allow(dead_code)]
+        source: String,
+        url: String,
+        asset_name: String,
+    },
+    /// Formula from a Homebrew tap
+    Tap {
+        name: String,
+        #[allow(dead_code)]
+        tap: String,
+        url: String,
+    },
+    /// Python managed by uv
+    UvPython { version: String },
+}
+
+/// Response from the `RepoSourceSyncer` discovery endpoint.
+#[derive(Debug, Deserialize)]
+struct DiscoveryResponse {
+    name: String,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    source_url: Option<String>,
+    #[serde(default)]
+    data: Option<serde_json::Value>,
+}
+
+/// Resolve a package from any available source.
 ///
-/// After a successful Homebrew API fetch, fires a non-blocking POST to
-/// `reposync.blackleafdigital.com` so the formula gets cached for everyone.
+/// Resolution order:
+/// 1. Special-case: `python3` / `python` -> `UvPython`
+/// 2. `RepoSources` cached formula -> `HomebrewBottle` if parseable
+/// 3. Homebrew API -> `HomebrewBottle` (fires a non-blocking POST to reposync)
+/// 4. `RepoSourceSyncer` `?discover=true` -> `DirectRelease`, `Tap`, or `HomebrewBottle`
 ///
 /// # Errors
 ///
-/// Returns an error if both the cache and the API fail.
-async fn fetch_formula_info(formula: &str) -> Result<BrewFormulaInfo> {
+/// Returns an error if no source can provide the package.
+#[allow(clippy::too_many_lines)]
+async fn resolve_package(formula: &str) -> Result<ResolvedPackage> {
+    // 0. Special case: python → UvPython
+    if formula == "python3" || formula == "python" || formula == "python@3" {
+        return Ok(ResolvedPackage::UvPython {
+            version: "3".to_string(),
+        });
+    }
+
     // 1. Try RepoSources cached formula
     let cached_url = format!("{REPO_SOURCES_BASE}/../formulas/{formula}.json");
     if let Ok(resp) = reqwest::get(&cached_url).await {
         if resp.status().is_success() {
             if let Ok(info) = resp.json::<BrewFormulaInfo>().await {
                 debug!("Using cached formula from RepoSources: {}", formula);
-                return Ok(info);
+                return Ok(ResolvedPackage::HomebrewBottle(info));
             }
         }
     }
@@ -498,53 +559,380 @@ async fn fetch_formula_info(formula: &str) -> Result<BrewFormulaInfo> {
             message: format!("failed to fetch Homebrew formula info for {formula}: {e}"),
         })?;
 
-    if !response.status().is_success() {
+    if response.status().is_success() {
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| BuildError::RegistryError {
+                message: format!("failed to read Homebrew formula response for {formula}: {e}"),
+            })?;
+
+        let info: BrewFormulaInfo =
+            serde_json::from_slice(&body).map_err(|e| BuildError::RegistryError {
+                message: format!("failed to parse Homebrew formula JSON for {formula}: {e}"),
+            })?;
+
+        // Fire-and-forget POST to reposync so it gets cached
+        let formula_name = formula.to_string();
+        let body_clone = body.to_vec();
+        tokio::spawn(async move {
+            let now = utc_iso8601(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+            );
+            let _ = reqwest::Client::new()
+                .post("https://reposync.blackleafdigital.com/formula")
+                .header("zlayer-repo-sync", &now)
+                .header("content-type", "application/json")
+                .body(format!(
+                    r#"{{"name":"{}","data":{}}}"#,
+                    formula_name,
+                    String::from_utf8_lossy(&body_clone)
+                ))
+                .send()
+                .await;
+        });
+
+        return Ok(ResolvedPackage::HomebrewBottle(info));
+    }
+
+    // 3. Homebrew API failed (404 or other) — ask RepoSourceSyncer to discover it
+    info!(
+        "Homebrew API returned {} for {}, asking RepoSourceSyncer to discover",
+        response.status(),
+        formula
+    );
+
+    let discover_url =
+        format!("https://reposync.blackleafdigital.com/formula/{formula}?discover=true");
+    if let Ok(resp) = reqwest::get(&discover_url).await {
+        if resp.status().is_success() {
+            if let Ok(text) = resp.text().await {
+                // Try to parse as DiscoveryResponse first
+                if let Ok(discovery) = serde_json::from_str::<DiscoveryResponse>(&text) {
+                    if let Some(ref source) = discovery.source {
+                        if let Some(tap_name) = source.strip_prefix("tap:") {
+                            let url = discovery.source_url.unwrap_or_default();
+                            info!(
+                                "Discovered {} as tap {} via RepoSourceSyncer",
+                                formula, tap_name
+                            );
+                            return Ok(ResolvedPackage::Tap {
+                                name: discovery.name,
+                                tap: tap_name.to_string(),
+                                url,
+                            });
+                        }
+                        if source.starts_with("github-release:")
+                            || source.starts_with("gitlab-release:")
+                            || source.starts_with("codeberg-release:")
+                            || source.starts_with("forgejo-release:")
+                        {
+                            let url = discovery.source_url.clone().unwrap_or_default();
+                            let asset_name = url.rsplit('/').next().unwrap_or(formula).to_string();
+                            info!(
+                                "Discovered {} as direct release via RepoSourceSyncer",
+                                formula
+                            );
+                            return Ok(ResolvedPackage::DirectRelease {
+                                name: discovery.name,
+                                source: source.clone(),
+                                url,
+                                asset_name,
+                            });
+                        }
+                    }
+                    // No source but has data — try as BrewFormulaInfo
+                    if let Some(ref data) = discovery.data {
+                        if let Ok(info) = serde_json::from_value::<BrewFormulaInfo>(data.clone()) {
+                            info!("Discovered {} via RepoSourceSyncer (bottle data)", formula);
+                            return Ok(ResolvedPackage::HomebrewBottle(info));
+                        }
+                    }
+                }
+                // Fall back: try parsing the whole response as BrewFormulaInfo
+                if let Ok(info) = serde_json::from_str::<BrewFormulaInfo>(&text) {
+                    info!("Discovered {} via RepoSourceSyncer", formula);
+                    return Ok(ResolvedPackage::HomebrewBottle(info));
+                }
+                debug!(
+                    "RepoSourceSyncer returned data for {} but not in any recognised format",
+                    formula
+                );
+            }
+        }
+    }
+
+    Err(BuildError::RegistryError {
+        message: format!(
+            "Formula '{formula}' not found in Homebrew, RepoSources, or forge discovery"
+        ),
+    })
+}
+
+/// Install a resolved package into the sandbox rootfs.
+///
+/// Dispatches to the appropriate installer based on the [`ResolvedPackage`] variant.
+///
+/// # Errors
+///
+/// Returns an error if installation fails.
+#[allow(clippy::too_many_lines)]
+async fn install_package(
+    formula: &str,
+    package: &ResolvedPackage,
+    rootfs_dir: &Path,
+    tmp_dir: &Path,
+) -> Result<()> {
+    match package {
+        ResolvedPackage::HomebrewBottle(info) => {
+            install_homebrew_bottle(formula, info, rootfs_dir, tmp_dir).await
+        }
+        ResolvedPackage::DirectRelease {
+            name,
+            url,
+            asset_name,
+            ..
+        } => install_direct_release(name, url, asset_name, rootfs_dir, tmp_dir).await,
+        ResolvedPackage::Tap { name, url, .. } => {
+            // For taps, download and extract the same way as a direct release
+            let asset_name = url.rsplit('/').next().unwrap_or(name);
+            install_direct_release(name, url, asset_name, rootfs_dir, tmp_dir).await
+        }
+        ResolvedPackage::UvPython { version } => {
+            install_uv_python(version, rootfs_dir, tmp_dir).await
+        }
+    }
+}
+
+/// Download a release asset, extract it, and copy executables to `{rootfs}/usr/local/bin/`.
+///
+/// Archive type is detected from the asset name:
+/// - `.zip` -> `unzip -o`
+/// - `.tar.gz` / `.tgz` -> `tar xzf`
+/// - `.tar.xz` -> `tar xJf`
+/// - No recognised extension -> treated as a single binary
+///
+/// After extraction, walks the tree looking for Mach-O executables (via `file`)
+/// and copies them to `{rootfs}/usr/local/bin/` with `chmod +x`.
+///
+/// # Errors
+///
+/// Returns an error if download, extraction, or filesystem operations fail.
+#[allow(
+    clippy::too_many_lines,
+    clippy::case_sensitive_file_extension_comparisons
+)]
+async fn install_direct_release(
+    name: &str,
+    url: &str,
+    asset_name: &str,
+    rootfs_dir: &Path,
+    tmp_dir: &Path,
+) -> Result<()> {
+    tokio::fs::create_dir_all(tmp_dir).await?;
+
+    let download_path = tmp_dir.join(asset_name);
+
+    // Download the asset
+    info!("Downloading release asset for {} from {}", name, url);
+    let bytes = reqwest::get(url)
+        .await
+        .map_err(|e| BuildError::RegistryError {
+            message: format!("failed to download release for {name}: {e}"),
+        })?
+        .bytes()
+        .await
+        .map_err(|e| BuildError::RegistryError {
+            message: format!("failed to read release bytes for {name}: {e}"),
+        })?;
+    tokio::fs::write(&download_path, &bytes).await?;
+
+    let usr_local_bin = rootfs_dir.join("usr/local/bin");
+    tokio::fs::create_dir_all(&usr_local_bin).await?;
+
+    let extract_dir = tmp_dir.join(format!("{name}_release_extract"));
+    let _ = tokio::fs::remove_dir_all(&extract_dir).await;
+    tokio::fs::create_dir_all(&extract_dir).await?;
+
+    let lower = asset_name.to_lowercase();
+    let is_archive = lower.ends_with(".zip")
+        || lower.ends_with(".tar.gz")
+        || lower.ends_with(".tgz")
+        || lower.ends_with(".tar.xz");
+
+    if is_archive {
+        // Extract based on extension
+        let output = if lower.ends_with(".zip") {
+            tokio::process::Command::new("unzip")
+                .args(["-o"])
+                .arg(&download_path)
+                .arg("-d")
+                .arg(&extract_dir)
+                .output()
+                .await?
+        } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
+            tokio::process::Command::new("tar")
+                .args(["xzf"])
+                .arg(&download_path)
+                .arg("-C")
+                .arg(&extract_dir)
+                .output()
+                .await?
+        } else {
+            // .tar.xz
+            tokio::process::Command::new("tar")
+                .args(["xJf"])
+                .arg(&download_path)
+                .arg("-C")
+                .arg(&extract_dir)
+                .output()
+                .await?
+        };
+
+        if !output.status.success() {
+            return Err(BuildError::RegistryError {
+                message: format!(
+                    "failed to extract release archive for {name}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+            });
+        }
+
+        // Walk the extracted tree and find Mach-O executables
+        let find_output = tokio::process::Command::new("find")
+            .arg(&extract_dir)
+            .args(["-type", "f"])
+            .output()
+            .await?;
+
+        let files_list = String::from_utf8_lossy(&find_output.stdout);
+        for line in files_list.lines() {
+            let path = Path::new(line.trim());
+            if !path.exists() {
+                continue;
+            }
+            // Use `file` command to check for Mach-O binary
+            let file_output = tokio::process::Command::new("file")
+                .arg(path)
+                .output()
+                .await;
+            if let Ok(fo) = file_output {
+                let file_desc = String::from_utf8_lossy(&fo.stdout);
+                if file_desc.contains("Mach-O") {
+                    if let Some(file_name) = path.file_name() {
+                        let dest = usr_local_bin.join(file_name);
+                        let _ = tokio::fs::copy(path, &dest).await;
+                        let _ = tokio::process::Command::new("chmod")
+                            .args(["+x"])
+                            .arg(&dest)
+                            .status()
+                            .await;
+                        info!(
+                            "Installed binary {} from release {}",
+                            file_name.to_string_lossy(),
+                            name
+                        );
+                    }
+                }
+            }
+        }
+    } else {
+        // No recognised archive extension — treat as a single binary
+        let dest = usr_local_bin.join(name);
+        tokio::fs::copy(&download_path, &dest).await?;
+        let _ = tokio::process::Command::new("chmod")
+            .args(["+x"])
+            .arg(&dest)
+            .status()
+            .await;
+        info!("Installed single binary {} from release", name);
+    }
+
+    // Cleanup
+    let _ = tokio::fs::remove_file(&download_path).await;
+    let _ = tokio::process::Command::new("rm")
+        .args(["-rf"])
+        .arg(&extract_dir)
+        .status()
+        .await;
+
+    Ok(())
+}
+
+/// Install Python via uv.
+///
+/// Ensures `uv` is available (installs it as a Homebrew bottle if not found),
+/// then runs `uv python install {version}` with the install dir set to
+/// `{rootfs}/usr/local/python`. Symlinks `python3` and `python` into
+/// `{rootfs}/usr/local/bin/`.
+///
+/// # Errors
+///
+/// Returns an error if uv installation or python provisioning fails.
+async fn install_uv_python(version: &str, rootfs_dir: &Path, tmp_dir: &Path) -> Result<()> {
+    let uv_bin = rootfs_dir.join("opt/homebrew/bin/uv");
+
+    // Ensure uv is installed
+    if !uv_bin.exists() {
+        info!("uv not found in rootfs, installing via Homebrew bottle");
+        let uv_pkg = resolve_package("uv").await?;
+        Box::pin(install_package("uv", &uv_pkg, rootfs_dir, tmp_dir)).await?;
+    }
+
+    if !uv_bin.exists() {
+        return Err(BuildError::RegistryError {
+            message: "failed to install uv — binary not found after installation".to_string(),
+        });
+    }
+
+    let python_install_dir = rootfs_dir.join("usr/local/python");
+    tokio::fs::create_dir_all(&python_install_dir).await?;
+
+    info!("Installing Python {} via uv", version);
+    let output = tokio::process::Command::new(&uv_bin)
+        .args(["python", "install", version])
+        .env("UV_PYTHON_INSTALL_DIR", &python_install_dir)
+        .output()
+        .await?;
+
+    if !output.status.success() {
         return Err(BuildError::RegistryError {
             message: format!(
-                "Homebrew formula API returned {} for {formula}",
-                response.status()
+                "uv python install failed: {}",
+                String::from_utf8_lossy(&output.stderr)
             ),
         });
     }
 
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| BuildError::RegistryError {
-            message: format!("failed to read Homebrew formula response for {formula}: {e}"),
-        })?;
+    // Symlink python3 and python into usr/local/bin
+    let usr_local_bin = rootfs_dir.join("usr/local/bin");
+    tokio::fs::create_dir_all(&usr_local_bin).await?;
 
-    let info: BrewFormulaInfo =
-        serde_json::from_slice(&body).map_err(|e| BuildError::RegistryError {
-            message: format!("failed to parse Homebrew formula JSON for {formula}: {e}"),
-        })?;
+    // Find the python binary uv installed
+    let find_output = tokio::process::Command::new("find")
+        .arg(&python_install_dir)
+        .args(["-name", "python3", "-type", "f"])
+        .output()
+        .await?;
 
-    // 3. Fire-and-forget POST to reposync so it gets cached
-    let formula_name = formula.to_string();
-    let body_clone = body.to_vec();
-    tokio::spawn(async move {
-        let now = {
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            utc_iso8601(secs)
-        };
+    let python_bin_path = String::from_utf8_lossy(&find_output.stdout);
+    if let Some(line) = python_bin_path.lines().next() {
+        let python_path = PathBuf::from(line.trim());
+        if python_path.exists() {
+            let symlink_python3 = usr_local_bin.join("python3");
+            let symlink_python = usr_local_bin.join("python");
+            let _ = tokio::fs::remove_file(&symlink_python3).await;
+            let _ = tokio::fs::remove_file(&symlink_python).await;
+            let _ = tokio::fs::symlink(&python_path, &symlink_python3).await;
+            let _ = tokio::fs::symlink(&python_path, &symlink_python).await;
+            info!("Symlinked python3 and python to {}", python_path.display());
+        }
+    }
 
-        let _ = reqwest::Client::new()
-            .post("https://reposync.blackleafdigital.com/formula")
-            .header("zlayer-repo-sync", &now)
-            .header("content-type", "application/json")
-            .body(format!(
-                r#"{{"name":"{}","data":{}}}"#,
-                formula_name,
-                String::from_utf8_lossy(&body_clone)
-            ))
-            .send()
-            .await;
-    });
-
-    Ok(info)
+    Ok(())
 }
 
 /// Download and extract a single Homebrew bottle into the sandbox rootfs.
@@ -560,7 +948,7 @@ async fn fetch_formula_info(formula: &str) -> Result<BrewFormulaInfo> {
 /// or extraction fails, or filesystem operations (directory creation, symlink)
 /// fail.
 #[allow(clippy::too_many_lines)]
-async fn install_single_bottle(
+async fn install_homebrew_bottle(
     formula: &str,
     info: &BrewFormulaInfo,
     rootfs_dir: &Path,
@@ -723,23 +1111,24 @@ async fn install_single_bottle(
     Ok(())
 }
 
-/// Fetch and extract a Homebrew bottle (and all its dependencies) into the
-/// sandbox rootfs.
+/// Resolve and install a package (with all Homebrew dependencies if applicable)
+/// into the sandbox rootfs.
 ///
-/// Performs a BFS traversal of the formula's dependency tree, installing each
-/// dependency before the formula itself. Formulas that are already present in
-/// the rootfs Cellar are skipped. Failures on individual dependencies are
-/// logged as warnings but do not abort the overall installation.
+/// Performs a BFS traversal of the dependency tree for Homebrew bottles,
+/// installing each dependency before the formula itself. Packages that are
+/// already present in the rootfs Cellar are skipped. Failures on individual
+/// dependencies are logged as warnings but do not abort the overall
+/// installation.
+///
+/// For non-Homebrew packages (`DirectRelease`, `Tap`, `UvPython`) the
+/// dependency walk is skipped since those sources do not expose brew-style
+/// dependency metadata.
 ///
 /// # Errors
 ///
 /// This function is infallible at the top level — individual formula failures
 /// are logged and skipped so that as many packages as possible are installed.
-pub async fn fetch_and_extract_bottle(
-    formula: &str,
-    rootfs_dir: &Path,
-    tmp_dir: &Path,
-) -> Result<()> {
+pub async fn install_with_deps(formula: &str, rootfs_dir: &Path, tmp_dir: &Path) -> Result<()> {
     let mut installed = HashSet::new();
     let mut queue = VecDeque::new();
     queue.push_back(formula.to_string());
@@ -751,42 +1140,48 @@ pub async fn fetch_and_extract_bottle(
 
         // Check if already in rootfs (from a previous build or earlier in this build)
         let cellar = rootfs_dir.join("opt/homebrew/Cellar").join(&current);
-        if cellar.exists() {
+        let usr_bin = rootfs_dir.join("usr/local/bin").join(&current);
+        if cellar.exists() || usr_bin.exists() {
             debug!("Skipping {} (already in rootfs)", current);
             installed.insert(current);
             continue;
         }
 
-        let info = match fetch_formula_info(&current).await {
-            Ok(info) => info,
+        let package = match resolve_package(&current).await {
+            Ok(pkg) => pkg,
             Err(e) => {
-                warn!(
-                    "Failed to fetch formula info for {}: {} (skipping)",
-                    current, e
-                );
+                warn!("Failed to resolve package {}: {} (skipping)", current, e);
                 installed.insert(current);
                 continue;
             }
         };
 
-        // Queue dependencies
-        for dep in &info.dependencies {
-            if !installed.contains(dep) {
-                queue.push_back(dep.clone());
+        // Queue dependencies only for HomebrewBottle (other sources don't have brew deps)
+        if let ResolvedPackage::HomebrewBottle(ref info) = package {
+            for dep in &info.dependencies {
+                if !installed.contains(dep) {
+                    queue.push_back(dep.clone());
+                }
             }
         }
 
-        // Install this formula
-        match install_single_bottle(&current, &info, rootfs_dir, tmp_dir).await {
+        // Install this package
+        match install_package(&current, &package, rootfs_dir, tmp_dir).await {
             Ok(()) => {
-                let version_str = info.versions.stable.as_deref().unwrap_or("unknown");
-                info!("Installed {} v{} via Homebrew bottle", current, version_str);
+                let version_str = match &package {
+                    ResolvedPackage::HomebrewBottle(info) => info
+                        .versions
+                        .stable
+                        .as_deref()
+                        .unwrap_or("unknown")
+                        .to_string(),
+                    ResolvedPackage::UvPython { version } => version.clone(),
+                    _ => "latest".to_string(),
+                };
+                info!("Installed {} v{}", current, version_str);
             }
             Err(e) => {
-                warn!(
-                    "Failed to install bottle for {}: {} (continuing)",
-                    current, e
-                );
+                warn!("Failed to install {}: {} (continuing)", current, e);
             }
         }
         installed.insert(current);
@@ -960,6 +1355,9 @@ fn map_single_package_hardcoded(pkg: &str) -> (String, bool) {
         "imagemagick" | "libmagickwand-dev" => ("imagemagick", false),
         "ffmpeg" | "libavcodec-dev" => ("ffmpeg", false),
         "libprotobuf-dev" | "protobuf-compiler" => ("protobuf", false),
+
+        // Language aliases
+        "golang" => ("go", false),
 
         // Unknown packages pass through as-is
         other => (other, false),
