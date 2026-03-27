@@ -3,7 +3,7 @@
 # build-macos-images.sh -- Build macOS-native base images for the sandbox builder
 #
 # Usage:
-#   ./scripts/build-macos-images.sh <subcommand>
+#   ./scripts/build-macos-images.sh <subcommand> [version ...]
 #
 # Subcommands:
 #   base     Build the base rootfs with macOS system binaries
@@ -13,7 +13,20 @@
 #   python   Build Python + uv toolchain image (requires base)
 #   deno     Build Deno toolchain image (requires base)
 #   bun      Build Bun toolchain image (requires base)
-#   all      Build base, then all toolchain images in parallel
+#   all      Build base, then all toolchain images (latest) in parallel
+#
+# Multi-version builds:
+#   ./scripts/build-macos-images.sh golang 1.22 1.23
+#   ./scripts/build-macos-images.sh node 18 20 22 24
+#   ./scripts/build-macos-images.sh python 3.10 3.11 3.12 3.13 3.14
+#
+# Environment variable overrides (takes precedence over API resolution):
+#   GO_VERSION=1.22.0 ./scripts/build-macos-images.sh golang
+#   NODE_VERSION=22.14.0 ./scripts/build-macos-images.sh node
+#   UV_VERSION=0.11.2 PYTHON_VERSION=3.12 ./scripts/build-macos-images.sh python
+#   DENO_VERSION=v2.2.4 ./scripts/build-macos-images.sh deno
+#   BUN_VERSION=v1.2.5 ./scripts/build-macos-images.sh bun
+#   RUST_VERSION=stable ./scripts/build-macos-images.sh rust
 #
 set -euo pipefail
 
@@ -37,6 +50,127 @@ else
 fi
 
 echo "==> Detected architecture: $ARCH (OCI: $OCI_ARCH)"
+
+# ---------------------------------------------------------------------------
+# Version resolution -- fetch latest versions from upstream APIs
+# ---------------------------------------------------------------------------
+
+resolve_latest() {
+    local name="$1"
+    local url="$2"
+    local jq_expr="$3"
+    local fallback="$4"
+    local result
+    result=$(curl -fsSL --connect-timeout 5 --max-time 10 "$url" 2>/dev/null | jq -r "$jq_expr" 2>/dev/null)
+    if [[ -z "$result" || "$result" == "null" ]]; then
+        echo "    Warning: Could not resolve latest $name, using fallback $fallback" >&2
+        echo "$fallback"
+    else
+        echo "$result"
+    fi
+}
+
+# Resolve the latest patch version for a partial Go version (e.g. "1.22" -> "1.22.10").
+# If already a full version (e.g. "1.22.5"), returns it unchanged.
+resolve_go_patch() {
+    local partial="$1"
+    # If it already has 3 components, assume it is fully specified
+    if [[ "$partial" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$partial"
+        return
+    fi
+    local result
+    result=$(curl -fsSL --connect-timeout 5 --max-time 10 "https://go.dev/dl/?mode=json&include=all" 2>/dev/null \
+        | jq -r --arg prefix "go${partial}." \
+            '[.[] | select(.version | startswith($prefix)) | .version | sub("^go";"")] | sort_by(split(".") | map(tonumber)) | last' \
+            2>/dev/null)
+    if [[ -z "$result" || "$result" == "null" ]]; then
+        echo "    Warning: Could not resolve Go ${partial}.x, using ${partial}.0" >&2
+        echo "${partial}.0"
+    else
+        echo "$result"
+    fi
+}
+
+# Resolve the latest patch version for a partial Node major (e.g. "20" -> "20.18.2").
+resolve_node_patch() {
+    local partial="$1"
+    # If it already has 3 components, return as-is
+    if [[ "$partial" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$partial"
+        return
+    fi
+    local result
+    result=$(curl -fsSL --connect-timeout 5 --max-time 10 "https://nodejs.org/dist/index.json" 2>/dev/null \
+        | jq -r --arg major "v${partial}." \
+            '[.[] | select(.version | startswith($major))][0].version | sub("^v";"")' \
+            2>/dev/null)
+    if [[ -z "$result" || "$result" == "null" ]]; then
+        echo "    Warning: Could not resolve Node ${partial}.x.x, using ${partial}.0.0" >&2
+        echo "${partial}.0.0"
+    else
+        echo "$result"
+    fi
+}
+
+# Resolve latest Deno patch for a partial version (e.g. "2.2" -> "v2.2.4").
+resolve_deno_patch() {
+    local partial="$1"
+    # If it starts with "v" and has 3 components, return as-is
+    if [[ "$partial" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        [[ "$partial" =~ ^v ]] || partial="v${partial}"
+        echo "$partial"
+        return
+    fi
+    # Strip leading v for matching
+    local bare="${partial#v}"
+    local result
+    result=$(curl -fsSL --connect-timeout 5 --max-time 10 "https://api.github.com/repos/denoland/deno/releases" 2>/dev/null \
+        | jq -r --arg prefix "v${bare}." \
+            '[.[] | select(.tag_name | startswith($prefix)) | .tag_name][0]' \
+            2>/dev/null)
+    if [[ -z "$result" || "$result" == "null" ]]; then
+        echo "    Warning: Could not resolve Deno ${partial}.x, using v${bare}.0" >&2
+        echo "v${bare}.0"
+    else
+        echo "$result"
+    fi
+}
+
+# Resolve latest Bun patch for a partial version (e.g. "1.2" -> "v1.2.5").
+resolve_bun_patch() {
+    local partial="$1"
+    # If it starts with "v" and has 3 components, return as-is
+    if [[ "$partial" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        [[ "$partial" =~ ^v ]] || partial="v${partial}"
+        echo "$partial"
+        return
+    fi
+    # Strip leading v for matching
+    local bare="${partial#v}"
+    local result
+    result=$(curl -fsSL --connect-timeout 5 --max-time 10 "https://api.github.com/repos/oven-sh/bun/releases" 2>/dev/null \
+        | jq -r --arg prefix "bun-v${bare}." \
+            '[.[] | select(.tag_name | startswith($prefix)) | .tag_name | sub("^bun-";"")][0]' \
+            2>/dev/null)
+    if [[ -z "$result" || "$result" == "null" ]]; then
+        echo "    Warning: Could not resolve Bun ${partial}.x, using v${bare}.0" >&2
+        echo "v${bare}.0"
+    else
+        echo "$result"
+    fi
+}
+
+# Default latest versions -- env vars override API resolution
+GO_VERSION="${GO_VERSION:-$(resolve_latest "Go" "https://go.dev/dl/?mode=json" '.[0].version | sub("^go";"")' "1.23.6")}"
+NODE_VERSION="${NODE_VERSION:-$(resolve_latest "Node" "https://nodejs.org/dist/index.json" '[.[] | select(.lts != false)][0].version | sub("^v";"")' "22.14.0")}"
+UV_VERSION="${UV_VERSION:-$(resolve_latest "uv" "https://api.github.com/repos/astral-sh/uv/releases/latest" '.tag_name' "0.11.2")}"
+PYTHON_VERSION="${PYTHON_VERSION:-3.13}"
+DENO_VERSION="${DENO_VERSION:-$(resolve_latest "Deno" "https://api.github.com/repos/denoland/deno/releases/latest" '.tag_name' "v2.2.4")}"
+BUN_VERSION="${BUN_VERSION:-$(resolve_latest "Bun" "https://api.github.com/repos/oven-sh/bun/releases/latest" '.tag_name | sub("^bun-";"")' "v1.2.5")}"
+RUST_VERSION="${RUST_VERSION:-stable}"
+
+echo "==> Resolved versions: Go=$GO_VERSION Node=$NODE_VERSION Python=$PYTHON_VERSION uv=$UV_VERSION Deno=$DENO_VERSION Bun=$BUN_VERSION Rust=$RUST_VERSION"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -79,6 +213,12 @@ write_oci_config() {
     local image_dir="$1"  # parent of rootfs/
     local image_name="$2"
     local extra_env="$3"  # JSON array string, e.g. '["GOROOT=/usr/local/go"]'
+    local version="${4:-}"
+
+    local version_label=""
+    if [[ -n "$version" ]]; then
+        version_label="$(printf ',\n      "io.zlayer.version": "%s"' "$version")"
+    fi
 
     cat > "$image_dir/config.json" <<JSONEOF
 {
@@ -91,7 +231,7 @@ write_oci_config() {
     "Cmd": null,
     "Labels": {
       "io.zlayer.image": "$image_name",
-      "io.zlayer.arch": "$OCI_ARCH"
+      "io.zlayer.arch": "$OCI_ARCH"${version_label}
     }
   }
 }
@@ -176,42 +316,38 @@ build_base() {
 # ---------------------------------------------------------------------------
 
 build_golang() {
+    local version="${1:-$GO_VERSION}"
+    # Resolve partial version (e.g. "1.22" -> "1.22.10")
+    version="$(resolve_go_patch "$version")"
+
     ensure_base
-    echo "==> Building Go toolchain image..."
+    echo "==> Building Go ${version} toolchain image..."
+    local image_name="golang-${version}"
     local rootfs
-    rootfs="$(clone_base golang)"
-    local image_dir="$BUILD_DIR/golang"
+    rootfs="$(clone_base "$image_name")"
+    local image_dir="$BUILD_DIR/$image_name"
 
-    local go_version="1.23.6"
-
-    if command -v go &>/dev/null; then
-        echo "    Found local Go installation, copying..."
-        local goroot
-        goroot="$(go env GOROOT)"
-        mkdir -p "$rootfs/usr/local/go"
-        cp -a "$goroot/." "$rootfs/usr/local/go/"
-    else
-        echo "    Go not found locally, downloading go${go_version}..."
-        local tarball="go${go_version}.darwin-${ARCH}.tar.gz"
-        local url="https://go.dev/dl/${tarball}"
-        local dl_path="$BUILD_DIR/.downloads/${tarball}"
-        mkdir -p "$BUILD_DIR/.downloads"
-        if [[ ! -f "$dl_path" ]]; then
-            curl -fSL -o "$dl_path" "$url"
-        fi
-        mkdir -p "$rootfs/usr/local"
-        tar -xzf "$dl_path" -C "$rootfs/usr/local/"
+    echo "    Downloading go${version}..."
+    local tarball="go${version}.darwin-${ARCH}.tar.gz"
+    local url="https://go.dev/dl/${tarball}"
+    local dl_path="$BUILD_DIR/.downloads/${tarball}"
+    mkdir -p "$BUILD_DIR/.downloads"
+    if [[ ! -f "$dl_path" ]]; then
+        curl -fSL -o "$dl_path" "$url"
     fi
+    mkdir -p "$rootfs/usr/local"
+    tar -xzf "$dl_path" -C "$rootfs/usr/local/"
 
     # Symlinks
     ln -sf ../go/bin/go    "$rootfs/usr/local/bin/go"
     ln -sf ../go/bin/gofmt "$rootfs/usr/local/bin/gofmt"
 
     write_oci_config "$image_dir" "zlayer-golang" \
-        '["PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin","GOROOT=/usr/local/go","GOPATH=/go"]'
+        '["PATH=/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin","GOROOT=/usr/local/go","GOPATH=/go"]' \
+        "$version"
 
-    create_layer_tar "$image_dir" "golang"
-    echo "==> Go image ready: $rootfs"
+    create_layer_tar "$image_dir" "golang-${version}"
+    echo "==> Go ${version} image ready: $rootfs"
 }
 
 # ---------------------------------------------------------------------------
@@ -219,43 +355,39 @@ build_golang() {
 # ---------------------------------------------------------------------------
 
 build_rust() {
-    ensure_base
-    echo "==> Building Rust toolchain image..."
-    local rootfs
-    rootfs="$(clone_base rust)"
-    local image_dir="$BUILD_DIR/rust"
+    local version="${1:-$RUST_VERSION}"
 
-    if command -v rustc &>/dev/null; then
-        echo "    Found local Rust installation, copying..."
-        local sysroot
-        sysroot="$(rustc --print sysroot)"
-        mkdir -p "$rootfs/usr/local/rust"
-        cp -a "$sysroot/." "$rootfs/usr/local/rust/"
-    else
-        echo "    Rust not found locally, installing via rustup-init..."
-        local rustup_init="$BUILD_DIR/.downloads/rustup-init"
-        mkdir -p "$BUILD_DIR/.downloads"
-        if [[ ! -f "$rustup_init" ]]; then
-            curl -fSL -o "$rustup_init" "https://sh.rustup.rs" --proto '=https' --tlsv1.2
-            # Actually download the binary installer
-            local rustup_url="https://static.rust-lang.org/rustup/dist/${ARCH}-apple-darwin/rustup-init"
-            curl -fSL -o "$rustup_init" "$rustup_url"
-            chmod +x "$rustup_init"
-        fi
-        local tmp_rust="$BUILD_DIR/.rust-tmp"
-        rm -rf "$tmp_rust"
-        RUSTUP_HOME="$tmp_rust/rustup" CARGO_HOME="$tmp_rust/cargo" \
-            "$rustup_init" -y --no-modify-path --default-toolchain stable 2>/dev/null
-        local sysroot
-        sysroot="$(RUSTUP_HOME="$tmp_rust/rustup" "$tmp_rust/cargo/bin/rustc" --print sysroot)"
-        mkdir -p "$rootfs/usr/local/rust"
-        cp -a "$sysroot/." "$rootfs/usr/local/rust/"
-        # Also copy cargo and friends from cargo/bin
-        cp "$tmp_rust/cargo/bin/cargo"   "$rootfs/usr/local/rust/bin/"
-        cp "$tmp_rust/cargo/bin/rustfmt" "$rootfs/usr/local/rust/bin/" 2>/dev/null || true
-        cp "$tmp_rust/cargo/bin/clippy-driver" "$rootfs/usr/local/rust/bin/" 2>/dev/null || true
-        rm -rf "$tmp_rust"
+    ensure_base
+    echo "==> Building Rust ${version} toolchain image..."
+    local image_name="rust-${version}"
+    local rootfs
+    rootfs="$(clone_base "$image_name")"
+    local image_dir="$BUILD_DIR/$image_name"
+
+    echo "    Installing Rust toolchain '${version}' via rustup-init..."
+    local rustup_init="$BUILD_DIR/.downloads/rustup-init"
+    mkdir -p "$BUILD_DIR/.downloads"
+    if [[ ! -f "$rustup_init" ]]; then
+        local rustup_url="https://static.rust-lang.org/rustup/dist/${ARCH}-apple-darwin/rustup-init"
+        curl -fSL -o "$rustup_init" "$rustup_url"
+        chmod +x "$rustup_init"
     fi
+    local tmp_rust="$BUILD_DIR/.rust-tmp"
+    rm -rf "$tmp_rust"
+    RUSTUP_HOME="$tmp_rust/rustup" CARGO_HOME="$tmp_rust/cargo" \
+        "$rustup_init" -y --no-modify-path --default-toolchain "$version" 2>/dev/null
+    local sysroot
+    sysroot="$(RUSTUP_HOME="$tmp_rust/rustup" "$tmp_rust/cargo/bin/rustc" --print sysroot)"
+    # Capture the actual version string for labeling
+    local actual_version
+    actual_version="$(RUSTUP_HOME="$tmp_rust/rustup" CARGO_HOME="$tmp_rust/cargo" "$tmp_rust/cargo/bin/rustc" --version | awk '{print $2}')"
+    mkdir -p "$rootfs/usr/local/rust"
+    cp -a "$sysroot/." "$rootfs/usr/local/rust/"
+    # Also copy cargo and friends from cargo/bin
+    cp "$tmp_rust/cargo/bin/cargo"   "$rootfs/usr/local/rust/bin/"
+    cp "$tmp_rust/cargo/bin/rustfmt" "$rootfs/usr/local/rust/bin/" 2>/dev/null || true
+    cp "$tmp_rust/cargo/bin/clippy-driver" "$rootfs/usr/local/rust/bin/" 2>/dev/null || true
+    rm -rf "$tmp_rust"
 
     # Symlinks
     mkdir -p "$rootfs/usr/local/bin"
@@ -266,10 +398,11 @@ build_rust() {
     done
 
     write_oci_config "$image_dir" "zlayer-rust" \
-        '["PATH=/usr/local/rust/bin:/usr/local/bin:/usr/bin:/bin","RUSTUP_HOME=/usr/local/rust","CARGO_HOME=/usr/local/rust"]'
+        '["PATH=/usr/local/rust/bin:/usr/local/bin:/usr/bin:/bin","RUSTUP_HOME=/usr/local/rust","CARGO_HOME=/usr/local/rust"]' \
+        "${actual_version:-$version}"
 
-    create_layer_tar "$image_dir" "rust"
-    echo "==> Rust image ready: $rootfs"
+    create_layer_tar "$image_dir" "rust-${version}"
+    echo "==> Rust ${version} image ready: $rootfs"
 }
 
 # ---------------------------------------------------------------------------
@@ -277,37 +410,27 @@ build_rust() {
 # ---------------------------------------------------------------------------
 
 build_node() {
+    local version="${1:-$NODE_VERSION}"
+    # Resolve partial version (e.g. "20" -> "20.18.2")
+    version="$(resolve_node_patch "$version")"
+
     ensure_base
-    echo "==> Building Node.js toolchain image..."
+    echo "==> Building Node.js ${version} toolchain image..."
+    local image_name="node-${version}"
     local rootfs
-    rootfs="$(clone_base node)"
-    local image_dir="$BUILD_DIR/node"
+    rootfs="$(clone_base "$image_name")"
+    local image_dir="$BUILD_DIR/$image_name"
 
-    local node_version="22.14.0"
-
-    if command -v node &>/dev/null; then
-        echo "    Found local Node.js installation, copying..."
-        local node_prefix
-        node_prefix="$(dirname "$(dirname "$(command -v node)")")"
-        mkdir -p "$rootfs/usr/local/node"
-        # Copy bin, lib, include, share
-        for d in bin lib include share; do
-            if [[ -d "$node_prefix/$d" ]]; then
-                cp -a "$node_prefix/$d" "$rootfs/usr/local/node/"
-            fi
-        done
-    else
-        echo "    Node.js not found locally, downloading v${node_version}..."
-        local tarball="node-v${node_version}-darwin-${ARCH}.tar.gz"
-        local url="https://nodejs.org/dist/v${node_version}/${tarball}"
-        local dl_path="$BUILD_DIR/.downloads/${tarball}"
-        mkdir -p "$BUILD_DIR/.downloads"
-        if [[ ! -f "$dl_path" ]]; then
-            curl -fSL -o "$dl_path" "$url"
-        fi
-        mkdir -p "$rootfs/usr/local/node"
-        tar -xzf "$dl_path" --strip-components=1 -C "$rootfs/usr/local/node/"
+    echo "    Downloading node v${version}..."
+    local tarball="node-v${version}-darwin-${ARCH}.tar.gz"
+    local url="https://nodejs.org/dist/v${version}/${tarball}"
+    local dl_path="$BUILD_DIR/.downloads/${tarball}"
+    mkdir -p "$BUILD_DIR/.downloads"
+    if [[ ! -f "$dl_path" ]]; then
+        curl -fSL -o "$dl_path" "$url"
     fi
+    mkdir -p "$rootfs/usr/local/node"
+    tar -xzf "$dl_path" --strip-components=1 -C "$rootfs/usr/local/node/"
 
     # Symlinks
     ln -sf ../node/bin/node "$rootfs/usr/local/bin/node"
@@ -315,10 +438,11 @@ build_node() {
     ln -sf ../node/bin/npx  "$rootfs/usr/local/bin/npx"
 
     write_oci_config "$image_dir" "zlayer-node" \
-        '["PATH=/usr/local/node/bin:/usr/local/bin:/usr/bin:/bin"]'
+        '["PATH=/usr/local/node/bin:/usr/local/bin:/usr/bin:/bin"]' \
+        "$version"
 
-    create_layer_tar "$image_dir" "node"
-    echo "==> Node.js image ready: $rootfs"
+    create_layer_tar "$image_dir" "node-${version}"
+    echo "==> Node.js ${version} image ready: $rootfs"
 }
 
 # ---------------------------------------------------------------------------
@@ -326,13 +450,16 @@ build_node() {
 # ---------------------------------------------------------------------------
 
 build_python() {
-    ensure_base
-    echo "==> Building Python + uv toolchain image..."
-    local rootfs
-    rootfs="$(clone_base python)"
-    local image_dir="$BUILD_DIR/python"
+    local version="${1:-$PYTHON_VERSION}"
 
-    local uv_version="0.6.9"
+    ensure_base
+    echo "==> Building Python ${version} + uv toolchain image..."
+    local image_name="python-${version}"
+    local rootfs
+    rootfs="$(clone_base "$image_name")"
+    local image_dir="$BUILD_DIR/$image_name"
+
+    local uv_version="$UV_VERSION"
 
     # -- uv --
     echo "    Installing uv ${uv_version}..."
@@ -368,40 +495,39 @@ build_python() {
     fi
     rm -rf "$uv_tmp"
 
-    # -- python3 --
-    if command -v python3 &>/dev/null; then
-        echo "    Found local Python3, copying..."
-        local py_real
-        py_real="$(python3 -c "import sys; print(sys.prefix)")"
-        # Copy the framework/prefix into the rootfs
-        mkdir -p "$rootfs/usr/local/python"
-        # Copy bin, lib, include
-        for d in bin lib include; do
-            if [[ -d "$py_real/$d" ]]; then
-                cp -a "$py_real/$d" "$rootfs/usr/local/python/"
-            fi
-        done
-        # Symlinks
-        if [[ -f "$rootfs/usr/local/python/bin/python3" ]]; then
-            ln -sf ../python/bin/python3 "$rootfs/usr/local/bin/python3"
-            ln -sf ../python/bin/python3 "$rootfs/usr/local/bin/python"
-        fi
+    # -- python via uv --
+    echo "    Installing Python ${version} via uv..."
+    # Use uv to install the requested Python version into the rootfs
+    # uv python install downloads and manages Python versions
+    UV_PYTHON_INSTALL_DIR="$rootfs/usr/local/python" \
+        "$rootfs/usr/local/bin/uv" python install "$version" 2>/dev/null || true
+
+    # Find the installed python binary
+    local py_bin
+    py_bin="$(find "$rootfs/usr/local/python" -name "python${version}" -o -name "python3" 2>/dev/null | head -1)"
+    if [[ -n "$py_bin" ]]; then
+        # Create symlinks to the installed Python
+        local py_rel
+        py_rel="$(realpath --relative-to="$rootfs/usr/local/bin" "$py_bin" 2>/dev/null || echo "$py_bin")"
+        ln -sf "$py_rel" "$rootfs/usr/local/bin/python3" 2>/dev/null || true
+        ln -sf python3 "$rootfs/usr/local/bin/python"
     else
-        echo "    Python3 not found locally. uv can install Python on first use."
+        echo "    Python ${version} install via uv did not produce a binary, creating shim..."
         # Create a shim that uses uv to run python
-        cat > "$rootfs/usr/local/bin/python3" <<'PYSHIM'
+        cat > "$rootfs/usr/local/bin/python3" <<PYSHIM
 #!/bin/sh
-exec /usr/local/bin/uv run python3 "$@"
+exec /usr/local/bin/uv run --python ${version} python3 "\$@"
 PYSHIM
         chmod +x "$rootfs/usr/local/bin/python3"
         ln -sf python3 "$rootfs/usr/local/bin/python"
     fi
 
     write_oci_config "$image_dir" "zlayer-python" \
-        '["PATH=/usr/local/python/bin:/usr/local/bin:/usr/bin:/bin","UV_SYSTEM_PYTHON=1"]'
+        '["PATH=/usr/local/python/bin:/usr/local/bin:/usr/bin:/bin","UV_SYSTEM_PYTHON=1"]' \
+        "$version"
 
-    create_layer_tar "$image_dir" "python"
-    echo "==> Python image ready: $rootfs"
+    create_layer_tar "$image_dir" "python-${version}"
+    echo "==> Python ${version} image ready: $rootfs"
 }
 
 # ---------------------------------------------------------------------------
@@ -409,15 +535,20 @@ PYSHIM
 # ---------------------------------------------------------------------------
 
 build_deno() {
+    local version="${1:-$DENO_VERSION}"
+    # Resolve partial version (e.g. "2.2" -> "v2.2.4")
+    version="$(resolve_deno_patch "$version")"
+    # Ensure the version starts with "v"
+    [[ "$version" =~ ^v ]] || version="v${version}"
+
     ensure_base
-    echo "==> Building Deno toolchain image..."
+    echo "==> Building Deno ${version} toolchain image..."
+    local image_name="deno-${version}"
     local rootfs
-    rootfs="$(clone_base deno)"
-    local image_dir="$BUILD_DIR/deno"
+    rootfs="$(clone_base "$image_name")"
+    local image_dir="$BUILD_DIR/$image_name"
 
-    local deno_version="v2.2.4"
-
-    echo "    Installing Deno ${deno_version}..."
+    echo "    Installing Deno ${version}..."
     local deno_arch
     if [[ "$ARCH" == "arm64" ]]; then
         deno_arch="aarch64"
@@ -425,8 +556,8 @@ build_deno() {
         deno_arch="x86_64"
     fi
     local deno_zip="deno-${deno_arch}-apple-darwin.zip"
-    local deno_url="https://github.com/denoland/deno/releases/download/${deno_version}/${deno_zip}"
-    local deno_dl="$BUILD_DIR/.downloads/${deno_zip}"
+    local deno_url="https://github.com/denoland/deno/releases/download/${version}/${deno_zip}"
+    local deno_dl="$BUILD_DIR/.downloads/deno-${version}-${deno_arch}.zip"
     mkdir -p "$BUILD_DIR/.downloads"
     if [[ ! -f "$deno_dl" ]]; then
         curl -fSL -o "$deno_dl" "$deno_url"
@@ -440,10 +571,11 @@ build_deno() {
     rm -rf "$deno_tmp"
 
     write_oci_config "$image_dir" "zlayer-deno" \
-        '["PATH=/usr/local/bin:/usr/bin:/bin","DENO_DIR=/var/tmp/deno"]'
+        '["PATH=/usr/local/bin:/usr/bin:/bin","DENO_DIR=/var/tmp/deno"]' \
+        "$version"
 
-    create_layer_tar "$image_dir" "deno"
-    echo "==> Deno image ready: $rootfs"
+    create_layer_tar "$image_dir" "deno-${version}"
+    echo "==> Deno ${version} image ready: $rootfs"
 }
 
 # ---------------------------------------------------------------------------
@@ -451,15 +583,20 @@ build_deno() {
 # ---------------------------------------------------------------------------
 
 build_bun() {
+    local version="${1:-$BUN_VERSION}"
+    # Resolve partial version (e.g. "1.2" -> "v1.2.5")
+    version="$(resolve_bun_patch "$version")"
+    # Ensure the version starts with "v"
+    [[ "$version" =~ ^v ]] || version="v${version}"
+
     ensure_base
-    echo "==> Building Bun toolchain image..."
+    echo "==> Building Bun ${version} toolchain image..."
+    local image_name="bun-${version}"
     local rootfs
-    rootfs="$(clone_base bun)"
-    local image_dir="$BUILD_DIR/bun"
+    rootfs="$(clone_base "$image_name")"
+    local image_dir="$BUILD_DIR/$image_name"
 
-    local bun_version="v1.2.5"
-
-    echo "    Installing Bun ${bun_version}..."
+    echo "    Installing Bun ${version}..."
     local bun_arch
     if [[ "$ARCH" == "arm64" ]]; then
         bun_arch="aarch64"
@@ -467,8 +604,8 @@ build_bun() {
         bun_arch="x64"
     fi
     local bun_zip="bun-darwin-${bun_arch}.zip"
-    local bun_url="https://github.com/oven-sh/bun/releases/download/bun-${bun_version}/${bun_zip}"
-    local bun_dl="$BUILD_DIR/.downloads/${bun_zip}"
+    local bun_url="https://github.com/oven-sh/bun/releases/download/bun-${version}/${bun_zip}"
+    local bun_dl="$BUILD_DIR/.downloads/bun-${version}-${bun_arch}.zip"
     mkdir -p "$BUILD_DIR/.downloads"
     if [[ ! -f "$bun_dl" ]]; then
         curl -fSL -o "$bun_dl" "$bun_url"
@@ -498,20 +635,21 @@ build_bun() {
     rm -rf "$bun_tmp"
 
     write_oci_config "$image_dir" "zlayer-bun" \
-        '["PATH=/usr/local/bin:/usr/bin:/bin"]'
+        '["PATH=/usr/local/bin:/usr/bin:/bin"]' \
+        "$version"
 
-    create_layer_tar "$image_dir" "bun"
-    echo "==> Bun image ready: $rootfs"
+    create_layer_tar "$image_dir" "bun-${version}"
+    echo "==> Bun ${version} image ready: $rootfs"
 }
 
 # ---------------------------------------------------------------------------
-# all
+# all -- builds latest of everything in parallel
 # ---------------------------------------------------------------------------
 
 build_all() {
     build_base
 
-    echo "==> Building all toolchain images in parallel..."
+    echo "==> Building all toolchain images (latest) in parallel..."
 
     local pids=()
 
@@ -563,7 +701,7 @@ build_all() {
 # ---------------------------------------------------------------------------
 
 usage() {
-    echo "Usage: $0 <subcommand>"
+    echo "Usage: $0 <subcommand> [version ...]"
     echo ""
     echo "Subcommands:"
     echo "  base     Build the base rootfs with macOS system binaries"
@@ -573,7 +711,17 @@ usage() {
     echo "  python   Build Python + uv toolchain image"
     echo "  deno     Build Deno toolchain image"
     echo "  bun      Build Bun toolchain image"
-    echo "  all      Build base + all toolchain images"
+    echo "  all      Build base + all toolchain images (latest)"
+    echo ""
+    echo "Multi-version builds:"
+    echo "  $0 golang 1.22 1.23"
+    echo "  $0 node 18 20 22 24"
+    echo "  $0 python 3.10 3.11 3.12 3.13 3.14"
+    echo ""
+    echo "Environment overrides:"
+    echo "  GO_VERSION=1.22.0 $0 golang"
+    echo "  NODE_VERSION=22.14.0 $0 node"
+    echo "  PYTHON_VERSION=3.12 $0 python"
     echo ""
     echo "Output directory: $BUILD_DIR/"
 }
@@ -583,15 +731,50 @@ if [[ $# -lt 1 ]]; then
     exit 1
 fi
 
+# Run versions: if extra args are given, iterate over them; otherwise use default.
+run_versions() {
+    local builder="$1"
+    shift
+    if [[ $# -gt 0 ]]; then
+        for v in "$@"; do
+            "$builder" "$v"
+        done
+    else
+        "$builder"
+    fi
+}
+
 case "$1" in
-    base)    build_base ;;
-    golang)  build_golang ;;
-    rust)    build_rust ;;
-    node)    build_node ;;
-    python)  build_python ;;
-    deno)    build_deno ;;
-    bun)     build_bun ;;
-    all)     build_all ;;
+    base)
+        build_base
+        ;;
+    golang)
+        shift
+        run_versions build_golang "$@"
+        ;;
+    rust)
+        shift
+        run_versions build_rust "$@"
+        ;;
+    node)
+        shift
+        run_versions build_node "$@"
+        ;;
+    python)
+        shift
+        run_versions build_python "$@"
+        ;;
+    deno)
+        shift
+        run_versions build_deno "$@"
+        ;;
+    bun)
+        shift
+        run_versions build_bun "$@"
+        ;;
+    all)
+        build_all
+        ;;
     -h|--help|help)
         usage
         exit 0

@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Multi-version builds in `scripts/build-macos-images.sh` -- e.g.
+  `./scripts/build-macos-images.sh node 18 20 22 24` builds Node 18, 20, 22, 24.
+  Partial versions auto-resolve to latest patch via upstream APIs. Environment
+  variable overrides (`GO_VERSION`, `NODE_VERSION`, `PYTHON_VERSION`, etc.) take
+  precedence over API resolution. Output directories are now versioned
+  (`$BUILD_DIR/golang-1.23.6/rootfs/`). OCI config.json includes version labels.
+
 ### Changed
 - Extracted buildah build orchestration logic from `ImageBuilder::build()` into
   `BuildahBackend::build_image()`. The `build()` method now simply parses the

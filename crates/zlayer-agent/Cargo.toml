@@ -90,6 +90,7 @@ libcontainer = "0.5"
 
 # macOS-specific dependencies for sandbox and VM runtimes
 [target.'cfg(target_os = "macos")'.dependencies]
+dirs = "5"
 libloading = "0.8"
 
 [dev-dependencies]
