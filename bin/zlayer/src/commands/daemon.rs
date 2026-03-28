@@ -719,6 +719,7 @@ async fn wait_for_daemon_ready(data_dir: &Path, timeout_secs: u64) -> Result<()>
     // Daemon didn't come up — surface the error from the log
     let log_dir = crate::cli::default_log_dir(data_dir);
     let log_path = log_dir.join("daemon.log");
+    #[allow(unused_mut)]
     let mut tail = if log_path.exists() {
         std::fs::read_to_string(&log_path)
             .ok()
