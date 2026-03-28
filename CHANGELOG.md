@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-03-28]
+
+### Fixed
+- Daemon startup failures now produce diagnostic output instead of
+  "no log output found at /var/log/zlayer/daemon.log". The systemd unit
+  template now redirects stdout/stderr to the daemon log file via
+  `StandardOutput=append:` and `StandardError=append:` directives. The log
+  directory is pre-created before starting the service. On timeout,
+  `wait_for_daemon_ready()` falls back to querying journalctl and provides
+  a diagnostic hint.
+
 ## [2026-03-27]
 
 ### Fixed
