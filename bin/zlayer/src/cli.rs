@@ -3,16 +3,15 @@ use std::path::PathBuf;
 
 /// Return the platform-appropriate default data directory for `ZLayer`.
 ///
-/// - macOS: `~/.local/share/zlayer` (user-writable without root)
-/// - Linux: `/var/lib/zlayer` (traditional, typically runs as root)
+/// - macOS / Linux: `~/.zlayer`
 /// - Windows: `%LOCALAPPDATA%\ZLayer` or `C:\ProgramData\ZLayer`
 pub(crate) fn default_data_dir() -> PathBuf {
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join(".local/share/zlayer")
+            PathBuf::from(home).join(".zlayer")
         } else {
-            PathBuf::from("/var/lib/zlayer")
+            PathBuf::from("/tmp/.zlayer")
         }
     }
     #[cfg(target_os = "windows")]
@@ -25,7 +24,11 @@ pub(crate) fn default_data_dir() -> PathBuf {
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        PathBuf::from("/var/lib/zlayer")
+        if let Some(home) = std::env::var_os("HOME") {
+            PathBuf::from(home).join(".zlayer")
+        } else {
+            PathBuf::from("/tmp/.zlayer")
+        }
     }
 }
 

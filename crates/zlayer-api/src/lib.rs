@@ -70,6 +70,8 @@ pub use handlers::tunnels::{
     TunnelApiState, TunnelStatus, TunnelSummary,
 };
 
+pub use axum::Extension;
+
 // Re-export storage types
 pub use storage::{
     DeploymentStatus, DeploymentStorage, InMemoryStorage, SqlxStorage, StorageError,

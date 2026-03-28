@@ -1028,6 +1028,89 @@ LOGO = r"""
 """
 
 
+def setup_container_runtime(use_sudo: bool = False) -> None:
+    """Install container runtime dependencies on Linux.
+
+    Checks for libseccomp, cgroups v2, and creates zlayer state directories.
+    """
+    if platform.system().lower() != "linux":
+        return
+
+    write()
+    info("Setting up container runtime dependencies...")
+
+    # Check for libseccomp (required by bundled libcontainer/youki)
+    has_libseccomp = False
+    try:
+        result = subprocess.run(
+            ["ldconfig", "-p"],
+            capture_output=True, text=True, timeout=10,
+        )
+        has_libseccomp = "libseccomp" in result.stdout
+    except Exception:
+        pass
+
+    if not has_libseccomp:
+        info("Installing libseccomp (required for container runtime)...")
+        pkg_cmds = [
+            (["apt-get"], ["apt-get", "update", "-qq"], ["apt-get", "install", "-y", "-qq", "libseccomp2"]),
+            (["dnf"], None, ["dnf", "install", "-y", "libseccomp"]),
+            (["yum"], None, ["yum", "install", "-y", "libseccomp"]),
+            (["pacman"], None, ["pacman", "-S", "--noconfirm", "libseccomp"]),
+            (["apk"], None, ["apk", "add", "libseccomp"]),
+            (["zypper"], None, ["zypper", "install", "-y", "libseccomp2"]),
+        ]
+        installed = False
+        for check_cmd, update_cmd, install_cmd in pkg_cmds:
+            if shutil.which(check_cmd[0]):
+                try:
+                    if update_cmd:
+                        sudo_cmd = ["sudo"] + update_cmd if use_sudo else update_cmd
+                        subprocess.run(sudo_cmd, check=True, capture_output=True, timeout=120)
+                    sudo_install = ["sudo"] + install_cmd if use_sudo else install_cmd
+                    subprocess.run(sudo_install, check=True, capture_output=True, timeout=120)
+                    success("libseccomp installed.")
+                    installed = True
+                except Exception as e:
+                    warn("Failed to install libseccomp via {}: {}".format(check_cmd[0], e))
+                break
+        if not installed:
+            warn("Could not install libseccomp automatically.")
+            warn("Please install it manually for your distribution.")
+            warn("The container runtime will not work without it.")
+    else:
+        success("libseccomp found.")
+
+    # Verify cgroups v2
+    if os.path.exists("/sys/fs/cgroup/cgroup.controllers"):
+        success("cgroups v2 found.")
+    else:
+        warn("cgroups v2 not detected at /sys/fs/cgroup/")
+        warn("The container runtime requires cgroups v2. Check your kernel configuration.")
+
+    # Create container runtime directories
+    info("Setting up container runtime directories...")
+    dirs = [
+        "/var/lib/zlayer/containers",
+        "/var/lib/zlayer/rootfs",
+        "/var/lib/zlayer/bundles",
+        "/var/lib/zlayer/cache",
+        "/var/lib/zlayer/volumes",
+    ]
+    for d in dirs:
+        try:
+            if use_sudo:
+                subprocess.run(
+                    ["sudo", "mkdir", "-p", d],
+                    check=True, capture_output=True, timeout=10,
+                )
+            else:
+                os.makedirs(d, exist_ok=True)
+        except Exception as e:
+            warn("Could not create {}: {}".format(d, e))
+    success("Container runtime directories ready.")
+
+
 def print_header() -> None:
     """Print the ZLayer logo and header."""
     write()
@@ -1433,7 +1516,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     if not installed_paths:
         fatal("No binaries were installed.")
 
-    # Step 5: PATH management
+    # Step 5: Container runtime setup (Linux only)
+    setup_container_runtime(use_sudo=use_sudo)
+
+    # Step 6: PATH management
     if not args.no_modify_path and not is_on_path(install_dir):
         write()
         if args.yes or not _is_interactive():

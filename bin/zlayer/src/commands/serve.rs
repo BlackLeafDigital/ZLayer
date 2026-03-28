@@ -693,6 +693,16 @@ pub(crate) async fn serve(
     };
     router = router.nest("/api/v1/cron", build_cron_routes(cron_state));
 
+    // Re-apply the auth extension layer AFTER all .nest() calls so that
+    // routes added after the base router (containers, jobs, cron, build, etc.)
+    // also receive the AuthState extension. In Axum, layers applied before
+    // .nest() do not propagate to routes nested afterwards.
+    let auth_state = zlayer_api::AuthState {
+        jwt_secret: api_config.jwt_secret.clone(),
+        credential_store: api_config.credential_store.clone(),
+    };
+    router = router.layer(zlayer_api::Extension(auth_state));
+
     info!(
         bind = %bind_addr,
         socket = %socket_path,

@@ -42,7 +42,17 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
+use serde::Deserialize;
+
 use crate::backend::BuildBackend;
+
+/// Minimal struct to read `source_hash` from a cached image's `config.json`.
+/// Separate from `SandboxImageConfig` which is macOS-only.
+#[derive(Deserialize)]
+struct CachedImageConfig {
+    #[serde(default)]
+    source_hash: Option<String>,
+}
 use crate::buildah::{BuildahCommand, BuildahExecutor};
 use crate::builder::{BuiltImage, ImageBuilder};
 use crate::error::{BuildError, Result};
@@ -571,6 +581,45 @@ fn apply_build_file(builder: ImageBuilder, file_path: &Path) -> ImageBuilder {
     }
 }
 
+/// Compute a SHA-256 hash of a file's contents for content-based cache invalidation.
+///
+/// Returns `None` if the file cannot be read.
+async fn compute_file_hash(path: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+
+    let content = tokio::fs::read(path).await.ok()?;
+    let mut hasher = Sha256::new();
+    hasher.update(&content);
+    Some(format!("{:x}", hasher.finalize()))
+}
+
+/// Sanitize an image reference into a filesystem-safe directory name.
+///
+/// Mirrors the logic in `sandbox_builder::sanitize_image_name`.
+fn sanitize_image_name_for_cache(image: &str) -> String {
+    image.replace(['/', ':', '@'], "_")
+}
+
+/// Check if a cached sandbox image at `data_dir/images/{sanitized}/config.json`
+/// has a `source_hash` matching `expected_hash`.
+///
+/// Returns the sanitized image name if a match is found.
+async fn check_cached_image_hash(
+    data_dir: &Path,
+    tag: &str,
+    expected_hash: &str,
+) -> Option<String> {
+    let sanitized = sanitize_image_name_for_cache(tag);
+    let config_path = data_dir.join("images").join(&sanitized).join("config.json");
+    let data = tokio::fs::read_to_string(&config_path).await.ok()?;
+    let config: CachedImageConfig = serde_json::from_str(&data).ok()?;
+    if config.source_hash.as_deref() == Some(expected_hash) {
+        Some(sanitized)
+    } else {
+        None
+    }
+}
+
 /// Build a single image from the pipeline
 ///
 /// This is extracted as a separate function to make it easier to spawn
@@ -591,12 +640,50 @@ async fn build_single_image(
     let context = base_dir.join(&image_config.context);
     let file_path = base_dir.join(&image_config.file);
 
+    // Content-based cache invalidation: hash the build file and check if the
+    // output image was already built from identical source content.
+    let file_hash = compute_file_hash(&file_path).await;
+    if let Some(ref hash) = file_hash {
+        let data_dir = dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("/tmp"))
+            .join(".zlayer");
+
+        let expanded_tags: Vec<String> = image_config
+            .tags
+            .iter()
+            .map(|t| expand_tag_with_vars(t, &pipeline.vars))
+            .collect();
+
+        // Check the first tag — if it has a cached image with matching hash, skip the build
+        if let Some(first_tag) = expanded_tags.first() {
+            if let Some(cached_id) = check_cached_image_hash(&data_dir, first_tag, hash).await {
+                info!(
+                    "[{}] Skipping build — cached image hash matches ({})",
+                    name, cached_id
+                );
+                return Ok(BuiltImage {
+                    image_id: cached_id,
+                    tags: expanded_tags,
+                    layer_count: 1,
+                    size: 0,
+                    build_time_ms: 0,
+                    is_manifest: false,
+                });
+            }
+        }
+    }
+
     let effective_backend: Arc<dyn BuildBackend> = backend
         .unwrap_or_else(|| Arc::new(crate::backend::BuildahBackend::with_executor(executor)));
     let mut builder = ImageBuilder::with_backend(&context, effective_backend)?;
 
     // Determine if this is a ZImagefile or Dockerfile based on extension/name
     builder = apply_build_file(builder, &file_path);
+
+    // Pass the source hash so the sandbox builder stores it for future cache checks
+    if let Some(hash) = file_hash {
+        builder = builder.source_hash(hash);
+    }
 
     // Set platform if specified
     if let Some(plat) = platform {

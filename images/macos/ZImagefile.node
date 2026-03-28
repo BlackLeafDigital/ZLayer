@@ -1,28 +1,7 @@
-base: zlayer/base:latest
+base: ghcr.io/blackleafdigital/zlayer/base:latest
 
 steps:
-  - run: |
-      NODE_DIR="$(dirname "$(dirname "$(which node 2>/dev/null)")" 2>/dev/null || echo '')"
-      if [ -n "$NODE_DIR" ] && [ -d "$NODE_DIR/bin/node" ]; then
-        mkdir -p usr/local/node
-        cp -R "$NODE_DIR"/* usr/local/node/ 2>/dev/null || true
-      else
-        ARCH="$(uname -m)"
-        [ "$ARCH" = "arm64" ] && NODE_ARCH="arm64" || NODE_ARCH="x64"
-        curl -fsSL "https://nodejs.org/dist/v22.14.0/node-v22.14.0-darwin-${NODE_ARCH}.tar.gz" | tar -xz -C usr/local/ --strip-components=1
-        # nodejs tarball extracts directly with bin/, lib/, etc.
-        # Rename to node subdir
-        mkdir -p usr/local/node
-        for d in bin lib include share; do
-          [ -d "usr/local/$d" ] && mv "usr/local/$d" "usr/local/node/$d" 2>/dev/null || true
-        done
-      fi
-
-  - run: |
-      mkdir -p usr/local/bin
-      for bin in node npm npx; do
-        [ -f "usr/local/node/bin/$bin" ] && ln -sf ../node/bin/$bin usr/local/bin/$bin
-      done
+  - run: apt-get install -y nodejs
 
 labels:
   org.opencontainers.image.title: "ZLayer macOS Node.js"

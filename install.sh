@@ -121,24 +121,60 @@ case ":${PATH}:" in
         ;;
 esac
 
+# --- Linux: install container runtime dependencies ---
+if [ "$OS" = "linux" ]; then
+    echo ""
+    echo "Checking container runtime dependencies..."
+
+    # libseccomp is required by the bundled container runtime (libcontainer/youki)
+    if ! ldconfig -p 2>/dev/null | grep -q libseccomp; then
+        echo "Installing libseccomp (required for container runtime)..."
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq libseccomp2
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y libseccomp
+        elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y libseccomp
+        elif command -v pacman >/dev/null 2>&1; then
+            sudo pacman -S --noconfirm libseccomp
+        elif command -v apk >/dev/null 2>&1; then
+            sudo apk add libseccomp
+        elif command -v zypper >/dev/null 2>&1; then
+            sudo zypper install -y libseccomp2
+        else
+            echo "Warning: Could not install libseccomp automatically."
+            echo "Please install it manually for your distribution."
+            echo "The container runtime will not work without it."
+        fi
+    else
+        echo "libseccomp found."
+    fi
+
+    # Verify cgroups v2 (required by libcontainer)
+    if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+        echo "Warning: cgroups v2 not detected at /sys/fs/cgroup/"
+        echo "The container runtime requires cgroups v2. Check your kernel configuration."
+    else
+        echo "cgroups v2 found."
+    fi
+
+    # Create container runtime directories
+    echo "Setting up container runtime directories..."
+    sudo mkdir -p /var/lib/zlayer/containers /var/lib/zlayer/rootfs \
+        /var/lib/zlayer/bundles /var/lib/zlayer/cache /var/lib/zlayer/volumes
+fi
+
 # --- Install and start service ---
 SKIP_SERVICE="${ZLAYER_NO_SERVICE:-}"
 if [ -z "$SKIP_SERVICE" ]; then
     echo ""
-    echo "Starting zlayer daemon..."
-    "${INSTALL_DIR}/${BINARY}" daemon install >/dev/null 2>&1 || true
-
+    echo "Installing zlayer daemon..."
     case "$OS" in
         linux)
-            if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet zlayer 2>/dev/null; then
-                echo "zlayer service started (systemd)"
-            fi
+            sudo "${INSTALL_DIR}/${BINARY}" daemon install
             ;;
         darwin)
-            PLIST="com.zlayer.daemon"
-            if launchctl list "$PLIST" >/dev/null 2>&1; then
-                echo "zlayer service started (launchd: ${PLIST})"
-            fi
+            "${INSTALL_DIR}/${BINARY}" daemon install
             ;;
     esac
 fi

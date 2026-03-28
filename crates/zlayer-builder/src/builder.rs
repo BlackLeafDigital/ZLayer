@@ -349,6 +349,11 @@ pub struct BuildOptions {
     /// Target platform for the build (e.g., "linux/amd64", "linux/arm64").
     /// When set, `buildah from` pulls the platform-specific image variant.
     pub platform: Option<String>,
+    /// SHA-256 hash of the source Dockerfile/ZImagefile content.
+    ///
+    /// When set, the sandbox builder can skip a rebuild if the cached image
+    /// was produced from identical source content (content-based invalidation).
+    pub source_hash: Option<String>,
 }
 
 impl Default for BuildOptions {
@@ -375,6 +380,7 @@ impl Default for BuildOptions {
             default_cache_mounts: Vec::new(),
             retries: 0,
             platform: None,
+            source_hash: None,
         }
     }
 }
@@ -962,6 +968,16 @@ impl ImageBuilder {
     #[must_use]
     pub fn platform(mut self, platform: impl Into<String>) -> Self {
         self.options.platform = Some(platform.into());
+        self
+    }
+
+    /// Set a pre-computed source hash for content-based cache invalidation.
+    ///
+    /// When set, the sandbox builder can skip a full rebuild if the cached
+    /// image was produced from identical source content.
+    #[must_use]
+    pub fn source_hash(mut self, hash: impl Into<String>) -> Self {
+        self.options.source_hash = Some(hash.into());
         self
     }
 
