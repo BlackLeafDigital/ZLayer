@@ -2,9 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [2026-03-27]
 
 ### Fixed
+- Install scripts (`install.sh`, `install.py`) now install `libseccomp` runtime
+  library, verify cgroups v2, and create `/var/lib/zlayer/` state directories.
+  Previously, fresh installs would fail to start containers because the bundled
+  libcontainer runtime requires libseccomp at runtime but nothing installed it.
 - Container, job, cron, and build API routes were missing the `AuthState`
   extension because it was applied inside `build_router_with_deployment_state()`
   before routes were nested in `serve.rs`. The `Extension(auth_state)` layer is
