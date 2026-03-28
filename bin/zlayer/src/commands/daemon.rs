@@ -423,6 +423,7 @@ fn systemctl_args(base_args: &[&str]) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines)]
 async fn install(
     data_dir: &Path,
     no_start: bool,
@@ -466,6 +467,9 @@ RestartSec=5
 LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
+LogsDirectory=zlayer
+StandardOutput=append:/var/log/zlayer/daemon.log
+StandardError=append:/var/log/zlayer/daemon.log
 {env_line}
 [Install]
 WantedBy=multi-user.target
@@ -505,6 +509,14 @@ WantedBy=multi-user.target
         bail!("systemctl enable failed: {stderr}");
     }
 
+    // Pre-create log directory so StandardOutput=append: works even on
+    // first start before init_daemon() runs, and on older systemd that
+    // doesn't support LogsDirectory.
+    let log_dir = crate::cli::default_log_dir(data_dir);
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("Warning: could not create {}: {e}", log_dir.display());
+    }
+
     if !no_start {
         // Write spawner PID so the new daemon's cleanup_stale_daemon() won't
         // kill this CLI process while we wait for readiness.
@@ -528,6 +540,8 @@ WantedBy=multi-user.target
             Ok(()) => {
                 let _ = std::fs::remove_file(&spawner_pid_path);
                 println!(" started via systemd");
+                println!("  Logs: {}", log_dir.join("daemon.log").display());
+                println!("  Stop: zlayer daemon stop");
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&spawner_pid_path);
@@ -593,7 +607,10 @@ async fn start(data_dir: &Path) -> Result<()> {
     match wait_for_daemon_ready(data_dir, 15).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
+            let log_dir = crate::cli::default_log_dir(data_dir);
             println!(" started");
+            println!("  Logs: {}", log_dir.join("daemon.log").display());
+            println!("  Stop: zlayer daemon stop");
         }
         Err(e) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
@@ -686,6 +703,7 @@ async fn status(data_dir: &Path) -> Result<()> {
 /// phases complete successfully. If it crashes during init, the file is never
 /// created. On timeout, the last 20 lines of `daemon.log` are included in the
 /// error to surface the actual failure reason.
+#[allow(unsafe_code)]
 async fn wait_for_daemon_ready(data_dir: &Path, timeout_secs: u64) -> Result<()> {
     let metadata_path = data_dir.join("daemon.json");
     let poll_interval = std::time::Duration::from_millis(250);
@@ -701,7 +719,7 @@ async fn wait_for_daemon_ready(data_dir: &Path, timeout_secs: u64) -> Result<()>
     // Daemon didn't come up — surface the error from the log
     let log_dir = crate::cli::default_log_dir(data_dir);
     let log_path = log_dir.join("daemon.log");
-    let tail = if log_path.exists() {
+    let mut tail = if log_path.exists() {
         std::fs::read_to_string(&log_path)
             .ok()
             .map(|content| {
@@ -714,7 +732,40 @@ async fn wait_for_daemon_ready(data_dir: &Path, timeout_secs: u64) -> Result<()>
         String::new()
     };
 
+    // If no log file output, try journalctl as a fallback (Linux/systemd)
+    #[cfg(target_os = "linux")]
     if tail.is_empty() {
+        let is_root = unsafe { libc::geteuid() } == 0;
+        let mut jctl_args = vec!["--no-pager", "-n", "20", "-u", "zlayer", "--output", "cat"];
+        if !is_root {
+            jctl_args.insert(0, "--user");
+        }
+        if let Ok(output) = std::process::Command::new("journalctl")
+            .args(&jctl_args)
+            .output()
+        {
+            let journal = String::from_utf8_lossy(&output.stdout);
+            if !journal.trim().is_empty() {
+                tail = journal.into_owned();
+            }
+        }
+    }
+
+    if tail.is_empty() {
+        #[cfg(target_os = "linux")]
+        {
+            let is_root = unsafe { libc::geteuid() } == 0;
+            let jctl_hint = if is_root {
+                "journalctl -u zlayer --no-pager -n 50"
+            } else {
+                "journalctl --user -u zlayer --no-pager -n 50"
+            };
+            bail!(
+                "Daemon failed to start within {timeout_secs}s (no log output found).\n\
+                 Check: {jctl_hint}"
+            );
+        }
+        #[cfg(not(target_os = "linux"))]
         bail!(
             "Daemon failed to start within {timeout_secs}s (no log output found at {})",
             log_path.display()

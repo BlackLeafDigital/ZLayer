@@ -185,6 +185,9 @@ LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
 Environment=ZLAYER_DATA_DIR=/var/lib/zlayer
+LogsDirectory=zlayer
+StandardOutput=append:/var/log/zlayer/daemon.log
+StandardError=append:/var/log/zlayer/daemon.log
 
 [Install]
 WantedBy=multi-user.target"
@@ -193,11 +196,13 @@ WantedBy=multi-user.target"
                     printf '%s\n' "$UNIT_CONTENT" > "$UNIT_FILE"
                     systemctl daemon-reload
                     systemctl enable zlayer >/dev/null 2>&1
+                    mkdir -p /var/log/zlayer
                     systemctl start zlayer
                 elif command -v sudo >/dev/null 2>&1; then
                     printf '%s\n' "$UNIT_CONTENT" | sudo tee "$UNIT_FILE" >/dev/null
                     sudo systemctl daemon-reload
                     sudo systemctl enable zlayer >/dev/null 2>&1
+                    sudo mkdir -p /var/log/zlayer
                     sudo systemctl start zlayer
                 else
                     echo "Warning: Cannot install systemd service (no write access to /etc/systemd/system)"

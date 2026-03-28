@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- Daemon startup failures now produce diagnostic output instead of
+  "no log output found at /var/log/zlayer/daemon.log". Both systemd unit
+  templates (install.sh and `zlayer daemon install`) now redirect
+  stdout/stderr to the daemon log file via `StandardOutput=append:` and
+  `StandardError=append:` directives. The log directory is pre-created
+  before starting the service. On timeout, `wait_for_daemon_ready()` falls
+  back to querying journalctl and provides a diagnostic hint.
+
 ### Added
 - Multi-version builds in `scripts/build-macos-images.sh` -- e.g.
   `./scripts/build-macos-images.sh node 18 20 22 24` builds Node 18, 20, 22, 24.
