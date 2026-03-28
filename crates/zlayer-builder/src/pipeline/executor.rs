@@ -42,7 +42,17 @@ use std::sync::Arc;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
+use serde::Deserialize;
+
 use crate::backend::BuildBackend;
+
+/// Minimal struct to read `source_hash` from a cached image's `config.json`.
+/// Separate from `SandboxImageConfig` which is macOS-only.
+#[derive(Deserialize)]
+struct CachedImageConfig {
+    #[serde(default)]
+    source_hash: Option<String>,
+}
 use crate::buildah::{BuildahCommand, BuildahExecutor};
 use crate::builder::{BuiltImage, ImageBuilder};
 use crate::error::{BuildError, Result};
@@ -602,7 +612,7 @@ async fn check_cached_image_hash(
     let sanitized = sanitize_image_name_for_cache(tag);
     let config_path = data_dir.join("images").join(&sanitized).join("config.json");
     let data = tokio::fs::read_to_string(&config_path).await.ok()?;
-    let config: crate::sandbox_builder::SandboxImageConfig = serde_json::from_str(&data).ok()?;
+    let config: CachedImageConfig = serde_json::from_str(&data).ok()?;
     if config.source_hash.as_deref() == Some(expected_hash) {
         Some(sanitized)
     } else {
