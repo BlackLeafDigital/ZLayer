@@ -83,15 +83,15 @@ jobs:
           VERSION="${{ needs.resolve-version.outputs.version || inputs.version }}"
           if [ -z "$VERSION" ]; then echo "ERROR: No version!"; exit 1; fi
           echo "Setting version to: ${VERSION}"
-          sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" Cargo.toml
+          sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           find crates bin -name Cargo.toml -exec sed -i "s/^version = \"0.0.0-dev\"/version = \"${VERSION}\"/" {} +
-          sed -i "s/version = \"0.0.0-dev\", package/version = \"${VERSION}\", package/" Cargo.toml
           cargo generate-lockfile
       - name: Publish crates to Forgejo
         if: steps.check.outputs.completed != 'true'
         run: |
           # Topological publish order (leaves first, dependents after)
           CRATES="
+            zlayer-paths-zql
             zlayer-spec-zql
             zlayer-observability-zql
             zlayer-init-actions-zql

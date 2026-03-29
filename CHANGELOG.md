@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- CI version substitution now uses global replace in `zdb-publish.yml`, fixing
+  `zlayer-paths` version not being updated (caused `^0.0.0-dev` vs `0.2.45` mismatch).
+- `zlayer-paths` crate renamed to `zlayer-paths-zql`, made publishable, and added to
+  all CI publish lists so dependent crates can resolve it from the Forgejo registry.
 - Daemon startup failures now produce diagnostic output instead of
   "no log output found at /var/log/zlayer/daemon.log". Both systemd unit
   templates (install.sh and `zlayer daemon install`) now redirect

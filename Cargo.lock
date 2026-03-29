@@ -10103,7 +10103,7 @@ dependencies = [
  "zlayer-core-zql",
  "zlayer-init-actions-zql",
  "zlayer-overlay-zql",
- "zlayer-paths",
+ "zlayer-paths-zql",
  "zlayer-proxy-zql",
  "zlayer-registry-zql",
  "zlayer-scheduler-zql",
@@ -10188,7 +10188,7 @@ dependencies = [
  "tracing",
  "xz2",
  "zip 2.4.2",
- "zlayer-paths",
+ "zlayer-paths-zql",
  "zlayer-registry-zql",
  "zlayer-tui-zql",
 ]
@@ -10223,7 +10223,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "tracing",
- "zlayer-paths",
+ "zlayer-paths-zql",
  "zlayer-spec-zql",
 ]
 
@@ -10319,7 +10319,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "zlayer-paths"
+name = "zlayer-paths-zql"
 version = "0.0.0-dev"
 dependencies = [
  "nix 0.31.2",
@@ -10352,7 +10352,7 @@ dependencies = [
  "tower",
  "tracing",
  "x509-parser",
- "zlayer-paths",
+ "zlayer-paths-zql",
  "zlayer-spec-zql",
 ]
 
@@ -10396,7 +10396,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "zlayer-paths",
+ "zlayer-paths-zql",
  "zql",
  "zstd",
 ]
@@ -10427,7 +10427,7 @@ dependencies = [
  "wiremock",
  "zlayer-consensus-zql",
  "zlayer-core-zql",
- "zlayer-paths",
+ "zlayer-paths-zql",
  "zlayer-spec-zql",
  "zql",
 ]
@@ -10452,7 +10452,7 @@ dependencies = [
  "tracing",
  "vaultrs",
  "zeroize",
- "zlayer-paths",
+ "zlayer-paths-zql",
  "zql",
 ]
 
@@ -10489,7 +10489,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
- "zlayer-paths",
+ "zlayer-paths-zql",
  "zql",
  "zstd",
 ]
@@ -10565,7 +10565,7 @@ dependencies = [
  "tokio",
  "tracing",
  "winreg",
- "zlayer-paths",
+ "zlayer-paths-zql",
 ]
 
 [[package]]
@@ -10606,7 +10606,7 @@ dependencies = [
  "zlayer-init-actions-zql",
  "zlayer-observability-zql",
  "zlayer-overlay-zql",
- "zlayer-paths",
+ "zlayer-paths-zql",
  "zlayer-proxy-zql",
  "zlayer-registry-zql",
  "zlayer-scheduler-zql",

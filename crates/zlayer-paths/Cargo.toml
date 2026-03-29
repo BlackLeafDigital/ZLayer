@@ -1,7 +1,6 @@
 [package]
-name = "zlayer-paths"
+name = "zlayer-paths-zql"
 description = "Centralized filesystem path resolution for ZLayer"
-publish = false
 version.workspace = true
 edition.workspace = true
 license.workspace = true
