@@ -297,6 +297,7 @@ jobs:
           }
 
           declare -A CRATE_TAGS=(
+            ["zlayer-paths"]="paths"
             ["zlayer-spec"]="spec"
             ["zlayer-observability"]="obs"
             ["zlayer-storage"]="storage"
@@ -315,7 +316,7 @@ jobs:
           # Wave 1 (no internal deps): spec, observability, storage, init-actions, registry, tui, consensus
           # Wave 2 (deps on wave 1): core (->spec), tunnel (->spec)
           # Wave 3 (deps on wave 1+2): overlay (->spec,core), builder (->tui, ?registry), scheduler (->spec,core,consensus)
-          CRATES="zlayer-spec zlayer-observability zlayer-storage zlayer-init-actions zlayer-registry zlayer-tui zlayer-consensus zlayer-core zlayer-tunnel zlayer-overlay zlayer-builder zlayer-scheduler"
+          CRATES="zlayer-paths zlayer-spec zlayer-observability zlayer-storage zlayer-init-actions zlayer-registry zlayer-tui zlayer-consensus zlayer-core zlayer-tunnel zlayer-overlay zlayer-builder zlayer-scheduler"
 
           for crate in $CRATES; do
             prefix="${CRATE_TAGS[$crate]}"
