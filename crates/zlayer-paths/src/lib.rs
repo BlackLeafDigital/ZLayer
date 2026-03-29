@@ -219,14 +219,16 @@ fn home_dir_or_tmp() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-#[cfg(unix)]
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 fn is_root() -> bool {
-    nix::unistd::geteuid().is_root()
-}
-
-#[cfg(not(unix))]
-fn is_root() -> bool {
-    false
+    #[cfg(unix)]
+    {
+        nix::unistd::geteuid().is_root()
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
 }
 
 #[cfg(test)]
