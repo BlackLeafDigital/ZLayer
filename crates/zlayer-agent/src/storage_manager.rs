@@ -67,7 +67,7 @@ pub struct S3MountInfo {
 
 /// Manages storage volumes for containers
 pub struct StorageManager {
-    /// Base directory for volumes (/var/lib/zlayer/volumes)
+    /// Base directory for volumes (see [`zlayer_paths::ZLayerDirs::volumes()`])
     volume_dir: PathBuf,
     /// Tracked volumes (name -> info)
     volumes: HashMap<String, VolumeInfo>,

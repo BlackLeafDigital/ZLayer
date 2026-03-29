@@ -14,7 +14,8 @@
 //!
 //! # async fn example() -> zlayer_secrets::Result<()> {
 //! let key = EncryptionKey::generate();
-//! let store = PersistentSecretsStore::open("/var/lib/zlayer/secrets", key).await?;
+//! let secrets_dir = zlayer_paths::ZLayerDirs::system_default().secrets();
+//! let store = PersistentSecretsStore::open(&secrets_dir, key).await?;
 //!
 //! // Store a secret
 //! let secret = Secret::new("my-password");

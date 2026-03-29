@@ -1,0 +1,12 @@
+[package]
+name = "zlayer-paths"
+description = "Centralized filesystem path resolution for ZLayer"
+publish = false
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["user"] }

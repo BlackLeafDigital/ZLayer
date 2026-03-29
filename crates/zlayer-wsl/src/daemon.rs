@@ -19,7 +19,10 @@ impl Default for WslBackendConfig {
     fn default() -> Self {
         Self {
             api_addr: "127.0.0.1:3669".parse().expect("valid socket addr"),
-            data_dir: "/var/lib/zlayer".to_string(),
+            data_dir: zlayer_paths::ZLayerDirs::system_default()
+                .data_dir()
+                .display()
+                .to_string(),
         }
     }
 }

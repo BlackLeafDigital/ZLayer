@@ -41,6 +41,7 @@ sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"], optional = tru
 
 # HashiCorp Vault (optional)
 vaultrs = { version = "0.7", optional = true }
+zlayer-paths = { version = "0.0.0-dev", path = "../zlayer-paths" }
 
 [features]
 default = ["persistent"]

@@ -12,6 +12,7 @@ readme = "README.md"
 
 [dependencies]
 # Internal crates
+zlayer-paths.workspace = true
 zlayer-spec.workspace = true
 zlayer-core.workspace = true
 zlayer-consensus.workspace = true

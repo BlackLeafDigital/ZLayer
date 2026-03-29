@@ -213,7 +213,9 @@ impl Default for LayerStorageConfig {
             region: None,
             endpoint_url: None,
             staging_dir: PathBuf::from("/tmp/zlayer-storage/staging"),
-            state_db_path: PathBuf::from("/var/lib/zlayer/layer-state.sqlite"),
+            state_db_path: zlayer_paths::ZLayerDirs::system_default()
+                .data_dir()
+                .join("layer-state.sqlite"),
             part_size_bytes: default_part_size(),
             max_concurrent_uploads: default_concurrent_uploads(),
             compression_level: default_compression_level(),

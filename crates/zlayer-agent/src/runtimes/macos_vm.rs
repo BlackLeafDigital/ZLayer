@@ -329,10 +329,8 @@ impl VmRuntime {
     /// Returns an error if the required directories cannot be created.
     #[allow(unsafe_code)]
     pub fn new(_auth_ctx: Option<crate::runtime::ContainerAuthContext>) -> Result<Self> {
-        let data_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".zlayer");
-        let log_dir = PathBuf::from("/var/log/zlayer");
+        let data_dir = zlayer_paths::ZLayerDirs::default_data_dir();
+        let log_dir = zlayer_paths::ZLayerDirs::default_log_dir();
 
         std::fs::create_dir_all(data_dir.join("vms")).map_err(|e| {
             AgentError::Configuration(format!(

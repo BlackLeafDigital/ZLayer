@@ -3,6 +3,7 @@ resolver = "2"
 default-members = ["bin/zlayer"]
 members = [
   "crates/zlayer-spec",
+  "crates/zlayer-paths",
   "crates/zlayer-core",
   "crates/zlayer-agent",
   "crates/zlayer-proxy",
@@ -183,6 +184,7 @@ rand = "0.9"
 socket2 = "0.5"
 
 # Internal crates
+zlayer-paths = { version = "0.0.0-dev", path = "crates/zlayer-paths" }
 zlayer-spec = { version = "0.0.0-dev", path = "crates/zlayer-spec" }
 zlayer-core = { version = "0.0.0-dev", path = "crates/zlayer-core" }
 zlayer-observability = { version = "0.0.0-dev", path = "crates/zlayer-observability" }

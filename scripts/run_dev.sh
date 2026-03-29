@@ -34,7 +34,7 @@ fi
 
 # Platform-aware paths (match Rust defaults in bin/zlayer/src/cli.rs)
 if [ "$PLATFORM" = "macos" ]; then
-    DATA_DIR="${HOME}/.local/share/zlayer"
+    DATA_DIR="${HOME}/.zlayer"
     SOCKET="${DATA_DIR}/run/zlayer.sock"
     LOG_DIR="${DATA_DIR}/logs"
     RUN_DIR="${DATA_DIR}/run"

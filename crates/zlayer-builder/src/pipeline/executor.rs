@@ -56,6 +56,7 @@ struct CachedImageConfig {
 use crate::buildah::{BuildahCommand, BuildahExecutor};
 use crate::builder::{BuiltImage, ImageBuilder};
 use crate::error::{BuildError, Result};
+use zlayer_paths::ZLayerDirs;
 
 use super::types::{PipelineDefaults, PipelineImage, ZPipeline};
 
@@ -644,9 +645,7 @@ async fn build_single_image(
     // output image was already built from identical source content.
     let file_hash = compute_file_hash(&file_path).await;
     if let Some(ref hash) = file_hash {
-        let data_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".zlayer");
+        let data_dir = ZLayerDirs::default_data_dir();
 
         let expanded_tags: Vec<String> = image_config
             .tags

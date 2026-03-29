@@ -51,7 +51,7 @@ pub struct DaemonConfig {
     pub dns_port: u16,
 
     /// Root data directory (databases, state).
-    /// Default: `~/.local/share/zlayer` on macOS, `/var/lib/zlayer` on Linux.
+    /// Default: `~/.zlayer` on macOS, `/var/lib/zlayer` (root) or `~/.zlayer` (user) on Linux.
     pub data_dir: PathBuf,
 
     /// Log directory.  Default: `{data_dir}/logs` on macOS, `/var/log/zlayer` on Linux.
@@ -537,7 +537,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                 {
                     use std::os::unix::fs::PermissionsExt;
                     let _ =
-                        std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o600));
+                        std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o644));
                 }
                 info!("Admin password persisted to {}", pw_path.display());
             }
@@ -567,7 +567,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                                 use std::os::unix::fs::PermissionsExt;
                                 let _ = std::fs::set_permissions(
                                     &pw_path,
-                                    std::fs::Permissions::from_mode(0o600),
+                                    std::fs::Permissions::from_mode(0o644),
                                 );
                             }
                             info!(
@@ -1013,7 +1013,7 @@ const LOG_MAX_AGE_SECS: u64 = 7 * 24 * 60 * 60;
 /// Background task that runs hourly to rotate and clean up container logs.
 ///
 /// For the youki runtime, container logs are stored under the bundle directory:
-///   `/var/lib/zlayer/bundles/{container_id}/logs/{stdout,stderr}.log`
+///   `{data_dir}/bundles/{container_id}/logs/{stdout,stderr}.log`
 ///
 /// This task:
 ///  1. Rotates any log file exceeding [`LOG_MAX_SIZE_BYTES`] by truncating it
