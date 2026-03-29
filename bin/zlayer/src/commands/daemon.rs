@@ -423,7 +423,7 @@ fn systemctl_args(base_args: &[&str]) -> Vec<String> {
 }
 
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, unsafe_code)]
 async fn install(
     data_dir: &Path,
     no_start: bool,
@@ -434,6 +434,54 @@ async fn install(
     use tokio::process::Command;
 
     let exe = std::env::current_exe().context("Cannot determine zlayer binary path")?;
+
+    // When installing a system-wide service (root), the binary must be in a
+    // location accessible to root at runtime.  User home directories are
+    // typically mode 0700, so /var/home/user/.local/bin/zlayer is unreachable
+    // by the systemd service.  Detect this and copy the binary to
+    // /usr/local/bin so the ExecStart path works.
+    let exe = {
+        let is_root = unsafe { libc::geteuid() } == 0;
+        if is_root {
+            let in_home = std::env::var("SUDO_USER")
+                .ok()
+                .and_then(|u| {
+                    // Check if exe lives under any home-like prefix
+                    let home_prefixes = [format!("/home/{u}"), format!("/var/home/{u}")];
+                    home_prefixes.iter().find(|p| exe.starts_with(p)).cloned()
+                })
+                .is_some()
+                || exe.to_string_lossy().contains("/.local/bin/");
+
+            if in_home {
+                let system_path = std::path::PathBuf::from("/usr/local/bin/zlayer");
+                std::fs::copy(&exe, &system_path).with_context(|| {
+                    format!(
+                        "Failed to copy {} to {} (binary is in a user home directory, \
+                         inaccessible to the systemd service running as root)",
+                        exe.display(),
+                        system_path.display()
+                    )
+                })?;
+                // Ensure it's executable
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&system_path, std::fs::Permissions::from_mode(0o755))
+                        .ok();
+                }
+                println!(
+                    "Copied binary to {} (original in user home is inaccessible to root service)",
+                    system_path.display()
+                );
+                system_path
+            } else {
+                exe
+            }
+        } else {
+            exe
+        }
+    };
 
     // --data-dir is a top-level Cli arg, so it must come BEFORE the subcommand.
     let mut exec_start = format!(
