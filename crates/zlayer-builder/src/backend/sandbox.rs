@@ -4,6 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
+use zlayer_paths::ZLayerDirs;
+
 use crate::builder::{BuildOptions, BuiltImage, RegistryAuth};
 use crate::dockerfile::Dockerfile;
 use crate::error::{BuildError, Result};
@@ -32,9 +34,7 @@ impl SandboxBackend {
 
 impl Default for SandboxBackend {
     fn default() -> Self {
-        let data_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".zlayer");
+        let data_dir = ZLayerDirs::default_data_dir();
         Self { data_dir }
     }
 }

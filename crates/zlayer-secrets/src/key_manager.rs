@@ -19,9 +19,6 @@ use tracing::{debug, info, warn};
 
 use crate::{EncryptionKey, Result, SecretsError};
 
-/// Default directory for storing encryption key files.
-pub const SECRETS_DIR: &str = "/var/lib/zlayer/secrets";
-
 /// Environment variable name for hex-encoded encryption key.
 const ENV_KEY: &str = "ZLAYER_SECRETS_KEY";
 
@@ -53,13 +50,13 @@ impl Default for KeyManager {
 }
 
 impl KeyManager {
-    /// Creates a new `KeyManager` with the default secrets directory.
+    /// Creates a new `KeyManager` with the platform-default secrets directory.
     ///
-    /// The default directory is `/var/lib/zlayer/secrets`.
+    /// The directory is resolved via [`zlayer_paths::ZLayerDirs::system_default().secrets()`].
     #[must_use]
     pub fn new() -> Self {
         Self {
-            base_dir: PathBuf::from(SECRETS_DIR),
+            base_dir: zlayer_paths::ZLayerDirs::system_default().secrets(),
         }
     }
 
@@ -249,7 +246,10 @@ mod tests {
     #[test]
     fn test_new_uses_default_dir() {
         let manager = KeyManager::new();
-        assert_eq!(manager.base_dir, PathBuf::from(SECRETS_DIR));
+        assert_eq!(
+            manager.base_dir,
+            zlayer_paths::ZLayerDirs::system_default().secrets()
+        );
     }
 
     #[test]
@@ -260,11 +260,11 @@ mod tests {
 
     #[test]
     fn test_key_file_path() {
-        let manager = KeyManager::with_base_dir("/var/lib/zlayer/secrets");
+        let manager = KeyManager::with_base_dir("/tmp/test-secrets");
         let path = manager.key_file_path("production");
         assert_eq!(
             path,
-            PathBuf::from("/var/lib/zlayer/secrets/secrets_production.key")
+            PathBuf::from("/tmp/test-secrets/secrets_production.key")
         );
     }
 

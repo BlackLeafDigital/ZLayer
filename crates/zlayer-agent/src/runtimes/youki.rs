@@ -20,18 +20,6 @@ use tokio::sync::RwLock;
 use tracing::instrument;
 use zlayer_spec::ServiceSpec;
 
-/// Default state directory for libcontainer containers
-pub const DEFAULT_STATE_DIR: &str = "/var/lib/zlayer/containers";
-
-/// Default rootfs directory for unpacked images
-pub const DEFAULT_ROOTFS_DIR: &str = "/var/lib/zlayer/rootfs";
-
-/// Default bundle directory
-pub const DEFAULT_BUNDLE_DIR: &str = "/var/lib/zlayer/bundles";
-
-/// Default cache directory for image blobs
-pub const DEFAULT_CACHE_DIR: &str = "/var/lib/zlayer/cache";
-
 /// Configuration for `YoukiRuntime`
 #[derive(Debug, Clone)]
 pub struct YoukiConfig {
@@ -66,17 +54,18 @@ pub struct YoukiConfig {
 
 impl Default for YoukiConfig {
     fn default() -> Self {
+        let dirs = zlayer_paths::ZLayerDirs::system_default();
         Self {
             state_dir: std::env::var("ZLAYER_STATE_DIR")
-                .map_or_else(|_| PathBuf::from(DEFAULT_STATE_DIR), PathBuf::from),
+                .map_or_else(|_| dirs.containers(), PathBuf::from),
             rootfs_dir: std::env::var("ZLAYER_ROOTFS_DIR")
-                .map_or_else(|_| PathBuf::from(DEFAULT_ROOTFS_DIR), PathBuf::from),
+                .map_or_else(|_| dirs.rootfs(), PathBuf::from),
             bundle_dir: std::env::var("ZLAYER_BUNDLE_DIR")
-                .map_or_else(|_| PathBuf::from(DEFAULT_BUNDLE_DIR), PathBuf::from),
+                .map_or_else(|_| dirs.bundles(), PathBuf::from),
             cache_dir: std::env::var("ZLAYER_CACHE_DIR")
-                .map_or_else(|_| PathBuf::from(DEFAULT_CACHE_DIR), PathBuf::from),
+                .map_or_else(|_| dirs.cache(), PathBuf::from),
             volume_dir: std::env::var("ZLAYER_VOLUME_DIR")
-                .map_or_else(|_| PathBuf::from("/var/lib/zlayer/volumes"), PathBuf::from),
+                .map_or_else(|_| dirs.volumes(), PathBuf::from),
             use_systemd: std::env::var("ZLAYER_USE_SYSTEMD")
                 .map(|v| v == "1" || v.to_lowercase() == "true")
                 .unwrap_or(false),
@@ -842,7 +831,7 @@ impl Runtime for YoukiRuntime {
                 .with_env("ZLAYER_TOKEN".to_string(), token)
                 .with_env(
                     "ZLAYER_SOCKET".to_string(),
-                    "/var/run/zlayer.sock".to_string(),
+                    zlayer_paths::ZLayerDirs::default_socket_path(),
                 )
                 .with_socket_mount(&auth_ctx.socket_path);
         }
@@ -1666,11 +1655,12 @@ mod tests {
     fn test_youki_config_default() {
         let config = YoukiConfig::default();
 
-        assert_eq!(config.state_dir, PathBuf::from(DEFAULT_STATE_DIR));
-        assert_eq!(config.rootfs_dir, PathBuf::from(DEFAULT_ROOTFS_DIR));
-        assert_eq!(config.bundle_dir, PathBuf::from(DEFAULT_BUNDLE_DIR));
-        assert_eq!(config.cache_dir, PathBuf::from(DEFAULT_CACHE_DIR));
-        assert_eq!(config.volume_dir, PathBuf::from("/var/lib/zlayer/volumes"));
+        let dirs = zlayer_paths::ZLayerDirs::system_default();
+        assert_eq!(config.state_dir, dirs.containers());
+        assert_eq!(config.rootfs_dir, dirs.rootfs());
+        assert_eq!(config.bundle_dir, dirs.bundles());
+        assert_eq!(config.cache_dir, dirs.cache());
+        assert_eq!(config.volume_dir, dirs.volumes());
         assert!(!config.use_systemd);
         assert!(config.cache_type.is_none());
         assert!(config.log_base_dir.is_none());
@@ -1753,14 +1743,9 @@ mod tests {
         let stdout = state_dir.join("stdout.log");
         let stderr = state_dir.join("stderr.log");
 
-        assert_eq!(
-            stdout,
-            PathBuf::from("/var/lib/zlayer/containers/testservice-2/stdout.log")
-        );
-        assert_eq!(
-            stderr,
-            PathBuf::from("/var/lib/zlayer/containers/testservice-2/stderr.log")
-        );
+        let dirs = zlayer_paths::ZLayerDirs::system_default();
+        assert_eq!(stdout, dirs.containers().join("testservice-2/stdout.log"));
+        assert_eq!(stderr, dirs.containers().join("testservice-2/stderr.log"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ resolver = "2"
 default-members = ["bin/zlayer"]
 members = [
   "crates/zlayer-spec",
+  "crates/zlayer-paths",
   "crates/zlayer-core",
   "crates/zlayer-agent",
   "crates/zlayer-proxy",
@@ -213,6 +214,7 @@ zlayer-secrets = { path = "crates/zlayer-secrets", version = "0.0.0-dev", packag
 zlayer-manager = { path = "crates/zlayer-manager", version = "0.0.0-dev", package = "zlayer-manager-zql", registry = "forgejo" }
 zlayer-consensus = { path = "crates/zlayer-consensus", version = "0.0.0-dev", package = "zlayer-consensus-zql", registry = "forgejo" }
 zlayer-wsl = { path = "crates/zlayer-wsl", version = "0.0.0-dev", package = "zlayer-wsl-zql", registry = "forgejo" }
+zlayer-paths = { path = "crates/zlayer-paths" }
 
 # =============================================================================
 # Build Profiles

@@ -83,6 +83,7 @@ http-body-util = { version = "0.1", optional = true }
 hyper = { version = "1", optional = true }
 anyhow = { version = "1", optional = true }
 sha2 = { workspace = true, optional = true }
+zlayer-paths = { version = "0.0.0-dev", path = "../zlayer-paths" }
 
 # Linux-specific dependencies for native container runtime (youki/libcontainer)
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -90,7 +91,6 @@ libcontainer = "0.5"
 
 # macOS-specific dependencies for sandbox and VM runtimes
 [target.'cfg(target_os = "macos")'.dependencies]
-dirs = "5"
 libloading = "0.8"
 
 [dev-dependencies]

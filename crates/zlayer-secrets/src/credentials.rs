@@ -15,7 +15,8 @@
 //!
 //! # async fn example() -> zlayer_secrets_zql::Result<()> {
 //! let key = EncryptionKey::generate();
-//! let store = PersistentSecretsStore::open("/var/lib/zlayer/secrets", key).await?;
+//! let secrets_dir = zlayer_paths::ZLayerDirs::system_default().secrets();
+//! let store = PersistentSecretsStore::open(&secrets_dir, key).await?;
 //! let cred_store = CredentialStore::new(store);
 //!
 //! // Create an API key

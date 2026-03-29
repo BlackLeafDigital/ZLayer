@@ -242,7 +242,11 @@ fn build_host_config(spec: &ServiceSpec, auth_socket_path: Option<&str>) -> Host
     // Build bind mounts (e.g. ZLayer auth socket)
     let mut binds: Vec<String> = Vec::new();
     if let Some(socket) = auth_socket_path {
-        binds.push(format!("{socket}:/var/run/zlayer.sock:ro"));
+        binds.push(format!(
+            "{}:{}:ro",
+            socket,
+            zlayer_paths::ZLayerDirs::default_socket_path()
+        ));
     }
 
     HostConfig {
@@ -434,7 +438,10 @@ impl Runtime for DockerRuntime {
             })?;
             env.push(format!("ZLAYER_API_URL={}", auth_ctx.api_url));
             env.push(format!("ZLAYER_TOKEN={token}"));
-            env.push("ZLAYER_SOCKET=/var/run/zlayer.sock".to_string());
+            env.push(format!(
+                "ZLAYER_SOCKET={}",
+                zlayer_paths::ZLayerDirs::default_socket_path()
+            ));
         }
 
         // Build exposed ports

@@ -16,7 +16,7 @@
 //! ## Supported Storage Types
 //!
 //! - **Bind mounts**: Direct host path mapping to guest path
-//! - **Named volumes**: Persistent storage under `/var/lib/zlayer/volumes/{name}`
+//! - **Named volumes**: Persistent storage under `{data_dir}/volumes/{name}`
 //!
 //! ## Unsupported Storage Types (logged as warnings)
 //!
@@ -47,12 +47,6 @@ use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use zlayer_registry::{detect_wasm_version_from_binary, WasiVersion};
 use zlayer_spec::{PullPolicy, ServiceSpec, StorageSpec, WasmCapabilities};
-
-/// Default directory for WASM module cache
-pub const DEFAULT_WASM_CACHE_DIR: &str = "/var/lib/zlayer/wasm";
-
-/// Default directory for named volumes
-pub const DEFAULT_VOLUMES_DIR: &str = "/var/lib/zlayer/volumes";
 
 /// Default capacity for stdout/stderr capture pipes (1MB)
 /// TODO: Phase 6 (stdout/stderr capture) will use this constant
@@ -85,7 +79,7 @@ struct ExecutionResult {
 ///
 /// # Supported Storage Types
 /// * `StorageSpec::Bind` - Direct host path to guest path mapping
-/// * `StorageSpec::Named` - Named volumes stored under `/var/lib/zlayer/volumes/{name}`
+/// * `StorageSpec::Named` - Named volumes stored under `{data_dir}/volumes/{name}`
 ///
 /// # Unsupported Storage Types (logged as warnings)
 /// * `StorageSpec::Tmpfs` - Memory-backed mounts
@@ -128,7 +122,11 @@ fn configure_wasi_mounts(
                 ..
             } => {
                 // Named volumes are stored under the volumes directory
-                let volume_path = format!("{DEFAULT_VOLUMES_DIR}/{name}");
+                let volume_path = zlayer_paths::ZLayerDirs::system_default()
+                    .volumes()
+                    .join(name)
+                    .to_string_lossy()
+                    .into_owned();
 
                 let (dir_perms, file_perms) = if *readonly {
                     (DirPerms::READ, FilePerms::READ)
@@ -309,8 +307,10 @@ pub struct WasmConfig {
 impl Default for WasmConfig {
     fn default() -> Self {
         Self {
-            cache_dir: std::env::var("ZLAYER_WASM_CACHE_DIR")
-                .map_or_else(|_| PathBuf::from(DEFAULT_WASM_CACHE_DIR), PathBuf::from),
+            cache_dir: std::env::var("ZLAYER_WASM_CACHE_DIR").map_or_else(
+                |_| zlayer_paths::ZLayerDirs::system_default().wasm(),
+                PathBuf::from,
+            ),
             enable_epochs: true,
             epoch_deadline: 1_000_000, // 1M instructions before yield check
             max_execution_time: Duration::from_secs(3600), // 1 hour default
@@ -1637,7 +1637,10 @@ mod tests {
     fn test_wasm_config_default() {
         let config = WasmConfig::default();
 
-        assert_eq!(config.cache_dir, PathBuf::from(DEFAULT_WASM_CACHE_DIR));
+        assert_eq!(
+            config.cache_dir,
+            zlayer_paths::ZLayerDirs::system_default().wasm()
+        );
         assert!(config.enable_epochs);
         assert_eq!(config.epoch_deadline, 1_000_000);
         assert_eq!(config.max_execution_time, Duration::from_secs(3600));

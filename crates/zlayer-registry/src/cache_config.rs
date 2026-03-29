@@ -16,10 +16,6 @@ use crate::persistent_cache::PersistentBlobCache;
 #[cfg(feature = "s3")]
 use crate::s3_cache::{S3BlobCache, S3CacheConfig};
 
-/// Default cache directory for persistent cache
-#[cfg(feature = "persistent")]
-const DEFAULT_CACHE_DIR: &str = "/var/lib/zlayer/cache";
-
 /// Default cache database filename
 #[cfg(feature = "persistent")]
 const DEFAULT_CACHE_DB: &str = "blobs.sqlite";
@@ -48,7 +44,9 @@ impl Default for CacheType {
         #[cfg(feature = "persistent")]
         {
             CacheType::Persistent {
-                path: PathBuf::from(DEFAULT_CACHE_DIR).join(DEFAULT_CACHE_DB),
+                path: zlayer_paths::ZLayerDirs::system_default()
+                    .cache()
+                    .join(DEFAULT_CACHE_DB),
             }
         }
         #[cfg(not(feature = "persistent"))]
@@ -64,7 +62,7 @@ impl CacheType {
     /// # Environment Variables
     ///
     /// - `ZLAYER_CACHE_TYPE`: Cache type - "memory", "persistent", or "s3" (default: "persistent")
-    /// - `ZLAYER_CACHE_DIR`: Path for persistent cache directory (default: /var/lib/zlayer/cache)
+    /// - `ZLAYER_CACHE_DIR`: Path for persistent cache directory (default: `ZLayerDirs::system_default().cache()`)
     /// - `ZLAYER_S3_BUCKET`: S3 bucket name (required for s3 type)
     /// - `ZLAYER_S3_REGION`: AWS region (optional)
     /// - `ZLAYER_S3_ENDPOINT`: Custom S3 endpoint for S3-compatible services
@@ -87,8 +85,11 @@ impl CacheType {
             "persistent" => {
                 #[cfg(feature = "persistent")]
                 {
-                    let cache_dir = std::env::var("ZLAYER_CACHE_DIR")
-                        .unwrap_or_else(|_| DEFAULT_CACHE_DIR.to_string());
+                    let default_cache_dir = zlayer_paths::ZLayerDirs::system_default()
+                        .cache()
+                        .to_string_lossy()
+                        .into_owned();
+                    let cache_dir = std::env::var("ZLAYER_CACHE_DIR").unwrap_or(default_cache_dir);
                     let path = PathBuf::from(cache_dir).join(DEFAULT_CACHE_DB);
                     Ok(CacheType::Persistent { path })
                 }
@@ -184,7 +185,9 @@ impl CacheType {
     #[must_use]
     pub fn persistent() -> Self {
         CacheType::Persistent {
-            path: PathBuf::from(DEFAULT_CACHE_DIR).join(DEFAULT_CACHE_DB),
+            path: zlayer_paths::ZLayerDirs::system_default()
+                .cache()
+                .join(DEFAULT_CACHE_DB),
         }
     }
 

@@ -18,7 +18,8 @@
 //!
 //! # async fn example() -> zlayer_secrets_zql::Result<()> {
 //! let key = EncryptionKey::generate();
-//! let store = PersistentSecretsStore::open("/var/lib/zlayer/secrets", key).await?;
+//! let secrets_dir = zlayer_paths::ZLayerDirs::system_default().secrets();
+//! let store = PersistentSecretsStore::open(&secrets_dir, key).await?;
 //!
 //! // Store a secret
 //! let secret = Secret::new("my-password");
@@ -87,7 +88,7 @@ impl PersistentSecretsStore {
         let path = path.as_ref();
 
         // If the path is an existing directory that isn't itself a ZQL database,
-        // append the default database dirname so callers can pass e.g. `/var/lib/zlayer`.
+        // append the default database dirname so callers can pass a data-dir root.
         // Once the database has been created (as a directory), subsequent opens
         // at the same path will detect the ZQL marker and use it directly.
         let db_path = if path.is_dir() && !path.join("ZQL_MANIFEST").exists() {

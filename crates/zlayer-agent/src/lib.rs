@@ -94,14 +94,10 @@ pub struct MacSandboxConfig {
 #[cfg(target_os = "macos")]
 impl Default for MacSandboxConfig {
     fn default() -> Self {
-        let base = std::env::var("HOME").map_or_else(
-            |_| PathBuf::from("/var/lib/zlayer"),
-            |h| PathBuf::from(h).join(".zlayer"),
-        );
-        let log_dir = base.join("logs");
+        let dirs = zlayer_paths::ZLayerDirs::system_default();
         Self {
-            data_dir: base,
-            log_dir,
+            data_dir: dirs.data_dir().to_path_buf(),
+            log_dir: dirs.logs(),
             gpu_access: true,
         }
     }

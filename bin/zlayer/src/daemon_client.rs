@@ -23,11 +23,11 @@ use tracing::{debug, info};
 
 /// Default path for the daemon Unix socket.
 ///
-/// On macOS: `~/.local/share/zlayer/run/zlayer.sock`.
+/// On macOS: `~/.zlayer/run/zlayer.sock`.
 /// On Linux: `/var/run/zlayer.sock`.
 #[must_use]
 pub fn default_socket_path() -> String {
-    crate::cli::default_socket_path(&crate::cli::default_data_dir())
+    zlayer_paths::ZLayerDirs::default_socket_path()
 }
 
 // ---------------------------------------------------------------------------

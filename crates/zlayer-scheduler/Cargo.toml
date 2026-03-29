@@ -15,6 +15,7 @@ readme = "README.md"
 zlayer-spec.workspace = true
 zlayer-core.workspace = true
 zlayer-consensus.workspace = true
+zlayer-paths.workspace = true
 
 # Serialization
 serde.workspace = true

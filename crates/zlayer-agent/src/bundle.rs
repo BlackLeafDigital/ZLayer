@@ -22,9 +22,6 @@ use tokio::fs;
 use zlayer_secrets::SecretsProvider;
 use zlayer_spec::{ServiceSpec, StorageSpec, StorageTier};
 
-/// Default bundle base directory
-pub const DEFAULT_BUNDLE_DIR: &str = "/var/lib/zlayer/bundles";
-
 /// All Linux capabilities for privileged mode
 const ALL_CAPABILITIES: &[Capability] = &[
     Capability::AuditControl,
@@ -151,8 +148,9 @@ fn get_device_type(path: &str) -> std::io::Result<LinuxDeviceType> {
 ///
 /// # Example
 /// ```ignore
-/// let builder = BundleBuilder::new("/var/lib/zlayer/bundles/mycontainer".into())
-///     .with_rootfs("/var/lib/zlayer/rootfs/myimage".into());
+/// let dirs = zlayer_paths::ZLayerDirs::system_default();
+/// let builder = BundleBuilder::new(dirs.bundles().join("mycontainer"))
+///     .with_rootfs(dirs.rootfs().join("myimage"));
 ///
 /// let bundle_path = builder.build(&container_id, &service_spec).await?;
 /// ```
@@ -234,7 +232,9 @@ impl BundleBuilder {
     /// Create a `BundleBuilder` for a container in the default bundle location
     #[must_use]
     pub fn for_container(container_id: &ContainerId) -> Self {
-        let bundle_dir = PathBuf::from(DEFAULT_BUNDLE_DIR).join(container_id.to_string());
+        let bundle_dir = zlayer_paths::ZLayerDirs::system_default()
+            .bundles()
+            .join(container_id.to_string());
         Self::new(bundle_dir)
     }
 
@@ -327,7 +327,7 @@ impl BundleBuilder {
     }
 
     /// Set a host-side Unix socket path to bind-mount into the container at
-    /// `/var/run/zlayer.sock` (read-only).
+    /// the default `ZLayer` socket path (read-only).
     #[must_use]
     pub fn with_socket_mount(mut self, path: impl Into<String>) -> Self {
         self.socket_path = Some(path.into());
@@ -601,7 +601,7 @@ impl BundleBuilder {
         if let Some(ref socket_path) = self.socket_path {
             mounts.push(
                 MountBuilder::default()
-                    .destination("/var/run/zlayer.sock")
+                    .destination(zlayer_paths::ZLayerDirs::default_socket_path())
                     .typ("none")
                     .source(socket_path.clone())
                     .options(vec!["rbind".into(), "ro".into()])
@@ -1896,20 +1896,16 @@ services:
             replica: 1,
         };
         let builder = BundleBuilder::for_container(&id);
-        assert_eq!(
-            builder.bundle_dir(),
-            Path::new("/var/lib/zlayer/bundles/myservice-rep-1")
-        );
+        let dirs = zlayer_paths::ZLayerDirs::system_default();
+        assert_eq!(builder.bundle_dir(), dirs.bundles().join("myservice-rep-1"));
     }
 
     #[test]
     fn test_bundle_builder_with_rootfs() {
+        let dirs = zlayer_paths::ZLayerDirs::system_default();
         let builder = BundleBuilder::new("/tmp/test-bundle".into())
-            .with_rootfs("/var/lib/zlayer/rootfs/myimage".into());
-        assert_eq!(
-            builder.rootfs_path,
-            Some(PathBuf::from("/var/lib/zlayer/rootfs/myimage"))
-        );
+            .with_rootfs(dirs.rootfs().join("myimage"));
+        assert_eq!(builder.rootfs_path, Some(dirs.rootfs().join("myimage")));
     }
 
     #[tokio::test]
@@ -2161,12 +2157,10 @@ services:
         .remove("test")
         .unwrap();
 
+        let dirs = zlayer_paths::ZLayerDirs::system_default();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
         let mut volume_paths = std::collections::HashMap::new();
-        volume_paths.insert(
-            "my-volume".to_string(),
-            PathBuf::from("/var/lib/zlayer/volumes/my-volume"),
-        );
+        volume_paths.insert("my-volume".to_string(), dirs.volumes().join("my-volume"));
 
         let mounts = builder.build_storage_mounts(&spec, &volume_paths).unwrap();
 
@@ -2177,7 +2171,12 @@ services:
                 .source()
                 .as_ref()
                 .map(|s| s.to_string_lossy().to_string()),
-            Some("/var/lib/zlayer/volumes/my-volume".to_string())
+            Some(
+                dirs.volumes()
+                    .join("my-volume")
+                    .to_string_lossy()
+                    .into_owned()
+            )
         );
     }
 
@@ -2243,12 +2242,10 @@ services:
         .remove("test")
         .unwrap();
 
+        let dirs = zlayer_paths::ZLayerDirs::system_default();
         let builder = BundleBuilder::new("/tmp/test-bundle".into());
         let mut volume_paths = std::collections::HashMap::new();
-        volume_paths.insert(
-            "app-data".to_string(),
-            PathBuf::from("/var/lib/zlayer/volumes/app-data"),
-        );
+        volume_paths.insert("app-data".to_string(), dirs.volumes().join("app-data"));
 
         let mounts = builder.build_storage_mounts(&spec, &volume_paths).unwrap();
 

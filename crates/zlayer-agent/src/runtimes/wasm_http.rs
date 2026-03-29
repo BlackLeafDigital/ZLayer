@@ -661,7 +661,7 @@ impl WasmHttpRuntime {
             .map_err(|e| WasmHttpError::EngineCreation(format!("failed to add WASI HTTP: {e}")))?;
 
         // Initialize the AOT disk cache directory
-        let cache_dir = PathBuf::from("/var/lib/zlayer/wasm/compiled");
+        let cache_dir = zlayer_paths::ZLayerDirs::system_default().wasm_compiled();
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
             warn!(
                 cache_dir = %cache_dir.display(),
@@ -738,7 +738,7 @@ impl WasmHttpRuntime {
         }
 
         // Initialize the AOT disk cache directory
-        let cache_dir = PathBuf::from("/var/lib/zlayer/wasm/compiled");
+        let cache_dir = zlayer_paths::ZLayerDirs::system_default().wasm_compiled();
         if let Err(e) = std::fs::create_dir_all(&cache_dir) {
             warn!(
                 cache_dir = %cache_dir.display(),

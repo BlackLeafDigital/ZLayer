@@ -538,7 +538,7 @@ impl Default for RaftConfig {
             election_timeout_ms: (300, 600),
             rpc_timeout_ms: 5000,
             raft_port: 9090,
-            data_dir: PathBuf::from("/var/lib/zlayer/raft"),
+            data_dir: zlayer_paths::ZLayerDirs::system_default().raft(),
         }
     }
 }

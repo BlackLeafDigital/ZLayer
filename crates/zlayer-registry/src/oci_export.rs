@@ -24,7 +24,7 @@
 //! use std::path::Path;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-//! let registry = LocalRegistry::new("/var/lib/zlayer/registry".into()).await?;
+//! let registry = LocalRegistry::new(zlayer_paths::ZLayerDirs::system_default().images()).await?;
 //!
 //! // Export an image to a tar.gz file
 //! let info = export_image(&registry, "myapp:latest", Path::new("/tmp/myapp.tar.gz")).await?;
@@ -314,7 +314,7 @@ fn parse_image_reference(image: &str) -> Result<(String, String), ExportError> {
 /// use std::path::Path;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let registry = LocalRegistry::new("/var/lib/zlayer/registry".into()).await?;
+/// let registry = LocalRegistry::new(zlayer_paths::ZLayerDirs::system_default().images()).await?;
 /// let info = export_image(&registry, "myapp:v1.0", Path::new("/tmp/myapp.tar.gz")).await?;
 /// println!("Exported image to {:?}", info.output_path);
 /// # Ok(())
@@ -475,7 +475,7 @@ pub async fn export_image(
 /// use std::path::Path;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let registry = LocalRegistry::new("/var/lib/zlayer/registry".into()).await?;
+/// let registry = LocalRegistry::new(zlayer_paths::ZLayerDirs::system_default().images()).await?;
 /// let info = import_image(&registry, Path::new("/tmp/myapp.tar.gz"), Some("myapp:imported")).await?;
 /// println!("Imported image with digest: {}", info.digest);
 /// # Ok(())

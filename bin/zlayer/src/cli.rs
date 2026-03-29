@@ -3,99 +3,30 @@ use std::path::PathBuf;
 
 /// Return the platform-appropriate default data directory for `ZLayer`.
 ///
-/// - macOS / Linux: `~/.zlayer`
-/// - Windows: `%LOCALAPPDATA%\ZLayer` or `C:\ProgramData\ZLayer`
+/// Delegates to [`zlayer_paths::ZLayerDirs::default_data_dir`].
 pub(crate) fn default_data_dir() -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join(".zlayer")
-        } else {
-            PathBuf::from("/tmp/.zlayer")
-        }
-    }
-    #[cfg(target_os = "windows")]
-    {
-        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-            PathBuf::from(local_app_data).join("ZLayer")
-        } else {
-            PathBuf::from(r"C:\ProgramData\ZLayer")
-        }
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        if let Some(home) = std::env::var_os("HOME") {
-            PathBuf::from(home).join(".zlayer")
-        } else {
-            PathBuf::from("/tmp/.zlayer")
-        }
-    }
+    zlayer_paths::ZLayerDirs::default_data_dir()
 }
 
 /// Return the platform-appropriate default runtime directory.
 ///
-/// - macOS: `{data_dir}/run` (under the user data dir)
-/// - Linux: `/var/run/zlayer`
-/// - Windows: `{data_dir}\run`
-pub(crate) fn default_run_dir(data_dir: &std::path::Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        data_dir.join("run")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        data_dir.join("run")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = data_dir;
-        PathBuf::from("/var/run/zlayer")
-    }
+/// Delegates to [`zlayer_paths::ZLayerDirs::default_run_dir`].
+pub(crate) fn default_run_dir(_data_dir: &std::path::Path) -> PathBuf {
+    zlayer_paths::ZLayerDirs::default_run_dir()
 }
 
 /// Return the platform-appropriate default log directory.
 ///
-/// - macOS: `{data_dir}/logs` (under the user data dir)
-/// - Linux: `/var/log/zlayer`
-/// - Windows: `{data_dir}\logs`
-pub(crate) fn default_log_dir(data_dir: &std::path::Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        data_dir.join("logs")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        data_dir.join("logs")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = data_dir;
-        PathBuf::from("/var/log/zlayer")
-    }
+/// Delegates to [`zlayer_paths::ZLayerDirs::default_log_dir`].
+pub(crate) fn default_log_dir(_data_dir: &std::path::Path) -> PathBuf {
+    zlayer_paths::ZLayerDirs::default_log_dir()
 }
 
 /// Return the platform-appropriate default socket path.
 ///
-/// On Windows, returns a TCP address instead of a Unix socket path since
-/// Unix domain sockets have limited support on Windows.
-pub(crate) fn default_socket_path(data_dir: &std::path::Path) -> String {
-    #[cfg(target_os = "macos")]
-    {
-        default_run_dir(data_dir)
-            .join("zlayer.sock")
-            .to_string_lossy()
-            .into_owned()
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = data_dir;
-        "tcp://127.0.0.1:3669".to_string()
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = data_dir;
-        "/var/run/zlayer.sock".to_string()
-    }
+/// Delegates to [`zlayer_paths::ZLayerDirs::default_socket_path`].
+pub(crate) fn default_socket_path(_data_dir: &std::path::Path) -> String {
+    zlayer_paths::ZLayerDirs::default_socket_path()
 }
 
 /// `ZLayer` container orchestration platform
@@ -121,10 +52,8 @@ pub(crate) struct Cli {
 
     /// Root data directory for all `ZLayer` state (databases, secrets, containers).
     ///
-    /// On macOS defaults to ~/.local/share/zlayer (no root required).
-    /// On Linux defaults to /var/lib/zlayer.
-    /// Other directories (logs, run, containers) are derived from this unless
-    /// individually overridden.
+    /// On macOS defaults to ~/.zlayer.
+    /// On Linux defaults to /var/lib/zlayer (root) or ~/.zlayer (user).
     #[arg(long, env = "ZLAYER_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
 
