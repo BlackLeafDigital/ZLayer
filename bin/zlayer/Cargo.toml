@@ -78,7 +78,7 @@ tokio-stream = { workspace = true }
 
 # System resource detection
 num_cpus = { workspace = true }
-zlayer-paths = { version = "0.0.0-dev", path = "../../crates/zlayer-paths" }
+zlayer-paths.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Internal crates (Unix-only -- depend on boringtun, libcontainer, etc.)

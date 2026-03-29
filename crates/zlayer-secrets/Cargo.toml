@@ -40,7 +40,7 @@ zql = { workspace = true, optional = true }
 
 # HashiCorp Vault (optional)
 vaultrs = { version = "0.7", optional = true }
-zlayer-paths = { version = "0.0.0-dev", path = "../zlayer-paths" }
+zlayer-paths.workspace = true
 
 [features]
 default = ["persistent"]
