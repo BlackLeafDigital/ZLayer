@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-03-29]
+
+### Fixed
+- `zlayer-paths` crate now publishable (removed `publish = false`) and added to
+  CI release publish order so crates depending on it can resolve it from the registry.
+
 ## [2026-03-28]
 
 ### Fixed

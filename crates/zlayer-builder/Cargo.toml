@@ -60,6 +60,7 @@ zip.workspace = true
 
 # Unix system calls (for chown)
 nix.workspace = true
+zlayer-paths.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

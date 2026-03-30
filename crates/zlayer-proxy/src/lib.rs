@@ -99,7 +99,7 @@ pub struct ZLayerProxyConfig {
     pub https_addr: String,
     /// Optional ACME email for Let's Encrypt certificate provisioning
     pub acme_email: Option<String>,
-    /// Path to store TLS certificates (default: "/var/lib/zlayer/certs")
+    /// Path to store TLS certificates (default: `zlayer_paths::ZLayerDirs::system_default().certs()`)
     pub cert_storage_path: String,
     /// Enable automatic ACME certificate provisioning
     pub acme_enabled: bool,
@@ -123,7 +123,10 @@ impl Default for ZLayerProxyConfig {
             http_addr: "0.0.0.0:80".to_string(),
             https_addr: "0.0.0.0:443".to_string(),
             acme_email: None,
-            cert_storage_path: "/var/lib/zlayer/certs".to_string(),
+            cert_storage_path: zlayer_paths::ZLayerDirs::system_default()
+                .certs()
+                .to_string_lossy()
+                .into_owned(),
             acme_enabled: false,
             acme_staging: false,
             acme_directory_url: None,
@@ -329,7 +332,12 @@ mod tests {
         assert_eq!(config.http_addr, "0.0.0.0:80");
         assert_eq!(config.https_addr, "0.0.0.0:443");
         assert!(config.acme_email.is_none());
-        assert_eq!(config.cert_storage_path, "/var/lib/zlayer/certs");
+        assert_eq!(
+            config.cert_storage_path,
+            zlayer_paths::ZLayerDirs::system_default()
+                .certs()
+                .to_string_lossy()
+        );
         assert!(!config.acme_enabled);
         assert!(!config.acme_staging);
         assert!(config.acme_directory_url.is_none());

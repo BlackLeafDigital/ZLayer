@@ -39,7 +39,7 @@ pub struct AgentConfig {
 }
 
 fn default_data_dir() -> PathBuf {
-    PathBuf::from("/var/lib/zlayer")
+    zlayer_paths::ZLayerDirs::default_data_dir()
 }
 
 /// Raft consensus configuration

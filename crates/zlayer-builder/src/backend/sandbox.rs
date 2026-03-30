@@ -9,6 +9,7 @@ use crate::dockerfile::Dockerfile;
 use crate::error::{BuildError, Result};
 use crate::sandbox_builder::SandboxImageBuilder;
 use crate::tui::BuildEvent;
+use zlayer_paths::ZLayerDirs;
 
 use super::BuildBackend;
 
@@ -32,9 +33,7 @@ impl SandboxBackend {
 
 impl Default for SandboxBackend {
     fn default() -> Self {
-        let data_dir = dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("/tmp"))
-            .join(".zlayer");
+        let data_dir = ZLayerDirs::default_data_dir();
         Self { data_dir }
     }
 }

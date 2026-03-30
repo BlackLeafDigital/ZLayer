@@ -364,34 +364,25 @@ pub fn install_instructions() -> String {
 
 /// Get the default install directory for `ZLayer` binaries
 fn default_install_dir() -> PathBuf {
-    // Try user directory first
-    if let Some(home) = dirs::home_dir() {
-        return home.join(".zlayer").join("bin");
-    }
-
-    // Fall back to system directory
-    PathBuf::from("/usr/local/lib/zlayer")
+    zlayer_paths::ZLayerDirs::system_default().bin()
 }
 
 /// Get all paths to search for buildah
 fn get_search_paths(install_dir: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-
-    // Custom install directory
-    paths.push(install_dir.join("buildah"));
-
-    // User ZLayer directory
-    if let Some(home) = dirs::home_dir() {
-        paths.push(home.join(".zlayer").join("bin").join("buildah"));
-    }
-
-    // System ZLayer directory
-    paths.push(PathBuf::from("/usr/local/lib/zlayer/buildah"));
-
-    // Standard system paths
-    paths.push(PathBuf::from("/usr/bin/buildah"));
-    paths.push(PathBuf::from("/usr/local/bin/buildah"));
-    paths.push(PathBuf::from("/bin/buildah"));
+    let mut paths = vec![
+        // Custom install directory
+        install_dir.join("buildah"),
+        // User ZLayer directory
+        zlayer_paths::ZLayerDirs::system_default()
+            .bin()
+            .join("buildah"),
+        // System ZLayer directory
+        PathBuf::from("/usr/local/lib/zlayer/buildah"),
+        // Standard system paths
+        PathBuf::from("/usr/bin/buildah"),
+        PathBuf::from("/usr/local/bin/buildah"),
+        PathBuf::from("/bin/buildah"),
+    ];
 
     // Deduplicate while preserving order
     let mut seen = std::collections::HashSet::new();

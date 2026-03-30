@@ -7,7 +7,7 @@
 //! ## Directory Structure
 //!
 //! ```text
-//! /var/lib/zlayer/registry/
+//! {data_dir}/registry/
 //! |-- blobs/
 //! |   |-- sha256/
 //! |       |-- <digest>   # blob content
@@ -109,7 +109,7 @@ impl RegistryIndex {
 /// use std::path::PathBuf;
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-/// let registry = LocalRegistry::new(PathBuf::from("/var/lib/zlayer/registry")).await?;
+/// let registry = LocalRegistry::new(PathBuf::from("/tmp/zlayer/registry")).await?;
 ///
 /// // Store a blob
 /// let data = b"layer data";

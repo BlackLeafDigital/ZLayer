@@ -93,8 +93,7 @@ if [ -f "${INSTALL_DIR}/${BINARY}" ]; then
     echo "Stopping zlayer..."
     "${INSTALL_DIR}/${BINARY}" daemon uninstall >/dev/null 2>&1 || true
     # Clean up stale state
-    rm -f "${HOME}/.local/share/zlayer/daemon.json" 2>/dev/null || true
-    rm -f "${HOME}/.local/share/zlayer/run/zlayer.sock" 2>/dev/null || true
+    rm -f /var/lib/zlayer/daemon.json 2>/dev/null || true
     rm -f /var/run/zlayer.sock 2>/dev/null || true
     sleep 2
 fi

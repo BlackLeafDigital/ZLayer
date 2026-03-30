@@ -79,6 +79,7 @@ tokio-stream = { workspace = true }
 
 # System resource detection
 num_cpus = { workspace = true }
+zlayer-paths.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 # Internal crates (Unix-only -- depend on boringtun, libcontainer, etc.)

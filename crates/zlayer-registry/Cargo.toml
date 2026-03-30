@@ -27,6 +27,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 zstd = "0.13.3"
+zlayer-paths.workspace = true
 
 [dev-dependencies]
 serial_test = "3"
