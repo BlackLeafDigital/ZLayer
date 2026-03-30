@@ -83,6 +83,8 @@ pub enum Request {
         cpu_used: f64,
         memory_used: u64,
         disk_used: u64,
+        #[serde(default)]
+        gpu_utilization: Vec<GpuUtilizationReport>,
     },
     /// Update node status (ready/draining/dead)
     UpdateNodeStatus { node_id: NodeId, status: String },
@@ -216,6 +218,9 @@ pub struct NodeInfo {
     /// Current disk usage in bytes
     #[serde(default)]
     pub disk_used: u64,
+    /// Current GPU utilization snapshots
+    #[serde(default)]
+    pub gpu_utilization: Vec<GpuUtilizationReport>,
     /// Node status: "ready", "draining", or "dead"
     #[serde(default = "default_node_status")]
     pub status: String,
@@ -241,6 +246,23 @@ pub struct GpuInfoSummary {
     pub model: String,
     /// VRAM in MB
     pub memory_mb: u64,
+}
+
+/// Per-GPU utilization snapshot reported in node heartbeats
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GpuUtilizationReport {
+    /// GPU index on this node
+    pub index: u32,
+    /// GPU compute utilization percentage (0-100)
+    pub utilization_percent: f32,
+    /// GPU memory currently used in MB
+    pub memory_used_mb: u64,
+    /// GPU total memory in MB
+    pub memory_total_mb: u64,
+    /// GPU temperature in Celsius
+    pub temperature_c: Option<u32>,
+    /// GPU power draw in Watts
+    pub power_draw_w: Option<f32>,
 }
 
 /// Parameters for adding a new member to the Raft cluster.
@@ -343,12 +365,14 @@ impl ClusterState {
                 cpu_used,
                 memory_used,
                 disk_used,
+                gpu_utilization,
             } => {
                 if let Some(node) = self.nodes.get_mut(node_id) {
                     node.last_heartbeat = *timestamp;
                     node.cpu_used = *cpu_used;
                     node.memory_used = *memory_used;
                     node.disk_used = *disk_used;
+                    node.gpu_utilization.clone_from(gpu_utilization);
                 }
                 Response::Success { data: None }
             }
@@ -460,6 +484,7 @@ impl ClusterState {
                 cpu_used: 0.0,
                 memory_used: 0,
                 disk_used: 0,
+                gpu_utilization: Vec::new(),
                 status: "ready".to_string(),
                 mode: mode.to_owned(),
             },

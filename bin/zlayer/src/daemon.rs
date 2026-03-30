@@ -546,6 +546,14 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             let pw_path = config.data_dir.join("admin_password");
             if pw_path.exists() {
                 info!("Admin API credential already exists");
+                // Ensure password file is world-readable so non-root tools
+                // (e.g. E2E tests, CLI) can auto-detect credentials.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(&pw_path, std::fs::Permissions::from_mode(0o644));
+                }
             } else {
                 warn!("Admin credential exists but password file is missing — regenerating");
                 let new_password = generate_admin_password();

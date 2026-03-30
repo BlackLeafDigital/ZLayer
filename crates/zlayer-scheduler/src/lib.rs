@@ -390,6 +390,7 @@ impl Scheduler {
                 #[allow(clippy::cast_possible_truncation)]
                 let gpu_count = n.gpus.len() as u32;
                 resources.gpu_total = gpu_count;
+                resources.gpu_allocated = vec![placement::GpuAllocation::Free; gpu_count as usize];
                 resources.gpu_models = n.gpus.iter().map(|g| g.model.clone()).collect();
                 resources.gpu_memory_mb = n.gpus.iter().map(|g| g.memory_mb).sum();
                 if let Some(first_gpu) = n.gpus.first() {

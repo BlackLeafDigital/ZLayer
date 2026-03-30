@@ -36,7 +36,7 @@
 //! ## Limitations
 //!
 //! - **One GPU container at a time**: Metal GPU context cannot be shared across VMs
-//! - **Apple Silicon only**: Requires M1 or later (Hypervisor.framework)
+//! - **Requires Hypervisor.framework**: Works on Intel and Apple Silicon Macs; GPU forwarding (Metal/Venus-Vulkan) requires Apple Silicon
 //! - **No exec support**: Would require vsock or SSH agent inside the VM
 //! - **vCPUs must not exceed host cores**: libkrun silently hangs otherwise
 //! - **No graceful shutdown API**: VM exits when entrypoint process exits
