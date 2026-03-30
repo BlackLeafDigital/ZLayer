@@ -152,7 +152,10 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 
 #[cfg(feature = "cache")]
 mod sandbox_push {
-    use super::*;
+    use std::path::Path;
+
+    use crate::builder::RegistryAuth;
+    use crate::error::{BuildError, Result};
     use crate::sandbox_builder::SandboxImageConfig;
     use flate2::write::GzEncoder;
     use flate2::Compression;
@@ -160,7 +163,6 @@ mod sandbox_push {
         ImageIndexEntry, OciDescriptor, OciImageIndex, OciImageManifest, Platform,
     };
     use sha2::{Digest, Sha256};
-    use std::io::Write;
     use tar::Builder;
     use tracing::{debug, info};
     use zlayer_core::auth::DockerConfigAuth;
@@ -232,7 +234,7 @@ mod sandbox_push {
         info!("Creating layer from rootfs for {}", tag);
         let layer_blob = create_tar_gz_layer(&rootfs_dir).await?;
         let layer_digest = format!("sha256:{}", hex_digest(&layer_blob));
-        let layer_size = layer_blob.len() as i64;
+        let layer_size = i64::try_from(layer_blob.len()).unwrap_or(i64::MAX);
         debug!(
             digest = %layer_digest,
             size = layer_size,
@@ -242,13 +244,12 @@ mod sandbox_push {
         // 2. Build OCI image config
         let oci_config = build_oci_config(&sandbox_config, &layer_digest, layer_size);
         let config_blob = serde_json::to_vec(&oci_config).map_err(|e| {
-            BuildError::IoError(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to serialize OCI config: {e}"),
-            ))
+            BuildError::IoError(std::io::Error::other(format!(
+                "failed to serialize OCI config: {e}"
+            )))
         })?;
         let config_digest = format!("sha256:{}", hex_digest(&config_blob));
-        let config_size = config_blob.len() as i64;
+        let config_size = i64::try_from(config_blob.len()).unwrap_or(i64::MAX);
 
         // 3. Build OCI manifest
         let manifest = OciImageManifest {
@@ -275,13 +276,12 @@ mod sandbox_push {
 
         // 4. Serialize manifest and compute digest
         let manifest_bytes = serde_json::to_vec(&manifest).map_err(|e| {
-            BuildError::IoError(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to serialize OCI manifest: {e}"),
-            ))
+            BuildError::IoError(std::io::Error::other(format!(
+                "failed to serialize OCI manifest: {e}"
+            )))
         })?;
         let manifest_digest = format!("sha256:{}", hex_digest(&manifest_bytes));
-        let manifest_size = manifest_bytes.len() as i64;
+        let manifest_size = i64::try_from(manifest_bytes.len()).unwrap_or(i64::MAX);
 
         Ok(PreparedImage {
             layer_blob,
@@ -308,10 +308,14 @@ mod sandbox_push {
         let prepared = prepare_image_for_push(data_dir, tag).await?;
 
         // Resolve auth
-        let oci_auth = resolve_auth(tag, auth)?;
+        let oci_auth = resolve_auth(tag, auth);
 
         // Push via registry client
-        let cache = BlobCache::new();
+        let cache = BlobCache::new().map_err(|e| {
+            BuildError::IoError(std::io::Error::other(format!(
+                "failed to create blob cache: {e}"
+            )))
+        })?;
         let puller = ImagePuller::new(cache);
 
         info!("Pushing layer {} to {}", prepared.layer_digest, tag);
@@ -325,10 +329,7 @@ mod sandbox_push {
             )
             .await
             .map_err(|e| {
-                BuildError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to push layer: {e}"),
-                ))
+                BuildError::IoError(std::io::Error::other(format!("failed to push layer: {e}")))
             })?;
 
         info!("Pushing config {} to {}", prepared.config_digest, tag);
@@ -342,28 +343,23 @@ mod sandbox_push {
             )
             .await
             .map_err(|e| {
-                BuildError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to push config: {e}"),
-                ))
+                BuildError::IoError(std::io::Error::other(format!("failed to push config: {e}")))
             })?;
 
         info!("Pushing manifest for {}", tag);
         let manifest: OciImageManifest =
             serde_json::from_slice(&prepared.manifest_bytes).map_err(|e| {
-                BuildError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to deserialize manifest: {e}"),
-                ))
+                BuildError::IoError(std::io::Error::other(format!(
+                    "failed to deserialize manifest: {e}"
+                )))
             })?;
         puller
             .push_manifest_to_registry(tag, &manifest, &oci_auth)
             .await
             .map_err(|e| {
-                BuildError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to push manifest: {e}"),
-                ))
+                BuildError::IoError(std::io::Error::other(format!(
+                    "failed to push manifest: {e}"
+                )))
             })?;
 
         info!("Successfully pushed {}", tag);
@@ -389,10 +385,9 @@ mod sandbox_push {
 
         let index = SandboxManifestIndex { entries: vec![] };
         let index_json = serde_json::to_vec_pretty(&index).map_err(|e| {
-            BuildError::IoError(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to serialize manifest index: {e}"),
-            ))
+            BuildError::IoError(std::io::Error::other(format!(
+                "failed to serialize manifest index: {e}"
+            )))
         })?;
         tokio::fs::write(manifest_dir.join("index.json"), &index_json)
             .await
@@ -496,10 +491,9 @@ mod sandbox_push {
 
         // Write updated index
         let updated_json = serde_json::to_vec_pretty(&index).map_err(|e| {
-            BuildError::IoError(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("failed to serialize updated manifest index: {e}"),
-            ))
+            BuildError::IoError(std::io::Error::other(format!(
+                "failed to serialize updated manifest index: {e}"
+            )))
         })?;
         tokio::fs::write(&index_path, &updated_json)
             .await
@@ -509,6 +503,123 @@ mod sandbox_push {
                     format!("failed to write updated manifest index.json: {e}"),
                 ))
             })?;
+
+        Ok(())
+    }
+
+    /// Push all entries (layers, configs, manifests) for a manifest list to a
+    /// remote OCI registry.
+    async fn push_manifest_entries(
+        puller: &ImagePuller,
+        index: &SandboxManifestIndex,
+        blobs_dir: &Path,
+        destination: &str,
+        oci_auth: &OciRegistryAuth,
+    ) -> Result<()> {
+        let strip_prefix = |digest: &str| -> String {
+            digest.strip_prefix("sha256:").unwrap_or(digest).to_string()
+        };
+
+        for entry in &index.entries {
+            // Push layer blob
+            let layer_data = tokio::fs::read(blobs_dir.join(strip_prefix(&entry.layer_digest)))
+                .await
+                .map_err(|e| {
+                    BuildError::IoError(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to read layer blob {}: {e}", entry.layer_digest),
+                    ))
+                })?;
+
+            info!(
+                "Pushing layer {} for {} to {}",
+                entry.layer_digest, entry.image_tag, destination
+            );
+            puller
+                .push_blob(
+                    destination,
+                    &entry.layer_digest,
+                    &layer_data,
+                    "application/vnd.oci.image.layer.v1.tar+gzip",
+                    oci_auth,
+                )
+                .await
+                .map_err(|e| {
+                    BuildError::IoError(std::io::Error::other(format!(
+                        "failed to push layer {}: {e}",
+                        entry.layer_digest
+                    )))
+                })?;
+
+            // Push config blob
+            let config_data = tokio::fs::read(blobs_dir.join(strip_prefix(&entry.config_digest)))
+                .await
+                .map_err(|e| {
+                    BuildError::IoError(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to read config blob {}: {e}", entry.config_digest),
+                    ))
+                })?;
+
+            info!(
+                "Pushing config {} for {} to {}",
+                entry.config_digest, entry.image_tag, destination
+            );
+            puller
+                .push_blob(
+                    destination,
+                    &entry.config_digest,
+                    &config_data,
+                    "application/vnd.oci.image.config.v1+json",
+                    oci_auth,
+                )
+                .await
+                .map_err(|e| {
+                    BuildError::IoError(std::io::Error::other(format!(
+                        "failed to push config {}: {e}",
+                        entry.config_digest
+                    )))
+                })?;
+
+            // Push manifest blob
+            let manifest_data =
+                tokio::fs::read(blobs_dir.join(strip_prefix(&entry.manifest_digest)))
+                    .await
+                    .map_err(|e| {
+                        BuildError::IoError(std::io::Error::new(
+                            e.kind(),
+                            format!(
+                                "failed to read manifest blob {}: {e}",
+                                entry.manifest_digest
+                            ),
+                        ))
+                    })?;
+
+            let manifest: OciImageManifest =
+                serde_json::from_slice(&manifest_data).map_err(|e| {
+                    BuildError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "failed to deserialize manifest {}: {e}",
+                            entry.manifest_digest
+                        ),
+                    ))
+                })?;
+
+            info!(
+                "Pushing manifest {} for {} to {}",
+                entry.manifest_digest, entry.image_tag, destination
+            );
+            puller
+                .push_manifest_to_registry(destination, &manifest, oci_auth)
+                .await
+                .map_err(|e| {
+                    BuildError::IoError(std::io::Error::other(format!(
+                        "failed to push manifest {}: {e}",
+                        entry.manifest_digest
+                    )))
+                })?;
+        }
 
         Ok(())
     }
@@ -543,118 +654,19 @@ mod sandbox_push {
         })?;
 
         // Resolve auth against the destination reference
-        let oci_auth = resolve_auth(destination, auth)?;
+        let oci_auth = resolve_auth(destination, auth);
 
-        let cache = BlobCache::new();
+        let cache = BlobCache::new().map_err(|e| {
+            BuildError::IoError(std::io::Error::other(format!(
+                "failed to create blob cache: {e}"
+            )))
+        })?;
         let puller = ImagePuller::new(cache);
 
         let blobs_dir = manifest_dir.join("blobs");
 
-        // Helper to strip the "sha256:" prefix for filenames
-        let strip_prefix = |digest: &str| -> String {
-            digest.strip_prefix("sha256:").unwrap_or(digest).to_string()
-        };
-
-        for entry in &index.entries {
-            // Push layer blob
-            let layer_data = tokio::fs::read(blobs_dir.join(strip_prefix(&entry.layer_digest)))
-                .await
-                .map_err(|e| {
-                    BuildError::IoError(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to read layer blob {}: {e}", entry.layer_digest),
-                    ))
-                })?;
-
-            info!(
-                "Pushing layer {} for {} to {}",
-                entry.layer_digest, entry.image_tag, destination
-            );
-            puller
-                .push_blob(
-                    destination,
-                    &entry.layer_digest,
-                    &layer_data,
-                    "application/vnd.oci.image.layer.v1.tar+gzip",
-                    &oci_auth,
-                )
-                .await
-                .map_err(|e| {
-                    BuildError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("failed to push layer {}: {e}", entry.layer_digest),
-                    ))
-                })?;
-
-            // Push config blob
-            let config_data = tokio::fs::read(blobs_dir.join(strip_prefix(&entry.config_digest)))
-                .await
-                .map_err(|e| {
-                    BuildError::IoError(std::io::Error::new(
-                        e.kind(),
-                        format!("failed to read config blob {}: {e}", entry.config_digest),
-                    ))
-                })?;
-
-            info!(
-                "Pushing config {} for {} to {}",
-                entry.config_digest, entry.image_tag, destination
-            );
-            puller
-                .push_blob(
-                    destination,
-                    &entry.config_digest,
-                    &config_data,
-                    "application/vnd.oci.image.config.v1+json",
-                    &oci_auth,
-                )
-                .await
-                .map_err(|e| {
-                    BuildError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("failed to push config {}: {e}", entry.config_digest),
-                    ))
-                })?;
-
-            // Push manifest blob
-            let manifest_data =
-                tokio::fs::read(blobs_dir.join(strip_prefix(&entry.manifest_digest)))
-                    .await
-                    .map_err(|e| {
-                        BuildError::IoError(std::io::Error::new(
-                            e.kind(),
-                            format!(
-                                "failed to read manifest blob {}: {e}",
-                                entry.manifest_digest
-                            ),
-                        ))
-                    })?;
-
-            let manifest: OciImageManifest =
-                serde_json::from_slice(&manifest_data).map_err(|e| {
-                    BuildError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "failed to deserialize manifest {}: {e}",
-                            entry.manifest_digest
-                        ),
-                    ))
-                })?;
-
-            info!(
-                "Pushing manifest {} for {} to {}",
-                entry.manifest_digest, entry.image_tag, destination
-            );
-            puller
-                .push_manifest_to_registry(destination, &manifest, &oci_auth)
-                .await
-                .map_err(|e| {
-                    BuildError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("failed to push manifest {}: {e}", entry.manifest_digest),
-                    ))
-                })?;
-        }
+        // Push all individual entries (layers, configs, manifests)
+        push_manifest_entries(&puller, &index, &blobs_dir, destination, &oci_auth).await?;
 
         // Build and push the image index
         let image_index = OciImageIndex {
@@ -687,10 +699,9 @@ mod sandbox_push {
             .push_image_index_to_registry(destination, &image_index, &oci_auth)
             .await
             .map_err(|e| {
-                BuildError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("failed to push image index: {e}"),
-                ))
+                BuildError::IoError(std::io::Error::other(format!(
+                    "failed to push image index: {e}"
+                )))
             })?;
 
         info!("Successfully pushed manifest {} to {}", name, destination);
@@ -715,32 +726,28 @@ mod sandbox_push {
                 let encoder = GzEncoder::new(&mut buf, Compression::default());
                 let mut archive = Builder::new(encoder);
                 archive.append_dir_all(".", &rootfs).map_err(|e| {
-                    BuildError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("failed to create tar archive: {e}"),
-                    ))
+                    BuildError::IoError(std::io::Error::other(format!(
+                        "failed to create tar archive: {e}"
+                    )))
                 })?;
                 let encoder = archive.into_inner().map_err(|e| {
-                    BuildError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("failed to finalize tar archive: {e}"),
-                    ))
+                    BuildError::IoError(std::io::Error::other(format!(
+                        "failed to finalize tar archive: {e}"
+                    )))
                 })?;
                 encoder.finish().map_err(|e| {
-                    BuildError::IoError(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("failed to finish gzip: {e}"),
-                    ))
+                    BuildError::IoError(std::io::Error::other(format!(
+                        "failed to finish gzip: {e}"
+                    )))
                 })?;
             }
             Ok(buf)
         })
         .await
         .map_err(|e| {
-            BuildError::IoError(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("layer creation task failed: {e}"),
-            ))
+            BuildError::IoError(std::io::Error::other(format!(
+                "layer creation task failed: {e}"
+            )))
         })?
     }
 
@@ -808,13 +815,10 @@ mod sandbox_push {
     }
 
     /// Resolve OCI registry auth from the provided credentials or Docker config.
-    fn resolve_auth(tag: &str, auth: Option<&RegistryAuth>) -> Result<OciRegistryAuth> {
+    fn resolve_auth(tag: &str, auth: Option<&RegistryAuth>) -> OciRegistryAuth {
         // Use explicitly provided credentials first
         if let Some(auth) = auth {
-            return Ok(OciRegistryAuth::Basic(
-                auth.username.clone(),
-                auth.password.clone(),
-            ));
+            return OciRegistryAuth::Basic(auth.username.clone(), auth.password.clone());
         }
 
         // Fall back to Docker config
@@ -822,12 +826,12 @@ mod sandbox_push {
             // Extract registry hostname from the tag
             let registry = extract_registry(tag);
             if let Some((username, password)) = docker_config.get_credentials(&registry) {
-                return Ok(OciRegistryAuth::Basic(username, password));
+                return OciRegistryAuth::Basic(username, password);
             }
         }
 
         // No auth — try anonymous
-        Ok(OciRegistryAuth::Anonymous)
+        OciRegistryAuth::Anonymous
     }
 
     /// Extract the registry hostname from an image reference.
@@ -852,7 +856,10 @@ mod sandbox_push {
 
 #[cfg(not(feature = "cache"))]
 mod sandbox_push {
-    use super::*;
+    use std::path::Path;
+
+    use crate::builder::RegistryAuth;
+    use crate::error::{BuildError, Result};
 
     pub(super) async fn push_image(
         _data_dir: &Path,
