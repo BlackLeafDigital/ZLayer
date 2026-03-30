@@ -6,7 +6,7 @@ use crate::image_config::{ImageConfig, OciImageConfigRoot};
 use crate::wasm::{detect_artifact_type, extract_wasm_info, ArtifactType, WasmArtifactInfo};
 use oci_client::{
     client::{ClientConfig, ClientProtocol},
-    manifest::{ImageIndexEntry, OciImageManifest, OciManifest},
+    manifest::{ImageIndexEntry, OciImageIndex, OciImageManifest, OciManifest},
     secrets::RegistryAuth,
     Reference, RegistryOperation,
 };
@@ -722,6 +722,76 @@ impl ImagePuller {
             digest = %digest,
             manifest_url = %manifest_url,
             "manifest pushed successfully"
+        );
+
+        Ok(digest)
+    }
+
+    /// Push an OCI image index (manifest list) to a remote registry.
+    ///
+    /// Used for multi-platform images where each platform has its own manifest
+    /// and the index ties them together.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the reference is invalid, authentication fails, or
+    /// the index upload fails.
+    #[instrument(
+        name = "push_image_index_to_registry",
+        skip(self, index, auth),
+        fields(
+            reference = %reference,
+            manifests = index.manifests.len(),
+        )
+    )]
+    pub async fn push_image_index_to_registry(
+        &self,
+        reference: &str,
+        index: &OciImageIndex,
+        auth: &RegistryAuth,
+    ) -> std::result::Result<String, PushError> {
+        let image_ref: Reference = reference.parse().map_err(|_| PushError::InvalidReference {
+            reference: reference.to_string(),
+        })?;
+
+        tracing::debug!(
+            reference = %reference,
+            manifests = index.manifests.len(),
+            "pushing image index to registry"
+        );
+
+        // Authenticate for push operation
+        self.client
+            .auth(&image_ref, auth, RegistryOperation::Push)
+            .await
+            .map_err(|e| PushError::AuthenticationFailed {
+                registry: image_ref.resolve_registry().to_string(),
+                reason: e.to_string(),
+            })?;
+
+        // Push the image index
+        let manifest_url = self
+            .client
+            .push_manifest(&image_ref, &OciManifest::ImageIndex(index.clone()))
+            .await
+            .map_err(|e| PushError::ManifestUploadFailed {
+                reason: e.to_string(),
+            })?;
+
+        let digest = if let Some(digest_start) = manifest_url.rfind('@') {
+            manifest_url[digest_start + 1..].to_string()
+        } else {
+            let index_json =
+                serde_json::to_vec(index).map_err(|e| PushError::ManifestUploadFailed {
+                    reason: format!("failed to serialize image index: {e}"),
+                })?;
+            crate::cache::compute_digest(&index_json)
+        };
+
+        tracing::info!(
+            reference = %reference,
+            digest = %digest,
+            "image index pushed successfully"
         );
 
         Ok(digest)

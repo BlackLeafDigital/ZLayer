@@ -115,7 +115,11 @@ fn build_exposed_ports(spec: &ServiceSpec) -> Vec<String> {
 
 /// Build host configuration for Docker container
 #[allow(clippy::too_many_lines)]
-fn build_host_config(spec: &ServiceSpec, auth_socket_path: Option<&str>) -> HostConfig {
+fn build_host_config(
+    spec: &ServiceSpec,
+    auth_socket_path: Option<&str>,
+    gpu_indices: Option<&[u32]>,
+) -> HostConfig {
     let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
 
     for endpoint in &spec.endpoints {
@@ -165,12 +169,17 @@ fn build_host_config(spec: &ServiceSpec, auth_socket_path: Option<&str>) -> Host
     // AMD/Intel use raw device passthrough since Docker has no native plugin for them.
     let mut device_requests: Option<Vec<DeviceRequest>> = None;
     if let Some(ref gpu) = spec.resources.gpu {
+        let indices: Vec<u32> =
+            gpu_indices.map_or_else(|| (0..gpu.count).collect(), <[u32]>::to_vec);
+
         match gpu.vendor.as_str() {
             "nvidia" => {
-                // NVIDIA Container Toolkit handles this via device_requests
+                // NVIDIA Container Toolkit handles this via device_requests.
+                // Use explicit device_ids so the scheduler can pin specific GPUs.
                 device_requests = Some(vec![DeviceRequest {
                     driver: Some("nvidia".into()),
-                    count: Some(i64::from(gpu.count)),
+                    device_ids: Some(indices.iter().map(ToString::to_string).collect()),
+                    count: None, // don't set count when using device_ids
                     capabilities: Some(vec![vec!["gpu".into()]]),
                     ..Default::default()
                 }]);
@@ -182,7 +191,7 @@ fn build_host_config(spec: &ServiceSpec, auth_socket_path: Option<&str>) -> Host
                     path_in_container: Some("/dev/kfd".into()),
                     cgroup_permissions: Some("rwm".into()),
                 });
-                for i in 0..gpu.count {
+                for i in &indices {
                     let render_path = format!("/dev/dri/renderD{}", 128 + i);
                     devices.push(DeviceMapping {
                         path_on_host: Some(render_path.clone()),
@@ -199,7 +208,7 @@ fn build_host_config(spec: &ServiceSpec, auth_socket_path: Option<&str>) -> Host
             }
             "intel" => {
                 // Intel GPU - pass through DRI devices
-                for i in 0..gpu.count {
+                for i in &indices {
                     let render_path = format!("/dev/dri/renderD{}", 128 + i);
                     devices.push(DeviceMapping {
                         path_on_host: Some(render_path.clone()),
@@ -220,7 +229,7 @@ fn build_host_config(spec: &ServiceSpec, auth_socket_path: Option<&str>) -> Host
                     vendor = %other,
                     "Unknown GPU vendor for Docker, attempting DRI device passthrough"
                 );
-                for i in 0..gpu.count {
+                for i in &indices {
                     let render_path = format!("/dev/dri/renderD{}", 128 + i);
                     devices.push(DeviceMapping {
                         path_on_host: Some(render_path.clone()),
@@ -243,8 +252,7 @@ fn build_host_config(spec: &ServiceSpec, auth_socket_path: Option<&str>) -> Host
     let mut binds: Vec<String> = Vec::new();
     if let Some(socket) = auth_socket_path {
         binds.push(format!(
-            "{}:{}:ro",
-            socket,
+            "{socket}:{}:ro",
             zlayer_paths::ZLayerDirs::default_socket_path()
         ));
     }
@@ -444,6 +452,42 @@ impl Runtime for DockerRuntime {
             ));
         }
 
+        // Inject GPU device visibility environment variables
+        if let Some(ref gpu) = spec.resources.gpu {
+            let indices: Vec<String> = (0..gpu.count).map(|i| i.to_string()).collect();
+            let device_list = indices.join(",");
+            match gpu.vendor.as_str() {
+                "nvidia" => {
+                    env.push(format!("NVIDIA_VISIBLE_DEVICES={device_list}"));
+                    env.push(format!("CUDA_VISIBLE_DEVICES={device_list}"));
+                }
+                "amd" => {
+                    env.push(format!("ROCR_VISIBLE_DEVICES={device_list}"));
+                    env.push(format!("HIP_VISIBLE_DEVICES={device_list}"));
+                }
+                "intel" => {
+                    env.push(format!("ZE_AFFINITY_MASK={device_list}"));
+                }
+                _ => {}
+            }
+        }
+
+        // Inject distributed training coordination env vars
+        if let Some(ref gpu) = spec.resources.gpu {
+            if let Some(ref dist) = gpu.distributed {
+                env.push(format!("MASTER_PORT={}", dist.master_port));
+                env.push(format!("MASTER_ADDR={}", id.service));
+                env.push("WORLD_SIZE=1".to_string());
+                env.push("RANK=0".to_string());
+                env.push("LOCAL_RANK=0".to_string());
+                match dist.backend.as_str() {
+                    "nccl" => env.push("NCCL_SOCKET_IFNAME=eth0".to_string()),
+                    "gloo" => env.push("GLOO_SOCKET_IFNAME=eth0".to_string()),
+                    _ => {}
+                }
+            }
+        }
+
         // Build exposed ports
         let exposed_ports = build_exposed_ports(spec);
 
@@ -452,7 +496,7 @@ impl Runtime for DockerRuntime {
             .auth_context
             .as_ref()
             .map(|ctx| ctx.socket_path.as_str());
-        let host_config = build_host_config(spec, auth_socket);
+        let host_config = build_host_config(spec, auth_socket, None);
 
         // Build command/entrypoint
         let cmd = spec.command.args.clone();
@@ -1122,7 +1166,7 @@ mod tests {
     #[test]
     fn test_build_host_config_ports() {
         let spec = create_test_spec(vec![8080]);
-        let host_config = build_host_config(&spec, None);
+        let host_config = build_host_config(&spec, None, None);
 
         let port_bindings = host_config.port_bindings.unwrap();
         let bindings = port_bindings.get("8080/tcp").unwrap().as_ref().unwrap();
@@ -1135,7 +1179,7 @@ mod tests {
     fn test_build_host_config_privileged() {
         let mut spec = create_test_spec(vec![]);
         spec.privileged = true;
-        let host_config = build_host_config(&spec, None);
+        let host_config = build_host_config(&spec, None, None);
         assert_eq!(host_config.privileged, Some(true));
     }
 
@@ -1152,6 +1196,7 @@ mod tests {
                 port,
                 target_port: None,
                 path: None,
+                host: None,
                 expose: ExposeType::Internal,
                 stream: None,
                 tunnel: None,

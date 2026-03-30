@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- macOS sandbox backend now supports `push_image`, `tag_image`, `manifest_create`,
+  `manifest_add`, and `manifest_push` operations. Previously, pipeline builds on
+  macOS succeeded but push/manifest operations always failed with "Operation 'push'
+  is not supported by this backend". The sandbox backend now tars the rootfs, builds
+  OCI manifests, and pushes via the registry client (requires the `cache` feature).
+  Multi-platform manifest lists are stored on disk and pushed as OCI image indexes.
+- `ImagePuller::push_image_index_to_registry` method for pushing OCI image indexes
+  (manifest lists) to remote registries.
+
 ### Fixed
 - CI version substitution now uses global replace in `zdb-publish.yml`, fixing
   `zlayer-paths` version not being updated (caused `^0.0.0-dev` vs `0.2.45` mismatch).

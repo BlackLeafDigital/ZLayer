@@ -269,6 +269,12 @@ impl EndpointSpec {
         self.inner.path.clone()
     }
 
+    /// The host header / virtual host
+    #[getter]
+    fn host(&self) -> Option<String> {
+        self.inner.host.clone()
+    }
+
     /// The exposure type (public or internal)
     #[getter]
     fn expose(&self) -> &str {
@@ -530,6 +536,7 @@ pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResu
             port: p,
             target_port: None,
             path: None,
+            host: None,
             expose: zlayer_spec::ExposeType::Internal,
             stream: None,
             tunnel: None,

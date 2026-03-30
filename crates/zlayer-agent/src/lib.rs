@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod autoscale_controller;
 pub mod bundle;
+pub mod cdi;
 pub mod cgroups_stats;
 pub mod container_supervisor;
 pub mod cron_scheduler;
@@ -12,6 +13,8 @@ pub mod dependency;
 pub mod env;
 pub mod error;
 pub mod gpu_detector;
+pub mod gpu_metrics;
+pub mod gpu_sharing;
 pub mod health;
 pub mod init;
 pub mod job;

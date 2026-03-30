@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 use tracing::debug;
-use zlayer_spec::{NodeMode, NodeSelector, ServiceSpec};
+use zlayer_spec::{GpuSharingMode, NodeMode, NodeSelector, ServiceSpec};
 
 use crate::error::{Result, SchedulerError};
 use crate::raft::NodeId;
@@ -38,6 +38,41 @@ impl ContainerId {
 impl std::fmt::Display for ContainerId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}-{}", self.service, self.replica)
+    }
+}
+
+/// Allocation state of a single GPU
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub enum GpuAllocation {
+    /// GPU is free
+    #[default]
+    Free,
+    /// GPU is exclusively allocated to one container
+    Exclusive,
+    /// GPU is shared via MPS or time-slicing; tracks current share count and max
+    Shared {
+        /// Number of containers currently sharing this GPU
+        current: u32,
+        /// Maximum number of containers allowed to share
+        max: u32,
+    },
+}
+
+impl GpuAllocation {
+    /// Returns true if this GPU can accept another container
+    #[must_use]
+    pub fn is_available(&self) -> bool {
+        match self {
+            Self::Free => true,
+            Self::Exclusive => false,
+            Self::Shared { current, max } => current < max,
+        }
+    }
+
+    /// Returns true if this GPU is completely free
+    #[must_use]
+    pub fn is_free(&self) -> bool {
+        matches!(self, Self::Free)
     }
 }
 
@@ -68,6 +103,9 @@ pub struct NodeResources {
     pub gpu_memory_mb: u64,
     /// GPU vendor (e.g., "nvidia", "amd", "intel", "apple"), empty if no GPUs
     pub gpu_vendor: String,
+    /// Per-GPU allocation state. Index corresponds to GPU detection order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_allocated: Vec<GpuAllocation>,
 }
 
 impl NodeResources {
@@ -84,6 +122,7 @@ impl NodeResources {
             gpu_models: Vec::new(),
             gpu_memory_mb: 0,
             gpu_vendor: String::new(),
+            gpu_allocated: Vec::new(),
         }
     }
 
@@ -127,9 +166,83 @@ impl NodeResources {
     }
 
     /// Get number of GPUs available for allocation
+    ///
+    /// A GPU is considered available if it is [`GpuAllocation::Free`] or if it
+    /// is [`GpuAllocation::Shared`] with room for another container.
     #[must_use]
+    #[allow(clippy::cast_possible_truncation)] // GPU count fits in u32
     pub fn gpu_available(&self) -> u32 {
-        self.gpu_total.saturating_sub(self.gpu_used)
+        if self.gpu_allocated.is_empty() {
+            // Fallback for nodes that haven't reported per-GPU state yet
+            self.gpu_total.saturating_sub(self.gpu_used)
+        } else {
+            self.gpu_allocated
+                .iter()
+                .filter(|a| a.is_available())
+                .count() as u32
+        }
+    }
+
+    /// Allocate `count` GPU indices, marking them according to the sharing mode.
+    ///
+    /// - `None` or `Some(Exclusive)`: sets [`GpuAllocation::Exclusive`] (only free GPUs)
+    /// - `Some(Mps)`: sets [`GpuAllocation::Shared`] with `max = 8`, or increments an
+    ///   existing shared GPU's `current` count
+    /// - `Some(TimeSlice)`: sets [`GpuAllocation::Shared`] with `max = 4`, or increments
+    ///   an existing shared GPU's `current` count
+    ///
+    /// Returns the allocated indices, or `None` if insufficient GPUs are available.
+    #[allow(clippy::cast_possible_truncation)] // GPU index fits in u32
+    pub fn allocate_gpus(
+        &mut self,
+        count: u32,
+        sharing: Option<GpuSharingMode>,
+    ) -> Option<Vec<u32>> {
+        let mut indices = Vec::with_capacity(count as usize);
+        for (i, alloc) in self.gpu_allocated.iter().enumerate() {
+            if alloc.is_available() {
+                indices.push(i as u32);
+                if indices.len() == count as usize {
+                    break;
+                }
+            }
+        }
+        if indices.len() == count as usize {
+            for &idx in &indices {
+                let slot = &mut self.gpu_allocated[idx as usize];
+                match sharing {
+                    None | Some(GpuSharingMode::Exclusive) => {
+                        *slot = GpuAllocation::Exclusive;
+                    }
+                    Some(GpuSharingMode::Mps) => match slot {
+                        GpuAllocation::Free => {
+                            *slot = GpuAllocation::Shared { current: 1, max: 8 };
+                        }
+                        GpuAllocation::Shared { current, .. } => {
+                            *current += 1;
+                        }
+                        GpuAllocation::Exclusive => {
+                            // Should not happen since is_available() returned true,
+                            // but be defensive
+                        }
+                    },
+                    Some(GpuSharingMode::TimeSlice) => match slot {
+                        GpuAllocation::Free => {
+                            *slot = GpuAllocation::Shared { current: 1, max: 4 };
+                        }
+                        GpuAllocation::Shared { current, .. } => {
+                            *current += 1;
+                        }
+                        GpuAllocation::Exclusive => {}
+                    },
+                }
+            }
+            // Keep gpu_used in sync for backward compat: count GPUs that are not free
+            self.gpu_used = self.gpu_allocated.iter().filter(|a| !a.is_free()).count() as u32;
+            Some(indices)
+        } else {
+            None
+        }
     }
 
     /// Returns `true` if this node uses unified memory (Apple Silicon).
@@ -236,6 +349,8 @@ pub struct PlacementDecision {
     pub node_id: Option<NodeId>,
     /// Reason for the placement decision
     pub reason: PlacementReason,
+    /// GPU indices allocated on the target node (empty if no GPUs requested)
+    pub gpu_indices: Vec<u32>,
 }
 
 impl PlacementDecision {
@@ -431,6 +546,24 @@ pub fn can_place_on_node(
                 return false;
             }
 
+            // Check GPU model affinity if requested
+            if let Some(ref requested_model) = gpu.model {
+                let has_matching_model = node
+                    .resources
+                    .gpu_models
+                    .iter()
+                    .any(|m| m.to_lowercase().contains(&requested_model.to_lowercase()));
+                if !has_matching_model {
+                    debug!(
+                        node = %node.id,
+                        requested_model = %requested_model,
+                        available_models = ?node.resources.gpu_models,
+                        "Node rejected: no GPU matching requested model"
+                    );
+                    return false;
+                }
+            }
+
             // Apple Silicon uses unified memory -- GPU VRAM = system RAM.
             // Don't double-count memory when both CPU and GPU resources are requested.
             // The node's `memory_total` already includes the GPU-accessible portion,
@@ -485,6 +618,7 @@ pub fn place_service_replicas(
     let mut decisions = Vec::with_capacity(replicas as usize);
 
     let gpu_count_requested = service_spec.resources.gpu.as_ref().map_or(0, |g| g.count);
+    let gpu_sharing = service_spec.resources.gpu.as_ref().and_then(|g| g.sharing);
 
     for replica in 0..replicas {
         let container_id = ContainerId::new(service_name, replica);
@@ -514,6 +648,7 @@ pub fn place_service_replicas(
                         service_name, service_spec.node_mode
                     ),
                 },
+                gpu_indices: Vec::new(),
             });
             continue;
         }
@@ -553,23 +688,108 @@ pub fn place_service_replicas(
         // Record the placement
         placements.place(container_id.clone(), selected_id);
 
-        // Track GPU usage on the selected node so subsequent placements
-        // see the reduced availability
-        if gpu_count_requested > 0 {
+        // Allocate specific GPU indices on the selected node
+        let gpu_indices = if gpu_count_requested > 0 {
             if let Some(node) = nodes.iter_mut().find(|n| n.id == selected_id) {
-                node.resources.gpu_used =
-                    node.resources.gpu_used.saturating_add(gpu_count_requested);
+                node.resources
+                    .allocate_gpus(gpu_count_requested, gpu_sharing)
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
             }
-        }
+        } else {
+            Vec::new()
+        };
 
         decisions.push(PlacementDecision {
             container_id,
             node_id: Some(selected_id),
             reason,
+            gpu_indices,
         });
     }
 
+    // Gang scheduling: all-or-nothing. If any replica failed to place,
+    // roll back all placements and return all-failed decisions.
+    let is_gang = service_spec
+        .resources
+        .gpu
+        .as_ref()
+        .and_then(|g| g.scheduling)
+        == Some(zlayer_spec::SchedulingPolicy::Gang);
+
+    if is_gang && decisions.iter().any(|d| d.node_id.is_none()) {
+        return gang_rollback(service_name, replicas, &decisions, nodes, placements);
+    }
+
     decisions
+}
+
+/// Roll back a failed gang-scheduled placement.
+///
+/// Undoes all successful placements from `decisions`, frees GPU allocations,
+/// and returns a vector of all-failed decisions.
+#[allow(clippy::cast_possible_truncation)] // GPU count fits in u32
+fn gang_rollback(
+    service_name: &str,
+    replicas: u32,
+    decisions: &[PlacementDecision],
+    nodes: &mut [NodeState],
+    placements: &mut PlacementState,
+) -> Vec<PlacementDecision> {
+    let placed_count = decisions.iter().filter(|d| d.node_id.is_some()).count();
+    debug!(
+        service = service_name,
+        replicas = replicas,
+        placed = placed_count,
+        "Gang scheduling failed: could not place all replicas, rolling back"
+    );
+
+    // Roll back: remove placements and free GPU allocations
+    for decision in decisions {
+        if let Some(node_id) = decision.node_id {
+            placements.remove_service_from_node(node_id, service_name);
+            if !decision.gpu_indices.is_empty() {
+                if let Some(node) = nodes.iter_mut().find(|n| n.id == node_id) {
+                    for &idx in &decision.gpu_indices {
+                        if let Some(slot) = node.resources.gpu_allocated.get_mut(idx as usize) {
+                            *slot = match slot {
+                                GpuAllocation::Shared { current, max } if *current > 1 => {
+                                    GpuAllocation::Shared {
+                                        current: *current - 1,
+                                        max: *max,
+                                    }
+                                }
+                                GpuAllocation::Exclusive
+                                | GpuAllocation::Shared { .. }
+                                | GpuAllocation::Free => GpuAllocation::Free,
+                            };
+                        }
+                    }
+                    node.resources.gpu_used = node
+                        .resources
+                        .gpu_allocated
+                        .iter()
+                        .filter(|a| !a.is_free())
+                        .count() as u32;
+                }
+            }
+        }
+    }
+
+    // Return all-failed decisions
+    (0..replicas)
+        .map(|replica| PlacementDecision {
+            container_id: ContainerId::new(service_name, replica),
+            node_id: None,
+            gpu_indices: Vec::new(),
+            reason: PlacementReason::NoSuitableNode {
+                reason: format!(
+                    "Gang scheduling: could not place all {replicas} replicas of '{service_name}'"
+                ),
+            },
+        })
+        .collect()
 }
 
 /// Select a node for bin-packing (shared mode)
@@ -585,6 +805,11 @@ fn select_for_bin_packing<'a>(
     let wants_gpu = service_spec
         .and_then(|s| s.resources.gpu.as_ref())
         .is_some();
+
+    let wants_spread = service_spec
+        .and_then(|s| s.resources.gpu.as_ref())
+        .and_then(|g| g.scheduling)
+        == Some(zlayer_spec::SchedulingPolicy::Spread);
 
     nodes
         .iter()
@@ -602,16 +827,28 @@ fn select_for_bin_packing<'a>(
                         let b_util_score = 100.0 - b.utilization();
 
                         let a_gpu_score = if a.resources.gpu_total > 0 {
-                            (f64::from(a.resources.gpu_available())
-                                / f64::from(a.resources.gpu_total))
-                                * 100.0
+                            let ratio = f64::from(a.resources.gpu_available())
+                                / f64::from(a.resources.gpu_total);
+                            if wants_spread {
+                                // Spread: prefer nodes with FEWER available GPUs
+                                (1.0 - ratio) * 100.0
+                            } else {
+                                // Pack: prefer nodes with MORE available GPUs
+                                ratio * 100.0
+                            }
                         } else {
                             0.0
                         };
                         let b_gpu_score = if b.resources.gpu_total > 0 {
-                            (f64::from(b.resources.gpu_available())
-                                / f64::from(b.resources.gpu_total))
-                                * 100.0
+                            let ratio = f64::from(b.resources.gpu_available())
+                                / f64::from(b.resources.gpu_total);
+                            if wants_spread {
+                                // Spread: prefer nodes with FEWER available GPUs
+                                (1.0 - ratio) * 100.0
+                            } else {
+                                // Pack: prefer nodes with MORE available GPUs
+                                ratio * 100.0
+                            }
                         } else {
                             0.0
                         };
@@ -790,7 +1027,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::float_cmp)]
     fn test_node_resources_utilization() {
         let mut res = NodeResources::new(4.0, 8 * 1024 * 1024 * 1024);
         assert!(res.utilization().abs() < f64::EPSILON);
@@ -1168,6 +1404,7 @@ mod tests {
         resources.gpu_vendor = vendor.to_string();
         resources.gpu_models = vec!["Test GPU".to_string(); gpu_total as usize];
         resources.gpu_memory_mb = u64::from(gpu_total) * 16384; // 16GB per GPU
+        resources.gpu_allocated = vec![GpuAllocation::Free; gpu_total as usize];
         NodeState::new(id, address).with_resources(resources)
     }
 
@@ -1178,6 +1415,10 @@ mod tests {
             count: gpu_count,
             vendor: gpu_vendor.to_string(),
             mode: None,
+            model: None,
+            scheduling: None,
+            distributed: None,
+            sharing: None,
         });
         spec
     }
@@ -1218,6 +1459,12 @@ mod tests {
     fn test_gpu_service_rejected_insufficient_available_gpus() {
         let mut node = make_gpu_node(1, "192.168.1.1:8000", 4, "nvidia");
         node.resources.gpu_used = 3; // Only 1 GPU available
+        node.resources.gpu_allocated = vec![
+            GpuAllocation::Exclusive,
+            GpuAllocation::Exclusive,
+            GpuAllocation::Exclusive,
+            GpuAllocation::Free,
+        ];
         let placements = PlacementState::new();
         let spec = make_gpu_service_spec(2, "nvidia", NodeMode::Shared);
 
@@ -1339,13 +1586,18 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::similar_names)]
     fn test_gpu_scoring_prefers_more_available_gpus() {
         // Node 1: 4 GPUs, 2 used (2 available)
         // Node 2: 4 GPUs, 0 used (4 available)
         // Both have equal CPU/memory utilization
         let mut gpu_node_a = make_gpu_node(1, "192.168.1.1:8000", 4, "nvidia");
         gpu_node_a.resources.gpu_used = 2;
+        gpu_node_a.resources.gpu_allocated = vec![
+            GpuAllocation::Exclusive,
+            GpuAllocation::Exclusive,
+            GpuAllocation::Free,
+            GpuAllocation::Free,
+        ];
         let gpu_node_b = make_gpu_node(2, "192.168.1.2:8000", 4, "nvidia");
 
         let mut nodes = vec![gpu_node_a, gpu_node_b];
@@ -1410,5 +1662,107 @@ mod tests {
             &placements,
             Some(&spec),
         ));
+    }
+
+    // ==========================================================================
+    // Gang scheduling tests
+    // ==========================================================================
+
+    #[test]
+    fn test_gang_scheduling_rolls_back_on_partial_failure() {
+        // 2 nodes with 1 GPU each, service requests 1 GPU per replica with 3 replicas
+        let mut nodes = vec![
+            make_gpu_node(1, "192.168.1.1:8000", 1, "nvidia"),
+            make_gpu_node(2, "192.168.1.2:8000", 1, "nvidia"),
+        ];
+        let mut placements = PlacementState::new();
+
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.resources.gpu = Some(zlayer_spec::GpuSpec {
+            count: 1,
+            vendor: "nvidia".to_string(),
+            mode: None,
+            model: None,
+            scheduling: Some(zlayer_spec::SchedulingPolicy::Gang),
+            distributed: None,
+            sharing: None,
+        });
+
+        let decisions = place_service_replicas("gpu-gang", &spec, 3, &mut nodes, &mut placements);
+
+        // All 3 should fail (only 2 nodes with GPUs)
+        assert!(
+            decisions.iter().all(|d| d.node_id.is_none()),
+            "Gang scheduling should fail all when not all can be placed"
+        );
+        assert_eq!(decisions.len(), 3);
+
+        // GPUs should be freed (rolled back)
+        assert_eq!(nodes[0].resources.gpu_available(), 1);
+        assert_eq!(nodes[1].resources.gpu_available(), 1);
+    }
+
+    #[test]
+    fn test_gang_scheduling_succeeds_when_all_fit() {
+        let mut nodes = vec![
+            make_gpu_node(1, "192.168.1.1:8000", 2, "nvidia"),
+            make_gpu_node(2, "192.168.1.2:8000", 2, "nvidia"),
+        ];
+        let mut placements = PlacementState::new();
+
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.resources.gpu = Some(zlayer_spec::GpuSpec {
+            count: 1,
+            vendor: "nvidia".to_string(),
+            mode: None,
+            model: None,
+            scheduling: Some(zlayer_spec::SchedulingPolicy::Gang),
+            distributed: None,
+            sharing: None,
+        });
+
+        let decisions = place_service_replicas("gpu-gang", &spec, 4, &mut nodes, &mut placements);
+
+        // All 4 should succeed (2 nodes x 2 GPUs each)
+        assert!(
+            decisions.iter().all(|d| d.node_id.is_some()),
+            "Gang scheduling should succeed when all fit"
+        );
+        assert_eq!(decisions.len(), 4);
+    }
+
+    // ==========================================================================
+    // GPU spread scheduling tests
+    // ==========================================================================
+
+    #[test]
+    fn test_spread_scheduling_distributes_across_nodes() {
+        // fresh_node has 4 GPUs (all free), busy_node has 4 GPUs (2 used)
+        // Spread should prefer busy_node (less GPU availability = more spread)
+        let fresh_node = make_gpu_node(1, "192.168.1.1:8000", 4, "nvidia");
+        let mut busy_node = make_gpu_node(2, "192.168.1.2:8000", 4, "nvidia");
+        // Allocate 2 GPUs on busy_node
+        busy_node.resources.gpu_allocated[0] = GpuAllocation::Exclusive;
+        busy_node.resources.gpu_allocated[1] = GpuAllocation::Exclusive;
+        busy_node.resources.gpu_used = 2;
+
+        let mut nodes = vec![fresh_node, busy_node];
+        let mut placements = PlacementState::new();
+
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.resources.gpu = Some(zlayer_spec::GpuSpec {
+            count: 1,
+            vendor: "nvidia".to_string(),
+            mode: None,
+            model: None,
+            scheduling: Some(zlayer_spec::SchedulingPolicy::Spread),
+            distributed: None,
+            sharing: None,
+        });
+
+        let decisions = place_service_replicas("spread-svc", &spec, 1, &mut nodes, &mut placements);
+
+        // Should prefer node2 (less GPU availability) to spread the workload
+        assert_eq!(decisions[0].node_id, Some(2));
     }
 }

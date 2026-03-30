@@ -394,6 +394,7 @@ impl Scheduler {
                 if let Some(first_gpu) = n.gpus.first() {
                     resources.gpu_vendor.clone_from(&first_gpu.vendor);
                 }
+                resources.gpu_allocated = vec![placement::GpuAllocation::Free; gpu_count as usize];
 
                 placement::NodeState {
                     id: n.node_id,

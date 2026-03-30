@@ -2119,7 +2119,7 @@ fn resolve_dest_path(rootfs_dir: &Path, working_dir: &str, dest: &str) -> PathBu
 }
 
 /// Sanitize an image name for use as a filesystem directory name.
-fn sanitize_image_name(image: &str) -> String {
+pub(crate) fn sanitize_image_name(image: &str) -> String {
     image.replace(['/', ':', '@'], "_")
 }
 
