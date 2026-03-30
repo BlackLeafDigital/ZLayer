@@ -59,7 +59,7 @@ pub struct RouteEntry {
 impl RouteEntry {
     /// Create a `RouteEntry` from a `zlayer_spec::EndpointSpec`.
     ///
-    /// Fields that cannot be derived from the spec alone (host, backends, TLS,
+    /// Fields that cannot be derived from the spec alone (backends, TLS,
     /// SNI) are given sensible defaults and can be overridden after construction.
     #[must_use]
     pub fn from_endpoint(service_name: &str, endpoint: &EndpointSpec) -> Self {
@@ -69,7 +69,7 @@ impl RouteEntry {
         Self {
             service_name: service_name.to_string(),
             endpoint_name: endpoint.name.clone(),
-            host: None,
+            host: endpoint.host.clone(),
             path_prefix: path_prefix.clone(),
             resolved: ResolvedService {
                 name: service_name.to_string(),
@@ -548,6 +548,7 @@ mod tests {
             port: 80,
             target_port: Some(8080),
             path: Some("/api".to_string()),
+            host: None,
             expose: ExposeType::Public,
             stream: None,
             tunnel: None,

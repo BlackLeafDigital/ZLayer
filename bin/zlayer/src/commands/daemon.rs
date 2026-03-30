@@ -455,6 +455,16 @@ async fn install(
 
             if in_home {
                 let system_path = std::path::PathBuf::from("/usr/local/bin/zlayer");
+
+                // Stop any running service before overwriting (avoids ETXTBSY)
+                let stop_args = systemctl_args(&["stop", UNIT_NAME]);
+                let _ = Command::new("systemctl").args(&stop_args).output().await;
+
+                // Unlink destination first — succeeds even while the old process
+                // runs (inode stays alive until exit), and the new copy gets a
+                // fresh inode that won't conflict with the running text segment.
+                let _ = std::fs::remove_file(&system_path);
+
                 std::fs::copy(&exe, &system_path).with_context(|| {
                     format!(
                         "Failed to copy {} to {} (binary is in a user home directory, \

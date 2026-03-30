@@ -48,6 +48,12 @@ zlayer-tui.workspace = true
 # Cache backend (optional)
 zlayer-registry = { workspace = true, optional = true }
 
+# OCI types for sandbox push (optional, gated on cache)
+oci-client = { workspace = true, optional = true }
+
+# Auth for sandbox push (optional, gated on cache)
+zlayer-core = { workspace = true, optional = true }
+
 # HTTP client (for ADD URL support)
 reqwest.workspace = true
 
@@ -70,7 +76,7 @@ tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }
 [features]
 default = []
 # Enable remote cache backend integration with zlayer-registry
-cache = ["zlayer-registry"]
+cache = ["zlayer-registry", "oci-client", "zlayer-core"]
 # Enable persistent disk-based cache (requires cache feature)
 cache-persistent = ["cache", "zlayer-registry/persistent"]
 # Enable S3-compatible storage backend (requires cache feature)

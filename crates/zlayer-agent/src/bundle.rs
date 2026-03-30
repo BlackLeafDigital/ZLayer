@@ -540,6 +540,47 @@ impl BundleBuilder {
             env.push(format!("{key}={value}"));
         }
 
+        // Inject GPU device visibility environment variables based on vendor
+        // and allocated indices so runtimes (CUDA, ROCm, oneAPI) see only
+        // the GPUs assigned to this container.
+        if let Some(ref gpu) = spec.resources.gpu {
+            // Default to 0..count when no explicit indices are provided
+            let indices: Vec<String> = (0..gpu.count).map(|i| i.to_string()).collect();
+            let device_list = indices.join(",");
+            match gpu.vendor.as_str() {
+                "nvidia" => {
+                    env.push(format!("NVIDIA_VISIBLE_DEVICES={device_list}"));
+                    env.push(format!("CUDA_VISIBLE_DEVICES={device_list}"));
+                }
+                "amd" => {
+                    env.push(format!("ROCR_VISIBLE_DEVICES={device_list}"));
+                    env.push(format!("HIP_VISIBLE_DEVICES={device_list}"));
+                }
+                "intel" => {
+                    env.push(format!("ZE_AFFINITY_MASK={device_list}"));
+                }
+                _ => {}
+            }
+        }
+
+        // Inject distributed training coordination env vars when configured.
+        // MASTER_ADDR uses the service DNS name (resolved by the overlay DNS).
+        // RANK defaults to 0 (overridden by the agent when placing specific replicas).
+        if let Some(ref gpu) = spec.resources.gpu {
+            if let Some(ref dist) = gpu.distributed {
+                env.push(format!("MASTER_PORT={}", dist.master_port));
+                env.push(format!("MASTER_ADDR={}", container_id.service));
+                env.push("WORLD_SIZE=1".to_string());
+                env.push("RANK=0".to_string());
+                env.push("LOCAL_RANK=0".to_string());
+                match dist.backend.as_str() {
+                    "nccl" => env.push("NCCL_SOCKET_IFNAME=eth0".to_string()),
+                    "gloo" => env.push("GLOO_SOCKET_IFNAME=eth0".to_string()),
+                    _ => {}
+                }
+            }
+        }
+
         // Build capabilities
         let capabilities = self.build_capabilities(spec)?;
 
@@ -1098,7 +1139,7 @@ impl BundleBuilder {
         }
 
         // Build device entries for passthrough
-        let devices = self.build_devices(spec)?;
+        let devices = self.build_devices(spec, None)?;
         if !devices.is_empty() {
             linux_builder = linux_builder.devices(devices);
         }
@@ -1182,7 +1223,7 @@ impl BundleBuilder {
         }
 
         // Device cgroup rules
-        let device_rules = self.build_device_cgroup_rules(spec)?;
+        let device_rules = self.build_device_cgroup_rules(spec, None)?;
         if !device_rules.is_empty() {
             resources_builder = resources_builder.devices(device_rules);
             has_resources = true;
@@ -1203,6 +1244,7 @@ impl BundleBuilder {
     fn build_device_cgroup_rules(
         &self,
         spec: &ServiceSpec,
+        _gpu_indices: Option<&[u32]>,
     ) -> Result<Vec<oci_spec::runtime::LinuxDeviceCgroup>> {
         let mut rules = Vec::new();
 
@@ -1399,7 +1441,11 @@ impl BundleBuilder {
 
     /// Build Linux device entries for passthrough
     #[allow(clippy::unused_self, clippy::too_many_lines)]
-    fn build_devices(&self, spec: &ServiceSpec) -> Result<Vec<oci_spec::runtime::LinuxDevice>> {
+    fn build_devices(
+        &self,
+        spec: &ServiceSpec,
+        gpu_indices: Option<&[u32]>,
+    ) -> Result<Vec<oci_spec::runtime::LinuxDevice>> {
         let mut devices = Vec::new();
 
         for device in &spec.devices {
@@ -1428,6 +1474,9 @@ impl BundleBuilder {
 
         // Auto-inject GPU devices when gpu spec is set
         if let Some(ref gpu) = spec.resources.gpu {
+            let indices: Vec<u32> =
+                gpu_indices.map_or_else(|| (0..gpu.count).collect(), <[u32]>::to_vec);
+
             match gpu.vendor.as_str() {
                 "nvidia" => {
                     // Always needed: nvidiactl, nvidia-uvm, nvidia-uvm-tools
@@ -1457,7 +1506,7 @@ impl BundleBuilder {
                     }
 
                     // Per-GPU devices: /dev/nvidia0, /dev/nvidia1, etc.
-                    for i in 0..gpu.count {
+                    for i in &indices {
                         let dev_path = format!("/dev/nvidia{i}");
                         if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
                             let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
@@ -1508,7 +1557,7 @@ impl BundleBuilder {
                     }
 
                     // DRI render nodes: /dev/dri/renderD128, renderD129, etc.
-                    for i in 0..gpu.count {
+                    for i in &indices {
                         let dev_path = format!("/dev/dri/renderD{}", 128 + i);
                         if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
                             let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
@@ -1533,7 +1582,7 @@ impl BundleBuilder {
                     }
 
                     // DRI card nodes: /dev/dri/card0, card1, etc.
-                    for i in 0..gpu.count {
+                    for i in &indices {
                         let dev_path = format!("/dev/dri/card{i}");
                         if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
                             let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
@@ -1559,7 +1608,7 @@ impl BundleBuilder {
                 }
                 "intel" => {
                     // Intel GPU: DRI render nodes /dev/dri/renderD128, etc.
-                    for i in 0..gpu.count {
+                    for i in &indices {
                         let dev_path = format!("/dev/dri/renderD{}", 128 + i);
                         if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
                             let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
@@ -1584,7 +1633,7 @@ impl BundleBuilder {
                     }
 
                     // Intel DRI card nodes: /dev/dri/card0, card1, etc.
-                    for i in 0..gpu.count {
+                    for i in &indices {
                         let dev_path = format!("/dev/dri/card{i}");
                         if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
                             let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);
@@ -1614,7 +1663,7 @@ impl BundleBuilder {
                         vendor = %other,
                         "Unknown GPU vendor, attempting DRI device passthrough"
                     );
-                    for i in 0..gpu.count {
+                    for i in &indices {
                         let dev_path = format!("/dev/dri/renderD{}", 128 + i);
                         if let Ok((major, minor)) = get_device_major_minor(&dev_path) {
                             let dev_type = get_device_type(&dev_path).unwrap_or(LinuxDeviceType::C);

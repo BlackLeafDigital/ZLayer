@@ -2,11 +2,68 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-03-30]
+
+### Added
+- `host` field on `EndpointSpec` for host-based/subdomain proxy routing
+  (e.g. `host: "api.example.com"` or `host: "*.example.com"`), wired into
+  `RouteEntry::from_endpoint()` so specs can declare host patterns directly.
+- GPU model affinity: `model` field on `GpuSpec` pins workloads to nodes with
+  a matching GPU model (substring match, e.g. `model: "A100"`).
+- GPU device index tracking: scheduler now allocates specific GPU indices per
+  container, preventing device overlap when multiple containers share a node.
+  `PlacementDecision` carries `gpu_indices` for downstream device injection.
+- GPU environment variable injection: containers automatically receive
+  `NVIDIA_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES` (NVIDIA),
+  `ROCR_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES` (AMD), or
+  `ZE_AFFINITY_MASK` (Intel) based on vendor and allocated indices.
+- Gang scheduling (`scheduling: gang` on `GpuSpec`): all-or-nothing placement
+  for distributed GPU jobs — if any replica cannot be placed, all are rolled back.
+- Distributed job coordination (`distributed` on `GpuSpec`): injects
+  `MASTER_ADDR`, `MASTER_PORT`, `WORLD_SIZE`, `RANK`, `LOCAL_RANK`, and
+  backend-specific env vars (`NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME`).
+- GPU spread scheduling (`scheduling: spread`): distributes GPU workloads across
+  nodes instead of bin-packing them onto the fewest nodes.
+- GPU sharing modes (`sharing` on `GpuSpec`): `mps` for NVIDIA Multi-Process
+  Service (up to 8 containers per GPU) and `time-slice` for round-robin sharing
+  (up to 4 containers per GPU). Fractional GPU tracking in scheduler.
+- `MpsDaemonManager` in `zlayer-agent` for reference-counted NVIDIA MPS daemon
+  lifecycle management (auto-start on first MPS container, auto-stop on last).
+- GPU utilization in heartbeat: `GpuUtilizationReport` struct with per-GPU
+  utilization %, memory, temperature, and power reported via Raft heartbeat.
+- GPU metrics collection module (`gpu_metrics`): portable metrics via
+  `nvidia-smi` (NVIDIA), sysfs (AMD/Intel) — no hard driver dependencies.
+- GPU health monitoring: detects thermal throttling, ECC errors, and
+  unresponsive GPUs via `check_gpu_health()`.
+- GPU metrics in `zlayer-observability`: utilization (percent), memory used/total
+  (bytes), temperature (celsius), and power draw (watts). Each metric is a
+  Prometheus `GaugeVec` with `gpu_index` and `node` labels.
+- CDI (Container Device Interface) support: discovers specs from `/etc/cdi/`
+  and `/var/run/cdi/`, resolves fully-qualified device names, merges container
+  edits, and can generate NVIDIA specs via `nvidia-ctk`.
+- macOS sandbox backend now supports `push_image`, `tag_image`, `manifest_create`,
+  `manifest_add`, and `manifest_push` operations. Previously, pipeline builds on
+  macOS succeeded but push/manifest operations always failed with "Operation 'push'
+  is not supported by this backend". The sandbox backend now tars the rootfs, builds
+  OCI manifests, and pushes via the registry client (requires the `cache` feature,
+  which the `zlayer` CLI already enables). Multi-platform manifest lists are stored
+  on disk and pushed as OCI image indexes.
+- `ImagePuller::push_image_index_to_registry` method for pushing OCI image indexes
+  (manifest lists) to remote registries.
+
 ## [2026-03-29]
 
 ### Fixed
 - `zlayer-paths` crate now publishable (removed `publish = false`) and added to
   CI release publish order so crates depending on it can resolve it from the registry.
+- `daemon install` no longer fails with "Text file busy" (ETXTBSY) when the old
+  binary is still running via systemd. The install function now stops the service
+  and unlinks the destination before copying.
+- `admin_password` file permissions are now enforced to 0o644 on every daemon
+  startup, not just on initial creation. Previously, files created with the old
+  0o600 permissions stayed unreadable to non-root tools (E2E tests, CLI) forever.
+- `DockerConfigAuth` now respects the `DOCKER_CONFIG` environment variable
+  (standard Docker convention) for locating `config.json`.
 
 ## [2026-03-28]
 

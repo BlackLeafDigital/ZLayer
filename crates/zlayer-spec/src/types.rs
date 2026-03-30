@@ -827,6 +827,59 @@ pub struct ResourcesSpec {
     pub gpu: Option<GpuSpec>,
 }
 
+/// Scheduling policy for GPU workloads
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SchedulingPolicy {
+    /// Place as many replicas as possible; partial placement is acceptable (default)
+    #[default]
+    BestEffort,
+    /// All replicas must be placed or none are; prevents partial GPU job deployment
+    Gang,
+    /// Spread replicas across nodes to maximize GPU distribution
+    Spread,
+}
+
+/// GPU sharing mode controlling how GPU resources are multiplexed.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum GpuSharingMode {
+    /// Whole GPU per container (default). No sharing.
+    #[default]
+    Exclusive,
+    /// NVIDIA Multi-Process Service: concurrent GPU compute sharing.
+    /// Multiple containers run GPU kernels simultaneously with hardware isolation.
+    Mps,
+    /// NVIDIA time-slicing: round-robin GPU access across containers.
+    /// Lower overhead than MPS but no concurrent execution.
+    TimeSlice,
+}
+
+/// Configuration for distributed GPU job coordination.
+///
+/// When enabled on a multi-replica GPU service, `ZLayer` injects standard
+/// distributed training environment variables (`MASTER_ADDR`, `MASTER_PORT`,
+/// `WORLD_SIZE`, `RANK`, `LOCAL_RANK`) so frameworks like `PyTorch`, `Horovod`,
+/// and `DeepSpeed` can coordinate automatically.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct DistributedConfig {
+    /// Communication backend: "nccl" (default), "gloo", or "mpi"
+    #[serde(default = "default_dist_backend")]
+    pub backend: String,
+    /// Port for rank-0 master coordination (default: 29500)
+    #[serde(default = "default_dist_port")]
+    pub master_port: u16,
+}
+
+fn default_dist_backend() -> String {
+    "nccl".to_string()
+}
+
+fn default_dist_port() -> u16 {
+    29500
+}
+
 /// GPU resource specification
 ///
 /// Supported vendors:
@@ -857,6 +910,23 @@ pub struct GpuSpec {
     /// GPU access mode (macOS only): `"native"`, `"vm"`, or `None` for auto-select
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Pin to a specific GPU model (e.g. "A100", "H100").
+    /// Substring match against detected GPU model names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Scheduling policy for GPU workloads.
+    /// - `best-effort` (default): place what fits
+    /// - `gang`: all-or-nothing for distributed jobs
+    /// - `spread`: distribute across nodes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduling: Option<SchedulingPolicy>,
+    /// Distributed GPU job coordination.
+    /// When set, injects `MASTER_ADDR`, `WORLD_SIZE`, `RANK`, `LOCAL_RANK` env vars.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub distributed: Option<DistributedConfig>,
+    /// GPU sharing mode: exclusive (default), mps, or time-slice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sharing: Option<GpuSharingMode>,
 }
 
 fn default_gpu_count() -> u32 {
@@ -1010,6 +1080,11 @@ pub struct EndpointSpec {
 
     /// URL path prefix (for http/https/websocket)
     pub path: Option<String>,
+
+    /// Host pattern for routing (e.g. "api.example.com" or "*.example.com").
+    /// `None` means match any host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
 
     /// Exposure type
     #[serde(default = "default_expose")]

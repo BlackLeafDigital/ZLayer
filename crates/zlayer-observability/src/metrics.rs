@@ -49,6 +49,18 @@ pub struct ZLayerMetrics {
     // System metrics
     /// Time since the service started in seconds
     pub uptime_seconds: Gauge,
+
+    // GPU metrics
+    /// GPU utilization percentage per GPU index and node
+    pub gpu_utilization: GaugeVec,
+    /// GPU memory used in bytes per GPU index and node
+    pub gpu_memory_used: GaugeVec,
+    /// GPU total memory in bytes per GPU index and node
+    pub gpu_memory_total: GaugeVec,
+    /// GPU temperature in celsius per GPU index and node
+    pub gpu_temperature: GaugeVec,
+    /// GPU power draw in watts per GPU index and node
+    pub gpu_power: GaugeVec,
 }
 
 impl ZLayerMetrics {
@@ -56,6 +68,7 @@ impl ZLayerMetrics {
     ///
     /// # Errors
     /// Returns an error if Prometheus metric creation or registration fails.
+    #[allow(clippy::too_many_lines)]
     pub fn new() -> Result<Self> {
         let registry = Registry::new();
 
@@ -136,6 +149,43 @@ impl ZLayerMetrics {
         )
         .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
 
+        // GPU metrics
+        let gpu_utilization = GaugeVec::new(
+            Opts::new(
+                "zlayer_gpu_utilization_percent",
+                "GPU utilization percentage",
+            ),
+            &["gpu_index", "node"],
+        )
+        .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
+
+        let gpu_memory_used = GaugeVec::new(
+            Opts::new("zlayer_gpu_memory_used_bytes", "GPU memory used in bytes"),
+            &["gpu_index", "node"],
+        )
+        .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
+
+        let gpu_memory_total = GaugeVec::new(
+            Opts::new("zlayer_gpu_memory_total_bytes", "GPU total memory in bytes"),
+            &["gpu_index", "node"],
+        )
+        .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
+
+        let gpu_temperature = GaugeVec::new(
+            Opts::new(
+                "zlayer_gpu_temperature_celsius",
+                "GPU temperature in celsius",
+            ),
+            &["gpu_index", "node"],
+        )
+        .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
+
+        let gpu_power = GaugeVec::new(
+            Opts::new("zlayer_gpu_power_watts", "GPU power draw in watts"),
+            &["gpu_index", "node"],
+        )
+        .map_err(|e| ObservabilityError::MetricsInit(e.to_string()))?;
+
         // Register all metrics
         registry.register(Box::new(services_total.clone())).ok();
         registry.register(Box::new(service_replicas.clone())).ok();
@@ -151,6 +201,11 @@ impl ZLayerMetrics {
         registry.register(Box::new(raft_term.clone())).ok();
         registry.register(Box::new(raft_commit_index.clone())).ok();
         registry.register(Box::new(uptime_seconds.clone())).ok();
+        registry.register(Box::new(gpu_utilization.clone())).ok();
+        registry.register(Box::new(gpu_memory_used.clone())).ok();
+        registry.register(Box::new(gpu_memory_total.clone())).ok();
+        registry.register(Box::new(gpu_temperature.clone())).ok();
+        registry.register(Box::new(gpu_power.clone())).ok();
 
         Ok(Self {
             registry,
@@ -166,6 +221,11 @@ impl ZLayerMetrics {
             raft_term,
             raft_commit_index,
             uptime_seconds,
+            gpu_utilization,
+            gpu_memory_used,
+            gpu_memory_total,
+            gpu_temperature,
+            gpu_power,
         })
     }
 
@@ -247,6 +307,43 @@ impl ZLayerMetrics {
     /// Update uptime
     pub fn set_uptime(&self, seconds: f64) {
         self.uptime_seconds.set(seconds);
+    }
+
+    /// Update GPU utilization percentage
+    pub fn set_gpu_utilization(&self, gpu_index: u32, node: &str, percent: f64) {
+        self.gpu_utilization
+            .with_label_values(&[&gpu_index.to_string(), node])
+            .set(percent);
+    }
+
+    /// Update GPU memory used in bytes
+    #[allow(clippy::cast_precision_loss)]
+    pub fn set_gpu_memory_used(&self, gpu_index: u32, node: &str, bytes: u64) {
+        self.gpu_memory_used
+            .with_label_values(&[&gpu_index.to_string(), node])
+            .set(bytes as f64);
+    }
+
+    /// Update GPU total memory in bytes
+    #[allow(clippy::cast_precision_loss)]
+    pub fn set_gpu_memory_total(&self, gpu_index: u32, node: &str, bytes: u64) {
+        self.gpu_memory_total
+            .with_label_values(&[&gpu_index.to_string(), node])
+            .set(bytes as f64);
+    }
+
+    /// Update GPU temperature in celsius
+    pub fn set_gpu_temperature(&self, gpu_index: u32, node: &str, celsius: f64) {
+        self.gpu_temperature
+            .with_label_values(&[&gpu_index.to_string(), node])
+            .set(celsius);
+    }
+
+    /// Update GPU power draw in watts
+    pub fn set_gpu_power(&self, gpu_index: u32, node: &str, watts: f64) {
+        self.gpu_power
+            .with_label_values(&[&gpu_index.to_string(), node])
+            .set(watts);
     }
 }
 
@@ -382,5 +479,27 @@ mod tests {
         let encoded = metrics.encode().unwrap();
         assert!(encoded.contains("zlayer_scale_up_total 2"));
         assert!(encoded.contains("zlayer_scale_down_total 1"));
+    }
+
+    #[test]
+    fn test_gpu_metrics() {
+        let metrics = ZLayerMetrics::new().unwrap();
+
+        metrics.set_gpu_utilization(0, "node-1", 85.5);
+        metrics.set_gpu_memory_used(0, "node-1", 8_589_934_592);
+        metrics.set_gpu_memory_total(0, "node-1", 17_179_869_184);
+        metrics.set_gpu_temperature(0, "node-1", 72.0);
+        metrics.set_gpu_power(0, "node-1", 250.0);
+
+        // Second GPU on same node
+        metrics.set_gpu_utilization(1, "node-1", 42.0);
+        metrics.set_gpu_temperature(1, "node-1", 65.5);
+
+        let encoded = metrics.encode().unwrap();
+        assert!(encoded.contains("zlayer_gpu_utilization_percent"));
+        assert!(encoded.contains("zlayer_gpu_memory_used_bytes"));
+        assert!(encoded.contains("zlayer_gpu_memory_total_bytes"));
+        assert!(encoded.contains("zlayer_gpu_temperature_celsius"));
+        assert!(encoded.contains("zlayer_gpu_power_watts"));
     }
 }

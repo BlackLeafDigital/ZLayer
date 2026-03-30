@@ -464,6 +464,8 @@ pub struct HeartbeatRequest {
     pub cpu_used: f64,
     pub memory_used: u64,
     pub disk_used: u64,
+    #[serde(default)]
+    pub gpu_utilization: Vec<zlayer_scheduler::raft::GpuUtilizationReport>,
 }
 
 /// Handle node heartbeat.
@@ -522,6 +524,7 @@ pub async fn cluster_heartbeat(
         cpu_used: req.cpu_used,
         memory_used: req.memory_used,
         disk_used: req.disk_used,
+        gpu_utilization: req.gpu_utilization,
     };
 
     match raft.propose(request).await {

@@ -120,7 +120,16 @@ impl DockerConfigAuth {
     }
 
     /// Get the default Docker config path (~/.docker/config.json)
+    ///
+    /// Respects the `DOCKER_CONFIG` environment variable (standard Docker
+    /// convention). This is important when running under sudo where
+    /// `dirs::home_dir()` returns `/root` but the Docker config was written
+    /// by a non-root user.
     fn default_config_path() -> Result<PathBuf> {
+        if let Ok(config_dir) = std::env::var("DOCKER_CONFIG") {
+            return Ok(PathBuf::from(config_dir).join("config.json"));
+        }
+
         let home = dirs::home_dir().ok_or_else(|| {
             crate::error::Error::config("Cannot determine home directory".to_string())
         })?;
