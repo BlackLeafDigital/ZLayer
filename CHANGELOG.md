@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-03-31]
+
+### Fixed
+- Sandbox backend push failure for multi-tag images ("rootfs not found"): secondary
+  tags now get on-disk directories via `tag_image()` before the push phase runs.
+- Sandbox backend tar archive failure on macOS ("No such file or directory"): tar
+  builder now preserves symlinks instead of following them, fixing broken Homebrew
+  symlinks and producing correct OCI layers.
+- Build workflow `upload-temp-packages` output: `package_base_url` is now set
+  unconditionally so re-runs don't pass an empty artifact URL to the release workflow.
+
 ## [2026-03-30]
 
 ### Added

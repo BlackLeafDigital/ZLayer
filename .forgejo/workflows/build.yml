@@ -533,13 +533,16 @@ jobs:
 
       - name: Upload to temp packages
         if: steps.check.outputs.completed != 'true'
-        id: upload
         shell: bash
         run: |
           BASE_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-temp/${{ github.run_id }}"
           chmod +x scripts/upload-packages.sh
           ./scripts/upload-packages.sh "$BASE_URL" "zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}" artifacts
-          echo "package_base_url=${BASE_URL}" >> $GITHUB_OUTPUT
+
+      - name: Set output URL
+        id: upload
+        run: |
+          echo "package_base_url=https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-temp/${{ github.run_id }}" >> $GITHUB_OUTPUT
 
       - name: Mark step complete
         if: steps.check.outputs.completed != 'true'
