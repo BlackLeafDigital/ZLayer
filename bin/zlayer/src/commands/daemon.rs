@@ -422,6 +422,36 @@ fn systemctl_args(base_args: &[&str]) -> Vec<String> {
     }
 }
 
+/// Pick a writable system location for the daemon binary.
+///
+/// Tries `/usr/local/bin` first (standard FHS), falls back to
+/// `/opt/zlayer/bin` for immutable distros (Fedora Atomic, Silverblue,
+/// uBlue) where `/usr` is a read-only overlay.
+#[cfg(target_os = "linux")]
+fn pick_system_binary_path() -> std::path::PathBuf {
+    use std::path::PathBuf;
+
+    let candidates = ["/usr/local/bin/zlayer", "/opt/zlayer/bin/zlayer"];
+    for candidate in &candidates {
+        let path = PathBuf::from(candidate);
+        if let Some(parent) = path.parent() {
+            if parent.exists() {
+                // Probe writability with a temp file (metadata mode bits
+                // lie on overlayfs — an actual write is the only truth).
+                let probe = parent.join(".zlayer_write_probe");
+                if std::fs::write(&probe, b"").is_ok() {
+                    let _ = std::fs::remove_file(&probe);
+                    return path;
+                }
+            } else if std::fs::create_dir_all(parent).is_ok() {
+                return path;
+            }
+        }
+    }
+    // Last resort (should be unreachable — /opt is always writable by root)
+    PathBuf::from("/opt/zlayer/bin/zlayer")
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_lines, unsafe_code)]
 async fn install(
@@ -454,7 +484,7 @@ async fn install(
                 || exe.to_string_lossy().contains("/.local/bin/");
 
             if in_home {
-                let system_path = std::path::PathBuf::from("/usr/local/bin/zlayer");
+                let system_path = pick_system_binary_path();
 
                 // Stop any running service before overwriting (avoids ETXTBSY)
                 let stop_args = systemctl_args(&["stop", UNIT_NAME]);
