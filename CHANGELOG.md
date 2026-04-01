@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 ## [2026-03-31]
 
 ### Fixed
+- `install.sh` falling back to `~/.local/bin` which breaks `daemon install` on
+  immutable distros (Fedora Atomic/Silverblue/uBlue). Now write-probes
+  `/usr/local/bin` (k3s pattern), falls back to `/opt/bin`. Binary always lands
+  in a system path accessible to systemd.
+- `pick_system_binary_path()` last-resort fallback returning `/opt/zlayer/bin/zlayer`
+  without creating the directory, causing ENOENT on `std::fs::copy`.
 - Sandbox backend push failure for multi-tag images ("rootfs not found"): secondary
   tags now get on-disk directories via `tag_image()` before the push phase runs.
 - Sandbox backend tar archive failure on macOS ("No such file or directory"): tar
