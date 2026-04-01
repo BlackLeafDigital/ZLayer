@@ -325,6 +325,22 @@ impl PipelineExecutor {
         if self.push_enabled && failed.is_empty() {
             info!("Pushing {} images", succeeded.len());
 
+            // Ensure secondary tags have on-disk directories (sandbox backend
+            // stores the rootfs under the first tag only; additional tags need
+            // to be created before push can find them).
+            if let Some(ref backend) = self.backend {
+                for image in succeeded.values() {
+                    if image.tags.len() > 1 {
+                        let first = &image.tags[0];
+                        for secondary in &image.tags[1..] {
+                            if let Err(e) = backend.tag_image(first, secondary).await {
+                                warn!("Failed to tag {} as {}: {}", first, secondary, e);
+                            }
+                        }
+                    }
+                }
+            }
+
             for (name, image) in &succeeded {
                 for tag in &image.tags {
                     let push_result = if image.is_manifest {

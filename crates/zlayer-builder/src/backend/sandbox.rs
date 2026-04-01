@@ -725,6 +725,7 @@ mod sandbox_push {
             {
                 let encoder = GzEncoder::new(&mut buf, Compression::default());
                 let mut archive = Builder::new(encoder);
+                archive.follow_symlinks(false);
                 archive.append_dir_all(".", &rootfs).map_err(|e| {
                     BuildError::IoError(std::io::Error::other(format!(
                         "failed to create tar archive: {e}"
