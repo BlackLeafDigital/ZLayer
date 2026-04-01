@@ -56,15 +56,18 @@ case "$VERSION" in
 esac
 
 # --- Resolve install dir ---
+# Binary must be in a system path for systemd (not ~/.local/bin).
+# Write-probe /usr/local/bin ([ -w ] lies on overlayfs), fall back to /opt/bin (k3s pattern).
 INSTALL_DIR="${ZLAYER_INSTALL_DIR:-}"
 if [ -z "$INSTALL_DIR" ]; then
-    if [ -w /usr/local/bin ]; then
+    PROBE="/usr/local/bin/.zlayer_probe_$$"
+    if (sudo touch "$PROBE" && sudo rm -f "$PROBE") 2>/dev/null; then
         INSTALL_DIR="/usr/local/bin"
     else
-        INSTALL_DIR="${HOME}/.local/bin"
+        INSTALL_DIR="/opt/bin"
     fi
 fi
-mkdir -p "$INSTALL_DIR"
+sudo mkdir -p "$INSTALL_DIR"
 
 # --- Download from GitHub Releases ---
 ARTIFACT="${BINARY}-${VERSION_NUM}-${OS}-${ARCH}.tar.gz"
@@ -91,23 +94,15 @@ fi
 # --- Stop running zlayer before overwriting binary ---
 if [ -f "${INSTALL_DIR}/${BINARY}" ]; then
     echo "Stopping zlayer..."
-    "${INSTALL_DIR}/${BINARY}" daemon uninstall >/dev/null 2>&1 || true
+    sudo "${INSTALL_DIR}/${BINARY}" daemon uninstall >/dev/null 2>&1 || true
     # Clean up stale state
     rm -f /var/lib/zlayer/daemon.json 2>/dev/null || true
     rm -f /var/run/zlayer.sock 2>/dev/null || true
     sleep 2
 fi
 
-if [ -w "$INSTALL_DIR" ]; then
-    cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
-    chmod +x "${INSTALL_DIR}/${BINARY}"
-elif command -v sudo >/dev/null 2>&1; then
-    sudo cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
-    sudo chmod +x "${INSTALL_DIR}/${BINARY}"
-else
-    echo "Error: Cannot write to ${INSTALL_DIR}" >&2
-    exit 1
-fi
+sudo cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
+sudo chmod +x "${INSTALL_DIR}/${BINARY}"
 
 echo ""
 echo "${BINARY} ${TAG} installed to ${INSTALL_DIR}/${BINARY}"
