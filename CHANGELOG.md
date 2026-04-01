@@ -11,6 +11,12 @@ All notable changes to this project will be documented in this file.
   in a system path accessible to systemd.
 - `pick_system_binary_path()` last-resort fallback returning `/opt/zlayer/bin/zlayer`
   without creating the directory, causing ENOENT on `std::fs::copy`.
+- Sandbox `copy_dir_recursive` failing on symlinks (common in macOS Homebrew images),
+  breaking secondary tag creation (`:latest`). Symlinks are now preserved instead of
+  falling through to `tokio::fs::copy`.
+- Crate publishing failing for all crates: `zlayer-wsl` had a hardcoded `version = "0.0.0-dev"`
+  instead of `version.workspace = true`, causing workspace resolution to fail after the
+  release sed version bump.
 - Sandbox backend push failure for multi-tag images ("rootfs not found"): secondary
   tags now get on-disk directories via `tag_image()` before the push phase runs.
 - Sandbox backend tar archive failure on macOS ("No such file or directory"): tar

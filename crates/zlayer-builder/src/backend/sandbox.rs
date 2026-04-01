@@ -139,6 +139,18 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let dest_path = dst.join(entry.file_name());
         if ty.is_dir() {
             Box::pin(copy_dir_recursive(&entry.path(), &dest_path)).await?;
+        } else if ty.is_symlink() {
+            let target = tokio::fs::read_link(entry.path()).await?;
+            #[cfg(unix)]
+            tokio::fs::symlink(&target, &dest_path).await?;
+            #[cfg(windows)]
+            {
+                if target.is_dir() {
+                    tokio::fs::symlink_dir(&target, &dest_path).await?;
+                } else {
+                    tokio::fs::symlink_file(&target, &dest_path).await?;
+                }
+            }
         } else {
             tokio::fs::copy(entry.path(), &dest_path).await?;
         }
