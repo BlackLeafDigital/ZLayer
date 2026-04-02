@@ -110,6 +110,31 @@ impl ZLayerDirs {
         }
     }
 
+    /// Preferred system directory for the `zlayer` binary.
+    ///
+    /// Tries `/usr/local/bin` first (standard FHS, writable on most systems).
+    /// Falls back to `{data_dir}/bin` (`/var/lib/zlayer/bin` on Linux as root)
+    /// which is always writable since `ZLayer` owns that directory.
+    ///
+    /// On macOS and Windows, returns `/usr/local/bin` or the data-dir `bin`
+    /// subdirectory respectively.
+    pub fn default_binary_dir() -> PathBuf {
+        // Probe /usr/local/bin writability — metadata mode bits lie on overlayfs
+        #[cfg(unix)]
+        {
+            let probe = PathBuf::from("/usr/local/bin/.zlayer_write_probe");
+            if std::fs::write(&probe, b"").is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                return PathBuf::from("/usr/local/bin");
+            }
+        }
+        // Fallback: our own bin dir (always writable)
+        let dirs = Self::system_default();
+        let bin_dir = dirs.bin();
+        let _ = std::fs::create_dir_all(&bin_dir);
+        bin_dir
+    }
+
     // ── Core subdirectories ─────────────────────────────────────────────
 
     /// Root data directory.

@@ -57,14 +57,15 @@ esac
 
 # --- Resolve install dir ---
 # Binary must be in a system path for systemd (not ~/.local/bin).
-# Write-probe /usr/local/bin ([ -w ] lies on overlayfs), fall back to /opt/bin (k3s pattern).
+# Write-probe /usr/local/bin first, fall back to /var/lib/zlayer/bin
+# (always writable, matches zlayer-paths ZLayerDirs::bin()).
 INSTALL_DIR="${ZLAYER_INSTALL_DIR:-}"
 if [ -z "$INSTALL_DIR" ]; then
     PROBE="/usr/local/bin/.zlayer_probe_$$"
-    if (sudo touch "$PROBE" && sudo rm -f "$PROBE") 2>/dev/null; then
+    if sudo touch "$PROBE" 2>/dev/null && sudo rm -f "$PROBE" 2>/dev/null; then
         INSTALL_DIR="/usr/local/bin"
     else
-        INSTALL_DIR="/opt/bin"
+        INSTALL_DIR="/var/lib/zlayer/bin"
     fi
 fi
 sudo mkdir -p "$INSTALL_DIR"
