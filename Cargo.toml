@@ -23,6 +23,7 @@ members = [
   "bin/zlayer",
   "crates/zlayer-manager",
   "crates/zlayer-consensus",
+  "crates/zlayer-docker",
   "crates/zlayer-wsl",
 ]
 
@@ -198,6 +199,7 @@ zlayer-tunnel = { version = "0.0.0-dev", path = "crates/zlayer-tunnel" }
 zlayer-tui = { version = "0.0.0-dev", path = "crates/zlayer-tui" }
 zlayer-consensus = { version = "0.0.0-dev", path = "crates/zlayer-consensus" }
 zlayer-agent = { version = "0.0.0-dev", path = "crates/zlayer-agent" }
+zlayer-docker = { version = "0.0.0-dev", path = "crates/zlayer-docker" }
 zlayer-api = { version = "0.0.0-dev", path = "crates/zlayer-api" }
 zlayer-proxy = { version = "0.0.0-dev", path = "crates/zlayer-proxy" }
 zlayer-secrets = { version = "0.0.0-dev", path = "crates/zlayer-secrets" }

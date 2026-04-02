@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-04-01]
+
+### Added
+- New `zlayer-docker` crate: Docker CLI, Compose, and API socket compatibility layer.
+  - `compose` module: Parse `docker-compose.yaml` files and convert to ZLayer `DeploymentSpec`.
+    Handles ports (short/long syntax), volumes (bind/named/tmpfs), environment (map/list),
+    depends_on (with conditions), healthchecks, deploy resources/replicas, and more.
+  - `cli` module: Docker-compatible CLI subcommands (`zlayer docker run/ps/stop/build/compose/etc.`)
+    with full argument parsing mirroring Docker CLI flags.
+  - `socket` module: Docker Engine API v1.43 socket emulation over Unix domain socket.
+    Stub endpoints for containers, images, volumes, networks, and system info.
+  - 104 unit tests + 5 integration tests covering compose parsing, conversion, and round-trips.
+  - Example `docker-compose.yaml` in `examples/` (nginx + API + postgres + redis stack).
+  - Wired into `bin/zlayer` as `zlayer docker` subcommand (feature-gated: `docker-compat`).
+- `zlayer daemon install --docker-socket`: opt-in Docker API socket at `/var/run/docker.sock`
+  and Docker CLI shim at `/usr/local/bin/docker` → `zlayer docker`.
+- `zlayer serve --docker-socket`: spawns Docker API socket server alongside the daemon.
+
 ## [2026-03-31]
 
 ### Fixed
