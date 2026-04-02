@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-04-01]
+
+### Added
+- New `zlayer-docker` crate: Docker CLI, Compose, and API socket compatibility layer.
+  - `compose` module: Parse `docker-compose.yaml` files and convert to ZLayer `DeploymentSpec`.
+    Handles ports (short/long syntax), volumes (bind/named/tmpfs), environment (map/list),
+    depends_on (with conditions), healthchecks, deploy resources/replicas, and more.
+  - `cli` module: Docker-compatible CLI subcommands (`zlayer docker run/ps/stop/build/compose/etc.`)
+    with full argument parsing mirroring Docker CLI flags.
+  - `socket` module: Docker Engine API v1.43 socket emulation over Unix domain socket.
+    Stub endpoints for containers, images, volumes, networks, and system info.
+  - 104 unit tests + 5 integration tests covering compose parsing, conversion, and round-trips.
+  - Example `docker-compose.yaml` in `examples/` (nginx + API + postgres + redis stack).
+  - Wired into `bin/zlayer` as `zlayer docker` subcommand (feature-gated: `docker-compat`).
+- `zlayer daemon install --docker-socket`: opt-in Docker API socket at `/var/run/docker.sock`
+  and Docker CLI shim at `/usr/local/bin/docker` → `zlayer docker`.
+- `zlayer serve --docker-socket`: spawns Docker API socket server alongside the daemon.
+
+## [2026-03-31]
+
+### Fixed
+- `install.sh` falling back to `~/.local/bin` which breaks `daemon install` on
+  immutable distros (Fedora Atomic/Silverblue/uBlue). Now write-probes
+  `/usr/local/bin` (k3s pattern), falls back to `/opt/bin`. Binary always lands
+  in a system path accessible to systemd.
+- `pick_system_binary_path()` last-resort fallback returning `/opt/zlayer/bin/zlayer`
+  without creating the directory, causing ENOENT on `std::fs::copy`.
+- Sandbox `copy_dir_recursive` failing on symlinks (common in macOS Homebrew images),
+  breaking secondary tag creation (`:latest`). Symlinks are now preserved instead of
+  falling through to `tokio::fs::copy`.
+- Crate publishing failing for all crates: `zlayer-wsl` had a hardcoded `version = "0.0.0-dev"`
+  instead of `version.workspace = true`, causing workspace resolution to fail after the
+  release sed version bump.
+- Sandbox backend push failure for multi-tag images ("rootfs not found"): secondary
+  tags now get on-disk directories via `tag_image()` before the push phase runs.
+- Sandbox backend tar archive failure on macOS ("No such file or directory"): tar
+  builder now preserves symlinks instead of following them, fixing broken Homebrew
+  symlinks and producing correct OCI layers.
+- Build workflow `upload-temp-packages` output: `package_base_url` is now set
+  unconditionally so re-runs don't pass an empty artifact URL to the release workflow.
+
 ## [Unreleased]
 
 ### Added

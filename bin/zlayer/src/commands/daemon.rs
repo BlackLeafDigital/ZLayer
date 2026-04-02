@@ -13,6 +13,8 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
             bind,
             jwt_secret,
             no_swagger,
+            #[cfg(feature = "docker-compat")]
+            docker_socket,
         } => {
             install(
                 data_dir,
@@ -20,6 +22,8 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
                 bind,
                 jwt_secret.as_deref(),
                 *no_swagger,
+                #[cfg(feature = "docker-compat")]
+                *docker_socket,
             )
             .await
         }
@@ -77,6 +81,7 @@ async fn install(
     bind: &str,
     jwt_secret: Option<&str>,
     no_swagger: bool,
+    #[cfg(feature = "docker-compat")] _docker_socket: bool,
 ) -> Result<()> {
     use tokio::process::Command;
 
@@ -424,32 +429,26 @@ fn systemctl_args(base_args: &[&str]) -> Vec<String> {
 
 /// Pick a writable system location for the daemon binary.
 ///
-/// Tries `/usr/local/bin` first (standard FHS), falls back to
-/// `/opt/zlayer/bin` for immutable distros (Fedora Atomic, Silverblue,
-/// uBlue) where `/usr` is a read-only overlay.
+/// Write-probes `/usr/local/bin` first (standard FHS), falls back to
+/// `/opt/bin` (k3s pattern) for immutable distros (Fedora Atomic,
+/// Silverblue, uBlue) where `/usr` is a read-only overlay.
 #[cfg(target_os = "linux")]
 fn pick_system_binary_path() -> std::path::PathBuf {
     use std::path::PathBuf;
 
-    let candidates = ["/usr/local/bin/zlayer", "/opt/zlayer/bin/zlayer"];
-    for candidate in &candidates {
-        let path = PathBuf::from(candidate);
-        if let Some(parent) = path.parent() {
-            if parent.exists() {
-                // Probe writability with a temp file (metadata mode bits
-                // lie on overlayfs — an actual write is the only truth).
-                let probe = parent.join(".zlayer_write_probe");
-                if std::fs::write(&probe, b"").is_ok() {
-                    let _ = std::fs::remove_file(&probe);
-                    return path;
-                }
-            } else if std::fs::create_dir_all(parent).is_ok() {
-                return path;
-            }
-        }
+    // Probe writability with a temp file — metadata mode bits lie on overlayfs.
+    let probe = PathBuf::from("/usr/local/bin/.zlayer_write_probe");
+    if std::fs::write(&probe, b"").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        return PathBuf::from("/usr/local/bin/zlayer");
     }
-    // Last resort (should be unreachable — /opt is always writable by root)
-    PathBuf::from("/opt/zlayer/bin/zlayer")
+
+    // Fallback: /opt/bin (k3s pattern for immutable distros)
+    let fallback = PathBuf::from("/opt/bin/zlayer");
+    if let Some(parent) = fallback.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    fallback
 }
 
 #[cfg(target_os = "linux")]
@@ -460,6 +459,7 @@ async fn install(
     bind: &str,
     jwt_secret: Option<&str>,
     no_swagger: bool,
+    #[cfg(feature = "docker-compat")] docker_socket: bool,
 ) -> Result<()> {
     use tokio::process::Command;
 
@@ -532,6 +532,10 @@ async fn install(
     if no_swagger {
         exec_start.push_str(" --no-swagger");
     }
+    #[cfg(feature = "docker-compat")]
+    if docker_socket {
+        exec_start.push_str(" --docker-socket");
+    }
 
     let env_line = if let Some(secret) = jwt_secret {
         format!("Environment=ZLAYER_JWT_SECRET={secret}\n")
@@ -603,6 +607,37 @@ WantedBy=multi-user.target
     let log_dir = crate::cli::default_log_dir(data_dir);
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         eprintln!("Warning: could not create {}: {e}", log_dir.display());
+    }
+
+    // Install Docker CLI shim when docker-compat is enabled
+    #[cfg(feature = "docker-compat")]
+    if docker_socket {
+        let shim_dir = pick_system_binary_path()
+            .parent()
+            .unwrap_or(std::path::Path::new("/usr/local/bin"))
+            .to_path_buf();
+        let shim_path = shim_dir.join("docker");
+        let shim_content = "#!/bin/sh\nexec zlayer docker \"$@\"\n";
+        match std::fs::write(&shim_path, shim_content) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755))
+                        .ok();
+                }
+                println!(
+                    "Installed Docker CLI shim: {} -> zlayer docker",
+                    shim_path.display()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "Warning: could not install Docker shim at {}: {e}",
+                    shim_path.display()
+                );
+            }
+        }
     }
 
     if !no_start {

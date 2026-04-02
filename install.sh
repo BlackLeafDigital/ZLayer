@@ -56,15 +56,18 @@ case "$VERSION" in
 esac
 
 # --- Resolve install dir ---
+# Binary must be in a system path for systemd (not ~/.local/bin).
+# Write-probe /usr/local/bin ([ -w ] lies on overlayfs), fall back to /opt/bin (k3s pattern).
 INSTALL_DIR="${ZLAYER_INSTALL_DIR:-}"
 if [ -z "$INSTALL_DIR" ]; then
-    if [ -w /usr/local/bin ]; then
+    PROBE="/usr/local/bin/.zlayer_probe_$$"
+    if (sudo touch "$PROBE" && sudo rm -f "$PROBE") 2>/dev/null; then
         INSTALL_DIR="/usr/local/bin"
     else
-        INSTALL_DIR="${HOME}/.local/bin"
+        INSTALL_DIR="/opt/bin"
     fi
 fi
-mkdir -p "$INSTALL_DIR"
+sudo mkdir -p "$INSTALL_DIR"
 
 # --- Download from GitHub Releases ---
 ARTIFACT="${BINARY}-${VERSION_NUM}-${OS}-${ARCH}.tar.gz"
@@ -74,7 +77,7 @@ TMPDIR="$(mktemp -d)"
 trap 'rm -rf "$TMPDIR"' EXIT
 
 echo "Downloading ${BINARY} ${TAG} (${OS}/${ARCH})..."
-if ! curl -fsSL "$URL" -o "${TMPDIR}/archive.tar.gz"; then
+if ! curl -fsSL --connect-timeout 30 --max-time 120 "$URL" -o "${TMPDIR}/archive.tar.gz"; then
     echo "Error: Download failed from ${URL}" >&2
     exit 1
 fi
@@ -90,63 +93,16 @@ fi
 
 # --- Stop running zlayer before overwriting binary ---
 if [ -f "${INSTALL_DIR}/${BINARY}" ]; then
-    NEED_SUDO=false
-    if [ ! -w "$INSTALL_DIR" ] && command -v sudo >/dev/null 2>&1; then
-        NEED_SUDO=true
-    fi
-
-    case "$OS" in
-        linux)
-            if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet zlayer 2>/dev/null; then
-                echo "Stopping zlayer..."
-                if [ "$NEED_SUDO" = true ]; then
-                    sudo systemctl stop zlayer
-                else
-                    systemctl stop zlayer
-                fi
-            elif pgrep -x "$BINARY" >/dev/null 2>&1; then
-                echo "Stopping zlayer..."
-                if [ "$NEED_SUDO" = true ]; then
-                    sudo pkill -x "$BINARY" 2>/dev/null || true
-                else
-                    pkill -x "$BINARY" 2>/dev/null || true
-                fi
-                for i in $(seq 1 50); do
-                    pgrep -x "$BINARY" >/dev/null 2>&1 || break
-                    sleep 0.1
-                done
-            fi
-            rm -f /var/run/zlayer.sock
-            ;;
-        darwin)
-            PLIST="com.zlayer.daemon"
-            if launchctl list "$PLIST" >/dev/null 2>&1; then
-                echo "Stopping zlayer..."
-                if [ "$NEED_SUDO" = true ]; then
-                    sudo launchctl stop "$PLIST" 2>/dev/null || true
-                else
-                    launchctl stop "$PLIST" 2>/dev/null || true
-                fi
-                sleep 1
-            elif pgrep -x "$BINARY" >/dev/null 2>&1; then
-                echo "Stopping zlayer..."
-                pkill -x "$BINARY" 2>/dev/null || true
-                sleep 1
-            fi
-            ;;
-    esac
+    echo "Stopping zlayer..."
+    sudo "${INSTALL_DIR}/${BINARY}" daemon uninstall >/dev/null 2>&1 || true
+    # Clean up stale state
+    rm -f /var/lib/zlayer/daemon.json 2>/dev/null || true
+    rm -f /var/run/zlayer.sock 2>/dev/null || true
+    sleep 2
 fi
 
-if [ -w "$INSTALL_DIR" ]; then
-    cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
-    chmod +x "${INSTALL_DIR}/${BINARY}"
-elif command -v sudo >/dev/null 2>&1; then
-    sudo cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
-    sudo chmod +x "${INSTALL_DIR}/${BINARY}"
-else
-    echo "Error: Cannot write to ${INSTALL_DIR}" >&2
-    exit 1
-fi
+sudo cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
+sudo chmod +x "${INSTALL_DIR}/${BINARY}"
 
 echo ""
 echo "${BINARY} ${TAG} installed to ${INSTALL_DIR}/${BINARY}"
@@ -159,74 +115,60 @@ case ":${PATH}:" in
         ;;
 esac
 
+# --- Linux: install container runtime dependencies ---
+if [ "$OS" = "linux" ]; then
+    echo ""
+    echo "Checking container runtime dependencies..."
+
+    # libseccomp is required by the bundled container runtime (libcontainer/youki)
+    if ! ldconfig -p 2>/dev/null | grep -q libseccomp; then
+        echo "Installing libseccomp (required for container runtime)..."
+        if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq libseccomp2
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y libseccomp
+        elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y libseccomp
+        elif command -v pacman >/dev/null 2>&1; then
+            sudo pacman -S --noconfirm libseccomp
+        elif command -v apk >/dev/null 2>&1; then
+            sudo apk add libseccomp
+        elif command -v zypper >/dev/null 2>&1; then
+            sudo zypper install -y libseccomp2
+        else
+            echo "Warning: Could not install libseccomp automatically."
+            echo "Please install it manually for your distribution."
+            echo "The container runtime will not work without it."
+        fi
+    else
+        echo "libseccomp found."
+    fi
+
+    # Verify cgroups v2 (required by libcontainer)
+    if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+        echo "Warning: cgroups v2 not detected at /sys/fs/cgroup/"
+        echo "The container runtime requires cgroups v2. Check your kernel configuration."
+    else
+        echo "cgroups v2 found."
+    fi
+
+    # Create container runtime directories
+    echo "Setting up container runtime directories..."
+    sudo mkdir -p /var/lib/zlayer/containers /var/lib/zlayer/rootfs \
+        /var/lib/zlayer/bundles /var/lib/zlayer/cache /var/lib/zlayer/volumes
+fi
+
 # --- Install and start service ---
 SKIP_SERVICE="${ZLAYER_NO_SERVICE:-}"
 if [ -z "$SKIP_SERVICE" ]; then
+    echo ""
+    echo "Installing zlayer daemon..."
     case "$OS" in
         linux)
-            if command -v systemctl >/dev/null 2>&1; then
-                echo ""
-                echo "Setting up systemd service..."
-
-                UNIT_FILE="/etc/systemd/system/zlayer.service"
-                UNIT_CONTENT="[Unit]
-Description=ZLayer Container Runtime
-Documentation=https://zlayer.dev
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${INSTALL_DIR}/${BINARY} serve
-ExecReload=/bin/kill -HUP \$MAINPID
-Restart=always
-RestartSec=5
-LimitNOFILE=1048576
-LimitNPROC=infinity
-LimitCORE=infinity
-Environment=ZLAYER_DATA_DIR=/var/lib/zlayer
-LogsDirectory=zlayer
-StandardOutput=append:/var/log/zlayer/daemon.log
-StandardError=append:/var/log/zlayer/daemon.log
-
-[Install]
-WantedBy=multi-user.target"
-
-                if [ -w "/etc/systemd/system" ]; then
-                    printf '%s\n' "$UNIT_CONTENT" > "$UNIT_FILE"
-                    systemctl daemon-reload
-                    systemctl enable zlayer >/dev/null 2>&1
-                    mkdir -p /var/log/zlayer
-                    systemctl start zlayer
-                elif command -v sudo >/dev/null 2>&1; then
-                    printf '%s\n' "$UNIT_CONTENT" | sudo tee "$UNIT_FILE" >/dev/null
-                    sudo systemctl daemon-reload
-                    sudo systemctl enable zlayer >/dev/null 2>&1
-                    sudo mkdir -p /var/log/zlayer
-                    sudo systemctl start zlayer
-                else
-                    echo "Warning: Cannot install systemd service (no write access to /etc/systemd/system)"
-                    echo "Run manually: zlayer serve"
-                fi
-
-                if systemctl is-active --quiet zlayer 2>/dev/null; then
-                    echo "zlayer service started (systemd)"
-                fi
-            else
-                echo ""
-                echo "No systemd found. Start manually: zlayer serve --daemon"
-            fi
+            sudo "${INSTALL_DIR}/${BINARY}" daemon install
             ;;
         darwin)
-            echo ""
-            echo "Starting zlayer daemon..."
-            # The binary handles launchd plist generation and loading
-            "${INSTALL_DIR}/${BINARY}" serve --daemon >/dev/null 2>&1 || true
-
-            PLIST="com.zlayer.daemon"
-            if launchctl list "$PLIST" >/dev/null 2>&1; then
-                echo "zlayer service started (launchd: ${PLIST})"
-            fi
+            "${INSTALL_DIR}/${BINARY}" daemon install
             ;;
     esac
 fi

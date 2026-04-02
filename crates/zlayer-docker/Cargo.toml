@@ -1,0 +1,52 @@
+[package]
+name = "zlayer-docker-zql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Docker CLI, Compose, and API socket compatibility layer for ZLayer"
+publish = false
+
+[lib]
+name = "zlayer_docker"
+
+[dependencies]
+# Internal crates
+zlayer-spec.workspace = true
+zlayer-core.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_yaml.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# CLI
+clap.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Web/HTTP
+axum.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tower.workspace = true
+
+# Optional dependencies
+zlayer-builder = { workspace = true, optional = true }
+
+[features]
+default = ["build"]
+build = ["dep:zlayer-builder"]
+socket = []
+
+[lints]
+workspace = true

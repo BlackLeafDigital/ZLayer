@@ -10230,6 +10230,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "zlayer-docker-zql"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "hyper 1.8.1",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "zlayer-builder-zql",
+ "zlayer-core-zql",
+ "zlayer-spec-zql",
+]
+
+[[package]]
 name = "zlayer-init-actions-zql"
 version = "0.0.0-dev"
 dependencies = [
@@ -10605,6 +10626,7 @@ dependencies = [
  "zlayer-api-zql",
  "zlayer-builder-zql",
  "zlayer-core-zql",
+ "zlayer-docker-zql",
  "zlayer-init-actions-zql",
  "zlayer-observability-zql",
  "zlayer-overlay-zql",
