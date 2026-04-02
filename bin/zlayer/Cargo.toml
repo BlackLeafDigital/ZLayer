@@ -15,7 +15,7 @@ path = "src/main.rs"
 [features]
 default = ["full"]
 # Full runtime with all CLI commands and capabilities
-full = ["docker", "wasm", "s3", "persistent", "observability", "nat"]
+full = ["docker", "docker-compat", "wasm", "s3", "persistent", "observability", "nat"]
 
 # WSL2 backend (Windows-only, thin CLI proxies to daemon in WSL2)
 wsl = ["dep:zlayer-wsl"]
@@ -27,6 +27,7 @@ s3 = ["zlayer-agent/s3", "zlayer-registry/s3"]
 persistent = ["zlayer-scheduler/persistent", "zlayer-registry/persistent"]
 observability = ["zlayer-observability/axum", "zlayer-observability/propagation"]
 nat = ["zlayer-overlay/nat"]
+docker-compat = ["dep:zlayer-docker"]
 
 [dependencies]
 # Internal crates (cross-platform)
@@ -92,6 +93,8 @@ zlayer-secrets.workspace = true
 zlayer-storage.workspace = true
 zlayer-init-actions.workspace = true
 secrecy = { workspace = true }
+# Docker compatibility layer (optional)
+zlayer-docker = { workspace = true, optional = true }
 # Daemonization (fork, setsid) and signal handling (kill) -- Unix only
 nix = { workspace = true }
 libc = { workspace = true }

@@ -417,7 +417,16 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
 
 /// Dispatch CLI commands to their handlers.
 #[allow(clippy::too_many_lines)]
-async fn run(cli: Cli) -> Result<()> {
+async fn run(mut cli: Cli) -> Result<()> {
+    // Docker compat: handle before borrowing since it takes ownership of args
+    #[cfg(feature = "docker-compat")]
+    if matches!(&cli.command, Some(Commands::Docker(_))) {
+        let Some(Commands::Docker(docker_cmd)) = cli.command.take() else {
+            unreachable!()
+        };
+        return zlayer_docker::handle_docker_command(*docker_cmd).await;
+    }
+
     // command is guaranteed to be Some at this point (TUI handled earlier)
     let command = cli
         .command
@@ -487,6 +496,8 @@ async fn run(cli: Cli) -> Result<()> {
         Commands::Wasm(wasm_cmd) => commands::wasm::handle_wasm(&cli, wasm_cmd).await,
         Commands::Tunnel(tunnel_cmd) => commands::tunnel::handle_tunnel(&cli, tunnel_cmd).await,
         Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd),
+        #[cfg(feature = "docker-compat")]
+        Commands::Docker(_) => unreachable!("Docker handled before borrow"),
         Commands::Export {
             image,
             output,
@@ -507,6 +518,10 @@ async fn run(cli: Cli) -> Result<()> {
             jwt_secret,
             no_swagger,
             daemon: _, // Already handled in main() before tokio runtime
+            #[cfg(feature = "docker-compat")]
+            docker_socket,
+            #[cfg(feature = "docker-compat")]
+            docker_socket_path,
             ..
         } => {
             #[cfg(all(target_os = "windows", feature = "wsl"))]
@@ -531,6 +546,19 @@ async fn run(cli: Cli) -> Result<()> {
             }
             #[cfg(unix)]
             {
+                // Spawn Docker API socket server if enabled
+                #[cfg(feature = "docker-compat")]
+                if *docker_socket {
+                    let path = docker_socket_path.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) =
+                            zlayer_docker::socket::serve(std::path::Path::new(&path)).await
+                        {
+                            tracing::error!("Docker API socket server failed: {e}");
+                        }
+                    });
+                }
+
                 let socket_path = cli.effective_socket_path();
                 let data_dir = cli.effective_data_dir();
                 commands::serve::serve(

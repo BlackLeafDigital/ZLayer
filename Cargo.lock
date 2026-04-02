@@ -10123,6 +10123,7 @@ dependencies = [
  "zlayer-api",
  "zlayer-builder",
  "zlayer-core",
+ "zlayer-docker",
  "zlayer-init-actions",
  "zlayer-observability",
  "zlayer-overlay",
@@ -10300,6 +10301,27 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "zlayer-paths",
+ "zlayer-spec",
+]
+
+[[package]]
+name = "zlayer-docker"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "axum",
+ "clap",
+ "hyper 1.8.1",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "zlayer-builder",
+ "zlayer-core",
  "zlayer-spec",
 ]
 

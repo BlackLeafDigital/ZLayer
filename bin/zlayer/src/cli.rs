@@ -506,6 +506,16 @@ pub(crate) enum Commands {
         /// Defaults to {run-dir}/zlayer.sock.
         #[arg(long)]
         socket: Option<String>,
+
+        /// Enable Docker API socket emulation
+        #[cfg(feature = "docker-compat")]
+        #[arg(long)]
+        docker_socket: bool,
+
+        /// Docker API socket path
+        #[cfg(feature = "docker-compat")]
+        #[arg(long, default_value = "/var/run/docker.sock")]
+        docker_socket_path: String,
     },
 
     /// Manage the zlayer background daemon
@@ -549,6 +559,20 @@ pub(crate) enum Commands {
     #[command(subcommand, display_order = 43)]
     Wasm(WasmCommands),
 
+    // ── Docker Compatibility ──────────────────────────────────────────
+    /// Docker-compatible commands (run, ps, compose, etc.)
+    ///
+    /// Provides Docker CLI compatibility so you can use familiar Docker
+    /// commands through `ZLayer`.
+    ///
+    /// Examples:
+    ///   zlayer docker ps
+    ///   zlayer docker compose up -f docker-compose.yaml
+    ///   zlayer docker run --rm -it alpine sh
+    #[cfg(feature = "docker-compat")]
+    #[command(subcommand, verbatim_doc_comment, display_order = 45)]
+    Docker(Box<zlayer_docker::DockerCommands>),
+
     // ── Interface ─────────────────────────────────────────────────────
     /// Launch interactive TUI
     #[command(display_order = 50)]
@@ -580,6 +604,11 @@ pub(crate) enum DaemonAction {
         /// Disable Swagger UI
         #[arg(long)]
         no_swagger: bool,
+
+        /// Enable Docker API socket emulation at /var/run/docker.sock
+        #[cfg(feature = "docker-compat")]
+        #[arg(long)]
+        docker_socket: bool,
     },
 
     /// Uninstall the zlayer system service
@@ -1384,6 +1413,7 @@ mod tests {
                 no_swagger,
                 daemon,
                 socket,
+                ..
             }) => {
                 assert_eq!(bind, "0.0.0.0:3669");
                 assert!(jwt_secret.is_none());
@@ -1455,6 +1485,7 @@ mod tests {
                 no_swagger,
                 daemon,
                 socket,
+                ..
             }) => {
                 assert_eq!(bind, "0.0.0.0:3000");
                 assert_eq!(jwt_secret, Some("test-secret".to_string()));
