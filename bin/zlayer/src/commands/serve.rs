@@ -255,7 +255,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     {
         let bind_addr: std::net::SocketAddr = ([0, 0, 0, 0], api_port).into();
         let mut port_free = false;
-        for attempt in 1..=50 {
+        for attempt in 1..=10 {
             if let Ok(_listener) = std::net::TcpListener::bind(bind_addr) {
                 // Listener is dropped immediately, port is free.
                 if attempt > 1 {
@@ -275,7 +275,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
         if !port_free {
             warn!(
                 port = api_port,
-                "API port still in use after 5 seconds — startup may fail with 'Address already in use'"
+                "API port still in use after 1s — startup may fail with 'Address already in use'"
             );
         }
     }
@@ -287,7 +287,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
         let wg_port: u16 = 51820;
         let wg_addr: std::net::SocketAddr = ([0, 0, 0, 0], wg_port).into();
         let mut wg_free = false;
-        for attempt in 1..=50 {
+        for attempt in 1..=10 {
             if std::net::UdpSocket::bind(wg_addr).is_ok() {
                 if attempt > 1 {
                     info!(
@@ -310,7 +310,7 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
         if !wg_free {
             warn!(
                 port = wg_port,
-                "WireGuard UDP port still in use after 5s — overlay may fail"
+                "WireGuard UDP port still in use after 1s — overlay may fail"
             );
         }
     }
