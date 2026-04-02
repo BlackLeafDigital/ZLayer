@@ -210,7 +210,7 @@ async fn install(
         }
 
         print!("Daemon starting...");
-        match wait_for_daemon_ready(data_dir, 15).await {
+        match wait_for_daemon_ready(data_dir, 45).await {
             Ok(()) => {
                 let _ = std::fs::remove_file(&spawner_pid_path);
                 println!(" started");
@@ -290,7 +290,7 @@ async fn start(data_dir: &Path) -> Result<()> {
     }
 
     print!("Daemon starting...");
-    match wait_for_daemon_ready(data_dir, 15).await {
+    match wait_for_daemon_ready(data_dir, 45).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
             println!(" started");
@@ -645,7 +645,7 @@ WantedBy=multi-user.target
         }
 
         print!("Daemon starting...");
-        match wait_for_daemon_ready(data_dir, 15).await {
+        match wait_for_daemon_ready(data_dir, 45).await {
             Ok(()) => {
                 let _ = std::fs::remove_file(&spawner_pid_path);
                 println!(" started via systemd");
@@ -713,7 +713,7 @@ async fn start(data_dir: &Path) -> Result<()> {
     }
 
     print!("Daemon starting...");
-    match wait_for_daemon_ready(data_dir, 15).await {
+    match wait_for_daemon_ready(data_dir, 45).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
             let log_dir = crate::cli::default_log_dir(data_dir);
