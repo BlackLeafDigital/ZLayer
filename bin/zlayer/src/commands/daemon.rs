@@ -429,26 +429,12 @@ fn systemctl_args(base_args: &[&str]) -> Vec<String> {
 
 /// Pick a writable system location for the daemon binary.
 ///
-/// Write-probes `/usr/local/bin` first (standard FHS), falls back to
-/// `/opt/bin` (k3s pattern) for immutable distros (Fedora Atomic,
-/// Silverblue, uBlue) where `/usr` is a read-only overlay.
+/// Delegates to [`zlayer_paths::ZLayerDirs::default_binary_dir`] which
+/// write-probes `/usr/local/bin` first, then falls back to the `ZLayer`
+/// data dir (`/var/lib/zlayer/bin`) which is always writable.
 #[cfg(target_os = "linux")]
 fn pick_system_binary_path() -> std::path::PathBuf {
-    use std::path::PathBuf;
-
-    // Probe writability with a temp file — metadata mode bits lie on overlayfs.
-    let probe = PathBuf::from("/usr/local/bin/.zlayer_write_probe");
-    if std::fs::write(&probe, b"").is_ok() {
-        let _ = std::fs::remove_file(&probe);
-        return PathBuf::from("/usr/local/bin/zlayer");
-    }
-
-    // Fallback: /opt/bin (k3s pattern for immutable distros)
-    let fallback = PathBuf::from("/opt/bin/zlayer");
-    if let Some(parent) = fallback.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    fallback
+    zlayer_paths::ZLayerDirs::default_binary_dir().join("zlayer")
 }
 
 #[cfg(target_os = "linux")]
