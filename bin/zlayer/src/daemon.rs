@@ -211,7 +211,7 @@ pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Resu
     let advertise_addr = detect_local_ip();
     let api_port: u16 = 3669;
     let raft_port: u16 = 9000;
-    let overlay_port: u16 = zlayer_overlay::DEFAULT_WG_PORT;
+    let overlay_port: u16 = zlayer_core::DEFAULT_WG_PORT;
     let overlay_cidr = "10.200.0.0/16".to_string();
 
     let (private_key, public_key) = OverlayTransport::generate_keys()
