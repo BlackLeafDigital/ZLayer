@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-04-03]
+
+### Added
+- Structured logging: `LogEntry`, `LogStream`, `LogSource`, `LogQuery` types,
+  `FileLogWriter`/`MemoryLogWriter`, `FileLogReader`/`apply_query()`,
+  `LogOutputConfig`/`LogDestination`, `LogsConfig` on `ServiceSpec`.
+- `max_files` on `FileLoggingConfig` for rotated log cleanup.
+- Daemon log rotation via `tracing-appender` with daily rotation.
+
+### Changed
+- `DEFAULT_WG_PORT` moved to `zlayer-core` for cross-platform availability.
+- `Runtime` trait: `container_logs()`/`get_logs()` return `Vec<LogEntry>`.
+  All runtimes (youki, docker, macOS sandbox, WASM) updated.
+- `ServiceManager::get_service_logs()` returns `Vec<LogEntry>`.
+- Daemon systemd unit uses `StandardOutput=journal`; daemon manages files via
+  `tracing-appender`.
+- Fresh daemon log on every start; `wait_for_daemon_ready` reads newest file.
+- Log rotation handles `.jsonl` + `executions/` cleanup.
+- Raft bootstrap skips `initialize()` on already-initialized nodes.
+- `install.sh` cleanup: stale interfaces, UAPI sockets, port-holding processes.
+
 ## [2026-04-02]
 
 ### Changed

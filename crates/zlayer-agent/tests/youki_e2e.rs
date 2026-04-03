@@ -615,7 +615,12 @@ async fn test_container_logs() {
         // Just verify the API doesn't panic
         match logs_result {
             Ok(logs) => {
-                println!("Container logs:\n{logs}");
+                let logs_text: String = logs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                println!("Container logs:\n{logs_text}");
             }
             Err(e) => {
                 println!("Could not get logs (expected if container exited): {e}");

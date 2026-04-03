@@ -152,6 +152,7 @@ mod tests {
                 node_selector: None,
                 service_type: ServiceType::default(),
                 wasm: None,
+                logs: None,
                 host_network: false,
             },
         );

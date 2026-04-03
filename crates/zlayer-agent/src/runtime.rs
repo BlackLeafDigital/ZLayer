@@ -8,6 +8,7 @@ use crate::error::{AgentError, Result};
 use std::net::IpAddr;
 use std::time::Duration;
 use tokio::task::JoinHandle;
+use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_spec::{PullPolicy, ServiceSpec};
 
 /// Container state
@@ -83,8 +84,8 @@ pub trait Runtime: Send + Sync {
     /// Get container state
     async fn container_state(&self, id: &ContainerId) -> Result<ContainerState>;
 
-    /// Get container logs
-    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<String>;
+    /// Get container logs as structured entries
+    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<Vec<LogEntry>>;
 
     /// Execute command in container
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)>;
@@ -103,9 +104,9 @@ pub trait Runtime: Send + Sync {
 
     /// Get container logs (stdout/stderr combined)
     ///
-    /// Returns logs as a vector of log lines.
+    /// Returns logs as structured entries.
     /// Used to capture job output after completion.
-    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>>;
+    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<LogEntry>>;
 
     /// Get the PID of a container's main process
     ///
@@ -254,8 +255,27 @@ impl Runtime for MockRuntime {
             })
     }
 
-    async fn container_logs(&self, id: &ContainerId, _tail: usize) -> Result<String> {
-        Ok(format!("Mock logs for {id}"))
+    async fn container_logs(&self, _id: &ContainerId, tail: usize) -> Result<Vec<LogEntry>> {
+        let entries = vec![
+            LogEntry {
+                timestamp: chrono::Utc::now(),
+                stream: LogStream::Stdout,
+                message: "mock log line 1".to_string(),
+                source: LogSource::Container("mock".to_string()),
+                service: None,
+                deployment: None,
+            },
+            LogEntry {
+                timestamp: chrono::Utc::now(),
+                stream: LogStream::Stderr,
+                message: "mock error line".to_string(),
+                source: LogSource::Container("mock".to_string()),
+                service: None,
+                deployment: None,
+            },
+        ];
+        let skip = entries.len().saturating_sub(tail);
+        Ok(entries.into_iter().skip(skip).collect())
     }
 
     async fn exec(&self, _id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)> {
@@ -302,14 +322,36 @@ impl Runtime for MockRuntime {
         }
     }
 
-    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>> {
-        // Mock: return dummy log lines
+    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<LogEntry>> {
+        // Mock: return dummy structured log entries
         let containers = self.containers.read().await;
         if containers.contains_key(id) {
+            let container_name = id.to_string();
             Ok(vec![
-                format!("[{}] Container started", id),
-                format!("[{}] Executing command...", id),
-                format!("[{}] Command completed successfully", id),
+                LogEntry {
+                    timestamp: chrono::Utc::now(),
+                    stream: LogStream::Stdout,
+                    message: format!("[{container_name}] Container started"),
+                    source: LogSource::Container(container_name.clone()),
+                    service: None,
+                    deployment: None,
+                },
+                LogEntry {
+                    timestamp: chrono::Utc::now(),
+                    stream: LogStream::Stdout,
+                    message: format!("[{container_name}] Executing command..."),
+                    source: LogSource::Container(container_name.clone()),
+                    service: None,
+                    deployment: None,
+                },
+                LogEntry {
+                    timestamp: chrono::Utc::now(),
+                    stream: LogStream::Stdout,
+                    message: format!("[{container_name}] Command completed successfully"),
+                    source: LogSource::Container(container_name),
+                    service: None,
+                    deployment: None,
+                },
             ])
         } else {
             Err(AgentError::NotFound {

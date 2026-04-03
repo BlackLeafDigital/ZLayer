@@ -248,10 +248,16 @@ impl Container {
             let id = inner.id.clone();
             drop(inner);
 
-            let logs = runtime
+            let entries = runtime
                 .container_logs(&id, tail)
                 .await
                 .map_err(ZLayerError::from)?;
+
+            let logs: String = entries
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
 
             to_py_result(Ok(logs))
         })

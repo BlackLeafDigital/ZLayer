@@ -111,6 +111,16 @@ pub struct FileLoggingConfig {
     /// Rotation strategy
     #[serde(default)]
     pub rotation: RotationStrategy,
+
+    /// Maximum number of rotated log files to keep. Oldest files beyond
+    /// this limit are deleted at startup. `None` means no limit.
+    #[serde(default = "default_max_files")]
+    pub max_files: Option<usize>,
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn default_max_files() -> Option<usize> {
+    Some(7)
 }
 
 fn default_prefix() -> String {
@@ -128,6 +138,52 @@ pub enum RotationStrategy {
     Hourly,
     /// Never rotate (single file)
     Never,
+}
+
+/// Log output configuration for containers and executions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogOutputConfig {
+    /// Where to write logs.
+    #[serde(default)]
+    pub destination: LogDestination,
+
+    /// Maximum total log size in bytes before rotation/truncation.
+    /// Default: 100MB.
+    #[serde(default = "default_max_log_size")]
+    pub max_size_bytes: u64,
+
+    /// How long to retain log files. Default: 7 days for disk, 1 hour for memory.
+    #[serde(default = "default_log_retention_secs")]
+    pub retention_secs: u64,
+}
+
+fn default_max_log_size() -> u64 {
+    100 * 1024 * 1024 // 100MB
+}
+
+fn default_log_retention_secs() -> u64 {
+    7 * 24 * 60 * 60 // 7 days
+}
+
+impl Default for LogOutputConfig {
+    fn default() -> Self {
+        Self {
+            destination: LogDestination::default(),
+            max_size_bytes: default_max_log_size(),
+            retention_secs: default_log_retention_secs(),
+        }
+    }
+}
+
+/// Where to write container/execution logs.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum LogDestination {
+    /// Write to disk as JSONL files (default).
+    #[default]
+    Disk,
+    /// Keep in memory with ring buffer (for short-lived executions).
+    Memory,
 }
 
 /// Metrics configuration

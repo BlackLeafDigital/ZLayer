@@ -529,6 +529,9 @@ async fn install(
         String::new()
     };
 
+    // Compute log_dir early so it's available for pre-creation and rotate.
+    let log_dir = crate::cli::default_log_dir(data_dir);
+
     let unit = format!(
         r"[Unit]
 Description=ZLayer Container Orchestration Daemon
@@ -546,8 +549,8 @@ LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
 LogsDirectory=zlayer
-StandardOutput=append:/var/log/zlayer/daemon.log
-StandardError=append:/var/log/zlayer/daemon.log
+StandardOutput=journal
+StandardError=journal
 {env_line}
 [Install]
 WantedBy=multi-user.target
@@ -587,10 +590,8 @@ WantedBy=multi-user.target
         bail!("systemctl enable failed: {stderr}");
     }
 
-    // Pre-create log directory so StandardOutput=append: works even on
-    // first start before init_daemon() runs, and on older systemd that
-    // doesn't support LogsDirectory.
-    let log_dir = crate::cli::default_log_dir(data_dir);
+    // Pre-create log directory so tracing-appender can write on first
+    // start before init_daemon() runs.
     if let Err(e) = std::fs::create_dir_all(&log_dir) {
         eprintln!("Warning: could not create {}: {e}", log_dir.display());
     }
@@ -632,6 +633,8 @@ WantedBy=multi-user.target
         let spawner_pid_path = data_dir.join("spawner.pid");
         std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
 
+        rotate_daemon_log(&log_dir);
+
         let start_args = systemctl_args(&["start", UNIT_NAME]);
         let out = Command::new("systemctl")
             .args(&start_args)
@@ -649,7 +652,7 @@ WantedBy=multi-user.target
             Ok(()) => {
                 let _ = std::fs::remove_file(&spawner_pid_path);
                 println!(" started via systemd");
-                println!("  Logs: {}", log_dir.join("daemon.log").display());
+                println!("  Logs: {}", log_dir.display());
                 println!("  Stop: zlayer daemon stop");
             }
             Err(e) => {
@@ -700,6 +703,9 @@ async fn start(data_dir: &Path) -> Result<()> {
     let spawner_pid_path = data_dir.join("spawner.pid");
     std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
 
+    let log_dir = crate::cli::default_log_dir(data_dir);
+    rotate_daemon_log(&log_dir);
+
     let args = systemctl_args(&["start", UNIT_NAME]);
     let out = Command::new("systemctl")
         .args(&args)
@@ -716,9 +722,8 @@ async fn start(data_dir: &Path) -> Result<()> {
     match wait_for_daemon_ready(data_dir, 45).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
-            let log_dir = crate::cli::default_log_dir(data_dir);
             println!(" started");
-            println!("  Logs: {}", log_dir.join("daemon.log").display());
+            println!("  Logs: {}", log_dir.display());
             println!("  Stop: zlayer daemon stop");
         }
         Err(e) => {
@@ -803,6 +808,47 @@ async fn status(data_dir: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Log helpers (shared across platforms)
+// ---------------------------------------------------------------------------
+
+/// Rotate the current day's daemon log file before a fresh start,
+/// ensuring that failure output is always from the current attempt.
+fn rotate_daemon_log(log_dir: &std::path::Path) {
+    // tracing-appender daily files are named `{prefix}.{YYYY-MM-DD}`
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let current = log_dir.join(format!("daemon.{today}"));
+    if current.exists() {
+        let prev = log_dir.join(format!("daemon.{today}.prev"));
+        let _ = std::fs::rename(&current, &prev);
+    }
+}
+
+/// Find the newest `daemon.*` log file (tracing-appender daily format).
+fn find_newest_daemon_log(log_dir: &std::path::Path) -> std::path::PathBuf {
+    // Look for tracing-appender daily files: daemon.YYYY-MM-DD
+    if let Ok(entries) = std::fs::read_dir(log_dir) {
+        let mut daemon_files: Vec<std::path::PathBuf> = entries
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("daemon.")
+                        && !std::path::Path::new(n)
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("prev"))
+                })
+            })
+            .collect();
+        daemon_files.sort();
+        if let Some(newest) = daemon_files.pop() {
+            return newest;
+        }
+    }
+    // Fallback to old name
+    log_dir.join("daemon.log")
+}
+
+// ---------------------------------------------------------------------------
 // Readiness check (shared across platforms)
 // ---------------------------------------------------------------------------
 
@@ -810,8 +856,8 @@ async fn status(data_dir: &Path) -> Result<()> {
 ///
 /// The `zlayer serve` process writes `daemon.json` after all infrastructure
 /// phases complete successfully. If it crashes during init, the file is never
-/// created. On timeout, the last 20 lines of `daemon.log` are included in the
-/// error to surface the actual failure reason.
+/// created. On timeout, the last 20 lines of the newest daemon log are
+/// included in the error to surface the actual failure reason.
 #[allow(unsafe_code)]
 async fn wait_for_daemon_ready(data_dir: &Path, timeout_secs: u64) -> Result<()> {
     let metadata_path = data_dir.join("daemon.json");
@@ -827,7 +873,7 @@ async fn wait_for_daemon_ready(data_dir: &Path, timeout_secs: u64) -> Result<()>
 
     // Daemon didn't come up — surface the error from the log
     let log_dir = crate::cli::default_log_dir(data_dir);
-    let log_path = log_dir.join("daemon.log");
+    let log_path = find_newest_daemon_log(&log_dir);
     #[allow(unused_mut)]
     let mut tail = if log_path.exists() {
         std::fs::read_to_string(&log_path)

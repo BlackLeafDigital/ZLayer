@@ -10102,6 +10102,7 @@ dependencies = [
  "wat",
  "zlayer-core-zql",
  "zlayer-init-actions-zql",
+ "zlayer-observability-zql",
  "zlayer-overlay-zql",
  "zlayer-paths-zql",
  "zlayer-proxy-zql",

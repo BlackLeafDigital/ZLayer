@@ -22,7 +22,9 @@
 pub mod config;
 pub mod container_spans;
 pub mod error;
+pub mod log_reader;
 pub mod logging;
+pub mod logs;
 pub mod metrics;
 pub mod propagation;
 pub mod tracing_otel;

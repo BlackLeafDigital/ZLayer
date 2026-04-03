@@ -546,6 +546,44 @@ pub enum TunnelProtocol {
     Udp,
 }
 
+/// Log output configuration for services and jobs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct LogsConfig {
+    /// Where to write logs: "disk" (default) or "memory"
+    #[serde(default = "default_logs_destination")]
+    pub destination: String,
+
+    /// Maximum log size in bytes (default: 100MB)
+    #[serde(default = "default_logs_max_size")]
+    pub max_size_bytes: u64,
+
+    /// Log retention in seconds (default: 7 days)
+    #[serde(default = "default_logs_retention")]
+    pub retention_secs: u64,
+}
+
+fn default_logs_destination() -> String {
+    "disk".to_string()
+}
+
+fn default_logs_max_size() -> u64 {
+    100 * 1024 * 1024 // 100MB
+}
+
+fn default_logs_retention() -> u64 {
+    7 * 24 * 60 * 60 // 7 days
+}
+
+impl Default for LogsConfig {
+    fn default() -> Self {
+        Self {
+            destination: default_logs_destination(),
+            max_size_bytes: default_logs_max_size(),
+            retention_secs: default_logs_retention(),
+        }
+    }
+}
+
 /// Per-service specification
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Validate)]
 #[serde(deny_unknown_fields)]
@@ -648,6 +686,10 @@ pub struct ServiceSpec {
     /// Also accepts the deprecated `wasm_http` key for backward compatibility.
     #[serde(default, skip_serializing_if = "Option::is_none", alias = "wasm_http")]
     pub wasm: Option<WasmConfig>,
+
+    /// Log output configuration. If not set, uses platform defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<LogsConfig>,
 
     /// Use host networking (container shares host network namespace)
     ///

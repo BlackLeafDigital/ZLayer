@@ -48,6 +48,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_spec::ServiceSpec;
 
 // ---------------------------------------------------------------------------
@@ -2210,10 +2211,10 @@ impl Runtime for SandboxRuntime {
         Ok(container.state.clone())
     }
 
-    /// Get container logs (stdout + stderr combined as a string).
+    /// Get container logs as structured [`LogEntry`] values.
     ///
-    /// If `tail > 0`, returns only the last `tail` lines.
-    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<String> {
+    /// If `tail > 0`, returns only the last `tail` entries.
+    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<Vec<LogEntry>> {
         let dir_name = Self::container_dir_name(id);
 
         let (stdout_path, stderr_path) = {
@@ -2227,35 +2228,43 @@ impl Runtime for SandboxRuntime {
             (container.stdout_path.clone(), container.stderr_path.clone())
         };
 
-        let mut combined = String::new();
+        let now = chrono::Utc::now();
+        let source = LogSource::Container(id.to_string());
+        let mut entries = Vec::new();
 
         if let Ok(stdout) = tokio::fs::read_to_string(&stdout_path).await {
-            if !stdout.is_empty() {
-                combined.push_str("[stdout]\n");
-                combined.push_str(&stdout);
+            for line in stdout.lines() {
+                entries.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stdout,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
             }
         }
 
         if let Ok(stderr) = tokio::fs::read_to_string(&stderr_path).await {
-            if !stderr.is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
-                }
-                combined.push_str("[stderr]\n");
-                combined.push_str(&stderr);
+            for line in stderr.lines() {
+                entries.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stderr,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
             }
         }
 
-        // Apply tail
-        if tail > 0 {
-            let lines: Vec<&str> = combined.lines().collect();
-            if lines.len() > tail {
-                let start = lines.len() - tail;
-                return Ok(lines[start..].join("\n"));
-            }
+        // Apply tail limit
+        if tail > 0 && entries.len() > tail {
+            let start = entries.len() - tail;
+            entries = entries.split_off(start);
         }
 
-        Ok(combined)
+        Ok(entries)
     }
 
     /// Execute a command inside a container's sandbox.
@@ -2442,8 +2451,8 @@ impl Runtime for SandboxRuntime {
         Ok(exit_code)
     }
 
-    /// Get container logs as a vector of lines (stdout + stderr combined).
-    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>> {
+    /// Get container logs as structured [`LogEntry`] values.
+    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<LogEntry>> {
         let dir_name = Self::container_dir_name(id);
 
         let (stdout_path, stderr_path) = {
@@ -2457,23 +2466,39 @@ impl Runtime for SandboxRuntime {
             (container.stdout_path.clone(), container.stderr_path.clone())
         };
 
-        let mut logs = Vec::new();
+        let now = chrono::Utc::now();
+        let source = LogSource::Container(id.to_string());
+        let mut entries = Vec::new();
 
         // Read stdout
         if let Ok(content) = tokio::fs::read_to_string(&stdout_path).await {
             for line in content.lines() {
-                logs.push(format!("[stdout] {line}"));
+                entries.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stdout,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
             }
         }
 
         // Read stderr
         if let Ok(content) = tokio::fs::read_to_string(&stderr_path).await {
             for line in content.lines() {
-                logs.push(format!("[stderr] {line}"));
+                entries.push(LogEntry {
+                    timestamp: now,
+                    stream: LogStream::Stderr,
+                    message: line.to_string(),
+                    source: source.clone(),
+                    service: None,
+                    deployment: None,
+                });
             }
         }
 
-        Ok(logs)
+        Ok(entries)
     }
 
     /// Get the PID of a container's main process.
