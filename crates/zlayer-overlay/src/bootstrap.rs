@@ -26,7 +26,7 @@ pub const DEFAULT_INTERFACE_NAME: &str = "utun";
 pub const DEFAULT_INTERFACE_NAME: &str = "zl-overlay0";
 
 /// Default overlay listen port
-pub const DEFAULT_WG_PORT: u16 = 51820;
+pub const DEFAULT_WG_PORT: u16 = 51420;
 
 /// Default overlay network CIDR (IPv4)
 pub const DEFAULT_OVERLAY_CIDR: &str = "10.200.0.0/16";

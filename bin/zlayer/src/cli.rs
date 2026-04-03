@@ -3,28 +3,36 @@ use std::path::PathBuf;
 
 /// Return the platform-appropriate default data directory for `ZLayer`.
 ///
-/// Delegates to [`zlayer_paths::ZLayerDirs::default_data_dir`].
+/// - macOS: `~/.zlayer`
+/// - Linux (root): `/var/lib/zlayer`
+/// - Linux (user): `~/.zlayer`
+/// - Windows: `%LOCALAPPDATA%\ZLayer` or `C:\ProgramData\ZLayer`
 pub(crate) fn default_data_dir() -> PathBuf {
     zlayer_paths::ZLayerDirs::default_data_dir()
 }
 
 /// Return the platform-appropriate default runtime directory.
 ///
-/// Delegates to [`zlayer_paths::ZLayerDirs::default_run_dir`].
+/// - macOS: `{default_data_dir}/run`
+/// - Linux: `/var/run/zlayer`
+/// - Windows: `{default_data_dir}\run`
 pub(crate) fn default_run_dir(_data_dir: &std::path::Path) -> PathBuf {
     zlayer_paths::ZLayerDirs::default_run_dir()
 }
 
 /// Return the platform-appropriate default log directory.
 ///
-/// Delegates to [`zlayer_paths::ZLayerDirs::default_log_dir`].
+/// - macOS: `{default_data_dir}/logs`
+/// - Linux: `/var/log/zlayer`
+/// - Windows: `{default_data_dir}\logs`
 pub(crate) fn default_log_dir(_data_dir: &std::path::Path) -> PathBuf {
     zlayer_paths::ZLayerDirs::default_log_dir()
 }
 
 /// Return the platform-appropriate default socket path.
 ///
-/// Delegates to [`zlayer_paths::ZLayerDirs::default_socket_path`].
+/// On Windows, returns a TCP address instead of a Unix socket path since
+/// Unix domain sockets have limited support on Windows.
 pub(crate) fn default_socket_path(_data_dir: &std::path::Path) -> String {
     zlayer_paths::ZLayerDirs::default_socket_path()
 }
@@ -54,6 +62,8 @@ pub(crate) struct Cli {
     ///
     /// On macOS defaults to ~/.zlayer.
     /// On Linux defaults to /var/lib/zlayer (root) or ~/.zlayer (user).
+    /// Other directories (logs, run, containers) are derived from this unless
+    /// individually overridden.
     #[arg(long, env = "ZLAYER_DATA_DIR")]
     pub(crate) data_dir: Option<PathBuf>,
 
@@ -930,7 +940,7 @@ pub(crate) enum NodeCommands {
         raft_port: u16,
 
         /// Overlay network port (`WireGuard` protocol)
-        #[arg(long, default_value = "51820")]
+        #[arg(long, default_value_t = zlayer_overlay::DEFAULT_WG_PORT)]
         overlay_port: u16,
 
         /// Data directory (defaults to platform default, see --data-dir)

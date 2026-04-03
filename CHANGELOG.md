@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-04-02]
+
+### Changed
+- Default WireGuard overlay port changed from 51820 to 51420 to avoid
+  conflicts with system WireGuard VPNs.
+- Replaced all hardcoded `51820` port literals with `DEFAULT_WG_PORT` constant
+  and `node_config.overlay_port` configuration throughout the codebase.
+- Daemon startup WireGuard port cleanup: replaced passive polling with active
+  process identification and termination. Reads overlay port from
+  `node_config.json` instead of hardcoding, identifies the port holder via
+  `ss`/`lsof`, and sends SIGTERM/SIGKILL to stale zlayer/boringtun processes.
+- `OverlayManager` now accepts a configurable overlay port via
+  `with_overlay_port()` builder method instead of hardcoding.
+- Raft bootstrap on restart now checks metrics before calling `initialize()`,
+  suppressing the noisy openraft ERROR log on already-initialized nodes.
+- `install.sh`: expanded cleanup on upgrade — removes stale `zl-*` network
+  interfaces, WireGuard UAPI sockets, and kills stale port-holding processes.
+
 ## [2026-04-01]
 
 ### Added
@@ -43,52 +61,163 @@ All notable changes to this project will be documented in this file.
 - Build workflow `upload-temp-packages` output: `package_base_url` is now set
   unconditionally so re-runs don't pass an empty artifact URL to the release workflow.
 
-## [Unreleased]
+## [2026-03-30]
 
 ### Added
+- `host` field on `EndpointSpec` for host-based/subdomain proxy routing
+  (e.g. `host: "api.example.com"` or `host: "*.example.com"`), wired into
+  `RouteEntry::from_endpoint()` so specs can declare host patterns directly.
+- GPU model affinity: `model` field on `GpuSpec` pins workloads to nodes with
+  a matching GPU model (substring match, e.g. `model: "A100"`).
+- GPU device index tracking: scheduler now allocates specific GPU indices per
+  container, preventing device overlap when multiple containers share a node.
+  `PlacementDecision` carries `gpu_indices` for downstream device injection.
+- GPU environment variable injection: containers automatically receive
+  `NVIDIA_VISIBLE_DEVICES`/`CUDA_VISIBLE_DEVICES` (NVIDIA),
+  `ROCR_VISIBLE_DEVICES`/`HIP_VISIBLE_DEVICES` (AMD), or
+  `ZE_AFFINITY_MASK` (Intel) based on vendor and allocated indices.
+- Gang scheduling (`scheduling: gang` on `GpuSpec`): all-or-nothing placement
+  for distributed GPU jobs — if any replica cannot be placed, all are rolled back.
+- Distributed job coordination (`distributed` on `GpuSpec`): injects
+  `MASTER_ADDR`, `MASTER_PORT`, `WORLD_SIZE`, `RANK`, `LOCAL_RANK`, and
+  backend-specific env vars (`NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME`).
+- GPU spread scheduling (`scheduling: spread`): distributes GPU workloads across
+  nodes instead of bin-packing them onto the fewest nodes.
+- GPU sharing modes (`sharing` on `GpuSpec`): `mps` for NVIDIA Multi-Process
+  Service (up to 8 containers per GPU) and `time-slice` for round-robin sharing
+  (up to 4 containers per GPU). Fractional GPU tracking in scheduler.
+- `MpsDaemonManager` in `zlayer-agent` for reference-counted NVIDIA MPS daemon
+  lifecycle management (auto-start on first MPS container, auto-stop on last).
+- GPU utilization in heartbeat: `GpuUtilizationReport` struct with per-GPU
+  utilization %, memory, temperature, and power reported via Raft heartbeat.
+- GPU metrics collection module (`gpu_metrics`): portable metrics via
+  `nvidia-smi` (NVIDIA), sysfs (AMD/Intel) — no hard driver dependencies.
+- GPU health monitoring: detects thermal throttling, ECC errors, and
+  unresponsive GPUs via `check_gpu_health()`.
+- GPU metrics in `zlayer-observability`: utilization (percent), memory used/total
+  (bytes), temperature (celsius), and power draw (watts). Each metric is a
+  Prometheus `GaugeVec` with `gpu_index` and `node` labels.
+- CDI (Container Device Interface) support: discovers specs from `/etc/cdi/`
+  and `/var/run/cdi/`, resolves fully-qualified device names, merges container
+  edits, and can generate NVIDIA specs via `nvidia-ctk`.
 - macOS sandbox backend now supports `push_image`, `tag_image`, `manifest_create`,
   `manifest_add`, and `manifest_push` operations. Previously, pipeline builds on
   macOS succeeded but push/manifest operations always failed with "Operation 'push'
   is not supported by this backend". The sandbox backend now tars the rootfs, builds
-  OCI manifests, and pushes via the registry client (requires the `cache` feature).
-  Multi-platform manifest lists are stored on disk and pushed as OCI image indexes.
+  OCI manifests, and pushes via the registry client (requires the `cache` feature,
+  which the `zlayer` CLI already enables). Multi-platform manifest lists are stored
+  on disk and pushed as OCI image indexes.
 - `ImagePuller::push_image_index_to_registry` method for pushing OCI image indexes
   (manifest lists) to remote registries.
 
+## [2026-03-29]
+
 ### Fixed
-- CI version substitution now uses global replace in `zdb-publish.yml`, fixing
-  `zlayer-paths` version not being updated (caused `^0.0.0-dev` vs `0.2.45` mismatch).
-- `zlayer-paths` crate renamed to `zlayer-paths-zql`, made publishable, and added to
-  all CI publish lists so dependent crates can resolve it from the Forgejo registry.
+- `zlayer-paths` crate now publishable (removed `publish = false`) and added to
+  CI release publish order so crates depending on it can resolve it from the registry.
+- `daemon install` no longer fails with "Text file busy" (ETXTBSY) when the old
+  binary is still running via systemd. The install function now stops the service
+  and unlinks the destination before copying.
+- `admin_password` file permissions are now enforced to 0o644 on every daemon
+  startup, not just on initial creation. Previously, files created with the old
+  0o600 permissions stayed unreadable to non-root tools (E2E tests, CLI) forever.
+- `DockerConfigAuth` now respects the `DOCKER_CONFIG` environment variable
+  (standard Docker convention) for locating `config.json`.
+
+## [2026-03-28]
+
+### Fixed
 - Daemon startup failures now produce diagnostic output instead of
-  "no log output found at /var/log/zlayer/daemon.log". Both systemd unit
-  templates (install.sh and `zlayer daemon install`) now redirect
-  stdout/stderr to the daemon log file via `StandardOutput=append:` and
-  `StandardError=append:` directives. The log directory is pre-created
-  before starting the service. On timeout, `wait_for_daemon_ready()` falls
-  back to querying journalctl and provides a diagnostic hint.
+  "no log output found at /var/log/zlayer/daemon.log". The systemd unit
+  template now redirects stdout/stderr to the daemon log file via
+  `StandardOutput=append:` and `StandardError=append:` directives. The log
+  directory is pre-created before starting the service. On timeout,
+  `wait_for_daemon_ready()` falls back to querying journalctl and provides
+  a diagnostic hint.
+
+## [2026-03-27]
+
+### Fixed
+- Install scripts (`install.sh`, `install.py`) now install `libseccomp` runtime
+  library, verify cgroups v2, and create `/var/lib/zlayer/` state directories.
+  Previously, fresh installs would fail to start containers because the bundled
+  libcontainer runtime requires libseccomp at runtime but nothing installed it.
+- Container, job, cron, and build API routes were missing the `AuthState`
+  extension because it was applied inside `build_router_with_deployment_state()`
+  before routes were nested in `serve.rs`. The `Extension(auth_state)` layer is
+  now re-applied after all `.nest()` calls so every route receives auth context.
+- `install.sh`: daemon install output was silently discarded (`>/dev/null 2>&1`).
+  Now shows output so users can see what happened. Linux installs use `sudo`,
+  macOS installs do not. Removed redundant post-install status checks that
+  duplicated the daemon's own readiness reporting.
+- Linux `daemon install`: `systemctl daemon-reload` and `systemctl enable` exit
+  codes were silently discarded (`let _ = ...`). They now propagate errors and
+  bail with the stderr message on failure.
+- Non-deterministic sandbox builder cache hash. `compute_dockerfile_hash()` used
+  `format!("{:?}", dockerfile)` which produced different hashes across runs due to
+  `HashMap` randomized iteration order. Replaced with deterministic per-instruction
+  `cache_key()` hashing. Also fixed `SandboxBackend::build_image()` not forwarding
+  `options.source_hash` to `SandboxImageBuilder`, so pipeline-provided hashes were
+  being silently ignored.
 
 ### Added
-- Multi-version builds in `scripts/build-macos-images.sh` -- e.g.
+- Content-based cache invalidation for the sandbox builder. `SandboxImageConfig`
+  now carries a `source_hash` field (SHA-256 of the Dockerfile/ZImagefile). When
+  a cached image exists with a matching hash, the rebuild is skipped entirely.
+  Pipeline builds (`build_single_image`) also compute a file hash up front and
+  short-circuit before even creating an `ImageBuilder` when the output image is
+  unchanged. `BuildOptions` and `ImageBuilder` gain a `source_hash` setter.
+  `build_toolchain_as_image()` and `build_base_image()` in `macos_image_resolver`
+  now embed source hashes in their cached configs.
+- Multi-version builds in `scripts/build-macos-images.sh` — e.g.
   `./scripts/build-macos-images.sh node 18 20 22 24` builds Node 18, 20, 22, 24.
   Partial versions auto-resolve to latest patch via upstream APIs. Environment
   variable overrides (`GO_VERSION`, `NODE_VERSION`, `PYTHON_VERSION`, etc.) take
   precedence over API resolution. Output directories are now versioned
   (`$BUILD_DIR/golang-1.23.6/rootfs/`). OCI config.json includes version labels.
+- `BuildBackend` trait in `zlayer-builder::backend` providing a pluggable
+  abstraction over container build tooling. Includes `BuildahBackend` (wraps
+  buildah CLI) and `SandboxBackend` (macOS Seatbelt, cfg-gated). Added
+  `detect_backend()` for runtime auto-detection with `ZLAYER_BACKEND` env
+  override support. Added `BuildError::NotSupported` variant for unsupported
+  backend operations.
+- `ImageBuilder::with_backend()` constructor for creating a builder with an
+  explicit `BuildBackend`. `ImageBuilder::new()` now auto-detects the backend
+  via `detect_backend()`. `with_executor()` wraps the executor in a
+  `BuildahBackend` for trait-based dispatch.
+- `PipelineExecutor::with_backend()` constructor for creating a pipeline
+  executor with an explicit `BuildBackend`. Push, manifest, and per-image
+  build operations delegate to the backend when set.
+
+### Refactored
+- Refactored package installer in `macos_image_resolver` to use a `ResolvedPackage`
+  enum (`HomebrewBottle`, `DirectRelease`, `Tap`, `UvPython`) instead of
+  shoehorning everything into `BrewFormulaInfo`. Renamed `fetch_formula_info()`
+  to `resolve_package()`, `install_single_bottle()` to `install_package()`, and
+  `fetch_and_extract_bottle()` to `install_with_deps()`. Added
+  `install_direct_release()` for downloading and extracting forge release assets,
+  `install_uv_python()` for Python provisioning via uv, and `DiscoveryResponse`
+  for structured RepoSourceSyncer discovery. Dependency BFS walk now only recurses
+  for `HomebrewBottle` variants. Added `"golang"` -> `("go", false)` to
+  `map_single_package_hardcoded()`.
+- Extracted the buildah build orchestration loop (stage walking, container
+  creation, instruction execution, COPY --from resolution, cache tracking,
+  commit, cleanup) from `ImageBuilder::build()` into
+  `BuildahBackend::build_image()`. `ImageBuilder::build()` is now a thin
+  coordinator: parse Dockerfile/ZImagefile/template, handle WASM early return,
+  delegate to the backend. `LayerCacheTracker` moved to `backend/buildah.rs`.
+  Removed inline `build_with_sandbox()`, `resolve_stages()`,
+  `resolve_base_image()`, `create_container()`, `commit_container()`,
+  `tag_image()`, `push_image()`, and `generate_build_id()` from `builder.rs`.
+- Pipeline executor (`pipeline/executor.rs`) now always uses
+  `ImageBuilder::with_backend()` instead of falling back to
+  `ImageBuilder::with_executor()`, wrapping a bare executor in a
+  `BuildahBackend` when no explicit backend is provided.
 
 ### Changed
-- Extracted buildah build orchestration logic from `ImageBuilder::build()` into
-  `BuildahBackend::build_image()`. The `build()` method now simply parses the
-  Dockerfile/ZImagefile and delegates to the backend. This removes the inline
-  buildah loop, the macOS sandbox fallback branch, and all buildah helper methods
-  (`resolve_stages`, `resolve_base_image`, `create_container`, `commit_container`,
-  `tag_image`, `push_image`) from `builder.rs`.
-- `LayerCacheTracker` moved from `builder.rs` to `backend/buildah.rs`.
-- Pipeline executor's `build_single_image` and `build_multiplatform_image` now
-  use `effective_backend` pattern (wrapping executor in `BuildahBackend`) instead
-  of branching on `Option<Arc<dyn BuildBackend>>`.
-
-### Added
+- CLI `pipeline` command now uses `detect_backend()` + `PipelineExecutor::with_backend()`
+  instead of directly creating a `BuildahExecutor`, enabling automatic sandbox
+  fallback on macOS.
 - Register container lifecycle routes (`/api/v1/containers`) in the daemon API
   server, enabling direct container creation, inspection, logs, exec, and stats
   endpoints independent of the deployment/service abstraction.
@@ -96,6 +225,81 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 - macOS sandbox runtime default data directory changed from `~/.local/share/zlayer`
   to `~/.zlayer` to match the builder and other components.
+- macOS images CI workflow (`macos-images.yml`): replaced `uses: ./` action
+  reference (which tried to download from GitHub and hung) with building zlayer
+  from source and running the pipeline directly.
+
+### Changed
+- `map_linux_packages()` in `macos_image_resolver` is now async and fetches
+  package mappings from RepoSources (`zachhandley.github.io/RepoSources/maps/`)
+  with a 7-day local cache at `{data_dir}/cache/package-maps/{distro}.json`.
+  Resolution order: cached/fetched RepoSources map, name transformation
+  heuristics (strip `-dev`, `lib` prefix, version digits), then hardcoded
+  fallback. The original hardcoded mapping is preserved as `map_single_package_hardcoded()`.
+- Homebrew bottle install success log now includes the formula version
+  (`versions.stable`) from the Homebrew API.
+
+- Refactored `fetch_and_extract_bottle()` in `macos_image_resolver` to resolve
+  the full Homebrew dependency tree (BFS) before installing a formula. Split into
+  three functions: `fetch_formula_info()`, `install_single_bottle()`, and the
+  public `fetch_and_extract_bottle()` entry point. Added `dependencies` and
+  `versions` fields to `BrewFormulaInfo`. Formulas already present in the rootfs
+  Cellar are skipped, and individual dependency failures are logged as warnings
+  without aborting the overall installation.
+- Refactored `sandbox_builder::setup_base_image()` to use the 3-tier macOS image
+  resolution from `macos_image_resolver`. Old inline toolchain provisioning block
+  replaced with Tier 1 (local cache), Tier 2 (GHCR pull), Tier 3 (local build)
+  pipeline. Non-rewritable images retain existing cache/pull logic.
+- `sandbox_builder::load_base_image_config()` now checks for rewritten macOS image
+  `config.json` before falling through to the existing `image_config.json` / registry
+  pull path.
+- Toolchain env injection in `build()` now guards against duplicating env vars that
+  are already present in the config (e.g., when loaded from a cached image config).
+- `sandbox_builder::execute_run()` now intercepts Linux package manager install
+  commands (`apt-get install`, `apk add`, `yum install`, `dnf install`) and fetches
+  Homebrew bottles into the sandbox rootfs before the translated (no-op) command runs.
+
+### Added
+- `extract_package_install_packages()` helper: parses package names from apt-get,
+  apk, yum, and dnf install commands, handling flags, sudo, and `&&`-compound
+  commands.
+- `find_after_subcommand()` helper: locates the argument tail after a subcommand
+  keyword, skipping leading flags.
+- 3-tier macOS image resolution system (`macos_image_resolver`) — rewrites Docker Hub
+  image references to macOS-native equivalents. Tier 1: pulls pre-built sandbox images
+  from `ghcr.io/blackleafdigital/zlayer`. Tier 2: builds toolchain images locally via
+  `macos_toolchain`. Tier 3: creates minimal base rootfs for distro images. Includes
+  GHCR auth resolution (GHCR_TOKEN, GITHUB_TOKEN, Docker config), Homebrew bottle
+  fetching for installing packages into sandbox rootfs, and Linux-to-brew package
+  name mapping.
+- GraalVM CE toolchain resolver for macOS sandbox builds — resolves exact versions
+  (`21.0.5`), partial/major versions (`21` -> latest 21.x.y), and `latest` by scanning
+  GitHub releases from `graalvm/graalvm-ce-builds`. Downloads macOS tarballs and
+  extracts with `--strip-components=3` (same JDK structure as Adoptium). Sets both
+  `JAVA_HOME` and `GRAALVM_HOME` environment variables. Detects base images containing
+  "graalvm" in the name (e.g., `graalvm-ce`, `graalvm/graalvm-ce`).
+- Swift toolchain resolver for macOS sandbox builds — provisions Swift from the host
+  system's Xcode Command Line Tools rather than downloading. Locates the toolchain via
+  `xcrun --find swiftc`, copies it into the cache keyed by the detected version, and
+  symlinks into the build rootfs at `/usr/local/swift`. Detects `swift` base images.
+- Java (Adoptium/Temurin) toolchain resolver for macOS sandbox builds — resolves `latest`
+  (fetches most recent LTS from Adoptium API), exact feature versions (`21`, `17`, `8`),
+  and dotted versions (`21.0.5` strips to major `21`). Uses the Adoptium binary API which
+  redirects to `.tar.gz` downloads. Extracts with `--strip-components=3` to handle the
+  macOS `jdk-X/Contents/Home/` tarball structure. Detects `eclipse-temurin`, `amazoncorretto`,
+  and `openjdk` base images.
+- Bun toolchain resolver for macOS sandbox builds — resolves exact versions (`1.2.3`),
+  partial versions (`1` -> latest 1.x.y), and `latest` by scanning GitHub releases from
+  `oven-sh/bun`. Downloads `bun-darwin-{arch}.zip` assets and extracts the binary into
+  the `bin/` directory structure for proper PATH integration.
+- Python toolchain resolver for macOS sandbox builds — uses standalone builds from
+  `astral-sh/python-build-standalone` on GitHub. Resolves exact versions (`3.12.1`),
+  partial versions (`3.12` -> latest 3.12.x), and `latest` by scanning GitHub release
+  assets. Downloads `install_only_stripped` tarballs for the host architecture.
+- Rust toolchain resolver for macOS sandbox builds — resolves exact versions (e.g. `1.82.0`),
+  partial versions (`1.82` -> `1.82.0`), and `latest` (fetches stable channel TOML). Downloads
+  standalone installer tarballs from `static.rust-lang.org`, extracts, and runs `install.sh`
+  with `--prefix` to provision rustc + cargo into the build cache.
 
 ### Changed
 - Sandbox builder: macOS toolchain provisioning now symlinks cached toolchains into the
@@ -104,7 +308,7 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 - Sandbox builder: macOS toolchain provisioning (`macos_toolchain.rs`) — auto-detects
-  language from base image (e.g. `golang:1.23-alpine` -> Go 1.23), downloads self-contained
+  language from base image (e.g. `golang:1.23-alpine` → Go 1.23), downloads self-contained
   macOS binaries from official APIs (go.dev, nodejs.org, etc.), and provisions them directly
   into the build rootfs. No brew, no global state, parallel-build safe. Supports Go + Node
   initially, with version resolution for any published version.
@@ -115,6 +319,9 @@ All notable changes to this project will be documented in this file.
 - Sandbox builder: broadened Seatbelt mach-lookup to allow all services during build-time,
   fixing brew/ruby/git failures caused by restricted XPC access
 - Sandbox builder: RunFailed errors now include stderr output for better diagnostics
+- action.yml: added curl timeouts (`--connect-timeout 30 --max-time 120`) to prevent
+  indefinite hangs when downloading ZLayer binaries from GitHub releases
+- install.sh: added curl timeouts to binary download
 - Sandbox builder: per-build HOME directory (`{image_dir}/home/`) instead of hardcoded
   `/root` — fixes `Read-only file system @ dir_s_mkdir - /root` errors from brew/git
 - Sandbox builder: base image config (ENV, WORKDIR, USER, ENTRYPOINT, CMD, Shell,
@@ -131,13 +338,6 @@ All notable changes to this project will be documented in this file.
   write to absolute host paths since there is no chroot on macOS)
 
 ### Added
-- Sandbox builder: `LocalRegistry` integration for base image resolution — pipeline-built
-  images stored in the local OCI registry can now be resolved as base images by
-  `SandboxImageBuilder`, with fallback to filesystem scan and remote pull
-- Pipeline cache config: `PipelineCacheConfig` type for configuring cache backends
-  (memory, persistent, s3) in ZPipeline.yaml via a top-level `cache:` field
-- Pipeline executor: `LocalRegistry` wiring so pipeline-built images from earlier waves
-  can be resolved as base images by downstream builds (behind `local-registry` feature)
 - macOS-native base images defined as ZImagefiles (`images/macos/`):
   `zlayer/base`, `zlayer/golang`, `zlayer/rust`, `zlayer/node`, `zlayer/python` (with uv),
   `zlayer/deno`, `zlayer/bun` — containing macOS Mach-O binaries for sandbox builds
@@ -189,6 +389,27 @@ All notable changes to this project will be documented in this file.
   ARG, LABEL, USER, VOLUME, and STOPSIGNAL instructions (single-stage builds).
 - `ImageBuilder` automatically falls back to the sandbox builder on macOS when buildah
   is not installed, instead of failing with a "buildah not found" error.
+- `examples/zlayer-web.zlayer.yml` deployment spec for the Leptos web frontend
+
+### Fixed
+- Daemon now regenerates the admin password if the `admin_password` file was
+  deleted while the credential store still has the (Argon2id-hashed) entry,
+  preventing permanently unrecoverable admin credentials
+- `zlayer daemon install` and `zlayer daemon start` now write a `spawner.pid`
+  marker file before launching the daemon via launchctl/systemctl, so the new
+  daemon's `cleanup_stale_daemon()` skips killing the spawning CLI process
+  (previously caused SIGTERM / exit 143)
+- `cleanup_stale_daemon()` now reads `{data_dir}/spawner.pid` as a fallback when
+  `ZLAYER_SPAWNER_PID` env var is not set (e.g., when launched via launchd/systemd),
+  preventing the daemon from killing the `zlayer daemon install/start` CLI process
+- GitHub Actions E2E workflow aligned with Forgejo: added `CARGO_BUILD_JOBS: "4"`,
+  `--test-threads=1` for Youki tests, and post-sudo permission fix to resolve
+  SQLite "database is locked" contention and test timeouts
+- `daemon install` placed `--data-dir` after the `serve` subcommand, but it's a
+  top-level CLI arg — clap rejected it, causing the daemon to crash-loop on start
+  (both macOS launchd and Linux systemd)
+
+### Previously added
 - Containers automatically receive `ZLAYER_API_URL`, `ZLAYER_TOKEN`, and
   `ZLAYER_SOCKET` environment variables for authenticated API access
 - Unix socket bind-mounted into containers for local auth bypass (Linux/Docker)

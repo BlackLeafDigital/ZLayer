@@ -164,7 +164,7 @@ pub(crate) async fn load_or_init_node_config(data_dir: &Path) -> Result<NodeConf
             advertise_addr,
             3669,
             9000,
-            51820,
+            zlayer_overlay::DEFAULT_WG_PORT,
             data_dir.to_path_buf(),
             "10.200.0.0/16".to_string(),
         )
@@ -530,7 +530,7 @@ pub(crate) async fn handle_node_join(
         .context("Failed to create HTTP client")?;
 
     // Parse overlay port from advertise address or use default
-    let overlay_port: u16 = 51820;
+    let overlay_port: u16 = zlayer_overlay::DEFAULT_WG_PORT;
     let raft_port: u16 = 9000;
 
     let join_request = NodeJoinRequest {
@@ -681,6 +681,7 @@ pub(crate) async fn handle_node_join(
     // This gives the joining node immediate overlay connectivity.
     // The TUN device will be cleaned up when this process exits; the daemon
     // will re-create it from the persisted bootstrap state on next start.
+    #[allow(clippy::needless_update)]
     let overlay_config = zlayer_overlay::OverlayConfig {
         local_endpoint: std::net::SocketAddr::new(
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -690,8 +691,7 @@ pub(crate) async fn handle_node_join(
         public_key: node_config.wireguard_public_key.clone(),
         overlay_cidr: overlay_ip_cidr,
         peer_discovery_interval: Duration::from_secs(30),
-        #[cfg(feature = "nat")]
-        nat: zlayer_overlay::nat::NatConfig::default(),
+        ..zlayer_overlay::OverlayConfig::default()
     };
 
     // Convert PeerConfig to PeerInfo for the transport layer
@@ -1358,7 +1358,7 @@ mod tests {
                 assert_eq!(advertise_addr, "10.0.0.1");
                 assert_eq!(api_port, 3669);
                 assert_eq!(raft_port, 9000);
-                assert_eq!(overlay_port, 51820);
+                assert_eq!(overlay_port, zlayer_overlay::DEFAULT_WG_PORT);
                 assert!(data_dir.is_none()); // resolved at runtime
                 assert_eq!(overlay_cidr, "10.200.0.0/16");
             }

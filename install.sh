@@ -96,10 +96,36 @@ fi
 if [ -f "${INSTALL_DIR}/${BINARY}" ]; then
     echo "Stopping zlayer..."
     sudo "${INSTALL_DIR}/${BINARY}" daemon uninstall >/dev/null 2>&1 || true
-    # Clean up stale state
+
+    # Clean up stale WireGuard interfaces (Linux only)
+    if [ "$OS" = "linux" ]; then
+        for iface in $(ip -br link 2>/dev/null | awk '/^zl-/{print $1}'); do
+            echo "  Removing stale interface: $iface"
+            sudo ip link delete "$iface" 2>/dev/null || true
+        done
+    fi
+
+    # Remove stale WireGuard UAPI sockets
+    sudo rm -f /var/run/wireguard/zl-*.sock 2>/dev/null || true
+
+    # Kill stale zlayer/boringtun processes holding the WireGuard port
+    if [ "$OS" = "linux" ] && command -v ss >/dev/null 2>&1; then
+        for pid in $(ss -ulnp 'sport = :51420' 2>/dev/null | grep -oP 'pid=\K[0-9]+'); do
+            pname=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+            case "$pname" in
+                *zlayer*|*boringtun*)
+                    echo "  Killing stale process: $pname (PID $pid)"
+                    sudo kill "$pid" 2>/dev/null || true
+                    ;;
+            esac
+        done
+    fi
+
+    # Clean up stale state files
     rm -f /var/lib/zlayer/daemon.json 2>/dev/null || true
     rm -f /var/run/zlayer.sock 2>/dev/null || true
-    sleep 2
+    rm -f /var/lib/zlayer/run/zlayer.pid 2>/dev/null || true
+    sleep 3
 fi
 
 sudo cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
