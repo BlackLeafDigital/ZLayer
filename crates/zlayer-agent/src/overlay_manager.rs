@@ -92,7 +92,7 @@ impl OverlayManager {
             service_transports: RwLock::new(HashMap::new()),
             ip_allocator: IpAllocator::new("10.200.0.0/16".parse().unwrap()),
             node_ip: None,
-            overlay_port: zlayer_overlay::DEFAULT_WG_PORT,
+            overlay_port: zlayer_core::DEFAULT_WG_PORT,
         })
     }
 

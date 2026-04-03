@@ -399,20 +399,20 @@ fn parse_port_from_bind(bind: &str) -> Option<u16> {
 }
 
 /// Read the overlay port from `{data_dir}/node_config.json`, falling back to
-/// [`zlayer_overlay::DEFAULT_WG_PORT`] on any error.
+/// [`zlayer_core::DEFAULT_WG_PORT`] on any error.
 fn load_overlay_port(data_dir: &std::path::Path) -> u16 {
     let config_path = data_dir.join("node_config.json");
     let Ok(contents) = std::fs::read_to_string(&config_path) else {
-        return zlayer_overlay::DEFAULT_WG_PORT;
+        return zlayer_core::DEFAULT_WG_PORT;
     };
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
-        return zlayer_overlay::DEFAULT_WG_PORT;
+        return zlayer_core::DEFAULT_WG_PORT;
     };
     value
         .get("overlay_port")
         .and_then(serde_json::Value::as_u64)
         .and_then(|p| u16::try_from(p).ok())
-        .unwrap_or(zlayer_overlay::DEFAULT_WG_PORT)
+        .unwrap_or(zlayer_core::DEFAULT_WG_PORT)
 }
 
 /// Attempt to find the process holding a UDP port.

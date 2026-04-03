@@ -25,8 +25,8 @@ pub const DEFAULT_INTERFACE_NAME: &str = "utun";
 #[cfg(not(target_os = "macos"))]
 pub const DEFAULT_INTERFACE_NAME: &str = "zl-overlay0";
 
-/// Default overlay listen port
-pub const DEFAULT_WG_PORT: u16 = 51420;
+/// Default overlay listen port (re-exported from `zlayer-core`).
+pub use zlayer_core::DEFAULT_WG_PORT;
 
 /// Default overlay network CIDR (IPv4)
 pub const DEFAULT_OVERLAY_CIDR: &str = "10.200.0.0/16";
