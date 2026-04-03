@@ -141,7 +141,7 @@ impl Default for OverlayAgentConfig {
 }
 
 fn default_wg_port() -> u16 {
-    51820
+    51420
 }
 
 /// Global overlay network configuration
