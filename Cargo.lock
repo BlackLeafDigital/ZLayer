@@ -10181,6 +10181,7 @@ dependencies = [
  "wat",
  "zlayer-core",
  "zlayer-init-actions",
+ "zlayer-observability",
  "zlayer-overlay",
  "zlayer-paths",
  "zlayer-proxy",

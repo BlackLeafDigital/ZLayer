@@ -17,6 +17,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
+use zlayer_observability::logs::LogEntry;
 use zlayer_overlay::DnsServer;
 use zlayer_proxy::{StreamRegistry, StreamService};
 use zlayer_spec::{DependsSpec, HealthCheck, Protocol, ResourceType, ServiceSpec};
@@ -1612,20 +1613,21 @@ impl ServiceManager {
     ///
     /// # Arguments
     /// * `service_name` - Name of the service to fetch logs for
-    /// * `tail` - Number of lines to return (0 = all)
+    /// * `tail` - Number of lines to return per container (0 = all)
     /// * `instance` - Optional specific instance (container ID suffix like "1", "2")
     ///
     /// # Errors
     /// Returns an error if the service or instance is not found.
     ///
     /// # Returns
-    /// Combined log output from all (or specific) container replicas as a string.
+    /// Structured log entries from all (or specific) container replicas. Each
+    /// entry has its `service` and `deployment` fields populated when available.
     pub async fn get_service_logs(
         &self,
         service_name: &str,
         tail: usize,
         instance: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<Vec<LogEntry>> {
         let container_ids = self.get_service_containers(service_name).await;
 
         if container_ids.is_empty() {
@@ -1660,43 +1662,34 @@ impl ServiceManager {
             });
         }
 
-        let mut combined = String::new();
+        let mut all_entries: Vec<LogEntry> = Vec::new();
 
         for id in &target_ids {
-            let header = if target_ids.len() > 1 {
-                format!("==> {id} <==\n")
-            } else {
-                String::new()
-            };
-
             match self.runtime.container_logs(id, tail).await {
-                Ok(logs) => {
-                    if !logs.is_empty() {
-                        combined.push_str(&header);
-                        combined.push_str(&logs);
-                        if !combined.ends_with('\n') {
-                            combined.push('\n');
+                Ok(mut entries) => {
+                    // Populate service and deployment metadata on each entry
+                    for entry in &mut entries {
+                        if entry.service.is_none() {
+                            entry.service = Some(service_name.to_string());
+                        }
+                        if entry.deployment.is_none() {
+                            entry.deployment.clone_from(&self.deployment_name);
                         }
                     }
+                    all_entries.extend(entries);
                 }
                 Err(e) => {
-                    use std::fmt::Write;
-                    combined.push_str(&header);
-                    let _ = writeln!(combined, "[error reading logs: {e}]");
+                    tracing::warn!(
+                        service = service_name,
+                        container = %id,
+                        error = %e,
+                        "Failed to read container logs"
+                    );
                 }
             }
         }
 
-        // If tail is requested and we have multiple containers, apply tail to combined output
-        if tail > 0 && target_ids.len() > 1 {
-            let lines: Vec<&str> = combined.lines().collect();
-            if lines.len() > tail {
-                combined = lines[lines.len() - tail..].join("\n");
-                combined.push('\n');
-            }
-        }
-
-        Ok(combined)
+        Ok(all_entries)
     }
 
     /// Get all container IDs for a specific service

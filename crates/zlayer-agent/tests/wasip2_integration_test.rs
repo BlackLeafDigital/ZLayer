@@ -155,6 +155,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         node_selector: None,
         service_type: zlayer_spec::ServiceType::Standard,
         wasm: None,
+        logs: None,
         host_network: false,
     }
 }
@@ -1211,7 +1212,7 @@ mod logs_tests {
             .await
             .expect("Should get logs");
         // Logs will be empty initially
-        assert!(logs.is_empty() || logs.trim().is_empty());
+        assert!(logs.is_empty());
     }
 
     #[tokio::test]
@@ -1236,9 +1237,11 @@ mod logs_tests {
         let lines = runtime.get_logs(&id).await.expect("Should get log lines");
         assert!(
             lines.is_empty()
-                || lines
-                    .iter()
-                    .all(|l| l.starts_with("[stdout]") || l.starts_with("[stderr]"))
+                || lines.iter().all(|e| matches!(
+                    e.stream,
+                    zlayer_observability::logs::LogStream::Stdout
+                        | zlayer_observability::logs::LogStream::Stderr
+                ))
         );
     }
 

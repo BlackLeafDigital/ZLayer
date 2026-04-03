@@ -1062,7 +1062,7 @@ async fn log_rotation_loop(log_dir: &std::path::Path, data_dir: &std::path::Path
 
 /// Rotate log files that exceed the size threshold.
 ///
-/// Walks `{bundle_dir}/*/logs/*.log` and truncates any file larger than
+/// Walks `{bundle_dir}/*/logs/*.{log,jsonl}` and truncates any file larger than
 /// [`LOG_MAX_SIZE_BYTES`], keeping approximately the last 10% of content.
 async fn rotate_large_logs(bundle_dir: &std::path::Path) -> Result<()> {
     if !bundle_dir.exists() {
@@ -1082,7 +1082,10 @@ async fn rotate_large_logs(bundle_dir: &std::path::Path) -> Result<()> {
 
         while let Ok(Some(log_entry)) = log_entries.next_entry().await {
             let path = log_entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("log") {
+            if !matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("log" | "jsonl")
+            ) {
                 continue;
             }
 
@@ -1122,10 +1125,10 @@ async fn rotate_large_logs(bundle_dir: &std::path::Path) -> Result<()> {
 /// Rotate log files in the structured log directory that exceed the size
 /// threshold.
 ///
-/// Walks `{log_dir}/**/*.log` and truncates any file larger than
+/// Walks `{log_dir}/**/*.{log,jsonl}` and truncates any file larger than
 /// [`LOG_MAX_SIZE_BYTES`], keeping approximately the last 10% of content.
 /// This handles the structured paths created by the youki runtime:
-///   `{log_dir}/{deployment}/{service}/{container_id}.{stdout,stderr}.log`
+///   `{log_dir}/{deployment}/{service}/{container_id}.{stdout,stderr}.{log,jsonl}`
 async fn rotate_structured_logs(log_dir: &std::path::Path) -> Result<()> {
     if !log_dir.exists() {
         return Ok(());
@@ -1149,7 +1152,10 @@ async fn rotate_structured_logs(log_dir: &std::path::Path) -> Result<()> {
                 continue;
             }
 
-            if path.extension().and_then(|e| e.to_str()) != Some("log") {
+            if !matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("log" | "jsonl")
+            ) {
                 continue;
             }
 
@@ -1192,7 +1198,8 @@ async fn rotate_structured_logs(log_dir: &std::path::Path) -> Result<()> {
 }
 
 /// Remove log files older than [`LOG_MAX_AGE_SECS`] from the daemon log
-/// directory.  This targets `/var/log/zlayer/**/*.log`.
+/// directory.  This targets `/var/log/zlayer/**/*.{log,jsonl}` as well as
+/// the `executions/` subdirectory.
 async fn cleanup_old_logs(log_dir: &std::path::Path) -> Result<()> {
     if !log_dir.exists() {
         return Ok(());
@@ -1201,11 +1208,19 @@ async fn cleanup_old_logs(log_dir: &std::path::Path) -> Result<()> {
     let now = std::time::SystemTime::now();
     let max_age = std::time::Duration::from_secs(LOG_MAX_AGE_SECS);
 
-    cleanup_old_logs_walk(log_dir, now, max_age).await
+    cleanup_old_logs_walk(log_dir, now, max_age).await?;
+
+    // Also clean up the executions/ subdirectory (execution log artifacts)
+    let executions_dir = log_dir.join("executions");
+    if executions_dir.exists() {
+        cleanup_old_logs_walk(&executions_dir, now, max_age).await?;
+    }
+
+    Ok(())
 }
 
 /// Walk a directory tree (iterative, no async recursion crate needed)
-/// and remove `.log` files older than `max_age`.
+/// and remove `.log` / `.jsonl` files older than `max_age`.
 async fn cleanup_old_logs_walk(
     root: &std::path::Path,
     now: std::time::SystemTime,
@@ -1226,7 +1241,10 @@ async fn cleanup_old_logs_walk(
 
             if metadata.is_dir() {
                 stack.push(path);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("log") {
+            } else if matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("log" | "jsonl")
+            ) {
                 if let Ok(modified) = metadata.modified() {
                     if let Ok(age) = now.duration_since(modified) {
                         if age > max_age {

@@ -1016,6 +1016,7 @@ mod tests {
             node_selector,
             service_type: zlayer_spec::ServiceType::default(),
             wasm: None,
+            logs: None,
             host_network: false,
         }
     }

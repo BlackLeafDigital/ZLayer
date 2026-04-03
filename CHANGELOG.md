@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-04-03]
+
+### Added
+- Structured logging types: `LogEntry`, `LogStream`, `LogSource`, `LogQuery` in
+  `zlayer-observability::logs` — unified type for all log sources (containers,
+  jobs, builds, daemon) with timestamps and stream identification.
+- `FileLogWriter` / `MemoryLogWriter` for writing structured JSONL log entries
+  to disk or in-memory ring buffer.
+- `FileLogReader` / `apply_query()` in `zlayer-observability::log_reader` for
+  reading JSONL files with filtering (stream, source, time range, tail limit)
+  and legacy `stdout.log`/`stderr.log` backward compatibility.
+- `LogOutputConfig` / `LogDestination` types for configurable log destination
+  (disk/memory), max size, and retention.
+- `LogsConfig` in `zlayer-spec` with `logs: Option<LogsConfig>` on `ServiceSpec`
+  so deployment specs can configure per-service log output.
+- `max_files: Option<usize>` on `FileLoggingConfig` — old rotated log files
+  beyond this limit are cleaned up at startup (default: 7).
+- Daemon log rotation via `tracing-appender` with daily rotation, replacing
+  the unbounded `dup2`-to-file approach.
+
+### Changed
+- Default WireGuard overlay port moved from `zlayer-overlay` to `zlayer-core`
+  (`DEFAULT_WG_PORT`) for cross-platform availability (Windows thin CLI).
+- `Runtime` trait: `container_logs()` returns `Vec<LogEntry>` (was `String`),
+  `get_logs()` returns `Vec<LogEntry>` (was `Vec<String>`). All 4 runtimes
+  (youki, docker, macOS sandbox, WASM) updated.
+- `ServiceManager::get_service_logs()` returns `Vec<LogEntry>` with populated
+  service/deployment fields.
+- Daemon systemd unit uses `StandardOutput=journal` instead of appending to
+  `/var/log/zlayer/daemon.log`. The daemon manages its own files via
+  `tracing-appender`; journald captures pre-init crashes.
+- `rotate_daemon_log()` renames the current day's log before every start so
+  failure output is always fresh.
+- `wait_for_daemon_ready()` finds the newest `daemon.*` tracing-appender file
+  instead of hardcoded `daemon.log`, with journalctl fallback.
+- Log rotation loop now handles `.jsonl` files alongside `.log`, and cleans up
+  the `executions/` subdirectory.
+- Raft bootstrap checks metrics before calling `initialize()` to suppress
+  noisy openraft ERROR log on already-initialized nodes.
+- `install.sh` cleanup now removes stale `zl-*` network interfaces, WireGuard
+  UAPI sockets, and kills stale port-holding processes.
+
 ## [2026-04-02]
 
 ### Changed

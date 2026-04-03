@@ -290,6 +290,7 @@ mod tests {
                 node_selector: None,
                 service_type: zlayer_spec::ServiceType::default(),
                 wasm: None,
+                logs: None,
                 host_network: false,
             },
         );

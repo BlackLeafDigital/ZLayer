@@ -100,6 +100,7 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         node_selector: None,
         service_type: ServiceType::default(),
         wasm: None,
+        logs: None,
         host_network: false,
     }
 }
@@ -401,20 +402,27 @@ async fn test_container_logs() {
         .await
         .expect("Failed to get logs");
 
-    println!("Logs: {logs}");
+    let logs_text: String = logs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    println!("Logs: {logs_text}");
     assert!(
-        logs.contains(test_message),
+        logs.iter().any(|e| e.message.contains(test_message)),
         "Logs should contain the test message"
     );
 
-    // Also test get_logs (returns Vec<String>)
+    // Also test get_logs (returns Vec<LogEntry>)
     let log_lines = runtime
         .get_logs(&id)
         .await
         .expect("Failed to get log lines");
     println!("Log lines: {log_lines:?}");
     assert!(
-        log_lines.iter().any(|line| line.contains(test_message)),
+        log_lines
+            .iter()
+            .any(|entry| entry.message.contains(test_message)),
         "Log lines should contain the test message"
     );
 }
@@ -953,13 +961,20 @@ async fn test_container_with_env() {
         .await
         .expect("Failed to get logs");
 
-    println!("Container output:\n{logs}");
+    let logs_text: String = logs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    println!("Container output:\n{logs_text}");
     assert!(
-        logs.contains("TEST_VAR=test_value"),
+        logs.iter()
+            .any(|e| e.message.contains("TEST_VAR=test_value")),
         "Logs should contain TEST_VAR"
     );
     assert!(
-        logs.contains("ANOTHER_VAR=another_value"),
+        logs.iter()
+            .any(|e| e.message.contains("ANOTHER_VAR=another_value")),
         "Logs should contain ANOTHER_VAR"
     );
 }

@@ -602,7 +602,11 @@ pub async fn get_service_logs(
             .get_service_logs(&service, tail, instance.as_deref())
             .await
         {
-            Ok(logs) => logs,
+            Ok(entries) => entries
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
             Err(zlayer_agent::AgentError::NotFound { reason, .. }) => {
                 format!("# Logs for {deployment}/{service}\n# No running containers ({reason})\n")
             }
@@ -650,13 +654,13 @@ fn log_follow_stream(
             let fetch_tail = if state.initial { state.tail } else { 10_000 };
 
             let mgr = state.manager.read().await;
-            let logs = mgr
+            let entries = mgr
                 .get_service_logs(&state.service, fetch_tail, state.instance.as_deref())
                 .await
                 .unwrap_or_default();
             drop(mgr);
 
-            let all_lines: Vec<&str> = logs.lines().collect();
+            let all_lines: Vec<String> = entries.iter().map(ToString::to_string).collect();
             let total = all_lines.len();
 
             let new_lines = if state.initial {

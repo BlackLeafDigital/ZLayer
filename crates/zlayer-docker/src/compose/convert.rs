@@ -97,6 +97,7 @@ fn convert_service(svc_name: &str, svc: &ComposeService) -> crate::Result<Servic
         node_selector: None,
         service_type: ServiceType::default(),
         wasm: None,
+        logs: None,
         host_network: false,
     })
 }

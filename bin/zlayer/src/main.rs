@@ -35,9 +35,6 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-use std::os::unix::io::AsRawFd;
-
 use cli::{Cli, Commands};
 use zlayer_observability::{
     init_observability, LogFormat, LogLevel, LoggingConfig, ObservabilityConfig,
@@ -118,7 +115,7 @@ fn main() -> ExitCode {
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
-            use std::fs::{self, OpenOptions};
+            use std::fs;
 
             let run_dir = cli.effective_run_dir();
             let log_dir = cli.effective_log_dir();
@@ -137,39 +134,11 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
 
-            // Open log file BEFORE forking so errors are visible on the caller's terminal
-            let log_path = log_dir.join("daemon.log");
-            let log_file = match OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log_path)
-                .with_context(|| format!("Failed to open {}", log_path.display()))
-            {
-                Ok(f) => f,
-                Err(e) => {
-                    eprintln!("Error: {e:#}");
-                    return ExitCode::FAILURE;
-                }
-            };
-
-            let log_fd = log_file.as_raw_fd();
-
             // Fork + setsid + chdir to /.
             if let Err(e) = nix::unistd::daemon(false, true).context("Failed to daemonize") {
                 eprintln!("Error: {e:#}");
                 return ExitCode::FAILURE;
             }
-
-            // We are now the daemon child process.
-            // Redirect stdout/stderr to the log file, close stdin.
-            // SAFETY: No threads exist yet. We own these fds and the log_fd is valid.
-            unsafe {
-                libc::dup2(log_fd, libc::STDOUT_FILENO);
-                libc::dup2(log_fd, libc::STDERR_FILENO);
-                libc::close(libc::STDIN_FILENO);
-            }
-
-            drop(log_file);
 
             // Write PID file
             let pid_path = run_dir.join("zlayer.pid");
@@ -204,11 +173,32 @@ fn main() -> ExitCode {
         LogFormat::Json
     };
 
+    // When running as a daemon/serve, log to files via tracing-appender
+    let file_logging = if matches!(&cli.command, Some(Commands::Serve { .. })) {
+        let log_dir = cli.effective_log_dir();
+        // Ensure log directory exists
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            eprintln!(
+                "Warning: failed to create log dir {}: {e}",
+                log_dir.display()
+            );
+        }
+        Some(zlayer_observability::config::FileLoggingConfig {
+            directory: log_dir,
+            prefix: "daemon".to_string(),
+            rotation: zlayer_observability::config::RotationStrategy::Daily,
+            max_files: Some(7),
+        })
+    } else {
+        None
+    };
+
     let obs_config = ObservabilityConfig {
         logging: LoggingConfig {
             level: log_level,
             format: log_format,
             filter_directives,
+            file: file_logging,
             ..Default::default()
         },
         ..Default::default()
