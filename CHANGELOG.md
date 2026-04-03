@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2026-04-02]
+
+### Changed
+- Default WireGuard overlay port changed from 51820 to 51420 to avoid
+  conflicts with system WireGuard VPNs.
+- Replaced all hardcoded `51820` port literals with `DEFAULT_WG_PORT` constant
+  and `node_config.overlay_port` configuration throughout the codebase.
+- Daemon startup WireGuard port cleanup: replaced passive polling with active
+  process identification and termination. Reads overlay port from
+  `node_config.json` instead of hardcoding, identifies the port holder via
+  `ss`/`lsof`, and sends SIGTERM/SIGKILL to stale zlayer/boringtun processes.
+- `OverlayManager` now accepts a configurable overlay port via
+  `with_overlay_port()` builder method instead of hardcoding.
+- Raft bootstrap on restart now checks metrics before calling `initialize()`,
+  suppressing the noisy openraft ERROR log on already-initialized nodes.
+- `install.sh`: expanded cleanup on upgrade — removes stale `zl-*` network
+  interfaces, WireGuard UAPI sockets, and kills stale port-holding processes.
+
 ## [2026-04-01]
 
 ### Added

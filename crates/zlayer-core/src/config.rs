@@ -140,8 +140,11 @@ impl Default for OverlayAgentConfig {
     }
 }
 
+/// Default overlay listen port (`WireGuard` protocol).
+pub const DEFAULT_WG_PORT: u16 = 51420;
+
 fn default_wg_port() -> u16 {
-    51820
+    DEFAULT_WG_PORT
 }
 
 /// Global overlay network configuration

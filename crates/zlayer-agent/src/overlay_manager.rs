@@ -70,6 +70,8 @@ pub struct OverlayManager {
     /// This node's IP address on the global overlay network.
     /// Set after `setup_global_overlay()` succeeds.
     node_ip: Option<IpAddr>,
+    /// `WireGuard` listen port for the overlay network.
+    overlay_port: u16,
 }
 
 impl OverlayManager {
@@ -90,7 +92,15 @@ impl OverlayManager {
             service_transports: RwLock::new(HashMap::new()),
             ip_allocator: IpAllocator::new("10.200.0.0/16".parse().unwrap()),
             node_ip: None,
+            overlay_port: zlayer_core::DEFAULT_WG_PORT,
         })
+    }
+
+    /// Set the `WireGuard` listen port for the overlay network.
+    #[must_use]
+    pub fn with_overlay_port(mut self, port: u16) -> Self {
+        self.overlay_port = port;
+        self
     }
 
     /// Setup the global overlay network for the deployment
@@ -105,7 +115,7 @@ impl OverlayManager {
             .map_err(|e| AgentError::Network(format!("Failed to generate keys: {e}")))?;
 
         let node_ip = self.ip_allocator.allocate()?;
-        let config = self.build_config(private_key, public_key, node_ip, 16, 51820);
+        let config = self.build_config(private_key, public_key, node_ip, 16, self.overlay_port);
         let mut transport = OverlayTransport::new(config, interface_name.clone());
 
         transport

@@ -164,7 +164,7 @@ pub(crate) async fn load_or_init_node_config(data_dir: &Path) -> Result<NodeConf
             advertise_addr,
             3669,
             9000,
-            51820,
+            zlayer_core::DEFAULT_WG_PORT,
             data_dir.to_path_buf(),
             "10.200.0.0/16".to_string(),
         )
@@ -530,7 +530,7 @@ pub(crate) async fn handle_node_join(
         .context("Failed to create HTTP client")?;
 
     // Parse overlay port from advertise address or use default
-    let overlay_port: u16 = 51820;
+    let overlay_port: u16 = zlayer_core::DEFAULT_WG_PORT;
     let raft_port: u16 = 9000;
 
     let join_request = NodeJoinRequest {
@@ -1358,7 +1358,7 @@ mod tests {
                 assert_eq!(advertise_addr, "10.0.0.1");
                 assert_eq!(api_port, 3669);
                 assert_eq!(raft_port, 9000);
-                assert_eq!(overlay_port, 51820);
+                assert_eq!(overlay_port, zlayer_core::DEFAULT_WG_PORT);
                 assert!(data_dir.is_none()); // resolved at runtime
                 assert_eq!(overlay_cidr, "10.200.0.0/16");
             }

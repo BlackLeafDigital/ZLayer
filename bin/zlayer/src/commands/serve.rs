@@ -280,34 +280,87 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     // 4b. Wait for WireGuard UDP port to be free (DEFAULT_WG_PORT in bootstrap.rs)
     // -----------------------------------------------------------------------
     {
-        let wg_port: u16 = 51820;
+        let wg_port = load_overlay_port(&config.data_dir);
         let wg_addr: std::net::SocketAddr = ([0, 0, 0, 0], wg_port).into();
-        let mut wg_free = false;
-        for attempt in 1..=10 {
-            if std::net::UdpSocket::bind(wg_addr).is_ok() {
-                if attempt > 1 {
-                    info!(
+
+        if std::net::UdpSocket::bind(wg_addr).is_err() {
+            // Port is occupied — try to identify and clean up the holder.
+            match find_udp_port_holder(wg_port).await {
+                Some((pid, ref name))
+                    if (name.contains("zlayer") || name.contains("boringtun")) && pid != my_pid =>
+                {
+                    warn!(
                         port = wg_port,
-                        attempts = attempt,
-                        "WireGuard UDP port is now free"
+                        pid = pid,
+                        process = %name,
+                        "Stale zlayer/boringtun process holding WireGuard port, sending SIGTERM"
+                    );
+                    // SAFETY: pid is a valid, live process that is not us.
+                    unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+
+                    // Wait up to 3s for graceful exit (30 x 100ms).
+                    let mut freed = false;
+                    for _ in 0..30 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if std::net::UdpSocket::bind(wg_addr).is_ok() {
+                            freed = true;
+                            break;
+                        }
+                    }
+
+                    if freed {
+                        info!(
+                            port = wg_port,
+                            pid = pid,
+                            "WireGuard UDP port freed after SIGTERM"
+                        );
+                    } else {
+                        warn!(
+                            port = wg_port,
+                            pid = pid,
+                            "Port still held after SIGTERM, sending SIGKILL"
+                        );
+                        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+                    }
+                }
+                Some((pid, ref name)) => {
+                    warn!(
+                        port = wg_port,
+                        pid = pid,
+                        process = %name,
+                        "WireGuard UDP port held by non-zlayer process, will not kill"
                     );
                 }
-                wg_free = true;
-                break;
+                None => {
+                    warn!(
+                        port = wg_port,
+                        "WireGuard UDP port in use but holder could not be identified"
+                    );
+                }
             }
-            if attempt == 1 {
+
+            // Safety-net passive poll: 5 attempts at 100ms (500ms total).
+            let mut wg_free = false;
+            for attempt in 1..=5 {
+                if std::net::UdpSocket::bind(wg_addr).is_ok() {
+                    if attempt > 1 {
+                        info!(
+                            port = wg_port,
+                            attempts = attempt,
+                            "WireGuard UDP port is now free"
+                        );
+                    }
+                    wg_free = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if !wg_free {
                 warn!(
                     port = wg_port,
-                    "WireGuard UDP port still in use, waiting..."
+                    "WireGuard UDP port still in use after cleanup — overlay may fail"
                 );
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        if !wg_free {
-            warn!(
-                port = wg_port,
-                "WireGuard UDP port still in use after 1s — overlay may fail"
-            );
         }
     }
 
@@ -339,6 +392,91 @@ fn process_alive(pid: i32) -> bool {
 fn parse_port_from_bind(bind: &str) -> Option<u16> {
     bind.rsplit_once(':')
         .and_then(|(_, port_str)| port_str.parse::<u16>().ok())
+}
+
+/// Read the overlay port from `{data_dir}/node_config.json`, falling back to
+/// [`zlayer_core::DEFAULT_WG_PORT`] on any error.
+fn load_overlay_port(data_dir: &std::path::Path) -> u16 {
+    let config_path = data_dir.join("node_config.json");
+    let Ok(contents) = std::fs::read_to_string(&config_path) else {
+        return zlayer_core::DEFAULT_WG_PORT;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return zlayer_core::DEFAULT_WG_PORT;
+    };
+    value
+        .get("overlay_port")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|p| u16::try_from(p).ok())
+        .unwrap_or(zlayer_core::DEFAULT_WG_PORT)
+}
+
+/// Attempt to find the process holding a UDP port.
+///
+/// Returns `Some((pid, process_name))` if a holder is found, `None` if the port
+/// appears free or the lookup fails.
+#[cfg(target_os = "linux")]
+async fn find_udp_port_holder(port: u16) -> Option<(u32, String)> {
+    // `ss -ulnp sport = :PORT` prints lines like:
+    //   UNCONN 0 0 0.0.0.0:51420 ... users:(("zlayer",pid=12345,fd=7))
+    let output = tokio::process::Command::new("ss")
+        .args(["-ulnp", &format!("sport = :{port}")])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Look for pid=(\d+) in the output.
+    let pid_str = stdout
+        .split("pid=")
+        .nth(1)?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?;
+
+    let pid: u32 = pid_str.parse().ok()?;
+
+    // Resolve the process name via `ps`.
+    let ps_out = tokio::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .await
+        .ok()?;
+
+    let name = String::from_utf8_lossy(&ps_out.stdout).trim().to_string();
+    Some((pid, name))
+}
+
+/// Attempt to find the process holding a UDP port.
+///
+/// Returns `Some((pid, process_name))` if a holder is found, `None` if the port
+/// appears free or the lookup fails.
+#[cfg(target_os = "macos")]
+async fn find_udp_port_holder(port: u16) -> Option<(u32, String)> {
+    let output = tokio::process::Command::new("lsof")
+        .args([&format!("-i UDP:{port}"), "-t"])
+        .output()
+        .await
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let pid: u32 = stdout.trim().lines().next()?.parse().ok()?;
+
+    let ps_out = tokio::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "comm="])
+        .output()
+        .await
+        .ok()?;
+
+    let name = String::from_utf8_lossy(&ps_out.stdout).trim().to_string();
+    Some((pid, name))
 }
 
 /// Start the daemon API server with full infrastructure.

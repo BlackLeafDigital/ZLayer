@@ -211,7 +211,7 @@ pub(crate) async fn load_or_init_node_config(data_dir: &std::path::Path) -> Resu
     let advertise_addr = detect_local_ip();
     let api_port: u16 = 3669;
     let raft_port: u16 = 9000;
-    let overlay_port: u16 = 51820;
+    let overlay_port: u16 = zlayer_core::DEFAULT_WG_PORT;
     let overlay_cidr = "10.200.0.0/16".to_string();
 
     let (private_key, public_key) = OverlayTransport::generate_keys()
@@ -656,11 +656,18 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
             Ok(coordinator) => {
                 // Bootstrap as single-node cluster if this is the leader (first node)
                 if node_config.is_leader {
-                    if let Err(e) = coordinator.bootstrap().await {
-                        // Already bootstrapped is fine (idempotent restart)
-                        info!("Raft bootstrap: {e} (already bootstrapped — resuming)");
+                    // Check metrics before bootstrapping to avoid openraft's
+                    // internal ERROR log ("Can not initialize") on restart.
+                    let metrics = coordinator.metrics();
+                    if metrics.current_term > 0 {
+                        info!("Raft already bootstrapped (resuming from persisted state)");
                     } else {
-                        info!("Raft single-node cluster bootstrapped");
+                        match coordinator.bootstrap().await {
+                            Ok(()) => info!("Raft single-node cluster bootstrapped"),
+                            Err(e) => {
+                                info!("Raft bootstrap: {e} (already bootstrapped — resuming)");
+                            }
+                        }
                     }
 
                     // Register the leader node in the Raft state machine so it

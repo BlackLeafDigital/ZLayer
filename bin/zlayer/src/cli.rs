@@ -940,7 +940,7 @@ pub(crate) enum NodeCommands {
         raft_port: u16,
 
         /// Overlay network port (`WireGuard` protocol)
-        #[arg(long, default_value = "51820")]
+        #[arg(long, default_value_t = zlayer_core::DEFAULT_WG_PORT)]
         overlay_port: u16,
 
         /// Data directory (defaults to platform default, see --data-dir)

@@ -561,14 +561,14 @@ async fn run(mut cli: Cli) -> Result<()> {
 
                 let socket_path = cli.effective_socket_path();
                 let data_dir = cli.effective_data_dir();
-                commands::serve::serve(
+                Box::pin(commands::serve::serve(
                     bind,
                     jwt_secret.clone(),
                     *no_swagger,
                     &socket_path,
                     cli.host_network,
                     data_dir,
-                )
+                ))
                 .await
             }
         }
