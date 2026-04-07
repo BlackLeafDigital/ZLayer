@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::instrument;
+use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_spec::ServiceSpec;
 
 /// Configuration for `YoukiRuntime`
@@ -1232,7 +1233,7 @@ impl Runtime for YoukiRuntime {
     /// Get container logs
     ///
     /// Reads from the container's stdout/stderr log files.
-    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<String> {
+    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<Vec<LogEntry>> {
         let container_id = self.container_id_str(id);
 
         // Get log paths from local state
@@ -1247,14 +1248,22 @@ impl Runtime for YoukiRuntime {
             }
         };
 
-        let mut logs = String::new();
+        let now = chrono::Utc::now();
+        let source = LogSource::Container(id.to_string());
+        let mut entries = Vec::new();
 
         // Read stdout
         if stdout_path.exists() {
             if let Ok(content) = fs::read_to_string(&stdout_path).await {
-                if !content.is_empty() {
-                    logs.push_str("[stdout]\n");
-                    logs.push_str(&content);
+                for line in content.lines() {
+                    entries.push(LogEntry {
+                        timestamp: now,
+                        stream: LogStream::Stdout,
+                        message: line.to_string(),
+                        source: source.clone(),
+                        service: None,
+                        deployment: None,
+                    });
                 }
             }
         }
@@ -1262,25 +1271,28 @@ impl Runtime for YoukiRuntime {
         // Read stderr
         if stderr_path.exists() {
             if let Ok(content) = fs::read_to_string(&stderr_path).await {
-                if !content.is_empty() {
-                    if !logs.is_empty() {
-                        logs.push('\n');
-                    }
-                    logs.push_str("[stderr]\n");
-                    logs.push_str(&content);
+                for line in content.lines() {
+                    entries.push(LogEntry {
+                        timestamp: now,
+                        stream: LogStream::Stderr,
+                        message: line.to_string(),
+                        source: source.clone(),
+                        service: None,
+                        deployment: None,
+                    });
                 }
             }
         }
 
+        // Sort by timestamp (all same for legacy files, but correct for future use)
+        entries.sort_by_key(|e| e.timestamp);
+
         // Apply tail limit
-        if tail > 0 {
-            let lines: Vec<&str> = logs.lines().collect();
-            if lines.len() > tail {
-                logs = lines[lines.len() - tail..].join("\n");
-            }
+        if tail > 0 && entries.len() > tail {
+            entries = entries.split_off(entries.len() - tail);
         }
 
-        Ok(logs)
+        Ok(entries)
     }
 
     /// Execute a command in a running container
@@ -1506,7 +1518,7 @@ impl Runtime for YoukiRuntime {
     /// Get container logs (stdout/stderr combined)
     ///
     /// Reads from the container's log files and returns as a vector of lines.
-    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>> {
+    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<LogEntry>> {
         let container_id = self.container_id_str(id);
 
         // Get log paths
@@ -1518,13 +1530,22 @@ impl Runtime for YoukiRuntime {
             }
         };
 
-        let mut logs = Vec::new();
+        let now = chrono::Utc::now();
+        let source = LogSource::Container(id.to_string());
+        let mut entries = Vec::new();
 
         // Read stdout
         if stdout_path.exists() {
             if let Ok(content) = fs::read_to_string(&stdout_path).await {
                 for line in content.lines() {
-                    logs.push(format!("[stdout] {line}"));
+                    entries.push(LogEntry {
+                        timestamp: now,
+                        stream: LogStream::Stdout,
+                        message: line.to_string(),
+                        source: source.clone(),
+                        service: None,
+                        deployment: None,
+                    });
                 }
             }
         }
@@ -1533,12 +1554,22 @@ impl Runtime for YoukiRuntime {
         if stderr_path.exists() {
             if let Ok(content) = fs::read_to_string(&stderr_path).await {
                 for line in content.lines() {
-                    logs.push(format!("[stderr] {line}"));
+                    entries.push(LogEntry {
+                        timestamp: now,
+                        stream: LogStream::Stderr,
+                        message: line.to_string(),
+                        source: source.clone(),
+                        service: None,
+                        deployment: None,
+                    });
                 }
             }
         }
 
-        Ok(logs)
+        // Sort by timestamp
+        entries.sort_by_key(|e| e.timestamp);
+
+        Ok(entries)
     }
 
     /// Get the PID of a container's main process

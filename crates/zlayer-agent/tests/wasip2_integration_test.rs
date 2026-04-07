@@ -32,8 +32,8 @@ use zlayer_agent::runtimes::{WasmConfig, WasmRuntime};
 use zlayer_agent::{ContainerId, ContainerState, Runtime};
 use zlayer_registry::{detect_wasm_version_from_binary, WasiVersion};
 use zlayer_spec::{
-    CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NetworkSpec, NodeMode,
-    PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceSpec,
+    CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NodeMode, PullPolicy,
+    ResourceType, ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec,
 };
 
 // =============================================================================
@@ -134,7 +134,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         resources: ResourcesSpec::default(),
         env: HashMap::new(),
         command: CommandSpec::default(),
-        network: NetworkSpec::default(),
+        network: ServiceNetworkSpec::default(),
         endpoints: vec![],
         scale: ScaleSpec::default(),
         depends: vec![],
@@ -155,6 +155,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         node_selector: None,
         service_type: zlayer_spec::ServiceType::Standard,
         wasm: None,
+        logs: None,
         host_network: false,
     }
 }
@@ -1211,7 +1212,7 @@ mod logs_tests {
             .await
             .expect("Should get logs");
         // Logs will be empty initially
-        assert!(logs.is_empty() || logs.trim().is_empty());
+        assert!(logs.is_empty());
     }
 
     #[tokio::test]
@@ -1236,9 +1237,11 @@ mod logs_tests {
         let lines = runtime.get_logs(&id).await.expect("Should get log lines");
         assert!(
             lines.is_empty()
-                || lines
-                    .iter()
-                    .all(|l| l.starts_with("[stdout]") || l.starts_with("[stderr]"))
+                || lines.iter().all(|e| matches!(
+                    e.stream,
+                    zlayer_observability::logs::LogStream::Stdout
+                        | zlayer_observability::logs::LogStream::Stderr
+                ))
         );
     }
 

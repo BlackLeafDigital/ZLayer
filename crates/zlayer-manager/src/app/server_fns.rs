@@ -66,23 +66,35 @@ pub struct SystemStats {
     pub uptime_seconds: u64,
 }
 
-/// Node information
+/// Node information from the Raft cluster state
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Node {
-    /// Node identifier
+    /// Raft-level node identifier
     pub id: String,
-    /// Node name
-    pub name: String,
-    /// Node status (e.g., "healthy", "unhealthy", "offline")
+    /// Advertise address (public IP)
+    pub address: String,
+    /// Node status (e.g., "ready", "draining", "dead")
     pub status: String,
-    /// Node IP address
-    pub ip_address: String,
-    /// CPU usage percentage
-    pub cpu_percent: f64,
-    /// Memory usage percentage
-    pub memory_percent: f64,
-    /// Number of running containers
-    pub running_containers: u32,
+    /// Role in the Raft cluster: "leader", "voter", or "learner"
+    pub role: String,
+    /// Join mode: "full" or "replicate"
+    pub mode: String,
+    /// Whether this node is the Raft leader
+    pub is_leader: bool,
+    /// Overlay network IP
+    pub overlay_ip: String,
+    /// Total CPU cores
+    pub cpu_total: f64,
+    /// Used CPU cores
+    pub cpu_used: f64,
+    /// Total memory in bytes
+    pub memory_total: u64,
+    /// Used memory in bytes
+    pub memory_used: u64,
+    /// When the node was registered (Unix timestamp ms)
+    pub registered_at: u64,
+    /// Last heartbeat timestamp (Unix timestamp ms)
+    pub last_heartbeat: u64,
 }
 
 /// Deployment information
@@ -104,6 +116,19 @@ pub struct Deployment {
     pub updated_at: String,
 }
 
+/// Service endpoint information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServiceEndpoint {
+    /// Endpoint name
+    pub name: String,
+    /// Protocol (http, https, tcp, websocket, etc.)
+    pub protocol: String,
+    /// Port number
+    pub port: u16,
+    /// URL (if publicly exposed)
+    pub url: Option<String>,
+}
+
 /// Service information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Service {
@@ -117,6 +142,8 @@ pub struct Service {
     pub replicas: u32,
     /// Desired replica count
     pub desired_replicas: u32,
+    /// Service endpoints (ports, protocols, URLs)
+    pub endpoints: Vec<ServiceEndpoint>,
 }
 
 /// Build status enumeration for UI
@@ -221,6 +248,9 @@ pub async fn get_system_stats() -> Result<SystemStats, ServerFnError> {
     // Get deployments to count them
     let deployments = client.list_deployments().await.unwrap_or_default();
 
+    // Get cluster nodes for node counts and aggregate resource usage
+    let cluster_nodes = client.list_cluster_nodes().await.unwrap_or_default();
+
     // SAFETY: Number of deployments will never exceed u32::MAX in practice
     #[allow(clippy::cast_possible_truncation)]
     let total_deployments = deployments.len() as u32;
@@ -228,17 +258,41 @@ pub async fn get_system_stats() -> Result<SystemStats, ServerFnError> {
     #[allow(clippy::cast_possible_truncation)]
     let active_deployments = deployments.iter().filter(|d| d.status == "running").count() as u32;
 
+    // SAFETY: Number of nodes will never exceed u32::MAX in practice
+    #[allow(clippy::cast_possible_truncation)]
+    let total_nodes = cluster_nodes.len() as u32;
+    // SAFETY: Number of healthy nodes will never exceed u32::MAX in practice
+    #[allow(clippy::cast_possible_truncation)]
+    let healthy_nodes = cluster_nodes.iter().filter(|n| n.status == "ready").count() as u32;
+
+    // Aggregate CPU and memory across cluster
+    let total_cpu: f64 = cluster_nodes.iter().map(|n| n.cpu_total).sum();
+    let used_cpu: f64 = cluster_nodes.iter().map(|n| n.cpu_used).sum();
+    let total_mem: u64 = cluster_nodes.iter().map(|n| n.memory_total).sum();
+    let used_mem: u64 = cluster_nodes.iter().map(|n| n.memory_used).sum();
+
+    let cpu_percent = if total_cpu > 0.0 {
+        (used_cpu / total_cpu) * 100.0
+    } else {
+        0.0
+    };
+    let memory_percent = if total_mem > 0 {
+        #[allow(clippy::cast_precision_loss)]
+        let pct = (used_mem as f64 / total_mem as f64) * 100.0;
+        pct
+    } else {
+        0.0
+    };
+
     Ok(SystemStats {
         version: health.version,
         runtime_name: health.runtime_name,
-        // Nodes are not yet exposed via API, so we default to 0
-        total_nodes: 0,
-        healthy_nodes: 0,
+        total_nodes,
+        healthy_nodes,
         total_deployments,
         active_deployments,
-        // CPU/memory metrics not yet exposed, default to 0
-        cpu_percent: 0.0,
-        memory_percent: 0.0,
+        cpu_percent,
+        memory_percent,
         uptime_seconds: health.uptime_secs.unwrap_or(0),
     })
 }
@@ -258,12 +312,33 @@ pub async fn get_runtime_name() -> Result<String, ServerFnError> {
 }
 
 /// Get all nodes in the cluster
-#[allow(clippy::unused_async)] // async required by Leptos #[server] macro - no node API yet
 #[server(prefix = "/api/manager")]
 pub async fn get_nodes() -> Result<Vec<Node>, ServerFnError> {
-    // Node API not yet implemented in zlayer-api
-    // Return empty list for now
-    Ok(vec![])
+    let client = get_api_client();
+
+    let cluster_nodes = client
+        .list_cluster_nodes()
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    Ok(cluster_nodes
+        .into_iter()
+        .map(|n| Node {
+            id: n.id,
+            address: n.advertise_addr,
+            status: n.status,
+            role: n.role,
+            mode: n.mode,
+            is_leader: n.is_leader,
+            overlay_ip: n.overlay_ip,
+            cpu_total: n.cpu_total,
+            cpu_used: n.cpu_used,
+            memory_total: n.memory_total,
+            memory_used: n.memory_used,
+            registered_at: n.registered_at,
+            last_heartbeat: n.last_heartbeat,
+        })
+        .collect())
 }
 
 /// Get all deployments
@@ -334,17 +409,32 @@ pub async fn get_services(deployment: String) -> Result<Vec<Service>, ServerFnEr
         .await
         .map_err(|e| api_error_to_server_error(&e))?;
 
-    // Map ServiceSummary to our Service type
-    let services = summaries
-        .into_iter()
-        .map(|summary| Service {
-            name: summary.name,
-            deployment: summary.deployment,
-            status: summary.status,
+    // Fetch details for each service to get endpoint information
+    let mut services = Vec::with_capacity(summaries.len());
+    for summary in &summaries {
+        let endpoints = match client.get_service(&deployment, &summary.name).await {
+            Ok(details) => details
+                .endpoints
+                .into_iter()
+                .map(|ep| ServiceEndpoint {
+                    name: ep.name,
+                    protocol: ep.protocol,
+                    port: ep.port,
+                    url: ep.url,
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+        services.push(Service {
+            name: summary.name.clone(),
+            deployment: summary.deployment.clone(),
+            status: summary.status.clone(),
             replicas: summary.replicas,
             desired_replicas: summary.desired_replicas,
-        })
-        .collect();
+            endpoints,
+        });
+    }
 
     Ok(services)
 }
@@ -926,6 +1016,346 @@ pub async fn get_dns_status() -> Result<DnsStatus, ServerFnError> {
 }
 
 // ============================================================================
+// Proxy Types
+// ============================================================================
+
+/// Backend summary for proxy UI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyBackendInfo {
+    /// Backend address (host:port)
+    pub address: String,
+    /// Whether the backend is healthy
+    pub healthy: bool,
+    /// Number of active connections
+    pub active_connections: u64,
+}
+
+/// Proxy route information for UI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyRouteInfo {
+    /// Host to match (e.g., "api.example.com")
+    pub host: Option<String>,
+    /// Path prefix to match (e.g., "/api")
+    pub path_prefix: String,
+    /// Whether to strip the matched prefix before forwarding
+    pub strip_prefix: bool,
+    /// Backends serving this route
+    pub backends: Vec<ProxyBackendInfo>,
+}
+
+/// Proxy backend group information for UI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyBackendGroupInfo {
+    /// Service name
+    pub service: String,
+    /// Load-balancing strategy ("round_robin" or "least_connections")
+    pub strategy: String,
+    /// Backends in this group
+    pub backends: Vec<ProxyBackendInfo>,
+}
+
+/// TLS certificate information for UI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsCertificateInfo {
+    /// Domain the certificate covers
+    pub domain: String,
+    /// Certificate issuer (e.g., "Let's Encrypt")
+    pub issuer: Option<String>,
+    /// When the certificate expires (ISO 8601)
+    pub expires_at: Option<String>,
+    /// Whether auto-renewal is enabled
+    pub auto_renew: bool,
+}
+
+/// Stream proxy information for UI
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamProxyInfo {
+    /// Protocol ("tcp" or "udp")
+    pub protocol: String,
+    /// Port the proxy listens on
+    pub listen_port: u16,
+    /// Backends receiving forwarded traffic
+    pub backends: Vec<ProxyBackendInfo>,
+}
+
+// ============================================================================
+// Proxy Server Functions
+// ============================================================================
+
+/// List all proxy routes
+#[server(GetProxyRoutes, prefix = "/api/manager")]
+pub async fn get_proxy_routes() -> Result<Vec<ProxyRouteInfo>, ServerFnError> {
+    let client = get_api_client();
+    let routes = client
+        .list_proxy_routes()
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    Ok(routes
+        .into_iter()
+        .map(|r| ProxyRouteInfo {
+            host: r.host,
+            path_prefix: r.path_prefix,
+            strip_prefix: r.strip_prefix,
+            backends: r
+                .backends
+                .into_iter()
+                .map(|b| ProxyBackendInfo {
+                    address: b.address,
+                    healthy: b.healthy,
+                    active_connections: b.active_connections,
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+/// List all proxy backend groups
+#[server(GetProxyBackends, prefix = "/api/manager")]
+pub async fn get_proxy_backends() -> Result<Vec<ProxyBackendGroupInfo>, ServerFnError> {
+    let client = get_api_client();
+    let groups = client
+        .list_proxy_backends()
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    Ok(groups
+        .into_iter()
+        .map(|g| ProxyBackendGroupInfo {
+            service: g.service,
+            strategy: g.strategy,
+            backends: g
+                .backends
+                .into_iter()
+                .map(|b| ProxyBackendInfo {
+                    address: b.address,
+                    healthy: b.healthy,
+                    active_connections: b.active_connections,
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+/// List all TLS certificates
+#[server(GetTlsCertificates, prefix = "/api/manager")]
+pub async fn get_tls_certificates() -> Result<Vec<TlsCertificateInfo>, ServerFnError> {
+    let client = get_api_client();
+    let certs = client
+        .list_tls_certificates()
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    Ok(certs
+        .into_iter()
+        .map(|c| TlsCertificateInfo {
+            domain: c.domain,
+            issuer: c.issuer,
+            expires_at: c.expires_at,
+            auto_renew: c.auto_renew,
+        })
+        .collect())
+}
+
+/// List all stream proxies
+#[server(GetStreamProxies, prefix = "/api/manager")]
+pub async fn get_stream_proxies() -> Result<Vec<StreamProxyInfo>, ServerFnError> {
+    let client = get_api_client();
+    let streams = client
+        .list_stream_proxies()
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    Ok(streams
+        .into_iter()
+        .map(|s| StreamProxyInfo {
+            protocol: s.protocol,
+            listen_port: s.listen_port,
+            backends: s
+                .backends
+                .into_iter()
+                .map(|b| ProxyBackendInfo {
+                    address: b.address,
+                    healthy: b.healthy,
+                    active_connections: b.active_connections,
+                })
+                .collect(),
+        })
+        .collect())
+}
+
+// ============================================================================
+// Network Server Functions
+// ============================================================================
+
+/// Network summary for UI display
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkInfo {
+    /// Network name
+    pub name: String,
+    /// Optional description
+    pub description: Option<String>,
+    /// Number of CIDR ranges
+    pub cidr_count: usize,
+    /// Number of members
+    pub member_count: usize,
+    /// Number of access rules
+    pub rule_count: usize,
+}
+
+/// Full network detail for the detail modal
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkDetail {
+    /// Network name
+    pub name: String,
+    /// Optional description
+    pub description: Option<String>,
+    /// CIDR ranges
+    pub cidrs: Vec<String>,
+    /// Members
+    pub members: Vec<NetworkMemberItem>,
+    /// Access rules
+    pub access_rules: Vec<NetworkAccessRuleItem>,
+}
+
+/// A member of a network (UI type)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkMemberItem {
+    /// Member identifier
+    pub name: String,
+    /// Type of member (user, group, node, cidr)
+    pub kind: String,
+}
+
+/// An access rule within a network (UI type)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkAccessRuleItem {
+    /// Target service name, or "*" for all
+    pub service: String,
+    /// Target deployment name, or "*" for all
+    pub deployment: String,
+    /// Specific ports, or empty for all
+    pub ports: String,
+    /// Allow or Deny
+    pub action: String,
+}
+
+/// List all networks
+#[server(GetNetworks, prefix = "/api/manager")]
+pub async fn get_networks() -> Result<Vec<NetworkInfo>, ServerFnError> {
+    let client = get_api_client();
+    let networks = client
+        .list_networks()
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    Ok(networks
+        .into_iter()
+        .map(|n| NetworkInfo {
+            name: n.name,
+            description: n.description,
+            cidr_count: n.cidr_count,
+            member_count: n.member_count,
+            rule_count: n.rule_count,
+        })
+        .collect())
+}
+
+/// Get a specific network by name
+#[server(GetNetwork, prefix = "/api/manager")]
+pub async fn get_network(name: String) -> Result<NetworkDetail, ServerFnError> {
+    let client = get_api_client();
+    let detail = client
+        .get_network(&name)
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    Ok(NetworkDetail {
+        name: detail.name,
+        description: detail.description,
+        cidrs: detail.cidrs,
+        members: detail
+            .members
+            .into_iter()
+            .map(|m| NetworkMemberItem {
+                name: m.name,
+                kind: m.kind,
+            })
+            .collect(),
+        access_rules: detail
+            .access_rules
+            .into_iter()
+            .map(|r| NetworkAccessRuleItem {
+                service: r.service,
+                deployment: r.deployment,
+                ports: r
+                    .ports
+                    .map(|p| {
+                        p.iter()
+                            .map(|port| port.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_else(|| "all".to_string()),
+                action: r.action,
+            })
+            .collect(),
+    })
+}
+
+/// Create a new network
+#[server(CreateNetwork, prefix = "/api/manager")]
+pub async fn create_network(
+    name: String,
+    description: String,
+    cidrs: String,
+) -> Result<NetworkInfo, ServerFnError> {
+    let client = get_api_client();
+
+    let cidr_list: Vec<String> = cidrs
+        .split(|c: char| c == ',' || c == '\n')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let request = crate::api_client::CreateNetworkRequest {
+        name: name.clone(),
+        description: if description.trim().is_empty() {
+            None
+        } else {
+            Some(description)
+        },
+        cidrs: cidr_list.clone(),
+        members: Vec::new(),
+        access_rules: Vec::new(),
+    };
+
+    let response = client
+        .create_network(&request)
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    Ok(NetworkInfo {
+        name: response.name,
+        description: response.description,
+        cidr_count: response.cidrs.len(),
+        member_count: response.members.len(),
+        rule_count: response.access_rules.len(),
+    })
+}
+
+/// Delete a network
+#[server(DeleteNetwork, prefix = "/api/manager")]
+pub async fn delete_network(name: String) -> Result<(), ServerFnError> {
+    let client = get_api_client();
+    client
+        .delete_network(&name)
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    Ok(())
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -996,36 +1426,51 @@ mod tests {
     #[test]
     fn test_node_serialize() {
         let node = Node {
-            id: "node-1".to_string(),
-            name: "worker-1".to_string(),
-            status: "healthy".to_string(),
-            ip_address: "192.168.1.10".to_string(),
-            cpu_percent: 25.5,
-            memory_percent: 40.0,
-            running_containers: 5,
+            id: "1".to_string(),
+            address: "192.168.1.10".to_string(),
+            status: "ready".to_string(),
+            role: "leader".to_string(),
+            mode: "full".to_string(),
+            is_leader: true,
+            overlay_ip: "10.200.0.1".to_string(),
+            cpu_total: 8.0,
+            cpu_used: 2.0,
+            memory_total: 16_000_000_000,
+            memory_used: 4_000_000_000,
+            registered_at: 1_706_745_600_000,
+            last_heartbeat: 1_706_745_700_000,
         };
         let json = serde_json::to_string(&node).unwrap();
-        assert!(json.contains("node-1"));
-        assert!(json.contains("worker-1"));
-        assert!(json.contains("healthy"));
+        assert!(json.contains("\"id\":\"1\""));
         assert!(json.contains("192.168.1.10"));
+        assert!(json.contains("ready"));
+        assert!(json.contains("leader"));
+        assert!(json.contains("10.200.0.1"));
     }
 
     #[test]
     fn test_node_deserialize() {
         let json = r#"{
-            "id": "node-2",
-            "name": "worker-2",
-            "status": "unhealthy",
-            "ip_address": "192.168.1.11",
-            "cpu_percent": 80.0,
-            "memory_percent": 90.0,
-            "running_containers": 10
+            "id": "2",
+            "address": "192.168.1.11",
+            "status": "dead",
+            "role": "voter",
+            "mode": "full",
+            "is_leader": false,
+            "overlay_ip": "10.200.0.2",
+            "cpu_total": 16.0,
+            "cpu_used": 8.0,
+            "memory_total": 32000000000,
+            "memory_used": 16000000000,
+            "registered_at": 1706745600000,
+            "last_heartbeat": 1706745700000
         }"#;
         let node: Node = serde_json::from_str(json).unwrap();
-        assert_eq!(node.id, "node-2");
-        assert_eq!(node.status, "unhealthy");
-        assert_eq!(node.running_containers, 10);
+        assert_eq!(node.id, "2");
+        assert_eq!(node.status, "dead");
+        assert_eq!(node.role, "voter");
+        assert!(!node.is_leader);
+        assert_eq!(node.overlay_ip, "10.200.0.2");
     }
 
     // =========================================================================
@@ -1079,10 +1524,17 @@ mod tests {
             status: "running".to_string(),
             replicas: 2,
             desired_replicas: 3,
+            endpoints: vec![ServiceEndpoint {
+                name: "http".to_string(),
+                protocol: "http".to_string(),
+                port: 8080,
+                url: Some("http://web.my-app.local:8080".to_string()),
+            }],
         };
         let json = serde_json::to_string(&service).unwrap();
         assert!(json.contains("web"));
         assert!(json.contains("my-app"));
+        assert!(json.contains("8080"));
     }
 
     #[test]
@@ -1092,12 +1544,14 @@ mod tests {
             "deployment": "backend",
             "status": "pending",
             "replicas": 0,
-            "desired_replicas": 1
+            "desired_replicas": 1,
+            "endpoints": []
         }"#;
         let service: Service = serde_json::from_str(json).unwrap();
         assert_eq!(service.name, "db");
         assert_eq!(service.deployment, "backend");
         assert_eq!(service.status, "pending");
+        assert!(service.endpoints.is_empty());
     }
 
     // =========================================================================
@@ -1608,5 +2062,245 @@ mod tests {
         assert_eq!(original.enabled, restored.enabled);
         assert_eq!(original.zone, restored.zone);
         assert_eq!(original.services, restored.services);
+    }
+
+    // =========================================================================
+    // ProxyBackendInfo Tests
+    // =========================================================================
+
+    #[test]
+    fn test_proxy_backend_info_serialize() {
+        let backend = ProxyBackendInfo {
+            address: "10.0.0.5:8080".to_string(),
+            healthy: true,
+            active_connections: 42,
+        };
+        let json = serde_json::to_string(&backend).unwrap();
+        assert!(json.contains("10.0.0.5:8080"));
+        assert!(json.contains("\"healthy\":true"));
+        assert!(json.contains("\"active_connections\":42"));
+    }
+
+    #[test]
+    fn test_proxy_backend_info_deserialize() {
+        let json = r#"{
+            "address": "10.0.0.6:9090",
+            "healthy": false,
+            "active_connections": 0
+        }"#;
+        let backend: ProxyBackendInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(backend.address, "10.0.0.6:9090");
+        assert!(!backend.healthy);
+        assert_eq!(backend.active_connections, 0);
+    }
+
+    // =========================================================================
+    // ProxyRouteInfo Tests
+    // =========================================================================
+
+    #[test]
+    fn test_proxy_route_info_serialize() {
+        let route = ProxyRouteInfo {
+            host: Some("api.example.com".to_string()),
+            path_prefix: "/v1".to_string(),
+            strip_prefix: true,
+            backends: vec![ProxyBackendInfo {
+                address: "10.0.0.5:8080".to_string(),
+                healthy: true,
+                active_connections: 10,
+            }],
+        };
+        let json = serde_json::to_string(&route).unwrap();
+        assert!(json.contains("api.example.com"));
+        assert!(json.contains("/v1"));
+        assert!(json.contains("\"strip_prefix\":true"));
+    }
+
+    #[test]
+    fn test_proxy_route_info_deserialize_no_host() {
+        let json = r#"{
+            "path_prefix": "/api",
+            "strip_prefix": false,
+            "backends": []
+        }"#;
+        let route: ProxyRouteInfo = serde_json::from_str(json).unwrap();
+        assert!(route.host.is_none());
+        assert_eq!(route.path_prefix, "/api");
+        assert!(!route.strip_prefix);
+        assert!(route.backends.is_empty());
+    }
+
+    // =========================================================================
+    // ProxyBackendGroupInfo Tests
+    // =========================================================================
+
+    #[test]
+    fn test_proxy_backend_group_info_serialize() {
+        let group = ProxyBackendGroupInfo {
+            service: "web-app".to_string(),
+            strategy: "round_robin".to_string(),
+            backends: vec![
+                ProxyBackendInfo {
+                    address: "10.0.0.1:8080".to_string(),
+                    healthy: true,
+                    active_connections: 5,
+                },
+                ProxyBackendInfo {
+                    address: "10.0.0.2:8080".to_string(),
+                    healthy: true,
+                    active_connections: 3,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&group).unwrap();
+        assert!(json.contains("web-app"));
+        assert!(json.contains("round_robin"));
+        assert!(json.contains("10.0.0.1:8080"));
+        assert!(json.contains("10.0.0.2:8080"));
+    }
+
+    #[test]
+    fn test_proxy_backend_group_info_deserialize() {
+        let json = r#"{
+            "service": "api-svc",
+            "strategy": "least_connections",
+            "backends": []
+        }"#;
+        let group: ProxyBackendGroupInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(group.service, "api-svc");
+        assert_eq!(group.strategy, "least_connections");
+        assert!(group.backends.is_empty());
+    }
+
+    // =========================================================================
+    // TlsCertificateInfo Tests
+    // =========================================================================
+
+    #[test]
+    fn test_tls_certificate_info_serialize() {
+        let cert = TlsCertificateInfo {
+            domain: "example.com".to_string(),
+            issuer: Some("Let's Encrypt".to_string()),
+            expires_at: Some("2026-01-01T00:00:00Z".to_string()),
+            auto_renew: true,
+        };
+        let json = serde_json::to_string(&cert).unwrap();
+        assert!(json.contains("example.com"));
+        assert!(json.contains("Let's Encrypt"));
+        assert!(json.contains("\"auto_renew\":true"));
+    }
+
+    #[test]
+    fn test_tls_certificate_info_deserialize_minimal() {
+        let json = r#"{
+            "domain": "test.local",
+            "auto_renew": false
+        }"#;
+        let cert: TlsCertificateInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(cert.domain, "test.local");
+        assert!(cert.issuer.is_none());
+        assert!(cert.expires_at.is_none());
+        assert!(!cert.auto_renew);
+    }
+
+    // =========================================================================
+    // StreamProxyInfo Tests
+    // =========================================================================
+
+    #[test]
+    fn test_stream_proxy_info_serialize() {
+        let stream = StreamProxyInfo {
+            protocol: "tcp".to_string(),
+            listen_port: 5432,
+            backends: vec![ProxyBackendInfo {
+                address: "10.0.0.10:5432".to_string(),
+                healthy: true,
+                active_connections: 20,
+            }],
+        };
+        let json = serde_json::to_string(&stream).unwrap();
+        assert!(json.contains("\"protocol\":\"tcp\""));
+        assert!(json.contains("\"listen_port\":5432"));
+        assert!(json.contains("10.0.0.10:5432"));
+    }
+
+    #[test]
+    fn test_stream_proxy_info_deserialize() {
+        let json = r#"{
+            "protocol": "udp",
+            "listen_port": 53,
+            "backends": []
+        }"#;
+        let stream: StreamProxyInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(stream.protocol, "udp");
+        assert_eq!(stream.listen_port, 53);
+        assert!(stream.backends.is_empty());
+    }
+
+    // =========================================================================
+    // Proxy Round-trip Tests
+    // =========================================================================
+
+    #[test]
+    fn test_proxy_route_info_roundtrip() {
+        let original = ProxyRouteInfo {
+            host: Some("app.example.com".to_string()),
+            path_prefix: "/api/v2".to_string(),
+            strip_prefix: true,
+            backends: vec![ProxyBackendInfo {
+                address: "10.0.0.1:3000".to_string(),
+                healthy: true,
+                active_connections: 7,
+            }],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: ProxyRouteInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(original.host, restored.host);
+        assert_eq!(original.path_prefix, restored.path_prefix);
+        assert_eq!(original.strip_prefix, restored.strip_prefix);
+        assert_eq!(original.backends.len(), restored.backends.len());
+    }
+
+    #[test]
+    fn test_tls_certificate_info_roundtrip() {
+        let original = TlsCertificateInfo {
+            domain: "secure.example.com".to_string(),
+            issuer: Some("ZeroSSL".to_string()),
+            expires_at: Some("2026-06-15T00:00:00Z".to_string()),
+            auto_renew: true,
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: TlsCertificateInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(original.domain, restored.domain);
+        assert_eq!(original.issuer, restored.issuer);
+        assert_eq!(original.expires_at, restored.expires_at);
+        assert_eq!(original.auto_renew, restored.auto_renew);
+    }
+
+    #[test]
+    fn test_stream_proxy_info_roundtrip() {
+        let original = StreamProxyInfo {
+            protocol: "tcp".to_string(),
+            listen_port: 3306,
+            backends: vec![
+                ProxyBackendInfo {
+                    address: "10.0.0.1:3306".to_string(),
+                    healthy: true,
+                    active_connections: 15,
+                },
+                ProxyBackendInfo {
+                    address: "10.0.0.2:3306".to_string(),
+                    healthy: false,
+                    active_connections: 0,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&original).unwrap();
+        let restored: StreamProxyInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(original.protocol, restored.protocol);
+        assert_eq!(original.listen_port, restored.listen_port);
+        assert_eq!(original.backends.len(), restored.backends.len());
+        assert_eq!(original.backends[0].address, restored.backends[0].address);
+        assert_eq!(original.backends[1].healthy, restored.backends[1].healthy);
     }
 }

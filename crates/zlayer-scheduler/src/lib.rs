@@ -434,7 +434,7 @@ impl Scheduler {
             resources: zlayer_spec::ResourcesSpec::default(),
             env: HashMap::default(),
             command: zlayer_spec::CommandSpec::default(),
-            network: zlayer_spec::NetworkSpec::default(),
+            network: zlayer_spec::ServiceNetworkSpec::default(),
             endpoints: vec![],
             scale: zlayer_spec::ScaleSpec::default(),
             depends: vec![],
@@ -455,6 +455,7 @@ impl Scheduler {
             node_selector: None,
             service_type: zlayer_spec::ServiceType::default(),
             wasm: None,
+            logs: None,
             host_network: false,
         };
 

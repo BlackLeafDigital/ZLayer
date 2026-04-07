@@ -553,6 +553,12 @@ impl CertManager {
         cache.len()
     }
 
+    /// Return the list of domain names currently held in the certificate cache.
+    pub async fn list_cached_domains(&self) -> Vec<String> {
+        let cache = self.cache.read().await;
+        cache.keys().cloned().collect()
+    }
+
     // =========================================================================
     // Certificate Metadata Management
     // =========================================================================

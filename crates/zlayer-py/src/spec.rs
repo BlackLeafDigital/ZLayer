@@ -553,7 +553,7 @@ pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResu
         resources: zlayer_spec::ResourcesSpec::default(),
         env: HashMap::new(),
         command: zlayer_spec::CommandSpec::default(),
-        network: zlayer_spec::NetworkSpec::default(),
+        network: zlayer_spec::ServiceNetworkSpec::default(),
         endpoints,
         scale: zlayer_spec::ScaleSpec::default(),
         depends: Vec::new(),
@@ -576,6 +576,7 @@ pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResu
         node_selector: None,
         service_type: zlayer_spec::ServiceType::default(),
         wasm: None,
+        logs: None,
         host_network: false,
     };
 

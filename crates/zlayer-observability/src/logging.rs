@@ -190,6 +190,11 @@ fn level_to_string(level: crate::config::LogLevel) -> String {
 fn create_file_writer(
     config: &FileLoggingConfig,
 ) -> Result<(tracing_appender::non_blocking::NonBlocking, WorkerGuard)> {
+    // Clean up old rotated files before creating the appender.
+    if let Some(max) = config.max_files {
+        cleanup_rotated_files(&config.directory, &config.prefix, max);
+    }
+
     let file_appender = match config.rotation {
         RotationStrategy::Daily => {
             tracing_appender::rolling::daily(&config.directory, &config.prefix)
@@ -203,6 +208,40 @@ fn create_file_writer(
     };
 
     Ok(tracing_appender::non_blocking(file_appender))
+}
+
+/// Delete the oldest rotated log files beyond `max_files`.
+///
+/// `tracing-appender` names rotated files as `{prefix}.{date}` (e.g.
+/// `daemon.2026-04-03`). We list all files matching the prefix, sort
+/// lexicographically (dates sort naturally), and remove the oldest.
+fn cleanup_rotated_files(directory: &std::path::Path, prefix: &str, max_files: usize) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+
+    let dot_prefix = format!("{prefix}.");
+    let mut files: Vec<std::path::PathBuf> = entries
+        .filter_map(std::result::Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&dot_prefix))
+        })
+        .collect();
+
+    if files.len() <= max_files {
+        return;
+    }
+
+    // Sort ascending by name (oldest dates first).
+    files.sort();
+
+    let to_remove = files.len() - max_files;
+    for path in files.into_iter().take(to_remove) {
+        let _ = std::fs::remove_file(&path);
+    }
 }
 
 #[cfg(test)]

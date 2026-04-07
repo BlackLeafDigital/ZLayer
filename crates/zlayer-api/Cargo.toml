@@ -19,6 +19,7 @@ path = "src/bin/openapi_spec.rs"
 # Internal crates
 zlayer-agent.workspace = true
 zlayer-builder.workspace = true
+zlayer-proxy.workspace = true
 zlayer-overlay.workspace = true
 zlayer-spec.workspace = true
 zlayer-scheduler.workspace = true

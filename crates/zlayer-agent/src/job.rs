@@ -404,11 +404,23 @@ impl JobExecutor {
 
         // Collect logs before cleanup using the runtime's get_logs method
         let logs = match runtime.get_logs(&container_id).await {
-            Ok(log_lines) => Some(log_lines.join("\n")),
+            Ok(entries) => Some(
+                entries
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
             Err(e) => {
                 // Fallback to container_logs if get_logs fails
                 match runtime.container_logs(&container_id, max_log_size).await {
-                    Ok(log_content) => Some(log_content),
+                    Ok(entries) => Some(
+                        entries
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    ),
                     Err(e2) => {
                         warn!(
                             job = %job_name,

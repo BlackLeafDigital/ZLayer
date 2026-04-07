@@ -235,9 +235,9 @@ fn generate_container_id(name: Option<&str>) -> (String, ContainerId) {
 /// since standalone containers don't need scaling, health checks, etc.
 fn build_service_spec(request: &CreateContainerRequest) -> zlayer_spec::ServiceSpec {
     use zlayer_spec::{
-        CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NetworkSpec,
-        NodeMode, PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceSpec, ServiceType,
-        StorageSpec,
+        CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NodeMode,
+        PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec,
+        ServiceType, StorageSpec,
     };
 
     let command_spec = if let Some(ref cmd) = request.command {
@@ -291,7 +291,7 @@ fn build_service_spec(request: &CreateContainerRequest) -> zlayer_spec::ServiceS
         resources,
         env: request.env.clone(),
         command: command_spec,
-        network: NetworkSpec::default(),
+        network: ServiceNetworkSpec::default(),
         endpoints: Vec::new(),
         scale: ScaleSpec::Manual,
         depends: Vec::new(),
@@ -312,6 +312,7 @@ fn build_service_spec(request: &CreateContainerRequest) -> zlayer_spec::ServiceS
         node_selector: None,
         service_type: ServiceType::default(),
         wasm: None,
+        logs: None,
         host_network: false,
     }
 }
@@ -717,11 +718,16 @@ pub async fn get_container_logs(
         Ok(sse.into_response())
     } else {
         // Plain text mode
-        let logs = state
+        let entries = state
             .runtime
             .container_logs(&container_id, query.tail)
             .await
             .map_err(|e| ApiError::Internal(format!("Failed to get logs: {e}")))?;
+        let logs: String = entries
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
         Ok(logs.into_response())
     }
 }
@@ -758,13 +764,13 @@ fn container_log_follow_stream(
 
             let fetch_tail = if state.initial { state.tail } else { 10_000 };
 
-            let logs = state
+            let entries = state
                 .runtime
                 .container_logs(&state.container_id, fetch_tail)
                 .await
                 .unwrap_or_default();
 
-            let all_lines: Vec<&str> = logs.lines().collect();
+            let all_lines: Vec<String> = entries.iter().map(ToString::to_string).collect();
             let total = all_lines.len();
 
             let new_lines = if state.initial {

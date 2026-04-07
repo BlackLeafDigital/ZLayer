@@ -256,6 +256,91 @@ pub struct CreateTunnelResponse {
 }
 
 // =========================================================================
+// Network Types
+// =========================================================================
+
+/// Summary returned when listing networks
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkSummary {
+    /// Network name
+    pub name: String,
+    /// Optional description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Number of CIDR ranges
+    pub cidr_count: usize,
+    /// Number of members
+    pub member_count: usize,
+    /// Number of access rules
+    pub rule_count: usize,
+}
+
+/// Full network policy detail
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkPolicyDetail {
+    /// Network name
+    pub name: String,
+    /// Optional description
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// CIDR ranges
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+    /// Members of this network
+    #[serde(default)]
+    pub members: Vec<NetworkMemberInfo>,
+    /// Access rules
+    #[serde(default)]
+    pub access_rules: Vec<NetworkAccessRuleInfo>,
+}
+
+/// A member of a network
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkMemberInfo {
+    /// Member identifier
+    pub name: String,
+    /// Type of member (user, group, node, cidr)
+    #[serde(default)]
+    pub kind: String,
+}
+
+/// An access rule within a network
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkAccessRuleInfo {
+    /// Target service name, or "*" for all
+    #[serde(default)]
+    pub service: String,
+    /// Target deployment name, or "*" for all
+    #[serde(default)]
+    pub deployment: String,
+    /// Specific ports, or None for all
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<Vec<u16>>,
+    /// Allow or Deny
+    #[serde(default)]
+    pub action: String,
+}
+
+/// Request to create a network
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateNetworkRequest {
+    /// Network name
+    pub name: String,
+    /// Optional description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// CIDR ranges
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+    /// Members
+    #[serde(default)]
+    pub members: Vec<NetworkMemberInfo>,
+    /// Access rules
+    #[serde(default)]
+    pub access_rules: Vec<NetworkAccessRuleInfo>,
+}
+
+// =========================================================================
 // Secrets Types
 // =========================================================================
 
@@ -453,6 +538,108 @@ pub struct DnsStatusResponse {
     pub service_count: usize,
     /// List of registered service names
     pub services: Vec<String>,
+}
+
+// =========================================================================
+// Proxy Types
+// =========================================================================
+
+/// Summary of a backend in a proxy route or backend group
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyBackendSummary {
+    /// Backend address (host:port)
+    pub address: String,
+    /// Whether the backend is healthy
+    pub healthy: bool,
+    /// Number of active connections
+    pub active_connections: u64,
+}
+
+/// A proxy route (L7 HTTP routing rule)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyRoute {
+    /// Host to match (e.g., "api.example.com"), if any
+    pub host: Option<String>,
+    /// Path prefix to match (e.g., "/api")
+    pub path_prefix: String,
+    /// Whether to strip the matched prefix before forwarding
+    pub strip_prefix: bool,
+    /// Backends serving this route
+    pub backends: Vec<ProxyBackendSummary>,
+}
+
+/// A group of backends behind a load-balancer strategy
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyBackendGroup {
+    /// Service name this group routes to
+    pub service: String,
+    /// Load-balancing strategy ("round_robin" or "least_connections")
+    pub strategy: String,
+    /// Backends in this group
+    pub backends: Vec<ProxyBackendSummary>,
+}
+
+/// TLS certificate metadata
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TlsCertificate {
+    /// Domain the certificate covers
+    pub domain: String,
+    /// Certificate issuer (e.g., "Let's Encrypt")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// When the certificate expires (ISO 8601)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// Whether auto-renewal is enabled
+    pub auto_renew: bool,
+}
+
+/// A stream proxy (L4 TCP/UDP forwarding rule)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StreamProxy {
+    /// Protocol ("tcp" or "udp")
+    pub protocol: String,
+    /// Port the proxy listens on
+    pub listen_port: u16,
+    /// Backends receiving forwarded traffic
+    pub backends: Vec<ProxyBackendSummary>,
+}
+
+// =========================================================================
+// Cluster Types
+// =========================================================================
+
+/// Summary of a cluster node from the Raft state
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterNodeSummary {
+    /// Raft-level ID
+    pub id: String,
+    /// Network address (Raft RPC address)
+    pub address: String,
+    /// Advertise address (public IP)
+    pub advertise_addr: String,
+    /// Current status (e.g. "ready", "draining", "dead")
+    pub status: String,
+    /// Role in the Raft cluster: "leader", "voter", or "learner"
+    pub role: String,
+    /// Join mode: "full" or "replicate"
+    pub mode: String,
+    /// Whether this node is the Raft leader
+    pub is_leader: bool,
+    /// Overlay network IP assigned to this node
+    pub overlay_ip: String,
+    /// Total CPU cores on this node
+    pub cpu_total: f64,
+    /// Current CPU usage (cores)
+    pub cpu_used: f64,
+    /// Total memory in bytes
+    pub memory_total: u64,
+    /// Current memory usage in bytes
+    pub memory_used: u64,
+    /// When the node was registered (Unix timestamp ms)
+    pub registered_at: u64,
+    /// Last heartbeat timestamp (Unix timestamp ms)
+    pub last_heartbeat: u64,
 }
 
 /// Error response from the API
@@ -1409,6 +1596,197 @@ impl ZLayerClient {
             .await?;
 
         self.handle_response(response).await
+    }
+
+    // =========================================================================
+    // Cluster Node Endpoints
+    // =========================================================================
+
+    /// List all nodes in the cluster
+    ///
+    /// Calls GET /api/v1/cluster/nodes to retrieve a list of all nodes
+    /// visible in the Raft cluster state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
+    pub async fn list_cluster_nodes(&self) -> Result<Vec<ClusterNodeSummary>> {
+        let response = self
+            .request(reqwest::Method::GET, "/api/v1/cluster/nodes")
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    // =========================================================================
+    // Proxy Endpoints
+    // =========================================================================
+
+    /// List all proxy routes
+    ///
+    /// Calls GET /api/v1/proxy/routes to retrieve L7 HTTP routing rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
+    pub async fn list_proxy_routes(&self) -> Result<Vec<ProxyRoute>> {
+        let response = self
+            .request(reqwest::Method::GET, "/api/v1/proxy/routes")
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// List all proxy backend groups
+    ///
+    /// Calls GET /api/v1/proxy/backends to retrieve backend groups
+    /// and their load-balancing configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
+    pub async fn list_proxy_backends(&self) -> Result<Vec<ProxyBackendGroup>> {
+        let response = self
+            .request(reqwest::Method::GET, "/api/v1/proxy/backends")
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// List all TLS certificates
+    ///
+    /// Calls GET /api/v1/proxy/tls to retrieve TLS certificate metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
+    pub async fn list_tls_certificates(&self) -> Result<Vec<TlsCertificate>> {
+        let response = self
+            .request(reqwest::Method::GET, "/api/v1/proxy/tls")
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// List all stream proxies
+    ///
+    /// Calls GET /api/v1/proxy/streams to retrieve L4 TCP/UDP stream proxy rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
+    pub async fn list_stream_proxies(&self) -> Result<Vec<StreamProxy>> {
+        let response = self
+            .request(reqwest::Method::GET, "/api/v1/proxy/streams")
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    // =========================================================================
+    // Network Endpoints
+    // =========================================================================
+
+    /// List all networks
+    ///
+    /// Calls GET /api/v1/networks to retrieve a summary of all defined networks.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the response cannot be deserialized.
+    pub async fn list_networks(&self) -> Result<Vec<NetworkSummary>> {
+        let response = self
+            .request(reqwest::Method::GET, "/api/v1/networks")
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// Get a specific network by name
+    ///
+    /// Calls GET /api/v1/networks/{name} to retrieve the full network policy.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The network name
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails, the network is not found,
+    /// or the response cannot be deserialized.
+    pub async fn get_network(&self, name: &str) -> Result<NetworkPolicyDetail> {
+        let response = self
+            .request(reqwest::Method::GET, &format!("/api/v1/networks/{name}"))
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// Create a new network
+    ///
+    /// Calls POST /api/v1/networks to create a new network policy.
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - The network creation request
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails, the network already exists,
+    /// or the response cannot be deserialized.
+    pub async fn create_network(
+        &self,
+        request: &CreateNetworkRequest,
+    ) -> Result<NetworkPolicyDetail> {
+        let response = self
+            .request(reqwest::Method::POST, "/api/v1/networks")
+            .json(request)
+            .send()
+            .await?;
+
+        self.handle_response(response).await
+    }
+
+    /// Delete a network
+    ///
+    /// Calls DELETE /api/v1/networks/{name} to remove a network policy.
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - The network name to delete
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP request fails or the network is not found.
+    pub async fn delete_network(&self, name: &str) -> Result<()> {
+        let response = self
+            .request(reqwest::Method::DELETE, &format!("/api/v1/networks/{name}"))
+            .send()
+            .await?;
+
+        let status = response.status();
+
+        if status.is_success() {
+            Ok(())
+        } else {
+            let error_text = response.text().await.unwrap_or_default();
+
+            match status {
+                StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
+                StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
+                _ => Err(ApiClientError::Api {
+                    status: status.as_u16(),
+                    message: error_text,
+                }),
+            }
+        }
     }
 }
 

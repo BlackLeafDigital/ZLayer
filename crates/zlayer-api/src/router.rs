@@ -21,8 +21,10 @@ use crate::handlers::cron::CronState;
 use crate::handlers::deployments::DeploymentState;
 use crate::handlers::internal::InternalState;
 use crate::handlers::jobs::JobState;
+use crate::handlers::networks::NetworkApiState;
 use crate::handlers::nodes::NodeApiState;
 use crate::handlers::overlay::OverlayApiState;
+use crate::handlers::proxy::ProxyApiState;
 use crate::handlers::secrets::SecretsState;
 use crate::handlers::services::ServiceState;
 use crate::handlers::storage::StorageState;
@@ -579,6 +581,27 @@ pub fn build_secrets_routes(secrets_state: SecretsState) -> Router<()> {
         .with_state(secrets_state)
 }
 
+/// Build routes for network management
+///
+/// Creates the routes for CRUD operations on network access-control groups.
+/// These routes require authentication; mutating endpoints require the
+/// `operator` role.
+///
+/// # Arguments
+/// * `network_state` - State containing the in-memory network store
+///
+/// # Returns
+/// A Router with the network endpoints
+pub fn build_network_routes(network_state: NetworkApiState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::networks::list_networks))
+        .route("/", post(handlers::networks::create_network))
+        .route("/{name}", get(handlers::networks::get_network))
+        .route("/{name}", put(handlers::networks::update_network))
+        .route("/{name}", delete(handlers::networks::delete_network))
+        .with_state(network_state)
+}
+
 /// Build the API router with secrets management capabilities
 ///
 /// This extends the basic router with endpoints for secrets management.
@@ -719,6 +742,22 @@ pub fn build_overlay_routes(overlay_state: OverlayApiState) -> Router<()> {
         .route("/ip-alloc", get(handlers::overlay::get_ip_allocation))
         .route("/dns", get(handlers::overlay::get_dns_status))
         .with_state(overlay_state)
+}
+
+/// Build routes for proxy status
+///
+/// Creates read-only routes for inspecting the reverse proxy's state:
+/// routes, backends, TLS certificates, and L4 stream proxies.
+///
+/// # Arguments
+/// * `proxy_state` - State containing optional references to proxy subsystems
+pub fn build_proxy_routes(proxy_state: ProxyApiState) -> Router<()> {
+    Router::new()
+        .route("/routes", get(handlers::proxy::list_routes))
+        .route("/backends", get(handlers::proxy::list_backends))
+        .route("/tls", get(handlers::proxy::list_tls))
+        .route("/streams", get(handlers::proxy::list_streams))
+        .with_state(proxy_state)
 }
 
 /// Build the API router with nodes and overlay capabilities

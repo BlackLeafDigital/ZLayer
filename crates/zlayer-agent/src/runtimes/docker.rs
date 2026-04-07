@@ -17,6 +17,7 @@ use futures_util::StreamExt;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tracing::instrument;
+use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_spec::{PullPolicy, ServiceSpec};
 
 /// Docker-based container runtime using bollard
@@ -694,7 +695,7 @@ impl Runtime for DockerRuntime {
             tail = %tail,
         )
     )]
-    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<String> {
+    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<Vec<LogEntry>> {
         let name = container_name(id);
 
         let options = LogsOptions {
@@ -706,12 +707,31 @@ impl Runtime for DockerRuntime {
         };
 
         let mut stream = self.docker.logs(&name, Some(options));
-        let mut output = String::new();
+        let mut entries = Vec::new();
+        let source = LogSource::Container(name.clone());
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(log_output) => {
-                    output.push_str(&log_output.to_string());
+                    let (stream_type, text) = match &log_output {
+                        bollard::container::LogOutput::StdOut { message } => {
+                            (LogStream::Stdout, String::from_utf8_lossy(message))
+                        }
+                        bollard::container::LogOutput::StdErr { message } => {
+                            (LogStream::Stderr, String::from_utf8_lossy(message))
+                        }
+                        _ => (LogStream::Stdout, log_output.to_string().into()),
+                    };
+                    for line in text.lines() {
+                        entries.push(LogEntry {
+                            timestamp: chrono::Utc::now(),
+                            stream: stream_type,
+                            message: line.to_string(),
+                            source: source.clone(),
+                            service: Some(id.service.clone()),
+                            deployment: None,
+                        });
+                    }
                 }
                 Err(e) => {
                     return Err(AgentError::NotFound {
@@ -722,8 +742,8 @@ impl Runtime for DockerRuntime {
             }
         }
 
-        tracing::debug!(container = %name, bytes = output.len(), "got container logs");
-        Ok(output)
+        tracing::debug!(container = %name, entry_count = entries.len(), "got container logs");
+        Ok(entries)
     }
 
     /// Execute a command inside a container
@@ -932,7 +952,7 @@ impl Runtime for DockerRuntime {
             service.name = %id.service,
         )
     )]
-    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>> {
+    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<LogEntry>> {
         let name = container_name(id);
 
         let options = LogsOptions {
@@ -944,15 +964,30 @@ impl Runtime for DockerRuntime {
         };
 
         let mut stream = self.docker.logs(&name, Some(options));
-        let mut lines = Vec::new();
+        let mut entries = Vec::new();
+        let source = LogSource::Container(name.clone());
 
         while let Some(result) = stream.next().await {
             match result {
                 Ok(log_output) => {
-                    // Each log line might contain newlines, so split them
-                    let text = log_output.to_string();
+                    let (stream_type, text) = match &log_output {
+                        bollard::container::LogOutput::StdOut { message } => {
+                            (LogStream::Stdout, String::from_utf8_lossy(message))
+                        }
+                        bollard::container::LogOutput::StdErr { message } => {
+                            (LogStream::Stderr, String::from_utf8_lossy(message))
+                        }
+                        _ => (LogStream::Stdout, log_output.to_string().into()),
+                    };
                     for line in text.lines() {
-                        lines.push(line.to_string());
+                        entries.push(LogEntry {
+                            timestamp: chrono::Utc::now(),
+                            stream: stream_type,
+                            message: line.to_string(),
+                            source: source.clone(),
+                            service: Some(id.service.clone()),
+                            deployment: None,
+                        });
                     }
                 }
                 Err(e) => {
@@ -964,8 +999,8 @@ impl Runtime for DockerRuntime {
             }
         }
 
-        tracing::debug!(container = %name, line_count = lines.len(), "got container logs");
-        Ok(lines)
+        tracing::debug!(container = %name, entry_count = entries.len(), "got container logs");
+        Ok(entries)
     }
 
     /// Get the PID of a container's main process
@@ -1213,7 +1248,7 @@ mod tests {
             resources: ResourcesSpec::default(),
             env: HashMap::new(),
             command: CommandSpec::default(),
-            network: NetworkSpec::default(),
+            network: ServiceNetworkSpec::default(),
             endpoints,
             scale: ScaleSpec::default(),
             depends: vec![],
@@ -1234,6 +1269,7 @@ mod tests {
             node_selector: None,
             service_type: ServiceType::default(),
             wasm: None,
+            logs: None,
             host_network: false,
         }
     }

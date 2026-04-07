@@ -214,6 +214,11 @@ impl ServiceRegistry {
     pub async fn route_count(&self) -> usize {
         self.routes.read().await.len()
     }
+
+    /// Return a snapshot of all registered routes.
+    pub async fn list_routes(&self) -> Vec<RouteEntry> {
+        self.routes.read().await.clone()
+    }
 }
 
 // ---------------------------------------------------------------------------

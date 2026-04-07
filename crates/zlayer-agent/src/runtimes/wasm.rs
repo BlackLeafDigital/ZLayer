@@ -45,6 +45,7 @@ use wasmtime_wasi::p1::{self, WasiP1Ctx};
 #[allow(unused_imports)]
 use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
+use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_registry::{detect_wasm_version_from_binary, WasiVersion};
 use zlayer_spec::{PullPolicy, ServiceSpec, StorageSpec, WasmCapabilities};
 
@@ -1417,7 +1418,7 @@ impl Runtime for WasmRuntime {
     }
 
     /// Get container logs
-    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<String> {
+    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<Vec<LogEntry>> {
         let instance_id = self.instance_id(id);
 
         let instances = self.instances.read().await;
@@ -1428,31 +1429,37 @@ impl Runtime for WasmRuntime {
                 reason: "WASM instance not found".to_string(),
             })?;
 
-        // Combine stdout and stderr
-        let mut logs = String::new();
+        let source = LogSource::Container(instance_id.clone());
+        let mut entries = Vec::new();
 
-        if !instance.stdout.is_empty() {
-            logs.push_str("[stdout]\n");
-            logs.push_str(&String::from_utf8_lossy(&instance.stdout));
+        for line in String::from_utf8_lossy(&instance.stdout).lines() {
+            entries.push(LogEntry {
+                timestamp: chrono::Utc::now(),
+                stream: LogStream::Stdout,
+                message: line.to_string(),
+                source: source.clone(),
+                service: Some(id.service.clone()),
+                deployment: None,
+            });
         }
 
-        if !instance.stderr.is_empty() {
-            if !logs.is_empty() {
-                logs.push('\n');
-            }
-            logs.push_str("[stderr]\n");
-            logs.push_str(&String::from_utf8_lossy(&instance.stderr));
+        for line in String::from_utf8_lossy(&instance.stderr).lines() {
+            entries.push(LogEntry {
+                timestamp: chrono::Utc::now(),
+                stream: LogStream::Stderr,
+                message: line.to_string(),
+                source: source.clone(),
+                service: Some(id.service.clone()),
+                deployment: None,
+            });
         }
 
         // Apply tail limit
-        if tail > 0 {
-            let lines: Vec<&str> = logs.lines().collect();
-            if lines.len() > tail {
-                logs = lines[lines.len() - tail..].join("\n");
-            }
+        if tail > 0 && entries.len() > tail {
+            entries = entries.split_off(entries.len() - tail);
         }
 
-        Ok(logs)
+        Ok(entries)
     }
 
     /// Execute command in container
@@ -1579,31 +1586,10 @@ impl Runtime for WasmRuntime {
         }
     }
 
-    /// Get container logs as lines
-    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>> {
-        let instance_id = self.instance_id(id);
-
-        let instances = self.instances.read().await;
-        let instance = instances
-            .get(&instance_id)
-            .ok_or_else(|| AgentError::NotFound {
-                container: instance_id.clone(),
-                reason: "WASM instance not found".to_string(),
-            })?;
-
-        let mut logs = Vec::new();
-
-        // Add stdout lines
-        for line in String::from_utf8_lossy(&instance.stdout).lines() {
-            logs.push(format!("[stdout] {line}"));
-        }
-
-        // Add stderr lines
-        for line in String::from_utf8_lossy(&instance.stderr).lines() {
-            logs.push(format!("[stderr] {line}"));
-        }
-
-        Ok(logs)
+    /// Get container logs as structured entries
+    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<LogEntry>> {
+        // Delegate to container_logs with tail=0 (all lines)
+        self.container_logs(id, 0).await
     }
 
     /// Get the PID of a WASM instance
