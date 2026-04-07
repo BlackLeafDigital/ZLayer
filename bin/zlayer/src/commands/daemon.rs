@@ -813,6 +813,7 @@ async fn status(data_dir: &Path) -> Result<()> {
 
 /// Rotate the current day's daemon log file before a fresh start,
 /// ensuring that failure output is always from the current attempt.
+#[cfg(target_os = "linux")]
 fn rotate_daemon_log(log_dir: &std::path::Path) {
     // tracing-appender daily files are named `{prefix}.{YYYY-MM-DD}`
     let today = chrono::Utc::now().format("%Y-%m-%d").to_string();

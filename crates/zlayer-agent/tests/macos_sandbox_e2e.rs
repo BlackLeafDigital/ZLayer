@@ -594,11 +594,13 @@ async fn test_container_lifecycle_echo() {
         let logs = runtime.container_logs(&id, 100).await;
         assert!(logs.is_ok(), "Failed to get logs: {logs:?}");
         let log_content = logs.unwrap();
-        println!("Container logs:\n{log_content}");
+        println!("Container logs:\n{log_content:?}");
         // echo should have written "hello from sandbox" to stdout
         assert!(
-            log_content.contains("hello from sandbox"),
-            "Logs should contain echo output, got: {log_content}"
+            log_content
+                .iter()
+                .any(|e| e.message.contains("hello from sandbox")),
+            "Logs should contain echo output, got: {log_content:?}"
         );
 
         // 8. Remove container
@@ -1819,7 +1821,7 @@ async fn test_get_logs_vector() {
         // At least one line should contain our echo output
         let has_output = log_lines
             .iter()
-            .any(|line| line.contains("hello from sandbox"));
+            .any(|line| line.message.contains("hello from sandbox"));
         assert!(
             has_output,
             "Logs should contain echo output, got: {log_lines:?}"
