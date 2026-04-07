@@ -269,7 +269,7 @@ mod tests {
                 resources: zlayer_spec::ResourcesSpec::default(),
                 env: HashMap::default(),
                 command: zlayer_spec::CommandSpec::default(),
-                network: zlayer_spec::NetworkSpec::default(),
+                network: zlayer_spec::ServiceNetworkSpec::default(),
                 endpoints: vec![],
                 scale: zlayer_spec::ScaleSpec::default(),
                 depends: vec![],
@@ -299,6 +299,7 @@ mod tests {
             version: "v1".to_string(),
             deployment: name.to_string(),
             services,
+            externals: HashMap::new(),
             tunnels: HashMap::new(),
             api: zlayer_spec::ApiSpec::default(),
         }

@@ -503,6 +503,16 @@ pub struct DeploymentSpec {
     #[validate(nested)]
     pub services: HashMap<String, ServiceSpec>,
 
+    /// External service definitions (proxy backends without containers)
+    ///
+    /// External services register static backend addresses with the proxy
+    /// for host/path-based routing without starting any containers.
+    /// Useful for proxying to services running outside of `ZLayer`
+    /// (e.g., on other machines reachable via VPN).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[validate(nested)]
+    pub externals: HashMap<String, ExternalSpec>,
+
     /// Top-level tunnel definitions (not tied to service endpoints)
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub tunnels: HashMap<String, TunnelDefinition>,
@@ -510,6 +520,36 @@ pub struct DeploymentSpec {
     /// API server configuration (enabled by default)
     #[serde(default)]
     pub api: ApiSpec,
+}
+
+/// External service specification (proxy backend without a container)
+///
+/// Defines a service that is not managed by `ZLayer` but should be proxied
+/// through `ZLayer`'s reverse proxy. The proxy registers static backend
+/// addresses and routes traffic based on endpoint host/path matching.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct ExternalSpec {
+    /// Static backend addresses (e.g., `["100.64.1.5:8096", "192.168.1.10:8096"]`)
+    ///
+    /// These are the upstream addresses the proxy will forward traffic to.
+    /// At least one backend is required.
+    #[validate(length(min = 1, message = "at least one backend address is required"))]
+    pub backends: Vec<String>,
+
+    /// Endpoint definitions (proxy bindings)
+    ///
+    /// Defines how public/internal traffic is routed to this external service.
+    #[serde(default)]
+    #[validate(nested)]
+    pub endpoints: Vec<EndpointSpec>,
+
+    /// Health check configuration
+    ///
+    /// When specified, the proxy will health-check backends and remove
+    /// unhealthy ones from the rotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<HealthSpec>,
 }
 
 /// Top-level tunnel definition (not tied to a service endpoint)
@@ -626,7 +666,7 @@ pub struct ServiceSpec {
 
     /// Network configuration
     #[serde(default)]
-    pub network: NetworkSpec,
+    pub network: ServiceNetworkSpec,
 
     /// Endpoint definitions (proxy bindings)
     #[serde(default)]
@@ -979,11 +1019,11 @@ fn default_gpu_vendor() -> String {
     "nvidia".to_string()
 }
 
-/// Network configuration
+/// Per-service network configuration (overlay + join policy).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 #[derive(Default)]
-pub struct NetworkSpec {
+pub struct ServiceNetworkSpec {
     /// Overlay network configuration
     #[serde(default)]
     pub overlays: OverlayConfig,
@@ -1554,6 +1594,94 @@ pub enum PanicAction {
     Restart,
     Shutdown,
     Isolate,
+}
+
+// ==========================================================================
+// Network / Access Control types
+// ==========================================================================
+
+/// A network policy defines an access control group with membership rules
+/// and service access policies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct NetworkPolicySpec {
+    /// Unique network name.
+    pub name: String,
+
+    /// Human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+
+    /// CIDR ranges that belong to this network (e.g., "10.200.0.0/16", "192.168.1.0/24").
+    #[serde(default)]
+    pub cidrs: Vec<String>,
+
+    /// Named members (users, groups, nodes) of this network.
+    #[serde(default)]
+    pub members: Vec<NetworkMember>,
+
+    /// Access rules defining which services this network can reach.
+    #[serde(default)]
+    pub access_rules: Vec<AccessRule>,
+}
+
+/// A member of a network.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkMember {
+    /// Member identifier (username, group name, node ID, or CIDR).
+    pub name: String,
+    /// Type of member.
+    #[serde(default)]
+    pub kind: MemberKind,
+}
+
+/// Type of network member.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberKind {
+    /// An individual user identity.
+    #[default]
+    User,
+    /// A group of users.
+    Group,
+    /// A specific cluster node.
+    Node,
+    /// A CIDR range (redundant with NetworkPolicySpec.cidrs but allows per-member CIDR).
+    Cidr,
+}
+
+/// An access rule determining what a network can reach.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccessRule {
+    /// Target service name, or "*" for all services.
+    #[serde(default = "wildcard")]
+    pub service: String,
+
+    /// Target deployment name, or "*" for all deployments.
+    #[serde(default = "wildcard")]
+    pub deployment: String,
+
+    /// Specific ports allowed. None means all ports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ports: Option<Vec<u16>>,
+
+    /// Whether to allow or deny access.
+    #[serde(default)]
+    pub action: AccessAction,
+}
+
+fn wildcard() -> String {
+    "*".to_string()
+}
+
+/// Access control action.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum AccessAction {
+    /// Allow access (default).
+    #[default]
+    Allow,
+    /// Deny access.
+    Deny,
 }
 
 #[cfg(test)]
@@ -2238,5 +2366,122 @@ api:
         assert_eq!(spec.api.bind, "0.0.0.0:3000");
         assert!(spec.api.jwt_secret.is_none()); // default None
         assert!(spec.api.swagger); // default true
+    }
+
+    // ==========================================================================
+    // NetworkPolicySpec tests
+    // ==========================================================================
+
+    #[test]
+    fn test_network_policy_spec_roundtrip() {
+        let spec = NetworkPolicySpec {
+            name: "corp-vpn".to_string(),
+            description: Some("Corporate VPN network".to_string()),
+            cidrs: vec!["10.200.0.0/16".to_string()],
+            members: vec![
+                NetworkMember {
+                    name: "alice".to_string(),
+                    kind: MemberKind::User,
+                },
+                NetworkMember {
+                    name: "ops-team".to_string(),
+                    kind: MemberKind::Group,
+                },
+                NetworkMember {
+                    name: "node-01".to_string(),
+                    kind: MemberKind::Node,
+                },
+            ],
+            access_rules: vec![
+                AccessRule {
+                    service: "api-gateway".to_string(),
+                    deployment: "*".to_string(),
+                    ports: Some(vec![443, 8080]),
+                    action: AccessAction::Allow,
+                },
+                AccessRule {
+                    service: "*".to_string(),
+                    deployment: "staging".to_string(),
+                    ports: None,
+                    action: AccessAction::Deny,
+                },
+            ],
+        };
+
+        let yaml = serde_yaml::to_string(&spec).unwrap();
+        let deserialized: NetworkPolicySpec = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(spec, deserialized);
+    }
+
+    #[test]
+    fn test_network_policy_spec_defaults() {
+        let yaml = r"
+name: minimal
+";
+        let spec: NetworkPolicySpec = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(spec.name, "minimal");
+        assert!(spec.description.is_none());
+        assert!(spec.cidrs.is_empty());
+        assert!(spec.members.is_empty());
+        assert!(spec.access_rules.is_empty());
+    }
+
+    #[test]
+    fn test_access_rule_defaults() {
+        let yaml = "{}";
+        let rule: AccessRule = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(rule.service, "*");
+        assert_eq!(rule.deployment, "*");
+        assert!(rule.ports.is_none());
+        assert_eq!(rule.action, AccessAction::Allow);
+    }
+
+    #[test]
+    fn test_member_kind_defaults_to_user() {
+        let yaml = r"
+name: bob
+";
+        let member: NetworkMember = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(member.name, "bob");
+        assert_eq!(member.kind, MemberKind::User);
+    }
+
+    #[test]
+    fn test_member_kind_variants() {
+        for (input, expected) in [
+            ("user", MemberKind::User),
+            ("group", MemberKind::Group),
+            ("node", MemberKind::Node),
+            ("cidr", MemberKind::Cidr),
+        ] {
+            let yaml = format!("name: test\nkind: {input}");
+            let member: NetworkMember = serde_yaml::from_str(&yaml).unwrap();
+            assert_eq!(member.kind, expected);
+        }
+    }
+
+    #[test]
+    fn test_access_action_variants() {
+        // Test via a wrapper struct since bare enums need a YAML tag
+        #[derive(Debug, Deserialize)]
+        struct Wrapper {
+            action: AccessAction,
+        }
+
+        let allow: Wrapper = serde_yaml::from_str("action: allow").unwrap();
+        let deny: Wrapper = serde_yaml::from_str("action: deny").unwrap();
+
+        assert_eq!(allow.action, AccessAction::Allow);
+        assert_eq!(deny.action, AccessAction::Deny);
+    }
+
+    #[test]
+    fn test_network_policy_spec_default_impl() {
+        let spec = NetworkPolicySpec::default();
+        assert_eq!(spec.name, "");
+        assert!(spec.description.is_none());
+        assert!(spec.cidrs.is_empty());
+        assert!(spec.members.is_empty());
+        assert!(spec.access_rules.is_empty());
     }
 }

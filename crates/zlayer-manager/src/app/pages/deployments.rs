@@ -7,7 +7,7 @@ use leptos::prelude::*;
 
 use crate::app::server_fns::{
     create_deployment, delete_deployment, get_deployments, get_service_logs, get_services,
-    Deployment, Service,
+    Deployment, Service, ServiceEndpoint,
 };
 
 /// Get the CSS class for a deployment status badge
@@ -28,6 +28,74 @@ fn service_status_class(status: &str) -> &'static str {
         "failed" | "error" => "badge badge-error badge-sm",
         _ => "badge badge-ghost badge-sm",
     }
+}
+
+/// Get the CSS class for a protocol badge
+fn protocol_badge_class(protocol: &str) -> &'static str {
+    match protocol.to_lowercase().as_str() {
+        "http" => "badge badge-info badge-xs",
+        "https" => "badge badge-success badge-xs",
+        "websocket" | "ws" | "wss" => "badge badge-secondary badge-xs",
+        "grpc" => "badge badge-accent badge-xs",
+        _ => "badge badge-ghost badge-xs",
+    }
+}
+
+/// Render endpoint rows for a service
+fn render_endpoints(endpoints: &[ServiceEndpoint]) -> impl IntoView {
+    if endpoints.is_empty() {
+        return view! {
+            <tr>
+                <td colspan="4" class="text-base-content/40 text-xs italic pl-8">
+                    "No endpoints configured"
+                </td>
+            </tr>
+        }
+        .into_any();
+    }
+
+    view! {
+        <tr>
+            <td colspan="4" class="p-0">
+                <table class="table table-xs w-full ml-4">
+                    <thead>
+                        <tr class="text-base-content/50">
+                            <th class="text-xs font-normal">"Protocol"</th>
+                            <th class="text-xs font-normal">"Port"</th>
+                            <th class="text-xs font-normal">"URL"</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {endpoints
+                            .iter()
+                            .map(|ep| {
+                                let badge_class = protocol_badge_class(&ep.protocol);
+                                let protocol_text = ep.protocol.to_uppercase();
+                                let port_text = ep.port.to_string();
+                                let url_text = ep
+                                    .url
+                                    .clone()
+                                    .unwrap_or_else(|| "-".to_string());
+                                let url_title = url_text.clone();
+                                view! {
+                                    <tr>
+                                        <td>
+                                            <span class=badge_class>{protocol_text}</span>
+                                        </td>
+                                        <td class="font-mono text-xs">{port_text}</td>
+                                        <td class="text-xs truncate max-w-xs" title=url_title>
+                                            {url_text}
+                                        </td>
+                                    </tr>
+                                }
+                            })
+                            .collect::<Vec<_>>()}
+                    </tbody>
+                </table>
+            </td>
+        </tr>
+    }
+    .into_any()
 }
 
 /// Render deployments table from data
@@ -485,12 +553,13 @@ pub fn Deployments() -> impl IntoView {
                                             <tbody>
                                                 {services
                                                     .into_iter()
-                                                    .map(|svc| {
+                                                    .flat_map(|svc| {
                                                         let svc_status_class = service_status_class(&svc.status);
                                                         let svc_name_for_logs = svc.name.clone();
                                                         let dep_name_for_logs = svc.deployment.clone();
                                                         let svc_name_check = svc.name.clone();
-                                                        view! {
+                                                        let endpoints = svc.endpoints.clone();
+                                                        let service_row = view! {
                                                             <tr>
                                                                 <td class="font-mono text-sm">{svc.name}</td>
                                                                 <td>
@@ -520,7 +589,9 @@ pub fn Deployments() -> impl IntoView {
                                                                     </button>
                                                                 </td>
                                                             </tr>
-                                                        }
+                                                        };
+                                                        let endpoint_row = render_endpoints(&endpoints);
+                                                        vec![service_row.into_any(), endpoint_row.into_any()]
                                                     })
                                                     .collect::<Vec<_>>()}
                                             </tbody>

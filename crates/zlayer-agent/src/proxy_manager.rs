@@ -16,9 +16,9 @@ use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use zlayer_proxy::{
-    load_existing_certs_into_resolver, CertManager, LbStrategy, LoadBalancer, ProxyConfig,
-    ProxyServer, RouteEntry, ServiceRegistry, SniCertResolver, StreamRegistry, TcpStreamService,
-    UdpStreamService,
+    load_existing_certs_into_resolver, CertManager, LbStrategy, LoadBalancer, NetworkPolicyChecker,
+    ProxyConfig, ProxyServer, RouteEntry, ServiceRegistry, SniCertResolver, StreamRegistry,
+    TcpStreamService, UdpStreamService,
 };
 use zlayer_spec::{ExposeType, Protocol, ServiceSpec};
 
@@ -113,6 +113,8 @@ pub struct ProxyManager {
     udp_listeners: RwLock<HashSet<u16>>,
     /// Number of active proxy connections (for graceful drain on shutdown)
     active_connections: Arc<AtomicU64>,
+    /// Optional network policy checker for access control enforcement
+    network_policy_checker: Option<NetworkPolicyChecker>,
 }
 
 impl ProxyManager {
@@ -136,6 +138,7 @@ impl ProxyManager {
             tcp_listeners: RwLock::new(HashSet::new()),
             udp_listeners: RwLock::new(HashSet::new()),
             active_connections: Arc::new(AtomicU64::new(0)),
+            network_policy_checker: None,
         }
     }
 
@@ -176,6 +179,18 @@ impl ProxyManager {
         self.stream_registry.as_ref()
     }
 
+    /// Set the network policy checker for access control enforcement
+    pub fn set_network_policy_checker(&mut self, checker: NetworkPolicyChecker) {
+        self.network_policy_checker = Some(checker);
+    }
+
+    /// Builder pattern: add network policy checker for access control enforcement
+    #[must_use]
+    pub fn with_network_policy_checker(mut self, checker: NetworkPolicyChecker) -> Self {
+        self.network_policy_checker = Some(checker);
+        self
+    }
+
     /// Start listening on a specific port bound to the given address.
     ///
     /// If already listening on this port, skip.
@@ -196,11 +211,14 @@ impl ProxyManager {
         proxy_config.server.http_addr = addr;
         proxy_config.server.http2_enabled = self.config.http2_enabled;
 
-        let server = ProxyServer::with_registry(
+        let mut server = ProxyServer::with_registry(
             proxy_config,
             self.registry.clone(),
             self.load_balancer.clone(),
         );
+        if let Some(ref checker) = self.network_policy_checker {
+            server = server.with_network_policy_checker(checker.clone());
+        }
         let server = Arc::new(server);
 
         info!(port = port, bind = %addr, "Proxy listening on port");
@@ -249,13 +267,16 @@ impl ProxyManager {
         let mut proxy_config = ProxyConfig::default();
         proxy_config.server.https_addr = addr;
 
-        let server = ProxyServer::with_tls_resolver(
+        let mut server = ProxyServer::with_tls_resolver(
             proxy_config,
             self.registry.clone(),
             self.load_balancer.clone(),
             sni_resolver,
         )
         .with_cert_manager(Arc::clone(cert_manager));
+        if let Some(ref checker) = self.network_policy_checker {
+            server = server.with_network_policy_checker(checker.clone());
+        }
         let server = Arc::new(server);
 
         info!(port = port, bind = %addr, "HTTPS proxy listening on port");

@@ -10233,6 +10233,7 @@ dependencies = [
  "zlayer-builder",
  "zlayer-observability",
  "zlayer-overlay",
+ "zlayer-proxy",
  "zlayer-scheduler",
  "zlayer-secrets",
  "zlayer-spec",

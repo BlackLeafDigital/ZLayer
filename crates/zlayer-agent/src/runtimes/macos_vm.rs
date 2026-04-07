@@ -67,6 +67,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
+use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_spec::ServiceSpec;
 
 // ---------------------------------------------------------------------------
@@ -1244,7 +1245,7 @@ impl Runtime for VmRuntime {
     ///
     /// Reads the console log file. If `tail > 0`, returns only the last
     /// `tail` lines.
-    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<String> {
+    async fn container_logs(&self, id: &ContainerId, tail: usize) -> Result<Vec<LogEntry>> {
         let dir_name = Self::container_dir_name(id);
 
         let log_file = {
@@ -1261,7 +1262,7 @@ impl Runtime for VmRuntime {
         let content = match tokio::fs::read_to_string(&log_file).await {
             Ok(s) => s,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(String::new());
+                return Ok(Vec::new());
             }
             Err(e) => {
                 return Err(AgentError::Internal(format!(
@@ -1271,16 +1272,27 @@ impl Runtime for VmRuntime {
             }
         };
 
+        let now = chrono::Utc::now();
+        let source = LogSource::Container(id.to_string());
+        let mut entries: Vec<LogEntry> = content
+            .lines()
+            .map(|line| LogEntry {
+                timestamp: now,
+                stream: LogStream::Stdout,
+                message: line.to_string(),
+                source: source.clone(),
+                service: None,
+                deployment: None,
+            })
+            .collect();
+
         // Apply tail
-        if tail > 0 {
-            let lines: Vec<&str> = content.lines().collect();
-            if lines.len() > tail {
-                let start = lines.len() - tail;
-                return Ok(lines[start..].join("\n"));
-            }
+        if tail > 0 && entries.len() > tail {
+            let start = entries.len() - tail;
+            entries = entries.split_off(start);
         }
 
-        Ok(content)
+        Ok(entries)
     }
 
     /// Execute a command inside the VM container.
@@ -1440,8 +1452,8 @@ impl Runtime for VmRuntime {
         }
     }
 
-    /// Get container logs as a vector of lines.
-    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<String>> {
+    /// Get container logs as structured entries.
+    async fn get_logs(&self, id: &ContainerId) -> Result<Vec<LogEntry>> {
         let dir_name = Self::container_dir_name(id);
 
         let log_file = {
@@ -1455,13 +1467,31 @@ impl Runtime for VmRuntime {
             container.log_file.clone()
         };
 
-        match tokio::fs::read_to_string(&log_file).await {
-            Ok(content) => Ok(content.lines().map(str::to_string).collect()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(vec![]),
-            Err(e) => Err(AgentError::Internal(format!(
-                "Failed to read VM console log: {e}"
-            ))),
-        }
+        let content = match tokio::fs::read_to_string(&log_file).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(AgentError::Internal(format!(
+                    "Failed to read VM console log: {e}"
+                )));
+            }
+        };
+
+        let now = chrono::Utc::now();
+        let source = LogSource::Container(id.to_string());
+        let entries = content
+            .lines()
+            .map(|line| LogEntry {
+                timestamp: now,
+                stream: LogStream::Stdout,
+                message: line.to_string(),
+                source: source.clone(),
+                service: None,
+                deployment: None,
+            })
+            .collect();
+
+        Ok(entries)
     }
 
     /// Get the PID of a container's main process.

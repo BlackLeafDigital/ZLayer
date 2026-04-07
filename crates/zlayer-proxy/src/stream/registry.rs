@@ -276,6 +276,24 @@ impl StreamRegistry {
         self.udp_services.iter().map(|e| *e.key()).collect()
     }
 
+    /// List all registered TCP services with their listen ports.
+    #[must_use]
+    pub fn list_tcp_services(&self) -> Vec<(u16, StreamService)> {
+        self.tcp_services
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect()
+    }
+
+    /// List all registered UDP services with their listen ports.
+    #[must_use]
+    pub fn list_udp_services(&self) -> Vec<(u16, StreamService)> {
+        self.udp_services
+            .iter()
+            .map(|e| (*e.key(), e.value().clone()))
+            .collect()
+    }
+
     /// Spawn a background health checker that periodically probes all
     /// registered TCP backends with a connect-only health check.
     ///

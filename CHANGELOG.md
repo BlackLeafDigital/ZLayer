@@ -2,9 +2,95 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Networks management page** in ZLayer Manager UI at `/networks`: full CRUD
+  interface for network access-control policies. Displays stats row (total
+  networks, members, rules, active policies), networks table with View/Delete
+  actions, detail modal showing CIDRs as badges, members table with kind badges,
+  and access rules table with allow/deny badges. Create modal accepts name,
+  description, and comma/newline-separated CIDRs. Delete confirmation modal
+  included. API client methods (`list_networks`, `get_network`,
+  `create_network`, `delete_network`) and Leptos server functions added. Sidebar
+  updated with "Networks" link in the Network section.
+- **Network policy enforcement in reverse proxy**: the proxy now evaluates
+  `NetworkPolicySpec` access rules against incoming requests. When a source IP
+  belongs to a network with defined policies, access is allowed or denied based
+  on service/deployment/port rules (deny takes priority, default deny when
+  governed). The `NetworkPolicyChecker` is shared between the API layer and
+  the proxy so that policy changes via the Networks API take effect immediately.
+- **Networks API** (`/api/v1/networks`): CRUD endpoints for network
+  access-control groups. Supports creating, listing, getting, updating, and
+  deleting `NetworkPolicySpec` objects that define membership (users, groups,
+  nodes, CIDRs) and service access rules. Includes `ip_matches_network()`
+  helper for CIDR-based access matching.
+- **`ServiceNetworkSpec` rename**: the per-service overlay/join-policy config
+  formerly named `NetworkSpec` is now `ServiceNetworkSpec` to avoid collision
+  with the new standalone `NetworkPolicySpec` type.
+- **Reverse Proxy management page** in ZLayer Manager UI at `/proxy`: displays
+  proxy stats (total routes, healthy/total backends, TLS certificates, active
+  streams), routes table with expandable backend details and health badges, TLS
+  certificates table with expiry warnings for certificates expiring within 7
+  days, and stream proxies table with TCP/UDP protocol badges. Sidebar updated
+  with "Reverse Proxy" and "SSH Tunnels" links in the Network section.
+- **Proxy management API endpoints** (`GET /api/v1/proxy/{routes,backends,tls,streams}`):
+  read-only REST endpoints for inspecting reverse proxy state. Includes L7
+  route listing, load-balancer backend groups with health status, TLS
+  certificate inventory with expiry/renewal info, and L4 TCP/UDP stream
+  proxies. New getters added to `ServiceRegistry::list_routes()`,
+  `LoadBalancer::{list_service_names, group_snapshot}`,
+  `CertManager::list_cached_domains()`, and
+  `StreamRegistry::{list_tcp_services, list_udp_services}`.
+- **Proxy management API client and server functions** in ZLayer Manager:
+  adds `ProxyRoute`, `ProxyBackendGroup`, `TlsCertificate`, and `StreamProxy`
+  types to the API client with methods `list_proxy_routes()`,
+  `list_proxy_backends()`, `list_tls_certificates()`, and
+  `list_stream_proxies()`. Corresponding Leptos server functions
+  (`get_proxy_routes`, `get_proxy_backends`, `get_tls_certificates`,
+  `get_stream_proxies`) provide data access for the proxy management UI page.
+- **Service endpoint display** in deployment detail modal: each service row now
+  shows its configured endpoints (protocol, port, URL) in an expandable sub-table.
+  Protocol badges use DaisyUI color coding (HTTP=info, HTTPS=success,
+  WebSocket=secondary, gRPC=accent, others=ghost). Services with no endpoints
+  show "No endpoints configured".
+- `ServiceEndpoint` type in Manager server functions for passing endpoint data
+  from the API to the UI.
+- `get_services()` now fetches per-service details to include endpoint
+  information alongside the service summary data.
+
 ## [2026-04-03]
 
 ### Added
+- **Nodes management page** in ZLayer Manager: replaces the "Coming Soon" stub
+  with a live cluster node table sourced from the Raft cluster state. Shows
+  stats row (total nodes, healthy count, leader, cluster health), a table with
+  node ID, address, role (leader/voter/learner badge), overlay IP, status
+  (ready/draining/dead badge), CPU, and memory. Includes a "Generate Join
+  Token" card when a leader is present.
+- `ClusterNodeSummary` in `/api/v1/cluster/nodes` now returns enriched data:
+  `advertise_addr`, `overlay_ip`, `cpu_total`, `cpu_used`, `memory_total`,
+  `memory_used`, `registered_at`, `last_heartbeat`, `role`, and `mode`.
+- `list_cluster_nodes()` method on `ZLayerClient` API client for calling
+  `GET /api/v1/cluster/nodes`.
+- Dashboard `get_system_stats()` now reports real node counts and aggregate
+  CPU/memory usage from cluster state instead of hardcoded zeros.
+
+### Changed
+- Overlay API endpoints (`/api/v1/overlay/status`, `/peers`, `/ip-alloc`, `/dns`)
+  now return real data from the `OverlayManager` and `DnsServer` instead of stub
+  503 responses. `OverlayApiState` holds `Option<Arc<RwLock<OverlayManager>>>` and
+  `Option<Arc<DnsServer>>`; the daemon's `serve` command wires them in from
+  `DaemonState`. When the overlay is unavailable (host networking mode), endpoints
+  return appropriate "unavailable" responses.
+- Added getters on `OverlayManager`: `deployment()`, `global_interface()`,
+  `overlay_port()`, `has_global_transport()`, `service_transport_count()`,
+  `overlay_cidr()`, `ip_alloc_stats()`.
+
+### Added
+- Theme toggle button in Manager navbar: toggles between "dark" and "zlayer"
+  (light) DaisyUI themes with localStorage persistence across page refreshes.
+  Sun icon in dark mode, moon icon in light mode.
 - Structured logging types: `LogEntry`, `LogStream`, `LogSource`, `LogQuery` in
   `zlayer-observability::logs` — unified type for all log sources (containers,
   jobs, builds, daemon) with timestamps and stream identification.

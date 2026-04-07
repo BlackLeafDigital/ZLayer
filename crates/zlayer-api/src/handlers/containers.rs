@@ -235,9 +235,9 @@ fn generate_container_id(name: Option<&str>) -> (String, ContainerId) {
 /// since standalone containers don't need scaling, health checks, etc.
 fn build_service_spec(request: &CreateContainerRequest) -> zlayer_spec::ServiceSpec {
     use zlayer_spec::{
-        CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NetworkSpec,
-        NodeMode, PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceSpec, ServiceType,
-        StorageSpec,
+        CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NodeMode,
+        PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec,
+        ServiceType, StorageSpec,
     };
 
     let command_spec = if let Some(ref cmd) = request.command {
@@ -291,7 +291,7 @@ fn build_service_spec(request: &CreateContainerRequest) -> zlayer_spec::ServiceS
         resources,
         env: request.env.clone(),
         command: command_spec,
-        network: NetworkSpec::default(),
+        network: ServiceNetworkSpec::default(),
         endpoints: Vec::new(),
         scale: ScaleSpec::Manual,
         depends: Vec::new(),

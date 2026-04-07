@@ -6,9 +6,9 @@ use std::time::Duration;
 use tracing::{info, warn};
 use zlayer_spec::{
     CommandSpec, DependencyCondition, DependsSpec, DeploymentSpec, EndpointSpec, ErrorsSpec,
-    ExposeType, HealthCheck, HealthSpec, ImageSpec, InitSpec, NetworkSpec, NodeMode, Protocol,
-    PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceSpec, ServiceType, StorageSpec,
-    StorageTier, TimeoutAction,
+    ExposeType, HealthCheck, HealthSpec, ImageSpec, InitSpec, NodeMode, Protocol, PullPolicy,
+    ResourceType, ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec, ServiceType,
+    StorageSpec, StorageTier, TimeoutAction,
 };
 
 use super::types::{
@@ -55,6 +55,7 @@ pub fn compose_to_deployment(compose: &ComposeFile, name: &str) -> crate::Result
         version: "v1".to_string(),
         deployment: name.to_string(),
         services,
+        externals: HashMap::new(),
         tunnels: HashMap::new(),
         api: zlayer_spec::ApiSpec::default(),
     })
@@ -82,7 +83,7 @@ fn convert_service(svc_name: &str, svc: &ComposeService) -> crate::Result<Servic
         resources,
         env,
         command,
-        network: NetworkSpec::default(),
+        network: ServiceNetworkSpec::default(),
         endpoints,
         scale,
         depends,

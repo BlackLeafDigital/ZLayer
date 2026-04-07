@@ -272,6 +272,28 @@ impl BackendGroup {
 // LoadBalancer
 // ---------------------------------------------------------------------------
 
+/// Point-in-time snapshot of a single backend's state.
+#[derive(Debug, Clone)]
+pub struct BackendSnapshot {
+    /// The backend's network address.
+    pub addr: SocketAddr,
+    /// Whether the backend is currently healthy.
+    pub healthy: bool,
+    /// Number of in-flight connections.
+    pub active_connections: u64,
+    /// Number of consecutive health-check failures.
+    pub consecutive_failures: u64,
+}
+
+/// Point-in-time snapshot of a backend group's state.
+#[derive(Debug, Clone)]
+pub struct BackendGroupSnapshot {
+    /// The load-balancing strategy for this group.
+    pub strategy: LbStrategy,
+    /// Snapshot of each backend in the group.
+    pub backends: Vec<BackendSnapshot>,
+}
+
 /// Top-level load balancer that manages backend groups keyed by service name.
 pub struct LoadBalancer {
     groups: DashMap<String, BackendGroup>,
@@ -371,6 +393,33 @@ impl LoadBalancer {
                 }
             }
         }
+    }
+
+    /// Return the list of registered service names.
+    #[must_use]
+    pub fn list_service_names(&self) -> Vec<String> {
+        self.groups.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Return a snapshot of a backend group's state for a given service.
+    ///
+    /// Each entry contains the backend address, health status, active
+    /// connections, and the group's strategy.
+    #[must_use]
+    pub fn group_snapshot(&self, service: &str) -> Option<BackendGroupSnapshot> {
+        self.groups.get(service).map(|g| BackendGroupSnapshot {
+            strategy: g.strategy,
+            backends: g
+                .backends
+                .iter()
+                .map(|b| BackendSnapshot {
+                    addr: b.addr,
+                    healthy: b.is_healthy(),
+                    active_connections: b.active_connections(),
+                    consecutive_failures: b.consecutive_failures(),
+                })
+                .collect(),
+        })
     }
 
     /// Spawn a background health-check task.
