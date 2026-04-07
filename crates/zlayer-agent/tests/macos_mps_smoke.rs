@@ -422,15 +422,15 @@ services:
         println!("Metal device check exit code: {exit_code}");
 
         let logs = runtime.container_logs(&id, 100).await.expect("logs failed");
-        println!("--- Metal Device Check Output ---\n{logs}");
+        println!("--- Metal Device Check Output ---\n{logs:?}");
 
         assert_eq!(exit_code, 0, "Metal device check should exit 0");
         assert!(
-            logs.contains("METAL_OK"),
-            "Output should contain METAL_OK, got:\n{logs}",
+            logs.iter().any(|e| e.message.contains("METAL_OK")),
+            "Output should contain METAL_OK, got:\n{logs:?}",
         );
         assert!(
-            logs.contains("METAL_DEVICE:"),
+            logs.iter().any(|e| e.message.contains("METAL_DEVICE:")),
             "Output should contain device name"
         );
 
@@ -505,15 +505,15 @@ services:
         println!("MPS compute exit code: {exit_code}");
 
         let logs = runtime.container_logs(&id, 100).await.expect("logs failed");
-        println!("--- MPS Compute Output ---\n{logs}");
+        println!("--- MPS Compute Output ---\n{logs:?}");
 
         assert_eq!(exit_code, 0, "MPS compute should exit 0");
         assert!(
-            logs.contains("MPS_COMPUTE_OK"),
-            "Output should contain MPS_COMPUTE_OK, got:\n{logs}",
+            logs.iter().any(|e| e.message.contains("MPS_COMPUTE_OK")),
+            "Output should contain MPS_COMPUTE_OK, got:\n{logs:?}",
         );
         assert!(
-            logs.contains("1024/1024 correct"),
+            logs.iter().any(|e| e.message.contains("1024/1024 correct")),
             "All 1024 vector additions should be correct"
         );
 
@@ -588,19 +588,19 @@ services:
         println!("Metal shader compile exit code: {exit_code}");
 
         let logs = runtime.container_logs(&id, 100).await.expect("logs failed");
-        println!("--- Metal Shader Compile Output ---\n{logs}");
+        println!("--- Metal Shader Compile Output ---\n{logs:?}");
 
         assert_eq!(exit_code, 0, "Metal shader compile should exit 0");
         assert!(
-            logs.contains("SHADER_COMPUTE_OK"),
-            "Output should contain SHADER_COMPUTE_OK, got:\n{logs}",
+            logs.iter().any(|e| e.message.contains("SHADER_COMPUTE_OK")),
+            "Output should contain SHADER_COMPUTE_OK, got:\n{logs:?}",
         );
         assert!(
-            logs.contains("SHADER_COMPILED:"),
+            logs.iter().any(|e| e.message.contains("SHADER_COMPILED:")),
             "Output should confirm shader was compiled"
         );
         assert!(
-            logs.contains("256/256 correct"),
+            logs.iter().any(|e| e.message.contains("256/256 correct")),
             "All 256 compute results should be correct"
         );
 
@@ -676,16 +676,16 @@ services:
         println!("GPU denied exit code: {exit_code}");
 
         let logs = runtime.container_logs(&id, 100).await.expect("logs failed");
-        println!("--- GPU Denied Output ---\n{logs}");
+        println!("--- GPU Denied Output ---\n{logs:?}");
 
         // The process should fail because runtime disabled GPU access
         assert_ne!(
             exit_code, 0,
-            "Metal should fail when runtime disables GPU, but got exit 0:\n{logs}",
+            "Metal should fail when runtime disables GPU, but got exit 0:\n{logs:?}",
         );
         assert!(
-            logs.contains("METAL_FAIL"),
-            "Output should contain METAL_FAIL, got:\n{logs}",
+            logs.iter().any(|e| e.message.contains("METAL_FAIL")),
+            "Output should contain METAL_FAIL, got:\n{logs:?}",
         );
 
         let _ = runtime.stop_container(&id, Duration::from_secs(5)).await;
