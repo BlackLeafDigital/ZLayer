@@ -113,8 +113,8 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use zlayer_spec::{
-        ApiSpec, CommandSpec, DeploymentSpec, ErrorsSpec, ImageSpec, InitSpec, NetworkSpec,
-        NodeMode, ResourcesSpec, ScaleSpec, ServiceSpec, ServiceType,
+        ApiSpec, CommandSpec, DeploymentSpec, ErrorsSpec, ImageSpec, InitSpec, NodeMode,
+        ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec, ServiceType,
     };
 
     fn create_test_spec(name: &str) -> DeploymentSpec {
@@ -131,7 +131,7 @@ mod tests {
                 resources: ResourcesSpec::default(),
                 env: HashMap::default(),
                 command: CommandSpec::default(),
-                network: NetworkSpec::default(),
+                network: ServiceNetworkSpec::default(),
                 endpoints: vec![],
                 scale: ScaleSpec::default(),
                 depends: vec![],

@@ -7,6 +7,7 @@ use crate::acme::CertManager;
 use crate::config::ProxyConfig;
 use crate::error::{ProxyError, Result};
 use crate::lb::LoadBalancer;
+use crate::network_policy::NetworkPolicyChecker;
 use crate::routes::{transform_path, ResolvedService, ServiceRegistry};
 use bytes::Bytes;
 use http::{header, Request, Response, Uri, Version};
@@ -73,6 +74,8 @@ pub struct ReverseProxyService {
     is_tls: bool,
     /// Certificate manager for ACME challenge responses
     cert_manager: Option<Arc<CertManager>>,
+    /// Optional network policy checker for access control enforcement
+    network_policy_checker: Option<NetworkPolicyChecker>,
 }
 
 impl ReverseProxyService {
@@ -96,6 +99,7 @@ impl ReverseProxyService {
             remote_addr: None,
             is_tls: false,
             cert_manager: None,
+            network_policy_checker: None,
         }
     }
 
@@ -117,6 +121,13 @@ impl ReverseProxyService {
     #[must_use]
     pub fn with_cert_manager(mut self, cm: Arc<CertManager>) -> Self {
         self.cert_manager = Some(cm);
+        self
+    }
+
+    /// Set the network policy checker for access control enforcement
+    #[must_use]
+    pub fn with_network_policy_checker(mut self, checker: NetworkPolicyChecker) -> Self {
+        self.network_policy_checker = Some(checker);
         self
     }
 
@@ -189,6 +200,19 @@ impl ReverseProxyService {
                             "endpoint is internal-only".to_string(),
                         ));
                     }
+                }
+            }
+
+            // Enforce network policy access rules
+            if let (Some(checker), Some(addr)) = (&self.network_policy_checker, self.remote_addr) {
+                if !checker
+                    .check_access(addr.ip(), &resolved.name, "*", resolved.target_port)
+                    .await
+                {
+                    return Err(ProxyError::Forbidden(format!(
+                        "network policy denied access to service '{}'",
+                        resolved.name
+                    )));
                 }
             }
 
@@ -387,6 +411,19 @@ impl ReverseProxyService {
                     );
                 }
                 _ => {}
+            }
+        }
+
+        // Enforce network policy access rules
+        if let (Some(checker), Some(addr)) = (&self.network_policy_checker, self.remote_addr) {
+            if !checker
+                .check_access(addr.ip(), &resolved.name, "*", resolved.target_port)
+                .await
+            {
+                return Err(ProxyError::Forbidden(format!(
+                    "network policy denied access to service '{}'",
+                    resolved.name
+                )));
             }
         }
 

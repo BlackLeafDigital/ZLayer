@@ -7,6 +7,7 @@ use crate::acme::CertManager;
 use crate::config::ProxyConfig;
 use crate::error::{ProxyError, Result};
 use crate::lb::LoadBalancer;
+use crate::network_policy::NetworkPolicyChecker;
 use crate::routes::ServiceRegistry;
 use crate::service::ReverseProxyService;
 use crate::sni_resolver::SniCertResolver;
@@ -38,6 +39,8 @@ pub struct ProxyServer {
     tls_acceptor: Option<TlsAcceptor>,
     /// Certificate manager for ACME challenge responses
     cert_manager: Option<Arc<CertManager>>,
+    /// Optional network policy checker for access control enforcement
+    network_policy_checker: Option<NetworkPolicyChecker>,
 }
 
 impl ProxyServer {
@@ -57,6 +60,7 @@ impl ProxyServer {
             shutdown_rx,
             tls_acceptor: None,
             cert_manager: None,
+            network_policy_checker: None,
         }
     }
 
@@ -90,6 +94,7 @@ impl ProxyServer {
             shutdown_rx,
             tls_acceptor: Some(acceptor),
             cert_manager: None,
+            network_policy_checker: None,
         }
     }
 
@@ -97,6 +102,13 @@ impl ProxyServer {
     #[must_use]
     pub fn with_cert_manager(mut self, cm: Arc<CertManager>) -> Self {
         self.cert_manager = Some(cm);
+        self
+    }
+
+    /// Set the network policy checker for access control enforcement
+    #[must_use]
+    pub fn with_network_policy_checker(mut self, checker: NetworkPolicyChecker) -> Self {
+        self.network_policy_checker = Some(checker);
         self
     }
 
@@ -189,6 +201,7 @@ impl ProxyServer {
                             let load_balancer = self.load_balancer.clone();
                             let config = self.config.clone();
                             let cert_manager = self.cert_manager.clone();
+                            let npc = self.network_policy_checker.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = Self::handle_connection(
@@ -198,6 +211,7 @@ impl ProxyServer {
                                     load_balancer,
                                     config,
                                     cert_manager,
+                                    npc,
                                 ).await {
                                     debug!(
                                         error = %e,
@@ -218,6 +232,7 @@ impl ProxyServer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_connection(
         stream: tokio::net::TcpStream,
         remote_addr: SocketAddr,
@@ -225,6 +240,7 @@ impl ProxyServer {
         load_balancer: Arc<LoadBalancer>,
         config: Arc<ProxyConfig>,
         cert_manager: Option<Arc<CertManager>>,
+        network_policy_checker: Option<NetworkPolicyChecker>,
     ) -> Result<()> {
         let io = TokioIo::new(stream);
 
@@ -232,6 +248,9 @@ impl ProxyServer {
             ReverseProxyService::new(registry, load_balancer, config).with_remote_addr(remote_addr);
         if let Some(cm) = cert_manager {
             service = service.with_cert_manager(cm);
+        }
+        if let Some(checker) = network_policy_checker {
+            service = service.with_network_policy_checker(checker);
         }
 
         let service = service_fn(move |req: Request<Incoming>| {
@@ -378,6 +397,7 @@ impl ProxyServer {
                             let config = self.config.clone();
                             let acceptor = acceptor.clone();
                             let cert_manager = self.cert_manager.clone();
+                            let npc = self.network_policy_checker.clone();
 
                             tokio::spawn(async move {
                                 if let Err(e) = Self::handle_tls_connection(
@@ -388,6 +408,7 @@ impl ProxyServer {
                                     config,
                                     acceptor,
                                     cert_manager,
+                                    npc,
                                 ).await {
                                     debug!(
                                         error = %e,
@@ -408,6 +429,7 @@ impl ProxyServer {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_tls_connection(
         stream: tokio::net::TcpStream,
         remote_addr: SocketAddr,
@@ -416,6 +438,7 @@ impl ProxyServer {
         config: Arc<ProxyConfig>,
         acceptor: TlsAcceptor,
         cert_manager: Option<Arc<CertManager>>,
+        network_policy_checker: Option<NetworkPolicyChecker>,
     ) -> Result<()> {
         // Perform TLS handshake
         let tls_stream = acceptor
@@ -430,6 +453,9 @@ impl ProxyServer {
             .with_tls(true);
         if let Some(cm) = cert_manager {
             service = service.with_cert_manager(cm);
+        }
+        if let Some(checker) = network_policy_checker {
+            service = service.with_network_policy_checker(checker);
         }
 
         let service = service_fn(move |req: Request<Incoming>| {

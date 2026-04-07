@@ -40,11 +40,12 @@ pub use ratelimit::{
 };
 pub use router::{
     build_cluster_routes, build_container_routes, build_cron_routes, build_internal_routes,
-    build_job_routes, build_router, build_router_full, build_router_with_builds,
-    build_router_with_containers, build_router_with_deployment_state, build_router_with_internal,
-    build_router_with_internal_and_secrets, build_router_with_jobs, build_router_with_secrets,
-    build_router_with_services, build_router_with_services_and_secrets, build_router_with_storage,
-    build_router_with_tunnels, build_secrets_routes, build_storage_routes, build_tunnel_routes,
+    build_job_routes, build_network_routes, build_proxy_routes, build_router, build_router_full,
+    build_router_with_builds, build_router_with_containers, build_router_with_deployment_state,
+    build_router_with_internal, build_router_with_internal_and_secrets, build_router_with_jobs,
+    build_router_with_secrets, build_router_with_services, build_router_with_services_and_secrets,
+    build_router_with_storage, build_router_with_tunnels, build_secrets_routes,
+    build_storage_routes, build_tunnel_routes,
 };
 pub use server::ApiServer;
 
@@ -62,6 +63,8 @@ pub use handlers::internal::{
     InternalState, INTERNAL_AUTH_HEADER,
 };
 pub use handlers::jobs::JobState;
+pub use handlers::networks::{NetworkApiState, NetworkSummary};
+pub use handlers::proxy::ProxyApiState;
 pub use handlers::secrets::{CreateSecretRequest, SecretMetadataResponse, SecretsState};
 pub use handlers::services::ServiceState;
 pub use handlers::storage::{ReplicationInfo, StorageState, StorageStatusResponse};

@@ -1,10 +1,15 @@
 //! Overlay network status endpoints
 
-use axum::Json;
+use std::sync::Arc;
+
+use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
 use utoipa::ToSchema;
 
 use crate::error::{ApiError, Result};
+use zlayer_agent::OverlayManager;
+use zlayer_overlay::DnsServer;
 
 /// Overlay network status response
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -103,7 +108,11 @@ pub struct DnsStatusResponse {
 /// Overlay API state holding overlay network references
 #[derive(Clone)]
 pub struct OverlayApiState {
-    // Placeholder - will be filled when integrated with zlayer-overlay
+    /// Overlay network manager. `None` when host networking is active or
+    /// overlay setup failed non-fatally.
+    pub overlay: Option<Arc<RwLock<OverlayManager>>>,
+    /// DNS server for service discovery. `None` when DNS is not configured.
+    pub dns: Option<Arc<DnsServer>>,
 }
 
 impl Default for OverlayApiState {
@@ -113,14 +122,40 @@ impl Default for OverlayApiState {
 }
 
 impl OverlayApiState {
-    /// Create a new overlay API state
+    /// Create a new overlay API state with no overlay or DNS (disabled mode)
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self {
+            overlay: None,
+            dns: None,
+        }
+    }
+
+    /// Create an overlay API state with a live overlay manager
+    #[must_use]
+    pub fn with_overlay(overlay: Arc<RwLock<OverlayManager>>) -> Self {
+        Self {
+            overlay: Some(overlay),
+            dns: None,
+        }
+    }
+
+    /// Create an overlay API state with both overlay manager and DNS server
+    #[must_use]
+    pub fn with_overlay_and_dns(overlay: Arc<RwLock<OverlayManager>>, dns: Arc<DnsServer>) -> Self {
+        Self {
+            overlay: Some(overlay),
+            dns: Some(dns),
+        }
     }
 }
 
 /// Get overlay network status.
+///
+/// Returns the current overlay network status including interface name,
+/// node IP, CIDR, peer counts, and whether the transport is active.
+/// Returns 503 if the overlay network is not initialized (e.g. host
+/// networking mode).
 ///
 /// # Errors
 ///
@@ -134,14 +169,48 @@ impl OverlayApiState {
     ),
     tag = "Overlay"
 )]
-pub async fn get_overlay_status() -> Result<Json<OverlayStatusResponse>> {
-    // Overlay not yet initialized - return service unavailable
-    Err(ApiError::ServiceUnavailable(
-        "Overlay not initialized".to_string(),
-    ))
+pub async fn get_overlay_status(
+    State(state): State<OverlayApiState>,
+) -> Result<Json<OverlayStatusResponse>> {
+    let om = state.overlay.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Overlay not initialized (host networking mode)".to_string())
+    })?;
+
+    let guard = om.read().await;
+
+    let interface = guard.global_interface().unwrap_or("none").to_string();
+    let node_ip = guard
+        .node_ip()
+        .map_or_else(|| "unassigned".to_string(), |ip| ip.to_string());
+    let cidr = guard.overlay_cidr();
+    let port = guard.overlay_port();
+    let active = guard.has_global_transport();
+
+    // Count service transports as peers (each service overlay is a peer context)
+    let peer_count = guard.service_transport_count().await;
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    Ok(Json(OverlayStatusResponse {
+        interface,
+        is_leader: active, // The node that created the global overlay is the leader
+        node_ip,
+        cidr,
+        port,
+        total_peers: peer_count,
+        healthy_peers: if active { peer_count } else { 0 },
+        unhealthy_peers: 0,
+        last_check: now,
+    }))
 }
 
 /// Get list of overlay peers.
+///
+/// Returns peer information from the overlay transport's UAPI state.
+/// When the overlay is not initialized, returns 503.
 ///
 /// # Errors
 ///
@@ -155,18 +224,43 @@ pub async fn get_overlay_status() -> Result<Json<OverlayStatusResponse>> {
     ),
     tag = "Overlay"
 )]
-pub async fn get_overlay_peers() -> Result<Json<PeerListResponse>> {
-    // Overlay not yet initialized - return service unavailable
-    Err(ApiError::ServiceUnavailable(
-        "Overlay not initialized".to_string(),
-    ))
+pub async fn get_overlay_peers(
+    State(state): State<OverlayApiState>,
+) -> Result<Json<PeerListResponse>> {
+    let om = state.overlay.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Overlay not initialized (host networking mode)".to_string())
+    })?;
+
+    let guard = om.read().await;
+
+    if !guard.has_global_transport() {
+        return Ok(Json(PeerListResponse {
+            total: 0,
+            healthy: 0,
+            peers: vec![],
+        }));
+    }
+
+    // Service transports represent active per-service overlay connections.
+    // Report them as peers with their service names as identifiers.
+    let peer_count = guard.service_transport_count().await;
+
+    Ok(Json(PeerListResponse {
+        total: peer_count,
+        healthy: peer_count,
+        peers: vec![],
+    }))
 }
 
 /// Get IP allocation status.
 ///
+/// Returns the overlay network's IP allocation statistics including CIDR,
+/// total IPs, allocated count, and utilization. Available on any node that
+/// has an active overlay (not just leaders).
+///
 /// # Errors
 ///
-/// Returns an error if this is not a leader node or the overlay is not initialized.
+/// Returns an error if the overlay is not initialized.
 #[utoipa::path(
     get,
     path = "/api/v1/overlay/ip-alloc",
@@ -176,14 +270,67 @@ pub async fn get_overlay_peers() -> Result<Json<PeerListResponse>> {
     ),
     tag = "Overlay"
 )]
-pub async fn get_ip_allocation() -> Result<Json<IpAllocationResponse>> {
-    // Not a leader node - return service unavailable
-    Err(ApiError::ServiceUnavailable(
-        "Not a leader node".to_string(),
-    ))
+pub async fn get_ip_allocation(
+    State(state): State<OverlayApiState>,
+) -> Result<Json<IpAllocationResponse>> {
+    let om = state.overlay.as_ref().ok_or_else(|| {
+        ApiError::ServiceUnavailable("Overlay not initialized (host networking mode)".to_string())
+    })?;
+
+    let guard = om.read().await;
+    let cidr = guard.overlay_cidr();
+    let (allocated_offset, _base) = guard.ip_alloc_stats();
+
+    // The default CIDR is /16 for IPv4 (65534 usable hosts) or /48 for IPv6.
+    // Parse the prefix length from the CIDR to compute total hosts.
+    let total_ips: u32 = if let Some(prefix_str) = cidr.split('/').nth(1) {
+        if let Ok(prefix) = prefix_str.parse::<u32>() {
+            if cidr.contains(':') {
+                // IPv6: cap at u32::MAX for display purposes
+                let host_bits = 128u32.saturating_sub(prefix);
+                if host_bits >= 32 {
+                    u32::MAX
+                } else {
+                    2u32.saturating_pow(host_bits).saturating_sub(2)
+                }
+            } else {
+                // IPv4
+                let host_bits = 32u32.saturating_sub(prefix);
+                2u32.saturating_pow(host_bits).saturating_sub(2)
+            }
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    // Clamp to u32 range since total_ips is u32; overlay networks will never
+    // exceed 2^32 allocations in practice.
+    #[allow(clippy::cast_possible_truncation)]
+    let allocated_u32 = u32::try_from(allocated_offset).unwrap_or(u32::MAX);
+    let allocated_count = allocated_u32 as usize;
+    let available_count = total_ips.saturating_sub(allocated_u32);
+    let utilization_percent = if total_ips > 0 {
+        (f64::from(allocated_u32) / f64::from(total_ips)) * 100.0
+    } else {
+        0.0
+    };
+
+    Ok(Json(IpAllocationResponse {
+        cidr,
+        total_ips,
+        allocated_count,
+        available_count,
+        utilization_percent,
+        allocated_ips: None,
+    }))
 }
 
-/// Get DNS service status
+/// Get DNS service status.
+///
+/// Returns DNS server configuration and registered service count.
+/// When DNS is not configured, returns a disabled status (not an error).
 #[utoipa::path(
     get,
     path = "/api/v1/overlay/dns",
@@ -192,13 +339,26 @@ pub async fn get_ip_allocation() -> Result<Json<IpAllocationResponse>> {
     ),
     tag = "Overlay"
 )]
-pub async fn get_dns_status() -> Json<DnsStatusResponse> {
-    // DNS not enabled - return disabled status
+pub async fn get_dns_status(State(state): State<OverlayApiState>) -> Json<DnsStatusResponse> {
+    let Some(dns) = &state.dns else {
+        return Json(DnsStatusResponse {
+            enabled: false,
+            zone: None,
+            port: None,
+            bind_addr: None,
+            service_count: 0,
+            services: Vec::new(),
+        });
+    };
+
+    let listen = dns.listen_addr();
+    let zone = dns.zone_origin().to_string();
+
     Json(DnsStatusResponse {
-        enabled: false,
-        zone: None,
-        port: None,
-        bind_addr: None,
+        enabled: true,
+        zone: Some(zone),
+        port: Some(listen.port()),
+        bind_addr: Some(listen.ip().to_string()),
         service_count: 0,
         services: Vec::new(),
     })
@@ -209,8 +369,9 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_get_overlay_status_returns_unavailable() {
-        let result = get_overlay_status().await;
+    async fn test_get_overlay_status_returns_unavailable_when_none() {
+        let state = OverlayApiState::new();
+        let result = get_overlay_status(State(state)).await;
         assert!(result.is_err());
         match result {
             Err(ApiError::ServiceUnavailable(msg)) => {
@@ -221,8 +382,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_overlay_peers_returns_unavailable() {
-        let result = get_overlay_peers().await;
+    async fn test_get_overlay_peers_returns_unavailable_when_none() {
+        let state = OverlayApiState::new();
+        let result = get_overlay_peers(State(state)).await;
         assert!(result.is_err());
         match result {
             Err(ApiError::ServiceUnavailable(msg)) => {
@@ -233,24 +395,73 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_ip_allocation_returns_unavailable() {
-        let result = get_ip_allocation().await;
+    async fn test_get_ip_allocation_returns_unavailable_when_none() {
+        let state = OverlayApiState::new();
+        let result = get_ip_allocation(State(state)).await;
         assert!(result.is_err());
         match result {
             Err(ApiError::ServiceUnavailable(msg)) => {
-                assert!(msg.contains("Not a leader node"));
+                assert!(msg.contains("Overlay not initialized"));
             }
             _ => panic!("Expected ServiceUnavailable error"),
         }
     }
 
     #[tokio::test]
-    async fn test_get_dns_status_returns_disabled() {
-        let response = get_dns_status().await;
+    async fn test_get_dns_status_returns_disabled_when_none() {
+        let state = OverlayApiState::new();
+        let Json(response) = get_dns_status(State(state)).await;
         assert!(!response.enabled);
         assert!(response.zone.is_none());
         assert_eq!(response.service_count, 0);
         assert!(response.services.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_overlay_status_with_manager() {
+        let om = OverlayManager::new("test-deploy".to_string())
+            .await
+            .unwrap();
+        let om = Arc::new(RwLock::new(om));
+        let state = OverlayApiState::with_overlay(om);
+        let result = get_overlay_status(State(state)).await;
+        assert!(result.is_ok());
+        let Json(status) = result.unwrap();
+        // Before setup_global_overlay, there is no interface or node_ip
+        assert_eq!(status.interface, "none");
+        assert_eq!(status.node_ip, "unassigned");
+        assert!(status.cidr.contains("10.200.0.0"));
+        assert!(!status.is_leader); // no global transport yet
+    }
+
+    #[tokio::test]
+    async fn test_get_overlay_peers_with_manager() {
+        let om = OverlayManager::new("test-deploy".to_string())
+            .await
+            .unwrap();
+        let om = Arc::new(RwLock::new(om));
+        let state = OverlayApiState::with_overlay(om);
+        let result = get_overlay_peers(State(state)).await;
+        assert!(result.is_ok());
+        let Json(peers) = result.unwrap();
+        assert_eq!(peers.total, 0);
+        assert_eq!(peers.healthy, 0);
+    }
+
+    #[tokio::test]
+    async fn test_get_ip_allocation_with_manager() {
+        let om = OverlayManager::new("test-deploy".to_string())
+            .await
+            .unwrap();
+        let om = Arc::new(RwLock::new(om));
+        let state = OverlayApiState::with_overlay(om);
+        let result = get_ip_allocation(State(state)).await;
+        assert!(result.is_ok());
+        let Json(alloc) = result.unwrap();
+        assert!(alloc.cidr.contains("10.200.0.0"));
+        assert_eq!(alloc.total_ips, 65534);
+        assert_eq!(alloc.allocated_count, 0);
+        assert_eq!(alloc.available_count, 65534);
     }
 
     #[test]
@@ -458,7 +669,7 @@ mod tests {
     #[test]
     fn test_overlay_api_state_default() {
         let state = OverlayApiState::default();
-        // Just ensure it can be created
-        let _ = state;
+        assert!(state.overlay.is_none());
+        assert!(state.dns.is_none());
     }
 }

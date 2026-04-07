@@ -15,7 +15,8 @@ use leptos_router::{
 
 use components::{Navbar, Sidebar};
 use pages::{
-    Builds, Dashboard, Deployments, Git, Jobs, Networking, Nodes, Overlay, Settings, SshTunnels,
+    Builds, Dashboard, Deployments, Git, Jobs, Networking, Networks, Nodes, Overlay, Proxy,
+    Settings, SshTunnels,
 };
 
 /// Shell component providing HTML structure for both SSR and hydration.
@@ -59,7 +60,9 @@ pub fn App() -> impl IntoView {
                             <Route path=path!("/nodes") view=Nodes />
                             <Route path=path!("/deployments") view=Deployments />
                             <Route path=path!("/networking") view=Networking />
+                            <Route path=path!("/networks") view=Networks />
                             <Route path=path!("/overlay") view=Overlay />
+                            <Route path=path!("/proxy") view=Proxy />
                             <Route path=path!("/ssh-tunnels") view=SshTunnels />
                             <Route path=path!("/git") view=Git />
                             <Route path=path!("/builds") view=Builds />

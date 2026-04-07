@@ -1248,7 +1248,7 @@ mod tests {
             resources: ResourcesSpec::default(),
             env: HashMap::new(),
             command: CommandSpec::default(),
-            network: NetworkSpec::default(),
+            network: ServiceNetworkSpec::default(),
             endpoints,
             scale: ScaleSpec::default(),
             depends: vec![],

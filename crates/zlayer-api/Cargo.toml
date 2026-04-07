@@ -15,6 +15,7 @@ readme = "README.md"
 zlayer-agent.workspace = true
 zlayer-builder.workspace = true
 zlayer-overlay.workspace = true
+zlayer-proxy.workspace = true
 zlayer-spec.workspace = true
 zlayer-scheduler.workspace = true
 zlayer-observability.workspace = true

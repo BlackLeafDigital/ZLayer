@@ -13,10 +13,11 @@ use zlayer_api::handlers::nodes::NodeApiState;
 use zlayer_api::handlers::overlay::OverlayApiState;
 use zlayer_api::router::{
     build_cluster_routes, build_container_routes, build_cron_routes, build_job_routes,
-    build_node_routes, build_overlay_routes, build_tunnel_routes,
+    build_network_routes, build_node_routes, build_overlay_routes, build_tunnel_routes,
 };
 use zlayer_api::{
-    ApiConfig, ApiServer, BuildState, ContainerApiState, CronState, JobState, TunnelApiState,
+    ApiConfig, ApiServer, BuildState, ContainerApiState, CronState, JobState, NetworkApiState,
+    TunnelApiState,
 };
 use zlayer_overlay::IpAllocator;
 
@@ -509,6 +510,11 @@ pub(crate) async fn serve(
         config
     });
 
+    // Shared network policy list — the proxy and API both hold a reference.
+    let network_policies = std::sync::Arc::new(tokio::sync::RwLock::new(Vec::<
+        zlayer_spec::NetworkPolicySpec,
+    >::new()));
+
     let config = DaemonConfig {
         host_network,
         data_dir,
@@ -520,6 +526,7 @@ pub(crate) async fn serve(
             jwt_secret: jwt_secret_raw.clone(),
             socket_path: socket_path.to_string(),
         }),
+        network_policies: Some(std::sync::Arc::clone(&network_policies)),
         ..Default::default()
     };
 
@@ -555,8 +562,8 @@ pub(crate) async fn serve(
         storage,
         secrets,
         credential_store,
-        stream_registry: _stream_registry,
-        cert_manager: _cert_manager,
+        stream_registry,
+        cert_manager,
         log_rotator_handle,
         health_checker_handle,
         node_config,
@@ -720,13 +727,24 @@ pub(crate) async fn serve(
     let secrets_routes = zlayer_api::build_secrets_routes(secrets_state);
     let mut router = base_router.nest("/api/v1/secrets", secrets_routes);
 
+    // Merge network access-control routes (shares the same policy list as the proxy)
+    let network_state = NetworkApiState {
+        networks: std::sync::Arc::clone(&network_policies),
+    };
+    let network_routes = build_network_routes(network_state);
+    router = router.nest("/api/v1/networks", network_routes);
+
     // Merge node management routes
     let node_state = NodeApiState::new();
     let node_routes = build_node_routes(node_state);
     router = router.nest("/api/v1/nodes", node_routes);
 
-    // Merge overlay network routes
-    let overlay_state = OverlayApiState::new();
+    // Merge overlay network routes with real overlay manager and DNS references
+    let overlay_state = match (&overlay, &dns) {
+        (Some(om), Some(d)) => OverlayApiState::with_overlay_and_dns(Arc::clone(om), Arc::clone(d)),
+        (Some(om), None) => OverlayApiState::with_overlay(Arc::clone(om)),
+        _ => OverlayApiState::new(),
+    };
     let overlay_routes = build_overlay_routes(overlay_state);
     router = router.nest("/api/v1/overlay", overlay_routes);
 
@@ -734,6 +752,16 @@ pub(crate) async fn serve(
     let tunnel_state = TunnelApiState::new();
     let tunnel_routes = build_tunnel_routes(tunnel_state);
     router = router.nest("/api/v1/tunnels", tunnel_routes);
+
+    // Merge proxy status routes
+    let proxy_state = zlayer_api::ProxyApiState {
+        registry: Some(proxy.registry()),
+        load_balancer: Some(proxy.load_balancer()),
+        cert_manager: Some(Arc::clone(&cert_manager)),
+        stream_registry: Some(Arc::clone(&stream_registry)),
+    };
+    let proxy_routes = zlayer_api::build_proxy_routes(proxy_state);
+    router = router.nest("/api/v1/proxy", proxy_routes);
 
     // Merge storage replication status routes
     let storage_api_state = zlayer_api::StorageState::new(replicator);

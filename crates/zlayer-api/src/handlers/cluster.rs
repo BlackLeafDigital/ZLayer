@@ -104,16 +104,32 @@ pub struct ClusterPeer {
 pub struct ClusterNodeSummary {
     /// UUID or Raft-level ID
     pub id: String,
-    /// Network address
+    /// Network address (Raft RPC address)
     pub address: String,
-    /// Current status (e.g. "ready", "unknown")
+    /// Advertise address (public IP)
+    pub advertise_addr: String,
+    /// Current status (e.g. "ready", "draining", "dead")
     pub status: String,
-    /// Role: "leader" or "worker"
+    /// Role in the Raft cluster: "leader", "voter", or "learner"
+    pub role: String,
+    /// Join mode: "full" or "replicate"
     pub mode: String,
-    /// Services running on this node
-    pub services: Vec<String>,
     /// Whether this node is the Raft leader
     pub is_leader: bool,
+    /// Overlay network IP assigned to this node
+    pub overlay_ip: String,
+    /// Total CPU cores on this node
+    pub cpu_total: f64,
+    /// Current CPU usage (cores)
+    pub cpu_used: f64,
+    /// Total memory in bytes
+    pub memory_total: u64,
+    /// Current memory usage in bytes
+    pub memory_used: u64,
+    /// When the node was registered (Unix timestamp ms)
+    pub registered_at: u64,
+    /// Last heartbeat timestamp (Unix timestamp ms)
+    pub last_heartbeat: u64,
 }
 
 // =============================================================================
@@ -435,7 +451,7 @@ pub async fn cluster_list_nodes(
         .nodes
         .values()
         .map(|n| {
-            let mode = if Some(n.node_id) == leader_id {
+            let role = if Some(n.node_id) == leader_id {
                 "leader".to_string()
             } else if voter_ids.contains(&n.node_id) {
                 "voter".to_string()
@@ -446,10 +462,18 @@ pub async fn cluster_list_nodes(
             ClusterNodeSummary {
                 id: format!("{}", n.node_id),
                 address: n.address.clone(),
+                advertise_addr: n.advertise_addr.clone(),
                 status: n.status.clone(),
-                mode,
-                services: Vec::new(),
+                role,
+                mode: n.mode.clone(),
                 is_leader: Some(n.node_id) == leader_id,
+                overlay_ip: n.overlay_ip.clone(),
+                cpu_total: n.cpu_total,
+                cpu_used: n.cpu_used,
+                memory_total: n.memory_total,
+                memory_used: n.memory_used,
+                registered_at: n.registered_at,
+                last_heartbeat: n.last_heartbeat,
             }
         })
         .collect();

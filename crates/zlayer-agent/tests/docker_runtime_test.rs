@@ -20,8 +20,8 @@ use std::time::Duration;
 use zlayer_agent_zql::runtimes::DockerRuntime;
 use zlayer_agent_zql::{ContainerId, ContainerState, Runtime};
 use zlayer_spec::{
-    CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NetworkSpec, NodeMode,
-    PullPolicy, ResourceType, ResourcesSpec, ScaleSpec, ServiceSpec, ServiceType,
+    CommandSpec, ErrorsSpec, HealthCheck, HealthSpec, ImageSpec, InitSpec, NodeMode, PullPolicy,
+    ResourceType, ResourcesSpec, ScaleSpec, ServiceNetworkSpec, ServiceSpec, ServiceType,
 };
 
 // =============================================================================
@@ -80,7 +80,7 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         resources: ResourcesSpec::default(),
         env: HashMap::new(),
         command: CommandSpec::default(),
-        network: NetworkSpec::default(),
+        network: ServiceNetworkSpec::default(),
         endpoints: vec![],
         scale: ScaleSpec::default(),
         depends: vec![],

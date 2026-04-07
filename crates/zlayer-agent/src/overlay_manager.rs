@@ -461,6 +461,48 @@ impl OverlayManager {
         self.node_ip
     }
 
+    /// Returns the deployment name this overlay manager was created for.
+    pub fn deployment(&self) -> &str {
+        &self.deployment
+    }
+
+    /// Returns the global overlay interface name, if one has been created.
+    pub fn global_interface(&self) -> Option<&str> {
+        self.global_interface.as_deref()
+    }
+
+    /// Returns the `WireGuard` listen port for the overlay network.
+    pub fn overlay_port(&self) -> u16 {
+        self.overlay_port
+    }
+
+    /// Returns `true` if the global overlay transport is active.
+    pub fn has_global_transport(&self) -> bool {
+        self.global_transport.is_some()
+    }
+
+    /// Returns the number of service-specific overlay transports currently active.
+    pub async fn service_transport_count(&self) -> usize {
+        self.service_transports.read().await.len()
+    }
+
+    /// Returns the CIDR string for the overlay IP allocator.
+    pub fn overlay_cidr(&self) -> String {
+        match self.ip_allocator.base {
+            IpAddr::V4(_) => format!("{}/16", self.ip_allocator.base),
+            IpAddr::V6(_) => format!("{}/48", self.ip_allocator.base),
+        }
+    }
+
+    /// Returns IP allocation statistics: (`allocated_count`, `next_offset`).
+    pub fn ip_alloc_stats(&self) -> (u64, IpAddr) {
+        let offset = self
+            .ip_allocator
+            .next_offset
+            .load(std::sync::atomic::Ordering::SeqCst);
+        (offset.saturating_sub(1), self.ip_allocator.base)
+    }
+
     #[allow(clippy::unused_self)]
     fn build_config(
         &self,

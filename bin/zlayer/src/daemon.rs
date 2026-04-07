@@ -66,6 +66,10 @@ pub struct DaemonConfig {
     /// Auth context injected into every container so it can call back to the
     /// host API.  Built from the JWT secret and bind address in `serve()`.
     pub auth_context: Option<zlayer_agent::ContainerAuthContext>,
+
+    /// Shared network policy list for proxy access control enforcement.
+    /// When populated, the proxy checks incoming requests against these policies.
+    pub network_policies: Option<Arc<RwLock<Vec<zlayer_spec::NetworkPolicySpec>>>>,
 }
 
 impl Default for DaemonConfig {
@@ -83,6 +87,7 @@ impl Default for DaemonConfig {
             run_dir,
             s3_storage: None,
             auth_context: None,
+            network_policies: None,
         }
     }
 }
@@ -413,6 +418,11 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
         Some(Arc::clone(&cert_manager)),
     );
     proxy_builder.set_stream_registry(Arc::clone(&stream_registry));
+    if let Some(ref policies) = config.network_policies {
+        proxy_builder.set_network_policy_checker(zlayer_proxy::NetworkPolicyChecker::new(
+            Arc::clone(policies),
+        ));
+    }
     let proxy = Arc::new(proxy_builder);
     info!("Proxy manager initialised (with L4 stream + TLS support)");
 

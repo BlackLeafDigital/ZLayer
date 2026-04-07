@@ -37,6 +37,7 @@
 // Core modules
 pub mod config;
 pub mod error;
+pub mod network_policy;
 pub mod server;
 pub mod service;
 pub mod tls;
@@ -57,6 +58,7 @@ pub use config::{
     HeaderConfig, PoolConfig, ProxyConfig, ServerConfig, TimeoutConfig, TlsConfig, TlsVersion,
 };
 pub use error::{ProxyError, Result};
+pub use network_policy::NetworkPolicyChecker;
 pub use server::ProxyServer;
 pub use service::{empty_body, full_body, BoxBody, ReverseProxyService};
 pub use tls::{create_tls_acceptor, TlsServerConfig};
@@ -65,10 +67,13 @@ pub use tunnel::{
 };
 
 // Re-export load balancer types
-pub use lb::{Backend, BackendGroup, ConnectionGuard, HealthStatus, LbStrategy, LoadBalancer};
+pub use lb::{
+    Backend, BackendGroup, BackendGroupSnapshot, BackendSnapshot, ConnectionGuard, HealthStatus,
+    LbStrategy, LoadBalancer,
+};
 
 // Re-export service routing types
-pub use acme::CertManager;
+pub use acme::{CertManager, CertMetadata};
 pub use routes::{ResolvedService, RouteEntry, ServiceRegistry};
 pub use sni_resolver::SniCertResolver;
 
