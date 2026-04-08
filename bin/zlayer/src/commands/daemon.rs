@@ -210,11 +210,10 @@ async fn install(
         }
 
         print!("Daemon starting...");
-        match wait_for_daemon_ready(data_dir, 45).await {
+        match wait_for_daemon_ready(45).await {
             Ok(()) => {
                 let _ = std::fs::remove_file(&spawner_pid_path);
                 println!(" started");
-                println!("  Logs: {log_path_str}");
                 println!("  Stop: zlayer daemon stop");
             }
             Err(e) => {
@@ -290,7 +289,7 @@ async fn start(data_dir: &Path) -> Result<()> {
     }
 
     print!("Daemon starting...");
-    match wait_for_daemon_ready(data_dir, 45).await {
+    match wait_for_daemon_ready(45).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
             println!(" started");
@@ -529,7 +528,7 @@ async fn install(
         String::new()
     };
 
-    // Compute log_dir early so it's available for pre-creation and rotate.
+    // Pre-create log directory so tracing-appender can write on first start.
     let log_dir = crate::cli::default_log_dir(data_dir);
 
     let unit = format!(
@@ -540,17 +539,17 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 ExecStart={exec_start}
 ExecReload=/bin/kill -HUP $MAINPID
+TimeoutStartSec=60
 Restart=always
 RestartSec=5
 LimitNOFILE=1048576
 LimitNPROC=infinity
 LimitCORE=infinity
-LogsDirectory=zlayer
-StandardOutput=journal
-StandardError=journal
+Delegate=yes
+KillMode=process
 {env_line}
 [Install]
 WantedBy=multi-user.target
@@ -633,8 +632,6 @@ WantedBy=multi-user.target
         let spawner_pid_path = data_dir.join("spawner.pid");
         std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
 
-        rotate_daemon_log(&log_dir);
-
         let start_args = systemctl_args(&["start", UNIT_NAME]);
         let out = Command::new("systemctl")
             .args(&start_args)
@@ -648,11 +645,10 @@ WantedBy=multi-user.target
         }
 
         print!("Daemon starting...");
-        match wait_for_daemon_ready(data_dir, 45).await {
+        match wait_for_daemon_ready(45).await {
             Ok(()) => {
                 let _ = std::fs::remove_file(&spawner_pid_path);
                 println!(" started via systemd");
-                println!("  Logs: {}", log_dir.display());
                 println!("  Stop: zlayer daemon stop");
             }
             Err(e) => {
@@ -703,9 +699,6 @@ async fn start(data_dir: &Path) -> Result<()> {
     let spawner_pid_path = data_dir.join("spawner.pid");
     std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
 
-    let log_dir = crate::cli::default_log_dir(data_dir);
-    rotate_daemon_log(&log_dir);
-
     let args = systemctl_args(&["start", UNIT_NAME]);
     let out = Command::new("systemctl")
         .args(&args)
@@ -719,11 +712,10 @@ async fn start(data_dir: &Path) -> Result<()> {
     }
 
     print!("Daemon starting...");
-    match wait_for_daemon_ready(data_dir, 45).await {
+    match wait_for_daemon_ready(45).await {
         Ok(()) => {
             let _ = std::fs::remove_file(&spawner_pid_path);
             println!(" started");
-            println!("  Logs: {}", log_dir.display());
             println!("  Stop: zlayer daemon stop");
         }
         Err(e) => {
@@ -811,125 +803,99 @@ async fn status(data_dir: &Path) -> Result<()> {
 // Log helpers (shared across platforms)
 // ---------------------------------------------------------------------------
 
-/// Rotate the current day's daemon log file before a fresh start,
-/// ensuring that failure output is always from the current attempt.
-#[cfg(target_os = "linux")]
-fn rotate_daemon_log(log_dir: &std::path::Path) {
-    // tracing-appender daily files are named `{prefix}.{YYYY-MM-DD}`
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    let current = log_dir.join(format!("daemon.{today}"));
-    if current.exists() {
-        let prev = log_dir.join(format!("daemon.{today}.prev"));
-        let _ = std::fs::rename(&current, &prev);
-    }
-}
-
-/// Find the newest `daemon.*` log file (tracing-appender daily format).
-fn find_newest_daemon_log(log_dir: &std::path::Path) -> std::path::PathBuf {
-    // Look for tracing-appender daily files: daemon.YYYY-MM-DD
-    if let Ok(entries) = std::fs::read_dir(log_dir) {
-        let mut daemon_files: Vec<std::path::PathBuf> = entries
-            .filter_map(std::result::Result::ok)
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    n.starts_with("daemon.")
-                        && !std::path::Path::new(n)
-                            .extension()
-                            .is_some_and(|ext| ext.eq_ignore_ascii_case("prev"))
-                })
-            })
-            .collect();
-        daemon_files.sort();
-        if let Some(newest) = daemon_files.pop() {
-            return newest;
-        }
-    }
-    // Fallback to old name
-    log_dir.join("daemon.log")
-}
-
 // ---------------------------------------------------------------------------
 // Readiness check (shared across platforms)
 // ---------------------------------------------------------------------------
 
-/// Poll for daemon readiness by watching for `daemon.json` to appear.
+/// Poll for daemon readiness by connecting to the API socket.
 ///
-/// The `zlayer serve` process writes `daemon.json` after all infrastructure
-/// phases complete successfully. If it crashes during init, the file is never
-/// created. On timeout, the last 20 lines of the newest daemon log are
-/// included in the error to surface the actual failure reason.
-#[allow(unsafe_code)]
-async fn wait_for_daemon_ready(data_dir: &Path, timeout_secs: u64) -> Result<()> {
-    let metadata_path = data_dir.join("daemon.json");
-    let poll_interval = std::time::Duration::from_millis(250);
-    let max_attempts = (timeout_secs * 1000) / 250;
+/// The API socket is the unified readiness signal: the daemon binds it only
+/// after all infrastructure phases (overlay, raft, storage, API routes)
+/// complete.  A successful health-checked connection means the daemon is
+/// fully ready.  This works identically on Linux, macOS, and WSL.
+///
+/// On timeout, [`get_daemon_failure_context`] auto-surfaces the error from
+/// the OS service manager (systemctl/journalctl on Linux, the stderr log on
+/// macOS) so the user sees why it failed without running a separate command.
+async fn wait_for_daemon_ready(timeout_secs: u64) -> Result<()> {
+    let poll_interval = std::time::Duration::from_millis(500);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
-    for _ in 0..max_attempts {
-        tokio::time::sleep(poll_interval).await;
-        if metadata_path.exists() {
-            return Ok(());
+    loop {
+        match crate::daemon_client::DaemonClient::try_connect().await {
+            Ok(Some(_)) => return Ok(()),
+            _ if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(poll_interval).await;
+            }
+            _ => break,
         }
     }
 
-    // Daemon didn't come up — surface the error from the log
-    let log_dir = crate::cli::default_log_dir(data_dir);
-    let log_path = find_newest_daemon_log(&log_dir);
-    #[allow(unused_mut)]
-    let mut tail = if log_path.exists() {
-        std::fs::read_to_string(&log_path)
-            .ok()
-            .map(|content| {
-                let lines: Vec<&str> = content.lines().collect();
-                let start = lines.len().saturating_sub(20);
-                lines[start..].join("\n")
-            })
-            .unwrap_or_default()
-    } else {
-        String::new()
-    };
+    let error_context = get_daemon_failure_context();
+    bail!("Daemon failed to start within {timeout_secs}s.\n{error_context}");
+}
 
-    // If no log file output, try journalctl as a fallback (Linux/systemd)
+/// Auto-surface error context from the OS service manager when the daemon
+/// fails to start.  On Linux, pulls from `systemctl status` and journalctl.
+/// On macOS, reads the stderr log from the launchd plist's `StandardErrorPath`.
+#[allow(unused_variables, unsafe_code)]
+fn get_daemon_failure_context() -> String {
+    let mut context = String::new();
+
     #[cfg(target_os = "linux")]
-    if tail.is_empty() {
-        let is_root = unsafe { libc::geteuid() } == 0;
-        let mut jctl_args = vec!["--no-pager", "-n", "20", "-u", "zlayer", "--output", "cat"];
-        if !is_root {
-            jctl_args.insert(0, "--user");
+    {
+        // systemctl status includes exit code and the last few journal lines
+        let args = systemctl_args(&["status", UNIT_NAME]);
+        if let Ok(out) = std::process::Command::new("systemctl").args(&args).output() {
+            let status = String::from_utf8_lossy(&out.stdout);
+            if !status.trim().is_empty() {
+                context.push_str(&status);
+                context.push('\n');
+            }
         }
-        if let Ok(output) = std::process::Command::new("journalctl")
-            .args(&jctl_args)
-            .output()
-        {
-            let journal = String::from_utf8_lossy(&output.stdout);
-            if !journal.trim().is_empty() {
-                tail = journal.into_owned();
+        // If status output is sparse, pull more lines from the journal
+        if context.len() < 100 {
+            let is_root = unsafe { libc::geteuid() } == 0;
+            let mut jctl_args = vec!["--no-pager", "-n", "30", "-u", "zlayer", "--output", "cat"];
+            if !is_root {
+                jctl_args.insert(0, "--user");
+            }
+            if let Ok(out) = std::process::Command::new("journalctl")
+                .args(&jctl_args)
+                .output()
+            {
+                let journal = String::from_utf8_lossy(&out.stdout);
+                if !journal.trim().is_empty() {
+                    context.push_str(&journal);
+                }
             }
         }
     }
 
-    if tail.is_empty() {
-        #[cfg(target_os = "linux")]
-        {
-            let is_root = unsafe { libc::geteuid() } == 0;
-            let jctl_hint = if is_root {
-                "journalctl -u zlayer --no-pager -n 50"
-            } else {
-                "journalctl --user -u zlayer --no-pager -n 50"
-            };
-            bail!(
-                "Daemon failed to start within {timeout_secs}s (no log output found).\n\
-                 Check: {jctl_hint}"
+    #[cfg(target_os = "macos")]
+    {
+        // Read the stderr log from the plist's StandardErrorPath
+        let log_dir =
+            crate::cli::default_log_dir(std::path::Path::new(&crate::cli::default_data_dir()));
+        let log_path = log_dir.join("daemon.log");
+        if let Ok(content) = std::fs::read_to_string(&log_path) {
+            let lines: Vec<&str> = content.lines().collect();
+            let start = lines.len().saturating_sub(20);
+            context = lines[start..].join("\n");
+        }
+        if context.trim().is_empty() {
+            context = format!(
+                "No log output found. Check: {}/daemon.log",
+                log_dir.display()
             );
         }
-        #[cfg(not(target_os = "linux"))]
-        bail!(
-            "Daemon failed to start within {timeout_secs}s (no log output found at {})",
-            log_path.display()
-        );
     }
 
-    bail!("Daemon failed to start within {timeout_secs}s. Last log output:\n{tail}");
+    if context.trim().is_empty() {
+        context = "No log output found.".to_string();
+    }
+
+    context
 }
 
 // ---------------------------------------------------------------------------

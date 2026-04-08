@@ -98,6 +98,8 @@ zlayer-docker = { workspace = true, optional = true }
 # Daemonization (fork, setsid) and signal handling (kill) -- Unix only
 nix = { workspace = true }
 libc = { workspace = true }
+# Systemd sd_notify(READY=1) for Type=notify unit
+sd-notify = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 zlayer-wsl = { workspace = true, optional = true }

@@ -906,8 +906,18 @@ pub(crate) async fn serve(
     };
 
     // -----------------------------------------------------------------------
-    // 6. Run dual TCP + Unix socket server (with local auth bypass on UDS)
+    // 6. Signal readiness to systemd (Type=notify) and run API server
     // -----------------------------------------------------------------------
+    // sd_notify fires right before the server binds its sockets.  With
+    // Type=notify, `systemctl start` blocks until this point — all init
+    // (overlay, raft, storage, etc.) is complete.  The socket bind itself
+    // takes microseconds, so the CLI's 500 ms socket-retry poll always
+    // finds it on the next tick.
+    #[cfg(target_os = "linux")]
+    {
+        let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
+    }
+
     ApiServer::run_dual_with_local_auth(
         bind_addr,
         socket_path,
