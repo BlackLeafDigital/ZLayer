@@ -152,6 +152,27 @@ fi
 sudo cp "$BIN_PATH" "${INSTALL_DIR}/${BINARY}"
 sudo chmod +x "${INSTALL_DIR}/${BINARY}"
 
+# --- SELinux: relabel binary so systemd's init_t can exec it ---
+# Files under /var/lib inherit var_lib_t, which init_t cannot exec as a
+# service entrypoint. Set bin_t via semanage (persistent) + restorecon,
+# with chcon as fallback. No-op on non-SELinux distros.
+if [ "$OS" = "linux" ] && command -v getenforce >/dev/null 2>&1; then
+    case "$(getenforce 2>/dev/null)" in
+        Enforcing|Permissive)
+            if command -v semanage >/dev/null 2>&1; then
+                sudo semanage fcontext -a -t bin_t "${INSTALL_DIR}(/.*)?" 2>/dev/null \
+                    || sudo semanage fcontext -m -t bin_t "${INSTALL_DIR}(/.*)?" 2>/dev/null \
+                    || true
+                sudo restorecon -RFv "${INSTALL_DIR}" >/dev/null 2>&1 || true
+            fi
+            # chcon works even when policycoreutils-python-utils (semanage)
+            # isn't installed — e.g., on the Silverblue base image.
+            sudo chcon -t bin_t "${INSTALL_DIR}/${BINARY}" 2>/dev/null || true
+            echo "SELinux: labeled ${BINARY} as bin_t"
+            ;;
+    esac
+fi
+
 echo ""
 echo "${BINARY} ${TAG} installed to ${INSTALL_DIR}/${BINARY}"
 
