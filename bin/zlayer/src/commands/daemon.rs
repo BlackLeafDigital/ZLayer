@@ -639,9 +639,9 @@ WantedBy=multi-user.target
             .await
             .context("Failed to start service")?;
         if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
             let _ = std::fs::remove_file(&spawner_pid_path);
-            bail!("systemctl start failed: {stderr}");
+            let context = get_daemon_failure_context();
+            bail!("Daemon failed to start.\n{context}");
         }
 
         print!("Daemon starting...");
@@ -706,9 +706,9 @@ async fn start(data_dir: &Path) -> Result<()> {
         .await
         .context("Failed to start service")?;
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
         let _ = std::fs::remove_file(&spawner_pid_path);
-        bail!("systemctl start failed: {stderr}");
+        let context = get_daemon_failure_context();
+        bail!("Daemon failed to start.\n{context}");
     }
 
     print!("Daemon starting...");
