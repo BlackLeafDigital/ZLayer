@@ -70,6 +70,27 @@ if [ -z "$INSTALL_DIR" ]; then
 fi
 sudo mkdir -p "$INSTALL_DIR"
 
+# --- Check installed version ---
+CURRENT_VERSION=""
+if [ -x "${INSTALL_DIR}/${BINARY}" ]; then
+    CURRENT_VERSION="$("${INSTALL_DIR}/${BINARY}" --version 2>/dev/null | sed -n 's/.*[[:space:]]\([0-9][0-9.]*\).*/\1/p')" || true
+fi
+
+echo ""
+if [ -n "$CURRENT_VERSION" ]; then
+    echo "  Installed: v${CURRENT_VERSION}"
+fi
+echo "  Target:    ${TAG}"
+
+if [ "$CURRENT_VERSION" = "$VERSION_NUM" ]; then
+    printf "\nAlready at %s. Reinstall anyway? [y/N] " "$TAG"
+    read -r REPLY </dev/tty || REPLY="n"
+    case "$REPLY" in
+        [yY]*) ;;
+        *) echo "Skipping."; exit 0 ;;
+    esac
+fi
+
 # --- Download from GitHub Releases ---
 ARTIFACT="${BINARY}-${VERSION_NUM}-${OS}-${ARCH}.tar.gz"
 URL="https://github.com/${REPO}/releases/download/${TAG}/${ARTIFACT}"
@@ -137,8 +158,26 @@ echo "${BINARY} ${TAG} installed to ${INSTALL_DIR}/${BINARY}"
 case ":${PATH}:" in
     *":${INSTALL_DIR}:"*) ;;
     *)
-        echo ""
-        echo "Add to PATH: export PATH=\"${INSTALL_DIR}:\$PATH\""
+        printf "\n%s is not in your PATH. Add it now? [Y/n] " "$INSTALL_DIR"
+        read -r REPLY </dev/tty || REPLY="y"
+        case "$REPLY" in
+            [nN]*)
+                echo "Skipped. Add manually: export PATH=\"${INSTALL_DIR}:\$PATH\""
+                ;;
+            *)
+                case "$OS" in
+                    linux)
+                        printf 'export PATH="%s:$PATH"\n' "$INSTALL_DIR" | sudo tee /etc/profile.d/zlayer.sh >/dev/null
+                        echo "Added to PATH via /etc/profile.d/zlayer.sh"
+                        ;;
+                    darwin)
+                        echo "$INSTALL_DIR" | sudo tee /etc/paths.d/zlayer >/dev/null
+                        echo "Added to PATH via /etc/paths.d/zlayer"
+                        ;;
+                esac
+                echo "Open a new terminal for the change to take effect."
+                ;;
+        esac
         ;;
 esac
 
