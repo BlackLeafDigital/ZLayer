@@ -2,17 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.10.64]
 
 ### Fixed
-- **Daemon startup failure now shows current error, not stale logs.** Replaced
-  the daemon-log-file-tailing mechanism with socket-based readiness polling
-  (the API socket IS the readiness signal — same pattern as Docker, containerd,
-  CRI-O). On failure, error context is auto-surfaced from systemctl/journalctl
-  (Linux) or the launchd stderr log (macOS). Deleted all log-rotation and
-  truncation code (`rotate_daemon_log`, `find_newest_daemon_log`,
-  `truncate_daemon_log`). Previously, `zlayer daemon install/start` could print
-  week-old tracing entries from previous attempts.
+- **Daemon startup failure now shows current error, not stale logs.** Daemon log
+  files are truncated before each start so failure diagnostics only contain
+  output from the current attempt. Switched from `RotationStrategy::Never` to
+  `Daily` rotation with 7-day retention. Added `--since=-2min` to the
+  journalctl fallback query on Linux. Previously, `zlayer daemon install/start`
+  could print week-old tracing entries from previous attempts.
 - **Systemd unit upgraded to `Type=notify`** with `sd_notify(READY=1)` via the
   pure-Rust `sd-notify` crate, matching Docker/containerd/CRI-O. `systemctl
   start zlayer` now blocks until the daemon is truly ready (all init phases
@@ -20,6 +18,13 @@ All notable changes to this project will be documented in this file.
 - **Fixed daemon.json / socket bind race condition.** `daemon.json` was written
   ~300 lines before the API socket bound, so the CLI could think the daemon was
   ready while the socket wasn't listening yet.
+
+### Changed
+- **Install script now auto-configures PATH.** When the install directory is not
+  already on PATH, the user is prompted (Y/n) and the script writes
+  `/etc/profile.d/zlayer.sh` (Linux) or `/etc/paths.d/zlayer` (macOS).
+- **Install script reports installed vs target version.** Shows both versions
+  before downloading and prompts before reinstalling the same version.
 
 ### Added
 - **Networks management page** in ZLayer Manager UI at `/networks`: full CRUD
