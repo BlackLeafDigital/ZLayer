@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Daemon startup failure now shows current error, not stale logs.** Replaced
+  the daemon-log-file-tailing mechanism with socket-based readiness polling
+  (the API socket IS the readiness signal — same pattern as Docker, containerd,
+  CRI-O). On failure, error context is auto-surfaced from systemctl/journalctl
+  (Linux) or the launchd stderr log (macOS). Deleted all log-rotation and
+  truncation code (`rotate_daemon_log`, `find_newest_daemon_log`,
+  `truncate_daemon_log`). Previously, `zlayer daemon install/start` could print
+  week-old tracing entries from previous attempts.
+- **Systemd unit upgraded to `Type=notify`** with `sd_notify(READY=1)` via the
+  pure-Rust `sd-notify` crate, matching Docker/containerd/CRI-O. `systemctl
+  start zlayer` now blocks until the daemon is truly ready (all init phases
+  complete, API socket bound) instead of returning immediately.
+- **Fixed daemon.json / socket bind race condition.** `daemon.json` was written
+  ~300 lines before the API socket bound, so the CLI could think the daemon was
+  ready while the socket wasn't listening yet.
+
 ### Added
 - **Networks management page** in ZLayer Manager UI at `/networks`: full CRUD
   interface for network access-control policies. Displays stats row (total

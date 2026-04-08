@@ -152,6 +152,9 @@ zip = "2"
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "signal", "process", "user"] }
 
+# Systemd readiness notification (pure-Rust, no libsystemd dep)
+sd-notify = "0.4"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
