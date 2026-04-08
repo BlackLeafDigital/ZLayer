@@ -2,9 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
-## [0.10.64]
+## [0.10.65]
 
 ### Fixed
+- **SELinux 203/EXEC on Fedora/RHEL.** Binaries installed under
+  `/var/lib/zlayer/bin` inherited `var_lib_t`, which systemd's `init_t` cannot
+  exec as a service entrypoint, so `systemctl start zlayer` failed with
+  `status=203/EXEC`. `install.sh` now relabels the binary to `bin_t` via
+  `semanage fcontext` + `restorecon` (persistent) with `chcon` as a fallback
+  for systems without `policycoreutils-python-utils` (e.g., Fedora Silverblue).
 - **Daemon startup failure now shows current error, not stale logs.** Daemon log
   files are truncated before each start so failure diagnostics only contain
   output from the current attempt. Switched from `RotationStrategy::Never` to
