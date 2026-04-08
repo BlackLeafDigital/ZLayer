@@ -152,6 +152,7 @@ zip = "2"
 # Unix/Linux system calls
 libc = "0.2"
 nix = { version = "0.31", features = ["fs", "signal", "process", "user"] }
+sd-notify = "0.4"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
