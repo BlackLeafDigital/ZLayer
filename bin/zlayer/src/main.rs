@@ -186,8 +186,8 @@ fn main() -> ExitCode {
         Some(zlayer_observability::config::FileLoggingConfig {
             directory: log_dir,
             prefix: "daemon.log".to_string(),
-            rotation: zlayer_observability::config::RotationStrategy::Never,
-            max_files: None,
+            rotation: zlayer_observability::config::RotationStrategy::Daily,
+            max_files: Some(7),
         })
     } else {
         None

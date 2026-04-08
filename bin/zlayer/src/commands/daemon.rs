@@ -189,6 +189,9 @@ async fn install(
         let spawner_pid_path = data_dir.join("spawner.pid");
         std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
 
+        // Clear stale logs so failure diagnostics only show this attempt.
+        truncate_daemon_logs(&log_dir);
+
         // Use modern launchctl bootstrap, fall back to legacy load
         let out = Command::new("launchctl")
             .args(["bootstrap", &target, &path_str])
@@ -269,6 +272,9 @@ async fn start(data_dir: &Path) -> Result<()> {
     // kill this CLI process while we wait for readiness.
     let spawner_pid_path = data_dir.join("spawner.pid");
     std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
+
+    // Clear stale logs so failure diagnostics only show this attempt.
+    truncate_daemon_logs(&crate::cli::default_log_dir(data_dir));
 
     let out = Command::new("launchctl")
         .args(["bootstrap", &target, &path_str])
@@ -632,6 +638,9 @@ WantedBy=multi-user.target
         let spawner_pid_path = data_dir.join("spawner.pid");
         std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
 
+        // Clear stale logs so failure diagnostics only show this attempt.
+        truncate_daemon_logs(&log_dir);
+
         let start_args = systemctl_args(&["start", UNIT_NAME]);
         let out = Command::new("systemctl")
             .args(&start_args)
@@ -698,6 +707,9 @@ async fn start(data_dir: &Path) -> Result<()> {
     // kill this CLI process while we wait for readiness.
     let spawner_pid_path = data_dir.join("spawner.pid");
     std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
+
+    // Clear stale logs so failure diagnostics only show this attempt.
+    truncate_daemon_logs(&crate::cli::default_log_dir(data_dir));
 
     let args = systemctl_args(&["start", UNIT_NAME]);
     let out = Command::new("systemctl")
@@ -803,6 +815,21 @@ async fn status(data_dir: &Path) -> Result<()> {
 // Log helpers (shared across platforms)
 // ---------------------------------------------------------------------------
 
+/// Clear daemon log files so failure diagnostics only show the current attempt.
+fn truncate_daemon_logs(log_dir: &std::path::Path) {
+    if let Ok(entries) = std::fs::read_dir(log_dir) {
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("daemon.log")
+            {
+                let _ = std::fs::File::create(entry.path());
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Readiness check (shared across platforms)
 // ---------------------------------------------------------------------------
@@ -856,7 +883,16 @@ fn get_daemon_failure_context() -> String {
         // If status output is sparse, pull more lines from the journal
         if context.len() < 100 {
             let is_root = unsafe { libc::geteuid() } == 0;
-            let mut jctl_args = vec!["--no-pager", "-n", "30", "-u", "zlayer", "--output", "cat"];
+            let mut jctl_args = vec![
+                "--no-pager",
+                "-n",
+                "30",
+                "--since=-2min",
+                "-u",
+                "zlayer",
+                "--output",
+                "cat",
+            ];
             if !is_root {
                 jctl_args.insert(0, "--user");
             }
