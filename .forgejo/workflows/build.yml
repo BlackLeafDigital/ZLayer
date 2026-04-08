@@ -95,6 +95,14 @@ jobs:
       - name: Install system deps
         if: steps.check.outputs.completed != 'true'
         run: apt-get update && apt-get install -y protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git
+      - name: Set workspace version
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          RAW="${{ inputs.version }}"
+          VERSION="${RAW#v}"
+          perl -i -pe 's/^version = "[^"]*"$/version = "'"$VERSION"'"/' Cargo.toml
+          grep '^version = ' Cargo.toml
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --package zlayer
@@ -165,6 +173,14 @@ jobs:
       - name: Install protobuf
         if: steps.check.outputs.completed != 'true'
         run: brew install protobuf
+      - name: Set workspace version
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          RAW="${{ inputs.version }}"
+          VERSION="${RAW#v}"
+          perl -i -pe 's/^version = "[^"]*"$/version = "'"$VERSION"'"/' Cargo.toml
+          grep '^version = ' Cargo.toml
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --target aarch64-apple-darwin --package zlayer
@@ -230,6 +246,14 @@ jobs:
         run: |
           choco install protoc -y
           echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
+      - name: Set workspace version
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          RAW="${{ inputs.version }}"
+          VERSION="${RAW#v}"
+          perl -i -pe 's/^version = "[^"]*"$/version = "'"$VERSION"'"/' Cargo.toml
+          grep '^version = ' Cargo.toml
       - name: Build (thin Windows CLI)
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --package zlayer --no-default-features --features wsl
@@ -377,6 +401,14 @@ jobs:
       - name: Install protobuf
         if: steps.check.outputs.completed != 'true'
         run: brew install protobuf
+      - name: Set workspace version
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          RAW="${{ inputs.version }}"
+          VERSION="${RAW#v}"
+          perl -i -pe 's/^version = "[^"]*"$/version = "'"$VERSION"'"/' Cargo.toml
+          grep '^version = ' Cargo.toml
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --target x86_64-apple-darwin --package zlayer
@@ -450,6 +482,14 @@ jobs:
       - name: Create target directory
         if: steps.check.outputs.completed != 'true'
         run: mkdir -p $CROSS_TARGET_DIR
+      - name: Set workspace version
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          RAW="${{ inputs.version }}"
+          VERSION="${RAW#v}"
+          perl -i -pe 's/^version = "[^"]*"$/version = "'"$VERSION"'"/' Cargo.toml
+          grep '^version = ' Cargo.toml
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer --target-dir $CROSS_TARGET_DIR
