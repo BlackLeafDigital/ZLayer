@@ -101,7 +101,7 @@ jobs:
         run: |
           RAW="${{ inputs.version }}"
           VERSION="${RAW#v}"
-          perl -i -pe 's/^version = "[^"]*"$/version = "'"$VERSION"'"/' Cargo.toml
+          sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
       - name: Build
         if: steps.check.outputs.completed != 'true'
@@ -179,7 +179,7 @@ jobs:
         run: |
           RAW="${{ inputs.version }}"
           VERSION="${RAW#v}"
-          perl -i -pe 's/^version = "[^"]*"$/version = "'"$VERSION"'"/' Cargo.toml
+          sed -i '' "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
       - name: Build
         if: steps.check.outputs.completed != 'true'
@@ -252,7 +252,7 @@ jobs:
         run: |
           RAW="${{ inputs.version }}"
           VERSION="${RAW#v}"
-          perl -i -pe 's/^version = "[^"]*"$/version = "'"$VERSION"'"/' Cargo.toml
+          sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
       - name: Build (thin Windows CLI)
         if: steps.check.outputs.completed != 'true'
@@ -407,7 +407,7 @@ jobs:
         run: |
           RAW="${{ inputs.version }}"
           VERSION="${RAW#v}"
-          perl -i -pe 's/^version = "[^"]*"$/version = "'"$VERSION"'"/' Cargo.toml
+          sed -i '' "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
       - name: Build
         if: steps.check.outputs.completed != 'true'
@@ -488,7 +488,7 @@ jobs:
         run: |
           RAW="${{ inputs.version }}"
           VERSION="${RAW#v}"
-          perl -i -pe 's/^version = "[^"]*"$/version = "'"$VERSION"'"/' Cargo.toml
+          sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
       - name: Build
         if: steps.check.outputs.completed != 'true'
