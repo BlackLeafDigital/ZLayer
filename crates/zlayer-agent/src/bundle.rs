@@ -638,12 +638,14 @@ impl BundleBuilder {
         let storage_mounts = self.build_storage_mounts(spec, volume_paths)?;
         mounts.extend(storage_mounts);
 
-        // Add ZLayer API socket bind-mount if configured
+        // Add ZLayer API socket bind-mount if configured.
+        // Use typ("bind") so libcontainer's mount code handles the source path
+        // correctly for sockets (canonicalize + file-based mount point creation).
         if let Some(ref socket_path) = self.socket_path {
             mounts.push(
                 MountBuilder::default()
                     .destination(zlayer_paths::ZLayerDirs::default_socket_path())
-                    .typ("none")
+                    .typ("bind")
                     .source(socket_path.clone())
                     .options(vec!["rbind".into(), "ro".into()])
                     .build()
@@ -1143,6 +1145,9 @@ impl BundleBuilder {
         if !devices.is_empty() {
             linux_builder = linux_builder.devices(devices);
         }
+
+        // Set rootfs propagation (matches Docker default)
+        linux_builder = linux_builder.rootfs_propagation("private".to_string());
 
         // Set masked/readonly paths based on privileged mode
         if spec.privileged {
