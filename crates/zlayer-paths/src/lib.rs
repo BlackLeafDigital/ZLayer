@@ -51,6 +51,24 @@ impl ZLayerDirs {
         }
     }
 
+    /// Detect the data directory of an existing installation.
+    ///
+    /// On Linux, if not root, checks whether `/var/lib/zlayer/daemon.json`
+    /// exists (indicating a system-level install) and returns
+    /// `/var/lib/zlayer` if so. Otherwise falls back to [`default_data_dir`].
+    pub fn detect_data_dir() -> PathBuf {
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            if !is_root() {
+                let system_data = PathBuf::from("/var/lib/zlayer");
+                if system_data.join("daemon.json").exists() {
+                    return system_data;
+                }
+            }
+        }
+        Self::default_data_dir()
+    }
+
     /// Default runtime directory.
     ///
     /// - Linux: `/var/run/zlayer`

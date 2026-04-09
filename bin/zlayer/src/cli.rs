@@ -8,7 +8,7 @@ use std::path::PathBuf;
 /// - Linux (user): `~/.zlayer`
 /// - Windows: `%LOCALAPPDATA%\ZLayer` or `C:\ProgramData\ZLayer`
 pub(crate) fn default_data_dir() -> PathBuf {
-    zlayer_paths::ZLayerDirs::default_data_dir()
+    zlayer_paths::ZLayerDirs::detect_data_dir()
 }
 
 /// Return the platform-appropriate default runtime directory.

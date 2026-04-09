@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.69]
+
+### Fixed
+- **`zlayer daemon status` and `zlayer status` report "not installed" / "not running"
+  after installing with sudo.** The daemon commands used `geteuid()` to decide
+  between system-level and user-level systemd paths. Since `install.sh` runs
+  `sudo zlayer daemon install` (system-level), but users query without sudo
+  (user-level), the status commands looked in the wrong place. Now probes the
+  filesystem for the actual unit file location and data directory, falling back
+  to euid only during fresh installs.
+
 ## [0.10.66]
 
 ### Fixed
