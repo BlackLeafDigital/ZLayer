@@ -800,6 +800,27 @@ impl Runtime for YoukiRuntime {
                 reason: format!("failed to extract rootfs: {e}"),
             })?;
 
+        // Log rootfs diagnostics for debugging container creation failures
+        match std::fs::read_dir(&rootfs_path) {
+            Ok(entries) => {
+                let count = entries.count();
+                tracing::info!(
+                    container = %container_id,
+                    rootfs = %rootfs_path.display(),
+                    entry_count = count,
+                    "rootfs extracted successfully"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    container = %container_id,
+                    rootfs = %rootfs_path.display(),
+                    error = %e,
+                    "rootfs directory not readable after extraction"
+                );
+            }
+        }
+
         // Get cached image config (entrypoint, cmd, env, workdir, user)
         let img_config = self.get_image_config(image).await;
 
@@ -884,7 +905,7 @@ impl Runtime for YoukiRuntime {
             // Build the container (creates it but doesn't start)
             let container = init_builder.build().map_err(|e| AgentError::CreateFailed {
                 id: container_id_clone.clone(),
-                reason: format!("failed to create container: {e}"),
+                reason: format!("failed to create container: {e:?}"),
             })?;
 
             Ok::<Container, AgentError>(container)

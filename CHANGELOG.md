@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.66]
+
+### Fixed
+- **Container creation "failed to prepare rootfs" on Linux.** libcontainer 0.5.7
+  used `is_file()` to decide bind mount destination type, which returned false
+  for Unix sockets — causing the ZLayer API socket mount to create a directory
+  instead of a file, failing with EINVAL. Upgraded to libcontainer git rev
+  `a68a38c4` (youki-dev/youki#3484) which uses `!is_dir()` instead.
+- **Improved container creation error reporting.** libcontainer errors now use
+  Debug formatting to preserve the full error chain, so mount failures show
+  the actual syscall error (e.g., EINVAL, EPERM) instead of just
+  "failed to prepare rootfs".
+
+### Changed
+- **Socket bind mount uses `typ("bind")`** instead of `typ("none")` in the OCI
+  spec, ensuring libcontainer's bind mount code path handles the source
+  correctly.
+- **Set `rootfsPropagation` to `"private"`** in OCI spec (matches Docker default).
+
+### Added
+- **`scripts/install-dev.sh`** — builds from source and installs like `install.sh`
+  but reports `0.0.0-dev`. Run `install.sh` to go back to a release build.
+
 ## [0.10.65]
 
 ### Fixed
