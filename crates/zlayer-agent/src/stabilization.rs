@@ -132,22 +132,43 @@ pub async fn wait_for_stabilization(
         }
 
         if start.elapsed() >= timeout {
-            // Build a failure message from unhealthy services
-            let failures: Vec<String> = summaries
+            // Build a failure message from unhealthy services, including
+            // the tail of each failing service's container logs so the
+            // user sees the real cause (e.g. "GLIBC_2.38 not found",
+            // "failed to prepare rootfs", "panicked at ...") instead of
+            // just "1/1 replicas, healthy=false".
+            let failing: Vec<&ServiceHealthSummary> = summaries
                 .iter()
                 .filter(|s| (s.running != s.desired || !s.healthy) && s.desired > 0)
-                .map(|s| {
-                    format!(
-                        "{}: {}/{} replicas, healthy={}",
-                        s.name, s.running, s.desired, s.healthy
-                    )
-                })
                 .collect();
 
-            let message = if failures.is_empty() {
+            let mut parts: Vec<String> = Vec::with_capacity(failing.len());
+            for s in &failing {
+                let header = format!(
+                    "{}: {}/{} replicas, healthy={}",
+                    s.name, s.running, s.desired, s.healthy
+                );
+                // Try to fetch the last 20 log lines from this service's
+                // replicas. A miss (no containers, runtime error) falls
+                // back to just the header so we never block the error
+                // on log retrieval.
+                match manager.get_service_logs(&s.name, 20, None).await {
+                    Ok(entries) if !entries.is_empty() => {
+                        let body = entries
+                            .iter()
+                            .map(|e| format!("    {}", e.message))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        parts.push(format!("{header}\n  logs:\n{body}"));
+                    }
+                    _ => parts.push(header),
+                }
+            }
+
+            let message = if parts.is_empty() {
                 "Stabilization timed out".to_string()
             } else {
-                format!("Stabilization timed out: {}", failures.join("; "))
+                format!("Stabilization timed out:\n  {}", parts.join("\n  "))
             };
 
             return StabilizationResult {

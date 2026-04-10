@@ -652,20 +652,42 @@ impl Runtime for YoukiRuntime {
         image: &str,
         policy: zlayer_spec::PullPolicy,
     ) -> Result<()> {
-        // For Never policy, we just check if we can pull from cache
-        // The actual extraction happens in create_container
+        let puller = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
+        let auth = self.auth_resolver.resolve(image);
+
+        // For Never policy, skip pulling layers from the remote, but STILL
+        // fetch the image config from the local blob cache (populated by a
+        // prior `zlayer import` or an earlier pull). Without the image
+        // config, the bundle builder has no way to know the image's
+        // entrypoint/cmd/env/workdir/user and falls back to `/bin/sh`,
+        // which exits immediately and kills the container. Fetching the
+        // config from cache is cheap (~1 KB) and non-fatal on miss.
         if matches!(policy, zlayer_spec::PullPolicy::Never) {
-            // Try to get manifest to verify image is cached
-            // For now, assume if policy is Never, caller knows image exists
-            tracing::debug!(image = %image, "pull policy is Never, skipping pull");
+            tracing::debug!(image = %image, "pull policy is Never, skipping layer pull");
+            match puller.pull_image_config(image, &auth).await {
+                Ok(config) => {
+                    tracing::info!(
+                        image = %image,
+                        has_entrypoint = config.entrypoint.is_some(),
+                        has_cmd = config.cmd.is_some(),
+                        "image config loaded from cache"
+                    );
+                    let mut configs = self.image_configs.write().await;
+                    configs.insert(image.to_string(), config);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        image = %image,
+                        error = %e,
+                        "failed to load image config from cache under pull_policy=Never, container will use spec defaults"
+                    );
+                }
+            }
             return Ok(());
         }
 
         // For IfNotPresent, check if image layers are in cache by trying to pull
         // Use the shared blob cache to avoid repeated opens and ensure persistence
-        let puller = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
-        let auth = self.auth_resolver.resolve(image);
-
         tracing::info!(image = %image, "pulling image layers to cache");
 
         // Pull image layers from registry (cached layers are retrieved from cache)

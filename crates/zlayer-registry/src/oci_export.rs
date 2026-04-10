@@ -476,7 +476,7 @@ pub async fn export_image(
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let registry = LocalRegistry::new("/tmp/zlayer/registry".into()).await?;
-/// let info = import_image(&registry, Path::new("/tmp/myapp.tar.gz"), Some("myapp:imported")).await?;
+/// let info = import_image(&registry, Path::new("/tmp/myapp.tar.gz"), Some("myapp:imported"), None).await?;
 /// println!("Imported image with digest: {}", info.digest);
 /// # Ok(())
 /// # }
@@ -486,6 +486,7 @@ pub async fn import_image(
     registry: &LocalRegistry,
     input: &Path,
     tag: Option<&str>,
+    blob_cache: Option<&dyn crate::cache::BlobCacheBackend>,
 ) -> Result<ImportInfo, ImportError> {
     // Read the archive
     let archive_data = fs::read(input).await?;
@@ -585,6 +586,15 @@ pub async fn import_image(
             .put_blob(config_data)
             .await
             .map_err(|e| ImportError::Registry(e.to_string()))?;
+
+        // Also populate the daemon's blob cache so `pull_image_config`
+        // finds the config blob without going to the remote registry.
+        // Without this, containers deployed with `pull_policy: never`
+        // fall back to `/bin/sh` as their entrypoint because the image
+        // config (with its `entrypoint`/`cmd`) is never loaded.
+        if let Some(cache) = blob_cache {
+            let _ = cache.put(&config.digest, config_data).await;
+        }
     }
 
     // Import layer blobs
@@ -602,6 +612,12 @@ pub async fn import_image(
             .put_blob(layer_data)
             .await
             .map_err(|e| ImportError::Registry(e.to_string()))?;
+
+        // Also populate the daemon's blob cache so ImagePuller finds
+        // these layers without going to the remote registry.
+        if let Some(cache) = blob_cache {
+            let _ = cache.put(&layer.digest, layer_data).await;
+        }
 
         layer_count += 1;
     }
@@ -647,6 +663,20 @@ pub async fn import_image(
         .put_manifest(&name, &reference, manifest_data)
         .await
         .map_err(|e| ImportError::Registry(e.to_string()))?;
+
+    // Also populate the daemon's manifest cache so ImagePuller
+    // finds this manifest without hitting the remote registry.
+    // The cache key format must match client.rs pull_manifest():
+    //   "manifest:{name}:{tag}"  (e.g. "manifest:zachhandley/zlayer-manager:latest")
+    if let Some(cache) = blob_cache {
+        let image_ref = if let Some(ref t) = final_tag {
+            format!("{name}:{t}")
+        } else {
+            name.clone()
+        };
+        let cache_key = format!("manifest:{image_ref}");
+        let _ = cache.put(&cache_key, manifest_data).await;
+    }
 
     let import_info = ImportInfo {
         digest: manifest_digest.clone(),
@@ -807,7 +837,7 @@ mod tests {
         let (import_registry, _import_temp) = create_test_registry().await;
 
         // Import the image
-        let import_info = import_image(&import_registry, &export_path, Some("imported:v1"))
+        let import_info = import_image(&import_registry, &export_path, Some("imported:v1"), None)
             .await
             .unwrap();
 
@@ -840,7 +870,7 @@ mod tests {
             .await
             .unwrap();
 
-        let result = import_image(&registry, &invalid_tar, None).await;
+        let result = import_image(&registry, &invalid_tar, None, None).await;
 
         assert!(result.is_err());
     }
@@ -882,7 +912,7 @@ mod tests {
 
         // Should still be importable - keep import_temp alive for the duration
         let (import_registry, _import_temp) = create_test_registry().await;
-        let import_info = import_image(&import_registry, &export_path, Some("test:imported"))
+        let import_info = import_image(&import_registry, &export_path, Some("test:imported"), None)
             .await
             .unwrap();
 

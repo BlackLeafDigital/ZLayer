@@ -19,6 +19,7 @@ pub mod health;
 pub mod init;
 pub mod job;
 pub mod metrics_providers;
+pub mod netlink;
 pub mod overlay_manager;
 pub mod proxy_manager;
 pub mod runtime;

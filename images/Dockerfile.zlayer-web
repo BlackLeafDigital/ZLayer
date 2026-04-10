@@ -4,7 +4,7 @@
 #   docker build -f images/Dockerfile.zlayer-web -t zlayer-web .
 
 # Stage 1: Chef base
-FROM lukemathwalker/cargo-chef:latest-rust-1.90 AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1.92 AS chef
 WORKDIR /build
 
 # Stage 2: Generate dependency recipe
@@ -38,7 +38,11 @@ RUN --mount=type=cache,target=/root/.cache/cargo-leptos,id=cargo-leptos-cache \
     cd crates/zlayer-web && cargo leptos build --release
 
 # Runtime stage
-FROM debian:bookworm-slim
+# trixie (glibc 2.41) matches the cargo-chef builder's glibc so the
+# zlayer-web binary's GLIBC_2.38+ symbol references resolve at runtime.
+# bookworm-slim (glibc 2.36) was too old and produced
+# `version 'GLIBC_2.38' not found` at container startup.
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
