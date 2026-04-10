@@ -108,6 +108,9 @@ pub mod error;
 pub mod health;
 pub mod transport;
 
+#[cfg(target_os = "linux")]
+pub(crate) mod netlink;
+
 #[cfg(feature = "nat")]
 pub mod nat;
 

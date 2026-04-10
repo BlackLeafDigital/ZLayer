@@ -180,6 +180,61 @@ impl ServiceInstance {
                     }
                 }
 
+                // Verify the container is still running before attempting
+                // overlay attach. If the init process crashed during start
+                // (bad image, missing libs, failed mount), the PID above is
+                // now dead and every `ip link set ... netns {pid}` will
+                // return a cryptic RTNETLINK error. Surface the real cause
+                // from the container's log tail instead of the cascade.
+                if container_pid.is_some() {
+                    let alive = match self.runtime.container_state(&id).await {
+                        Ok(
+                            ContainerState::Running
+                            | ContainerState::Pending
+                            | ContainerState::Initializing,
+                        ) => true,
+                        Ok(state) => {
+                            tracing::warn!(
+                                container = %id,
+                                ?state,
+                                "container exited before overlay attach could run"
+                            );
+                            false
+                        }
+                        Err(e) => {
+                            // State query failed — don't block the attach on
+                            // it. The overlay manager's own cleanup-on-error
+                            // path now handles the dead-PID case cleanly.
+                            tracing::warn!(
+                                container = %id,
+                                error = %e,
+                                "container state query failed before overlay attach, proceeding"
+                            );
+                            true
+                        }
+                    };
+                    if !alive {
+                        let log_tail = self.runtime.container_logs(&id, 40).await.ok().map_or_else(
+                            || "  <log read failed>".to_string(),
+                            |entries| {
+                                if entries.is_empty() {
+                                    "  <no log output>".to_string()
+                                } else {
+                                    entries
+                                        .into_iter()
+                                        .map(|e| format!("  {}", e.message))
+                                        .collect::<Vec<_>>()
+                                        .join("\n")
+                                }
+                            },
+                        );
+                        return Err(AgentError::StartFailed {
+                            id: id.to_string(),
+                            reason: format!("container exited during startup:\n{log_tail}"),
+                        });
+                    }
+                }
+
                 // Attach to overlay network if manager is available
                 let overlay_ip = if let Some(overlay) = &self.overlay_manager {
                     // Get container PID for network namespace attachment

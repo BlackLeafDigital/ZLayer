@@ -11,6 +11,7 @@ use boringtun::device::{DeviceConfig, DeviceHandle};
 use std::fmt::Write;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+#[cfg(target_os = "macos")]
 use tokio::process::Command;
 
 // ---------------------------------------------------------------------------
@@ -99,6 +100,45 @@ impl OverlayTransport {
         format!("/var/run/wireguard/{}.sock", self.interface_name)
     }
 
+    /// Best-effort cleanup of a stale Linux TUN interface left behind by a
+    /// previously crashed process.
+    ///
+    /// If the process was `SIGKILLed` (or crashed without running Drop),
+    /// the TUN device persists in the kernel and boringtun's
+    /// `DeviceHandle::new()` will fail on re-create with EEXIST. We probe
+    /// for the interface via RTNETLINK and delete it if present.
+    ///
+    /// Any error from either the probe or the delete is logged at WARN
+    /// level and swallowed — this is a cleanup path, not the primary
+    /// code path, and failure here is recoverable (the caller proceeds
+    /// with creation and the next step surfaces any real problem).
+    #[cfg(target_os = "linux")]
+    async fn cleanup_stale_linux_interface(iface_name: &str) {
+        match crate::netlink::link_exists(iface_name).await {
+            Ok(true) => {
+                tracing::warn!(
+                    interface = %iface_name,
+                    "stale network interface found, cleaning up before re-create"
+                );
+                if let Err(e) = crate::netlink::delete_link_by_name(iface_name).await {
+                    tracing::warn!(
+                        interface = %iface_name,
+                        error = %e,
+                        "failed to delete stale overlay interface (continuing)"
+                    );
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                tracing::warn!(
+                    interface = %iface_name,
+                    error = %e,
+                    "failed to probe for stale overlay interface (continuing)"
+                );
+            }
+        }
+    }
+
     /// Create the TUN interface via boringtun.
     ///
     /// This spawns boringtun worker threads that manage the TUN device.  The
@@ -130,27 +170,10 @@ impl OverlayTransport {
         // On Linux, clean up stale interfaces from a previous crashed deploy.
         // If the process was SIGKILLed, the TUN device persists in the kernel
         // and DeviceHandle::new() will fail on re-create.
-        #[cfg(target_os = "linux")]
-        {
-            let check_output = Command::new("ip")
-                .args(["link", "show", &self.interface_name])
-                .output()
-                .await;
-            if let Ok(output) = check_output {
-                if output.status.success() {
-                    tracing::warn!(
-                        interface = %self.interface_name,
-                        "stale network interface found, cleaning up before re-create"
-                    );
-                    let _ = Command::new("ip")
-                        .args(["link", "delete", &self.interface_name])
-                        .output()
-                        .await;
-                }
-            }
-        }
         // macOS utun devices are kernel-managed and auto-destroyed when the
-        // owning socket closes. No stale interface cleanup needed.
+        // owning socket closes, so cleanup is a no-op there.
+        #[cfg(target_os = "linux")]
+        Self::cleanup_stale_linux_interface(&self.interface_name).await;
 
         // Clean up stale UAPI socket left behind by a crashed process.
         let sock_path = format!("/var/run/wireguard/{}.sock", self.interface_name);
@@ -374,9 +397,10 @@ impl OverlayTransport {
 
     /// Platform-specific interface IP assignment and bring-up.
     ///
-    /// Supports both IPv4 and IPv6 overlay CIDRs. The `ip addr add` command
-    /// handles both address families natively. For explicit route addition,
-    /// uses `ip -6 route add` for IPv6 and `ip route add` for IPv4.
+    /// Supports both IPv4 and IPv6 overlay CIDRs. Uses RTNETLINK directly
+    /// via the [`crate::netlink`] helpers — no shell-outs to `ip`. The
+    /// address add handles both address families natively; the route add
+    /// dispatches on the destination's address family inside the helper.
     #[cfg(not(target_os = "macos"))]
     async fn configure_interface(&self) -> Result<(), Box<dyn std::error::Error>> {
         let cidr: ipnet::IpNet = self.config.overlay_cidr.parse().map_err(|e| {
@@ -385,69 +409,39 @@ impl OverlayTransport {
                 self.config.overlay_cidr
             )
         })?;
-        let is_ipv6 = cidr.addr().is_ipv6();
+        let overlay_addr = cidr.addr();
+        let prefix_len = cidr.prefix_len();
 
-        // Assign overlay IP address — `ip addr add` works for both IPv4 and IPv6
-        let output = Command::new("ip")
-            .args([
-                "addr",
-                "add",
-                &self.config.overlay_cidr,
-                "dev",
-                &self.interface_name,
-            ])
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Ignore "already exists" — idempotent
-            if !stderr.contains("RTNETLINK answers: File exists") {
-                return Err(format!("Failed to assign IP: {stderr}").into());
+        // Assign overlay IP address — rtnetlink handles both IPv4 and IPv6.
+        // Preserve the original shell-out's idempotency: swallow EEXIST /
+        // "File exists" since a previous run may have left the address
+        // configured on a still-live TUN device.
+        if let Err(e) =
+            crate::netlink::add_address_to_link(&self.interface_name, overlay_addr, prefix_len)
+                .await
+        {
+            let msg = e.to_string();
+            if !msg.contains("File exists") && !msg.contains("EEXIST") {
+                return Err(format!("Failed to assign IP: {msg}").into());
             }
         }
 
-        // Bring interface up
-        let output = Command::new("ip")
-            .args(["link", "set", "dev", &self.interface_name, "up"])
-            .output()
-            .await?;
+        // Bring interface up.
+        crate::netlink::set_link_up_by_name(&self.interface_name)
+            .await
+            .map_err(|e| format!("Failed to bring up interface: {e}"))?;
 
-        if !output.status.success() {
-            return Err(format!(
-                "Failed to bring up interface: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
-        }
-
-        // Add explicit route for the overlay subnet.
-        // For IPv6 use `ip -6 route add`, for IPv4 use `ip route add`.
-        let network_cidr = format!("{}/{}", cidr.network(), cidr.prefix_len());
-        let output = if is_ipv6 {
-            Command::new("ip")
-                .args([
-                    "-6",
-                    "route",
-                    "add",
-                    &network_cidr,
-                    "dev",
-                    &self.interface_name,
-                ])
-                .output()
-                .await?
-        } else {
-            Command::new("ip")
-                .args(["route", "add", &network_cidr, "dev", &self.interface_name])
-                .output()
-                .await?
-        };
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Ignore "already exists" — idempotent (kernel may auto-add connected route)
-            if !stderr.contains("RTNETLINK answers: File exists") {
-                return Err(format!("Failed to add route: {stderr}").into());
+        // Add explicit route for the overlay subnet. rtnetlink dispatches
+        // internally on v4/v6. Preserve the original shell-out's
+        // idempotency: swallow EEXIST since the kernel may auto-install a
+        // connected route when the address is assigned.
+        let net_addr = cidr.network();
+        if let Err(e) =
+            crate::netlink::add_route_via_dev(net_addr, prefix_len, &self.interface_name).await
+        {
+            let msg = e.to_string();
+            if !msg.contains("File exists") && !msg.contains("EEXIST") {
+                return Err(format!("Failed to add route: {msg}").into());
             }
         }
 

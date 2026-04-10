@@ -157,13 +157,23 @@ fn main() -> ExitCode {
             LogLevel::Warn,
             Some(
                 "zlayer=warn,zlayer_agent=warn,zlayer_overlay=warn,zlayer_proxy=warn,\
-                 zlayer_init_actions=warn,zlayer_scheduler=warn,zlayer_api=warn,warn"
+                 zlayer_init_actions=warn,zlayer_scheduler=warn,zlayer_api=warn,\
+                 netlink_packet_route::link::buffer_tool=error,warn"
                     .to_string(),
             ),
         ),
-        1 => (LogLevel::Info, None),  // -v: global info
-        2 => (LogLevel::Debug, None), // -vv: debug
-        _ => (LogLevel::Trace, None), // -vvv: trace
+        1 => (
+            LogLevel::Info,
+            Some("netlink_packet_route::link::buffer_tool=error,info".to_string()),
+        ),
+        2 => (
+            LogLevel::Debug,
+            Some("netlink_packet_route::link::buffer_tool=error,debug".to_string()),
+        ),
+        _ => (
+            LogLevel::Trace,
+            Some("netlink_packet_route::link::buffer_tool=error,trace".to_string()),
+        ),
     };
 
     // Use pretty format for terminals, JSON for piped output

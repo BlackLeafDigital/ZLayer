@@ -3,6 +3,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::os::fd::AsFd;
 use tokio::sync::RwLock;
 use zlayer_overlay::{OverlayConfig, OverlayTransport};
 
@@ -108,6 +109,14 @@ impl OverlayManager {
     /// # Errors
     /// Returns an error if key generation or interface creation fails.
     pub async fn setup_global_overlay(&mut self) -> Result<(), AgentError> {
+        if self.global_transport.is_some() {
+            tracing::debug!(
+                deployment = %self.deployment,
+                "Global overlay already active, reusing existing transport"
+            );
+            return Ok(());
+        }
+
         let interface_name = make_interface_name(&[&self.deployment], "g");
 
         let (private_key, public_key) = OverlayTransport::generate_keys()
@@ -141,6 +150,19 @@ impl OverlayManager {
     /// # Errors
     /// Returns an error if the overlay interface cannot be created.
     pub async fn setup_service_overlay(&self, service_name: &str) -> Result<String, AgentError> {
+        {
+            let transports = self.service_transports.read().await;
+            if let Some(existing) = transports.get(service_name) {
+                let existing_name = existing.interface_name().to_string();
+                tracing::debug!(
+                    service = %service_name,
+                    interface = %existing_name,
+                    "Service overlay already active, reusing existing transport"
+                );
+                return Ok(existing_name);
+            }
+        }
+
         let interface_name = make_interface_name(&[&self.deployment, service_name], "s");
 
         // Attempt overlay creation (for inter-node communication)
@@ -244,14 +266,28 @@ impl OverlayManager {
             })?;
 
             let container_ip = self.ip_allocator.allocate()?;
-            self.attach_to_interface(container_pid, service_iface, container_ip)
-                .await?;
+            self.attach_to_interface(
+                container_pid,
+                service_iface,
+                container_ip,
+                "s",
+                "eth0",
+                true,
+            )
+            .await?;
 
             if join_global {
                 if let Some(global_iface) = &self.global_interface {
                     let global_ip = self.ip_allocator.allocate()?;
-                    self.attach_to_interface(container_pid, global_iface, global_ip)
-                        .await?;
+                    self.attach_to_interface(
+                        container_pid,
+                        global_iface,
+                        global_ip,
+                        "g",
+                        "eth1",
+                        false,
+                    )
+                    .await?;
                 }
             }
 
@@ -265,145 +301,145 @@ impl OverlayManager {
         container_pid: u32,
         _interface: &str,
         ip: IpAddr,
+        tag: &str,
+        container_iface: &str,
+        add_default_route: bool,
     ) -> Result<(), AgentError> {
+        // Best-effort cleanup of orphan veths left by a previous daemon crash.
+        self.sweep_orphan_veths().await;
+
         let is_v6 = ip.is_ipv6();
-        let veth_host = format!("veth-{container_pid}");
-        let veth_container = "eth0";
+        let prefix_len: u8 = if is_v6 { 64 } else { 24 };
+        let host_prefix: u8 = if is_v6 { 128 } else { 32 };
 
-        // Clean up any stale veth pair left by a previous daemon crash.
-        // This is idempotent — deleting a non-existent interface fails silently.
-        let _ = self
-            .run_command("ip", &["link", "delete", &veth_host])
-            .await;
+        let veth_host = format!("veth-{container_pid}-{tag}");
+        let veth_pending = format!("vc-{container_pid}-{tag}");
+        let veth_container = container_iface.to_string();
 
-        self.run_command(
-            "ip",
-            &[
-                "link",
-                "add",
-                &veth_host,
-                "type",
-                "veth",
-                "peer",
-                "name",
-                veth_container,
-            ],
-        )
-        .await?;
+        // Pin the container's network namespace via an OwnedFd so we
+        // survive a racing exit of the container init process.
+        let container_ns_fd = std::os::fd::OwnedFd::from(
+            std::fs::File::open(format!("/proc/{container_pid}/ns/net")).map_err(|e| {
+                AgentError::Network(format!("Failed to open /proc/{container_pid}/ns/net: {e}"))
+            })?,
+        );
 
-        self.run_command(
-            "ip",
-            &[
-                "link",
-                "set",
-                veth_container,
-                "netns",
-                &container_pid.to_string(),
-            ],
-        )
-        .await?;
+        // Pre-cleanup: delete any stale veth endpoints left by a previous
+        // daemon crash. These calls are idempotent.
+        crate::netlink::delete_link_by_name(&veth_host)
+            .await
+            .map_err(|e| AgentError::Network(format!("pre-cleanup delete {veth_host}: {e}")))?;
+        crate::netlink::delete_link_by_name(&veth_pending)
+            .await
+            .map_err(|e| AgentError::Network(format!("pre-cleanup delete {veth_pending}: {e}")))?;
 
-        // IP assignment: /24 for IPv4, /64 for IPv6
-        let addr_cidr = if is_v6 {
-            format!("{ip}/64")
-        } else {
-            format!("{ip}/24")
-        };
+        // Main setup wrapped in a block so we can clean up on error.
+        let result: Result<(), AgentError> = async {
+            // (a) Create the veth pair in the host netns.
+            crate::netlink::create_veth_pair(&veth_host, &veth_pending)
+                .await
+                .map_err(|e| AgentError::Network(format!("create veth pair: {e}")))?;
 
-        // Use `ip -6` for IPv6 addresses
-        let ip_cmd_flag: &[&str] = if is_v6 { &["-6"] } else { &[] };
+            // (b) Atomically move the pending end into the container netns
+            //     and rename it to the final container interface name.
+            crate::netlink::move_link_into_netns_fd_and_rename(
+                &veth_pending,
+                AsFd::as_fd(&container_ns_fd),
+                &veth_container,
+            )
+            .map_err(|e| AgentError::Network(format!("move veth into netns: {e}")))?;
 
-        let pid_str = container_pid.to_string();
-        let mut nsenter_addr_args: Vec<&str> = vec!["-t", &pid_str, "-n", "ip"];
-        nsenter_addr_args.extend_from_slice(ip_cmd_flag);
-        nsenter_addr_args.extend_from_slice(&["addr", "add", &addr_cidr, "dev", veth_container]);
+            // (c) Container-netns operations: assign IP, bring up links,
+            //     optionally add default route. Runs on a dedicated thread
+            //     that enters the container netns via setns(2).
+            let vc = veth_container.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::netlink::with_netns_fd_async(container_ns_fd, move || async move {
+                    crate::netlink::add_address_to_link_by_name(&vc, ip, prefix_len).await?;
+                    crate::netlink::set_link_up_by_name(&vc).await?;
+                    crate::netlink::set_link_up_by_name("lo").await?;
+                    if add_default_route {
+                        crate::netlink::add_default_route_via_dev(&vc, is_v6).await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+            .map_err(|e| AgentError::Network(format!("container netns task panicked: {e}")))?
+            .map_err(|e| AgentError::Network(format!("container netns ops: {e}")))?;
 
-        self.run_command("nsenter", &nsenter_addr_args).await?;
+            // (d) Host-side: bring up our end of the veth pair.
+            crate::netlink::set_link_up_by_name(&veth_host)
+                .await
+                .map_err(|e| AgentError::Network(format!("set {veth_host} up: {e}")))?;
 
-        self.run_command(
-            "nsenter",
-            &[
-                "-t",
-                &pid_str,
-                "-n",
-                "ip",
-                "link",
-                "set",
-                veth_container,
-                "up",
-            ],
-        )
-        .await?;
+            // (e) Host route: /32 (v4) or /128 (v6) pointing at the veth.
+            crate::netlink::replace_route_via_dev(ip, host_prefix, &veth_host, self.node_ip)
+                .await
+                .map_err(|e| {
+                    AgentError::Network(format!("host route for {ip}/{host_prefix}: {e}"))
+                })?;
 
-        // Bring up loopback inside the container namespace.
-        // New network namespaces start with `lo` in the DOWN state;
-        // services binding to 127.0.0.1 will fail without this.
-        self.run_command(
-            "nsenter",
-            &["-t", &pid_str, "-n", "ip", "link", "set", "lo", "up"],
-        )
-        .await?;
+            // (f) Sysctls: best-effort, don't fail the attach on these.
+            let _ = crate::netlink::set_sysctl("net.ipv4.ip_forward", "1");
+            let _ = crate::netlink::set_sysctl("net.ipv6.conf.all.forwarding", "1");
 
-        // Add a default route inside the container namespace so the container
-        // can respond to traffic from ANY source IP (not just its subnet).
-        // Without this, the container drops SYN-ACK responses when the host
-        // connects using its primary interface IP (outside the overlay subnet).
-        // No gateway is needed for veth point-to-point links.
-        let mut nsenter_route_args: Vec<&str> = vec!["-t", &pid_str, "-n", "ip"];
-        nsenter_route_args.extend_from_slice(ip_cmd_flag);
-        nsenter_route_args.extend_from_slice(&["route", "add", "default", "dev", veth_container]);
+            Ok(())
+        }
+        .await;
 
-        self.run_command("nsenter", &nsenter_route_args).await?;
-
-        // Bring up host-side veth so traffic can flow
-        self.run_command("ip", &["link", "set", &veth_host, "up"])
-            .await?;
-
-        // Use "replace" instead of "add" so stale routes from a previous
-        // daemon run don't cause a failure (EEXIST).
-        // When the node has an overlay IP, set it as the source so the
-        // container sees a routable address in the overlay subnet.
-        //
-        // IPv4: `ip route replace {ip}/32 dev {veth} [src {node_ip}]`
-        // IPv6: `ip -6 route replace {ip}/128 dev {veth} [src {node_ip}]`
-        let host_route = if is_v6 {
-            format!("{ip}/128")
-        } else {
-            format!("{ip}/32")
-        };
-
-        if let Some(node_ip) = self.node_ip {
-            let src_str = node_ip.to_string();
-            let mut route_args: Vec<&str> = Vec::new();
-            route_args.extend_from_slice(ip_cmd_flag);
-            route_args.extend_from_slice(&[
-                "route",
-                "replace",
-                &host_route,
-                "dev",
-                &veth_host,
-                "src",
-                &src_str,
-            ]);
-            self.run_command("ip", &route_args).await?;
-        } else {
-            let mut route_args: Vec<&str> = Vec::new();
-            route_args.extend_from_slice(ip_cmd_flag);
-            route_args.extend_from_slice(&["route", "replace", &host_route, "dev", &veth_host]);
-            self.run_command("ip", &route_args).await?;
+        // Cleanup on error: try to remove the host-side veth (which also
+        // destroys the peer end if it still exists).
+        if result.is_err() {
+            let _ = crate::netlink::delete_link_by_name(&veth_host).await;
+            let _ = crate::netlink::delete_link_by_name(&veth_pending).await;
         }
 
-        // Ensure IP forwarding is enabled so the kernel forwards packets
-        // between the veth pairs and the overlay TUN interface.
-        let _ = self
-            .run_command("sysctl", &["-w", "net.ipv4.ip_forward=1"])
-            .await;
-        // Also enable IPv6 forwarding for dual-stack support
-        let _ = self
-            .run_command("sysctl", &["-w", "net.ipv6.conf.all.forwarding=1"])
-            .await;
+        result
+    }
 
-        Ok(())
+    /// Best-effort sweep of orphan veth endpoints whose owning container
+    /// process is no longer alive. Names matching `veth-<pid>-*` or
+    /// `vc-<pid>-*` where `/proc/<pid>` does not exist are deleted.
+    async fn sweep_orphan_veths(&self) {
+        let links = match crate::netlink::list_all_links().await {
+            Ok(links) => links,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to list links for orphan sweep");
+                return;
+            }
+        };
+
+        for (_index, name) in links {
+            // We only care about our veth endpoints.
+            let remainder = if let Some(r) = name.strip_prefix("veth-") {
+                r
+            } else if let Some(r) = name.strip_prefix("vc-") {
+                r
+            } else {
+                continue;
+            };
+
+            // Extract the PID: everything before the first `-` after the prefix.
+            let Some(pid_str) = remainder.split('-').next() else {
+                continue;
+            };
+
+            let pid: u32 = match pid_str.parse() {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            // If the process is still alive, leave the veth alone.
+            if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                continue;
+            }
+
+            tracing::info!(link = %name, pid = pid, "Deleting orphan veth");
+            if let Err(e) = crate::netlink::delete_link_by_name(&name).await {
+                tracing::warn!(link = %name, error = %e, "Failed to delete orphan veth");
+            }
+        }
     }
 
     /// Tear down the overlay network for a single service.
@@ -524,24 +560,6 @@ impl OverlayManager {
             overlay_cidr: format!("{ip}/{mask}"),
             ..OverlayConfig::default()
         }
-    }
-
-    async fn run_command(&self, cmd: &str, args: &[&str]) -> Result<(), AgentError> {
-        let output = tokio::process::Command::new(cmd)
-            .args(args)
-            .output()
-            .await
-            .map_err(|e| AgentError::Network(format!("Failed to run {cmd}: {e}")))?;
-
-        if !output.status.success() {
-            return Err(AgentError::Network(format!(
-                "Command {} failed: {}",
-                cmd,
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-
-        Ok(())
     }
 }
 

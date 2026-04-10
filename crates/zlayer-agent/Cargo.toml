@@ -51,6 +51,11 @@ zlayer-proxy.workspace = true
 zlayer-registry = { workspace = true, features = ["persistent"] }
 zlayer-overlay.workspace = true
 ipnetwork = "0.21.1"
+rtnetlink = "0.14"
+# Must match the version used internally by rtnetlink 0.14 so
+# `RouteScope` and other route-message types line up across crate
+# boundaries when we construct requests directly.
+netlink-packet-route = "0.19"
 num_cpus.workspace = true
 zlayer-scheduler.workspace = true
 zlayer-storage = { workspace = true, optional = true }

@@ -151,7 +151,7 @@ zip = "2"
 
 # Unix/Linux system calls
 libc = "0.2"
-nix = { version = "0.31", features = ["fs", "signal", "process", "user"] }
+nix = { version = "0.31", features = ["fs", "signal", "process", "user", "sched", "mount"] }
 sd-notify = "0.4"
 
 # CLI

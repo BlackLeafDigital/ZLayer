@@ -48,6 +48,8 @@ pub use router::{
     build_storage_routes, build_tunnel_routes,
 };
 pub use server::ApiServer;
+#[cfg(unix)]
+pub use server::{bind_dual_with_local_auth, serve_bound, BoundListeners};
 
 // Re-export state types for job/cron/build/deployment/service/internal/container endpoints
 pub use handlers::build::{BuildManager, BuildState, BuildStateEnum, BuildStatus, TemplateInfo};
