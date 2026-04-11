@@ -10,7 +10,7 @@ version: "1"
 
 stages:
   chef:
-    base: "lukemathwalker/cargo-chef:latest-rust-1.90"
+    base: "lukemathwalker/cargo-chef:latest-rust-1.92"
     workdir: "/build"
 
   planner:
@@ -63,7 +63,11 @@ stages:
       - run: "cp -r target/site /build/site"
 
   runtime:
-    base: "debian:bookworm-slim"
+    # trixie (glibc 2.41) matches the cargo-chef builder's glibc so the
+    # zlayer-web binary's GLIBC_2.38+ symbol references resolve at runtime.
+    # bookworm-slim (glibc 2.36) was too old and produced
+    # `version 'GLIBC_2.38' not found` at container startup.
+    base: "debian:trixie-slim"
     workdir: "/app"
     steps:
       - run: "apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*"

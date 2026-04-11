@@ -150,7 +150,7 @@ zip = "2"
 
 # Unix/Linux system calls
 libc = "0.2"
-nix = { version = "0.31", features = ["fs", "signal", "process", "user"] }
+nix = { version = "0.31", features = ["fs", "signal", "process", "user", "sched", "mount"] }
 
 # Systemd readiness notification (pure-Rust, no libsystemd dep)
 sd-notify = "0.4"

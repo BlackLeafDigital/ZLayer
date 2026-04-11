@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
@@ -16,8 +16,7 @@ use zlayer_api::router::{
     build_network_routes, build_node_routes, build_overlay_routes, build_tunnel_routes,
 };
 use zlayer_api::{
-    ApiConfig, ApiServer, BuildState, ContainerApiState, CronState, JobState, NetworkApiState,
-    TunnelApiState,
+    ApiConfig, BuildState, ContainerApiState, CronState, JobState, NetworkApiState, TunnelApiState,
 };
 use zlayer_overlay::IpAllocator;
 
@@ -545,6 +544,13 @@ pub(crate) async fn serve(
     cleanup_stale_daemon(&config, socket_path, bind).await;
 
     // -----------------------------------------------------------------------
+    // 1c. Bind TCP + Unix listeners early so the socket file exists on disk
+    //     before restore_deployments tries to bind-mount it into containers.
+    // -----------------------------------------------------------------------
+    let bound_listeners =
+        zlayer_api::bind_dual_with_local_auth(bind_addr, socket_path, &jwt_secret_raw).await?;
+
+    // -----------------------------------------------------------------------
     // 2. Initialise all daemon infrastructure
     // -----------------------------------------------------------------------
     info!("Initialising daemon infrastructure");
@@ -918,14 +924,7 @@ pub(crate) async fn serve(
         let _ = sd_notify::notify(false, &[sd_notify::NotifyState::Ready]);
     }
 
-    ApiServer::run_dual_with_local_auth(
-        bind_addr,
-        socket_path,
-        router,
-        api_config.jwt_secret.expose_secret(),
-        shutdown,
-    )
-    .await?;
+    zlayer_api::serve_bound(bound_listeners, router, shutdown).await?;
 
     // -----------------------------------------------------------------------
     // 7. Post-shutdown cleanup: tear down infrastructure in reverse order

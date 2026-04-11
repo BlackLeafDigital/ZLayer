@@ -41,17 +41,26 @@ pub(crate) async fn handle_export(cli: &Cli, image: &str, output: &Path, gzip: b
 /// Handle import command - import image from OCI tar archive
 #[allow(clippy::cast_precision_loss)]
 pub(crate) async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) -> Result<()> {
-    use zlayer_registry::{import_image, LocalRegistry};
+    use zlayer_registry::{import_image, LocalRegistry, PersistentBlobCache};
 
     let registry_path = cli.effective_data_dir().join("registry");
     let registry = LocalRegistry::new(registry_path)
         .await
         .context("Failed to open local registry")?;
 
+    // Open the same blob cache the daemon uses so imported layers are
+    // visible to ImagePuller without a remote registry round-trip.
+    // The daemon opens this exact file path (see youki.rs config.cache_dir.join("blobs.redb")).
+    // Despite the `.redb` extension this is a SQLite database (historical naming).
+    let cache_path = cli.effective_data_dir().join("cache").join("blobs.redb");
+    let blob_cache = PersistentBlobCache::open(&cache_path)
+        .await
+        .context("Failed to open blob cache")?;
+
     info!("Importing from {}", input.display());
     println!("Importing from {}...", input.display());
 
-    let import_info = import_image(&registry, input, tag.as_deref())
+    let import_info = import_image(&registry, input, tag.as_deref(), Some(&blob_cache))
         .await
         .context("Failed to import image")?;
 

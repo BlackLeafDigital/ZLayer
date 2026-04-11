@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.70]
+
+### Fixed
+- **Deploy "Stabilization timed out" no longer masks the real container
+  failure.** When a container's init process crashed during startup (bad
+  image, missing libs, failed mount), the overlay attach code would run
+  against the now-dead PID and emit misleading `RTNETLINK answers: No such
+  process` / `File exists` / `Invalid "netns" value` errors. The user then
+  saw a generic `Stabilization timed out: N/N replicas, healthy=false`
+  with no pointer to the root cause. The agent now (a) checks the
+  container's state between `start_container` and overlay attach, (b)
+  returns the container's log tail when the init already exited, and
+  (c) includes each failing service's recent log lines in the
+  stabilization timeout error itself.
+- **Veth leak from failed overlay attaches.** Each failed
+  `attach_to_interface` used to leave a `veth-<pid>` pair (one end named
+  `eth0`) orphaned in the host network namespace. The next deploy's
+  `ip link add ... peer name eth0` then failed with RTNETLINK "File
+  exists", cascading across redeploys. The overlay manager now (a) creates
+  the container-side veth with a unique name (`vc-<pid>`) and renames it
+  to `eth0` only after moving into the container's netns, (b) deletes
+  the pair on any attach-path failure, and (c) sweeps orphan veth pairs
+  whose owning PID is no longer alive before each new attach.
+- **`zlayer-manager` and `zlayer-web` images fail at runtime with
+  `version 'GLIBC_2.38' not found`.** The cargo-chef builder
+  (`lukemathwalker/cargo-chef:latest-rust-1.90`) runs on Debian trixie
+  (glibc 2.41), but the runtime stage was pinned to `debian:bookworm-slim`
+  (glibc 2.36). Binaries referencing GLIBC_2.38+ symbols would not start.
+  Both Dockerfile and ZImagefile runtime stages now use `debian:trixie-slim`
+  to match the builder glibc.
+
 ## [0.10.69]
 
 ### Fixed
