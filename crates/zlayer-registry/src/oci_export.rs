@@ -31,7 +31,7 @@
 //! println!("Exported {} layers, digest: {}", info.layers, info.digest);
 //!
 //! // Import an image from a tar file
-//! let info = import_image(&registry, Path::new("/tmp/myapp.tar.gz"), Some("myapp:imported")).await?;
+//! let info = import_image(&registry, Path::new("/tmp/myapp.tar.gz"), Some("myapp:imported"), None).await?;
 //! println!("Imported {} layers, digest: {}", info.layers, info.digest);
 //! # Ok(())
 //! # }
