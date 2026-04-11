@@ -278,6 +278,7 @@ pub async fn create_runtime(
 /// - On macOS: `SandboxRuntime` (native Metal/MPS) → `VmRuntime` (libkrun Linux compat with GPU) → Docker
 /// - On Windows: Use Docker directly
 /// - Returns an error if no runtime can be initialized
+#[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
 async fn create_auto_runtime(
     auth_ctx: Option<ContainerAuthContext>,
 ) -> Result<Arc<dyn Runtime + Send + Sync>> {
