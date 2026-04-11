@@ -29,6 +29,11 @@
 //!          the container IP, bring `eth0` / `lo` up, and add the
 //!          default route.
 
+#![cfg_attr(
+    not(target_os = "linux"),
+    allow(clippy::missing_errors_doc, clippy::unused_async)
+)]
+
 use thiserror::Error;
 
 /// Errors returned by the netlink helpers in this module.
