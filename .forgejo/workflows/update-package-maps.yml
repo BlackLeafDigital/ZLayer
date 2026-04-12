@@ -35,7 +35,7 @@ jobs:
           make with_llvm=no && make with_llvm=no install
           cd / && rm -rf /tmp/libversion /tmp/postgresql-libversion
 
-      - uses: https://code.forgejo.org/actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Generate maps from Repology dump
         env:
