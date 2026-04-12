@@ -9,6 +9,7 @@ description = "ZLayer deployment specification parsing and validation"
 keywords = ["container", "orchestration", "deployment", "spec", "yaml"]
 categories = ["config", "parsing"]
 readme = "README.md"
+publish = ["forgejo"]
 
 [dependencies]
 cron.workspace = true

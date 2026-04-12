@@ -9,6 +9,7 @@ description = "S3-backed container layer persistence with crash-tolerant uploads
 keywords = ["container", "storage", "s3", "layer", "persistence"]
 categories = ["filesystem"]
 readme = "README.md"
+publish = ["forgejo"]
 
 [dependencies]
 # AWS SDK

@@ -9,6 +9,7 @@ description = "OCI container registry client with blob caching"
 keywords = ["container", "oci", "registry", "docker", "image"]
 categories = ["network-programming", "caching"]
 readme = "README.md"
+publish = ["forgejo"]
 
 [dependencies]
 anyhow.workspace = true

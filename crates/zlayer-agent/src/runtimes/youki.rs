@@ -5,12 +5,13 @@
 
 use crate::cgroups_stats::{self, ContainerStats};
 use crate::error::{AgentError, Result};
-use crate::runtime::{ContainerId, ContainerState, Runtime};
+use crate::runtime::{ContainerId, ContainerState, ImageInfo, PruneResult, Runtime};
 use crate::storage_manager::StorageManager;
 use libcontainer::container::builder::ContainerBuilder;
 use libcontainer::container::{Container, ContainerStatus};
 use libcontainer::signal::Signal;
 use libcontainer::syscall::syscall::SyscallType;
+use oci_client::manifest::OciImageManifest;
 use std::collections::HashMap;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::path::PathBuf;
@@ -467,13 +468,22 @@ impl YoukiRuntime {
     /// Pull image layers and return them for extraction
     ///
     /// Uses the shared blob cache to avoid repeated network requests for cached layers.
-    async fn pull_image_layers(&self, image: &str) -> Result<Vec<(Vec<u8>, String)>> {
+    /// The `policy` parameter is translated to a `force_refresh` flag: `PullPolicy::Always`
+    /// clears the manifest cache before fetching, while `IfNotPresent` and `Never` reuse
+    /// any cached manifest (the puller still revalidates mutable tags via HEAD for
+    /// `IfNotPresent`, and serves purely from cache for `Never`).
+    async fn pull_image_layers(
+        &self,
+        image: &str,
+        policy: zlayer_spec::PullPolicy,
+    ) -> Result<Vec<(Vec<u8>, String)>> {
         // Use the shared blob cache instead of opening a new one each time
         let puller = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
         let auth = self.auth_resolver.resolve(image);
+        let force_refresh = matches!(policy, zlayer_spec::PullPolicy::Always);
 
         puller
-            .pull_image(image, &auth)
+            .pull_image_with_policy(image, &auth, force_refresh)
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
@@ -688,11 +698,13 @@ impl Runtime for YoukiRuntime {
 
         // For IfNotPresent, check if image layers are in cache by trying to pull
         // Use the shared blob cache to avoid repeated opens and ensure persistence
-        tracing::info!(image = %image, "pulling image layers to cache");
+        // For Always, force a round-trip to the registry by clearing the manifest cache.
+        let force_refresh = matches!(policy, zlayer_spec::PullPolicy::Always);
+        tracing::info!(image = %image, force_refresh, "pulling image layers to cache");
 
         // Pull image layers from registry (cached layers are retrieved from cache)
         let layers = puller
-            .pull_image(image, &auth)
+            .pull_image_with_policy(image, &auth, force_refresh)
             .await
             .map_err(|e| AgentError::PullFailed {
                 image: image.to_string(),
@@ -706,7 +718,10 @@ impl Runtime for YoukiRuntime {
         );
 
         // Also pull and cache the image config (entrypoint, cmd, env, etc.)
-        match puller.pull_image_config(image, &auth).await {
+        match puller
+            .pull_image_config_with_policy(image, &auth, force_refresh)
+            .await
+        {
             Ok(config) => {
                 tracing::info!(
                     image = %image,
@@ -803,8 +818,12 @@ impl Runtime for YoukiRuntime {
                 reason: format!("failed to create bundle directory: {e}"),
             })?;
 
-        // Pull image layers (from cache if available)
-        let layers = self.pull_image_layers(image).await?;
+        // Pull image layers (from cache if available). Honor the spec's pull policy so
+        // that `Always` forces a manifest refresh, `IfNotPresent` serves from cache with
+        // mutable-tag revalidation, and `Never` reuses cached blobs.
+        let layers = self
+            .pull_image_layers(image, spec.image.pull_policy)
+            .await?;
 
         tracing::debug!(
             container = %container_id,
@@ -1718,6 +1737,173 @@ impl Runtime for YoukiRuntime {
             }
         }
         Ok(())
+    }
+
+    async fn list_images(&self) -> Result<Vec<ImageInfo>> {
+        let keys = self
+            .blob_cache
+            .keys_with_prefix("manifest:")
+            .await
+            .map_err(|e| {
+                AgentError::Internal(format!("failed to list manifest cache keys: {e}"))
+            })?;
+
+        let mut images = Vec::with_capacity(keys.len());
+        for key in keys {
+            // Strip the "manifest:" prefix
+            let reference = match key.strip_prefix("manifest:") {
+                Some(r) => r.to_string(),
+                None => continue,
+            };
+
+            // Load manifest body to compute size and extract digest
+            let Ok(Some(manifest_bytes)) = self.blob_cache.get(&key).await else {
+                continue; // cache entry disappeared — skip
+            };
+
+            let Ok(manifest) = serde_json::from_slice::<OciImageManifest>(&manifest_bytes) else {
+                continue; // corrupt entry — skip
+            };
+
+            // Sum layer sizes + config size
+            let layers_size: i64 = manifest.layers.iter().map(|l| l.size).sum();
+            let config_size = manifest.config.size;
+            let total = layers_size.saturating_add(config_size);
+            let size_bytes = if total > 0 {
+                u64::try_from(total).ok()
+            } else {
+                None
+            };
+
+            // Look up the stored registry digest (Wave 2 convention)
+            let digest_key = format!("manifest-digest:{reference}");
+            let digest = self
+                .blob_cache
+                .get(&digest_key)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|bytes| String::from_utf8(bytes).ok());
+
+            images.push(ImageInfo {
+                reference,
+                digest,
+                size_bytes,
+            });
+        }
+
+        Ok(images)
+    }
+
+    async fn remove_image(&self, image: &str, _force: bool) -> Result<()> {
+        let manifest_key = format!("manifest:{image}");
+        let digest_key = format!("manifest-digest:{image}");
+
+        // Load manifest to learn the blob digests it references
+        let manifest_bytes = self
+            .blob_cache
+            .get(&manifest_key)
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to read manifest cache: {e}")))?;
+
+        let Some(manifest_bytes) = manifest_bytes else {
+            return Err(AgentError::NotFound {
+                container: image.to_string(),
+                reason: format!("image '{image}' not found in cache"),
+            });
+        };
+
+        let manifest: OciImageManifest = serde_json::from_slice(&manifest_bytes).map_err(|e| {
+            AgentError::Internal(format!(
+                "failed to parse cached manifest for '{image}': {e}"
+            ))
+        })?;
+
+        // Delete each referenced blob. Don't bail on individual failures — log and continue.
+        for layer in &manifest.layers {
+            if let Err(e) = self.blob_cache.delete(&layer.digest).await {
+                tracing::warn!(
+                    image = %image,
+                    digest = %layer.digest,
+                    error = %e,
+                    "failed to delete layer blob"
+                );
+            }
+        }
+        if let Err(e) = self.blob_cache.delete(&manifest.config.digest).await {
+            tracing::warn!(
+                image = %image,
+                digest = %manifest.config.digest,
+                error = %e,
+                "failed to delete config blob"
+            );
+        }
+
+        // Delete the manifest body and its digest sidecar
+        self.blob_cache
+            .delete(&manifest_key)
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to delete manifest: {e}")))?;
+        let _ = self.blob_cache.delete(&digest_key).await;
+
+        Ok(())
+    }
+
+    async fn prune_images(&self) -> Result<PruneResult> {
+        // 1. Collect all digests referenced by remaining manifests.
+        let manifest_keys = self
+            .blob_cache
+            .keys_with_prefix("manifest:")
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to list manifests: {e}")))?;
+
+        let mut referenced: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for key in &manifest_keys {
+            let Ok(Some(bytes)) = self.blob_cache.get(key).await else {
+                continue;
+            };
+            let Ok(manifest) = serde_json::from_slice::<OciImageManifest>(&bytes) else {
+                continue;
+            };
+            referenced.insert(manifest.config.digest.clone());
+            for layer in &manifest.layers {
+                referenced.insert(layer.digest.clone());
+            }
+        }
+
+        // 2. Walk all sha256:* blob keys and delete those not referenced.
+        let all_blob_keys = self
+            .blob_cache
+            .keys_with_prefix("sha256:")
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to list blobs: {e}")))?;
+
+        let mut deleted = Vec::new();
+        let mut space_reclaimed: u64 = 0;
+
+        for key in all_blob_keys {
+            if referenced.contains(&key) {
+                continue;
+            }
+            // Grab the blob size before deleting (best-effort).
+            if let Ok(Some(bytes)) = self.blob_cache.get(&key).await {
+                space_reclaimed = space_reclaimed.saturating_add(bytes.len() as u64);
+            }
+            if let Err(e) = self.blob_cache.delete(&key).await {
+                tracing::warn!(
+                    digest = %key,
+                    error = %e,
+                    "failed to delete orphaned blob during prune"
+                );
+                continue;
+            }
+            deleted.push(key);
+        }
+
+        Ok(PruneResult {
+            deleted,
+            space_reclaimed,
+        })
     }
 }
 

@@ -9,6 +9,7 @@ description = "High-performance reverse proxy with TLS termination and L4/L7 rou
 keywords = ["proxy", "reverse-proxy", "tls", "load-balancer"]
 categories = ["network-programming", "web-programming"]
 readme = "README.md"
+publish = false
 
 [dependencies]
 # HTTP implementation

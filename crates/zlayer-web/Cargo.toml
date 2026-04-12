@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 description = "ZLayer web UI with Leptos SSR + Hydration"
 rust-version.workspace = true
+publish = false
 
 [lib]
 name = "zlayer_web"

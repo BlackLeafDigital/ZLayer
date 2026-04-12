@@ -8,6 +8,7 @@ rust-version.workspace = true
 description = "Shared Raft consensus library built on openraft 0.9 for ZLayer and Zatabase"
 keywords = ["raft", "consensus", "distributed", "openraft"]
 categories = ["concurrency", "network-programming"]
+publish = ["forgejo"]
 
 [dependencies]
 # Consensus

@@ -9,6 +9,7 @@ description = "Shared types and configuration for ZLayer container orchestration
 keywords = ["container", "orchestration", "types", "config"]
 categories = ["config"]
 readme = "README.md"
+publish = ["forgejo"]
 
 [dependencies]
 base64 = "0.22"

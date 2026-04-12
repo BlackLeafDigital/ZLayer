@@ -9,6 +9,7 @@ description = "Pre-start container lifecycle actions (TCP, HTTP, S3, commands)"
 keywords = ["container", "init", "lifecycle", "hooks", "s3"]
 categories = ["asynchronous"]
 readme = "README.md"
+publish = ["forgejo"]
 
 [dependencies]
 aws-config = { version = "1.8.11", features = ["behavior-version-latest"], optional = true }

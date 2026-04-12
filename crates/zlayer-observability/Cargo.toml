@@ -9,6 +9,7 @@ description = "OpenTelemetry tracing and Prometheus metrics for ZLayer"
 keywords = ["opentelemetry", "prometheus", "metrics", "tracing", "observability"]
 categories = ["development-tools::profiling"]
 readme = "README.md"
+publish = ["forgejo"]
 
 [features]
 default = []

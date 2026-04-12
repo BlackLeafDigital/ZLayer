@@ -446,6 +446,8 @@ async fn run(mut cli: Cli) -> Result<()> {
             build_args,
             target,
             no_cache,
+            pull,
+            no_pull,
             push,
             no_tui,
             verbose_build,
@@ -460,6 +462,8 @@ async fn run(mut cli: Cli) -> Result<()> {
                 build_args.clone(),
                 target.clone(),
                 *no_cache,
+                pull.clone(),
+                *no_pull,
                 *push,
                 *no_tui,
                 *verbose_build,
@@ -654,6 +658,10 @@ async fn run(mut cli: Cli) -> Result<()> {
         Commands::Daemon(action) => {
             commands::daemon::handle_daemon(action, &cli.effective_data_dir()).await
         }
+        #[cfg(unix)]
+        Commands::Image(image_cmd) => commands::image::handle_image(&cli, image_cmd).await,
+        #[cfg(unix)]
+        Commands::System(system_cmd) => commands::system::handle_system(&cli, system_cmd).await,
 
         // On non-Unix platforms, runtime commands are not available
         #[cfg(not(unix))]

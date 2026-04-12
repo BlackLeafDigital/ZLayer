@@ -9,6 +9,7 @@ description = "Secure tunneling for ZLayer services"
 keywords = ["tunnel", "proxy", "networking", "container"]
 categories = ["network-programming"]
 readme = "README.md"
+publish = ["forgejo"]
 
 [dependencies]
 # Async runtime

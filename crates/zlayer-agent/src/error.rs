@@ -62,6 +62,10 @@ pub enum AgentError {
     /// Internal runtime error
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// Operation is not supported by this runtime
+    #[error("Operation not supported by this runtime: {0}")]
+    Unsupported(String),
 }
 
 pub type Result<T, E = AgentError> = std::result::Result<T, E>;

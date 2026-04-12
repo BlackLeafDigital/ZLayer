@@ -20,6 +20,7 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tokio::net::UnixStream;
 use tracing::{debug, info};
+use zlayer_api::handlers::images::{ImageInfoDto, PruneResultDto};
 
 /// Default path for the daemon Unix socket.
 ///
@@ -848,6 +849,39 @@ impl DaemonClient {
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    // ------------------------------------------------------------------
+    // Image management
+    // ------------------------------------------------------------------
+
+    /// List cached images from the daemon.
+    ///
+    /// `GET /api/v1/images`
+    pub async fn list_images(&self) -> Result<Vec<ImageInfoDto>> {
+        let (status, body) = self.get("/api/v1/images").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Remove a cached image from the daemon.
+    ///
+    /// `DELETE /api/v1/images/{image}?force=BOOL` -- returns 204 No Content.
+    pub async fn remove_image(&self, image: &str, force: bool) -> Result<()> {
+        let path = format!("/api/v1/images/{}?force={}", urlencoding(image), force);
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Prune dangling / unused cached images from the daemon.
+    ///
+    /// `POST /api/v1/system/prune`
+    pub async fn prune_images(&self) -> Result<PruneResultDto> {
+        // Send an empty JSON object as body to keep Content-Type consistent.
+        let (status, body) = self.post_json("/api/v1/system/prune", "{}").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
     }
 }
 

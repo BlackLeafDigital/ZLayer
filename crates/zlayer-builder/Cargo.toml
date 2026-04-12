@@ -9,6 +9,7 @@ description = "Dockerfile parsing and buildah-based container image building"
 keywords = ["container", "docker", "dockerfile", "buildah", "image"]
 categories = ["development-tools", "command-line-utilities"]
 readme = "README.md"
+publish = ["forgejo"]
 
 [dependencies]
 # Dockerfile parsing

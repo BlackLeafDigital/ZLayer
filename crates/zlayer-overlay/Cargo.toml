@@ -9,6 +9,7 @@ description = "Encrypted overlay networking for containers using boringtun users
 keywords = ["container", "networking", "boringtun", "overlay", "userspace"]
 categories = ["network-programming"]
 readme = "README.md"
+publish = ["forgejo"]
 
 [dependencies]
 blake2.workspace = true

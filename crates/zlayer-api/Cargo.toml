@@ -9,6 +9,7 @@ description = "REST API server for ZLayer container orchestration"
 keywords = ["container", "api", "rest", "axum", "orchestration"]
 categories = ["web-programming::http-server"]
 readme = "README.md"
+publish = false
 
 [dependencies]
 # Internal crates

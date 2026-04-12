@@ -179,6 +179,21 @@ impl PersistentBlobCache {
         Ok(())
     }
 
+    /// Return every cached key whose name starts with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CacheError::Database`] on database scan failure.
+    pub async fn keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>, CacheError> {
+        let mut db = self.db.lock().await;
+        let result: std::result::Result<Vec<(String, CachedBlob)>, _> =
+            db.scan_typed("blobs", prefix);
+        match result {
+            Ok(entries) => Ok(entries.into_iter().map(|(key, _)| key).collect()),
+            Err(e) => Err(CacheError::Database(format!("failed to list keys: {e}"))),
+        }
+    }
+
     /// Get current cache size in bytes
     ///
     /// # Errors
@@ -319,6 +334,15 @@ impl BlobCacheBackend for PersistentBlobCache {
 
     async fn contains(&self, digest: &str) -> Result<bool, CacheError> {
         PersistentBlobCache::contains(self, digest).await
+    }
+
+    async fn delete(&self, digest: &str) -> Result<(), CacheError> {
+        // Delegate to the inherent method (already async).
+        PersistentBlobCache::delete(self, digest).await
+    }
+
+    async fn keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>, CacheError> {
+        PersistentBlobCache::keys_with_prefix(self, prefix).await
     }
 }
 

@@ -9,6 +9,7 @@ description = "Raft-based distributed scheduler for container orchestration"
 keywords = ["container", "scheduler", "raft", "distributed", "orchestration"]
 categories = ["concurrency"]
 readme = "README.md"
+publish = ["forgejo"]
 
 [dependencies]
 # Internal crates

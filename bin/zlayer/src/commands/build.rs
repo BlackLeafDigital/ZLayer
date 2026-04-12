@@ -21,11 +21,26 @@ pub(crate) async fn handle_build(
     build_args: Vec<String>,
     target: Option<String>,
     no_cache: bool,
+    pull: String,
+    no_pull: bool,
     push: bool,
     no_tui: bool,
     verbose_build: bool,
 ) -> Result<()> {
-    use zlayer_builder::{detect_runtime, BuildEvent, ImageBuilder, PlainLogger, Runtime};
+    use zlayer_builder::{
+        detect_runtime, BuildEvent, ImageBuilder, PlainLogger, PullBaseMode, Runtime,
+    };
+
+    // Resolve pull mode: --no-pull wins as an explicit override
+    let pull_mode = if no_pull {
+        PullBaseMode::Never
+    } else {
+        match pull.as_str() {
+            "always" => PullBaseMode::Always,
+            "never" => PullBaseMode::Never,
+            _ => PullBaseMode::Newer,
+        }
+    };
 
     info!(
         context = %context.display(),
@@ -112,6 +127,9 @@ pub(crate) async fn handle_build(
     if no_cache {
         builder = builder.no_cache();
     }
+
+    // Apply pull strategy (default Newer is a no-op but harmless to set explicitly)
+    builder = builder.pull(pull_mode);
 
     // Apply push
     if push {

@@ -11,7 +11,7 @@ use std::sync::mpsc;
 use tracing::{debug, info};
 
 use crate::buildah::{BuildahCommand, BuildahExecutor};
-use crate::builder::{BuildOptions, BuiltImage, RegistryAuth};
+use crate::builder::{BuildOptions, BuiltImage, PullBaseMode, RegistryAuth};
 use crate::dockerfile::{Dockerfile, ImageRef, Instruction, RunMount, Stage};
 use crate::error::{BuildError, Result};
 use crate::tui::BuildEvent;
@@ -236,10 +236,22 @@ impl BuildahBackend {
     }
 
     /// Create a working container from an image.
-    async fn create_container(&self, image: &str, platform: Option<&str>) -> Result<String> {
-        let cmd = BuildahCommand::new("from")
-            .arg_opt("--platform", platform)
-            .arg(image);
+    async fn create_container(
+        &self,
+        image: &str,
+        platform: Option<&str>,
+        pull: PullBaseMode,
+    ) -> Result<String> {
+        let mut cmd = BuildahCommand::new("from").arg_opt("--platform", platform);
+
+        match pull {
+            PullBaseMode::Newer => cmd = cmd.arg("--pull=newer"),
+            PullBaseMode::Always => cmd = cmd.arg("--pull=always"),
+            PullBaseMode::Never => { /* no flag — let buildah use whatever is local */ }
+        }
+
+        cmd = cmd.arg(image);
+
         let output = self.executor.execute_checked(&cmd).await?;
         Ok(output.stdout.trim().to_string())
     }
@@ -335,7 +347,7 @@ impl BuildBackend for BuildahBackend {
                 .resolve_base_image(&stage.base_image, &stage_images, options)
                 .await?;
             let container_id = self
-                .create_container(&base, options.platform.as_deref())
+                .create_container(&base, options.platform.as_deref(), options.pull)
                 .await?;
 
             debug!(
