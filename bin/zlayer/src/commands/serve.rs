@@ -787,6 +787,10 @@ pub(crate) async fn serve(
     let storage_routes = zlayer_api::build_storage_routes(storage_api_state);
     router = router.nest("/api/v1/storage", storage_routes);
 
+    // Merge image management routes (list / rm / system prune)
+    let image_routes = zlayer_api::build_image_routes(runtime.clone());
+    router = router.nest("/api/v1", image_routes);
+
     // Merge cluster routes (join, node listing)
     // Initialize CIDR-aware IP allocator for overlay address assignment
     let ip_allocator_path = config.data_dir.join("ip_allocator.json");

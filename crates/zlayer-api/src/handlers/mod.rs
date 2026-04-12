@@ -7,6 +7,7 @@ pub mod containers;
 pub mod cron;
 pub mod deployments;
 pub mod health;
+pub mod images;
 pub mod internal;
 pub mod jobs;
 pub mod networks;

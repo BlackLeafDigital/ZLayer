@@ -2,6 +2,58 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.71]
+
+### Fixed
+- **`zlayer deploy` keeps serving stale `:latest` images after a new
+  release is pushed.** The end-to-end pull path had three independent
+  cache bugs that all had to be fixed together. First, the
+  `zlayer-registry` manifest cache was keyed by tag (`manifest:<image>`)
+  in a persistent SQLite store with no TTL and no revalidation, so any
+  cached mutable-tag manifest was served forever across daemon restarts.
+  `pull_manifest` now revalidates mutable tags (`:latest`, `:dev`,
+  `:edge`, `:main`, `:master`, empty/missing tag) via
+  `HEAD /v2/{repo}/manifests/{tag}` and compares the upstream digest
+  against a new `manifest-digest:<image>` sidecar entry; on mismatch the
+  stale cache is invalidated before the refetch. Registry-unreachable
+  errors fall back to the cached copy with a warning so offline deploys
+  still work. Pinned tags and digest refs keep their fast-path behavior.
+  Second, `YoukiRuntime::pull_image` hard-coded `PullPolicy::IfNotPresent`,
+  dropping any `pull_policy: always` the user set in their spec before it
+  reached the puller; `pull_image_with_policy` and `pull_image_layers` now
+  thread the spec's policy all the way through to the registry client via
+  the new `ImagePuller::pull_image_with_policy(..., force_refresh)` entry
+  point, which invalidates the manifest cache when `force_refresh` is
+  true. Third, `DockerRuntime::pull_image_with_policy` trusted
+  `docker inspect_image` alone to short-circuit `IfNotPresent` pulls,
+  never consulting the registry; it now compares the local image's
+  `repo_digests` entry against the upstream digest returned by
+  bollard's `inspect_registry_image` (the Docker distribution API) and
+  re-pulls on mismatch.
+- **`zlayer build` / `zlayer-build` reuse stale base images.**
+  `buildah from` was invoked with no `--pull` flag, so any upstream
+  republish of the base image was invisible to subsequent local builds
+  until `buildah rmi` was run manually. Builds now default to
+  `--pull=newer`, matching modern build-tool conventions: fast when
+  nothing has changed, correct when the registry has a newer copy.
+  Controlled via the new `--pull=<newer|always|never>` and `--no-pull`
+  flags on `zlayer build`.
+
+### Added
+- **`zlayer image ls`, `zlayer image rm <image>`, `zlayer system prune`
+  subcommands.** First-class image management from the CLI via new
+  `/api/v1/images`, `/api/v1/images/{image}`, and `/api/v1/system/prune`
+  REST endpoints on the daemon, backed by new
+  `Runtime::list_images`, `Runtime::remove_image`, and
+  `Runtime::prune_images` trait methods. Implemented for the Docker
+  runtime (via bollard's image-management APIs) and the Youki runtime
+  (walks the persistent `zlayer-registry` cache to remove manifest
+  entries and their referenced layer blobs, and prunes orphaned
+  content-addressed blobs). Other runtimes inherit a default
+  "unsupported" error. Users can now force a fresh pull of a stale
+  `:latest` image with `zlayer image rm <image>` + redeploy instead of
+  manually wiping `{data_dir}/cache/blobs.redb`.
+
 ## [0.10.70]
 
 ### Fixed

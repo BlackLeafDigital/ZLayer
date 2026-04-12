@@ -5,9 +5,12 @@
 
 use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
-use crate::runtime::{ContainerId, ContainerState, Runtime};
+use crate::runtime::{ContainerId, ContainerState, ImageInfo, PruneResult, Runtime};
+use bollard::errors::Error as BollardError;
 use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::models::{ContainerCreateBody, DeviceMapping, DeviceRequest, HostConfig, PortBinding};
+use bollard::models::{
+    ContainerCreateBody, DeviceMapping, DeviceRequest, HostConfig, ImageInspect, PortBinding,
+};
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, LogsOptions, RemoveContainerOptions,
     StartContainerOptions, StatsOptions, StopContainerOptions, WaitContainerOptions,
@@ -79,6 +82,47 @@ impl DockerRuntime {
             auth_context: None,
         }
     }
+
+    /// Perform the actual image pull: create the pull stream and drain its
+    /// progress events. Does not consult any pull policy — callers are
+    /// responsible for deciding whether a pull should happen.
+    async fn do_pull(&self, image: &str) -> Result<()> {
+        // Parse image into name and tag
+        let (name, tag) = parse_image_ref(image);
+
+        tracing::info!(image = %image, name = %name, tag = %tag, "pulling image");
+
+        let options = CreateImageOptions {
+            from_image: Some(name.to_string()),
+            tag: if tag.is_empty() {
+                None
+            } else {
+                Some(tag.to_string())
+            },
+            ..Default::default()
+        };
+
+        let mut stream = self.docker.create_image(Some(options), None, None);
+
+        while let Some(result) = stream.next().await {
+            match result {
+                Ok(info) => {
+                    if let Some(status) = info.status {
+                        tracing::debug!(status = %status, "pull progress");
+                    }
+                }
+                Err(e) => {
+                    return Err(AgentError::PullFailed {
+                        image: image.to_string(),
+                        reason: e.to_string(),
+                    });
+                }
+            }
+        }
+
+        tracing::info!(image = %image, "image pulled successfully");
+        Ok(())
+    }
 }
 
 /// Generate a container name from a `ContainerId`
@@ -104,6 +148,27 @@ fn parse_image_ref(image: &str) -> (&str, &str) {
     }
 
     (image, "latest")
+}
+
+/// Extract the local image digest for `image` by scanning `repo_digests` for
+/// an entry matching `repo_name` (the part before the `@`). Returns the
+/// `sha256:...` suffix of the matching entry, or `None` if no matching
+/// digest is recorded.
+///
+/// `ImageInspect.repo_digests` entries look like
+/// `"zachhandley/zlayer-manager@sha256:abc..."`. Docker stores one entry per
+/// repository that this image has been pulled from, so we match by repo
+/// rather than taking the first entry.
+fn extract_local_digest(inspect: &ImageInspect, repo_name: &str) -> Option<String> {
+    let digests = inspect.repo_digests.as_ref()?;
+    digests.iter().find_map(|entry| {
+        let (repo, digest) = entry.split_once('@')?;
+        if repo == repo_name {
+            Some(digest.to_string())
+        } else {
+            None
+        }
+    })
 }
 
 /// Build exposed ports list for Docker container config
@@ -339,49 +404,81 @@ impl Runtime for DockerRuntime {
             return Ok(());
         }
 
-        // Handle IfNotPresent - check if image exists
-        if matches!(policy, PullPolicy::IfNotPresent)
-            && self.docker.inspect_image(image).await.is_ok()
-        {
-            tracing::debug!(image = %image, "image already present, skipping pull");
-            return Ok(());
-        }
+        // Handle IfNotPresent - check local presence, and when a tag is
+        // involved, compare local vs. upstream digests so we re-pull when the
+        // registry has moved forward.
+        if matches!(policy, PullPolicy::IfNotPresent) {
+            // Step 1: is the image even present locally?
+            let local_inspect = match self.docker.inspect_image(image).await {
+                Ok(inspect) => inspect,
+                Err(BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {
+                    tracing::debug!(image = %image, "image not present locally, pulling");
+                    return self.do_pull(image).await;
+                }
+                Err(e) => {
+                    return Err(AgentError::Internal(format!(
+                        "failed to inspect image '{image}': {e}"
+                    )));
+                }
+            };
 
-        // Parse image into name and tag
-        let (name, tag) = parse_image_ref(image);
+            // Step 2: if it's pinned by digest, local presence is sufficient.
+            let (name, tag) = parse_image_ref(image);
+            if tag.is_empty() {
+                tracing::debug!(
+                    image = %image,
+                    "image pinned by digest and present, skipping pull"
+                );
+                return Ok(());
+            }
 
-        tracing::info!(image = %image, name = %name, tag = %tag, "pulling image");
+            // Step 3: compare local vs remote digests.
+            let local_digest = extract_local_digest(&local_inspect, name);
 
-        let options = CreateImageOptions {
-            from_image: Some(name.to_string()),
-            tag: if tag.is_empty() {
-                None
-            } else {
-                Some(tag.to_string())
-            },
-            ..Default::default()
-        };
-
-        let mut stream = self.docker.create_image(Some(options), None, None);
-
-        while let Some(result) = stream.next().await {
-            match result {
-                Ok(info) => {
-                    if let Some(status) = info.status {
-                        tracing::debug!(status = %status, "pull progress");
+            match self.docker.inspect_registry_image(image, None).await {
+                Ok(dist) => {
+                    let remote_digest = dist.descriptor.digest;
+                    match (&local_digest, &remote_digest) {
+                        (Some(local), Some(remote)) if local == remote => {
+                            tracing::debug!(
+                                image = %image,
+                                digest = %local,
+                                "image up-to-date, skipping pull"
+                            );
+                            return Ok(());
+                        }
+                        (Some(local), Some(remote)) => {
+                            tracing::info!(
+                                image = %image,
+                                local = %local,
+                                remote = %remote,
+                                "image digests differ, re-pulling"
+                            );
+                            return self.do_pull(image).await;
+                        }
+                        _ => {
+                            tracing::info!(
+                                image = %image,
+                                "local or remote digest missing, re-pulling to be safe"
+                            );
+                            return self.do_pull(image).await;
+                        }
                     }
                 }
                 Err(e) => {
-                    return Err(AgentError::PullFailed {
-                        image: image.to_string(),
-                        reason: e.to_string(),
-                    });
+                    tracing::warn!(
+                        image = %image,
+                        error = %e,
+                        "failed to query registry digest, using local image"
+                    );
+                    return Ok(());
                 }
             }
         }
 
-        tracing::info!(image = %image, "image pulled successfully");
-        Ok(())
+        self.do_pull(image).await
     }
 
     /// Create a container from the given spec
@@ -1070,6 +1167,80 @@ impl Runtime for DockerRuntime {
         tracing::debug!(container = %name, ip = ?ip, "got container IP from Docker inspect");
         Ok(ip)
     }
+
+    #[instrument(skip(self), fields(otel.name = "image.list"))]
+    async fn list_images(&self) -> Result<Vec<ImageInfo>> {
+        use bollard::query_parameters::ListImagesOptionsBuilder;
+        let options = ListImagesOptionsBuilder::default().all(true).build();
+        let summaries = self
+            .docker
+            .list_images(Some(options))
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to list images: {e}")))?;
+
+        let mut infos = Vec::with_capacity(summaries.len());
+        for summary in summaries {
+            // Pick the first non-placeholder repo tag as the canonical reference.
+            let reference = summary
+                .repo_tags
+                .iter()
+                .find(|t| !t.is_empty() && t.as_str() != "<none>:<none>")
+                .cloned()
+                .unwrap_or_else(|| summary.id.clone());
+
+            // First repo digest as the content-addressed digest, if any.
+            let digest = summary
+                .repo_digests
+                .iter()
+                .find_map(|rd| rd.split_once('@').map(|(_, d)| d.to_string()));
+
+            let size_bytes = u64::try_from(summary.size).ok();
+
+            infos.push(ImageInfo {
+                reference,
+                digest,
+                size_bytes,
+            });
+        }
+        Ok(infos)
+    }
+
+    #[instrument(skip(self), fields(otel.name = "image.remove", container.image.name = %image, force))]
+    async fn remove_image(&self, image: &str, force: bool) -> Result<()> {
+        use bollard::query_parameters::RemoveImageOptionsBuilder;
+        let options = RemoveImageOptionsBuilder::default().force(force).build();
+        self.docker
+            .remove_image(image, Some(options), None)
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to remove image '{image}': {e}")))?;
+        Ok(())
+    }
+
+    #[instrument(skip(self), fields(otel.name = "image.prune"))]
+    async fn prune_images(&self) -> Result<PruneResult> {
+        let response = self
+            .docker
+            .prune_images(None::<bollard::query_parameters::PruneImagesOptions>)
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to prune images: {e}")))?;
+
+        let deleted: Vec<String> = response
+            .images_deleted
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.deleted.or(item.untagged))
+            .collect();
+
+        let space_reclaimed = response
+            .space_reclaimed
+            .and_then(|v| u64::try_from(v).ok())
+            .unwrap_or(0);
+
+        Ok(PruneResult {
+            deleted,
+            space_reclaimed,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1133,6 +1304,73 @@ mod tests {
         let (name, tag) = parse_image_ref(image);
         assert_eq!(name, image);
         assert_eq!(tag, "");
+    }
+
+    #[test]
+    fn extract_local_digest_matches_repo() {
+        let inspect = ImageInspect {
+            repo_digests: Some(vec!["zachhandley/zlayer-manager@sha256:abc123".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_local_digest(&inspect, "zachhandley/zlayer-manager"),
+            Some("sha256:abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_local_digest_returns_none_for_non_matching_repo() {
+        let inspect = ImageInspect {
+            repo_digests: Some(vec!["otherrepo/image@sha256:def456".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_local_digest(&inspect, "zachhandley/zlayer-manager"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_local_digest_returns_none_when_repo_digests_missing() {
+        let inspect = ImageInspect {
+            repo_digests: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_local_digest(&inspect, "zachhandley/zlayer-manager"),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_local_digest_skips_malformed_entries() {
+        let inspect = ImageInspect {
+            repo_digests: Some(vec![
+                "malformed-no-at-sign".to_string(),
+                "zachhandley/zlayer-manager@sha256:abc123".to_string(),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_local_digest(&inspect, "zachhandley/zlayer-manager"),
+            Some("sha256:abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_local_digest_picks_matching_when_multiple() {
+        let inspect = ImageInspect {
+            repo_digests: Some(vec![
+                "otherrepo/image@sha256:111".to_string(),
+                "zachhandley/zlayer-manager@sha256:abc123".to_string(),
+                "thirdparty/image@sha256:222".to_string(),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_local_digest(&inspect, "zachhandley/zlayer-manager"),
+            Some("sha256:abc123".to_string())
+        );
     }
 
     #[test]

@@ -16,6 +16,8 @@ pub mod deploy;
 #[cfg(unix)]
 pub mod exec;
 #[cfg(unix)]
+pub mod image;
+#[cfg(unix)]
 pub mod join;
 #[cfg(unix)]
 pub mod node;
@@ -23,5 +25,7 @@ pub mod node;
 pub mod ps;
 #[cfg(unix)]
 pub mod serve;
+#[cfg(unix)]
+pub mod system;
 #[cfg(unix)]
 pub mod token;
