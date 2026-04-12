@@ -23,6 +23,43 @@ pub trait BlobCacheBackend: Send + Sync {
 
     /// Check if a blob exists in the cache
     async fn contains(&self, digest: &str) -> Result<bool, CacheError>;
+
+    /// Remove a cached entry by key.
+    ///
+    /// The default implementation returns an "unsupported" error so backends
+    /// that cannot efficiently delete individual entries (e.g. immutable
+    /// object stores) can still satisfy the trait. Callers should treat a
+    /// delete failure as non-fatal and continue — the cache will eventually
+    /// be revalidated or evicted by other means.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError::Database` when the backend does not support
+    /// point deletion, or when the underlying store reports a failure.
+    async fn delete(&self, _digest: &str) -> Result<(), CacheError> {
+        Err(CacheError::Database(
+            "delete not supported for this cache backend".to_string(),
+        ))
+    }
+
+    /// Return every cached key whose name starts with `prefix`.
+    ///
+    /// Used by image-management operations (`zlayer image ls`, `rm`, `prune`)
+    /// to walk the manifest keyspace without loading every blob. The default
+    /// implementation returns `CacheError::Database`, so backends that cannot
+    /// efficiently enumerate keys (e.g. S3) simply don't support the feature.
+    ///
+    /// Ordering is not defined; callers must not depend on it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError::Database` when the backend doesn't support
+    /// enumeration, or when the underlying store fails.
+    async fn keys_with_prefix(&self, _prefix: &str) -> Result<Vec<String>, CacheError> {
+        Err(CacheError::Database(
+            "keys_with_prefix not supported for this cache backend".to_string(),
+        ))
+    }
 }
 
 /// Local blob cache for OCI images (in-memory)
@@ -201,6 +238,23 @@ impl BlobCacheBackend for BlobCache {
         // Delegate to the synchronous method
         BlobCache::contains(self, digest)
     }
+
+    async fn delete(&self, digest: &str) -> Result<(), CacheError> {
+        // Delegate to the synchronous method
+        BlobCache::delete(self, digest)
+    }
+
+    async fn keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>, CacheError> {
+        let blobs = self
+            .blobs
+            .read()
+            .map_err(|e| CacheError::Database(format!("failed to acquire read lock: {e}")))?;
+        Ok(blobs
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect())
+    }
 }
 
 /// Validate that a digest string is properly formatted
@@ -286,5 +340,25 @@ mod tests {
         // Delete
         cache.delete(&digest).unwrap();
         assert!(!cache.contains(&digest).unwrap());
+    }
+
+    #[tokio::test]
+    async fn blob_cache_keys_with_prefix_filters_correctly() {
+        let cache = BlobCache::new().unwrap();
+        cache.put("manifest:foo", b"body1").unwrap();
+        cache.put("manifest:bar", b"body2").unwrap();
+        // Real sha256 digest of b"body3" so put() validation succeeds.
+        let body3 = b"body3";
+        let body3_digest = compute_digest(body3);
+        cache.put(&body3_digest, body3).unwrap();
+
+        let mut keys = <BlobCache as BlobCacheBackend>::keys_with_prefix(&cache, "manifest:")
+            .await
+            .unwrap();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec!["manifest:bar".to_string(), "manifest:foo".to_string()]
+        );
     }
 }

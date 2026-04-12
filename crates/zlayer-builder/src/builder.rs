@@ -249,6 +249,24 @@ impl RegistryAuth {
     }
 }
 
+/// Strategy for pulling the base image before building.
+///
+/// Controls the `--pull` flag passed to `buildah from`. The default is
+/// [`PullBaseMode::Newer`], matching the behaviour users expect from
+/// modern build tools: fast when nothing has changed, correct when the
+/// upstream base image has been republished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PullBaseMode {
+    /// Pull only if the registry has a newer version (`--pull=newer`).
+    /// Default behaviour.
+    #[default]
+    Newer,
+    /// Always pull, even if a local copy exists (`--pull=always`).
+    Always,
+    /// Never pull — use whatever is in local storage (no `--pull` flag passed).
+    Never,
+}
+
 /// Build options for customizing the image build process
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -354,6 +372,12 @@ pub struct BuildOptions {
     /// When set, the sandbox builder can skip a rebuild if the cached image
     /// was produced from identical source content (content-based invalidation).
     pub source_hash: Option<String>,
+    /// How to handle base-image pulling during `buildah from`.
+    ///
+    /// Default: [`PullBaseMode::Newer`] — only pull if the registry has a
+    /// newer version. Set to [`PullBaseMode::Always`] for CI builds that
+    /// must always refresh, or [`PullBaseMode::Never`] for offline builds.
+    pub pull: PullBaseMode,
 }
 
 impl Default for BuildOptions {
@@ -381,6 +405,7 @@ impl Default for BuildOptions {
             retries: 0,
             platform: None,
             source_hash: None,
+            pull: PullBaseMode::default(),
         }
     }
 }
@@ -753,6 +778,19 @@ impl ImageBuilder {
     #[must_use]
     pub fn no_cache(mut self) -> Self {
         self.options.no_cache = true;
+        self
+    }
+
+    /// Set the base-image pull strategy for the build.
+    ///
+    /// By default, `buildah from` is invoked with `--pull=newer`, so an
+    /// up-to-date local base image is reused but a newer one on the
+    /// registry will be fetched. Pass [`PullBaseMode::Always`] to force a
+    /// fresh pull on every build, or [`PullBaseMode::Never`] to stay fully
+    /// offline.
+    #[must_use]
+    pub fn pull(mut self, mode: PullBaseMode) -> Self {
+        self.options.pull = mode;
         self
     }
 

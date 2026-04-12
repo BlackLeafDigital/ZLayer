@@ -230,6 +230,22 @@ impl PersistentBlobCache {
         Ok(())
     }
 
+    /// Return every `digest` column value whose name starts with `prefix`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CacheError::Database` on SQL failure.
+    pub async fn keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>, CacheError> {
+        let pattern = format!("{prefix}%");
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT digest FROM blobs WHERE digest LIKE ? ESCAPE '\\'")
+                .bind(pattern)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| CacheError::Database(format!("failed to list keys: {e}")))?;
+        Ok(rows.into_iter().map(|(s,)| s).collect())
+    }
+
     /// Get current cache size in bytes
     ///
     /// # Errors
@@ -354,6 +370,15 @@ impl BlobCacheBackend for PersistentBlobCache {
 
     async fn contains(&self, digest: &str) -> Result<bool, CacheError> {
         PersistentBlobCache::contains(self, digest).await
+    }
+
+    async fn delete(&self, digest: &str) -> Result<(), CacheError> {
+        // Delegate to the inherent method (already async).
+        PersistentBlobCache::delete(self, digest).await
+    }
+
+    async fn keys_with_prefix(&self, prefix: &str) -> Result<Vec<String>, CacheError> {
+        PersistentBlobCache::keys_with_prefix(self, prefix).await
     }
 }
 

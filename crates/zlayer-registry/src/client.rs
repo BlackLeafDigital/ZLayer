@@ -92,6 +92,46 @@ fn go_os_name() -> &'static str {
     }
 }
 
+/// Returns true when the image reference uses a "mutable" tag whose meaning
+/// can change over time (e.g. `:latest`, `:dev`), so cached manifests for it
+/// must be revalidated against the registry rather than trusted forever.
+///
+/// Returns false for pinned tags (`:v1.2.3`), digest references
+/// (`image@sha256:...`), and anything else not in the known-mutable set.
+fn is_mutable_tag(image: &str) -> bool {
+    // Digest references are always immutable — strip anything from `@` onward
+    // and, if a digest was present, the reference is content-addressed.
+    let (without_digest, had_digest) = match image.find('@') {
+        Some(idx) => (&image[..idx], true),
+        None => (image, false),
+    };
+    if had_digest {
+        return false;
+    }
+
+    // Find the tag by looking at the LAST `:`. If everything after it contains
+    // a `/`, that colon was part of a registry host:port, not a tag separator.
+    let tag = match without_digest.rfind(':') {
+        Some(idx) => {
+            let candidate = &without_digest[idx + 1..];
+            if candidate.contains('/') {
+                // Colon belonged to a host:port, so there is no explicit tag.
+                None
+            } else {
+                Some(candidate)
+            }
+        }
+        None => None,
+    };
+
+    match tag {
+        // No tag at all — Docker defaults to `latest`, which is mutable.
+        // Empty tag (e.g. `nginx:`) is treated the same as a missing tag.
+        None | Some("") => true,
+        Some(t) => matches!(t, "latest" | "dev" | "edge" | "main" | "master"),
+    }
+}
+
 /// Platform resolver that works correctly on macOS.
 ///
 /// On macOS, this performs a two-pass search:
@@ -275,10 +315,152 @@ impl ImagePuller {
         Ok(buffer)
     }
 
-    /// Pull an image manifest from the registry
+    /// Fetch the current upstream manifest digest for `image` from the registry
+    /// without pulling the manifest body. Uses `HEAD /v2/{repo}/manifests/{tag}`.
     ///
-    /// Returns the manifest and its digest. Manifests are cached to avoid
-    /// repeated network requests for the same image reference.
+    /// Returns `Ok(Some(digest))` when the registry reports a current digest,
+    /// `Ok(None)` when the image or tag is not found on the registry, and `Err`
+    /// on transport / auth / protocol failures.
+    ///
+    /// This exists so [`pull_manifest`] can revalidate its cache entry against
+    /// the live registry state for mutable tags (`:latest`, `:dev`, ...) without
+    /// paying for a full manifest download on every pull.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the image reference is invalid or the registry
+    /// returns a transport, auth, or protocol-level failure.
+    pub async fn remote_manifest_digest(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+    ) -> Result<Option<String>> {
+        let reference: Reference = image.parse().map_err(|_| RegistryError::NotFound {
+            registry: "unknown".to_string(),
+            image: image.to_string(),
+        })?;
+
+        match self.client.fetch_manifest_digest(&reference, auth).await {
+            Ok(digest) => Ok(Some(digest)),
+            Err(oci_client::errors::OciDistributionError::ImageManifestNotFoundError(_)) => {
+                tracing::debug!(image = %image, "remote manifest not found");
+                Ok(None)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, image = %image, "failed to fetch remote manifest digest");
+                Err(RegistryError::Oci(e))
+            }
+        }
+    }
+
+    /// Try to satisfy a manifest request from the persistent cache.
+    ///
+    /// Returns `Some((manifest, digest))` when the cached entry is usable
+    /// (either because the image ref is pinned, or because a HEAD revalidation
+    /// against the registry confirmed the cached digest is still current, or
+    /// because the registry was unreachable and we're falling back to stale).
+    /// Returns `None` when the caller should proceed to fetch the manifest
+    /// fresh from the registry — i.e. there is no cached entry, the cached
+    /// bytes could not be deserialized, or revalidation detected a newer
+    /// digest and already invalidated the cache entries.
+    async fn try_cached_manifest(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+        cache_key: &str,
+        digest_key: &str,
+    ) -> Option<(OciImageManifest, String)> {
+        let data = self.cache.get(cache_key).await.ok().flatten()?;
+        let manifest = serde_json::from_slice::<OciImageManifest>(&data).ok()?;
+
+        let cached_digest = self
+            .cache
+            .get(digest_key)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|bytes| String::from_utf8(bytes).ok());
+
+        // Pinned refs: trust the cache without revalidation.
+        if !is_mutable_tag(image) {
+            let digest = cached_digest.unwrap_or_else(|| crate::cache::compute_digest(&data));
+            tracing::debug!(image = %image, "manifest cache hit (pinned ref)");
+            return Some((manifest, digest));
+        }
+
+        // Mutable tag: revalidate against the registry.
+        match self.remote_manifest_digest(image, auth).await {
+            Ok(Some(remote_digest)) => {
+                if let Some(cached) = cached_digest.as_deref() {
+                    if cached == remote_digest {
+                        tracing::debug!(image = %image, "manifest cache hit (revalidated)");
+                        return Some((manifest, remote_digest));
+                    }
+                    tracing::info!(
+                        image = %image,
+                        cached = %cached,
+                        remote = %remote_digest,
+                        "cached manifest is stale, refetching"
+                    );
+                } else {
+                    // Legacy pre-revalidation entry with no cached digest:
+                    // treat as stale so we refetch once and populate both
+                    // keys for future revalidations.
+                    tracing::info!(
+                        image = %image,
+                        remote = %remote_digest,
+                        "cached manifest has no stored digest, refetching"
+                    );
+                }
+                if let Err(e) = self.cache.delete(cache_key).await {
+                    tracing::warn!(
+                        image = %image,
+                        error = %e,
+                        "failed to delete stale manifest cache entry"
+                    );
+                }
+                if let Err(e) = self.cache.delete(digest_key).await {
+                    tracing::warn!(
+                        image = %image,
+                        error = %e,
+                        "failed to delete stale manifest digest cache entry"
+                    );
+                }
+                None
+            }
+            Ok(None) => {
+                tracing::warn!(image = %image, "remote manifest not found, using stale cache");
+                let digest = cached_digest.unwrap_or_else(|| crate::cache::compute_digest(&data));
+                Some((manifest, digest))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    image = %image,
+                    error = %e,
+                    "manifest revalidation failed, using stale cache"
+                );
+                let digest = cached_digest.unwrap_or_else(|| crate::cache::compute_digest(&data));
+                Some((manifest, digest))
+            }
+        }
+    }
+
+    /// Pull an image manifest from the registry.
+    ///
+    /// Returns the manifest and its registry-reported digest. Manifests are
+    /// cached to avoid repeated network requests for the same image reference.
+    ///
+    /// For mutable tags (`:latest`, `:dev`, `:edge`, `:main`, `:master`, or
+    /// missing/empty tags), a cache hit triggers a `HEAD` revalidation against
+    /// the upstream registry. If the cached digest still matches, the cached
+    /// manifest is returned. If the remote digest differs, the cache entry is
+    /// invalidated and the manifest is refetched. If the revalidation request
+    /// itself fails (e.g. the registry is unreachable), the stale cached
+    /// manifest is returned rather than failing the caller — serving stale
+    /// beats crashing the deploy.
+    ///
+    /// Pinned tags (e.g. `:v1.2.3`) and digest references (`img@sha256:...`)
+    /// are treated as immutable: a cache hit is returned without revalidation.
     ///
     /// # Errors
     ///
@@ -288,16 +470,19 @@ impl ImagePuller {
         image: &str,
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
-        // Cache key: use "manifest:" prefix + image reference
+        // Cache keys: one for the manifest body, one for the registry-reported
+        // digest. We store the digest separately because `compute_digest` over
+        // the cached JSON bytes is NOT equal to the canonical OCI manifest
+        // digest the registry would report (content-addressed hash of the
+        // on-the-wire bytes, not our cached re-serialization).
         let cache_key = format!("manifest:{image}");
+        let digest_key = format!("manifest-digest:{image}");
 
-        // Check cache first
-        if let Ok(Some(data)) = self.cache.get(&cache_key).await {
-            if let Ok(manifest) = serde_json::from_slice::<OciImageManifest>(&data) {
-                let digest = crate::cache::compute_digest(&data);
-                tracing::debug!(image = %image, "manifest cache hit");
-                return Ok((manifest, digest));
-            }
+        if let Some(hit) = self
+            .try_cached_manifest(image, auth, &cache_key, &digest_key)
+            .await
+        {
+            return Ok(hit);
         }
 
         let reference: Reference = image.parse().map_err(|_| RegistryError::NotFound {
@@ -323,12 +508,64 @@ impl ImagePuller {
             "manifest pulled successfully"
         );
 
-        // Cache for next time
+        // Cache the manifest body and its registry-reported digest side by
+        // side so the next call can revalidate cheaply via HEAD.
         if let Ok(bytes) = serde_json::to_vec(&manifest) {
-            let _ = self.cache.put(&cache_key, &bytes).await;
+            if let Err(e) = self.cache.put(&cache_key, &bytes).await {
+                tracing::warn!(image = %image, error = %e, "failed to cache manifest body");
+            }
+            if let Err(e) = self.cache.put(&digest_key, digest.as_bytes()).await {
+                tracing::warn!(
+                    image = %image,
+                    error = %e,
+                    "failed to cache manifest digest"
+                );
+            }
         }
 
         Ok((manifest, digest))
+    }
+
+    /// Pull an image manifest, optionally forcing a cache bypass.
+    ///
+    /// When `force_refresh` is `true`, any cached entry for this image is
+    /// deleted before the fetch, guaranteeing a round-trip to the registry.
+    /// This is the implementation hook for `PullPolicy::Always` — higher-level
+    /// runtimes translate their policy into this boolean.
+    ///
+    /// When `force_refresh` is `false`, this behaves identically to
+    /// [`pull_manifest`], which already revalidates cached entries for mutable
+    /// tags.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest cannot be pulled or the image
+    /// reference is invalid.
+    pub async fn pull_manifest_with_policy(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+        force_refresh: bool,
+    ) -> Result<(OciImageManifest, String)> {
+        if force_refresh {
+            let cache_key = format!("manifest:{image}");
+            let digest_key = format!("manifest-digest:{image}");
+            if let Err(e) = self.cache.delete(&cache_key).await {
+                tracing::warn!(
+                    image = %image,
+                    error = %e,
+                    "failed to invalidate manifest cache for force refresh"
+                );
+            }
+            if let Err(e) = self.cache.delete(&digest_key).await {
+                tracing::warn!(
+                    image = %image,
+                    error = %e,
+                    "failed to invalidate manifest digest cache for force refresh"
+                );
+            }
+        }
+        self.pull_manifest(image, auth).await
     }
 
     /// Pull and parse the image configuration from the registry.
@@ -392,6 +629,46 @@ impl ImagePuller {
         );
 
         Ok(config)
+    }
+
+    /// Pull and parse the image configuration, optionally forcing a cache
+    /// bypass on the underlying manifest fetch.
+    ///
+    /// When `force_refresh` is `true`, the manifest cache entry for this image
+    /// is invalidated before fetching. The config blob itself is
+    /// content-addressed by digest, so it does not need explicit invalidation
+    /// — once the refreshed manifest points at a new config digest, the
+    /// existing blob-cache lookup will naturally miss and refetch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest or config blob cannot be fetched, or
+    /// if the config blob cannot be parsed as valid JSON.
+    pub async fn pull_image_config_with_policy(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+        force_refresh: bool,
+    ) -> Result<ImageConfig> {
+        if force_refresh {
+            let cache_key = format!("manifest:{image}");
+            let digest_key = format!("manifest-digest:{image}");
+            if let Err(e) = self.cache.delete(&cache_key).await {
+                tracing::warn!(
+                    image = %image,
+                    error = %e,
+                    "failed to invalidate manifest cache for force refresh"
+                );
+            }
+            if let Err(e) = self.cache.delete(&digest_key).await {
+                tracing::warn!(
+                    image = %image,
+                    error = %e,
+                    "failed to invalidate manifest digest cache for force refresh"
+                );
+            }
+        }
+        self.pull_image_config(image, auth).await
     }
 
     /// Detect the artifact type of an image from its manifest
@@ -562,6 +839,46 @@ impl ImagePuller {
         );
 
         Ok(layers)
+    }
+
+    /// Pull a complete image, optionally forcing a cache bypass on the
+    /// underlying manifest fetch.
+    ///
+    /// When `force_refresh` is `true`, the manifest cache entry for this image
+    /// is invalidated before fetching. Layer blobs are content-addressed by
+    /// digest, so they do not need explicit invalidation — once the refreshed
+    /// manifest points at new layer digests, the existing blob-cache lookups
+    /// will naturally miss and refetch the new layers. Shared layer blobs
+    /// remain valid cache hits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest or any layer cannot be pulled.
+    pub async fn pull_image_with_policy(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+        force_refresh: bool,
+    ) -> Result<Vec<(Vec<u8>, String)>> {
+        if force_refresh {
+            let cache_key = format!("manifest:{image}");
+            let digest_key = format!("manifest-digest:{image}");
+            if let Err(e) = self.cache.delete(&cache_key).await {
+                tracing::warn!(
+                    image = %image,
+                    error = %e,
+                    "failed to invalidate manifest cache for force refresh"
+                );
+            }
+            if let Err(e) = self.cache.delete(&digest_key).await {
+                tracing::warn!(
+                    image = %image,
+                    error = %e,
+                    "failed to invalidate manifest digest cache for force refresh"
+                );
+            }
+        }
+        self.pull_image(image, auth).await
     }
 
     /// Push a blob to a remote registry
@@ -2168,5 +2485,53 @@ mod tests {
         assert!(result.blobs_pushed[0].contains("config"));
         // Layer is pushed second
         assert!(result.blobs_pushed[1].contains("layer"));
+    }
+
+    // =========================================================================
+    // is_mutable_tag Tests
+    // =========================================================================
+
+    #[test]
+    fn is_mutable_tag_recognises_no_tag() {
+        assert!(is_mutable_tag("nginx"));
+        assert!(is_mutable_tag("zachhandley/zlayer-manager"));
+        assert!(is_mutable_tag("registry.example.com:5000/img"));
+    }
+
+    #[test]
+    fn is_mutable_tag_recognises_empty_tag() {
+        assert!(is_mutable_tag("nginx:"));
+    }
+
+    #[test]
+    fn is_mutable_tag_recognises_known_mutable_tags() {
+        assert!(is_mutable_tag("nginx:latest"));
+        assert!(is_mutable_tag("nginx:dev"));
+        assert!(is_mutable_tag("nginx:edge"));
+        assert!(is_mutable_tag("nginx:main"));
+        assert!(is_mutable_tag("nginx:master"));
+        assert!(is_mutable_tag("zachhandley/zlayer-manager:latest"));
+        assert!(is_mutable_tag("registry.example.com:5000/img:latest"));
+    }
+
+    #[test]
+    fn is_mutable_tag_rejects_pinned_tags() {
+        assert!(!is_mutable_tag("nginx:1.25"));
+        assert!(!is_mutable_tag("nginx:1.25.3"));
+        assert!(!is_mutable_tag("zachhandley/zlayer-manager:v0.10.70"));
+        assert!(!is_mutable_tag("registry.example.com:5000/img:v1"));
+    }
+
+    #[test]
+    fn is_mutable_tag_rejects_digest_refs() {
+        assert!(!is_mutable_tag(
+            "img@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_mutable_tag(
+            "nginx:latest@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
+        assert!(!is_mutable_tag(
+            "registry.example.com:5000/img@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
     }
 }

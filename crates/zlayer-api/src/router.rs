@@ -562,6 +562,24 @@ pub fn build_router_with_internal(
     base_router.nest("/api/v1/internal", internal_routes)
 }
 
+/// Build routes for image management.
+///
+/// Creates the routes for listing, removing, and pruning images. These
+/// routes require authentication and dispatch into the runtime's image
+/// management methods (`list_images`, `remove_image`, `prune_images`).
+///
+/// # Arguments
+/// * `runtime` - The container runtime (Youki, Docker, WASM, etc.)
+///
+/// # Returns
+/// A `Router` with `/images`, `/images/{image}`, and `/system/prune` routes.
+pub fn build_image_routes(
+    runtime: Arc<dyn zlayer_agent::runtime::Runtime + Send + Sync>,
+) -> Router<()> {
+    use crate::handlers::images::{image_routes, ImageState};
+    image_routes().with_state(ImageState::new(runtime))
+}
+
 /// Build routes for secrets management
 ///
 /// Creates the routes for CRUD operations on secrets. These routes require

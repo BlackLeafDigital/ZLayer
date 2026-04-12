@@ -363,6 +363,18 @@ pub(crate) enum Commands {
         #[arg(long)]
         no_cache: bool,
 
+        /// Base-image pull strategy (newer|always|never). Default: newer.
+        ///
+        /// - `newer` - Pull only if the registry has a newer version (fast + correct)
+        /// - `always` - Always pull, even if a local copy exists
+        /// - `never`  - Use whatever is in local storage (offline builds)
+        #[arg(long, value_parser = ["newer", "always", "never"], default_value = "newer")]
+        pull: String,
+
+        /// Shortcut for `--pull=never` (offline builds).
+        #[arg(long)]
+        no_pull: bool,
+
         /// Push to registry after build
         #[arg(long)]
         push: bool,
@@ -534,6 +546,20 @@ pub(crate) enum Commands {
     /// Initialize, configure, and manage the `ZLayer` Manager web UI.
     #[command(subcommand, display_order = 34)]
     Manager(ManagerCommands),
+
+    /// Image management commands
+    ///
+    /// List, remove, and prune cached images in the daemon's image storage.
+    /// Works against whichever runtime the daemon is using (Youki, Docker, ...).
+    #[command(subcommand, display_order = 35)]
+    Image(ImageCommands),
+
+    /// System-wide maintenance commands
+    ///
+    /// High-level maintenance operations: prune dangling resources, inspect
+    /// daemon state, etc.
+    #[command(subcommand, display_order = 36)]
+    System(SystemCommands),
 
     // ── Inspection & Configuration ────────────────────────────────────
     /// Validate a spec file without deploying
@@ -758,6 +784,56 @@ pub(crate) enum TunnelCommands {
         /// Time-to-live for the access (e.g., 1h, 30m)
         #[arg(long, default_value = "1h")]
         ttl: String,
+    },
+}
+
+/// Image management subcommands
+#[derive(Subcommand, Debug)]
+pub(crate) enum ImageCommands {
+    /// List cached images known to the daemon.
+    ///
+    /// Examples:
+    ///   zlayer image ls
+    #[command(visible_alias = "list", verbatim_doc_comment)]
+    Ls {
+        /// Output format (table or json)
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Remove a cached image from the daemon.
+    ///
+    /// Examples:
+    ///   zlayer image rm zachhandley/zlayer-manager:latest
+    ///   zlayer image rm ubuntu:22.04 --force
+    #[command(visible_alias = "remove", verbatim_doc_comment)]
+    Rm {
+        /// Image reference to remove (e.g. `myregistry/myimage:tag`).
+        image: String,
+
+        /// Force removal even if the image is referenced by a container.
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// System-wide maintenance subcommands
+#[derive(Subcommand, Debug)]
+pub(crate) enum SystemCommands {
+    /// Prune dangling / unused cached images.
+    ///
+    /// Removes any cached image blob that is not referenced by a currently
+    /// cached manifest. Safe to run on a long-lived daemon to reclaim disk
+    /// space.
+    ///
+    /// Examples:
+    ///   zlayer system prune
+    ///   zlayer system prune --yes
+    #[command(verbatim_doc_comment)]
+    Prune {
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
     },
 }
 

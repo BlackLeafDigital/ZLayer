@@ -58,6 +58,27 @@ pub struct Container {
     pub port_override: Option<u16>,
 }
 
+/// Summary information about a cached image on the host runtime.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ImageInfo {
+    /// Canonical image reference (e.g. `zachhandley/zlayer-manager:latest`).
+    pub reference: String,
+    /// Content-addressed digest if known (`sha256:...`). `None` when the
+    /// backend only tracks images by tag.
+    pub digest: Option<String>,
+    /// Total on-disk / in-cache size in bytes, when available.
+    pub size_bytes: Option<u64>,
+}
+
+/// Result of a prune operation.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PruneResult {
+    /// Image references that were removed.
+    pub deleted: Vec<String>,
+    /// Bytes reclaimed from the cache. `0` when the backend cannot report.
+    pub space_reclaimed: u64,
+}
+
 /// Abstract container runtime trait
 ///
 /// This trait abstracts over different container runtimes (containerd, CRI-O, etc.)
@@ -155,6 +176,37 @@ pub trait Runtime: Send + Sync {
     /// volume sync (e.g., Youki with the `s3` feature) override this.
     async fn sync_container_volumes(&self, _id: &ContainerId) -> Result<()> {
         Ok(())
+    }
+
+    /// List all images managed by this runtime's image storage.
+    ///
+    /// The default implementation returns `AgentError::Unsupported` — individual
+    /// runtimes override this with backend-specific logic (bollard for Docker,
+    /// zlayer-registry cache walk for Youki, etc.).
+    async fn list_images(&self) -> Result<Vec<ImageInfo>> {
+        Err(AgentError::Unsupported(
+            "list_images is not supported by this runtime".into(),
+        ))
+    }
+
+    /// Remove an image by reference from local storage.
+    ///
+    /// When `force` is true, also removes the image even when other containers
+    /// reference it. The default implementation returns `AgentError::Unsupported`.
+    async fn remove_image(&self, _image: &str, _force: bool) -> Result<()> {
+        Err(AgentError::Unsupported(
+            "remove_image is not supported by this runtime".into(),
+        ))
+    }
+
+    /// Prune dangling / unused images from local storage.
+    ///
+    /// Returns a [`PruneResult`] describing what was removed. The default
+    /// implementation returns `AgentError::Unsupported`.
+    async fn prune_images(&self) -> Result<PruneResult> {
+        Err(AgentError::Unsupported(
+            "prune_images is not supported by this runtime".into(),
+        ))
     }
 }
 
@@ -388,6 +440,18 @@ impl Runtime for MockRuntime {
                 reason: "container not found".to_string(),
             })
         }
+    }
+
+    async fn list_images(&self) -> Result<Vec<ImageInfo>> {
+        Ok(Vec::new())
+    }
+
+    async fn remove_image(&self, _image: &str, _force: bool) -> Result<()> {
+        Ok(())
+    }
+
+    async fn prune_images(&self) -> Result<PruneResult> {
+        Ok(PruneResult::default())
     }
 }
 
