@@ -122,6 +122,8 @@ pub struct YoukiRuntime {
     storage_manager: std::sync::Arc<tokio::sync::RwLock<StorageManager>>,
     /// Shared blob cache for image layers (avoids repeated opens and ensures cache persistence)
     blob_cache: std::sync::Arc<Box<dyn zlayer_registry::BlobCacheBackend>>,
+    /// Local OCI registry for resolving locally-built images
+    local_registry: Option<std::sync::Arc<zlayer_registry::LocalRegistry>>,
     /// Cached image configs (entrypoint, cmd, env, etc.) keyed by image reference
     image_configs: RwLock<HashMap<String, zlayer_registry::ImageConfig>>,
     /// Auth context for container-to-host API authentication.
@@ -201,12 +203,27 @@ impl YoukiRuntime {
                 })?
         };
 
+        let local_registry = {
+            let registry_path = config.cache_dir.parent().map_or_else(
+                || config.cache_dir.join("registry"),
+                |data_dir| data_dir.join("registry"),
+            );
+            match zlayer_registry::LocalRegistry::new(registry_path).await {
+                Ok(reg) => Some(std::sync::Arc::new(reg)),
+                Err(e) => {
+                    tracing::warn!("Failed to open local registry: {e}");
+                    None
+                }
+            }
+        };
+
         Ok(Self {
             config,
             containers: RwLock::new(HashMap::new()),
             auth_resolver: zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()),
             storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
             blob_cache,
+            local_registry,
             image_configs: RwLock::new(HashMap::new()),
             auth_context,
         })
@@ -284,12 +301,27 @@ impl YoukiRuntime {
                 })?
         };
 
+        let local_registry = {
+            let registry_path = config.cache_dir.parent().map_or_else(
+                || config.cache_dir.join("registry"),
+                |data_dir| data_dir.join("registry"),
+            );
+            match zlayer_registry::LocalRegistry::new(registry_path).await {
+                Ok(reg) => Some(std::sync::Arc::new(reg)),
+                Err(e) => {
+                    tracing::warn!("Failed to open local registry: {e}");
+                    None
+                }
+            }
+        };
+
         Ok(Self {
             config,
             containers: RwLock::new(HashMap::new()),
             auth_resolver: zlayer_core::AuthResolver::new(auth_config),
             storage_manager: std::sync::Arc::new(tokio::sync::RwLock::new(storage_manager)),
             blob_cache,
+            local_registry,
             image_configs: RwLock::new(HashMap::new()),
             auth_context: None,
         })
@@ -478,7 +510,14 @@ impl YoukiRuntime {
         policy: zlayer_spec::PullPolicy,
     ) -> Result<Vec<(Vec<u8>, String)>> {
         // Use the shared blob cache instead of opening a new one each time
-        let puller = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
+        let puller = {
+            let p = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
+            if let Some(ref registry) = self.local_registry {
+                p.with_local_registry(registry.clone())
+            } else {
+                p
+            }
+        };
         let auth = self.auth_resolver.resolve(image);
         let force_refresh = matches!(policy, zlayer_spec::PullPolicy::Always);
 
@@ -662,7 +701,14 @@ impl Runtime for YoukiRuntime {
         image: &str,
         policy: zlayer_spec::PullPolicy,
     ) -> Result<()> {
-        let puller = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
+        let puller = {
+            let p = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());
+            if let Some(ref registry) = self.local_registry {
+                p.with_local_registry(registry.clone())
+            } else {
+                p
+            }
+        };
         let auth = self.auth_resolver.resolve(image);
 
         // For Never policy, skip pulling layers from the remote, but STILL

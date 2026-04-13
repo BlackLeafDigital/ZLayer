@@ -1,0 +1,42 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "ZLayer Manager",
+  "version": "0.1.0",
+  "identifier": "dev.zlayer.manager",
+  "build": {
+    "beforeDevCommand": "cd ../../crates/zlayer-manager && cargo leptos watch",
+    "devUrl": "http://localhost:6677",
+    "beforeBuildCommand": "cd ../../crates/zlayer-manager && cargo leptos build --release",
+    "frontendDist": "../../crates/zlayer-manager/target/site"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "ZLayer Manager",
+        "width": 1200,
+        "height": 800,
+        "minWidth": 800,
+        "minHeight": 600,
+        "backgroundColor": "#0B0C10"
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self' http://127.0.0.1:*; script-src 'self' 'unsafe-inline' 'unsafe-eval' http://127.0.0.1:* blob:; style-src 'self' 'unsafe-inline' http://127.0.0.1:*; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:*; img-src 'self' http://127.0.0.1:* data: blob:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "macOS": {
+      "minimumSystemVersion": "11.0"
+    }
+  }
+}

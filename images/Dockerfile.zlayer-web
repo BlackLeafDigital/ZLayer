@@ -57,7 +57,11 @@ COPY --from=builder /build/target/release/zlayer-web /app/zlayer-web
 COPY --from=builder /build/target/site /app/target/site
 
 ENV ZLAYER_WEB_ADDR=0.0.0.0:3000
+ENV LEPTOS_SITE_ADDR=0.0.0.0:3000
 ENV LEPTOS_SITE_ROOT=/app/target/site
+ENV LEPTOS_OUTPUT_NAME=zlayer-web
+ENV LEPTOS_SITE_PKG_DIR=pkg
+ENV LEPTOS_HASH_FILES=true
 ENV RUST_LOG=info
 
 EXPOSE 3000

@@ -198,5 +198,5 @@ sleep 2
 
 - **Makefile stale package names**: `test-scheduler`, `test-api`, etc. use old names without the `zlayer-` prefix. Use `cargo test --package zlayer-<name>` directly.
 - **Sandbox + Leptos SSR**: Manager returns empty replies inside Seatbelt sandbox due to `0.0.0.0` bind vs `localhost`-only sandbox rule. Run outside sandbox for dev.
-- **WASM asset hashes**: Leptos SSR generates unhashed `/pkg/zlayer-manager.js` paths but cargo-leptos builds with content hashes. Workaround: symlinks in rootfs.
+- **WASM asset hashes**: Fixed — `LEPTOS_OUTPUT_NAME`, `LEPTOS_SITE_PKG_DIR`, and `LEPTOS_HASH_FILES` runtime env vars are now set in container images so Leptos SSR generates hashed paths matching the built artifacts. Symlink workaround no longer needed.
 - **Overlay on macOS**: `boringtun` WireGuard device fails (no `CAP_NET_ADMIN`). Overlay network inactive on mac-sandbox runtime.

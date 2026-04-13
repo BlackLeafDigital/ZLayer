@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Default permissions for ZLayer Manager desktop","local":true,"windows":["main"],"permissions":["core:default","opener:default","window-state:default"]}}

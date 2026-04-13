@@ -190,7 +190,7 @@ Pushes to GHCR only (DockerHub handled by Forgejo release):
 |----------------|------------------------------|----------|-------------------|
 | zlayer-node    | zlayer-runtime binary + containerd | 80, 443  | ubuntu:22.04      |
 | zlayer-web     | zlayer-web Leptos SSR + WASM | 3000     | debian:bookworm-slim |
-| zlayer-manager | zlayer-manager Leptos SSR    | 9120     | debian:bookworm-slim |
+| zlayer-manager | zlayer-manager Leptos SSR    | 6677     | debian:trixie-slim   |
 
 ---
 

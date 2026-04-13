@@ -46,6 +46,7 @@ pub use router::{
     build_router_with_internal_and_secrets, build_router_with_jobs, build_router_with_secrets,
     build_router_with_services, build_router_with_services_and_secrets, build_router_with_storage,
     build_router_with_tunnels, build_secrets_routes, build_storage_routes, build_tunnel_routes,
+    build_volume_routes,
 };
 pub use server::ApiServer;
 #[cfg(unix)]
@@ -74,6 +75,7 @@ pub use handlers::tunnels::{
     CreateNodeTunnelRequest, CreateNodeTunnelResponse, CreateTunnelRequest, CreateTunnelResponse,
     TunnelApiState, TunnelStatus, TunnelSummary,
 };
+pub use handlers::volumes::{DeleteVolumeQuery, VolumeApiState, VolumeSummary};
 
 pub use axum::Extension;
 

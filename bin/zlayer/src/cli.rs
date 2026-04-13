@@ -49,6 +49,7 @@ COMMAND GROUPS:
   Registry:     pull, export, import
   Cluster:      node, serve, tunnel, manager
   Inspection:   validate, token, spec, wasm
+  Auth:         auth login, auth logout, auth status
   Interface:    tui
 
 Run 'zlayer <command> --help' for details on a specific command.")]
@@ -554,16 +555,44 @@ pub(crate) enum Commands {
     #[command(subcommand, display_order = 35)]
     Image(ImageCommands),
 
+    /// Container management commands
+    ///
+    /// List, inspect, remove, and view logs/stats of containers managed by
+    /// the daemon.
+    #[command(subcommand, display_order = 36)]
+    Container(ContainerCommands),
+
     /// System-wide maintenance commands
     ///
     /// High-level maintenance operations: prune dangling resources, inspect
     /// daemon state, etc.
-    #[command(subcommand, display_order = 36)]
+    #[command(subcommand, display_order = 37)]
     System(SystemCommands),
+
+    /// Secrets management commands
+    ///
+    /// Create, list, inspect, and remove secrets stored by the daemon.
+    /// Secret values are encrypted at rest and never exposed through
+    /// listing or inspection.
+    #[command(subcommand, display_order = 38)]
+    Secret(SecretCommands),
+
+    /// Network management commands
+    ///
+    /// List, create, inspect, and remove networks. Also show overlay
+    /// network status, peers, and DNS entries.
+    #[command(subcommand, display_order = 39)]
+    Network(NetworkCommands),
+
+    /// Volume management commands
+    ///
+    /// List and remove named volumes stored by the daemon.
+    #[command(subcommand, display_order = 40)]
+    Volume(VolumeCommands),
 
     // ── Inspection & Configuration ────────────────────────────────────
     /// Validate a spec file without deploying
-    #[command(display_order = 40)]
+    #[command(display_order = 41)]
     Validate {
         /// Path to deployment spec (auto-discovers *.zlayer.yml in current directory)
         spec_path: Option<PathBuf>,
@@ -575,11 +604,24 @@ pub(crate) enum Commands {
     #[command(subcommand, display_order = 41)]
     Token(TokenCommands),
 
+    /// Authentication commands
+    ///
+    /// Log in to a `ZLayer` server, check status, or log out.
+    #[command(subcommand, display_order = 41)]
+    Auth(AuthCommands),
+
     /// Specification inspection commands
     ///
     /// Validate, dump, and inspect deployment specifications.
     #[command(subcommand, display_order = 42)]
     Spec(SpecCommands),
+
+    /// Job and cron job management commands
+    ///
+    /// List, trigger, and check the status of jobs and cron jobs.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 42)]
+    Job(JobCommands),
 
     /// WASM build, export, and management commands
     #[command(subcommand, display_order = 43)]
@@ -815,6 +857,102 @@ pub(crate) enum ImageCommands {
         #[arg(long)]
         force: bool,
     },
+
+    /// Push an image to a remote registry.
+    ///
+    /// Examples:
+    ///   zlayer image push myregistry/myimage:tag
+    ///   zlayer image push myregistry/myimage:tag --username user --password pass
+    #[command(verbatim_doc_comment)]
+    Push {
+        /// Image reference to push (e.g. `myregistry/myimage:tag`).
+        image: String,
+
+        /// Registry username.
+        #[arg(long)]
+        username: Option<String>,
+
+        /// Registry password.
+        #[arg(long)]
+        password: Option<String>,
+    },
+
+    /// Inspect an image (show manifest and configuration details).
+    ///
+    /// Examples:
+    ///   zlayer image inspect ubuntu:22.04
+    ///   zlayer image inspect zachhandley/zlayer-manager:latest
+    #[command(verbatim_doc_comment)]
+    Inspect {
+        /// Image reference to inspect.
+        image: String,
+    },
+}
+
+/// Container management subcommands
+#[derive(Subcommand, Debug)]
+pub(crate) enum ContainerCommands {
+    /// List all containers managed by the daemon.
+    ///
+    /// Examples:
+    ///   zlayer container ls
+    ///   zlayer container ls --output json
+    #[command(visible_alias = "list", verbatim_doc_comment)]
+    Ls {
+        /// Output format (table or json)
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Inspect a container (detailed JSON output).
+    ///
+    /// Examples:
+    ///   zlayer container inspect abc123
+    #[command(verbatim_doc_comment)]
+    Inspect {
+        /// Container ID
+        id: String,
+    },
+
+    /// Remove a container.
+    ///
+    /// Examples:
+    ///   zlayer container rm abc123
+    ///   zlayer container rm abc123 --force
+    #[command(visible_alias = "remove", verbatim_doc_comment)]
+    Rm {
+        /// Container ID
+        id: String,
+
+        /// Force removal even if the container is running.
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// View container logs.
+    ///
+    /// Examples:
+    ///   zlayer container logs abc123
+    ///   zlayer container logs abc123 --tail 100
+    #[command(verbatim_doc_comment)]
+    Logs {
+        /// Container ID
+        id: String,
+
+        /// Number of most recent log lines to return.
+        #[arg(long)]
+        tail: Option<u32>,
+    },
+
+    /// View container resource statistics.
+    ///
+    /// Examples:
+    ///   zlayer container stats abc123
+    #[command(verbatim_doc_comment)]
+    Stats {
+        /// Container ID
+        id: String,
+    },
 }
 
 /// System-wide maintenance subcommands
@@ -834,6 +972,148 @@ pub(crate) enum SystemCommands {
         /// Skip the confirmation prompt.
         #[arg(long, short)]
         yes: bool,
+    },
+}
+
+/// Secrets management subcommands
+#[derive(Subcommand, Debug)]
+pub(crate) enum SecretCommands {
+    /// List all secrets
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Output format (table or json)
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+    /// Create a new secret
+    Create {
+        /// Secret name
+        name: String,
+        /// Secret value
+        #[arg(long)]
+        value: String,
+    },
+    /// Get secret metadata (does not reveal the value)
+    Get {
+        /// Secret name
+        name: String,
+    },
+    /// Remove a secret
+    #[command(visible_alias = "remove")]
+    Rm {
+        /// Secret name
+        name: String,
+    },
+}
+
+/// Network management subcommands
+#[derive(Subcommand, Debug)]
+pub(crate) enum NetworkCommands {
+    /// List all networks
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Output format (table or json)
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+    /// Inspect a network
+    Inspect {
+        /// Network name
+        name: String,
+    },
+    /// Create a network
+    Create {
+        /// Network name
+        name: String,
+    },
+    /// Remove a network
+    #[command(visible_alias = "remove")]
+    Rm {
+        /// Network name
+        name: String,
+    },
+    /// Show overlay network status
+    Status,
+    /// List overlay peers
+    Peers,
+    /// Show DNS entries
+    Dns,
+}
+
+/// Volume management subcommands
+#[derive(Subcommand, Debug)]
+pub(crate) enum VolumeCommands {
+    /// List all volumes
+    ///
+    /// Examples:
+    ///   zlayer volume ls
+    ///   zlayer volume ls --output json
+    #[command(visible_alias = "list", verbatim_doc_comment)]
+    Ls {
+        /// Output format (table or json)
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+    /// Remove a volume
+    ///
+    /// Examples:
+    ///   zlayer volume rm my-volume
+    ///   zlayer volume rm my-volume --force
+    #[command(visible_alias = "remove", verbatim_doc_comment)]
+    Rm {
+        /// Volume name
+        name: String,
+        /// Force removal even if the volume is non-empty
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+/// Job management subcommands
+#[derive(Subcommand, Debug)]
+pub(crate) enum JobCommands {
+    /// List all jobs
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Output format (table or json)
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+    /// Trigger a job
+    Trigger {
+        /// Deployment name
+        deployment: String,
+        /// Job name
+        job: String,
+    },
+    /// Get job status
+    Status {
+        /// Deployment name
+        deployment: String,
+        /// Job name
+        job: String,
+    },
+    /// Cron job management
+    #[command(subcommand)]
+    Cron(CronCommands),
+}
+
+/// Cron job subcommands
+#[derive(Subcommand, Debug)]
+pub(crate) enum CronCommands {
+    /// List all cron jobs
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Output format (table or json)
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+    /// Get cron job status
+    Status {
+        /// Deployment name
+        deployment: String,
+        /// Cron job name
+        cron: String,
     },
 }
 
@@ -1187,6 +1467,39 @@ pub(crate) enum TokenCommands {
 
     /// Show admin API credentials
     Show,
+}
+
+/// Authentication subcommands
+#[derive(Subcommand, Debug)]
+pub(crate) enum AuthCommands {
+    /// Log in to a `ZLayer` server
+    ///
+    /// Authenticates against a `ZLayer` server and stores the JWT locally.
+    /// Credentials are prompted interactively unless --api-key and
+    /// --api-secret are provided.
+    ///
+    /// Examples:
+    ///   zlayer auth login <http://10.0.0.1:3669>
+    ///   zlayer auth login <http://10.0.0.1:3669> --api-key admin --api-secret s3cret
+    #[command(verbatim_doc_comment)]
+    Login {
+        /// Server URL (e.g., `http://10.0.0.1:3669`)
+        url: String,
+
+        /// API key (prompted interactively if omitted)
+        #[arg(long)]
+        api_key: Option<String>,
+
+        /// API secret (prompted interactively if omitted)
+        #[arg(long)]
+        api_secret: Option<String>,
+    },
+
+    /// Log out (remove stored credentials)
+    Logout,
+
+    /// Show current authentication status
+    Status,
 }
 
 /// Spec inspection subcommands

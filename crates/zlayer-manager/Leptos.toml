@@ -12,7 +12,8 @@ bin-package = "zlayer-manager"
 # Site configuration
 site-root = "target/site"
 site-pkg-dir = "pkg"
-site-addr = "127.0.0.1:9120"
+site-addr = "127.0.0.1:6677"
+assets-dir = "assets"
 
 # Tailwind v4 CSS input file
 tailwind-input-file = "./tailwind.css"

@@ -29,6 +29,7 @@ use crate::handlers::secrets::SecretsState;
 use crate::handlers::services::ServiceState;
 use crate::handlers::storage::StorageState;
 use crate::handlers::tunnels::TunnelApiState;
+use crate::handlers::volumes::VolumeApiState;
 use crate::openapi::ApiDoc;
 use crate::ratelimit::{rate_limit_middleware, IpRateLimiter, RateLimitState};
 use crate::storage::{DeploymentStorage, InMemoryStorage};
@@ -892,6 +893,23 @@ pub fn build_storage_routes(storage_state: StorageState) -> Router<()> {
     Router::new()
         .route("/status", get(handlers::storage::get_storage_status))
         .with_state(storage_state)
+}
+
+/// Build routes for volume management
+///
+/// Creates the routes for listing and deleting named volumes.
+/// These routes require authentication; delete requires the `operator` role.
+///
+/// # Arguments
+/// * `volume_state` - State containing the storage manager and volume directory
+///
+/// # Returns
+/// A Router with the volume endpoints
+pub fn build_volume_routes(volume_state: VolumeApiState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::volumes::list_volumes))
+        .route("/{name}", delete(handlers::volumes::delete_volume))
+        .with_state(volume_state)
 }
 
 /// Build routes for raw container lifecycle management

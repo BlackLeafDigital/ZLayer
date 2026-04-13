@@ -90,14 +90,17 @@ stages:
         from: builder
         to: "/app/target/site"
     env:
-      ZLAYER_MANAGER_ADDR: "0.0.0.0:9120"
+      ZLAYER_MANAGER_ADDR: "0.0.0.0:6677"
       # LEPTOS_SITE_ADDR overrides the Leptos.toml default
-      # (127.0.0.1:9120) so the server binds on all interfaces,
+      # (127.0.0.1:6677) so the server binds on all interfaces,
       # making it reachable via the overlay network from outside
       # the container netns.
-      LEPTOS_SITE_ADDR: "0.0.0.0:9120"
+      LEPTOS_SITE_ADDR: "0.0.0.0:6677"
       LEPTOS_SITE_ROOT: "/app/target/site"
+      LEPTOS_OUTPUT_NAME: "zlayer-manager"
+      LEPTOS_SITE_PKG_DIR: "pkg"
+      LEPTOS_HASH_FILES: "true"
       RUST_LOG: "info"
     cmd: ["/app/zlayer-manager"]
 
-expose: 9120
+expose: 6677

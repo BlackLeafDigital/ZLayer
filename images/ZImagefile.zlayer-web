@@ -84,7 +84,11 @@ stages:
         to: "/app/target/site"
     env:
       ZLAYER_WEB_ADDR: "0.0.0.0:3000"
+      LEPTOS_SITE_ADDR: "0.0.0.0:3000"
       LEPTOS_SITE_ROOT: "/app/target/site"
+      LEPTOS_OUTPUT_NAME: "zlayer-web"
+      LEPTOS_SITE_PKG_DIR: "pkg"
+      LEPTOS_HASH_FILES: "true"
       RUST_LOG: "info"
     cmd: ["/app/zlayer-web"]
 
