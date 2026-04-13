@@ -116,7 +116,7 @@ jobs:
           grep '^version = ' Cargo.toml
       - name: Build
         if: steps.check.outputs.completed != 'true'
-        run: cargo build --release --package zlayer
+        run: cargo build --release --package zlayer || cargo build --release --package zlayer
       - name: Package
         if: steps.check.outputs.completed != 'true'
         run: tar czf "zlayer-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer

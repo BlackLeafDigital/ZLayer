@@ -482,9 +482,8 @@ services:
 #[test]
 fn test_env_file_single_path() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("zlayer-test-envfile-single");
-    let _ = std::fs::create_dir_all(&dir);
-    let env_path = dir.join(".env");
+    let dir = tempfile::tempdir().unwrap();
+    let env_path = dir.path().join(".env");
     let mut f = std::fs::File::create(&env_path).unwrap();
     writeln!(f, "# comment").unwrap();
     writeln!(f, "DB_HOST=localhost").unwrap();
@@ -551,9 +550,8 @@ services:
 #[test]
 fn test_env_file_list_mixed() {
     use std::io::Write;
-    let dir = std::env::temp_dir().join("zlayer-test-envfile-mixed");
-    let _ = std::fs::create_dir_all(&dir);
-    let env_path = dir.join("real.env");
+    let dir = tempfile::tempdir().unwrap();
+    let env_path = dir.path().join("real.env");
     let mut f = std::fs::File::create(&env_path).unwrap();
     writeln!(f, "REAL_VAR=yes").unwrap();
     drop(f);
