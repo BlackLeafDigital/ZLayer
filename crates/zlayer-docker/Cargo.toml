@@ -45,5 +45,8 @@ default = ["build"]
 build = ["dep:zlayer-builder"]
 socket = []
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true
