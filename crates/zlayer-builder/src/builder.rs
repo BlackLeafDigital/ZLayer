@@ -113,10 +113,10 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use tokio::fs;
-use tracing::{debug, info, instrument};
+use tracing::{debug, info, instrument, warn};
 
 use crate::backend::BuildBackend;
-use crate::buildah::BuildahExecutor;
+use crate::buildah::{BuildahCommand, BuildahExecutor};
 use crate::dockerfile::{Dockerfile, RunMount};
 use crate::error::{BuildError, Result};
 use crate::templates::{get_template, Runtime};
@@ -127,6 +127,9 @@ use zlayer_registry::cache::BlobCacheBackend;
 
 #[cfg(feature = "local-registry")]
 use zlayer_registry::LocalRegistry;
+
+#[cfg(feature = "local-registry")]
+use zlayer_registry::import_image;
 
 /// Output from parsing a `ZImagefile` - either a Dockerfile for container builds
 /// or a WASM build result for WebAssembly builds.
@@ -1353,14 +1356,67 @@ impl ImageBuilder {
             })?;
 
         info!("Delegating build to {} backend", backend.name());
-        backend
+        let built = backend
             .build_image(
                 &self.context,
                 &dockerfile,
                 &self.options,
                 self.event_tx.clone(),
             )
-            .await
+            .await?;
+
+        // Import the built image into ZLayer's local registry and blob cache
+        // so the runtime can find it without pulling from a remote registry.
+        #[cfg(feature = "local-registry")]
+        if let Some(ref registry) = self.local_registry {
+            if !built.tags.is_empty() {
+                let tmp_path = std::env::temp_dir().join(format!(
+                    "zlayer-build-{}-{}.tar",
+                    std::process::id(),
+                    start_time.elapsed().as_nanos()
+                ));
+
+                // Export the image from buildah's store to an OCI archive.
+                let export_tag = &built.tags[0];
+                let dest = format!("oci-archive:{}", tmp_path.display());
+                let push_cmd = BuildahCommand::push_to(export_tag, &dest);
+
+                match self.executor.execute_checked(&push_cmd).await {
+                    Ok(_) => {
+                        // Resolve the blob cache backend (if available).
+                        let blob_cache: Option<&dyn zlayer_registry::cache::BlobCacheBackend> =
+                            self.cache_backend.as_ref().map(|arc| arc.as_ref().as_ref());
+
+                        for tag in &built.tags {
+                            match import_image(registry, &tmp_path, Some(tag.as_str()), blob_cache)
+                                .await
+                            {
+                                Ok(info) => {
+                                    info!(
+                                        tag = %tag,
+                                        digest = %info.digest,
+                                        "Imported into local registry"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(tag = %tag, error = %e, "Failed to import into local registry");
+                                }
+                            }
+                        }
+
+                        // Clean up the temporary archive.
+                        if let Err(e) = fs::remove_file(&tmp_path).await {
+                            warn!(path = %tmp_path.display(), error = %e, "Failed to remove temp OCI archive");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Failed to export image for local registry import");
+                    }
+                }
+            }
+        }
+
+        Ok(built)
     }
 
     /// Detection order:

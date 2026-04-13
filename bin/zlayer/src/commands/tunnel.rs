@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::cli::{Cli, TunnelCommands};
+use crate::daemon_client::DaemonClient;
 use crate::util::parse_duration;
 
 /// Handle tunnel subcommands
@@ -12,8 +13,8 @@ pub(crate) async fn handle_tunnel(_cli: &Cli, cmd: &TunnelCommands) -> Result<()
             services,
             ttl_hours,
         } => handle_tunnel_create(name, services.clone(), *ttl_hours),
-        TunnelCommands::List { output } => handle_tunnel_list(output),
-        TunnelCommands::Revoke { id } => handle_tunnel_revoke(id),
+        TunnelCommands::List { output } => handle_tunnel_list(output).await,
+        TunnelCommands::Revoke { id } => handle_tunnel_revoke(id).await,
         TunnelCommands::Connect {
             server,
             token,
@@ -26,14 +27,14 @@ pub(crate) async fn handle_tunnel(_cli: &Cli, cmd: &TunnelCommands) -> Result<()
             local_port,
             remote_port,
             expose,
-        } => handle_tunnel_add(name, from, to, *local_port, *remote_port, expose),
-        TunnelCommands::Remove { name } => handle_tunnel_remove(name),
-        TunnelCommands::Status { id } => handle_tunnel_status(id.clone()),
+        } => handle_tunnel_add(name, from, to, *local_port, *remote_port, expose).await,
+        TunnelCommands::Remove { name } => handle_tunnel_remove(name).await,
+        TunnelCommands::Status { id } => handle_tunnel_status(id.clone()).await,
         TunnelCommands::Access {
             endpoint,
             local_port,
             ttl,
-        } => handle_tunnel_access(endpoint, *local_port, ttl),
+        } => handle_tunnel_access(endpoint, *local_port, ttl).await,
     }
 }
 
@@ -76,40 +77,78 @@ pub(crate) fn handle_tunnel_create(
         "  zlayer tunnel connect --server wss://your-server/tunnel/v1 --token {token} --service name:local:remote"
     );
 
-    // Note: In production, this would store the token in the cluster state via API
-    warn!("Note: Token created locally only. Use the API for persistent storage.");
-
     Ok(())
 }
 
 /// List tunnel tokens
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn handle_tunnel_list(output: &str) -> Result<()> {
+pub(crate) async fn handle_tunnel_list(output: &str) -> Result<()> {
     info!(output = %output, "Listing tunnels");
 
-    // In production, this would query the API
-    println!("Tunnel List");
-    println!("===========\n");
-    println!("[No tunnels configured - use the API to manage tunnels]");
-    println!("\nTo list tunnels via API:");
-    println!("  curl -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels");
+    let client = DaemonClient::connect().await?;
+    let tunnels = client.list_tunnels().await?;
+
+    let arr = tunnels.as_array().unwrap_or(&Vec::new()).clone();
+
+    if output == "json" {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&tunnels).unwrap_or_default()
+        );
+        return Ok(());
+    }
+
+    // Table output
+    if arr.is_empty() {
+        println!("No tunnels configured.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<38} {:<20} {:<12} {:<20} {:<20}",
+        "ID", "NAME", "STATUS", "SERVICES", "EXPIRES"
+    );
+    println!("{}", "-".repeat(110));
+    for t in &arr {
+        let id = t.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+        let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("-");
+        let status = t.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+        let services_display = t.get("services").and_then(|v| v.as_array()).map_or_else(
+            || "all".to_string(),
+            |arr| {
+                let joined = arr
+                    .iter()
+                    .filter_map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if joined.is_empty() {
+                    "all".to_string()
+                } else {
+                    joined
+                }
+            },
+        );
+        let expires = t
+            .get("expires_at")
+            .and_then(serde_json::Value::as_u64)
+            .map_or_else(|| "-".to_string(), |ts| format!("{ts}"));
+        println!("{id:<38} {name:<20} {status:<12} {services_display:<20} {expires:<20}");
+    }
 
     Ok(())
 }
 
 /// Revoke a tunnel token
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn handle_tunnel_revoke(id: &str) -> Result<()> {
+pub(crate) async fn handle_tunnel_revoke(id: &str) -> Result<()> {
     info!(id = %id, "Revoking tunnel");
 
-    println!("Revoking tunnel: {id}");
-    println!("\nTo revoke via API:");
-    println!(
-        "  curl -X DELETE -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/{id}"
-    );
+    let client = DaemonClient::connect().await?;
+    let result = client.revoke_tunnel(id).await?;
 
-    // In production, this would call the API
-    warn!("Note: Use the API for actual tunnel revocation.");
+    let msg = result
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Tunnel revoked successfully");
+    println!("{msg}");
 
     Ok(())
 }
@@ -218,7 +257,7 @@ pub(crate) async fn handle_tunnel_connect(
 }
 
 /// Add a node-to-node tunnel
-pub(crate) fn handle_tunnel_add(
+pub(crate) async fn handle_tunnel_add(
     name: &str,
     from: &str,
     to: &str,
@@ -240,76 +279,104 @@ pub(crate) fn handle_tunnel_add(
         anyhow::bail!("Expose must be 'public' or 'internal'");
     }
 
-    println!("Creating node-to-node tunnel: {name}");
-    println!("  From: {from} (port {local_port})");
-    println!("  To: {to} (port {remote_port})");
-    println!("  Expose: {expose}");
-    println!();
-    println!("To create via API:");
-    println!(
-        r#"  curl -X POST -H 'Authorization: Bearer <token>' -H 'Content-Type: application/json' \
-    -d '{{"name":"{name}","from_node":"{from}","to_node":"{to}","local_port":{local_port},"remote_port":{remote_port},"expose":"{expose}"}}' \
-    http://localhost:3669/api/v1/tunnels/node"#
-    );
+    let client = DaemonClient::connect().await?;
+    let result = client
+        .add_node_tunnel(name, from, to, local_port, remote_port, expose)
+        .await?;
 
-    // In production, this would call the API
-    warn!("Note: Use the API for actual tunnel creation.");
+    println!("Node-to-node tunnel created:");
+    println!(
+        "  Name:        {}",
+        result.get("name").and_then(|v| v.as_str()).unwrap_or(name)
+    );
+    println!(
+        "  From:        {} (port {})",
+        result
+            .get("from_node")
+            .and_then(|v| v.as_str())
+            .unwrap_or(from),
+        local_port
+    );
+    println!(
+        "  To:          {} (port {})",
+        result.get("to_node").and_then(|v| v.as_str()).unwrap_or(to),
+        remote_port
+    );
+    println!(
+        "  Expose:      {}",
+        result
+            .get("expose")
+            .and_then(|v| v.as_str())
+            .unwrap_or(expose)
+    );
+    println!(
+        "  Status:      {}",
+        result
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending")
+    );
 
     Ok(())
 }
 
 /// Remove a node-to-node tunnel
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn handle_tunnel_remove(name: &str) -> Result<()> {
+pub(crate) async fn handle_tunnel_remove(name: &str) -> Result<()> {
     info!(name = %name, "Removing node-to-node tunnel");
 
-    println!("Removing node-to-node tunnel: {name}");
-    println!("\nTo remove via API:");
-    println!(
-        "  curl -X DELETE -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/node/{name}"
-    );
+    let client = DaemonClient::connect().await?;
+    let result = client.remove_node_tunnel(name).await?;
 
-    // In production, this would call the API
-    warn!("Note: Use the API for actual tunnel removal.");
+    let msg = result
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Node tunnel removed successfully");
+    println!("{msg}");
 
     Ok(())
 }
 
 /// Show tunnel status
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn handle_tunnel_status(id: Option<String>) -> Result<()> {
+pub(crate) async fn handle_tunnel_status(id: Option<String>) -> Result<()> {
     info!(id = ?id, "Getting tunnel status");
 
+    let client = DaemonClient::connect().await?;
+
     if let Some(tunnel_id) = id {
-        println!("Tunnel Status: {tunnel_id}");
-        println!("==============={}", "=".repeat(tunnel_id.len()));
-        println!("\nTo get status via API:");
+        let status = client.get_tunnel_status(&tunnel_id).await?;
         println!(
-            "  curl -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels/{tunnel_id}/status"
+            "{}",
+            serde_json::to_string_pretty(&status).unwrap_or_default()
         );
     } else {
-        println!("All Tunnel Status");
-        println!("=================\n");
-        println!("[Use the API to list tunnel status]");
-        println!("\nTo list all tunnels via API:");
-        println!("  curl -H 'Authorization: Bearer <token>' http://localhost:3669/api/v1/tunnels");
-    }
+        // No specific ID -- list all tunnels with their status
+        let tunnels = client.list_tunnels().await?;
+        let arr = tunnels.as_array().unwrap_or(&Vec::new()).clone();
 
-    // In production, this would query the API
-    warn!("Note: Use the API for actual tunnel status.");
+        if arr.is_empty() {
+            println!("No tunnels configured.");
+            return Ok(());
+        }
+
+        println!("{:<38} {:<20} {:<12}", "ID", "NAME", "STATUS");
+        println!("{}", "-".repeat(70));
+        for t in &arr {
+            let tid = t.get("id").and_then(|v| v.as_str()).unwrap_or("-");
+            let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("-");
+            let st = t.get("status").and_then(|v| v.as_str()).unwrap_or("-");
+            println!("{tid:<38} {name:<20} {st:<12}");
+        }
+    }
 
     Ok(())
 }
 
 /// Request temporary access to a tunneled service
-pub(crate) fn handle_tunnel_access(
+pub(crate) async fn handle_tunnel_access(
     endpoint: &str,
     local_port: Option<u16>,
     ttl: &str,
 ) -> Result<()> {
-    // LocalProxy would be used here in full implementation
-    // use zlayer_tunnel::LocalProxy;
-
     info!(
         endpoint = %endpoint,
         local_port = ?local_port,
@@ -320,8 +387,10 @@ pub(crate) fn handle_tunnel_access(
     // Parse TTL for validation
     let _ttl_secs = parse_duration(ttl)?;
 
-    // Use provided port or auto-assign
     let port = local_port.unwrap_or(0);
+
+    // Verify daemon is reachable
+    let _client = DaemonClient::connect().await?;
 
     println!("Requesting temporary access to: {endpoint}");
     println!(
@@ -335,15 +404,14 @@ pub(crate) fn handle_tunnel_access(
     println!("  TTL: {ttl}");
     println!();
 
-    // In production, this would:
-    // 1. Request a temporary token from the API
-    // 2. Start a LocalProxy to the target service
-    // 3. Display the local port for connection
-
-    println!("[Access functionality requires API integration]");
-    println!("\nOnce implemented, you would connect to:");
-    println!("  localhost:{port} -> {endpoint}");
-    println!("\nThe connection will automatically close after {ttl}.");
+    // Access requires a daemon-side temporary token + LocalProxy integration.
+    // The daemon is reachable, but the access-token API endpoint is not yet
+    // available. Once it is, this command will:
+    //   1. Request a temporary token from the daemon API
+    //   2. Start a LocalProxy to the target service
+    //   3. Display the local port for connection
+    println!("Access proxy is not yet available in the daemon API.");
+    println!("Use 'zlayer tunnel connect' to establish a full tunnel instead.");
 
     Ok(())
 }

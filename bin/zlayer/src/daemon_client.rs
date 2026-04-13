@@ -883,6 +883,382 @@ impl DaemonClient {
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
     }
+
+    /// Push an image to a remote registry.
+    ///
+    /// `POST /api/v1/images/push`
+    pub async fn push_image(
+        &self,
+        image: &str,
+        username: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        let payload = serde_json::json!({
+            "image": image,
+            "username": username,
+            "password": password,
+        });
+        let (status, body) = self
+            .post_json("/api/v1/images/push", &payload.to_string())
+            .await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Inspect an image — retrieve manifest and configuration details.
+    ///
+    /// `GET /api/v1/images/{image}/inspect`
+    pub async fn inspect_image(&self, image: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/images/{}/inspect", urlencoding(image));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    // ------------------------------------------------------------------
+    // Container management
+    // ------------------------------------------------------------------
+
+    /// List all containers from the daemon.
+    ///
+    /// `GET /api/v1/containers`
+    pub async fn get_all_containers(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get("/api/v1/containers").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get detailed information about a single container.
+    ///
+    /// `GET /api/v1/containers/{id}`
+    pub async fn get_container(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/containers/{}", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Delete a container.
+    ///
+    /// `DELETE /api/v1/containers/{id}?force=BOOL`
+    pub async fn delete_container(&self, id: &str, force: bool) -> Result<()> {
+        let path = format!("/api/v1/containers/{}?force={}", urlencoding(id), force);
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Get logs for a container.
+    ///
+    /// `GET /api/v1/containers/{id}/logs[?tail=N]`
+    pub async fn get_container_logs(
+        &self,
+        id: &str,
+        tail: Option<u32>,
+    ) -> Result<serde_json::Value> {
+        let mut path = format!("/api/v1/containers/{}/logs", urlencoding(id));
+        if let Some(n) = tail {
+            use std::fmt::Write;
+            let _ = write!(path, "?tail={n}");
+        }
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get resource statistics for a container.
+    ///
+    /// `GET /api/v1/containers/{id}/stats`
+    pub async fn get_container_stats(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/containers/{}/stats", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    // ------------------------------------------------------------------
+    // Tunnel management
+    // ------------------------------------------------------------------
+
+    /// List all tunnels.
+    ///
+    /// `GET /api/v1/tunnels`
+    pub async fn list_tunnels(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get("/api/v1/tunnels").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Revoke (delete) a tunnel by ID.
+    ///
+    /// `DELETE /api/v1/tunnels/{id}`
+    pub async fn revoke_tunnel(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/tunnels/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get tunnel status by ID.
+    ///
+    /// `GET /api/v1/tunnels/{id}/status`
+    pub async fn get_tunnel_status(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/tunnels/{}/status", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a node-to-node tunnel.
+    ///
+    /// `POST /api/v1/tunnels/node`
+    pub async fn add_node_tunnel(
+        &self,
+        name: &str,
+        from_node: &str,
+        to_node: &str,
+        local_port: u16,
+        remote_port: u16,
+        expose: &str,
+    ) -> Result<serde_json::Value> {
+        let payload = serde_json::json!({
+            "name": name,
+            "from_node": from_node,
+            "to_node": to_node,
+            "local_port": local_port,
+            "remote_port": remote_port,
+            "expose": expose,
+        });
+        let (status, body) = self
+            .post_json("/api/v1/tunnels/node", &payload.to_string())
+            .await?;
+        if !status.is_success() {
+            Self::check_status(status, &body)?;
+        }
+        Self::parse_json(&body)
+    }
+
+    /// Remove a node-to-node tunnel by name.
+    ///
+    /// `DELETE /api/v1/tunnels/node/{name}`
+    pub async fn remove_node_tunnel(&self, name: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/tunnels/node/{}", urlencoding(name));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    // ------------------------------------------------------------------
+    // Secrets management
+    // ------------------------------------------------------------------
+
+    /// List all secrets from the daemon.
+    ///
+    /// `GET /api/v1/secrets`
+    pub async fn list_secrets(&self) -> Result<Vec<serde_json::Value>> {
+        let (status, body) = self.get("/api/v1/secrets").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create or update a secret.
+    ///
+    /// `POST /api/v1/secrets` with `{"name": "<name>", "value": "<value>"}`
+    pub async fn create_secret(&self, name: &str, value: &str) -> Result<serde_json::Value> {
+        let payload = serde_json::json!({ "name": name, "value": value });
+        let (status, body) = self
+            .post_json("/api/v1/secrets", &payload.to_string())
+            .await?;
+        if !status.is_success() {
+            Self::check_status(status, &body)?;
+        }
+        Self::parse_json(&body)
+    }
+
+    /// Get metadata for a specific secret (value is never returned).
+    ///
+    /// `GET /api/v1/secrets/{name}`
+    pub async fn get_secret(&self, name: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/secrets/{}", urlencoding(name));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Delete a secret by name.
+    ///
+    /// `DELETE /api/v1/secrets/{name}` -- returns 204 No Content on success.
+    pub async fn delete_secret(&self, name: &str) -> Result<()> {
+        let path = format!("/api/v1/secrets/{}", urlencoding(name));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Network management
+    // ------------------------------------------------------------------
+
+    /// List all networks.
+    ///
+    /// `GET /api/v1/networks`
+    pub async fn list_networks(&self) -> Result<Vec<serde_json::Value>> {
+        let (status, body) = self.get("/api/v1/networks").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get details for a specific network by name.
+    ///
+    /// `GET /api/v1/networks/{name}`
+    pub async fn get_network(&self, name: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/networks/{}", urlencoding(name));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new network.
+    ///
+    /// `POST /api/v1/networks` with `{"name": "<name>"}`
+    pub async fn create_network(&self, name: &str) -> Result<serde_json::Value> {
+        let payload = serde_json::json!({ "name": name });
+        let (status, body) = self
+            .post_json("/api/v1/networks", &payload.to_string())
+            .await?;
+        if !status.is_success() {
+            Self::check_status(status, &body)?;
+        }
+        Self::parse_json(&body)
+    }
+
+    /// Delete a network by name.
+    ///
+    /// `DELETE /api/v1/networks/{name}` -- returns 204 No Content on success.
+    pub async fn delete_network(&self, name: &str) -> Result<()> {
+        let path = format!("/api/v1/networks/{}", urlencoding(name));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Volume management
+    // ------------------------------------------------------------------
+
+    /// List all volumes.
+    ///
+    /// `GET /api/v1/volumes`
+    pub async fn list_volumes(&self) -> Result<Vec<serde_json::Value>> {
+        let (status, body) = self.get("/api/v1/volumes").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Delete a volume by name.
+    ///
+    /// `DELETE /api/v1/volumes/{name}?force={force}` -- returns 204 No Content on success.
+    pub async fn delete_volume(&self, name: &str, force: bool) -> Result<()> {
+        let path = format!("/api/v1/volumes/{}?force={}", urlencoding(name), force,);
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Overlay network
+    // ------------------------------------------------------------------
+
+    /// Get overlay network status.
+    ///
+    /// `GET /api/v1/overlay/status`
+    pub async fn get_overlay_status(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get("/api/v1/overlay/status").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get overlay peer list.
+    ///
+    /// `GET /api/v1/overlay/peers`
+    pub async fn get_overlay_peers(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get("/api/v1/overlay/peers").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get overlay DNS entries.
+    ///
+    /// `GET /api/v1/overlay/dns`
+    pub async fn get_overlay_dns(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get("/api/v1/overlay/dns").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    // ------------------------------------------------------------------
+    // Job management
+    // ------------------------------------------------------------------
+
+    /// List all jobs.
+    ///
+    /// `GET /api/v1/jobs`
+    pub async fn list_jobs(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get("/api/v1/jobs").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Trigger a job execution.
+    ///
+    /// `POST /api/v1/deployments/{deployment}/jobs/{job}/trigger`
+    pub async fn trigger_job(&self, deployment: &str, job: &str) -> Result<serde_json::Value> {
+        let path = format!(
+            "/api/v1/deployments/{}/jobs/{}/trigger",
+            urlencoding(deployment),
+            urlencoding(job),
+        );
+        let (status, body) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get job status.
+    ///
+    /// `GET /api/v1/deployments/{deployment}/jobs/{job}`
+    pub async fn get_job_status(&self, deployment: &str, job: &str) -> Result<serde_json::Value> {
+        let path = format!(
+            "/api/v1/deployments/{}/jobs/{}",
+            urlencoding(deployment),
+            urlencoding(job),
+        );
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// List all cron jobs.
+    ///
+    /// `GET /api/v1/cron`
+    pub async fn list_cron_jobs(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get("/api/v1/cron").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get cron job status.
+    ///
+    /// `GET /api/v1/deployments/{deployment}/cron/{cron}`
+    pub async fn get_cron_status(&self, deployment: &str, cron: &str) -> Result<serde_json::Value> {
+        let path = format!(
+            "/api/v1/deployments/{}/cron/{}",
+            urlencoding(deployment),
+            urlencoding(cron),
+        );
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
 }
 
 // ---------------------------------------------------------------------------

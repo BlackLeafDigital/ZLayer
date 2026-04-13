@@ -2,7 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.74]
+
+### Added
+- **`zlayer volume` CLI commands.** New subcommand group for volume
+  management: `ls` (list volumes with name, path, and size) and `rm`
+  (remove a volume, with `--force` for non-empty volumes). Includes new
+  REST API endpoints (`GET /api/v1/volumes`, `DELETE /api/v1/volumes/{name}`)
+  backed by filesystem-level volume directory enumeration, plus
+  `DaemonClient` methods and route registration in the daemon server.
+
 ## [0.10.73]
+
+### Added
+- **`zlayer network` CLI commands.** New subcommand group for network
+  management: `ls`, `inspect`, `create`, `rm` for network CRUD, plus
+  `status`, `peers`, and `dns` for overlay network introspection. All
+  commands communicate with the daemon via the existing REST API endpoints.
 
 ### Fixed
 - **zlayer-manager white screen in production.** Container images were missing

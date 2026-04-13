@@ -16,6 +16,12 @@ pub(crate) async fn handle_image(_cli: &Cli, cmd: &ImageCommands) -> Result<()> 
     match cmd {
         ImageCommands::Ls { output } => list_images(output).await,
         ImageCommands::Rm { image, force } => remove_image(image, *force).await,
+        ImageCommands::Push {
+            image,
+            username,
+            password,
+        } => push_image(image, username.as_deref(), password.as_deref()).await,
+        ImageCommands::Inspect { image } => inspect_image(image).await,
     }
 }
 
@@ -47,6 +53,25 @@ async fn remove_image(image: &str, force: bool) -> Result<()> {
     let client = DaemonClient::connect().await?;
     client.remove_image(image, force).await?;
     println!("Removed {image}");
+    Ok(())
+}
+
+async fn push_image(image: &str, username: Option<&str>, password: Option<&str>) -> Result<()> {
+    let client = DaemonClient::connect().await?;
+    let resp = client.push_image(image, username, password).await?;
+    if let Some(msg) = resp.get("message").and_then(|v| v.as_str()) {
+        println!("{msg}");
+    } else {
+        println!("Pushed {image}");
+    }
+    Ok(())
+}
+
+async fn inspect_image(image: &str) -> Result<()> {
+    let client = DaemonClient::connect().await?;
+    let info = client.inspect_image(image).await?;
+    let json = serde_json::to_string_pretty(&info)?;
+    println!("{json}");
     Ok(())
 }
 

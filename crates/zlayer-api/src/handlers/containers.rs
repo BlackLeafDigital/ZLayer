@@ -103,6 +103,9 @@ pub struct CreateContainerRequest {
     /// Optional human-readable name
     #[serde(default)]
     pub name: Option<String>,
+    /// Image pull policy: "always", "`if_not_present`", or "never"
+    #[serde(default)]
+    pub pull_policy: Option<String>,
     /// Environment variables
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -286,7 +289,11 @@ fn build_service_spec(request: &CreateContainerRequest) -> zlayer_spec::ServiceS
         schedule: None,
         image: ImageSpec {
             name: request.image.clone(),
-            pull_policy: PullPolicy::IfNotPresent,
+            pull_policy: match request.pull_policy.as_deref() {
+                Some("always") => PullPolicy::Always,
+                Some("never") => PullPolicy::Never,
+                _ => PullPolicy::IfNotPresent,
+            },
         },
         resources,
         env: request.env.clone(),
@@ -407,10 +414,15 @@ pub async fn create_container(
         "Creating standalone container"
     );
 
-    // Pull the image
+    // Pull the image with the requested policy
+    let pull_policy = match request.pull_policy.as_deref() {
+        Some("always") => zlayer_spec::PullPolicy::Always,
+        Some("never") => zlayer_spec::PullPolicy::Never,
+        _ => zlayer_spec::PullPolicy::IfNotPresent,
+    };
     state
         .runtime
-        .pull_image(&request.image)
+        .pull_image_with_policy(&request.image, pull_policy)
         .await
         .map_err(|e| {
             ApiError::Internal(format!("Failed to pull image '{}': {e}", request.image))
@@ -1128,6 +1140,7 @@ mod tests {
         let request = CreateContainerRequest {
             image: "alpine:latest".to_string(),
             name: None,
+            pull_policy: None,
             env: HashMap::new(),
             command: None,
             labels: HashMap::new(),
@@ -1146,6 +1159,7 @@ mod tests {
         let request = CreateContainerRequest {
             image: "node:20".to_string(),
             name: Some("build-runner".to_string()),
+            pull_policy: None,
             env: HashMap::from([("NODE_ENV".to_string(), "production".to_string())]),
             command: Some(vec!["node".to_string(), "server.js".to_string()]),
             labels: HashMap::from([("ci".to_string(), "true".to_string())]),

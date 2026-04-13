@@ -14,9 +14,11 @@ use zlayer_api::handlers::overlay::OverlayApiState;
 use zlayer_api::router::{
     build_cluster_routes, build_container_routes, build_cron_routes, build_job_routes,
     build_network_routes, build_node_routes, build_overlay_routes, build_tunnel_routes,
+    build_volume_routes,
 };
 use zlayer_api::{
     ApiConfig, BuildState, ContainerApiState, CronState, JobState, NetworkApiState, TunnelApiState,
+    VolumeApiState,
 };
 use zlayer_overlay::IpAllocator;
 
@@ -858,6 +860,12 @@ pub(crate) async fn serve(
     let container_state = ContainerApiState::new(runtime);
     let container_routes = build_container_routes(container_state);
     router = router.nest("/api/v1/containers", container_routes);
+
+    // Merge volume management routes
+    let volume_dir = config.data_dir.join("volumes");
+    let volume_state = VolumeApiState::new(volume_dir);
+    let volume_routes = build_volume_routes(volume_state);
+    router = router.nest("/api/v1/volumes", volume_routes);
 
     let job_state = JobState {
         executor: job_executor,
