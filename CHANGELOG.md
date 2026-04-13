@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.73]
+
+### Fixed
+- **zlayer-manager white screen in production.** Container images were missing
+  `LEPTOS_OUTPUT_NAME`, `LEPTOS_SITE_PKG_DIR`, and `LEPTOS_HASH_FILES` runtime
+  env vars, so Leptos SSR generated unhashed script paths that didn't match the
+  hashed files built by cargo-leptos. Also added `assets-dir` to `Leptos.toml`
+  so the logo and other static assets are copied into the site directory.
+- **zlayer-web same missing env vars.** Applied the same runtime env var fix to
+  the zlayer-web container images.
+
+### Changed
+- **zlayer-manager default port 9120 → 6677.** Port 9120 conflicted with
+  Komodo. Updated CLI default, Leptos config, container images, deployment
+  spec generator, and documentation.
+
 ## [0.10.72]
 
 ### Fixed

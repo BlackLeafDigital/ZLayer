@@ -31,7 +31,7 @@ pub(crate) fn handle_manager_init(
     info!(port = port, version = %version, "Initializing zlayer-manager deployment");
 
     // Build the manager service spec
-    // The OCI image defaults to listening on 9120 (ZLAYER_MANAGER_ADDR).
+    // The OCI image defaults to listening on 6677 (ZLAYER_MANAGER_ADDR).
     // We use target_port to tell the proxy where the container actually listens,
     // while `port` is the external-facing proxy listen port.
     let spec = format!(
@@ -51,7 +51,7 @@ services:
       - name: http
         protocol: http
         port: {port}
-        target_port: 9120
+        target_port: 6677
         expose: public
     scale:
       mode: fixed
@@ -59,7 +59,7 @@ services:
     health:
       check:
         type: http
-        url: http://localhost:9120/health
+        url: http://localhost:6677/health
 "
     );
 
