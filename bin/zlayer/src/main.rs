@@ -662,6 +662,12 @@ async fn run(mut cli: Cli) -> Result<()> {
         Commands::Image(image_cmd) => commands::image::handle_image(&cli, image_cmd).await,
         #[cfg(unix)]
         Commands::System(system_cmd) => commands::system::handle_system(&cli, system_cmd).await,
+        #[cfg(unix)]
+        Commands::Network(network_cmd) => {
+            commands::network::handle_network(&cli, network_cmd).await
+        }
+        #[cfg(unix)]
+        Commands::Volume(volume_cmd) => commands::volume::handle_volume(&cli, volume_cmd).await,
 
         // On non-Unix platforms, runtime commands are not available
         #[cfg(not(unix))]

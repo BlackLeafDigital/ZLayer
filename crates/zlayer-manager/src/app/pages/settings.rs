@@ -1,83 +1,438 @@
 //! Settings page
 //!
-//! Manages general settings (saved to localStorage) and secrets
-//! (saved via the ZLayer API).
+//! Manages instances (remote ZLayer API connections), secrets,
+//! and danger-zone operations (cluster reset).
 
 use crate::app::server_fns::{
-    create_secret, delete_secret, get_secrets, reset_cluster, SecretInfo,
+    add_new_instance, create_secret, delete_secret, get_instances, get_secrets,
+    remove_existing_instance, reset_cluster, switch_instance, test_instance_connection,
+    update_existing_instance, SecretInfo,
 };
 use leptos::prelude::*;
 
 #[component]
-fn GeneralSettingsCard() -> impl IntoView {
-    let (cluster_name, set_cluster_name) = signal("zlayer-production".to_string());
-    let (api_url, set_api_url) = signal("https://api.zlayer.io".to_string());
-    let (saved, set_saved) = signal(false);
+fn InstancesCard() -> impl IntoView {
+    let (refresh, set_refresh) = signal(0u32);
+    let instances = Resource::new(move || refresh.get(), |_| get_instances());
+
+    // Modal state
+    let (show_modal, set_show_modal) = signal(false);
+    let (editing_index, set_editing_index) = signal(Option::<usize>::None);
+    let (inst_name, set_inst_name) = signal(String::new());
+    let (inst_url, set_inst_url) = signal(String::new());
+    let (inst_token, set_inst_token) = signal(String::new());
+    let (modal_error, set_modal_error) = signal(Option::<String>::None);
+
+    // Test connection state
+    let (test_result, set_test_result) = signal(Option::<Result<String, String>>::None);
+    let (testing, set_testing) = signal(false);
+
+    // Delete confirmation state
+    let (confirm_delete_index, set_confirm_delete_index) = signal(Option::<usize>::None);
+
+    let open_add_modal = move |_| {
+        set_editing_index.set(None);
+        set_inst_name.set(String::new());
+        set_inst_url.set(String::new());
+        set_inst_token.set(String::new());
+        set_modal_error.set(None);
+        set_test_result.set(None);
+        set_show_modal.set(true);
+    };
+
+    let close_modal = move |_: leptos::ev::MouseEvent| {
+        set_show_modal.set(false);
+        set_modal_error.set(None);
+        set_test_result.set(None);
+    };
+
+    let test_action = Action::new(move |input: &(String, Option<String>)| {
+        let (url, token) = input.clone();
+        async move {
+            set_testing.set(true);
+            set_test_result.set(None);
+            let result = test_instance_connection(url, token).await;
+            match result {
+                Ok(msg) => set_test_result.set(Some(Ok(msg))),
+                Err(e) => set_test_result.set(Some(Err(e.to_string()))),
+            }
+            set_testing.set(false);
+        }
+    });
+
+    let save_action = Action::new(
+        move |input: &(Option<usize>, String, String, Option<String>)| {
+            let (index, name, url, token) = input.clone();
+            async move {
+                let result = match index {
+                    Some(idx) => update_existing_instance(idx, name, url, token).await,
+                    None => add_new_instance(name, url, token).await,
+                };
+                match result {
+                    Ok(()) => {
+                        set_show_modal.set(false);
+                        set_modal_error.set(None);
+                        set_test_result.set(None);
+                        set_refresh.update(|n| *n += 1);
+                    }
+                    Err(e) => {
+                        set_modal_error.set(Some(e.to_string()));
+                    }
+                }
+            }
+        },
+    );
+
+    let switch_action = Action::new(move |index: &usize| {
+        let index = *index;
+        async move {
+            let _ = switch_instance(index).await;
+            set_refresh.update(|n| *n += 1);
+        }
+    });
+
+    let delete_action = Action::new(move |index: &usize| {
+        let index = *index;
+        async move {
+            let _ = remove_existing_instance(index).await;
+            set_confirm_delete_index.set(None);
+            set_refresh.update(|n| *n += 1);
+        }
+    });
 
     view! {
         <div class="card bg-base-200 shadow-xl">
             <div class="card-body">
-                <h2 class="card-title">"General Settings"</h2>
-                <div class="form-control w-full max-w-md">
+                <div class="flex justify-between items-center">
+                    <h2 class="card-title">"Instances"</h2>
+                    <button class="btn btn-primary btn-sm" on:click=open_add_modal>
+                        "Add Instance"
+                    </button>
+                </div>
+                <p class="text-base-content/70 text-sm">
+                    "Manage connections to ZLayer API instances."
+                </p>
+
+                <Suspense fallback=move || {
+                    view! { <span class="loading loading-spinner"></span> }
+                }>
+                    <ErrorBoundary fallback=|errors| {
+                        view! {
+                            <div class="alert alert-error">
+                                {move || format!("{:?}", errors.get())}
+                            </div>
+                        }
+                    }>
+                        {move || {
+                            instances
+                                .get()
+                                .map(|result| {
+                                    match result {
+                                        Ok(instance_list) => {
+                                            if instance_list.is_empty() {
+                                                view! {
+                                                    <div class="alert alert-info">
+                                                        "No instances configured. Add one to get started."
+                                                    </div>
+                                                }
+                                                    .into_any()
+                                            } else {
+                                                view! {
+                                                    <div class="overflow-x-auto">
+                                                        <table class="table table-zebra w-full">
+                                                            <thead>
+                                                                <tr>
+                                                                    <th>"Status"</th>
+                                                                    <th>"Name"</th>
+                                                                    <th>"URL"</th>
+                                                                    <th>"Token"</th>
+                                                                    <th>"Actions"</th>
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody>
+                                                                {instance_list
+                                                                    .into_iter()
+                                                                    .enumerate()
+                                                                    .map(|(i, inst)| {
+                                                                        let name = inst.name.clone();
+                                                                        let url = inst.url.clone();
+                                                                        let is_active = inst.is_active;
+                                                                        let has_token = inst.has_token;
+                                                                        let edit_name = name.clone();
+                                                                        let edit_url = url.clone();
+                                                                        view! {
+                                                                            <tr class=if is_active {
+                                                                                "bg-success/10"
+                                                                            } else {
+                                                                                ""
+                                                                            }>
+                                                                                <td>
+                                                                                    {if is_active {
+                                                                                        view! {
+                                                                                            <span class="badge badge-success badge-sm">"Active"</span>
+                                                                                        }
+                                                                                            .into_any()
+                                                                                    } else {
+                                                                                        view! {
+                                                                                            <span class="badge badge-ghost badge-sm">"Inactive"</span>
+                                                                                        }
+                                                                                            .into_any()
+                                                                                    }}
+                                                                                </td>
+                                                                                <td class="font-semibold">{name}</td>
+                                                                                <td class="font-mono text-sm">{url}</td>
+                                                                                <td>
+                                                                                    {if has_token {
+                                                                                        view! {
+                                                                                            <span class="badge badge-info badge-sm">
+                                                                                                "Set"
+                                                                                            </span>
+                                                                                        }
+                                                                                            .into_any()
+                                                                                    } else {
+                                                                                        view! {
+                                                                                            <span class="badge badge-ghost badge-sm">
+                                                                                                "None"
+                                                                                            </span>
+                                                                                        }
+                                                                                            .into_any()
+                                                                                    }}
+                                                                                </td>
+                                                                                <td>
+                                                                                    <div class="flex gap-1">
+                                                                                        {if is_active {
+                                                                                            None
+                                                                                        } else {
+                                                                                            Some(view! {
+                                                                                                <button
+                                                                                                    class="btn btn-success btn-xs"
+                                                                                                    on:click=move |_| {
+                                                                                                        switch_action.dispatch(i);
+                                                                                                    }
+                                                                                                >
+                                                                                                    "Connect"
+                                                                                                </button>
+                                                                                            })
+                                                                                        }}
+                                                                                        <button
+                                                                                            class="btn btn-ghost btn-xs"
+                                                                                            on:click=move |_| {
+                                                                                                set_editing_index.set(Some(i));
+                                                                                                set_inst_name.set(edit_name.clone());
+                                                                                                set_inst_url.set(edit_url.clone());
+                                                                                                set_inst_token.set(String::new());
+                                                                                                set_modal_error.set(None);
+                                                                                                set_test_result.set(None);
+                                                                                                set_show_modal.set(true);
+                                                                                            }
+                                                                                        >
+                                                                                            "Edit"
+                                                                                        </button>
+                                                                                        <button
+                                                                                            class="btn btn-ghost btn-xs text-error"
+                                                                                            on:click=move |_| {
+                                                                                                set_confirm_delete_index.set(Some(i));
+                                                                                            }
+                                                                                        >
+                                                                                            "Delete"
+                                                                                        </button>
+                                                                                    </div>
+                                                                                </td>
+                                                                            </tr>
+                                                                        }
+                                                                    })
+                                                                    .collect::<Vec<_>>()}
+                                                            </tbody>
+                                                        </table>
+                                                    </div>
+                                                }
+                                                    .into_any()
+                                            }
+                                        }
+                                        Err(e) => {
+                                            view! {
+                                                <div class="alert alert-error">{e.to_string()}</div>
+                                            }
+                                                .into_any()
+                                        }
+                                    }
+                                })
+                        }}
+                    </ErrorBoundary>
+                </Suspense>
+            </div>
+        </div>
+
+        // Add/Edit Instance Modal
+        <div class=move || {
+            if show_modal.get() { "modal modal-open" } else { "modal" }
+        }>
+            <div class="modal-box">
+                <h3 class="font-bold text-lg">
+                    {move || {
+                        if editing_index.get().is_some() {
+                            "Edit Instance"
+                        } else {
+                            "Add Instance"
+                        }
+                    }}
+                </h3>
+
+                {move || {
+                    modal_error
+                        .get()
+                        .map(|msg| {
+                            view! {
+                                <div class="alert alert-error mb-4 mt-2">
+                                    <span>{msg}</span>
+                                </div>
+                            }
+                        })
+                }}
+
+                <div class="form-control w-full mt-4">
                     <label class="label">
-                        <span class="label-text">"Cluster Name"</span>
+                        <span class="label-text">"Name"</span>
                     </label>
                     <input
                         type="text"
-                        placeholder="my-cluster"
                         class="input input-bordered w-full"
-                        prop:value=move || cluster_name.get()
-                        on:input=move |ev| {
-                            set_cluster_name.set(event_target_value(&ev));
-                            set_saved.set(false);
-                        }
+                        placeholder="e.g. Production"
+                        prop:value=move || inst_name.get()
+                        on:input=move |ev| set_inst_name.set(event_target_value(&ev))
                     />
                 </div>
-                <div class="form-control w-full max-w-md">
+                <div class="form-control w-full mt-2">
                     <label class="label">
-                        <span class="label-text">"API URL"</span>
+                        <span class="label-text">"URL"</span>
                     </label>
                     <input
                         type="url"
-                        placeholder="https://api.example.com"
                         class="input input-bordered w-full"
-                        prop:value=move || api_url.get()
-                        on:input=move |ev| {
-                            set_api_url.set(event_target_value(&ev));
-                            set_saved.set(false);
-                        }
+                        placeholder="https://api.example.com:3669"
+                        prop:value=move || inst_url.get()
+                        on:input=move |ev| set_inst_url.set(event_target_value(&ev))
                     />
                 </div>
-                <div class="card-actions justify-end mt-4 items-center">
-                    {move || {
-                        saved
-                            .get()
-                            .then(|| {
+                <div class="form-control w-full mt-2">
+                    <label class="label">
+                        <span class="label-text">"Token (optional)"</span>
+                    </label>
+                    <input
+                        type="password"
+                        class="input input-bordered w-full"
+                        placeholder="Leave blank to keep existing token"
+                        prop:value=move || inst_token.get()
+                        on:input=move |ev| set_inst_token.set(event_target_value(&ev))
+                    />
+                </div>
+
+                // Test connection result
+                {move || {
+                    test_result
+                        .get()
+                        .map(|result| match result {
+                            Ok(msg) => {
                                 view! {
-                                    <span class="text-success text-sm">"Settings saved"</span>
+                                    <div class="alert alert-success mt-4">
+                                        <span>{msg}</span>
+                                    </div>
                                 }
-                            })
-                    }}
-                    <button
-                        class="btn btn-primary"
-                        on:click=move |_| {
-                            #[cfg(target_arch = "wasm32")]
-                            {
-                                if let Some(storage) = web_sys::window()
-                                    .and_then(|w| w.local_storage().ok().flatten())
-                                {
-                                    let _ = storage
-                                        .set_item("zlayer_cluster_name", &cluster_name.get());
-                                    let _ = storage.set_item("zlayer_api_url", &api_url.get());
-                                }
+                                    .into_any()
                             }
-                            set_saved.set(true);
+                            Err(msg) => {
+                                view! {
+                                    <div class="alert alert-error mt-4">
+                                        <span>{msg}</span>
+                                    </div>
+                                }
+                                    .into_any()
+                            }
+                        })
+                }}
+
+                <div class="modal-action">
+                    <button
+                        class="btn btn-outline btn-sm"
+                        prop:disabled=move || inst_url.get().trim().is_empty() || testing.get()
+                        on:click=move |_| {
+                            let token = if inst_token.get().trim().is_empty() {
+                                None
+                            } else {
+                                Some(inst_token.get())
+                            };
+                            test_action.dispatch((inst_url.get(), token));
                         }
                     >
-                        "Save Changes"
+                        {move || if testing.get() { "Testing..." } else { "Test Connection" }}
+                    </button>
+                    <button class="btn" on:click=close_modal>
+                        "Cancel"
+                    </button>
+                    <button
+                        class="btn btn-primary"
+                        prop:disabled=move || {
+                            inst_name.get().trim().is_empty()
+                                || inst_url.get().trim().is_empty()
+                        }
+                        on:click=move |_| {
+                            let token = if inst_token.get().trim().is_empty() {
+                                None
+                            } else {
+                                Some(inst_token.get())
+                            };
+                            save_action
+                                .dispatch((
+                                    editing_index.get(),
+                                    inst_name.get(),
+                                    inst_url.get(),
+                                    token,
+                                ));
+                        }
+                    >
+                        "Save"
                     </button>
                 </div>
             </div>
+            <div class="modal-backdrop" on:click=close_modal></div>
+        </div>
+
+        // Delete Confirmation Modal
+        <div class=move || {
+            if confirm_delete_index.get().is_some() {
+                "modal modal-open"
+            } else {
+                "modal"
+            }
+        }>
+            <div class="modal-box">
+                <h3 class="font-bold text-lg text-error">"Delete Instance"</h3>
+                <p class="py-4">
+                    "Are you sure you want to remove this instance? This action cannot be undone."
+                </p>
+                <div class="modal-action">
+                    <button
+                        class="btn"
+                        on:click=move |_| set_confirm_delete_index.set(None)
+                    >
+                        "Cancel"
+                    </button>
+                    <button
+                        class="btn btn-error"
+                        on:click=move |_| {
+                            if let Some(idx) = confirm_delete_index.get() {
+                                delete_action.dispatch(idx);
+                            }
+                        }
+                    >
+                        "Delete"
+                    </button>
+                </div>
+            </div>
+            <div
+                class="modal-backdrop"
+                on:click=move |_| set_confirm_delete_index.set(None)
+            ></div>
         </div>
     }
 }
@@ -438,7 +793,7 @@ pub fn Settings() -> impl IntoView {
     view! {
         <div class="container mx-auto p-6 space-y-6">
             <h1 class="text-3xl font-bold mb-6">"Settings"</h1>
-            <GeneralSettingsCard />
+            <InstancesCard />
             <SecretsCard />
             <DangerZoneCard />
         </div>

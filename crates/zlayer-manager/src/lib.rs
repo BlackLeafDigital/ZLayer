@@ -13,6 +13,10 @@
 #[cfg(feature = "ssr")]
 pub mod api_client;
 pub mod app;
+#[cfg(feature = "ssr")]
+pub mod instances;
+#[cfg(feature = "ssr")]
+pub mod server;
 
 /// Hydrate the client-side application.
 ///

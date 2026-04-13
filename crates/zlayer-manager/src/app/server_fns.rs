@@ -15,22 +15,107 @@ use crate::api_client::{ApiClientError, ZLayerClient};
 // Client Helper (SSR only)
 // ============================================================================
 
-/// Default API URL if ZLAYER_API_URL is not set
-#[cfg(feature = "ssr")]
-const DEFAULT_API_URL: &str = "http://localhost:3669";
-
-/// Get a ZLayer API client configured from environment
+/// Get a ZLayer API client from the active instance
 #[cfg(feature = "ssr")]
 fn get_api_client() -> ZLayerClient {
-    let base_url = std::env::var("ZLAYER_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
-    let token = std::env::var("ZLAYER_API_TOKEN").ok();
-    ZLayerClient::new(base_url, token)
+    let instance = crate::instances::get_active();
+    ZLayerClient::new(instance.url, instance.token)
 }
 
 /// Convert `ApiClientError` to `ServerFnError`
 #[cfg(feature = "ssr")]
 fn api_error_to_server_error(err: &ApiClientError) -> ServerFnError {
     ServerFnError::new(err.to_string())
+}
+
+// ============================================================================
+// Instance Management
+// ============================================================================
+
+/// Instance info returned to the frontend
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstanceInfo {
+    pub name: String,
+    pub url: String,
+    pub has_token: bool,
+    pub is_active: bool,
+}
+
+/// Get all saved instances
+#[server(prefix = "/api/manager")]
+pub async fn get_instances() -> Result<Vec<InstanceInfo>, ServerFnError> {
+    let (instances, active_idx) = crate::instances::list_all();
+    Ok(instances
+        .into_iter()
+        .enumerate()
+        .map(|(i, inst)| InstanceInfo {
+            name: inst.name,
+            url: inst.url,
+            has_token: inst.token.is_some(),
+            is_active: i == active_idx,
+        })
+        .collect())
+}
+
+/// Get the active connection info
+#[server(prefix = "/api/manager")]
+pub async fn get_active_connection() -> Result<InstanceInfo, ServerFnError> {
+    let (instances, active_idx) = crate::instances::list_all();
+    let inst = &instances[active_idx.min(instances.len().saturating_sub(1))];
+    Ok(InstanceInfo {
+        name: inst.name.clone(),
+        url: inst.url.clone(),
+        has_token: inst.token.is_some(),
+        is_active: true,
+    })
+}
+
+/// Switch the active instance
+#[server(prefix = "/api/manager")]
+pub async fn switch_instance(index: usize) -> Result<(), ServerFnError> {
+    crate::instances::set_active(index).map_err(ServerFnError::new)
+}
+
+/// Add a new instance
+#[server(prefix = "/api/manager")]
+pub async fn add_new_instance(
+    name: String,
+    url: String,
+    token: Option<String>,
+) -> Result<(), ServerFnError> {
+    let token = token.filter(|t| !t.is_empty());
+    crate::instances::add(crate::instances::Instance { name, url, token })
+        .map_err(ServerFnError::new)
+}
+
+/// Update an existing instance
+#[server(prefix = "/api/manager")]
+pub async fn update_existing_instance(
+    index: usize,
+    name: String,
+    url: String,
+    token: Option<String>,
+) -> Result<(), ServerFnError> {
+    let token = token.filter(|t| !t.is_empty());
+    crate::instances::update(index, crate::instances::Instance { name, url, token })
+        .map_err(ServerFnError::new)
+}
+
+/// Remove an instance
+#[server(prefix = "/api/manager")]
+pub async fn remove_existing_instance(index: usize) -> Result<(), ServerFnError> {
+    crate::instances::remove(index).map_err(ServerFnError::new)
+}
+
+/// Test connection to a ZLayer API endpoint
+#[server(prefix = "/api/manager")]
+pub async fn test_instance_connection(
+    url: String,
+    token: Option<String>,
+) -> Result<String, ServerFnError> {
+    crate::instances::test_connection(&url, token.as_deref())
+        .await
+        .map_err(ServerFnError::new)
 }
 
 // ============================================================================

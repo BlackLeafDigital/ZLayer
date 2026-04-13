@@ -13,6 +13,19 @@ All notable changes to this project will be documented in this file.
 - **zlayer-web same missing env vars.** Applied the same runtime env var fix to
   the zlayer-web container images.
 
+### Added
+- **ZLayer Desktop (Tauri v2).** Native desktop app wrapping the zlayer-manager
+  web UI in a Tauri webview with an embedded SSR server. All Leptos server
+  functions work unchanged — the Tauri app spawns the Axum server on a random
+  localhost port and navigates the webview to it. New crate: `bin/zlayer-desktop`.
+- **`zlayer_manager::server` module.** Extracted server startup logic from
+  `main.rs` into a reusable library function so both the CLI binary and the
+  Tauri desktop app can start the embedded server.
+- **Instance management.** The manager can now connect to multiple remote
+  ZLayer instances. Added an instance list UI in Settings with add/edit/delete/
+  switch and a "Test Connection" button. Active connection shown in sidebar.
+  Instances persist to `~/.config/zlayer/instances.json`.
+
 ### Changed
 - **zlayer-manager default port 9120 → 6677.** Port 9120 conflicted with
   Komodo. Updated CLI default, Leptos config, container images, deployment

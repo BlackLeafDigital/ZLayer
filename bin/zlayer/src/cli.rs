@@ -561,6 +561,19 @@ pub(crate) enum Commands {
     #[command(subcommand, display_order = 36)]
     System(SystemCommands),
 
+    /// Network management commands
+    ///
+    /// List, create, inspect, and remove networks. Also show overlay
+    /// network status, peers, and DNS entries.
+    #[command(subcommand, display_order = 37)]
+    Network(NetworkCommands),
+
+    /// Volume management commands
+    ///
+    /// List and remove named volumes stored by the daemon.
+    #[command(subcommand, display_order = 38)]
+    Volume(VolumeCommands),
+
     // ── Inspection & Configuration ────────────────────────────────────
     /// Validate a spec file without deploying
     #[command(display_order = 40)]
@@ -834,6 +847,69 @@ pub(crate) enum SystemCommands {
         /// Skip the confirmation prompt.
         #[arg(long, short)]
         yes: bool,
+    },
+}
+
+/// Network management subcommands
+#[derive(Subcommand, Debug)]
+pub(crate) enum NetworkCommands {
+    /// List all networks
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Output format (table or json)
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+    /// Inspect a network
+    Inspect {
+        /// Network name
+        name: String,
+    },
+    /// Create a network
+    Create {
+        /// Network name
+        name: String,
+    },
+    /// Remove a network
+    #[command(visible_alias = "remove")]
+    Rm {
+        /// Network name
+        name: String,
+    },
+    /// Show overlay network status
+    Status,
+    /// List overlay peers
+    Peers,
+    /// Show DNS entries
+    Dns,
+}
+
+/// Volume management subcommands
+#[derive(Subcommand, Debug)]
+pub(crate) enum VolumeCommands {
+    /// List all volumes
+    ///
+    /// Examples:
+    ///   zlayer volume ls
+    ///   zlayer volume ls --output json
+    #[command(visible_alias = "list", verbatim_doc_comment)]
+    Ls {
+        /// Output format (table or json)
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+    /// Remove a volume
+    ///
+    /// Examples:
+    ///   zlayer volume rm my-volume
+    ///   zlayer volume rm my-volume --force
+    #[command(visible_alias = "remove", verbatim_doc_comment)]
+    Rm {
+        /// Volume name
+        name: String,
+        /// Force removal even if the volume is non-empty
+        #[arg(long)]
+        force: bool,
     },
 }
 

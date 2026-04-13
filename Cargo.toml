@@ -21,6 +21,7 @@ members = [
   "crates/zlayer-secrets",
   "crates/zlayer-tunnel",
   "bin/zlayer",
+  "bin/zlayer-desktop",
   "crates/zlayer-manager",
   "crates/zlayer-consensus",
   "crates/zlayer-docker",

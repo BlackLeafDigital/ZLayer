@@ -5,6 +5,8 @@
 use leptos::prelude::*;
 use leptos_router::components::A;
 
+use crate::app::server_fns::get_active_connection;
+
 /// Sidebar component with navigation links and icons
 #[component]
 #[allow(clippy::too_many_lines)]
@@ -129,8 +131,45 @@ pub fn Sidebar() -> impl IntoView {
                 </li>
             </ul>
 
-            // Version footer
-            <div class="p-4 border-t border-base-300">
+            // Connection indicator + version footer
+            <div class="p-4 border-t border-base-300 space-y-2">
+                {
+                    let connection = Resource::new(|| (), |_| get_active_connection());
+                    view! {
+                        <Suspense fallback=move || view! {
+                            <div class="flex items-center gap-2">
+                                <span class="loading loading-spinner loading-xs"></span>
+                                <span class="text-xs text-base-content/50">"Connecting..."</span>
+                            </div>
+                        }>
+                            {move || {
+                                connection.get().map(|result| {
+                                    match result {
+                                        Ok(info) => view! {
+                                            <div class="flex flex-col gap-0.5">
+                                                <div class="flex items-center gap-2">
+                                                    <span class={if info.is_active {
+                                                        "badge badge-xs badge-success"
+                                                    } else {
+                                                        "badge badge-xs badge-error"
+                                                    }}></span>
+                                                    <span class="text-xs font-medium truncate">{info.name}</span>
+                                                </div>
+                                                <div class="text-[10px] text-base-content/40 truncate pl-4">{info.url}</div>
+                                            </div>
+                                        }.into_any(),
+                                        Err(_) => view! {
+                                            <div class="flex items-center gap-2">
+                                                <span class="badge badge-xs badge-error"></span>
+                                                <span class="text-xs text-base-content/50">"No connection"</span>
+                                            </div>
+                                        }.into_any(),
+                                    }
+                                })
+                            }}
+                        </Suspense>
+                    }
+                }
                 <div class="text-xs text-base-content/40">"ZLayer v0.1.0"</div>
             </div>
         </aside>

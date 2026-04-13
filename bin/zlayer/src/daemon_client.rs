@@ -883,6 +883,107 @@ impl DaemonClient {
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
     }
+
+    // ------------------------------------------------------------------
+    // Network management
+    // ------------------------------------------------------------------
+
+    /// List all networks.
+    ///
+    /// `GET /api/v1/networks`
+    pub async fn list_networks(&self) -> Result<Vec<serde_json::Value>> {
+        let (status, body) = self.get("/api/v1/networks").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get details for a specific network by name.
+    ///
+    /// `GET /api/v1/networks/{name}`
+    pub async fn get_network(&self, name: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/networks/{}", urlencoding(name));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new network.
+    ///
+    /// `POST /api/v1/networks` with `{"name": "<name>"}`
+    pub async fn create_network(&self, name: &str) -> Result<serde_json::Value> {
+        let payload = serde_json::json!({ "name": name });
+        let (status, body) = self
+            .post_json("/api/v1/networks", &payload.to_string())
+            .await?;
+        if !status.is_success() {
+            Self::check_status(status, &body)?;
+        }
+        Self::parse_json(&body)
+    }
+
+    /// Delete a network by name.
+    ///
+    /// `DELETE /api/v1/networks/{name}` -- returns 204 No Content on success.
+    pub async fn delete_network(&self, name: &str) -> Result<()> {
+        let path = format!("/api/v1/networks/{}", urlencoding(name));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Volume management
+    // ------------------------------------------------------------------
+
+    /// List all volumes.
+    ///
+    /// `GET /api/v1/volumes`
+    pub async fn list_volumes(&self) -> Result<Vec<serde_json::Value>> {
+        let (status, body) = self.get("/api/v1/volumes").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Delete a volume by name.
+    ///
+    /// `DELETE /api/v1/volumes/{name}?force={force}` -- returns 204 No Content on success.
+    pub async fn delete_volume(&self, name: &str, force: bool) -> Result<()> {
+        let path = format!("/api/v1/volumes/{}?force={}", urlencoding(name), force);
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Overlay network
+    // ------------------------------------------------------------------
+
+    /// Get overlay network status.
+    ///
+    /// `GET /api/v1/overlay/status`
+    pub async fn get_overlay_status(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get("/api/v1/overlay/status").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get overlay peer list.
+    ///
+    /// `GET /api/v1/overlay/peers`
+    pub async fn get_overlay_peers(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get("/api/v1/overlay/peers").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Get overlay DNS entries.
+    ///
+    /// `GET /api/v1/overlay/dns`
+    pub async fn get_overlay_dns(&self) -> Result<serde_json::Value> {
+        let (status, body) = self.get("/api/v1/overlay/dns").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
 }
 
 // ---------------------------------------------------------------------------

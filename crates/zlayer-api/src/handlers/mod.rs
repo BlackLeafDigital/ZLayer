@@ -18,6 +18,7 @@ pub mod secrets;
 pub mod services;
 pub mod storage;
 pub mod tunnels;
+pub mod volumes;
 
 pub use auth::*;
 pub use build::*;
@@ -36,3 +37,4 @@ pub use secrets::*;
 pub use services::*;
 pub use storage::*;
 pub use tunnels::*;
+pub use volumes::*;

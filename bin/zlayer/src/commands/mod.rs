@@ -20,6 +20,8 @@ pub mod image;
 #[cfg(unix)]
 pub mod join;
 #[cfg(unix)]
+pub mod network;
+#[cfg(unix)]
 pub mod node;
 #[cfg(unix)]
 pub mod ps;
@@ -29,3 +31,5 @@ pub mod serve;
 pub mod system;
 #[cfg(unix)]
 pub mod token;
+#[cfg(unix)]
+pub mod volume;
