@@ -408,65 +408,13 @@ async fn status(data_dir: &Path) -> Result<()> {
 const UNIT_NAME: &str = "zlayer.service";
 
 #[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServiceLevel {
-    System,
-    User,
-}
-
-/// Detect where the zlayer systemd service is actually installed.
-///
-/// Probes the filesystem for an existing unit file rather than guessing
-/// from euid.  Falls back to euid only when no unit exists yet (fresh
-/// install).
-#[cfg(target_os = "linux")]
-#[allow(unsafe_code)]
-fn detect_service_level() -> ServiceLevel {
-    // System-level (most common: installed via `sudo zlayer daemon install`)
-    let system_path = std::path::Path::new("/etc/systemd/system").join(UNIT_NAME);
-    if system_path.exists() {
-        return ServiceLevel::System;
-    }
-
-    // User-level
-    if let Ok(home) = std::env::var("HOME") {
-        let user_path =
-            std::path::PathBuf::from(format!("{home}/.config/systemd/user")).join(UNIT_NAME);
-        if user_path.exists() {
-            return ServiceLevel::User;
-        }
-    }
-
-    // Neither exists — fall back to euid for install-time decisions
-    let is_root = unsafe { libc::geteuid() } == 0;
-    if is_root {
-        ServiceLevel::System
-    } else {
-        ServiceLevel::User
-    }
-}
-
-#[cfg(target_os = "linux")]
 fn unit_path() -> std::path::PathBuf {
-    match detect_service_level() {
-        ServiceLevel::System => std::path::PathBuf::from("/etc/systemd/system").join(UNIT_NAME),
-        ServiceLevel::User => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-            std::path::PathBuf::from(format!("{home}/.config/systemd/user")).join(UNIT_NAME)
-        }
-    }
+    std::path::PathBuf::from("/etc/systemd/system").join(UNIT_NAME)
 }
 
 #[cfg(target_os = "linux")]
 fn systemctl_args(base_args: &[&str]) -> Vec<String> {
-    match detect_service_level() {
-        ServiceLevel::System => base_args.iter().copied().map(ToString::to_string).collect(),
-        ServiceLevel::User => {
-            let mut args = vec!["--user".to_string()];
-            args.extend(base_args.iter().copied().map(ToString::to_string));
-            args
-        }
-    }
+    base_args.iter().copied().map(ToString::to_string).collect()
 }
 
 /// Pick a writable system location for the daemon binary.
@@ -919,7 +867,7 @@ fn get_daemon_failure_context() -> String {
         }
         // If status output is sparse, pull more lines from the journal
         if context.len() < 100 {
-            let mut jctl_args = vec![
+            let jctl_args = vec![
                 "--no-pager",
                 "-n",
                 "30",
@@ -929,9 +877,6 @@ fn get_daemon_failure_context() -> String {
                 "--output",
                 "cat",
             ];
-            if detect_service_level() == ServiceLevel::User {
-                jctl_args.insert(0, "--user");
-            }
             if let Ok(out) = std::process::Command::new("journalctl")
                 .args(&jctl_args)
                 .output()

@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.72]
+
+### Fixed
+- **`zlayer status` reports "not running" when daemon runs as root via
+  systemd.** The Unix socket at `/var/run/zlayer.sock` was created with
+  mode `0o660` (owner+group only). When the daemon runs as root, the
+  socket is owned by `root:root`, so non-root users cannot stat it and
+  `zlayer status` thinks nothing is there. Changed to `0o666`; access
+  control is already handled by the local auth token.
+- **`zlayer daemon status` reports "not installed" on SELinux/Fedora
+  Atomic systems.** The `detect_service_level()` function tried to stat
+  `/etc/systemd/system/zlayer.service` to decide system vs user service,
+  but on SELinux-confined systems non-root users cannot stat files in
+  that directory. The fallback returned `User`, causing all `systemctl`
+  calls to use `--user` (wrong namespace). Removed the dead
+  `ServiceLevel::User` code path entirely — on Linux, zlayer is always
+  installed as a system service.
+
 ## [0.10.71]
 
 ### Fixed
