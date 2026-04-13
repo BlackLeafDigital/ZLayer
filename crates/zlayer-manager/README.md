@@ -36,7 +36,7 @@ cargo install cargo-leptos
 cd crates/zlayer-manager
 cargo leptos watch
 
-# Access at http://localhost:9120
+# Access at http://localhost:6677
 ```
 
 ### Production
@@ -59,7 +59,7 @@ zlayer-manager --connect http://localhost:3669
 zlayer-manager --connect http://localhost:3669 --token <JWT_TOKEN>
 
 # Custom port
-zlayer-manager --port 9120
+zlayer-manager --port 6677
 
 # Embedded mode (starts own ZLayer instance) - future
 zlayer-manager --embedded

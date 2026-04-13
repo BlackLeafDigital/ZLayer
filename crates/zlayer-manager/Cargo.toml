@@ -86,8 +86,8 @@ hydrate = [
 output-name = "zlayer-manager"
 site-root = "target/site"
 site-pkg-dir = "pkg"
-site-addr = "127.0.0.1:9120"
-reload-port = 9121
+site-addr = "127.0.0.1:6677"
+reload-port = 6678
 # Tailwind v4 CSS input file
 tailwind-input-file = "./tailwind.css"
 # Features

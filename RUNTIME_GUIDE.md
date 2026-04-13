@@ -12,7 +12,7 @@ A Rust-based container orchestration platform — 19 crates, 5 container runtime
 User
  │
  ├── zlayer (unified binary)  bin/zlayer         TUI, CLI, daemon, build — all in one
- └── zlayer-manager (web UI)  crates/zlayer-manager   Leptos SSR + WASM, port 9120
+ └── zlayer-manager (web UI)  crates/zlayer-manager   Leptos SSR + WASM, port 6677
       │
       ▼
  zlayer-api (REST)            crates/zlayer-api       Axum, JWT, port 3669
@@ -274,7 +274,7 @@ Single unified binary for all operations. The former `zlayer-runtime` and `zlaye
 | `zlayer manager init/status/stop` | Web UI management. |
 
 ### `zlayer-manager` (web UI) — `crates/zlayer-manager`
-Leptos SSR web dashboard on port 9120. Reads from API at port 3669.
+Leptos SSR web dashboard on port 6677. Reads from API at port 3669.
 
 ---
 

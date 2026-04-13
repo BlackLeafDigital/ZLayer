@@ -39,7 +39,7 @@ pub struct Args {
     pub embedded: bool,
 
     /// Port to bind the web server
-    #[arg(long, short, default_value = "9120", env = "PORT")]
+    #[arg(long, short, default_value = "6677", env = "PORT")]
     pub port: u16,
 
     /// Path to configuration file
@@ -75,7 +75,7 @@ mod tests {
     #[test]
     fn test_default_port() {
         let args = Args::parse_from(["zlayer-manager"]);
-        assert_eq!(args.port, 9120);
+        assert_eq!(args.port, 6677);
     }
 
     #[test]
