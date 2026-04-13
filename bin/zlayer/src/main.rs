@@ -476,6 +476,7 @@ async fn run(mut cli: Cli) -> Result<()> {
             commands::lifecycle::validate(&path)
         }
         Commands::Spec(spec_cmd) => commands::spec::handle_spec(spec_cmd),
+        Commands::Auth(auth_cmd) => commands::auth::handle_auth(auth_cmd).await,
         Commands::Pipeline {
             file,
             set,
@@ -661,11 +662,19 @@ async fn run(mut cli: Cli) -> Result<()> {
         #[cfg(unix)]
         Commands::Image(image_cmd) => commands::image::handle_image(&cli, image_cmd).await,
         #[cfg(unix)]
+        Commands::Container(container_cmd) => {
+            commands::container::handle_container(&cli, container_cmd).await
+        }
+        #[cfg(unix)]
         Commands::System(system_cmd) => commands::system::handle_system(&cli, system_cmd).await,
+        #[cfg(unix)]
+        Commands::Secret(secret_cmd) => commands::secret::handle_secret(&cli, secret_cmd).await,
         #[cfg(unix)]
         Commands::Network(network_cmd) => {
             commands::network::handle_network(&cli, network_cmd).await
         }
+        #[cfg(unix)]
+        Commands::Job(job_cmd) => commands::job::handle_job(&cli, job_cmd).await,
         #[cfg(unix)]
         Commands::Volume(volume_cmd) => commands::volume::handle_volume(&cli, volume_cmd).await,
 

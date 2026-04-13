@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::sync::mpsc;
+use std::sync::Arc;
 use tracing::{info, warn};
 
 /// Build a container image from a Dockerfile or runtime template
@@ -94,6 +95,34 @@ pub(crate) async fn handle_build(
         .await
         .context("Failed to create image builder")?
         .with_events(event_tx);
+
+    // Wire up local registry + blob cache so built images are stored locally.
+    // Both are best-effort: if either fails we log a warning and continue.
+    let data_dir = zlayer_paths::ZLayerDirs::detect_data_dir();
+
+    let cache_path = data_dir.join("cache").join("blobs.redb");
+    match zlayer_registry::PersistentBlobCache::open(&cache_path).await {
+        Ok(cache) => {
+            let backend: Arc<Box<dyn zlayer_registry::cache::BlobCacheBackend>> =
+                Arc::new(Box::new(cache));
+            builder = builder.with_cache_backend(backend);
+        }
+        Err(e) => {
+            warn!(
+                "Failed to open persistent blob cache, builds will not populate local cache: {e}"
+            );
+        }
+    }
+
+    let registry_path = data_dir.join("registry");
+    match zlayer_registry::LocalRegistry::new(registry_path).await {
+        Ok(registry) => {
+            builder = builder.with_local_registry(registry);
+        }
+        Err(e) => {
+            warn!("Failed to open local registry, built images will not be stored locally: {e}");
+        }
+    }
 
     // Apply Dockerfile path if specified
     if let Some(dockerfile) = file {

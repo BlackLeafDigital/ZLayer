@@ -132,6 +132,25 @@ fn is_mutable_tag(image: &str) -> bool {
     }
 }
 
+/// Parse an image reference into (name, tag/reference) for local registry lookup.
+#[cfg(feature = "local")]
+#[allow(clippy::unnecessary_wraps)]
+fn parse_local_image_ref(image: &str) -> Option<(String, String)> {
+    if let Some(at_pos) = image.find('@') {
+        let name = &image[..at_pos];
+        let digest = &image[at_pos + 1..];
+        return Some((name.to_string(), digest.to_string()));
+    }
+    if let Some(colon_pos) = image.rfind(':') {
+        let potential_tag = &image[colon_pos + 1..];
+        if !potential_tag.contains('/') && !potential_tag.is_empty() {
+            let name = &image[..colon_pos];
+            return Some((name.to_string(), potential_tag.to_string()));
+        }
+    }
+    Some((image.to_string(), "latest".to_string()))
+}
+
 /// Platform resolver that works correctly on macOS.
 ///
 /// On macOS, this performs a two-pass search:
@@ -200,6 +219,8 @@ pub struct ImagePuller {
     client: oci_client::Client,
     cache: Arc<Box<dyn BlobCacheBackend>>,
     concurrency_limit: Arc<Semaphore>,
+    #[cfg(feature = "local")]
+    local_registry: Option<std::sync::Arc<crate::local_registry::LocalRegistry>>,
 }
 
 impl ImagePuller {
@@ -211,6 +232,8 @@ impl ImagePuller {
             client,
             cache: Arc::new(Box::new(cache) as Box<dyn BlobCacheBackend>),
             concurrency_limit: Arc::new(Semaphore::new(3)),
+            #[cfg(feature = "local")]
+            local_registry: None,
         }
     }
 
@@ -223,6 +246,8 @@ impl ImagePuller {
             client,
             cache,
             concurrency_limit: Arc::new(Semaphore::new(3)),
+            #[cfg(feature = "local")]
+            local_registry: None,
         }
     }
 
@@ -249,6 +274,17 @@ impl ImagePuller {
     #[must_use]
     pub fn with_concurrency_limit(mut self, limit: usize) -> Self {
         self.concurrency_limit = Arc::new(Semaphore::new(limit));
+        self
+    }
+
+    /// Set a local OCI registry for image resolution.
+    #[cfg(feature = "local")]
+    #[must_use]
+    pub fn with_local_registry(
+        mut self,
+        registry: std::sync::Arc<crate::local_registry::LocalRegistry>,
+    ) -> Self {
+        self.local_registry = Some(registry);
         self
     }
 
@@ -445,6 +481,27 @@ impl ImagePuller {
         }
     }
 
+    /// Try to resolve a manifest from the local registry.
+    #[cfg(feature = "local")]
+    async fn try_local_registry(&self, image: &str) -> Option<(OciImageManifest, String)> {
+        let registry = self.local_registry.as_ref()?;
+        let (name, reference) = parse_local_image_ref(image)?;
+        match registry.get_manifest(&name, &reference).await {
+            Ok(data) => match serde_json::from_slice::<OciImageManifest>(&data) {
+                Ok(manifest) => {
+                    let digest = crate::cache::compute_digest(&data);
+                    tracing::debug!(image = %image, digest = %digest, "manifest found in local registry");
+                    Some((manifest, digest))
+                }
+                Err(e) => {
+                    tracing::warn!(image = %image, error = %e, "local registry manifest parse failed");
+                    None
+                }
+            },
+            Err(_) => None,
+        }
+    }
+
     /// Pull an image manifest from the registry.
     ///
     /// Returns the manifest and its registry-reported digest. Manifests are
@@ -470,14 +527,10 @@ impl ImagePuller {
         image: &str,
         auth: &RegistryAuth,
     ) -> Result<(OciImageManifest, String)> {
-        // Cache keys: one for the manifest body, one for the registry-reported
-        // digest. We store the digest separately because `compute_digest` over
-        // the cached JSON bytes is NOT equal to the canonical OCI manifest
-        // digest the registry would report (content-addressed hash of the
-        // on-the-wire bytes, not our cached re-serialization).
         let cache_key = format!("manifest:{image}");
         let digest_key = format!("manifest-digest:{image}");
 
+        // 1. Blob cache hit?
         if let Some(hit) = self
             .try_cached_manifest(image, auth, &cache_key, &digest_key)
             .await
@@ -485,6 +538,44 @@ impl ImagePuller {
             return Ok(hit);
         }
 
+        // 2. Local registry hit? Populate blob cache from it.
+        #[cfg(feature = "local")]
+        if let Some((manifest, digest)) = self.try_local_registry(image).await {
+            if let Ok(bytes) = serde_json::to_vec(&manifest) {
+                let _ = self.cache.put(&cache_key, &bytes).await;
+                let _ = self.cache.put(&digest_key, digest.as_bytes()).await;
+            }
+
+            if is_mutable_tag(image) {
+                match self.remote_manifest_digest(image, auth).await {
+                    Ok(Some(remote_digest)) if remote_digest != digest => {
+                        tracing::info!(
+                            image = %image,
+                            local = %digest,
+                            remote = %remote_digest,
+                            "remote has newer manifest, pulling fresh"
+                        );
+                        // Fall through to remote pull below
+                    }
+                    Ok(Some(_)) => {
+                        tracing::debug!(image = %image, "local manifest matches remote, using local");
+                        return Ok((manifest, digest));
+                    }
+                    Ok(None) => {
+                        tracing::debug!(image = %image, "image not on remote registry, using local");
+                        return Ok((manifest, digest));
+                    }
+                    Err(e) => {
+                        tracing::warn!(image = %image, error = %e, "remote check failed, using local manifest");
+                        return Ok((manifest, digest));
+                    }
+                }
+            } else {
+                return Ok((manifest, digest));
+            }
+        }
+
+        // 3. Pull from remote registry
         let reference: Reference = image.parse().map_err(|_| RegistryError::NotFound {
             registry: "unknown".to_string(),
             image: image.to_string(),
@@ -492,38 +583,38 @@ impl ImagePuller {
 
         tracing::info!(image = %image, "pulling manifest from registry");
 
-        let (manifest, digest) = self
-            .client
-            .pull_image_manifest(&reference, auth)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, image = %image, "failed to pull manifest");
-                RegistryError::Oci(e)
-            })?;
-
-        tracing::debug!(
-            image = %image,
-            digest = %digest,
-            layers = manifest.layers.len(),
-            "manifest pulled successfully"
-        );
-
-        // Cache the manifest body and its registry-reported digest side by
-        // side so the next call can revalidate cheaply via HEAD.
-        if let Ok(bytes) = serde_json::to_vec(&manifest) {
-            if let Err(e) = self.cache.put(&cache_key, &bytes).await {
-                tracing::warn!(image = %image, error = %e, "failed to cache manifest body");
-            }
-            if let Err(e) = self.cache.put(&digest_key, digest.as_bytes()).await {
-                tracing::warn!(
+        match self.client.pull_image_manifest(&reference, auth).await {
+            Ok((manifest, digest)) => {
+                tracing::debug!(
                     image = %image,
-                    error = %e,
-                    "failed to cache manifest digest"
+                    digest = %digest,
+                    layers = manifest.layers.len(),
+                    "manifest pulled successfully"
                 );
+
+                if let Ok(bytes) = serde_json::to_vec(&manifest) {
+                    let _ = self.cache.put(&cache_key, &bytes).await;
+                    let _ = self.cache.put(&digest_key, digest.as_bytes()).await;
+                }
+
+                Ok((manifest, digest))
+            }
+            Err(remote_err) => {
+                // 4. Remote failed — try local registry as last resort
+                #[cfg(feature = "local")]
+                if let Some((manifest, digest)) = self.try_local_registry(image).await {
+                    tracing::warn!(
+                        image = %image,
+                        error = %remote_err,
+                        "remote pull failed, falling back to local registry"
+                    );
+                    return Ok((manifest, digest));
+                }
+
+                tracing::error!(error = %remote_err, image = %image, "failed to pull manifest");
+                Err(RegistryError::Oci(remote_err))
             }
         }
-
-        Ok((manifest, digest))
     }
 
     /// Pull an image manifest, optionally forcing a cache bypass.
