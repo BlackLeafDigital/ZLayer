@@ -243,21 +243,30 @@ def extract_mappings(tmpdir, port, distro_repo):
 
 
 def write_map_file(filepath, distro_repo, mappings):
+    # Merge with existing mappings so packages only grow, never shrink
+    existing = {}
+    if os.path.exists(filepath):
+        with open(filepath) as f:
+            existing = json.load(f).get("mappings", {})
+
+    merged = {**existing, **mappings}
+
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     doc = {
         "metadata": {
             "generated_at": now,
             "source": "repology-dump",
             "distro": distro_repo,
-            "total_mappings": len(mappings),
+            "total_mappings": len(merged),
         },
-        "mappings": dict(sorted(mappings.items())),
+        "mappings": dict(sorted(merged.items())),
     }
     os.makedirs(os.path.dirname(filepath), exist_ok=True)
     with open(filepath, "w") as f:
         json.dump(doc, f, indent=2)
     size_kb = os.path.getsize(filepath) / 1024
-    print(f"  {distro_repo}: {len(mappings)} mappings ({size_kb:.1f} KB)")
+    added = len(merged) - len(existing)
+    print(f"  {distro_repo}: {len(merged)} mappings ({added:+d} new, {size_kb:.1f} KB)")
 
 
 def main():

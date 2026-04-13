@@ -35,7 +35,15 @@ jobs:
           make with_llvm=no && make with_llvm=no install
           cd / && rm -rf /tmp/libversion /tmp/postgresql-libversion
 
-      - uses: https://code.forgejo.org/actions/checkout@v4
+      - uses: actions/checkout@v4
+
+      - name: Seed existing maps from RepoSources
+        env:
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+        run: |
+          git clone --depth=1 https://x-access-token:${GH_TOKEN}@github.com/ZachHandley/RepoSources.git /tmp/repo
+          mkdir -p public/maps
+          cp -f /tmp/repo/public/maps/*.json public/maps/ 2>/dev/null || true
 
       - name: Generate maps from Repology dump
         env:
@@ -47,7 +55,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
         run: |
-          git clone --depth=1 https://x-access-token:${GH_TOKEN}@github.com/ZachHandley/RepoSources.git /tmp/repo
           mkdir -p /tmp/repo/public/maps
           cp -f public/maps/*.json /tmp/repo/public/maps/
           cd /tmp/repo
