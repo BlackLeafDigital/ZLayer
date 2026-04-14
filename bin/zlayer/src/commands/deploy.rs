@@ -11,14 +11,20 @@
 //! the spec locally and displays the deployment plan.
 
 use anyhow::{Context, Result};
+use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::cli::Cli;
 use crate::daemon_client::DaemonClient;
-use crate::deploy_tui::{DeployEvent, LogLevel, PlainDeployLogger, ServicePlan};
+use crate::deploy_tui::{
+    app::DeployTui, DeployEvent, InfraPhase, LogLevel, PlainDeployLogger, ServicePlan,
+};
 use crate::util::{discover_spec_path, parse_spec};
 
 // ---------------------------------------------------------------------------
@@ -61,13 +67,34 @@ fn build_service_plan(name: &str, service: &zlayer_spec::ServiceSpec) -> Service
 fn setup_plain_channel() -> mpsc::Sender<DeployEvent> {
     let (tx, rx) = mpsc::channel::<DeployEvent>();
 
-    let is_color = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let is_color = std::io::stdout().is_terminal();
     std::thread::spawn(move || {
         let logger = PlainDeployLogger::with_color(is_color);
         logger.process_events(rx);
     });
 
     tx
+}
+
+/// Set up the interactive TUI event channel, returning the sender and a join
+/// handle for the TUI task.
+///
+/// Spawns `DeployTui::run()` on a blocking task. The TUI owns the terminal
+/// (raw mode + alternate screen) and exits on channel-close once the deploy
+/// task drops the sender. Ctrl+C inside the TUI calls `shutdown.notify_one()`
+/// rather than killing the process, so the caller must also listen on
+/// `shutdown` and tear down the deploy flow when it fires.
+fn setup_tui_channel(
+    shutdown: Arc<Notify>,
+) -> (mpsc::Sender<DeployEvent>, JoinHandle<std::io::Result<()>>) {
+    let (tx, rx) = mpsc::channel::<DeployEvent>();
+
+    let handle = tokio::task::spawn_blocking(move || {
+        let mut tui = DeployTui::new(rx, shutdown);
+        tui.run()
+    });
+
+    (tx, handle)
 }
 
 // ---------------------------------------------------------------------------
@@ -120,54 +147,69 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
     let spec_yaml = std::fs::read_to_string(spec_path)
         .with_context(|| format!("Failed to read spec file: {}", spec_path.display()))?;
 
-    // Display the plan before submitting
-    let tx = setup_plain_channel();
-    let plans: Vec<ServicePlan> = spec
-        .services
-        .iter()
-        .map(|(name, svc)| build_service_plan(name, svc))
-        .collect();
-    emit(
-        &tx,
-        DeployEvent::PlanReady {
-            deployment_name: spec.deployment.clone(),
-            version: spec.version.clone(),
-            services: plans,
-        },
-    );
+    // Decide between TUI and plain logger. TUI is the default when stdout is
+    // a TTY and --no-tui wasn't passed; detach/background still use the TUI so
+    // the submit -> register -> scale -> ready (or failed) sequence animates.
+    let use_tui = !cli.no_tui && std::io::stdout().is_terminal();
+    let shutdown = Arc::new(Notify::new());
+    let (tx, tui_handle): (
+        mpsc::Sender<DeployEvent>,
+        Option<JoinHandle<std::io::Result<()>>>,
+    ) = if use_tui {
+        let (tx, h) = setup_tui_channel(shutdown.clone());
+        (tx, Some(h))
+    } else {
+        (setup_plain_channel(), None)
+    };
 
-    // Connect to daemon (auto-starts if needed)
-    let client = DaemonClient::connect().await?;
+    let run_result: Result<()> = async {
+        // Display the plan before submitting
+        let plans: Vec<ServicePlan> = spec
+            .services
+            .iter()
+            .map(|(name, svc)| build_service_plan(name, svc))
+            .collect();
+        emit(
+            &tx,
+            DeployEvent::PlanReady {
+                deployment_name: spec.deployment.clone(),
+                version: spec.version.clone(),
+                services: plans,
+            },
+        );
 
-    emit(
-        &tx,
-        DeployEvent::Log {
-            level: LogLevel::Info,
-            message: "Submitting deployment to daemon...".to_string(),
-        },
-    );
+        // Connect to daemon (auto-starts if needed)
+        let client = DaemonClient::connect().await?;
 
-    let result = client
-        .create_deployment(&spec_yaml)
-        .await
-        .context("Failed to submit deployment to daemon")?;
+        emit(
+            &tx,
+            DeployEvent::Log {
+                level: LogLevel::Info,
+                message: "Submitting deployment to daemon...".to_string(),
+            },
+        );
 
-    let deployment_name = result
-        .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or(&spec.deployment)
-        .to_string();
+        let submit_result = client
+            .create_deployment(&spec_yaml)
+            .await
+            .context("Failed to submit deployment to daemon")?;
 
-    let status = result
-        .get("status")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
+        let deployment_name = submit_result
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&spec.deployment)
+            .to_string();
 
-    info!(
-        deployment = %deployment_name,
-        status = %status,
-        "Deployment submitted"
-    );
+        let status = submit_result
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        info!(
+            deployment = %deployment_name,
+            status = %status,
+            "Deployment submitted"
+        );
 
     // ------------------------------------------------------------------
     // Foreground mode: stream SSE events for real-time progress
@@ -179,6 +221,7 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                 let mut deployment_failed = false;
                 let mut failure_message = String::new();
 
+                let mut infra_synthesized = false;
                 while let Some((event_type, data)) = rx.recv().await {
                     match event_type.as_str() {
                         "started" => {
@@ -203,6 +246,38 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                     ),
                                 },
                             );
+                            // The daemon doesn't publish infra-lifecycle events
+                            // today; by the time "started" fires the infrastructure
+                            // is already up, so mark each phase Complete once so
+                            // the TUI's infra panel renders filled instead of all
+                            // Pending spinners. Revisit if/when the daemon exposes
+                            // real InfraPhase* events.
+                            if !infra_synthesized {
+                                infra_synthesized = true;
+                                for phase in [
+                                    InfraPhase::Runtime,
+                                    InfraPhase::Overlay,
+                                    InfraPhase::Dns,
+                                    InfraPhase::Proxy,
+                                    InfraPhase::Supervisor,
+                                    InfraPhase::Api,
+                                ] {
+                                    emit(
+                                        &tx,
+                                        DeployEvent::InfraPhaseComplete {
+                                            phase,
+                                            success: true,
+                                            message: None,
+                                        },
+                                    );
+                                }
+                            }
+                            // Seed the service panel with one entry per planned
+                            // service so the TUI has something to render while
+                            // the per-service events stream in.
+                            for name in services {
+                                emit(&tx, DeployEvent::ServiceDeployStarted { name });
+                            }
                         }
                         "service_registered" => {
                             if let Some(svc) = parse_service_field(&data) {
@@ -213,6 +288,7 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                         message: format!("  [{svc}] registered"),
                                     },
                                 );
+                                emit(&tx, DeployEvent::ServiceRegistered { name: svc });
                             }
                         }
                         "service_registration_failed" => {
@@ -222,6 +298,13 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                     DeployEvent::Log {
                                         level: LogLevel::Warn,
                                         message: format!("  [{svc}] registration failed: {err}"),
+                                    },
+                                );
+                                emit(
+                                    &tx,
+                                    DeployEvent::ServiceDeployFailed {
+                                        name: svc,
+                                        error: err,
                                     },
                                 );
                             }
@@ -299,6 +382,13 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                         ),
                                     },
                                 );
+                                emit(
+                                    &tx,
+                                    DeployEvent::ServiceScaling {
+                                        name: svc,
+                                        target_replicas: target as u32,
+                                    },
+                                );
                             }
                         }
                         "service_scaled" => {
@@ -318,6 +408,13 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                         ),
                                     },
                                 );
+                                emit(
+                                    &tx,
+                                    DeployEvent::ServiceDeployComplete {
+                                        name: svc,
+                                        replicas: replicas as u32,
+                                    },
+                                );
                             }
                         }
                         "service_scale_failed" => {
@@ -327,6 +424,13 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                                     DeployEvent::Log {
                                         level: LogLevel::Warn,
                                         message: format!("  [{svc}] scaling failed: {err}"),
+                                    },
+                                );
+                                emit(
+                                    &tx,
+                                    DeployEvent::ServiceDeployFailed {
+                                        name: svc,
+                                        error: err,
                                     },
                                 );
                             }
@@ -360,8 +464,15 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
 
                 // Stream ended -- handle terminal state
                 if deployment_ready {
-                    return print_deployment_success(&client, &deployment_name, &spec, &tx, cli)
-                        .await;
+                    return print_deployment_success(
+                        &client,
+                        &deployment_name,
+                        &spec,
+                        &tx,
+                        cli,
+                        shutdown.clone(),
+                    )
+                    .await;
                 } else if deployment_failed {
                     return print_deployment_failure(
                         &client,
@@ -431,6 +542,7 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
                             &spec,
                             &tx,
                             cli,
+                            shutdown.clone(),
                         )
                         .await;
                     }
@@ -458,26 +570,43 @@ pub(crate) async fn deploy(cli: &Cli, spec_path: &Path, dry_run: bool) -> Result
         }
     }
 
-    // Timeout
-    warn!(
-        deployment = %deployment_name,
-        elapsed_secs = start.elapsed().as_secs(),
-        "Timed out waiting for deployment to become ready"
-    );
-    emit(
-        &tx,
-        DeployEvent::Log {
-            level: LogLevel::Warn,
-            message: format!(
-                "Timed out after {}s waiting for deployment '{}' to become ready. \
-                 The daemon is still processing -- check `zlayer status` for updates.",
-                poll_timeout.as_secs(),
-                deployment_name,
-            ),
-        },
-    );
+        // Timeout
+        warn!(
+            deployment = %deployment_name,
+            elapsed_secs = start.elapsed().as_secs(),
+            "Timed out waiting for deployment to become ready"
+        );
+        emit(
+            &tx,
+            DeployEvent::Log {
+                level: LogLevel::Warn,
+                message: format!(
+                    "Timed out after {}s waiting for deployment '{}' to become ready. \
+                     The daemon is still processing -- check `zlayer status` for updates.",
+                    poll_timeout.as_secs(),
+                    deployment_name,
+                ),
+            },
+        );
 
-    Ok(())
+        Ok(())
+    }
+    .await;
+
+    // Cleanup: drop the sender so the channel closes, then wait for the TUI
+    // task (if any) to restore the terminal and exit cleanly. The TUI
+    // auto-exits on channel close when the phase is Running/Complete
+    // (app.rs handles this).
+    drop(tx);
+    if let Some(h) = tui_handle {
+        match h.await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(error = %e, "Deploy TUI reported error"),
+            Err(e) => warn!(error = %e, "Deploy TUI task panicked"),
+        }
+    }
+
+    run_result
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +688,7 @@ async fn print_deployment_success(
     spec: &zlayer_spec::DeploymentSpec,
     tx: &mpsc::Sender<DeployEvent>,
     cli: &Cli,
+    shutdown: Arc<Notify>,
 ) -> Result<()> {
     // Fetch final deployment details for health summary
     let deployment = client.get_deployment(deployment_name).await.ok();
@@ -683,7 +813,7 @@ async fn print_deployment_success(
                     .to_string(),
             },
         );
-        wait_for_ctrl_c_or_status(client, deployment_name, tx, spec).await;
+        wait_for_ctrl_c_or_status(client, deployment_name, tx, spec, shutdown).await;
     }
 
     Ok(())
@@ -731,6 +861,7 @@ async fn wait_for_ctrl_c_or_status(
     deployment_name: &str,
     tx: &mpsc::Sender<DeployEvent>,
     spec: &zlayer_spec::DeploymentSpec,
+    shutdown: Arc<Notify>,
 ) {
     use crate::deploy_tui::{ServiceHealth, ServiceStatus};
 
@@ -741,6 +872,15 @@ async fn wait_for_ctrl_c_or_status(
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
+                emit(tx, DeployEvent::Log {
+                    level: LogLevel::Info,
+                    message: "Detaching from deployment (daemon continues running).".to_string(),
+                });
+                break;
+            }
+            () = shutdown.notified() => {
+                // TUI intercepts Ctrl+C as a key event in raw mode and signals
+                // us via this Notify; without this branch the loop would hang.
                 emit(tx, DeployEvent::Log {
                     level: LogLevel::Info,
                     message: "Detaching from deployment (daemon continues running).".to_string(),
