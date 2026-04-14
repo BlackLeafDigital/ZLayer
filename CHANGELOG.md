@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.76]
+
+### Added
+- **`zlayer` system group provisioned during `daemon install` (Linux).**
+  `zlayer daemon install` now creates a `zlayer` system group (via `groupadd
+  --system`), adds `$SUDO_USER` to it (via `usermod -aG`), and chgrps +
+  chmods the shared build-facing data directories — `registry`, `cache`, and
+  `bundles` — so unprivileged users can run `zlayer build` against the
+  system-wide data dir without sudo. Secrets, raft, and live container
+  runtime state (containers/rootfs/volumes) stay root-only. Applied before
+  the `systemctl daemon-reload` call so group setup still takes effect on
+  WSL distros with systemd disabled. Membership in `zlayer` is
+  root-equivalent on the host (same trust model as the `docker` group). No
+  change on macOS (single-user data dir) or Windows.
+
+### Fixed
+- **`zlayer build` silently skipped local-registry import on permission
+  errors.** When the builder's local-registry import step hit EACCES —
+  typically because an unprivileged user ran `zlayer build` against the
+  root-owned `/var/lib/zlayer/registry` — it logged a warning and returned
+  success. The daemon then couldn't find the just-built image locally and
+  fell through to Docker Hub, producing confusing 401s for images that were
+  never supposed to leave the box. The import step now returns a hard error
+  that names the registry path and the underlying cause.
 ## [0.10.75]
 
 ### Added
@@ -13,14 +37,6 @@ All notable changes to this project will be documented in this file.
   populate in real time. Ctrl+C inside the TUI detaches cleanly (the daemon
   keeps running). `--no-tui` (already a global flag) falls back to the plain
   logger; dry-run and non-TTY stdout (CI/piped) also stay plain.
-
-### Fixed
-- **zlayer-manager container panic at startup.** `cargo-leptos` emits
-  `hash.txt` to the workspace target directory when `hash-files = true`, but
-  the runtime image didn't copy it, so Leptos 0.8.17 panicked at startup
-  with `failed to read hash file` before serving the first request.
-  `ZImagefile.zlayer-manager` now copies `hash.txt` into `/app/hash.txt`
-  alongside the binary.
 
 ## [0.10.73]
 

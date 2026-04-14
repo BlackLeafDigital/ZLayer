@@ -17,12 +17,9 @@ members = [
   "crates/zlayer-tui",
   "crates/zlayer-storage",
   "crates/zlayer-py",
-  "crates/zlayer-web",
   "crates/zlayer-secrets",
   "crates/zlayer-tunnel",
   "bin/zlayer",
-  "bin/zlayer-desktop",
-  "crates/zlayer-manager",
   "crates/zlayer-consensus",
   "crates/zlayer-docker",
   "crates/zlayer-wsl",
@@ -212,9 +209,7 @@ zlayer-proxy = { path = "crates/zlayer-proxy", version = "0.0.0-dev", package = 
 zlayer-api = { path = "crates/zlayer-api", version = "0.0.0-dev", package = "zlayer-api-zql", registry = "forgejo" }
 zlayer-tui = { path = "crates/zlayer-tui", version = "0.0.0-dev", package = "zlayer-tui-zql", registry = "forgejo" }
 zlayer-py = { path = "crates/zlayer-py", version = "0.0.0-dev", package = "zlayer-py-zql", registry = "forgejo" }
-zlayer-web = { path = "crates/zlayer-web", version = "0.0.0-dev", package = "zlayer-web-zql", registry = "forgejo" }
 zlayer-secrets = { path = "crates/zlayer-secrets", version = "0.0.0-dev", package = "zlayer-secrets-zql", registry = "forgejo" }
-zlayer-manager = { path = "crates/zlayer-manager", version = "0.0.0-dev", package = "zlayer-manager-zql", registry = "forgejo" }
 zlayer-consensus = { path = "crates/zlayer-consensus", version = "0.0.0-dev", package = "zlayer-consensus-zql", registry = "forgejo" }
 zlayer-docker = { path = "crates/zlayer-docker", version = "0.0.0-dev", package = "zlayer-docker-zql", registry = "forgejo" }
 zlayer-wsl = { path = "crates/zlayer-wsl", version = "0.0.0-dev", package = "zlayer-wsl-zql", registry = "forgejo" }

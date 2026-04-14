@@ -58,10 +58,10 @@ stages:
             sharing: shared
             readonly: true
 
-      # Copy Leptos hash file out of cached target dir (cargo-leptos emits it
-      # to the workspace target dir when hash-files=true; the server panics
-      # at startup without it).
-      - run: "cp target/hash.txt /build/hash.txt"
+      # Copy Leptos hash file out of cached target dir. cargo-leptos emits
+      # hash.txt into site-root (target/site/) when hash-files=true; the
+      # server panics at startup without it.
+      - run: "cp target/site/hash.txt /build/hash.txt"
         cache:
           - target: /build/target
             id: cargo-target-manager
