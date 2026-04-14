@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.76]
+
+### Added
+- **`zlayer` system group provisioned during `daemon install` (Linux).**
+  `zlayer daemon install` now creates a `zlayer` system group (via `groupadd
+  --system`), adds `$SUDO_USER` to it (via `usermod -aG`), and chgrps +
+  chmods the shared build-facing data directories — `registry`, `cache`, and
+  `bundles` — so unprivileged users can run `zlayer build` against the
+  system-wide data dir without sudo. Secrets, raft, and live container
+  runtime state (containers/rootfs/volumes) stay root-only. Applied before
+  the `systemctl daemon-reload` call so group setup still takes effect on
+  WSL distros with systemd disabled. Membership in `zlayer` is
+  root-equivalent on the host (same trust model as the `docker` group). No
+  change on macOS (single-user data dir) or Windows.
+
+### Fixed
+- **`zlayer build` silently skipped local-registry import on permission
+  errors.** When the builder's local-registry import step hit EACCES —
+  typically because an unprivileged user ran `zlayer build` against the
+  root-owned `/var/lib/zlayer/registry` — it logged a warning and returned
+  success. The daemon then couldn't find the just-built image locally and
+  fell through to Docker Hub, producing confusing 401s for images that were
+  never supposed to leave the box. The import step now returns a hard error
+  that names the registry path and the underlying cause.
+- **`zlayer-manager` image build failed copying `hash.txt`.** The 0.10.75
+  fix copied from `target/hash.txt`, but cargo-leptos emits `hash.txt` into
+  the site-root (`target/site/hash.txt`). Both `ZImagefile.zlayer-manager`
+  and `Dockerfile.zlayer-manager` now copy from the correct path.
+
 ## [0.10.75]
 
 ### Added
