@@ -27,9 +27,11 @@ All notable changes to this project will be documented in this file.
   never supposed to leave the box. The import step now returns a hard error
   that names the registry path and the underlying cause.
 - **`zlayer-manager` image build failed copying `hash.txt`.** The 0.10.75
-  fix copied from `target/hash.txt`, but cargo-leptos emits `hash.txt` into
-  the site-root (`target/site/hash.txt`). Both `ZImagefile.zlayer-manager`
-  and `Dockerfile.zlayer-manager` now copy from the correct path.
+  fix copied from `target/hash.txt`, but cargo-leptos 0.3.x writes `hash.txt`
+  next to the compiled binary (`target/release/hash.txt`). Both
+  `ZImagefile.zlayer-manager` and `Dockerfile.zlayer-manager` now copy from
+  the correct path, verified locally by running `cargo leptos build
+  --release` and inspecting the output.
 
 ## [0.10.75]
 

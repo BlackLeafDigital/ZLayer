@@ -60,8 +60,8 @@ COPY --from=builder /build/target/site /app/target/site
 
 # Copy hash.txt next to the binary; Leptos reads it from CWD (/app)
 # at startup when LEPTOS_HASH_FILES=true. cargo-leptos emits hash.txt
-# into site-root (target/site/).
-COPY --from=builder /build/target/site/hash.txt /app/hash.txt
+# next to the bin (target/release/hash.txt).
+COPY --from=builder /build/target/release/hash.txt /app/hash.txt
 
 ENV ZLAYER_MANAGER_ADDR=0.0.0.0:6677
 # LEPTOS_SITE_ADDR overrides the Leptos.toml default (127.0.0.1:6677)

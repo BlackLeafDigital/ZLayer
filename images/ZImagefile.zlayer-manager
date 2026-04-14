@@ -69,10 +69,10 @@ stages:
       # Copy site assets out of target dir
       - run: "cp -r target/site /build/site"
 
-      # Copy Leptos hash file. cargo-leptos emits hash.txt into site-root
-      # (target/site/) when hash-files=true; the server panics at startup
-      # without it.
-      - run: "cp target/site/hash.txt /build/hash.txt"
+      # Copy Leptos hash file. cargo-leptos emits hash.txt next to the bin
+      # (target/release/hash.txt) when hash-files=true; the server panics at
+      # startup without it.
+      - run: "cp target/release/hash.txt /build/hash.txt"
 
   runtime:
     # trixie (glibc 2.41) matches the cargo-chef builder's glibc so the
