@@ -58,6 +58,16 @@ stages:
             sharing: shared
             readonly: true
 
+      # Copy Leptos hash file out of cached target dir (cargo-leptos emits it
+      # to the workspace target dir when hash-files=true; the server panics
+      # at startup without it).
+      - run: "cp target/hash.txt /build/hash.txt"
+        cache:
+          - target: /build/target
+            id: cargo-target-manager
+            sharing: shared
+            readonly: true
+
   runtime:
     base: "debian:bookworm-slim"
     workdir: "/app"
@@ -74,6 +84,12 @@ stages:
       - copy: "site"
         from: builder
         to: "/app/target/site"
+
+      # Copy hash.txt next to the binary; Leptos reads it from CWD (/app)
+      # at startup when LEPTOS_HASH_FILES=true.
+      - copy: "hash.txt"
+        from: builder
+        to: "/app/hash.txt"
     env:
       ZLAYER_MANAGER_ADDR: "0.0.0.0:6677"
       # LEPTOS_SITE_ADDR overrides the Leptos.toml default

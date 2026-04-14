@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.75]
+
+### Added
+- **Interactive deploy TUI.** `zlayer deploy` and `zlayer up` now render the
+  existing ratatui-based deploy TUI by default on a TTY. The TUI animates the
+  deployment plan, infra status panel, per-service lifecycle (Registering →
+  Scaling → Running or Failed), and a scrollable log pane. SSE events from
+  the daemon are translated into structured `DeployEvent`s so the panels
+  populate in real time. Ctrl+C inside the TUI detaches cleanly (the daemon
+  keeps running). `--no-tui` (already a global flag) falls back to the plain
+  logger; dry-run and non-TTY stdout (CI/piped) also stay plain.
+
+### Fixed
+- **zlayer-manager container panic at startup.** `cargo-leptos` emits
+  `hash.txt` to the workspace target directory when `hash-files = true`, but
+  the runtime image didn't copy it, so Leptos 0.8.17 panicked at startup
+  with `failed to read hash file` before serving the first request.
+  `ZImagefile.zlayer-manager` now copies `hash.txt` into `/app/hash.txt`
+  alongside the binary.
+
 ## [0.10.73]
 
 ### Fixed
