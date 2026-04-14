@@ -26,6 +26,18 @@ All notable changes to this project will be documented in this file.
   fell through to Docker Hub, producing confusing 401s for images that were
   never supposed to leave the box. The import step now returns a hard error
   that names the registry path and the underlying cause.
+- **`zlayer-manager` image build failed copying `hash.txt`.** The 0.10.75
+  fix copied from `target/hash.txt`, but cargo-leptos 0.3.x writes `hash.txt`
+  next to the compiled binary (`target/release/hash.txt`).
+  `ZImagefile.zlayer-manager` now copies from the correct path, verified
+  locally by running `cargo leptos build --release` and inspecting the
+  output.
+- **`cargo install cargo-leptos` in zlayer-manager/zlayer-web images broke
+  when `core2 0.4.0` was yanked.** Fresh semver resolution picked the
+  yanked version transitively via `libflate`. Both Dockerfiles and
+  ZImagefiles now use `cargo install cargo-leptos --locked`, which reuses
+  the lockfile shipped with cargo-leptos and avoids the yank entirely.
+
 ## [0.10.75]
 
 ### Added

@@ -75,7 +75,6 @@ jobs:
       - name: Install system dependencies
         if: steps.check.outputs.completed != 'true'
         run: |
-          sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
@@ -219,7 +218,6 @@ jobs:
       - name: Install system dependencies
         if: steps.check-status.outputs.completed != 'true'
         run: |
-          sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust
@@ -312,7 +310,6 @@ jobs:
       - name: Install system dependencies
         if: steps.check-status.outputs.completed != 'true'
         run: |
-          sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev jq
 
       - name: Setup Rust

@@ -19,7 +19,7 @@ stages:
       - run: "apt-get update && apt-get install -y protobuf-compiler libseccomp-dev pkg-config cmake libssl-dev nodejs npm && rm -rf /var/lib/apt/lists/*"
 
       # Install wasm target and cargo-leptos
-      - run: "rustup target add wasm32-unknown-unknown && cargo install cargo-leptos"
+      - run: "rustup target add wasm32-unknown-unknown && cargo install cargo-leptos --locked"
         cache:
           - target: /usr/local/cargo/registry
             id: cargo-registry
@@ -59,9 +59,9 @@ stages:
             readonly: true
 
       # Copy Leptos hash file out of cached target dir. cargo-leptos emits
-      # hash.txt into site-root (target/site/) when hash-files=true; the
-      # server panics at startup without it.
-      - run: "cp target/site/hash.txt /build/hash.txt"
+      # hash.txt next to the bin (target/release/hash.txt) when
+      # hash-files=true; the server panics at startup without it.
+      - run: "cp target/release/hash.txt /build/hash.txt"
         cache:
           - target: /build/target
             id: cargo-target-manager

@@ -63,7 +63,7 @@ jobs:
           registries: ${{ env.FORGEJO_REGISTRIES }}
       - name: Install system deps
         if: steps.check.outputs.completed != 'true'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev jq
+        run: sudo apt-get install -y protobuf-compiler libseccomp-dev jq
       - name: Restore cache
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
