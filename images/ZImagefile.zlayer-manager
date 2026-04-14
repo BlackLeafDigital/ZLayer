@@ -30,7 +30,7 @@ stages:
       - run: "apt-get update && apt-get install -y protobuf-compiler libseccomp-dev pkg-config cmake libssl-dev nodejs npm && rm -rf /var/lib/apt/lists/*"
 
       # Install wasm target and cargo-leptos
-      - run: "rustup target add wasm32-unknown-unknown && cargo install cargo-leptos"
+      - run: "rustup target add wasm32-unknown-unknown && cargo install cargo-leptos --locked"
         cache:
           - target: /usr/local/cargo/registry
             id: cargo-registry
@@ -69,6 +69,11 @@ stages:
       # Copy site assets out of target dir
       - run: "cp -r target/site /build/site"
 
+      # Copy Leptos hash file. cargo-leptos emits hash.txt next to the bin
+      # (target/release/hash.txt) when hash-files=true; the server panics at
+      # startup without it.
+      - run: "cp target/release/hash.txt /build/hash.txt"
+
   runtime:
     # trixie (glibc 2.41) matches the cargo-chef builder's glibc so the
     # zlayer-manager binary's GLIBC_2.38+ symbol references resolve at runtime.
@@ -89,6 +94,12 @@ stages:
       - copy: "site"
         from: builder
         to: "/app/target/site"
+
+      # Copy hash.txt next to the binary; Leptos reads it from CWD (/app)
+      # at startup when LEPTOS_HASH_FILES=true.
+      - copy: "hash.txt"
+        from: builder
+        to: "/app/hash.txt"
     env:
       ZLAYER_MANAGER_ADDR: "0.0.0.0:6677"
       # LEPTOS_SITE_ADDR overrides the Leptos.toml default

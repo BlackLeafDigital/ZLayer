@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y \
 # cargo-leptos auto-downloads the Tailwind v4 CLI when tailwind-input-file
 # is configured in Leptos.toml, so no manual Tailwind installation is needed.
 RUN rustup target add wasm32-unknown-unknown && \
-    cargo install cargo-leptos
+    cargo install cargo-leptos --locked
 
 # Cook dependencies (cached layer)
 COPY --from=planner /build/recipe.json recipe.json
@@ -57,6 +57,11 @@ COPY --from=builder /build/target/release/zlayer-manager /app/zlayer-manager
 
 # Copy the site assets (WASM, CSS, JS, etc.)
 COPY --from=builder /build/target/site /app/target/site
+
+# Copy hash.txt next to the binary; Leptos reads it from CWD (/app)
+# at startup when LEPTOS_HASH_FILES=true. cargo-leptos emits hash.txt
+# next to the bin (target/release/hash.txt).
+COPY --from=builder /build/target/release/hash.txt /app/hash.txt
 
 ENV ZLAYER_MANAGER_ADDR=0.0.0.0:6677
 # LEPTOS_SITE_ADDR overrides the Leptos.toml default (127.0.0.1:6677)

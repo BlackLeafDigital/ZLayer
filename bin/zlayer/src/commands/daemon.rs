@@ -427,6 +427,164 @@ fn pick_system_binary_path() -> std::path::PathBuf {
     zlayer_paths::ZLayerDirs::default_binary_dir().join("zlayer")
 }
 
+/// Create the `zlayer` group, add the invoking user to it, and make the
+/// shared build-facing data directories group-writable.
+///
+/// Lets unprivileged users run `zlayer build` against the system-wide data
+/// directory without sudo, which otherwise fails silently when the builder's
+/// local-registry import hits EACCES on `/var/lib/zlayer/registry/`.
+///
+/// Scope is deliberately narrow: only `registry`, `cache`, and `bundles` are
+/// group-writable. Secrets, raft state, `admin_password`, and live container
+/// runtime state (containers/rootfs/volumes) stay root-only.
+///
+/// Membership in the `zlayer` group is effectively root-equivalent on the
+/// host (a group member can publish a manifest that the daemon later runs as
+/// root), same trust model as the `docker` group.
+///
+/// Failures here are non-fatal — the systemd service install must still
+/// succeed even when `groupadd` / `usermod` / `chgrp` aren't available, so
+/// this only logs warnings and returns `Ok`.
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_lines, unsafe_code)]
+async fn ensure_zlayer_group(data_dir: &Path) -> Result<()> {
+    use tokio::process::Command;
+
+    // Only provisioning system-wide paths makes sense as root.
+    let is_root = unsafe { libc::geteuid() } == 0;
+    if !is_root {
+        return Ok(());
+    }
+
+    // 1. Create the group if it doesn't exist.
+    let getent_ok = Command::new("getent")
+        .args(["group", "zlayer"])
+        .output()
+        .await
+        .is_ok_and(|out| out.status.success());
+    if !getent_ok {
+        match Command::new("groupadd")
+            .args(["--system", "zlayer"])
+            .output()
+            .await
+        {
+            Ok(out) if out.status.success() => {
+                println!("Created system group 'zlayer'.");
+            }
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!("Warning: groupadd zlayer failed: {}", stderr.trim());
+                eprintln!("         Unprivileged users will need sudo to run `zlayer build`.");
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("Warning: could not run groupadd: {e}");
+                return Ok(());
+            }
+        }
+    }
+
+    // 2. Add the invoking user to the group (if sudo'd).
+    if let Ok(user) = std::env::var("SUDO_USER") {
+        if !user.is_empty() && user != "root" {
+            // Skip if already a member — avoids redundant usermod noise.
+            let already_member = Command::new("id")
+                .args(["-nG", &user])
+                .output()
+                .await
+                .map(|out| {
+                    out.status.success()
+                        && String::from_utf8_lossy(&out.stdout)
+                            .split_whitespace()
+                            .any(|g| g == "zlayer")
+                })
+                .unwrap_or(false);
+
+            if !already_member {
+                match Command::new("usermod")
+                    .args(["-aG", "zlayer", &user])
+                    .output()
+                    .await
+                {
+                    Ok(out) if out.status.success() => {
+                        println!("Added user '{user}' to group 'zlayer'.");
+                        println!(
+                            "  Log out and back in (or run `newgrp zlayer`) before your \
+                             next `zlayer build`."
+                        );
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        eprintln!(
+                            "Warning: usermod -aG zlayer {user} failed: {}",
+                            stderr.trim()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("Warning: could not run usermod: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Make the build-facing subdirs group-writable.
+    //    Only registry/cache/bundles — NOT secrets, raft, containers, rootfs, volumes.
+    let shared_dirs = ["registry", "cache", "bundles"];
+    let mut chowned_any = false;
+    for sub in shared_dirs {
+        let path = data_dir.join(sub);
+        if let Err(e) = std::fs::create_dir_all(&path) {
+            eprintln!("Warning: could not create {}: {e}", path.display());
+            continue;
+        }
+
+        let chgrp_ok = Command::new("chgrp")
+            .args(["-R", "zlayer"])
+            .arg(&path)
+            .output()
+            .await
+            .is_ok_and(|out| out.status.success());
+        if !chgrp_ok {
+            eprintln!(
+                "Warning: chgrp -R zlayer {} failed; group 'zlayer' members may not be \
+                 able to write here",
+                path.display()
+            );
+            continue;
+        }
+
+        // g+rwX → group can read/write all files, traverse directories (capital X
+        // only sets +x on dirs or already-exec files, so we don't flip regular
+        // files to executable).
+        let _ = Command::new("chmod")
+            .args(["-R", "g+rwX"])
+            .arg(&path)
+            .output()
+            .await;
+
+        // setgid on every directory so newly-created files inherit the zlayer
+        // group. Applied via `find -type d` so we don't flip g+s on regular
+        // files (where SGID has a very different, security-sensitive meaning).
+        let _ = Command::new("find")
+            .arg(&path)
+            .args(["-type", "d", "-exec", "chmod", "g+s", "{}", "+"])
+            .output()
+            .await;
+
+        chowned_any = true;
+    }
+
+    if chowned_any {
+        println!(
+            "Configured group-writable data directories: {}",
+            shared_dirs.join(", ")
+        );
+    }
+
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_lines, unsafe_code)]
 async fn install(
@@ -557,6 +715,12 @@ WantedBy=multi-user.target
         .await
         .with_context(|| format!("Failed to write {}", path.display()))?;
     println!("Installed systemd unit: {}", path.display());
+
+    // Provision the `zlayer` group and make build-facing data directories
+    // group-writable. Done before systemctl calls so it still takes effect on
+    // systemd-less environments (e.g. WSL distros with systemd disabled),
+    // where the subsequent daemon-reload/enable calls may fail.
+    ensure_zlayer_group(data_dir).await?;
 
     let reload_args = systemctl_args(&["daemon-reload"]);
     let reload_out = Command::new("systemctl")

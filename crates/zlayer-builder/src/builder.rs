@@ -1298,6 +1298,7 @@ impl ImageBuilder {
     ///
     /// Panics if an instruction output is missing after all retry attempts (internal invariant).
     #[instrument(skip(self), fields(context = %self.context.display()))]
+    #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> Result<BuiltImage> {
         let start_time = std::time::Instant::now();
 
@@ -1367,6 +1368,12 @@ impl ImageBuilder {
 
         // Import the built image into ZLayer's local registry and blob cache
         // so the runtime can find it without pulling from a remote registry.
+        //
+        // A user who wired up a local registry clearly wants built images to
+        // live there — if the import fails (almost always EACCES on the
+        // registry dir for an unprivileged user), bail with the registry path
+        // in the message instead of silently producing a build that the
+        // daemon can't find.
         #[cfg(feature = "local-registry")]
         if let Some(ref registry) = self.local_registry {
             if !built.tags.is_empty() {
@@ -1381,38 +1388,49 @@ impl ImageBuilder {
                 let dest = format!("oci-archive:{}", tmp_path.display());
                 let push_cmd = BuildahCommand::push_to(export_tag, &dest);
 
-                match self.executor.execute_checked(&push_cmd).await {
-                    Ok(_) => {
-                        // Resolve the blob cache backend (if available).
-                        let blob_cache: Option<&dyn zlayer_registry::cache::BlobCacheBackend> =
-                            self.cache_backend.as_ref().map(|arc| arc.as_ref().as_ref());
+                self.executor
+                    .execute_checked(&push_cmd)
+                    .await
+                    .map_err(|e| BuildError::RegistryError {
+                        message: format!(
+                            "failed to export image to OCI archive for local registry \
+                             import at {}: {e}",
+                            registry.root().display()
+                        ),
+                    })?;
 
-                        for tag in &built.tags {
-                            match import_image(registry, &tmp_path, Some(tag.as_str()), blob_cache)
+                // Resolve the blob cache backend (if available).
+                let blob_cache: Option<&dyn zlayer_registry::cache::BlobCacheBackend> =
+                    self.cache_backend.as_ref().map(|arc| arc.as_ref().as_ref());
+
+                let import_result = async {
+                    for tag in &built.tags {
+                        let info =
+                            import_image(registry, &tmp_path, Some(tag.as_str()), blob_cache)
                                 .await
-                            {
-                                Ok(info) => {
-                                    info!(
-                                        tag = %tag,
-                                        digest = %info.digest,
-                                        "Imported into local registry"
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!(tag = %tag, error = %e, "Failed to import into local registry");
-                                }
-                            }
-                        }
-
-                        // Clean up the temporary archive.
-                        if let Err(e) = fs::remove_file(&tmp_path).await {
-                            warn!(path = %tmp_path.display(), error = %e, "Failed to remove temp OCI archive");
-                        }
+                                .map_err(|e| BuildError::RegistryError {
+                                    message: format!(
+                                        "failed to import '{tag}' into local registry at {}: {e}",
+                                        registry.root().display()
+                                    ),
+                                })?;
+                        info!(
+                            tag = %tag,
+                            digest = %info.digest,
+                            "Imported into local registry"
+                        );
                     }
-                    Err(e) => {
-                        warn!(error = %e, "Failed to export image for local registry import");
-                    }
+                    Ok::<(), BuildError>(())
                 }
+                .await;
+
+                // Clean up the temporary archive regardless of whether the
+                // import succeeded (best-effort; warn on failure).
+                if let Err(e) = fs::remove_file(&tmp_path).await {
+                    warn!(path = %tmp_path.display(), error = %e, "Failed to remove temp OCI archive");
+                }
+
+                import_result?;
             }
         }
 
