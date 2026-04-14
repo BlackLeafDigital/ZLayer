@@ -35,7 +35,7 @@ async fn list_jobs(output: &str) -> Result<()> {
                     .unwrap_or(job["name"].as_str().unwrap_or("-"));
                 let status = job["status"].as_str().unwrap_or("-");
                 let trigger = job["trigger"].as_str().unwrap_or("-");
-                println!("{:<30} {:<20} {:<15}", name, status, trigger);
+                println!("{name:<30} {status:<20} {trigger:<15}");
             }
             if arr.is_empty() {
                 println!("(no jobs)");
@@ -84,34 +84,29 @@ async fn list_cron_jobs(output: &str) -> Result<()> {
     if output == "json" {
         let json = serde_json::to_string_pretty(&crons)?;
         println!("{json}");
-    } else {
-        if let Some(arr) = crons.as_array() {
-            println!(
-                "{:<30} {:<25} {:<10} {:<25} {:<25}",
-                "NAME", "SCHEDULE", "ENABLED", "LAST RUN", "NEXT RUN"
-            );
-            for cron in arr {
-                let name = cron["name"].as_str().unwrap_or("-");
-                let schedule = cron["schedule"].as_str().unwrap_or("-");
-                let enabled = if cron["enabled"].as_bool().unwrap_or(false) {
-                    "yes"
-                } else {
-                    "no"
-                };
-                let last_run = cron["last_run"].as_str().unwrap_or("-");
-                let next_run = cron["next_run"].as_str().unwrap_or("-");
-                println!(
-                    "{:<30} {:<25} {:<10} {:<25} {:<25}",
-                    name, schedule, enabled, last_run, next_run
-                );
-            }
-            if arr.is_empty() {
-                println!("(no cron jobs)");
-            }
-        } else {
-            let json = serde_json::to_string_pretty(&crons)?;
-            println!("{json}");
+    } else if let Some(arr) = crons.as_array() {
+        println!(
+            "{:<30} {:<25} {:<10} {:<25} {:<25}",
+            "NAME", "SCHEDULE", "ENABLED", "LAST RUN", "NEXT RUN"
+        );
+        for cron in arr {
+            let name = cron["name"].as_str().unwrap_or("-");
+            let schedule = cron["schedule"].as_str().unwrap_or("-");
+            let enabled = if cron["enabled"].as_bool().unwrap_or(false) {
+                "yes"
+            } else {
+                "no"
+            };
+            let last_run = cron["last_run"].as_str().unwrap_or("-");
+            let next_run = cron["next_run"].as_str().unwrap_or("-");
+            println!("{name:<30} {schedule:<25} {enabled:<10} {last_run:<25} {next_run:<25}");
         }
+        if arr.is_empty() {
+            println!("(no cron jobs)");
+        }
+    } else {
+        let json = serde_json::to_string_pretty(&crons)?;
+        println!("{json}");
     }
     Ok(())
 }

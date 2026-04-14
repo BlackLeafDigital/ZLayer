@@ -308,6 +308,7 @@ pub async fn validate_spec(yaml_content: String) -> Result<String, ServerFnError
 /// This server function accepts WAT (WebAssembly Text) format code,
 /// compiles it to WASM bytes, and executes it using wasmtime.
 #[server(prefix = "/api/leptos")]
+#[allow(clippy::unused_async)]
 pub async fn execute_wasm(
     code: String,
     language: String,
@@ -362,6 +363,7 @@ pub async fn execute_wasm(
 
 /// Execute pre-compiled WASM bytes directly
 #[server(prefix = "/api/leptos")]
+#[allow(clippy::unused_async)]
 pub async fn execute_wasm_bytes_api(
     wasm_bytes: Vec<u8>,
 ) -> Result<WasmExecutionResult, ServerFnError> {
@@ -555,6 +557,7 @@ fn convert_i64_to_wasm_val(
 
 /// Execute a specific exported function from a WASM module
 #[server(prefix = "/api/leptos")]
+#[allow(clippy::unused_async)]
 pub async fn execute_wasm_function(
     code: String,
     function_name: String,

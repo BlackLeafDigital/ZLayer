@@ -2,7 +2,9 @@ use anyhow::{Context, Result};
 use tracing::info;
 
 use crate::cli::{Cli, TunnelCommands};
+#[cfg(unix)]
 use crate::daemon_client::DaemonClient;
+#[cfg(unix)]
 use crate::util::parse_duration;
 
 /// Handle tunnel subcommands
@@ -13,13 +15,16 @@ pub(crate) async fn handle_tunnel(_cli: &Cli, cmd: &TunnelCommands) -> Result<()
             services,
             ttl_hours,
         } => handle_tunnel_create(name, services.clone(), *ttl_hours),
-        TunnelCommands::List { output } => handle_tunnel_list(output).await,
-        TunnelCommands::Revoke { id } => handle_tunnel_revoke(id).await,
         TunnelCommands::Connect {
             server,
             token,
             services,
         } => handle_tunnel_connect(server, token, services.clone()).await,
+        #[cfg(unix)]
+        TunnelCommands::List { output } => handle_tunnel_list(output).await,
+        #[cfg(unix)]
+        TunnelCommands::Revoke { id } => handle_tunnel_revoke(id).await,
+        #[cfg(unix)]
         TunnelCommands::Add {
             name,
             from,
@@ -28,13 +33,21 @@ pub(crate) async fn handle_tunnel(_cli: &Cli, cmd: &TunnelCommands) -> Result<()
             remote_port,
             expose,
         } => handle_tunnel_add(name, from, to, *local_port, *remote_port, expose).await,
+        #[cfg(unix)]
         TunnelCommands::Remove { name } => handle_tunnel_remove(name).await,
+        #[cfg(unix)]
         TunnelCommands::Status { id } => handle_tunnel_status(id.clone()).await,
+        #[cfg(unix)]
         TunnelCommands::Access {
             endpoint,
             local_port,
             ttl,
         } => handle_tunnel_access(endpoint, *local_port, ttl).await,
+        #[cfg(not(unix))]
+        _ => anyhow::bail!(
+            "This tunnel command requires the ZLayer runtime which is not available on Windows.\n\
+             Start the WSL2 daemon with 'zlayer serve' and use the daemon API."
+        ),
     }
 }
 
@@ -81,6 +94,7 @@ pub(crate) fn handle_tunnel_create(
 }
 
 /// List tunnel tokens
+#[cfg(unix)]
 pub(crate) async fn handle_tunnel_list(output: &str) -> Result<()> {
     info!(output = %output, "Listing tunnels");
 
@@ -138,6 +152,7 @@ pub(crate) async fn handle_tunnel_list(output: &str) -> Result<()> {
 }
 
 /// Revoke a tunnel token
+#[cfg(unix)]
 pub(crate) async fn handle_tunnel_revoke(id: &str) -> Result<()> {
     info!(id = %id, "Revoking tunnel");
 
@@ -257,6 +272,7 @@ pub(crate) async fn handle_tunnel_connect(
 }
 
 /// Add a node-to-node tunnel
+#[cfg(unix)]
 pub(crate) async fn handle_tunnel_add(
     name: &str,
     from: &str,
@@ -321,6 +337,7 @@ pub(crate) async fn handle_tunnel_add(
 }
 
 /// Remove a node-to-node tunnel
+#[cfg(unix)]
 pub(crate) async fn handle_tunnel_remove(name: &str) -> Result<()> {
     info!(name = %name, "Removing node-to-node tunnel");
 
@@ -337,6 +354,7 @@ pub(crate) async fn handle_tunnel_remove(name: &str) -> Result<()> {
 }
 
 /// Show tunnel status
+#[cfg(unix)]
 pub(crate) async fn handle_tunnel_status(id: Option<String>) -> Result<()> {
     info!(id = ?id, "Getting tunnel status");
 
@@ -372,6 +390,7 @@ pub(crate) async fn handle_tunnel_status(id: Option<String>) -> Result<()> {
 }
 
 /// Request temporary access to a tunneled service
+#[cfg(unix)]
 pub(crate) async fn handle_tunnel_access(
     endpoint: &str,
     local_port: Option<u16>,
