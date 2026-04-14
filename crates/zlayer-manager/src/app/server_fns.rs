@@ -43,6 +43,7 @@ pub struct InstanceInfo {
 
 /// Get all saved instances
 #[server(prefix = "/api/manager")]
+#[allow(clippy::unused_async)]
 pub async fn get_instances() -> Result<Vec<InstanceInfo>, ServerFnError> {
     let (instances, active_idx) = crate::instances::list_all();
     Ok(instances
@@ -59,6 +60,7 @@ pub async fn get_instances() -> Result<Vec<InstanceInfo>, ServerFnError> {
 
 /// Get the active connection info
 #[server(prefix = "/api/manager")]
+#[allow(clippy::unused_async)]
 pub async fn get_active_connection() -> Result<InstanceInfo, ServerFnError> {
     let (instances, active_idx) = crate::instances::list_all();
     let inst = &instances[active_idx.min(instances.len().saturating_sub(1))];
@@ -72,12 +74,14 @@ pub async fn get_active_connection() -> Result<InstanceInfo, ServerFnError> {
 
 /// Switch the active instance
 #[server(prefix = "/api/manager")]
+#[allow(clippy::unused_async)]
 pub async fn switch_instance(index: usize) -> Result<(), ServerFnError> {
     crate::instances::set_active(index).map_err(ServerFnError::new)
 }
 
 /// Add a new instance
 #[server(prefix = "/api/manager")]
+#[allow(clippy::unused_async)]
 pub async fn add_new_instance(
     name: String,
     url: String,
@@ -90,6 +94,7 @@ pub async fn add_new_instance(
 
 /// Update an existing instance
 #[server(prefix = "/api/manager")]
+#[allow(clippy::unused_async)]
 pub async fn update_existing_instance(
     index: usize,
     name: String,
@@ -103,6 +108,7 @@ pub async fn update_existing_instance(
 
 /// Remove an instance
 #[server(prefix = "/api/manager")]
+#[allow(clippy::unused_async)]
 pub async fn remove_existing_instance(index: usize) -> Result<(), ServerFnError> {
     crate::instances::remove(index).map_err(ServerFnError::new)
 }
@@ -842,14 +848,11 @@ pub async fn reset_cluster() -> Result<String, ServerFnError> {
 
     if errors.is_empty() {
         Ok(format!(
-            "Cluster reset complete. Deleted {} deployment(s) and {} secret(s).",
-            deleted_deployments, deleted_secrets
+            "Cluster reset complete. Deleted {deleted_deployments} deployment(s) and {deleted_secrets} secret(s)."
         ))
     } else {
         Err(ServerFnError::new(format!(
-            "Partial reset: deleted {} deployment(s) and {} secret(s), but {} error(s) occurred: {}",
-            deleted_deployments,
-            deleted_secrets,
+            "Partial reset: deleted {deleted_deployments} deployment(s) and {deleted_secrets} secret(s), but {} error(s) occurred: {}",
             errors.len(),
             errors.join("; ")
         )))
@@ -1376,15 +1379,15 @@ pub async fn get_network(name: String) -> Result<NetworkDetail, ServerFnError> {
             .map(|r| NetworkAccessRuleItem {
                 service: r.service,
                 deployment: r.deployment,
-                ports: r
-                    .ports
-                    .map(|p| {
+                ports: r.ports.map_or_else(
+                    || "all".to_string(),
+                    |p| {
                         p.iter()
-                            .map(|port| port.to_string())
+                            .map(ToString::to_string)
                             .collect::<Vec<_>>()
                             .join(", ")
-                    })
-                    .unwrap_or_else(|| "all".to_string()),
+                    },
+                ),
                 action: r.action,
             })
             .collect(),
@@ -1401,7 +1404,7 @@ pub async fn create_network(
     let client = get_api_client();
 
     let cidr_list: Vec<String> = cidrs
-        .split(|c: char| c == ',' || c == '\n')
+        .split([',', '\n'])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();

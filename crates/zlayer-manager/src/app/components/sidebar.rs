@@ -134,7 +134,7 @@ pub fn Sidebar() -> impl IntoView {
             // Connection indicator + version footer
             <div class="p-4 border-t border-base-300 space-y-2">
                 {
-                    let connection = Resource::new(|| (), |_| get_active_connection());
+                    let connection = Resource::new(|| (), |()| get_active_connection());
                     view! {
                         <Suspense fallback=move || view! {
                             <div class="flex items-center gap-2">

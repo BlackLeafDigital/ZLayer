@@ -3,6 +3,8 @@
 //! This module provides the core server startup logic so it can be reused
 //! by both the standalone CLI binary and the Tauri desktop wrapper.
 
+#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
+
 use std::future::IntoFuture;
 use std::net::SocketAddr;
 
