@@ -37,7 +37,6 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
@@ -122,7 +121,6 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
@@ -214,7 +212,6 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
@@ -300,7 +297,6 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
           sudo apt-get install -y protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
