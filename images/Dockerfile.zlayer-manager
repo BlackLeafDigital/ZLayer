@@ -28,7 +28,7 @@ RUN apt-get update && apt-get install -y \
 # cargo-leptos auto-downloads the Tailwind v4 CLI when tailwind-input-file
 # is configured in Leptos.toml, so no manual Tailwind installation is needed.
 RUN rustup target add wasm32-unknown-unknown && \
-    cargo install cargo-leptos
+    cargo install cargo-leptos --locked
 
 # Cook dependencies (cached layer)
 COPY --from=planner /build/recipe.json recipe.json
