@@ -3,6 +3,8 @@
 //! Manages a list of ZLayer API instances that the manager can connect to.
 //! Persists to `~/.config/zlayer/instances.json`.
 
+#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
+
 use std::path::PathBuf;
 use std::sync::{LazyLock, RwLock};
 
