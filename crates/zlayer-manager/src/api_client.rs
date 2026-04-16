@@ -7,12 +7,67 @@ use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+#[cfg(feature = "ssr")]
+mod uds {
+    use std::future::Future;
+    use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    use hyper::Uri;
+    use tokio::net::UnixStream;
+
+    #[derive(Clone)]
+    pub(super) struct UnixConnector {
+        pub(super) socket_path: PathBuf,
+    }
+
+    impl tower::Service<Uri> for UnixConnector {
+        type Response = hyper_util::rt::TokioIo<UnixStream>;
+        type Error = std::io::Error;
+        type Future = Pin<Box<dyn Future<Output = std::io::Result<Self::Response>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _uri: Uri) -> Self::Future {
+            let path = self.socket_path.clone();
+            Box::pin(async move {
+                let stream = UnixStream::connect(&path).await?;
+                Ok(hyper_util::rt::TokioIo::new(stream))
+            })
+        }
+    }
+}
+
+/// Minimal percent-encoder for query-string components. Encodes any byte that
+/// isn't in the unreserved set (`A-Za-z0-9-_.~`) as `%XX`. Used only by the
+/// UDS transport's query-string builder.
+#[cfg(feature = "ssr")]
+fn pct(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(&mut out, "%{b:02X}");
+        }
+    }
+    out
+}
+
 /// Errors that can occur when calling the ZLayer API
 #[derive(Debug, Error)]
 pub enum ApiClientError {
     /// HTTP request failed
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+
+    /// Transport-level failure (UDS connection error, hyper error, IO error).
+    #[error("Transport error: {0}")]
+    Transport(String),
 
     /// Server returned an error response
     #[error("API error ({status}): {message}")]
@@ -653,12 +708,27 @@ struct ErrorResponse {
 /// HTTP client for calling ZLayer API
 #[derive(Debug, Clone)]
 pub struct ZLayerClient {
-    /// HTTP client
-    client: Client,
-    /// Base URL for the API (e.g., "http://localhost:9090")
-    base_url: String,
+    transport: Transport,
     /// Optional Bearer token for authentication
     token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(clippy::large_enum_variant)]
+enum Transport {
+    Tcp {
+        client: Client,
+        base_url: String,
+    },
+    #[cfg(feature = "ssr")]
+    Unix {
+        client: hyper_util::client::legacy::Client<
+            uds::UnixConnector,
+            http_body_util::Full<bytes::Bytes>,
+        >,
+        #[allow(dead_code)]
+        socket_path: std::path::PathBuf,
+    },
 }
 
 impl ZLayerClient {
@@ -693,11 +763,39 @@ impl ZLayerClient {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");
-        let base_url = base_url.into();
+        let base_url = base_url.into().trim_end_matches('/').to_string();
 
         Self {
-            client,
-            base_url: base_url.trim_end_matches('/').to_string(),
+            transport: Transport::Tcp { client, base_url },
+            token,
+        }
+    }
+
+    /// Create a new ZLayer API client that talks over a Unix Domain Socket.
+    ///
+    /// Used when the manager runs inside a container and the zlayer-runtime's
+    /// socket is bind-mounted in (path comes from `ZLAYER_SOCKET`). Works
+    /// regardless of the container's network namespace.
+    ///
+    /// # Arguments
+    ///
+    /// * `socket_path` - Filesystem path to the runtime's Unix socket.
+    /// * `token` - Optional Bearer token for authentication.
+    #[cfg(feature = "ssr")]
+    pub fn new_unix(socket_path: impl Into<std::path::PathBuf>, token: Option<String>) -> Self {
+        let socket_path = socket_path.into();
+        let connector = uds::UnixConnector {
+            socket_path: socket_path.clone(),
+        };
+        let client =
+            hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
+                .build(connector);
+
+        Self {
+            transport: Transport::Unix {
+                client,
+                socket_path,
+            },
             token,
         }
     }
@@ -707,53 +805,165 @@ impl ZLayerClient {
         self.token = token;
     }
 
-    /// Build a request with optional authorization header
-    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        let url = format!("{}{}", self.base_url, path);
-        let mut req = self.client.request(method, &url);
-
-        if let Some(ref token) = self.token {
-            req = req.header("Authorization", format!("Bearer {token}"));
-        }
-
-        req
-    }
-
-    /// Handle API response, converting errors appropriately
-    async fn handle_response<T: for<'de> Deserialize<'de>>(
+    /// Transport-aware request execution. Returns (status, response body bytes).
+    ///
+    /// - `Tcp`: reqwest builder + send + collect bytes.
+    /// - `Unix` (ssr-only): hyper client over the bind-mounted UDS.
+    ///
+    /// `json_body` is serialised via serde_json. `query` becomes a query string
+    /// appended to the path.
+    async fn execute<B: serde::Serialize + ?Sized>(
         &self,
-        response: reqwest::Response,
-    ) -> Result<T> {
-        let status = response.status();
+        method: reqwest::Method,
+        path: &str,
+        json_body: Option<&B>,
+        query: Option<&[(&str, &str)]>,
+    ) -> Result<(StatusCode, bytes::Bytes)> {
+        match &self.transport {
+            Transport::Tcp { client, base_url } => {
+                let url = format!("{base_url}{path}");
+                let mut req = client.request(method, &url);
+                if let Some(ref token) = self.token {
+                    req = req.header("Authorization", format!("Bearer {token}"));
+                }
+                if let Some(q) = query {
+                    req = req.query(q);
+                }
+                if let Some(b) = json_body {
+                    req = req.json(b);
+                }
+                let resp = req.send().await?;
+                let status = resp.status();
+                let body = resp.bytes().await?;
+                Ok((status, body))
+            }
+            #[cfg(feature = "ssr")]
+            Transport::Unix { client, .. } => {
+                use http_body_util::{BodyExt, Full};
 
-        if status.is_success() {
-            response
-                .json::<T>()
-                .await
-                .map_err(|e| ApiClientError::Deserialize(e.to_string()))
-        } else {
-            // Try to parse error response
-            let error_text = response.text().await.unwrap_or_default();
-
-            match status {
-                StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
-                StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
-                StatusCode::TOO_MANY_REQUESTS => Err(ApiClientError::RateLimited),
-                _ => {
-                    // Try to parse as ErrorResponse
-                    if let Ok(err) = serde_json::from_str::<ErrorResponse>(&error_text) {
-                        Err(ApiClientError::Api {
-                            status: status.as_u16(),
-                            message: err.message,
-                        })
-                    } else {
-                        Err(ApiClientError::Api {
-                            status: status.as_u16(),
-                            message: error_text,
-                        })
+                let mut uri_s = format!("http://localhost{path}");
+                if let Some(q) = query {
+                    if !q.is_empty() {
+                        let qs = q
+                            .iter()
+                            .map(|(k, v)| format!("{}={}", pct(k), pct(v)))
+                            .collect::<Vec<_>>()
+                            .join("&");
+                        uri_s.push('?');
+                        uri_s.push_str(&qs);
                     }
                 }
+
+                let uri: hyper::Uri =
+                    uri_s.parse().map_err(|e: hyper::http::uri::InvalidUri| {
+                        ApiClientError::Transport(format!("invalid URI {uri_s}: {e}"))
+                    })?;
+
+                let mut builder = hyper::Request::builder()
+                    .method(method.as_str())
+                    .uri(uri)
+                    .header("Host", "localhost");
+                if let Some(ref token) = self.token {
+                    builder = builder.header("Authorization", format!("Bearer {token}"));
+                }
+
+                let body_bytes: bytes::Bytes = match json_body {
+                    Some(b) => {
+                        builder = builder.header("Content-Type", "application/json");
+                        let v = serde_json::to_vec(b)
+                            .map_err(|e| ApiClientError::Deserialize(e.to_string()))?;
+                        bytes::Bytes::from(v)
+                    }
+                    None => bytes::Bytes::new(),
+                };
+
+                let req = builder
+                    .body(Full::new(body_bytes))
+                    .map_err(|e| ApiClientError::Transport(format!("build request: {e}")))?;
+
+                let resp = client
+                    .request(req)
+                    .await
+                    .map_err(|e| ApiClientError::Transport(format!("UDS request: {e}")))?;
+
+                let hyper_status = resp.status();
+                let status = StatusCode::from_u16(hyper_status.as_u16())
+                    .map_err(|e| ApiClientError::Transport(format!("bad status: {e}")))?;
+
+                let collected = resp
+                    .into_body()
+                    .collect()
+                    .await
+                    .map_err(|e| ApiClientError::Transport(format!("collect body: {e}")))?;
+                let body: bytes::Bytes = collected.to_bytes();
+
+                Ok((status, body))
             }
+        }
+    }
+
+    /// Parse a `(status, body_bytes)` pair into a deserialized `T` or a mapped
+    /// [`ApiClientError`], mirroring the error mapping of `handle_response`.
+    /// Used by public methods whose response body is JSON.
+    fn parse_response<T: for<'de> Deserialize<'de>>(status: StatusCode, body: &[u8]) -> Result<T> {
+        if status.is_success() {
+            return serde_json::from_slice::<T>(body)
+                .map_err(|e| ApiClientError::Deserialize(e.to_string()));
+        }
+
+        let error_text = String::from_utf8_lossy(body).into_owned();
+        match status {
+            StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
+            StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
+            StatusCode::TOO_MANY_REQUESTS => Err(ApiClientError::RateLimited),
+            _ => {
+                if let Ok(err) = serde_json::from_slice::<ErrorResponse>(body) {
+                    Err(ApiClientError::Api {
+                        status: status.as_u16(),
+                        message: err.message,
+                    })
+                } else {
+                    Err(ApiClientError::Api {
+                        status: status.as_u16(),
+                        message: error_text,
+                    })
+                }
+            }
+        }
+    }
+
+    /// Parse a `(status, body_bytes)` pair into a plain String (for log endpoints etc.)
+    /// or a mapped error. Mirrors error mapping of `parse_response` minus the 429 branch
+    /// and the ErrorResponse JSON parsing (log endpoints return text on error).
+    fn parse_text_response(status: StatusCode, body: &[u8]) -> Result<String> {
+        if status.is_success() {
+            return Ok(String::from_utf8_lossy(body).into_owned());
+        }
+        let error_text = String::from_utf8_lossy(body).into_owned();
+        match status {
+            StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
+            StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
+            _ => Err(ApiClientError::Api {
+                status: status.as_u16(),
+                message: error_text,
+            }),
+        }
+    }
+
+    /// Parse a `(status, body_bytes)` pair for endpoints that return no body on success.
+    /// Maps non-success statuses to `ApiClientError` the same way `parse_text_response` does.
+    fn parse_status_only(status: StatusCode, body: &[u8]) -> Result<()> {
+        if status.is_success() {
+            return Ok(());
+        }
+        let error_text = String::from_utf8_lossy(body).into_owned();
+        match status {
+            StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
+            StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
+            _ => Err(ApiClientError::Api {
+                status: status.as_u16(),
+                message: error_text,
+            }),
         }
     }
 
@@ -769,12 +979,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn health_live(&self) -> Result<HealthResponse> {
-        let response = self
-            .request(reqwest::Method::GET, "/health/live")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/health/live", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Check API readiness
@@ -785,12 +993,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn health_ready(&self) -> Result<HealthResponse> {
-        let response = self
-            .request(reqwest::Method::GET, "/health/ready")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/health/ready", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Convenience method to check overall health (uses readiness check)
@@ -814,12 +1020,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_deployments(&self) -> Result<Vec<DeploymentSummary>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/deployments")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/deployments", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get deployment details
@@ -834,12 +1038,11 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn get_deployment(&self, name: &str) -> Result<DeploymentDetails> {
-        let response = self
-            .request(reqwest::Method::GET, &format!("/api/v1/deployments/{name}"))
-            .send()
+        let path = format!("/api/v1/deployments/{name}");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Create a new deployment from a YAML spec
@@ -855,14 +1058,16 @@ impl ZLayerClient {
     /// Returns an error if the HTTP request fails, the spec is invalid,
     /// or the response cannot be deserialized.
     pub async fn create_deployment(&self, yaml: &str) -> Result<DeploymentDetails> {
-        let body = serde_json::json!({ "spec": yaml });
-        let response = self
-            .request(reqwest::Method::POST, "/api/v1/deployments")
-            .json(&body)
-            .send()
+        let body_json = serde_json::json!({ "spec": yaml });
+        let (status, body) = self
+            .execute(
+                reqwest::Method::POST,
+                "/api/v1/deployments",
+                Some(&body_json),
+                None,
+            )
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Delete a deployment
@@ -877,30 +1082,11 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the deployment is not found.
     pub async fn delete_deployment(&self, name: &str) -> Result<()> {
-        let response = self
-            .request(
-                reqwest::Method::DELETE,
-                &format!("/api/v1/deployments/{name}"),
-            )
-            .send()
+        let path = format!("/api/v1/deployments/{name}");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::DELETE, &path, None, None)
             .await?;
-
-        let status = response.status();
-
-        if status.is_success() {
-            Ok(())
-        } else {
-            let error_text = response.text().await.unwrap_or_default();
-
-            match status {
-                StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
-                StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
-                _ => Err(ApiClientError::Api {
-                    status: status.as_u16(),
-                    message: error_text,
-                }),
-            }
-        }
+        Self::parse_status_only(status, &body)
     }
 
     // =========================================================================
@@ -919,15 +1105,11 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_services(&self, deployment: &str) -> Result<Vec<ServiceSummary>> {
-        let response = self
-            .request(
-                reqwest::Method::GET,
-                &format!("/api/v1/deployments/{deployment}/services"),
-            )
-            .send()
+        let path = format!("/api/v1/deployments/{deployment}/services");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get service details
@@ -943,15 +1125,11 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn get_service(&self, deployment: &str, service: &str) -> Result<ServiceDetails> {
-        let response = self
-            .request(
-                reqwest::Method::GET,
-                &format!("/api/v1/deployments/{deployment}/services/{service}"),
-            )
-            .send()
+        let path = format!("/api/v1/deployments/{deployment}/services/{service}");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get service logs
@@ -973,35 +1151,20 @@ impl ZLayerClient {
         service: &str,
         lines: Option<u32>,
     ) -> Result<String> {
-        let mut req = self.request(
-            reqwest::Method::GET,
-            &format!("/api/v1/deployments/{deployment}/services/{service}/logs"),
-        );
-
-        if let Some(lines) = lines {
-            req = req.query(&[("lines", lines)]);
-        }
-
-        let response = req.send().await?;
-
-        if response.status().is_success() {
-            response
-                .text()
-                .await
-                .map_err(|e| ApiClientError::Deserialize(e.to_string()))
+        let path = format!("/api/v1/deployments/{deployment}/services/{service}/logs");
+        let lines_str;
+        let query_slice;
+        let query = if let Some(n) = lines {
+            lines_str = n.to_string();
+            query_slice = [("lines", lines_str.as_str())];
+            Some(&query_slice[..])
         } else {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-
-            match status {
-                StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
-                StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
-                _ => Err(ApiClientError::Api {
-                    status: status.as_u16(),
-                    message: error_text,
-                }),
-            }
-        }
+            None
+        };
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, &path, None, query)
+            .await?;
+        Self::parse_text_response(status, &body)
     }
 
     // =========================================================================
@@ -1016,12 +1179,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_builds(&self) -> Result<Vec<BuildStatus>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/builds")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/builds", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Trigger a new build
@@ -1039,13 +1200,15 @@ impl ZLayerClient {
         &self,
         request: &TriggerBuildRequest,
     ) -> Result<TriggerBuildResponse> {
-        let response = self
-            .request(reqwest::Method::POST, "/api/v1/build/json")
-            .json(request)
-            .send()
+        let (status, body) = self
+            .execute(
+                reqwest::Method::POST,
+                "/api/v1/build/json",
+                Some(request),
+                None,
+            )
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get build status
@@ -1060,12 +1223,11 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn get_build_status(&self, id: &str) -> Result<BuildStatus> {
-        let response = self
-            .request(reqwest::Method::GET, &format!("/api/v1/build/{id}"))
-            .send()
+        let path = format!("/api/v1/build/{id}");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get build logs
@@ -1080,29 +1242,11 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn get_build_logs(&self, id: &str) -> Result<String> {
-        let response = self
-            .request(reqwest::Method::GET, &format!("/api/v1/build/{id}/logs"))
-            .send()
+        let path = format!("/api/v1/build/{id}/logs");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, &path, None, None)
             .await?;
-
-        if response.status().is_success() {
-            response
-                .text()
-                .await
-                .map_err(|e| ApiClientError::Deserialize(e.to_string()))
-        } else {
-            let status = response.status();
-            let error_text = response.text().await.unwrap_or_default();
-
-            match status {
-                StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
-                StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
-                _ => Err(ApiClientError::Api {
-                    status: status.as_u16(),
-                    message: error_text,
-                }),
-            }
-        }
+        Self::parse_text_response(status, &body)
     }
 
     // =========================================================================
@@ -1118,12 +1262,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_secrets(&self) -> Result<Vec<SecretMetadata>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/secrets")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/secrets", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get metadata for a specific secret
@@ -1140,12 +1282,11 @@ impl ZLayerClient {
     /// Returns an error if the HTTP request fails, the secret is not found,
     /// or the response cannot be deserialized.
     pub async fn get_secret_metadata(&self, name: &str) -> Result<SecretMetadata> {
-        let response = self
-            .request(reqwest::Method::GET, &format!("/api/v1/secrets/{name}"))
-            .send()
+        let path = format!("/api/v1/secrets/{name}");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Create or update a secret
@@ -1167,14 +1308,15 @@ impl ZLayerClient {
             name: name.to_string(),
             value: value.to_string(),
         };
-
-        let response = self
-            .request(reqwest::Method::POST, "/api/v1/secrets")
-            .json(&request)
-            .send()
+        let (status, body) = self
+            .execute(
+                reqwest::Method::POST,
+                "/api/v1/secrets",
+                Some(&request),
+                None,
+            )
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Delete a secret
@@ -1189,27 +1331,11 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the secret is not found.
     pub async fn delete_secret(&self, name: &str) -> Result<()> {
-        let response = self
-            .request(reqwest::Method::DELETE, &format!("/api/v1/secrets/{name}"))
-            .send()
+        let path = format!("/api/v1/secrets/{name}");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::DELETE, &path, None, None)
             .await?;
-
-        let status = response.status();
-
-        if status.is_success() {
-            Ok(())
-        } else {
-            let error_text = response.text().await.unwrap_or_default();
-
-            match status {
-                StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
-                StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
-                _ => Err(ApiClientError::Api {
-                    status: status.as_u16(),
-                    message: error_text,
-                }),
-            }
-        }
+        Self::parse_status_only(status, &body)
     }
 
     // =========================================================================
@@ -1230,15 +1356,11 @@ impl ZLayerClient {
     /// Returns an error if the HTTP request fails, the job is not found,
     /// or the response cannot be deserialized.
     pub async fn trigger_job(&self, name: &str) -> Result<TriggerJobResponse> {
-        let response = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/api/v1/jobs/{name}/trigger"),
-            )
-            .send()
+        let path = format!("/api/v1/jobs/{name}/trigger");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::POST, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get job execution status
@@ -1255,15 +1377,11 @@ impl ZLayerClient {
     /// Returns an error if the HTTP request fails, the execution is not found,
     /// or the response cannot be deserialized.
     pub async fn get_execution_status(&self, execution_id: &str) -> Result<JobExecutionResponse> {
-        let response = self
-            .request(
-                reqwest::Method::GET,
-                &format!("/api/v1/jobs/{execution_id}/status"),
-            )
-            .send()
+        let path = format!("/api/v1/jobs/{execution_id}/status");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// List executions for a job
@@ -1285,27 +1403,24 @@ impl ZLayerClient {
         limit: Option<usize>,
         status: Option<&str>,
     ) -> Result<Vec<JobExecutionResponse>> {
-        let mut req = self.request(
-            reqwest::Method::GET,
-            &format!("/api/v1/jobs/{job_name}/executions"),
-        );
-
-        // Build query parameters
-        let mut params = Vec::new();
-        if let Some(limit) = limit {
-            params.push(("limit", limit.to_string()));
+        let path = format!("/api/v1/jobs/{job_name}/executions");
+        let limit_str = limit.map(|n| n.to_string());
+        let mut params: Vec<(&str, &str)> = Vec::new();
+        if let Some(ref s) = limit_str {
+            params.push(("limit", s.as_str()));
         }
-        if let Some(status) = status {
-            params.push(("status", status.to_string()));
+        if let Some(s) = status {
+            params.push(("status", s));
         }
-
-        if !params.is_empty() {
-            req = req.query(&params);
-        }
-
-        let response = req.send().await?;
-
-        self.handle_response(response).await
+        let query = if params.is_empty() {
+            None
+        } else {
+            Some(params.as_slice())
+        };
+        let (status_code, body) = self
+            .execute::<()>(reqwest::Method::GET, &path, None, query)
+            .await?;
+        Self::parse_response(status_code, &body)
     }
 
     /// Cancel a running job execution
@@ -1322,15 +1437,11 @@ impl ZLayerClient {
     /// Returns an error if the HTTP request fails, the execution is not found,
     /// or the execution is already in a terminal state.
     pub async fn cancel_execution(&self, execution_id: &str) -> Result<JobExecutionResponse> {
-        let response = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/api/v1/jobs/{execution_id}/cancel"),
-            )
-            .send()
+        let path = format!("/api/v1/jobs/{execution_id}/cancel");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::POST, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     // =========================================================================
@@ -1346,12 +1457,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_cron_jobs(&self) -> Result<Vec<CronJobResponse>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/cron")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/cron", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get cron job details
@@ -1367,12 +1476,11 @@ impl ZLayerClient {
     /// Returns an error if the HTTP request fails, the cron job is not found,
     /// or the response cannot be deserialized.
     pub async fn get_cron_job(&self, name: &str) -> Result<CronJobResponse> {
-        let response = self
-            .request(reqwest::Method::GET, &format!("/api/v1/cron/{name}"))
-            .send()
+        let path = format!("/api/v1/cron/{name}");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Manually trigger a cron job
@@ -1389,15 +1497,11 @@ impl ZLayerClient {
     /// Returns an error if the HTTP request fails, the cron job is not found,
     /// or the response cannot be deserialized.
     pub async fn trigger_cron_job(&self, name: &str) -> Result<TriggerCronResponse> {
-        let response = self
-            .request(
-                reqwest::Method::POST,
-                &format!("/api/v1/cron/{name}/trigger"),
-            )
-            .send()
+        let path = format!("/api/v1/cron/{name}/trigger");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::POST, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Enable a cron job
@@ -1414,12 +1518,11 @@ impl ZLayerClient {
     /// Returns an error if the HTTP request fails, the cron job is not found,
     /// or the response cannot be deserialized.
     pub async fn enable_cron_job(&self, name: &str) -> Result<CronStatusResponse> {
-        let response = self
-            .request(reqwest::Method::PUT, &format!("/api/v1/cron/{name}/enable"))
-            .send()
+        let path = format!("/api/v1/cron/{name}/enable");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::POST, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Disable a cron job
@@ -1436,15 +1539,11 @@ impl ZLayerClient {
     /// Returns an error if the HTTP request fails, the cron job is not found,
     /// or the response cannot be deserialized.
     pub async fn disable_cron_job(&self, name: &str) -> Result<CronStatusResponse> {
-        let response = self
-            .request(
-                reqwest::Method::PUT,
-                &format!("/api/v1/cron/{name}/disable"),
-            )
-            .send()
+        let path = format!("/api/v1/cron/{name}/disable");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::POST, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     // =========================================================================
@@ -1459,12 +1558,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_tunnels(&self) -> Result<Vec<TunnelSummary>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/tunnels")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/tunnels", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Create a new tunnel
@@ -1482,13 +1579,15 @@ impl ZLayerClient {
         &self,
         request: &CreateTunnelRequest,
     ) -> Result<CreateTunnelResponse> {
-        let response = self
-            .request(reqwest::Method::POST, "/api/v1/tunnels")
-            .json(request)
-            .send()
+        let (status, body) = self
+            .execute(
+                reqwest::Method::POST,
+                "/api/v1/tunnels",
+                Some(request),
+                None,
+            )
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Delete (revoke) a tunnel
@@ -1503,27 +1602,11 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the tunnel is not found.
     pub async fn delete_tunnel(&self, id: &str) -> Result<()> {
-        let response = self
-            .request(reqwest::Method::DELETE, &format!("/api/v1/tunnels/{id}"))
-            .send()
+        let path = format!("/api/v1/tunnels/{id}");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::DELETE, &path, None, None)
             .await?;
-
-        let status = response.status();
-
-        if status.is_success() {
-            Ok(())
-        } else {
-            let error_text = response.text().await.unwrap_or_default();
-
-            match status {
-                StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
-                StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
-                _ => Err(ApiClientError::Api {
-                    status: status.as_u16(),
-                    message: error_text,
-                }),
-            }
-        }
+        Self::parse_status_only(status, &body)
     }
 
     // =========================================================================
@@ -1539,12 +1622,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn get_overlay_status(&self) -> Result<OverlayStatusResponse> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/overlay/status")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/overlay/status", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get overlay network peers
@@ -1556,12 +1637,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn get_overlay_peers(&self) -> Result<PeerListResponse> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/overlay/peers")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/overlay/peers", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get IP allocation status
@@ -1573,12 +1652,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn get_ip_allocation(&self) -> Result<IpAllocationResponse> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/overlay/ip-alloc")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/overlay/ip-alloc", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get DNS service status
@@ -1590,12 +1667,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn get_dns_status(&self) -> Result<DnsStatusResponse> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/overlay/dns")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/overlay/dns", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     // =========================================================================
@@ -1611,12 +1686,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_cluster_nodes(&self) -> Result<Vec<ClusterNodeSummary>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/cluster/nodes")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/cluster/nodes", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     // =========================================================================
@@ -1631,12 +1704,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_proxy_routes(&self) -> Result<Vec<ProxyRoute>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/proxy/routes")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/proxy/routes", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// List all proxy backend groups
@@ -1648,12 +1719,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_proxy_backends(&self) -> Result<Vec<ProxyBackendGroup>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/proxy/backends")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/proxy/backends", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// List all TLS certificates
@@ -1664,12 +1733,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_tls_certificates(&self) -> Result<Vec<TlsCertificate>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/proxy/tls")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/proxy/tls", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// List all stream proxies
@@ -1680,12 +1747,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_stream_proxies(&self) -> Result<Vec<StreamProxy>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/proxy/streams")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/proxy/streams", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     // =========================================================================
@@ -1700,12 +1765,10 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the response cannot be deserialized.
     pub async fn list_networks(&self) -> Result<Vec<NetworkSummary>> {
-        let response = self
-            .request(reqwest::Method::GET, "/api/v1/networks")
-            .send()
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, "/api/v1/networks", None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Get a specific network by name
@@ -1721,12 +1784,11 @@ impl ZLayerClient {
     /// Returns an error if the HTTP request fails, the network is not found,
     /// or the response cannot be deserialized.
     pub async fn get_network(&self, name: &str) -> Result<NetworkPolicyDetail> {
-        let response = self
-            .request(reqwest::Method::GET, &format!("/api/v1/networks/{name}"))
-            .send()
+        let path = format!("/api/v1/networks/{name}");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::GET, &path, None, None)
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Create a new network
@@ -1745,13 +1807,15 @@ impl ZLayerClient {
         &self,
         request: &CreateNetworkRequest,
     ) -> Result<NetworkPolicyDetail> {
-        let response = self
-            .request(reqwest::Method::POST, "/api/v1/networks")
-            .json(request)
-            .send()
+        let (status, body) = self
+            .execute(
+                reqwest::Method::POST,
+                "/api/v1/networks",
+                Some(request),
+                None,
+            )
             .await?;
-
-        self.handle_response(response).await
+        Self::parse_response(status, &body)
     }
 
     /// Delete a network
@@ -1766,26 +1830,199 @@ impl ZLayerClient {
     ///
     /// Returns an error if the HTTP request fails or the network is not found.
     pub async fn delete_network(&self, name: &str) -> Result<()> {
-        let response = self
-            .request(reqwest::Method::DELETE, &format!("/api/v1/networks/{name}"))
-            .send()
+        let path = format!("/api/v1/networks/{name}");
+        let (status, body) = self
+            .execute::<()>(reqwest::Method::DELETE, &path, None, None)
             .await?;
+        Self::parse_status_only(status, &body)
+    }
 
-        let status = response.status();
+    // ---- Raw auth passthrough ----
 
-        if status.is_success() {
-            Ok(())
-        } else {
-            let error_text = response.text().await.unwrap_or_default();
+    /// Perform a raw HTTP request against the underlying transport and return
+    /// the status, body, and `Set-Cookie` headers intact.
+    ///
+    /// Used by Manager server_fns to proxy auth and users endpoints. Unlike the
+    /// typed methods, this one forwards the caller's cookies and preserves the
+    /// upstream's response cookies so the browser session round-trips cleanly.
+    ///
+    /// # Arguments
+    /// - `method` — HTTP method.
+    /// - `path` — path-and-query segment starting with `/` (e.g. `/auth/login`
+    ///   or `/api/v1/users?x=1`).
+    /// - `body` — optional request body (sent as `application/json` when
+    ///   `Some`).
+    /// - `forward_cookie` — optional `Cookie` header value to forward from the
+    ///   browser's request (e.g. `zlayer_session=…; zlayer_csrf=…`).
+    /// - `csrf_token` — optional `X-CSRF-Token` header value (double-submit).
+    ///
+    /// # Errors
+    /// Returns `ApiClientError::Transport` or `ApiClientError::Http` on
+    /// transport-level failures. Does NOT map non-2xx statuses to errors —
+    /// the caller is expected to inspect `RawResponse::status`.
+    pub async fn raw_request(
+        &self,
+        method: RawMethod,
+        path: &str,
+        body: Option<&[u8]>,
+        forward_cookie: Option<&str>,
+        csrf_token: Option<&str>,
+    ) -> Result<RawResponse> {
+        match &self.transport {
+            Transport::Tcp { client, base_url } => {
+                let url = format!("{base_url}{path}");
+                let mut req = client.request(method.as_reqwest(), &url);
+                if let Some(tok) = &self.token {
+                    req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {tok}"));
+                }
+                if let Some(cookie) = forward_cookie {
+                    req = req.header(reqwest::header::COOKIE, cookie);
+                }
+                if let Some(csrf) = csrf_token {
+                    req = req.header("x-csrf-token", csrf);
+                }
+                if let Some(body) = body {
+                    req = req
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(body.to_vec());
+                }
 
-            match status {
-                StatusCode::NOT_FOUND => Err(ApiClientError::NotFound(error_text)),
-                StatusCode::UNAUTHORIZED => Err(ApiClientError::Unauthorized(error_text)),
-                _ => Err(ApiClientError::Api {
-                    status: status.as_u16(),
-                    message: error_text,
-                }),
+                let resp = req.send().await?;
+                let status = resp.status();
+                let set_cookies: Vec<String> = resp
+                    .headers()
+                    .get_all(reqwest::header::SET_COOKIE)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .map(str::to_string)
+                    .collect();
+                let body = resp.bytes().await?;
+                Ok(RawResponse {
+                    status,
+                    body,
+                    set_cookies,
+                })
             }
+
+            #[cfg(feature = "ssr")]
+            Transport::Unix { client, .. } => {
+                use http_body_util::{BodyExt, Full};
+
+                // UDS transport uses a fixed "localhost" host; the connector
+                // ignores the authority portion.
+                let uri: hyper::Uri = format!("http://localhost{path}").parse().map_err(
+                    |e: hyper::http::uri::InvalidUri| {
+                        ApiClientError::Transport(format!("invalid URI: {e}"))
+                    },
+                )?;
+
+                let mut builder = hyper::Request::builder()
+                    .method(method.as_hyper())
+                    .uri(uri)
+                    .header(hyper::header::HOST, "localhost");
+                if let Some(tok) = &self.token {
+                    builder = builder.header(hyper::header::AUTHORIZATION, format!("Bearer {tok}"));
+                }
+                if let Some(cookie) = forward_cookie {
+                    builder = builder.header(hyper::header::COOKIE, cookie);
+                }
+                if let Some(csrf) = csrf_token {
+                    builder = builder.header("x-csrf-token", csrf);
+                }
+
+                let req = if let Some(body) = body {
+                    builder
+                        .header(hyper::header::CONTENT_TYPE, "application/json")
+                        .body(Full::new(bytes::Bytes::copy_from_slice(body)))
+                        .map_err(|e| ApiClientError::Transport(format!("build request: {e}")))?
+                } else {
+                    builder
+                        .body(Full::new(bytes::Bytes::new()))
+                        .map_err(|e| ApiClientError::Transport(format!("build request: {e}")))?
+                };
+
+                let resp = client
+                    .request(req)
+                    .await
+                    .map_err(|e| ApiClientError::Transport(format!("UDS request: {e}")))?;
+
+                let status_u16 = resp.status().as_u16();
+                let status = reqwest::StatusCode::from_u16(status_u16).map_err(|e| {
+                    ApiClientError::Transport(format!("invalid status {status_u16}: {e}"))
+                })?;
+
+                let set_cookies: Vec<String> = resp
+                    .headers()
+                    .get_all(hyper::header::SET_COOKIE)
+                    .iter()
+                    .filter_map(|v| v.to_str().ok())
+                    .map(str::to_string)
+                    .collect();
+
+                let body = resp
+                    .into_body()
+                    .collect()
+                    .await
+                    .map_err(|e| ApiClientError::Transport(format!("UDS body read: {e}")))?
+                    .to_bytes();
+
+                Ok(RawResponse {
+                    status,
+                    body,
+                    set_cookies,
+                })
+            }
+        }
+    }
+}
+
+/// Raw response from a passthrough HTTP call.
+///
+/// Exposes the status, body bytes, and any `Set-Cookie` headers the upstream
+/// API wrote — used by Leptos server_fns to mirror login/logout cookies back
+/// to the browser.
+#[derive(Debug)]
+pub struct RawResponse {
+    /// Upstream HTTP status code.
+    pub status: reqwest::StatusCode,
+    /// Response body bytes.
+    pub body: bytes::Bytes,
+    /// `Set-Cookie` header values from the upstream response, one entry per
+    /// header (multi-valued).
+    pub set_cookies: Vec<String>,
+}
+
+/// HTTP method selector for the raw passthrough. We don't use `reqwest::Method`
+/// directly so callers don't need a reqwest dep.
+#[derive(Debug, Clone, Copy)]
+pub enum RawMethod {
+    /// HTTP GET.
+    Get,
+    /// HTTP POST.
+    Post,
+    /// HTTP PATCH.
+    Patch,
+    /// HTTP DELETE.
+    Delete,
+}
+
+impl RawMethod {
+    fn as_reqwest(self) -> reqwest::Method {
+        match self {
+            RawMethod::Get => reqwest::Method::GET,
+            RawMethod::Post => reqwest::Method::POST,
+            RawMethod::Patch => reqwest::Method::PATCH,
+            RawMethod::Delete => reqwest::Method::DELETE,
+        }
+    }
+
+    #[cfg(feature = "ssr")]
+    fn as_hyper(self) -> hyper::Method {
+        match self {
+            RawMethod::Get => hyper::Method::GET,
+            RawMethod::Post => hyper::Method::POST,
+            RawMethod::Patch => hyper::Method::PATCH,
+            RawMethod::Delete => hyper::Method::DELETE,
         }
     }
 }
@@ -1794,10 +2031,18 @@ impl ZLayerClient {
 mod tests {
     use super::*;
 
+    fn tcp_base_url(client: &ZLayerClient) -> &str {
+        match &client.transport {
+            Transport::Tcp { base_url, .. } => base_url,
+            #[cfg(feature = "ssr")]
+            Transport::Unix { .. } => panic!("expected Tcp transport"),
+        }
+    }
+
     #[test]
     fn test_client_new() {
         let client = ZLayerClient::new("http://localhost:9090".to_string(), None);
-        assert_eq!(client.base_url, "http://localhost:9090");
+        assert_eq!(tcp_base_url(&client), "http://localhost:9090");
         assert!(client.token.is_none());
     }
 
@@ -1808,7 +2053,7 @@ mod tests {
             Some("test-token".to_string()),
         );
         // Trailing slash should be trimmed
-        assert_eq!(client.base_url, "http://localhost:9090");
+        assert_eq!(tcp_base_url(&client), "http://localhost:9090");
         assert_eq!(client.token, Some("test-token".to_string()));
     }
 
@@ -2364,5 +2609,36 @@ mod tests {
         assert_eq!(original.enabled, restored.enabled);
         assert_eq!(original.zone, restored.zone);
         assert_eq!(original.services, restored.services);
+    }
+
+    mod raw_tests {
+        use super::super::{RawMethod, RawResponse};
+        use bytes::Bytes;
+        use reqwest::StatusCode;
+
+        #[test]
+        fn raw_method_round_trip() {
+            // Each variant maps consistently across both transport conversions.
+            for m in [
+                RawMethod::Get,
+                RawMethod::Post,
+                RawMethod::Patch,
+                RawMethod::Delete,
+            ] {
+                assert_eq!(m.as_reqwest().as_str(), format!("{m:?}").to_uppercase());
+            }
+        }
+
+        #[test]
+        fn raw_response_fields_are_public() {
+            let r = RawResponse {
+                status: StatusCode::OK,
+                body: Bytes::from_static(b"{}"),
+                set_cookies: vec!["a=b".into()],
+            };
+            assert_eq!(r.status, StatusCode::OK);
+            assert_eq!(r.body, Bytes::from_static(b"{}"));
+            assert_eq!(r.set_cookies.len(), 1);
+        }
     }
 }

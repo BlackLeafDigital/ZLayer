@@ -151,6 +151,34 @@ impl BuildManager {
         let builds = self.builds.read().await;
         builds.values().take(limit).cloned().collect()
     }
+
+    /// Block until the build reaches a terminal state
+    /// ([`BuildStateEnum::Complete`] or [`BuildStateEnum::Failed`]).
+    ///
+    /// Polls internally every 200ms with a hard ceiling of one hour: if the
+    /// deadline elapses before the build finishes, whatever the current
+    /// `BuildStatus` says (usually still `Running`) is returned so the caller
+    /// can surface a timeout in a meaningful way rather than hanging forever.
+    ///
+    /// Returns `None` when the id is unknown (never registered, or cleaned up
+    /// before the first poll).
+    pub async fn wait_for_build(&self, id: &str) -> Option<BuildStatus> {
+        use tokio::time::{sleep, Duration, Instant};
+        let deadline = Instant::now() + Duration::from_secs(60 * 60);
+        loop {
+            let status = self.get_status(id).await?;
+            if matches!(
+                status.status,
+                BuildStateEnum::Complete | BuildStateEnum::Failed
+            ) {
+                return Some(status);
+            }
+            if Instant::now() >= deadline {
+                return Some(status);
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
+    }
 }
 
 // ============================================================================
@@ -738,7 +766,7 @@ async fn extract_tarball(data: &[u8], target_dir: &std::path::Path) -> Result<()
 }
 
 /// Spawn the build process in a background task
-fn spawn_build(
+pub(crate) fn spawn_build(
     manager: Arc<BuildManager>,
     build_id: String,
     context_dir: PathBuf,
@@ -1011,5 +1039,47 @@ mod tests {
         assert_eq!(status.status, BuildStateEnum::Complete);
         assert_eq!(status.image_id, Some("sha256:abc".to_string()));
         assert!(status.completed_at.is_some());
+    }
+
+    /// `wait_for_build` must block until a concurrent task flips the build
+    /// into a terminal state. We spawn a background task that sleeps 50ms
+    /// then marks the build `Complete`; `wait_for_build` should observe the
+    /// terminal state and return with the final `BuildStatus`.
+    #[tokio::test]
+    async fn test_wait_for_build_returns_on_complete() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(BuildManager::new(temp_dir.path().to_path_buf()));
+
+        let _tx = manager.register_build("wait-1".to_string()).await;
+
+        // Flip the build to Complete from another task after a short delay.
+        let writer = Arc::clone(&manager);
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            writer
+                .update_status(
+                    "wait-1",
+                    BuildStateEnum::Complete,
+                    Some("sha256:deadbeef".to_string()),
+                    None,
+                )
+                .await;
+        });
+
+        let status = manager
+            .wait_for_build("wait-1")
+            .await
+            .expect("build should be registered");
+        assert_eq!(status.status, BuildStateEnum::Complete);
+        assert_eq!(status.image_id.as_deref(), Some("sha256:deadbeef"));
+    }
+
+    /// `wait_for_build` returns `None` when the id was never registered.
+    #[tokio::test]
+    async fn test_wait_for_build_unknown_id_returns_none() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = BuildManager::new(temp_dir.path().to_path_buf());
+
+        assert!(manager.wait_for_build("ghost").await.is_none());
     }
 }

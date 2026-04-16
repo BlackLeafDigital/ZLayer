@@ -28,6 +28,14 @@ pub enum StorageError {
     #[error("Deployment not found: {0}")]
     NotFound(String),
 
+    /// Row already exists (unique constraint violation)
+    #[error("Already exists: {0}")]
+    AlreadyExists(String),
+
+    /// Other / miscellaneous error (e.g. unknown column, invalid argument)
+    #[error("Storage error: {0}")]
+    Other(String),
+
     /// IO error
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

@@ -36,8 +36,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+          NEEDRESTART_SUSPEND: "1"
         run: |
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          sudo -E apt-get install -y -o Dpkg::Options::="--force-confnew" protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
@@ -120,8 +124,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+          NEEDRESTART_SUSPEND: "1"
         run: |
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          sudo -E apt-get install -y -o Dpkg::Options::="--force-confnew" protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
@@ -211,8 +219,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+          NEEDRESTART_SUSPEND: "1"
         run: |
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          sudo -E apt-get install -y -o Dpkg::Options::="--force-confnew" protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
@@ -296,8 +308,12 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+          NEEDRESTART_MODE: a
+          NEEDRESTART_SUSPEND: "1"
         run: |
-          sudo apt-get install -y protobuf-compiler libseccomp-dev
+          sudo -E apt-get install -y -o Dpkg::Options::="--force-confnew" protobuf-compiler libseccomp-dev
 
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main

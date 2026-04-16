@@ -25,6 +25,7 @@ pub mod daemon_client;
 #[allow(dead_code)]
 mod deploy_tui;
 pub mod resources;
+pub mod session;
 mod util;
 mod views;
 mod widgets;
@@ -477,7 +478,6 @@ async fn run(mut cli: Cli) -> Result<()> {
             commands::lifecycle::validate(&path)
         }
         Commands::Spec(spec_cmd) => commands::spec::handle_spec(spec_cmd),
-        Commands::Auth(auth_cmd) => commands::auth::handle_auth(auth_cmd).await,
         Commands::Pipeline {
             file,
             set,
@@ -612,7 +612,14 @@ async fn run(mut cli: Cli) -> Result<()> {
             follow,
             instance,
         } => {
-            commands::lifecycle::logs(deployment, service, *lines, *follow, instance.clone()).await
+            commands::lifecycle::logs(
+                deployment.as_deref(),
+                service,
+                *lines,
+                *follow,
+                instance.clone(),
+            )
+            .await
         }
         #[cfg(unix)]
         Commands::Stop {
@@ -622,7 +629,7 @@ async fn run(mut cli: Cli) -> Result<()> {
             timeout,
         } => {
             commands::lifecycle::stop(
-                deployment,
+                deployment.as_deref(),
                 service.clone(),
                 *force,
                 *timeout,
@@ -678,6 +685,326 @@ async fn run(mut cli: Cli) -> Result<()> {
         Commands::Job(job_cmd) => commands::job::handle_job(&cli, job_cmd).await,
         #[cfg(unix)]
         Commands::Volume(volume_cmd) => commands::volume::handle_volume(&cli, volume_cmd).await,
+        #[cfg(unix)]
+        Commands::Auth(auth_cmd) => match auth_cmd {
+            cli::AuthCommands::Bootstrap {
+                email,
+                password,
+                display_name,
+            } => {
+                commands::auth::bootstrap(email.clone(), password.clone(), display_name.clone())
+                    .await
+            }
+            cli::AuthCommands::Login { email, password } => {
+                commands::auth::login(email.clone(), password.clone()).await
+            }
+            cli::AuthCommands::Logout => commands::auth::logout().await,
+            cli::AuthCommands::Whoami => commands::auth::whoami().await,
+        },
+        #[cfg(unix)]
+        Commands::Env(env_cmd) => match env_cmd {
+            cli::EnvCommands::Ls { project, output } => {
+                commands::env::list(project.clone(), output).await
+            }
+            cli::EnvCommands::Create {
+                name,
+                project,
+                description,
+            } => commands::env::create(name.clone(), project.clone(), description.clone()).await,
+            cli::EnvCommands::Show { id, output } => commands::env::get(id.clone(), output).await,
+            cli::EnvCommands::Update {
+                id,
+                name,
+                description,
+            } => commands::env::update(id.clone(), name.clone(), description.clone()).await,
+            cli::EnvCommands::Delete { id, yes } => commands::env::delete(id.clone(), *yes).await,
+        },
+        #[cfg(unix)]
+        Commands::Task(task_cmd) => match task_cmd {
+            cli::TaskCommands::List { project, output } => {
+                commands::task::list(project.clone(), output).await
+            }
+            cli::TaskCommands::Create {
+                name,
+                kind,
+                body,
+                project,
+            } => {
+                commands::task::create(name.clone(), kind.clone(), body.clone(), project.clone())
+                    .await
+            }
+            cli::TaskCommands::Run { id } => commands::task::run(id.clone()).await,
+            cli::TaskCommands::Logs { id } => commands::task::logs(id.clone()).await,
+            cli::TaskCommands::Delete { id, yes } => commands::task::delete(id.clone(), *yes).await,
+        },
+        #[cfg(unix)]
+        Commands::Workflow(wf_cmd) => match wf_cmd {
+            cli::WorkflowCommands::List { output } => commands::workflow::list(output).await,
+            cli::WorkflowCommands::Create {
+                name,
+                steps,
+                project,
+            } => commands::workflow::create(name.clone(), steps.clone(), project.clone()).await,
+            cli::WorkflowCommands::Run { id } => commands::workflow::run(id.clone()).await,
+            cli::WorkflowCommands::Logs { id } => commands::workflow::logs(id.clone()).await,
+            cli::WorkflowCommands::Delete { id, yes } => {
+                commands::workflow::delete(id.clone(), *yes).await
+            }
+        },
+        #[cfg(unix)]
+        Commands::Notifier(n_cmd) => match n_cmd {
+            cli::NotifierCommands::List { output } => commands::notifier::list(output).await,
+            cli::NotifierCommands::Create {
+                name,
+                kind,
+                webhook_url,
+                url,
+            } => {
+                commands::notifier::create(
+                    name.clone(),
+                    kind.clone(),
+                    webhook_url.clone(),
+                    url.clone(),
+                )
+                .await
+            }
+            cli::NotifierCommands::Test { id } => commands::notifier::test(id.clone()).await,
+            cli::NotifierCommands::Delete { id, yes } => {
+                commands::notifier::delete(id.clone(), *yes).await
+            }
+        },
+        #[cfg(unix)]
+        Commands::Variable(var_cmd) => match var_cmd {
+            cli::VariableCommands::List { scope, output } => {
+                commands::variable::list(scope.clone(), output).await
+            }
+            cli::VariableCommands::Set { name, value, scope } => {
+                commands::variable::set(name.clone(), value.clone(), scope.clone()).await
+            }
+            cli::VariableCommands::Get { name, scope } => {
+                commands::variable::get(name.clone(), scope.clone()).await
+            }
+            cli::VariableCommands::Unset { name, scope } => {
+                commands::variable::unset(name.clone(), scope.clone()).await
+            }
+        },
+        #[cfg(unix)]
+        Commands::Project(project_cmd) => match project_cmd {
+            cli::ProjectCommands::Ls { output } => commands::project::list(output).await,
+            cli::ProjectCommands::Create {
+                name,
+                git_url,
+                git_branch,
+                build_kind,
+                build_path,
+                description,
+                registry_credential,
+                git_credential,
+                default_env,
+            } => {
+                commands::project::create(
+                    name.clone(),
+                    git_url.clone(),
+                    git_branch.clone(),
+                    build_kind.map(|k| k.to_string()),
+                    build_path.clone(),
+                    description.clone(),
+                    registry_credential.clone(),
+                    git_credential.clone(),
+                    default_env.clone(),
+                )
+                .await
+            }
+            cli::ProjectCommands::Show { id, output } => {
+                commands::project::show(id.clone(), output).await
+            }
+            cli::ProjectCommands::Update {
+                id,
+                name,
+                description,
+                git_url,
+                git_branch,
+                build_kind,
+                build_path,
+                registry_credential,
+                git_credential,
+                default_env,
+            } => {
+                commands::project::update(
+                    id.clone(),
+                    name.clone(),
+                    description.clone(),
+                    git_url.clone(),
+                    git_branch.clone(),
+                    build_kind.map(|k| k.to_string()),
+                    build_path.clone(),
+                    registry_credential.clone(),
+                    git_credential.clone(),
+                    default_env.clone(),
+                )
+                .await
+            }
+            cli::ProjectCommands::Delete { id, yes } => {
+                commands::project::delete(id.clone(), *yes).await
+            }
+            cli::ProjectCommands::LinkDeployment { id, deployment } => {
+                commands::project::link_deployment(id.clone(), deployment.clone()).await
+            }
+            cli::ProjectCommands::UnlinkDeployment { id, deployment } => {
+                commands::project::unlink_deployment(id.clone(), deployment.clone()).await
+            }
+            cli::ProjectCommands::ListDeployments { id } => {
+                commands::project::list_deployments(id.clone()).await
+            }
+            cli::ProjectCommands::Pull { id } => commands::project::pull(id.clone()).await,
+            cli::ProjectCommands::AutoDeploy { id, enabled } => {
+                commands::project::auto_deploy(id.clone(), *enabled).await
+            }
+            cli::ProjectCommands::PollInterval { id, seconds } => {
+                commands::project::poll_interval(id.clone(), *seconds).await
+            }
+            cli::ProjectCommands::Webhook(wh_cmd) => match wh_cmd {
+                cli::WebhookCommands::Show { id } => {
+                    commands::project::webhook_show(id.clone()).await
+                }
+                cli::WebhookCommands::Rotate { id } => {
+                    commands::project::webhook_rotate(id.clone()).await
+                }
+            },
+        },
+        #[cfg(unix)]
+        Commands::Credential(cred_cmd) => match cred_cmd {
+            cli::CredentialCommands::Registry(reg_cmd) => match reg_cmd {
+                cli::RegistryCredentialCommands::Ls { output } => {
+                    commands::credential::registry_list(output).await
+                }
+                cli::RegistryCredentialCommands::Add {
+                    registry,
+                    username,
+                    password,
+                    auth_type,
+                } => {
+                    commands::credential::registry_add(
+                        registry.clone(),
+                        username.clone(),
+                        password.clone(),
+                        auth_type.to_string(),
+                    )
+                    .await
+                }
+                cli::RegistryCredentialCommands::Delete { id, yes } => {
+                    commands::credential::registry_delete(id.clone(), *yes).await
+                }
+            },
+            cli::CredentialCommands::Git(git_cmd) => match git_cmd {
+                cli::GitCredentialCommands::Ls { output } => {
+                    commands::credential::git_list(output).await
+                }
+                cli::GitCredentialCommands::Add { name, value, kind } => {
+                    commands::credential::git_add(name.clone(), value.clone(), kind.to_string())
+                        .await
+                }
+                cli::GitCredentialCommands::Delete { id, yes } => {
+                    commands::credential::git_delete(id.clone(), *yes).await
+                }
+            },
+        },
+        #[cfg(unix)]
+        Commands::Sync(sync_cmd) => match sync_cmd {
+            cli::SyncCommands::Ls { output } => commands::sync_cmd::list(output).await,
+            cli::SyncCommands::Create {
+                name,
+                project,
+                path,
+                auto_apply,
+            } => {
+                commands::sync_cmd::create(name.clone(), project.clone(), path.clone(), *auto_apply)
+                    .await
+            }
+            cli::SyncCommands::Diff { id } => commands::sync_cmd::diff(id.clone()).await,
+            cli::SyncCommands::Apply { id } => commands::sync_cmd::apply(id.clone()).await,
+            cli::SyncCommands::Delete { id, yes } => {
+                commands::sync_cmd::delete(id.clone(), *yes).await
+            }
+        },
+        #[cfg(unix)]
+        Commands::User(user_cmd) => match user_cmd {
+            cli::UserCommands::Ls { output } => commands::user::list(output).await,
+            cli::UserCommands::Create {
+                email,
+                password,
+                role,
+                display_name,
+            } => {
+                commands::user::create(
+                    email.clone(),
+                    password.clone(),
+                    (*role).into(),
+                    display_name.clone(),
+                )
+                .await
+            }
+            cli::UserCommands::SetRole { id, role } => {
+                commands::user::set_role(id.clone(), (*role).into()).await
+            }
+            cli::UserCommands::SetPassword { id } => commands::user::set_password(id.clone()).await,
+            cli::UserCommands::Delete { id, yes } => commands::user::delete(id.clone(), *yes).await,
+        },
+        #[cfg(unix)]
+        Commands::Group(group_cmd) => match group_cmd {
+            cli::GroupCommands::List { output } => commands::group::list(output).await,
+            cli::GroupCommands::Create { name } => commands::group::create(name.clone()).await,
+            cli::GroupCommands::Delete { id, yes } => {
+                commands::group::delete(id.clone(), *yes).await
+            }
+            cli::GroupCommands::Member(member_cmd) => match member_cmd {
+                cli::GroupMemberCommands::Add { group, user } => {
+                    commands::group::member_add(group.clone(), user.clone()).await
+                }
+                cli::GroupMemberCommands::Remove { group, user } => {
+                    commands::group::member_remove(group.clone(), user.clone()).await
+                }
+            },
+        },
+        #[cfg(unix)]
+        Commands::Permission(perm_cmd) => match perm_cmd {
+            cli::PermissionCommands::List {
+                user,
+                group,
+                output,
+            } => commands::permission::list(user.clone(), group.clone(), output).await,
+            cli::PermissionCommands::Grant {
+                subject_kind,
+                subject,
+                resource_kind,
+                resource,
+                level,
+            } => {
+                commands::permission::grant(
+                    (*subject_kind).into(),
+                    subject.clone(),
+                    resource_kind.clone(),
+                    resource.clone(),
+                    (*level).into(),
+                )
+                .await
+            }
+            cli::PermissionCommands::Revoke { id } => {
+                commands::permission::revoke(id.clone()).await
+            }
+        },
+        #[cfg(unix)]
+        Commands::Audit(audit_cmd) => match audit_cmd {
+            cli::AuditCommands::Tail {
+                user,
+                resource,
+                limit,
+                output,
+            } => {
+                commands::audit_cmd::tail(user.clone(), resource.clone(), Some(*limit), output)
+                    .await
+            }
+        },
 
         // On non-Unix platforms, runtime commands are not available
         #[cfg(not(unix))]

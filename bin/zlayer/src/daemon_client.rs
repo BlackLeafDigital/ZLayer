@@ -20,7 +20,11 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tokio::net::UnixStream;
 use tracing::{debug, info};
+use zlayer_api::handlers::auth::{BootstrapRequest, LoginRequest, LoginResponse, UserView};
 use zlayer_api::handlers::images::{ImageInfoDto, PruneResultDto};
+use zlayer_api::handlers::secrets::SecretMetadataResponse;
+use zlayer_api::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
+use zlayer_api::storage::{StoredEnvironment, StoredVariable};
 
 /// Default path for the daemon Unix socket.
 ///
@@ -271,16 +275,49 @@ impl DaemonClient {
     // Low-level HTTP helpers
     // ------------------------------------------------------------------
 
+    /// If the user has a saved session (`~/.zlayer/session.json`) with an
+    /// unexpired token, attach it as an `Authorization: Bearer <token>` header.
+    /// When the file is absent or the token has expired, this is a no-op -- the
+    /// daemon's Unix-socket middleware will inject the local-admin token.
+    fn apply_session_auth(
+        mut builder: hyper::http::request::Builder,
+    ) -> hyper::http::request::Builder {
+        match crate::session::read_session() {
+            Ok(Some(session)) if !session.is_expired() => {
+                builder = builder.header(
+                    hyper::header::AUTHORIZATION,
+                    format!("Bearer {}", session.token),
+                );
+            }
+            Ok(Some(expired)) => {
+                tracing::debug!(
+                    email = %expired.email,
+                    "Session file present but token has expired; ignoring"
+                );
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to read session file; proceeding without bearer"
+                );
+            }
+        }
+        builder
+    }
+
     /// Send a GET request and return the response body as bytes.
     async fn get(&self, path: &str) -> Result<(hyper::StatusCode, Bytes)> {
         let uri: Uri = format!("http://localhost{path}")
             .parse()
             .with_context(|| format!("Invalid request path: {path}"))?;
 
-        let req = hyper::Request::builder()
+        let builder = hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri(uri)
-            .header("Host", "localhost")
+            .header("Host", "localhost");
+        let builder = Self::apply_session_auth(builder);
+        let req = builder
             .body(Full::new(Bytes::new()))
             .context("Failed to build GET request")?;
 
@@ -307,11 +344,13 @@ impl DaemonClient {
             .parse()
             .with_context(|| format!("Invalid request path: {path}"))?;
 
-        let req = hyper::Request::builder()
+        let builder = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(uri)
             .header("Host", "localhost")
-            .header("Content-Type", "application/json")
+            .header("Content-Type", "application/json");
+        let builder = Self::apply_session_auth(builder);
+        let req = builder
             .body(Full::new(Bytes::from(body.to_owned())))
             .context("Failed to build POST request")?;
 
@@ -338,10 +377,12 @@ impl DaemonClient {
             .parse()
             .with_context(|| format!("Invalid request path: {path}"))?;
 
-        let req = hyper::Request::builder()
+        let builder = hyper::Request::builder()
             .method(hyper::Method::DELETE)
             .uri(uri)
-            .header("Host", "localhost")
+            .header("Host", "localhost");
+        let builder = Self::apply_session_auth(builder);
+        let req = builder
             .body(Full::new(Bytes::new()))
             .context("Failed to build DELETE request")?;
 
@@ -350,6 +391,74 @@ impl DaemonClient {
             .request(req)
             .await
             .with_context(|| format!("DELETE {path} failed"))?;
+
+        let status = resp.status();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .context("Failed to read response body")?
+            .to_bytes();
+
+        Ok((status, body))
+    }
+
+    /// Send a POST request with a plain-text body and return the response.
+    ///
+    /// Used for endpoints whose body is not JSON (e.g. dotenv bulk imports).
+    async fn post_text(&self, path: &str, body: &str) -> Result<(hyper::StatusCode, Bytes)> {
+        let uri: Uri = format!("http://localhost{path}")
+            .parse()
+            .with_context(|| format!("Invalid request path: {path}"))?;
+
+        let builder = hyper::Request::builder()
+            .method(hyper::Method::POST)
+            .uri(uri)
+            .header("Host", "localhost")
+            .header("Content-Type", "text/plain; charset=utf-8");
+        let builder = Self::apply_session_auth(builder);
+        let req = builder
+            .body(Full::new(Bytes::from(body.to_owned())))
+            .context("Failed to build POST request")?;
+
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("POST {path} failed"))?;
+
+        let status = resp.status();
+        let body = resp
+            .into_body()
+            .collect()
+            .await
+            .context("Failed to read response body")?
+            .to_bytes();
+
+        Ok((status, body))
+    }
+
+    /// Send a PATCH request with a JSON body and return the response.
+    async fn patch_json(&self, path: &str, body: &str) -> Result<(hyper::StatusCode, Bytes)> {
+        let uri: Uri = format!("http://localhost{path}")
+            .parse()
+            .with_context(|| format!("Invalid request path: {path}"))?;
+
+        let builder = hyper::Request::builder()
+            .method(hyper::Method::PATCH)
+            .uri(uri)
+            .header("Host", "localhost")
+            .header("Content-Type", "application/json");
+        let builder = Self::apply_session_auth(builder);
+        let req = builder
+            .body(Full::new(Bytes::from(body.to_owned())))
+            .context("Failed to build PATCH request")?;
+
+        let resp = self
+            .client
+            .request(req)
+            .await
+            .with_context(|| format!("PATCH {path} failed"))?;
 
         let status = resp.status();
         let body = resp
@@ -1255,6 +1364,983 @@ impl DaemonClient {
             urlencoding(deployment),
             urlencoding(cron),
         );
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    // ------------------------------------------------------------------
+    // Auth
+    // ------------------------------------------------------------------
+
+    /// POST /auth/bootstrap -- create the first admin user. Returns the user view and csrf token.
+    pub async fn auth_bootstrap(&self, req: &BootstrapRequest) -> Result<LoginResponse> {
+        let body = serde_json::to_string(req).context("Failed to serialise BootstrapRequest")?;
+        let (status, resp_body) = self.post_json("/auth/bootstrap", &body).await?;
+        Self::check_status(status, &resp_body)?;
+        Self::parse_json(&resp_body)
+    }
+
+    /// POST /auth/login -- authenticate by email+password. Returns the session cookie
+    /// via HTTP headers (discarded here -- CLI stores the separately-obtained token from
+    /// /auth/token) and the login response body.
+    pub async fn auth_login(&self, req: &LoginRequest) -> Result<LoginResponse> {
+        let body = serde_json::to_string(req).context("Failed to serialise LoginRequest")?;
+        let (status, resp_body) = self.post_json("/auth/login", &body).await?;
+        Self::check_status(status, &resp_body)?;
+        Self::parse_json(&resp_body)
+    }
+
+    /// POST /auth/logout -- invalidate the session cookie on the server.
+    /// CLI-side session-file deletion happens separately in commands/auth.rs.
+    pub async fn auth_logout(&self) -> Result<()> {
+        let (status, resp_body) = self.post_json("/auth/logout", "").await?;
+        // 204 No Content is success.
+        if status.is_success() {
+            Ok(())
+        } else {
+            Self::check_status(status, &resp_body)
+        }
+    }
+
+    /// GET /auth/me -- current user from the attached session/Bearer auth.
+    pub async fn auth_whoami(&self) -> Result<UserView> {
+        let (status, body) = self.get("/auth/me").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// POST /auth/token -- exchange email+password for a JWT. Used by `zlayer auth
+    /// login` to persist a token in the session file. Returns a raw JSON value so
+    /// the caller can extract `access_token` without coupling to zlayer-api types
+    /// that aren't re-exported there.
+    pub async fn auth_token(&self, api_key: &str, api_secret: &str) -> Result<serde_json::Value> {
+        let body = serde_json::json!({
+            "api_key": api_key,
+            "api_secret": api_secret,
+        })
+        .to_string();
+        let (status, resp_body) = self.post_json("/auth/token", &body).await?;
+        Self::check_status(status, &resp_body)?;
+        Self::parse_json(&resp_body)
+    }
+
+    // ------------------------------------------------------------------
+    // Users
+    // ------------------------------------------------------------------
+
+    /// GET /api/v1/users -- list all users (admin).
+    pub async fn list_users(&self) -> Result<Vec<UserView>> {
+        let (status, body) = self.get("/api/v1/users").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// POST /api/v1/users -- create a new user (admin).
+    pub async fn create_user(&self, req: &CreateUserRequest) -> Result<UserView> {
+        let body = serde_json::to_string(req).context("Failed to serialise CreateUserRequest")?;
+        let (status, resp_body) = self.post_json("/api/v1/users", &body).await?;
+        Self::check_status(status, &resp_body)?;
+        Self::parse_json(&resp_body)
+    }
+
+    /// GET /api/v1/users/{id}.
+    pub async fn get_user(&self, id: &str) -> Result<UserView> {
+        let path = format!("/api/v1/users/{}", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// PATCH /api/v1/users/{id} -- update user fields.
+    pub async fn update_user(&self, id: &str, req: &UpdateUserRequest) -> Result<UserView> {
+        let body = serde_json::to_string(req).context("Failed to serialise UpdateUserRequest")?;
+        let path = format!("/api/v1/users/{}", urlencoding(id));
+        let (status, resp_body) = self.patch_json(&path, &body).await?;
+        Self::check_status(status, &resp_body)?;
+        Self::parse_json(&resp_body)
+    }
+
+    /// DELETE /api/v1/users/{id}.
+    pub async fn delete_user(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/users/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Self::check_status(status, &body)
+        }
+    }
+
+    /// POST /api/v1/users/{id}/password -- set a user's password (admin or self-service).
+    pub async fn set_user_password(&self, id: &str, req: &SetPasswordRequest) -> Result<()> {
+        let body = serde_json::to_string(req).context("Failed to serialise SetPasswordRequest")?;
+        let path = format!("/api/v1/users/{}/password", urlencoding(id));
+        let (status, resp_body) = self.post_json(&path, &body).await?;
+        if status.is_success() {
+            Ok(())
+        } else {
+            Self::check_status(status, &resp_body)
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Environments
+    // ------------------------------------------------------------------
+
+    /// List environments, optionally filtered by project id.
+    ///
+    /// `GET /api/v1/environments?project={id}` (omit `project` for globals,
+    /// pass `*` to list every environment across projects + globals).
+    pub async fn list_environments(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<StoredEnvironment>> {
+        let path = match project_id {
+            Some(p) => format!("/api/v1/environments?project={}", urlencoding(p)),
+            None => "/api/v1/environments".to_string(),
+        };
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new environment.
+    ///
+    /// `POST /api/v1/environments` with `{ name, project_id?, description? }`.
+    pub async fn create_environment(
+        &self,
+        name: &str,
+        project_id: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<StoredEnvironment> {
+        let body = serde_json::json!({
+            "name": name,
+            "project_id": project_id,
+            "description": description,
+        })
+        .to_string();
+        let (status, resp) = self.post_json("/api/v1/environments", &body).await?;
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
+    /// Fetch a single environment by id.
+    ///
+    /// `GET /api/v1/environments/{id}`.
+    pub async fn get_environment(&self, id: &str) -> Result<StoredEnvironment> {
+        let path = format!("/api/v1/environments/{}", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Update an environment's name and/or description.
+    ///
+    /// `PATCH /api/v1/environments/{id}` with `{ name?, description? }`.
+    pub async fn update_environment(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<StoredEnvironment> {
+        let body = serde_json::json!({
+            "name": name,
+            "description": description,
+        })
+        .to_string();
+        let path = format!("/api/v1/environments/{}", urlencoding(id));
+        let (status, resp) = self.patch_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Delete an environment.
+    ///
+    /// `DELETE /api/v1/environments/{id}` — 204 on success, 409 if the
+    /// environment still has secrets.
+    pub async fn delete_environment(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/environments/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Variables
+    // ------------------------------------------------------------------
+
+    /// List variables, optionally filtered by scope.
+    ///
+    /// `GET /api/v1/variables?scope={id}` (omit `scope` for globals).
+    pub async fn list_variables(&self, scope: Option<&str>) -> Result<Vec<StoredVariable>> {
+        let path = match scope {
+            Some(s) => format!("/api/v1/variables?scope={}", urlencoding(s)),
+            None => "/api/v1/variables".to_string(),
+        };
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new variable.
+    ///
+    /// `POST /api/v1/variables` with `{ name, value, scope? }`.
+    pub async fn create_variable(
+        &self,
+        name: &str,
+        value: &str,
+        scope: Option<&str>,
+    ) -> Result<StoredVariable> {
+        let body = serde_json::json!({
+            "name": name,
+            "value": value,
+            "scope": scope,
+        })
+        .to_string();
+        let (status, resp) = self.post_json("/api/v1/variables", &body).await?;
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
+    /// Fetch a single variable by id.
+    ///
+    /// `GET /api/v1/variables/{id}`.
+    pub async fn get_variable(&self, id: &str) -> Result<StoredVariable> {
+        let path = format!("/api/v1/variables/{}", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Update a variable's name and/or value.
+    ///
+    /// `PATCH /api/v1/variables/{id}` with `{ name?, value? }`.
+    pub async fn update_variable(
+        &self,
+        id: &str,
+        name: Option<&str>,
+        value: Option<&str>,
+    ) -> Result<StoredVariable> {
+        let body = serde_json::json!({
+            "name": name,
+            "value": value,
+        })
+        .to_string();
+        let path = format!("/api/v1/variables/{}", urlencoding(id));
+        let (status, resp) = self.patch_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Delete a variable.
+    ///
+    /// `DELETE /api/v1/variables/{id}` -- 204 on success.
+    pub async fn delete_variable(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/variables/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Projects
+    // ------------------------------------------------------------------
+
+    /// List all projects.
+    ///
+    /// `GET /api/v1/projects`
+    pub async fn list_projects(&self) -> Result<Vec<serde_json::Value>> {
+        let (status, body) = self.get("/api/v1/projects").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new project.
+    ///
+    /// `POST /api/v1/projects`
+    pub async fn create_project(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        let (status, resp) = self
+            .post_json("/api/v1/projects", &body.to_string())
+            .await?;
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
+    /// Get a project by id.
+    ///
+    /// `GET /api/v1/projects/{id}`
+    pub async fn get_project(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/projects/{}", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Update a project (partial).
+    ///
+    /// `PATCH /api/v1/projects/{id}`
+    pub async fn update_project(
+        &self,
+        id: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/projects/{}", urlencoding(id));
+        let (status, resp) = self.patch_json(&path, &body.to_string()).await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    /// Delete a project.
+    ///
+    /// `DELETE /api/v1/projects/{id}` -- 204 on success.
+    pub async fn delete_project(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/projects/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// List deployments linked to a project.
+    ///
+    /// `GET /api/v1/projects/{id}/deployments`
+    pub async fn list_project_deployments(&self, id: &str) -> Result<Vec<String>> {
+        let path = format!("/api/v1/projects/{}/deployments", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Link a deployment to a project.
+    ///
+    /// `POST /api/v1/projects/{id}/deployments` with `{"deployment_name": "..."}`
+    pub async fn link_project_deployment(&self, id: &str, deployment_name: &str) -> Result<()> {
+        let path = format!("/api/v1/projects/{}/deployments", urlencoding(id));
+        let payload = serde_json::json!({ "deployment_name": deployment_name });
+        let (status, body) = self.post_json(&path, &payload.to_string()).await?;
+        if !status.is_success() {
+            Self::check_status(status, &body)?;
+        }
+        Ok(())
+    }
+
+    /// Unlink a deployment from a project.
+    ///
+    /// `DELETE /api/v1/projects/{id}/deployments/{name}`
+    pub async fn unlink_project_deployment(&self, id: &str, deployment_name: &str) -> Result<()> {
+        let path = format!(
+            "/api/v1/projects/{}/deployments/{}",
+            urlencoding(id),
+            urlencoding(deployment_name),
+        );
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Clone or fast-forward pull a project's git repository on the daemon.
+    ///
+    /// `POST /api/v1/projects/{id}/pull` -- returns `{ project_id, git_url,
+    /// branch, sha, path }`.
+    pub async fn project_pull(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/projects/{}/pull", urlencoding(id));
+        // POST with an empty body; `post_json` requires a serialised payload
+        // so we send `{}` here to match the route's lack of a request body.
+        let (status, resp) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    // ------------------------------------------------------------------
+    // Webhooks
+    // ------------------------------------------------------------------
+
+    /// Get webhook configuration (URL + secret) for a project.
+    ///
+    /// `GET /api/v1/projects/{id}/webhook`
+    pub async fn get_project_webhook(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/projects/{}/webhook", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Rotate the webhook secret for a project.
+    ///
+    /// `POST /api/v1/projects/{id}/webhook/rotate`
+    pub async fn rotate_project_webhook(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/projects/{}/webhook/rotate", urlencoding(id));
+        let (status, resp) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    // ------------------------------------------------------------------
+    // Credentials
+    // ------------------------------------------------------------------
+
+    /// List registry credentials.
+    ///
+    /// `GET /api/v1/credentials/registry`
+    pub async fn list_registry_credentials(&self) -> Result<Vec<serde_json::Value>> {
+        let (status, body) = self.get("/api/v1/credentials/registry").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a registry credential.
+    ///
+    /// `POST /api/v1/credentials/registry`
+    pub async fn create_registry_credential(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let (status, resp) = self
+            .post_json("/api/v1/credentials/registry", &body.to_string())
+            .await?;
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
+    /// Delete a registry credential.
+    ///
+    /// `DELETE /api/v1/credentials/registry/{id}`
+    pub async fn delete_registry_credential(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/credentials/registry/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// List git credentials.
+    ///
+    /// `GET /api/v1/credentials/git`
+    pub async fn list_git_credentials(&self) -> Result<Vec<serde_json::Value>> {
+        let (status, body) = self.get("/api/v1/credentials/git").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a git credential.
+    ///
+    /// `POST /api/v1/credentials/git`
+    pub async fn create_git_credential(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let (status, resp) = self
+            .post_json("/api/v1/credentials/git", &body.to_string())
+            .await?;
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
+    /// Delete a git credential.
+    ///
+    /// `DELETE /api/v1/credentials/git/{id}`
+    pub async fn delete_git_credential(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/credentials/git/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Env-scoped secrets
+    // ------------------------------------------------------------------
+
+    /// List secrets under a specific environment.
+    ///
+    /// `GET /api/v1/secrets?environment={env_id}`.
+    pub async fn list_secrets_in_env(&self, env_id: &str) -> Result<Vec<SecretMetadataResponse>> {
+        let path = format!("/api/v1/secrets?environment={}", urlencoding(env_id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Set (create or update) a secret under a specific environment.
+    ///
+    /// `POST /api/v1/secrets?environment={env_id}` with `{ name, value }`.
+    pub async fn set_secret_in_env(
+        &self,
+        env_id: &str,
+        name: &str,
+        value: &str,
+    ) -> Result<SecretMetadataResponse> {
+        let path = format!("/api/v1/secrets?environment={}", urlencoding(env_id));
+        let body = serde_json::json!({ "name": name, "value": value }).to_string();
+        let (status, resp) = self.post_json(&path, &body).await?;
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
+    /// Delete a secret under a specific environment.
+    ///
+    /// `DELETE /api/v1/secrets/{name}?environment={env_id}` — 204 on success.
+    pub async fn delete_secret_in_env(&self, env_id: &str, name: &str) -> Result<()> {
+        let path = format!(
+            "/api/v1/secrets/{}?environment={}",
+            urlencoding(name),
+            urlencoding(env_id),
+        );
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Reveal a secret value under a specific environment (admin only).
+    ///
+    /// `GET /api/v1/secrets/{name}?environment={env_id}&reveal=true`.
+    /// Returns the plaintext value extracted from the `SecretMetadataResponse`.
+    pub async fn reveal_secret_in_env(&self, env_id: &str, name: &str) -> Result<String> {
+        let path = format!(
+            "/api/v1/secrets/{}?environment={}&reveal=true",
+            urlencoding(name),
+            urlencoding(env_id),
+        );
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        let resp: SecretMetadataResponse = Self::parse_json(&body)?;
+        resp.value
+            .ok_or_else(|| anyhow::anyhow!("Daemon did not return a value for revealed secret"))
+    }
+
+    /// Bulk-import secrets from a `.env`-style body into a specific environment.
+    ///
+    /// `POST /api/v1/secrets/bulk-import?environment={env_id}` with a
+    /// `text/plain` body containing `KEY=VALUE` lines. Returns the raw import
+    /// summary ({ created, updated, errors }) as a JSON value so the caller
+    /// can render it verbatim.
+    pub async fn bulk_import_secrets(
+        &self,
+        env_id: &str,
+        dotenv_body: &str,
+    ) -> Result<serde_json::Value> {
+        let path = format!(
+            "/api/v1/secrets/bulk-import?environment={}",
+            urlencoding(env_id),
+        );
+        let (status, resp) = self.post_text(&path, dotenv_body).await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
+    // ------------------------------------------------------------------
+    // Syncs
+    // ------------------------------------------------------------------
+
+    /// List all syncs.
+    ///
+    /// `GET /api/v1/syncs`
+    pub async fn list_syncs(&self) -> Result<Vec<serde_json::Value>> {
+        let (status, body) = self.get("/api/v1/syncs").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new sync.
+    ///
+    /// `POST /api/v1/syncs`
+    pub async fn create_sync(&self, body: &serde_json::Value) -> Result<serde_json::Value> {
+        let (status, resp) = self.post_json("/api/v1/syncs", &body.to_string()).await?;
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
+    /// Get the diff for a sync.
+    ///
+    /// `GET /api/v1/syncs/{id}/diff`
+    pub async fn diff_sync(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/syncs/{}/diff", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Apply a sync (dry-run in v1).
+    ///
+    /// `POST /api/v1/syncs/{id}/apply`
+    pub async fn apply_sync(&self, id: &str) -> Result<serde_json::Value> {
+        let path = format!("/api/v1/syncs/{}/apply", urlencoding(id));
+        let (status, body) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Delete a sync.
+    ///
+    /// `DELETE /api/v1/syncs/{id}` -- 204 on success.
+    pub async fn delete_sync(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/syncs/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Tasks
+    // ------------------------------------------------------------------
+
+    /// List all tasks, optionally filtered by project id.
+    ///
+    /// `GET /api/v1/tasks[?project_id={id}]`
+    pub async fn list_tasks(
+        &self,
+        project_id: Option<&str>,
+    ) -> Result<Vec<zlayer_api::StoredTask>> {
+        let path = match project_id {
+            Some(pid) => format!("/api/v1/tasks?project_id={}", urlencoding(pid)),
+            None => "/api/v1/tasks".to_string(),
+        };
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new task.
+    ///
+    /// `POST /api/v1/tasks` with `{ name, kind, body, project_id? }`.
+    pub async fn create_task(
+        &self,
+        name: &str,
+        kind: &str,
+        body_script: &str,
+        project_id: Option<&str>,
+    ) -> Result<zlayer_api::StoredTask> {
+        let payload = serde_json::json!({
+            "name": name,
+            "kind": kind,
+            "body": body_script,
+            "project_id": project_id,
+        })
+        .to_string();
+        let (status, resp) = self.post_json("/api/v1/tasks", &payload).await?;
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
+    /// Fetch a single task by id.
+    ///
+    /// `GET /api/v1/tasks/{id}`.
+    pub async fn get_task(&self, id: &str) -> Result<zlayer_api::StoredTask> {
+        let path = format!("/api/v1/tasks/{}", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Execute a task synchronously.
+    ///
+    /// `POST /api/v1/tasks/{id}/run`.
+    pub async fn run_task(&self, id: &str) -> Result<zlayer_api::TaskRun> {
+        let path = format!("/api/v1/tasks/{}/run", urlencoding(id));
+        let (status, body) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// List past runs for a task.
+    ///
+    /// `GET /api/v1/tasks/{id}/runs`.
+    pub async fn list_task_runs(&self, id: &str) -> Result<Vec<zlayer_api::TaskRun>> {
+        let path = format!("/api/v1/tasks/{}/runs", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Delete a task.
+    ///
+    /// `DELETE /api/v1/tasks/{id}` -- 204 on success.
+    pub async fn delete_task(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/tasks/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Workflows
+    // ------------------------------------------------------------------
+
+    /// List all workflows.
+    ///
+    /// `GET /api/v1/workflows`
+    pub async fn list_workflows(&self) -> Result<Vec<zlayer_api::StoredWorkflow>> {
+        let (status, body) = self.get("/api/v1/workflows").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new workflow.
+    ///
+    /// `POST /api/v1/workflows` with `{ name, steps, project_id? }`.
+    ///
+    /// `steps_json` is a raw JSON array of workflow steps.
+    pub async fn create_workflow(
+        &self,
+        name: &str,
+        steps_json: &str,
+        project_id: Option<&str>,
+    ) -> Result<zlayer_api::StoredWorkflow> {
+        // Parse the steps JSON to validate it before sending
+        let steps: serde_json::Value =
+            serde_json::from_str(steps_json).context("Invalid JSON for --steps")?;
+
+        let payload = serde_json::json!({
+            "name": name,
+            "steps": steps,
+            "project_id": project_id,
+        })
+        .to_string();
+        let (status, resp) = self.post_json("/api/v1/workflows", &payload).await?;
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
+    /// Execute a workflow synchronously.
+    ///
+    /// `POST /api/v1/workflows/{id}/run`.
+    pub async fn run_workflow(&self, id: &str) -> Result<zlayer_api::WorkflowRun> {
+        let path = format!("/api/v1/workflows/{}/run", urlencoding(id));
+        let (status, body) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// List past runs for a workflow.
+    ///
+    /// `GET /api/v1/workflows/{id}/runs`.
+    pub async fn list_workflow_runs(&self, id: &str) -> Result<Vec<zlayer_api::WorkflowRun>> {
+        let path = format!("/api/v1/workflows/{}/runs", urlencoding(id));
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Delete a workflow.
+    ///
+    /// `DELETE /api/v1/workflows/{id}` -- 204 on success.
+    pub async fn delete_workflow(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/workflows/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Notifiers
+    // ------------------------------------------------------------------
+
+    /// List all notifiers.
+    ///
+    /// `GET /api/v1/notifiers`
+    pub async fn list_notifiers(&self) -> Result<Vec<zlayer_api::StoredNotifier>> {
+        let (status, body) = self.get("/api/v1/notifiers").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new notifier.
+    ///
+    /// `POST /api/v1/notifiers` with `{ name, kind, config }`.
+    pub async fn create_notifier(
+        &self,
+        name: &str,
+        kind: zlayer_api::NotifierKind,
+        config: &zlayer_api::NotifierConfig,
+    ) -> Result<zlayer_api::StoredNotifier> {
+        let payload = serde_json::json!({
+            "name": name,
+            "kind": kind,
+            "config": config,
+        })
+        .to_string();
+        let (status, resp) = self.post_json("/api/v1/notifiers", &payload).await?;
+        if !status.is_success() {
+            Self::check_status(status, &resp)?;
+        }
+        Self::parse_json(&resp)
+    }
+
+    /// Send a test notification through a notifier.
+    ///
+    /// `POST /api/v1/notifiers/{id}/test`.
+    pub async fn test_notifier(&self, id: &str) -> Result<zlayer_api::TestNotifierResponse> {
+        let path = format!("/api/v1/notifiers/{}/test", urlencoding(id));
+        let (status, body) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Delete a notifier.
+    ///
+    /// `DELETE /api/v1/notifiers/{id}` -- 204 on success.
+    pub async fn delete_notifier(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/notifiers/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Groups
+    // ------------------------------------------------------------------
+
+    /// List all groups.
+    ///
+    /// `GET /api/v1/groups`
+    pub async fn list_groups(&self) -> Result<Vec<zlayer_api::storage::StoredUserGroup>> {
+        let (status, body) = self.get("/api/v1/groups").await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a group.
+    ///
+    /// `POST /api/v1/groups`
+    pub async fn create_group(
+        &self,
+        req: &zlayer_api::CreateGroupRequest,
+    ) -> Result<zlayer_api::storage::StoredUserGroup> {
+        let body = serde_json::to_string(req).context("Failed to serialise CreateGroupRequest")?;
+        let (status, resp_body) = self.post_json("/api/v1/groups", &body).await?;
+        Self::check_status(status, &resp_body)?;
+        Self::parse_json(&resp_body)
+    }
+
+    /// Delete a group.
+    ///
+    /// `DELETE /api/v1/groups/{id}` -- 204 on success.
+    pub async fn delete_group(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/groups/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Add a member to a group.
+    ///
+    /// `POST /api/v1/groups/{id}/members`
+    pub async fn add_group_member(&self, group_id: &str, user_id: &str) -> Result<()> {
+        let req = zlayer_api::AddMemberRequest {
+            user_id: user_id.to_string(),
+        };
+        let body = serde_json::to_string(&req).context("Failed to serialise AddMemberRequest")?;
+        let path = format!("/api/v1/groups/{}/members", urlencoding(group_id));
+        let (status, resp_body) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp_body)?;
+        Ok(())
+    }
+
+    /// Remove a member from a group.
+    ///
+    /// `DELETE /api/v1/groups/{id}/members/{user_id}`
+    pub async fn remove_group_member(&self, group_id: &str, user_id: &str) -> Result<()> {
+        let path = format!(
+            "/api/v1/groups/{}/members/{}",
+            urlencoding(group_id),
+            urlencoding(user_id)
+        );
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Permissions
+    // ------------------------------------------------------------------
+
+    /// List permissions for a subject.
+    ///
+    /// `GET /api/v1/permissions?user={id}` or `?group={id}`
+    pub async fn list_permissions(
+        &self,
+        user: Option<&str>,
+        group: Option<&str>,
+    ) -> Result<Vec<zlayer_api::storage::StoredPermission>> {
+        let mut path = "/api/v1/permissions".to_string();
+        if let Some(uid) = user {
+            path = format!("{path}?user={}", urlencoding(uid));
+        } else if let Some(gid) = group {
+            path = format!("{path}?group={}", urlencoding(gid));
+        }
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Grant a permission.
+    ///
+    /// `POST /api/v1/permissions`
+    pub async fn grant_permission(
+        &self,
+        req: &zlayer_api::GrantPermissionRequest,
+    ) -> Result<zlayer_api::storage::StoredPermission> {
+        let body =
+            serde_json::to_string(req).context("Failed to serialise GrantPermissionRequest")?;
+        let (status, resp_body) = self.post_json("/api/v1/permissions", &body).await?;
+        Self::check_status(status, &resp_body)?;
+        Self::parse_json(&resp_body)
+    }
+
+    /// Revoke a permission.
+    ///
+    /// `DELETE /api/v1/permissions/{id}` -- 204 on success.
+    pub async fn revoke_permission(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/permissions/{}", urlencoding(id));
+        let (status, body) = self.delete(&path).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Audit
+    // ------------------------------------------------------------------
+
+    /// List audit entries with optional filters.
+    ///
+    /// `GET /api/v1/audit?user={id}&resource_kind={k}&limit={n}`
+    pub async fn list_audit(
+        &self,
+        user: Option<&str>,
+        resource_kind: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<zlayer_api::storage::AuditEntry>> {
+        let mut params = Vec::new();
+        if let Some(u) = user {
+            params.push(format!("user={}", urlencoding(u)));
+        }
+        if let Some(rk) = resource_kind {
+            params.push(format!("resource_kind={}", urlencoding(rk)));
+        }
+        if let Some(l) = limit {
+            params.push(format!("limit={l}"));
+        }
+        let path = if params.is_empty() {
+            "/api/v1/audit".to_string()
+        } else {
+            format!("/api/v1/audit?{}", params.join("&"))
+        };
         let (status, body) = self.get(&path).await?;
         Self::check_status(status, &body)?;
         Self::parse_json(&body)

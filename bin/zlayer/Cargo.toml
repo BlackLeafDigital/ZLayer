@@ -45,6 +45,8 @@ zlayer-tui.workspace = true
 
 # CLI
 clap = { workspace = true, features = ["derive", "env"] }
+# Interactive prompts for disambiguation
+dialoguer = { version = "0.11", default-features = false, features = ["password"] }
 
 # Async
 tokio = { workspace = true, features = ["full"] }
@@ -103,6 +105,9 @@ sd-notify = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 zlayer-wsl = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

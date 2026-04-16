@@ -713,7 +713,20 @@ impl BuildahCommand {
             Instruction::Env(env) => Self::config_envs(container, env),
 
             Instruction::Workdir(dir) => {
-                vec![Self::config_workdir(container, dir)]
+                // Match Docker's WORKDIR semantics: create the directory in
+                // the rootfs as well as updating image metadata. `buildah
+                // config --workingdir` alone is metadata-only, which leaves
+                // containers that chdir(cwd) at init time failing with
+                // ENOENT when the path wasn't otherwise materialised by a
+                // prior RUN/COPY. mkdir -p is idempotent, so this is safe
+                // when the directory already exists.
+                vec![
+                    Self::run_exec(
+                        container,
+                        &["mkdir".to_string(), "-p".to_string(), dir.clone()],
+                    ),
+                    Self::config_workdir(container, dir),
+                ]
             }
 
             Instruction::Expose(expose) => {
@@ -884,6 +897,30 @@ mod tests {
         let cmds = BuildahCommand::from_instruction("container-1", &instruction);
         assert_eq!(cmds.len(), 1);
         assert!(cmds[0].args.contains(&"run".to_string()));
+    }
+
+    #[test]
+    fn test_from_instruction_workdir_creates_and_configures() {
+        // WORKDIR must both create the dir in the rootfs (like Docker) AND
+        // update image metadata. Emitting only `config --workingdir` leaves
+        // containers chdir-ing to a missing directory at init time.
+        let instruction = Instruction::Workdir("/workspace".to_string());
+        let cmds = BuildahCommand::from_instruction("container-1", &instruction);
+
+        assert_eq!(cmds.len(), 2, "WORKDIR should emit mkdir + config");
+
+        let run_args = &cmds[0].args;
+        assert_eq!(run_args[0], "run");
+        assert_eq!(run_args[1], "container-1");
+        assert_eq!(run_args[2], "--");
+        assert_eq!(run_args[3], "mkdir");
+        assert_eq!(run_args[4], "-p");
+        assert_eq!(run_args[5], "/workspace");
+
+        assert_eq!(
+            cmds[1].args,
+            vec!["config", "--workingdir", "/workspace", "container-1"]
+        );
     }
 
     #[test]

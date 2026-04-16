@@ -3,8 +3,9 @@
 //! Top navigation bar with hamburger menu (mobile) and theme info.
 
 use leptos::prelude::*;
+use leptos::task::spawn_local;
 
-use crate::app::server_fns::get_runtime_name;
+use crate::app::server_fns::{get_runtime_name, manager_logout, manager_me};
 
 const THEME_STORAGE_KEY: &str = "zlm-theme";
 const THEME_DARK: &str = "dark";
@@ -34,8 +35,19 @@ fn read_saved_theme() -> String {
 
 /// Navbar component for ZLayer Manager
 #[component]
+#[allow(clippy::too_many_lines)] // view macro DSL; matches Sidebar's pattern
 pub fn Navbar() -> impl IntoView {
     let runtime = Resource::new(|| (), |()| get_runtime_name());
+    let me = Resource::new(|| (), |()| async move { manager_me().await });
+
+    let on_logout = move |_| {
+        spawn_local(async move {
+            let _ = manager_logout().await;
+            if let Some(w) = web_sys::window() {
+                let _ = w.location().set_href("/login");
+            }
+        });
+    };
 
     // true = dark theme, false = light ("zlayer") theme
     let is_dark = RwSignal::new(true);
@@ -121,6 +133,74 @@ pub fn Navbar() -> impl IntoView {
                         </svg>
                     </Show>
                 </button>
+                <Suspense fallback=|| ().into_any()>
+                    {move || {
+                        match me.get() {
+                            Some(Ok(resp)) => {
+                                if let Some(user) = resp.user {
+                                    view! {
+                                        <div class="dropdown dropdown-end">
+                                            <div
+                                                tabindex="0"
+                                                role="button"
+                                                class="btn btn-ghost btn-sm gap-2"
+                                            >
+                                                <svg
+                                                    xmlns="http://www.w3.org/2000/svg"
+                                                    fill="none"
+                                                    viewBox="0 0 24 24"
+                                                    stroke-width="1.5"
+                                                    stroke="currentColor"
+                                                    class="w-5 h-5"
+                                                >
+                                                    <path
+                                                        stroke-linecap="round"
+                                                        stroke-linejoin="round"
+                                                        d="M15.75 6a3.75 3.75 0 11-7.5 0 3.75 3.75 0 017.5 0zM4.501 20.118a7.5 7.5 0 0114.998 0A17.933 17.933 0 0112 21.75c-2.676 0-5.216-.584-7.499-1.632z"
+                                                    />
+                                                </svg>
+                                                <span class="hidden sm:inline">
+                                                    {user.display_name.clone()}
+                                                </span>
+                                            </div>
+                                            <ul
+                                                tabindex="0"
+                                                class="dropdown-content menu bg-base-200 rounded-box z-40 w-56 p-2 shadow"
+                                            >
+                                                <li class="menu-title">
+                                                    <span class="text-xs">{user.email.clone()}</span>
+                                                </li>
+                                                <li>
+                                                    <button on:click=on_logout>
+                                                        <svg
+                                                            xmlns="http://www.w3.org/2000/svg"
+                                                            fill="none"
+                                                            viewBox="0 0 24 24"
+                                                            stroke-width="1.5"
+                                                            stroke="currentColor"
+                                                            class="w-4 h-4"
+                                                        >
+                                                            <path
+                                                                stroke-linecap="round"
+                                                                stroke-linejoin="round"
+                                                                d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15M12 9l-3 3m0 0l3 3m-3-3h12.75"
+                                                            />
+                                                        </svg>
+                                                        "Sign out"
+                                                    </button>
+                                                </li>
+                                            </ul>
+                                        </div>
+                                    }
+                                        .into_any()
+                                } else {
+                                    ().into_any()
+                                }
+                            }
+                            _ => ().into_any(),
+                        }
+                    }}
+                </Suspense>
             </div>
         </div>
     }

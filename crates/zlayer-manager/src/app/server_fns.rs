@@ -19,11 +19,32 @@ use crate::api_client::{ApiClientError, ZLayerClient};
 #[cfg(feature = "ssr")]
 const DEFAULT_API_URL: &str = "http://localhost:3669";
 
-/// Get a ZLayer API client configured from environment
+/// Get a ZLayer API client configured from the environment.
+///
+/// Preferred transport:
+/// 1. Unix Domain Socket — if `ZLAYER_SOCKET` points at an existing file, use
+///    `ZLayerClient::new_unix`. Works inside overlay-networked containers
+///    where TCP loopback to the host is unreachable.
+/// 2. TCP — otherwise use `ZLAYER_API_URL` (defaulting to
+///    `DEFAULT_API_URL`).
+///
+/// In both modes `ZLAYER_API_TOKEN` (if set) becomes the Bearer token.
 #[cfg(feature = "ssr")]
 fn get_api_client() -> ZLayerClient {
-    let base_url = std::env::var("ZLAYER_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
     let token = std::env::var("ZLAYER_API_TOKEN").ok();
+
+    if let Ok(socket) = std::env::var("ZLAYER_SOCKET") {
+        let path = std::path::PathBuf::from(&socket);
+        if path.exists() {
+            return ZLayerClient::new_unix(path, token);
+        }
+        tracing::warn!(
+            socket = %socket,
+            "ZLAYER_SOCKET is set but the socket file does not exist; falling back to TCP"
+        );
+    }
+
+    let base_url = std::env::var("ZLAYER_API_URL").unwrap_or_else(|_| DEFAULT_API_URL.to_string());
     ZLayerClient::new(base_url, token)
 }
 
@@ -33,6 +54,94 @@ fn api_error_to_server_error(err: &ApiClientError) -> ServerFnError {
     ServerFnError::new(err.to_string())
 }
 
+/// Headers forwarded from the browser's request to the upstream API — the
+/// session cookie and the double-submit CSRF token.
+#[cfg(feature = "ssr")]
+struct ForwardedHeaders {
+    /// Raw `Cookie:` header value, if the browser sent one.
+    cookie: Option<String>,
+    /// `x-csrf-token` header value, if the browser sent one.
+    csrf: Option<String>,
+}
+
+/// Extract the `Cookie` and `x-csrf-token` headers from the current axum
+/// request so we can forward them to the zlayer-api backend.
+///
+/// Returns an empty `ForwardedHeaders` if the request extractor fails (e.g.
+/// no axum request is in scope — shouldn't happen inside a server_fn, but
+/// we stay defensive rather than panicking).
+#[cfg(feature = "ssr")]
+async fn extract_forwarded_headers() -> ForwardedHeaders {
+    use axum::http::HeaderMap;
+    let Ok(headers) = leptos_axum::extract::<HeaderMap>().await else {
+        return ForwardedHeaders {
+            cookie: None,
+            csrf: None,
+        };
+    };
+    let cookie = headers
+        .get(axum::http::header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let csrf = headers
+        .get("x-csrf-token")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    ForwardedHeaders { cookie, csrf }
+}
+
+/// Append each upstream `Set-Cookie` header onto the Leptos response. Uses
+/// `append_header` (not `insert_header`) so multiple `Set-Cookie` values
+/// coexist — the typical login flow emits both a session cookie and a
+/// CSRF-token cookie in one response.
+#[cfg(feature = "ssr")]
+fn propagate_set_cookies(cookies: &[String]) {
+    use axum::http::{header::SET_COOKIE, HeaderValue};
+    let Some(opts) = use_context::<leptos_axum::ResponseOptions>() else {
+        tracing::warn!("ResponseOptions not in context; cannot propagate Set-Cookie headers");
+        return;
+    };
+    for c in cookies {
+        match HeaderValue::from_str(c) {
+            Ok(v) => opts.append_header(SET_COOKIE, v),
+            Err(e) => tracing::warn!(error = %e, cookie = %c, "invalid Set-Cookie value; skipping"),
+        }
+    }
+}
+
+/// Pull a human-readable error message out of an upstream JSON error body.
+/// Falls back to the raw body when the payload isn't JSON with a `message`
+/// or `error` string field.
+#[cfg(feature = "ssr")]
+fn parse_error_message(body: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| {
+            v.get("message")
+                .or_else(|| v.get("error"))
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| String::from_utf8_lossy(body).into_owned())
+}
+
+/// Percent-encode a path segment. UUIDs and simple ids never need encoding,
+/// but we stay safe against caller-supplied input that might contain `/`,
+/// spaces, or other reserved characters.
+#[cfg(feature = "ssr")]
+fn pct_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(&mut out, "%{b:02X}");
+        }
+    }
+    out
+}
+
 // ============================================================================
 // Response Types
 // ============================================================================
@@ -40,6 +149,102 @@ fn api_error_to_server_error(err: &ApiClientError) -> ServerFnError {
 /// Default runtime name when the field is absent from JSON (backwards compat).
 fn default_runtime_name() -> String {
     "auto".to_string()
+}
+
+// ============================================================================
+// Auth / users types (local mirrors of zlayer-api types for client-side use)
+// ============================================================================
+
+/// A user record as returned by the auth/users API, re-shaped for the
+/// hydrate-side code (no dependency on `zlayer-api`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagerUserView {
+    /// Stable user identifier (UUID, opaque).
+    pub id: String,
+    /// Email address (login identifier).
+    pub email: String,
+    /// Display name.
+    pub display_name: String,
+    /// Role — "admin" or "user".
+    pub role: String,
+    /// Whether the account is active (disabled accounts cannot log in).
+    pub is_active: bool,
+    /// Last successful login as RFC-3339 string, or `None` if the user has
+    /// never logged in.
+    pub last_login_at: Option<String>,
+}
+
+/// Credentials submitted by the login form.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerLoginRequest {
+    /// Email address.
+    pub email: String,
+    /// Plaintext password (TLS-terminated in production).
+    pub password: String,
+}
+
+/// Response returned by a successful login or bootstrap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerLoginResponse {
+    /// The user that just authenticated.
+    pub user: ManagerUserView,
+    /// CSRF token to be stored in memory / sent back via `x-csrf-token`.
+    pub csrf_token: String,
+}
+
+/// First-run admin-creation payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerBootstrapRequest {
+    /// Email address for the new admin.
+    pub email: String,
+    /// Plaintext password for the new admin.
+    pub password: String,
+    /// Optional display name — backend falls back to the email's local part.
+    pub display_name: Option<String>,
+}
+
+/// Admin-initiated user creation payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerCreateUserRequest {
+    /// Email address.
+    pub email: String,
+    /// Initial password.
+    pub password: String,
+    /// Optional display name.
+    pub display_name: Option<String>,
+    /// "admin" or "user".
+    pub role: String,
+}
+
+/// Patch-style update payload — every field is optional.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerUpdateUserRequest {
+    /// New display name, or leave unchanged.
+    pub display_name: Option<String>,
+    /// New role ("admin" or "user"), or leave unchanged.
+    pub role: Option<String>,
+    /// New active flag, or leave unchanged.
+    pub is_active: Option<bool>,
+}
+
+/// Admin-initiated password reset payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerSetPasswordRequest {
+    /// New password.
+    pub new_password: String,
+    /// Required when a non-admin resets their own password; optional
+    /// otherwise (admin bypass).
+    pub current_password: Option<String>,
+}
+
+/// Aggregated response for `/auth/me` — tells the UI whether to render the
+/// login form, the bootstrap form, or an authenticated view.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerMeResponse {
+    /// Some(user) when signed in; None when anonymous.
+    pub user: Option<ManagerUserView>,
+    /// True iff the backend has no users at all (first-run).
+    pub needs_bootstrap: bool,
 }
 
 /// System statistics for the manager dashboard
@@ -1288,15 +1493,15 @@ pub async fn get_network(name: String) -> Result<NetworkDetail, ServerFnError> {
             .map(|r| NetworkAccessRuleItem {
                 service: r.service,
                 deployment: r.deployment,
-                ports: r
-                    .ports
-                    .map(|p| {
+                ports: r.ports.map_or_else(
+                    || "all".to_string(),
+                    |p| {
                         p.iter()
-                            .map(|port| port.to_string())
+                            .map(ToString::to_string)
                             .collect::<Vec<_>>()
                             .join(", ")
-                    })
-                    .unwrap_or_else(|| "all".to_string()),
+                    },
+                ),
                 action: r.action,
             })
             .collect(),
@@ -1313,7 +1518,7 @@ pub async fn create_network(
     let client = get_api_client();
 
     let cidr_list: Vec<String> = cidrs
-        .split(|c: char| c == ',' || c == '\n')
+        .split([',', '\n'])
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .collect();
@@ -1353,6 +1558,2310 @@ pub async fn delete_network(name: String) -> Result<(), ServerFnError> {
         .await
         .map_err(|e| api_error_to_server_error(&e))?;
     Ok(())
+}
+
+// ============================================================================
+// Auth + users (proxy to zlayer-api with cookie / CSRF forwarding)
+// ============================================================================
+
+/// POST `/auth/login` — log the user in. Returns the user + csrf token and
+/// sets the `zlayer_session` cookie on the browser.
+#[server(prefix = "/api/manager")]
+pub async fn manager_login(
+    req: ManagerLoginRequest,
+) -> Result<ManagerLoginResponse, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            "/auth/login",
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    propagate_set_cookies(&resp.set_cookies);
+
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Login failed ({}): {msg}",
+            resp.status
+        )));
+    }
+
+    serde_json::from_slice(&resp.body).map_err(|e| ServerFnError::new(format!("deserialise: {e}")))
+}
+
+/// POST `/auth/bootstrap` — create the first admin user. Only succeeds when
+/// the user table is empty; otherwise the backend returns 409.
+#[server(prefix = "/api/manager")]
+pub async fn manager_bootstrap(
+    req: ManagerBootstrapRequest,
+) -> Result<ManagerLoginResponse, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            "/auth/bootstrap",
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    propagate_set_cookies(&resp.set_cookies);
+
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Bootstrap failed ({}): {msg}",
+            resp.status
+        )));
+    }
+
+    serde_json::from_slice(&resp.body).map_err(|e| ServerFnError::new(format!("deserialise: {e}")))
+}
+
+/// POST `/auth/logout` — clear the session cookie. Always forwards any
+/// `Set-Cookie` headers from the backend (which typically include an
+/// expired-cookie header to clear the browser state).
+#[server(prefix = "/api/manager")]
+pub async fn manager_logout() -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            "/auth/logout",
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    propagate_set_cookies(&resp.set_cookies);
+
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Logout failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+/// GET `/auth/me` — returns the current user, or `needs_bootstrap: true`
+/// when no users exist on the backend.
+///
+/// Never returns an error for the "not authenticated" case — it returns
+/// `Ok(ManagerMeResponse { user: None, .. })`. `/auth/me` alone doesn't
+/// tell us whether the store is empty (it returns 401 either way), so on
+/// 401 we probe `/auth/bootstrap` with an empty body:
+///   - 400 → empty creds rejected, meaning the user table is empty and
+///     bootstrap is available (`needs_bootstrap = true`).
+///   - 409 → bootstrap already completed, at least one user exists
+///     (`needs_bootstrap = false`).
+///   - anything else → conservative `needs_bootstrap = false`.
+#[server(prefix = "/api/manager")]
+pub async fn manager_me() -> Result<ManagerMeResponse, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+
+    let me_resp = client
+        .raw_request(
+            RawMethod::Get,
+            "/auth/me",
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    if me_resp.status.is_success() {
+        let user: ManagerUserView = serde_json::from_slice(&me_resp.body)
+            .map_err(|e| ServerFnError::new(format!("deserialise /auth/me: {e}")))?;
+        return Ok(ManagerMeResponse {
+            user: Some(user),
+            needs_bootstrap: false,
+        });
+    }
+
+    // Not authenticated — probe bootstrap state with an intentionally
+    // invalid (empty) body. We don't forward cookies/csrf here — this is
+    // a pure state probe against the unauthenticated endpoint.
+    let probe_body = b"{\"email\":\"\",\"password\":\"\"}";
+    let probe = client
+        .raw_request(
+            RawMethod::Post,
+            "/auth/bootstrap",
+            Some(probe_body),
+            None,
+            None,
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    // 400 means the backend parsed our body but rejected the empty creds —
+    // which it only does when the user table is empty (and bootstrap is
+    // therefore available). 409 means bootstrap is already done; any other
+    // status we treat conservatively as "bootstrap not available" to avoid
+    // offering an endpoint that would fail.
+    let needs_bootstrap = probe.status.as_u16() == 400;
+
+    Ok(ManagerMeResponse {
+        user: None,
+        needs_bootstrap,
+    })
+}
+
+/// GET `/api/v1/users` — list all users. Admin only; the backend enforces.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_users() -> Result<Vec<ManagerUserView>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            "/api/v1/users",
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List users failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise users: {e}")))
+}
+
+/// POST `/api/v1/users` — create a new user. Admin only.
+#[server(prefix = "/api/manager")]
+pub async fn manager_create_user(
+    req: ManagerCreateUserRequest,
+) -> Result<ManagerUserView, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            "/api/v1/users",
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Create user failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body).map_err(|e| ServerFnError::new(format!("deserialise: {e}")))
+}
+
+/// PATCH `/api/v1/users/{id}` — update a user's display name, role, or
+/// active flag. Admin only.
+#[server(prefix = "/api/manager")]
+pub async fn manager_update_user(
+    id: String,
+    req: ManagerUpdateUserRequest,
+) -> Result<ManagerUserView, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let path = format!("/api/v1/users/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Patch,
+            &path,
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Update user failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body).map_err(|e| ServerFnError::new(format!("deserialise: {e}")))
+}
+
+/// DELETE `/api/v1/users/{id}`.
+#[server(prefix = "/api/manager")]
+pub async fn manager_delete_user(id: String) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/users/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Delete,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Delete user failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+/// POST `/api/v1/users/{id}/password` — set/change a user's password.
+#[server(prefix = "/api/manager")]
+pub async fn manager_set_user_password(
+    id: String,
+    req: ManagerSetPasswordRequest,
+) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let path = format!("/api/v1/users/{}/password", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            &path,
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Set password failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Variables — `/variables` page server fns
+// ============================================================================
+
+use crate::wire::variables::WireVariable;
+
+/// Request body for `manager_create_variable`. Mirrors the daemon's
+/// `CreateVariableRequest`. Kept local to avoid pulling `zlayer-api` into
+/// the hydrate/WASM build.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerCreateVariableRequest {
+    /// Variable name (unique within the chosen scope).
+    pub name: String,
+    /// Plaintext value.
+    pub value: String,
+    /// Optional project-scope id. `None` = global variable.
+    pub scope: Option<String>,
+}
+
+/// Patch-style update body. All fields optional.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ManagerUpdateVariableRequest {
+    /// New name, or leave unchanged.
+    pub name: Option<String>,
+    /// New value, or leave unchanged.
+    pub value: Option<String>,
+}
+
+/// GET `/api/v1/variables` — list all global variables.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_variables() -> Result<Vec<WireVariable>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            "/api/v1/variables",
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List variables failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise variables: {e}")))
+}
+
+/// POST `/api/v1/variables` — create a new variable. Admin only on the
+/// backend.
+#[server(prefix = "/api/manager")]
+pub async fn manager_create_variable(
+    name: String,
+    value: String,
+    scope: Option<String>,
+) -> Result<WireVariable, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let req = ManagerCreateVariableRequest { name, value, scope };
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            "/api/v1/variables",
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Create variable failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise variable: {e}")))
+}
+
+/// PATCH `/api/v1/variables/{id}` — update value and/or name.
+#[server(prefix = "/api/manager")]
+pub async fn manager_update_variable(
+    id: String,
+    name: Option<String>,
+    value: Option<String>,
+) -> Result<WireVariable, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let req = ManagerUpdateVariableRequest { name, value };
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let path = format!("/api/v1/variables/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Patch,
+            &path,
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Update variable failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise variable: {e}")))
+}
+
+/// DELETE `/api/v1/variables/{id}`. Returns `Ok(())` on 204/200.
+#[server(prefix = "/api/manager")]
+pub async fn manager_delete_variable(id: String) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/variables/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Delete,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Delete variable failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Secrets — `/secrets` page server fns
+// ============================================================================
+
+use crate::wire::secrets::{BulkImportResult, WireEnvironment, WireSecret};
+
+/// Request body for `manager_create_secret`.
+///
+/// Mirrors the daemon's `CreateSecretRequest`. Note the daemon does NOT
+/// accept a body-level `environment` field — that flows via the
+/// `?environment=` query string instead. `scope` is only honoured in the
+/// legacy path (mutually exclusive with the query env).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerCreateSecretRequest {
+    /// Secret identifier within the chosen scope.
+    pub name: String,
+    /// Plaintext value. Stored encrypted at rest.
+    pub value: String,
+}
+
+/// GET `/api/v1/environments` — list environments. When
+/// `include_all_projects` is true we request `?project=*` so the caller
+/// sees globals + every project's envs in one table.
+///
+/// The Secrets page uses the default (globals only) because Phase 4
+/// env-scoped secrets live on global environments; project-scoped envs
+/// show up here only when `include_all_projects=true` is passed.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_environments() -> Result<Vec<WireEnvironment>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    // Always request `?project=*` so the Secrets page can show secrets
+    // attached to project envs in addition to globals. The backend sorts
+    // them by name.
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            "/api/v1/environments?project=*",
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List environments failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise environments: {e}")))
+}
+
+/// GET `/api/v1/secrets` — list secret metadata. Without `environment`
+/// we list the daemon's `default` scope.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_secrets(
+    environment: Option<String>,
+) -> Result<Vec<WireSecret>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = match environment.as_deref() {
+        Some(id) if !id.is_empty() => {
+            format!("/api/v1/secrets?environment={}", pct_encode_path(id))
+        }
+        _ => "/api/v1/secrets".to_string(),
+    };
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List secrets failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise secrets: {e}")))
+}
+
+/// POST `/api/v1/secrets` — upsert a secret. The daemon treats create and
+/// update identically at this endpoint (201 vs 200 on the status code). We
+/// expose a single helper for both flows.
+#[server(prefix = "/api/manager")]
+pub async fn manager_create_secret(
+    name: String,
+    value: String,
+    environment: Option<String>,
+) -> Result<WireSecret, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let req = ManagerCreateSecretRequest { name, value };
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let path = match environment.as_deref() {
+        Some(id) if !id.is_empty() => {
+            format!("/api/v1/secrets?environment={}", pct_encode_path(id))
+        }
+        _ => "/api/v1/secrets".to_string(),
+    };
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            &path,
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Create secret failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise secret: {e}")))
+}
+
+/// Upsert-style update. The daemon's secrets endpoint has no PATCH — POST
+/// with the same name replaces the value. We expose it as `update_secret`
+/// so the UI call site reads naturally.
+#[server(prefix = "/api/manager")]
+pub async fn manager_update_secret(
+    name: String,
+    value: String,
+    environment: Option<String>,
+) -> Result<WireSecret, ServerFnError> {
+    manager_create_secret(name, value, environment).await
+}
+
+/// Reveal the plaintext value for a secret. Admin-only on the daemon —
+/// non-admin sessions receive 403 and the helper surfaces the error.
+///
+/// We parse the full `SecretMetadataResponse` and extract `.value`, falling
+/// back to an error if the server responded with metadata-only (which
+/// would only happen if we mis-called the endpoint).
+#[server(prefix = "/api/manager")]
+pub async fn manager_reveal_secret(
+    name: String,
+    environment: Option<String>,
+) -> Result<String, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = match environment.as_deref() {
+        Some(id) if !id.is_empty() => format!(
+            "/api/v1/secrets/{}?reveal=true&environment={}",
+            pct_encode_path(&name),
+            pct_encode_path(id),
+        ),
+        _ => format!("/api/v1/secrets/{}?reveal=true", pct_encode_path(&name)),
+    };
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Reveal secret failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    let wire: WireSecret = serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise secret: {e}")))?;
+    wire.value
+        .ok_or_else(|| ServerFnError::new("server did not return a plaintext value".to_string()))
+}
+
+/// DELETE `/api/v1/secrets/{name}` scoped to the env (when provided).
+#[server(prefix = "/api/manager")]
+pub async fn manager_delete_secret(
+    name: String,
+    environment: Option<String>,
+) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = match environment.as_deref() {
+        Some(id) if !id.is_empty() => format!(
+            "/api/v1/secrets/{}?environment={}",
+            pct_encode_path(&name),
+            pct_encode_path(id),
+        ),
+        _ => format!("/api/v1/secrets/{}", pct_encode_path(&name)),
+    };
+    let resp = client
+        .raw_request(
+            RawMethod::Delete,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Delete secret failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+/// POST `/api/v1/secrets/bulk-import?environment={id}` — upload `.env`
+/// content to an environment scope. The daemon requires a real env id (no
+/// globals), so when the caller passes `None` we surface an error up
+/// front rather than sending the request.
+#[server(prefix = "/api/manager")]
+pub async fn manager_bulk_import_secrets(
+    environment: Option<String>,
+    entries: Vec<(String, String)>,
+) -> Result<BulkImportResult, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let env_id = environment
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            ServerFnError::new(
+                "Bulk import requires an environment id (the daemon rejects globals)".to_string(),
+            )
+        })?;
+
+    // Serialise entries as `.env` lines. Values are written verbatim —
+    // the daemon parses them with the same quote-stripping rules our
+    // client applied.
+    let mut body = String::new();
+    for (k, v) in &entries {
+        body.push_str(k);
+        body.push('=');
+        body.push_str(v);
+        body.push('\n');
+    }
+
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!(
+        "/api/v1/secrets/bulk-import?environment={}",
+        pct_encode_path(env_id)
+    );
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            &path,
+            Some(body.as_bytes()),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Bulk import failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise bulk result: {e}")))
+}
+
+// ============================================================================
+// Tasks — `/tasks` page server fns
+// ============================================================================
+
+use crate::wire::tasks::{WireTask, WireTaskRun, WireTaskSpec};
+
+/// GET `/api/v1/tasks` — list all tasks (global + project-scoped).
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_tasks() -> Result<Vec<WireTask>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            "/api/v1/tasks",
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List tasks failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise tasks: {e}")))
+}
+
+/// GET `/api/v1/tasks/{id}` — fetch a single task.
+#[server(prefix = "/api/manager")]
+pub async fn manager_get_task(id: String) -> Result<WireTask, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/tasks/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Get task failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise task: {e}")))
+}
+
+/// POST `/api/v1/tasks` — create a new task. Admin only on the backend.
+///
+/// `spec.kind` must be `"bash"` — that's the only variant the daemon
+/// accepts today (`TaskKind::Bash`).
+#[server(prefix = "/api/manager")]
+pub async fn manager_create_task(spec: WireTaskSpec) -> Result<WireTask, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let body =
+        serde_json::to_vec(&spec).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            "/api/v1/tasks",
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Create task failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise task: {e}")))
+}
+
+/// DELETE `/api/v1/tasks/{id}`. Returns `Ok(())` on 204/200.
+#[server(prefix = "/api/manager")]
+pub async fn manager_delete_task(id: String) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/tasks/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Delete,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Delete task failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+/// POST `/api/v1/tasks/{id}/run` — execute a task synchronously. Admin only.
+///
+/// This call blocks until the run completes; the daemon captures
+/// stdout/stderr and the final exit code and returns the recorded
+/// [`WireTaskRun`].
+#[server(prefix = "/api/manager")]
+pub async fn manager_run_task(id: String) -> Result<WireTaskRun, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/tasks/{}/run", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Run task failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise task run: {e}")))
+}
+
+/// GET `/api/v1/tasks/{id}/runs` — list past runs for a task, most-recent
+/// first.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_task_runs(task_id: String) -> Result<Vec<WireTaskRun>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/tasks/{}/runs", pct_encode_path(&task_id));
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List task runs failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise task runs: {e}")))
+}
+
+// ============================================================================
+// Notifiers — `/notifiers` page server fns
+// ============================================================================
+
+use crate::wire::notifiers::{NotifierTestResult, WireNotifier, WireNotifierConfig};
+
+/// Body for `POST /api/v1/notifiers`. Matches the daemon's
+/// `CreateNotifierRequest`: `{ name, kind, config }` where `kind` is the
+/// lowercase discriminator and `config` is the tagged-union payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerCreateNotifierRequest {
+    /// Display name.
+    pub name: String,
+    /// One of `"slack"`, `"discord"`, `"webhook"`, `"smtp"`.
+    pub kind: String,
+    /// Channel-specific configuration; `type` must match `kind`.
+    pub config: WireNotifierConfig,
+}
+
+/// Body for `PATCH /api/v1/notifiers/{id}` — all fields optional.
+#[derive(Debug, Clone, Serialize, Default, Deserialize)]
+pub struct ManagerUpdateNotifierRequest {
+    /// New display name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// New enabled flag.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// New configuration — `type` tag must match the existing notifier's
+    /// kind (the daemon rejects kind/config mismatches with 400).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<WireNotifierConfig>,
+}
+
+/// GET `/api/v1/notifiers` — list every configured notifier.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_notifiers() -> Result<Vec<WireNotifier>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            "/api/v1/notifiers",
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List notifiers failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise notifiers: {e}")))
+}
+
+/// POST `/api/v1/notifiers` — create a new notifier. Admin only on the
+/// backend.
+///
+/// Daemon-side create always produces `enabled: true`; when the caller
+/// asks for `enabled: false` we immediately PATCH the notifier so the
+/// final state matches the form.
+#[server(prefix = "/api/manager")]
+pub async fn manager_create_notifier(
+    name: String,
+    enabled: bool,
+    config: WireNotifierConfig,
+) -> Result<WireNotifier, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+
+    let kind = config.kind().to_string();
+    let req = ManagerCreateNotifierRequest { name, kind, config };
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            "/api/v1/notifiers",
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Create notifier failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    let mut notifier: WireNotifier = serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise notifier: {e}")))?;
+    if !enabled {
+        notifier = manager_update_notifier(notifier.id.clone(), None, Some(false), None).await?;
+    }
+    Ok(notifier)
+}
+
+/// PATCH `/api/v1/notifiers/{id}`. Admin only on the backend.
+#[server(prefix = "/api/manager")]
+pub async fn manager_update_notifier(
+    id: String,
+    name: Option<String>,
+    enabled: Option<bool>,
+    config: Option<WireNotifierConfig>,
+) -> Result<WireNotifier, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let req = ManagerUpdateNotifierRequest {
+        name,
+        enabled,
+        config,
+    };
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let path = format!("/api/v1/notifiers/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Patch,
+            &path,
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Update notifier failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise notifier: {e}")))
+}
+
+/// DELETE `/api/v1/notifiers/{id}`. Admin only. Returns `Ok(())` on any
+/// 2xx response.
+#[server(prefix = "/api/manager")]
+pub async fn manager_delete_notifier(id: String) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/notifiers/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Delete,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Delete notifier failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+/// POST `/api/v1/notifiers/{id}/test` — send a live test notification
+/// through the configured channel. Admin only. Upstream failures are
+/// returned as HTTP 200 with `success: false` per the daemon's contract,
+/// so `Ok(NotifierTestResult { success: false, .. })` is a normal outcome
+/// that the UI should surface as an `alert-error` rather than a
+/// server-fn error.
+#[server(prefix = "/api/manager")]
+pub async fn manager_test_notifier(id: String) -> Result<NotifierTestResult, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/notifiers/{}/test", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Test notifier failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise test result: {e}")))
+}
+
+// ============================================================================
+// Workflows — `/workflows` page server fns
+// ============================================================================
+//
+// Endpoint inventory (from `zlayer-api/src/router.rs::build_workflow_routes`
+// and `handlers/workflows.rs`):
+//
+//   GET    /api/v1/workflows             -> list
+//   POST   /api/v1/workflows             -> create (admin)
+//   GET    /api/v1/workflows/{id}        -> get
+//   DELETE /api/v1/workflows/{id}        -> delete (admin)
+//   POST   /api/v1/workflows/{id}/run    -> execute synchronously (admin)
+//   GET    /api/v1/workflows/{id}/runs   -> list past runs
+//
+// No PATCH / update endpoint is exposed, so the UI omits an Edit action —
+// same pattern Tasks uses. To change a workflow, delete and recreate.
+
+use crate::wire::workflows::{WireWorkflow, WireWorkflowRun, WireWorkflowSpec};
+
+/// GET `/api/v1/workflows` — list all workflows (global + project-scoped).
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_workflows() -> Result<Vec<WireWorkflow>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            "/api/v1/workflows",
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List workflows failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise workflows: {e}")))
+}
+
+/// GET `/api/v1/workflows/{id}` — fetch a single workflow.
+#[server(prefix = "/api/manager")]
+pub async fn manager_get_workflow(id: String) -> Result<WireWorkflow, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/workflows/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Get workflow failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise workflow: {e}")))
+}
+
+/// POST `/api/v1/workflows` — create a new workflow. Admin only on the
+/// backend. Body matches the daemon's `CreateWorkflowRequest` exactly:
+/// `{ name, steps, project_id? }`.
+#[server(prefix = "/api/manager")]
+pub async fn manager_create_workflow(
+    spec: WireWorkflowSpec,
+) -> Result<WireWorkflow, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let body =
+        serde_json::to_vec(&spec).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            "/api/v1/workflows",
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Create workflow failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise workflow: {e}")))
+}
+
+/// DELETE `/api/v1/workflows/{id}`. Admin only. Returns `Ok(())` on any
+/// 2xx response; the daemon cascade-deletes the workflow's run history
+/// atomically.
+#[server(prefix = "/api/manager")]
+pub async fn manager_delete_workflow(id: String) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/workflows/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Delete,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Delete workflow failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+/// POST `/api/v1/workflows/{id}/run` — execute a workflow synchronously.
+/// Admin only.
+///
+/// This call blocks until the run completes; the daemon records the run
+/// in `workflow_runs` and returns the terminal [`WireWorkflowRun`] with
+/// per-step results. `BuildProject` steps can take several minutes when
+/// the underlying buildah invocation is slow, so the UI should present a
+/// spinner and avoid racing additional requests.
+#[server(prefix = "/api/manager")]
+pub async fn manager_run_workflow(id: String) -> Result<WireWorkflowRun, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/workflows/{}/run", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Run workflow failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise workflow run: {e}")))
+}
+
+/// GET `/api/v1/workflows/{id}/runs` — list past runs for a workflow,
+/// most-recent first (the daemon returns a reverse-chronological index
+/// scan on `(workflow_id, started_at DESC)`).
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_workflow_runs(
+    workflow_id: String,
+) -> Result<Vec<WireWorkflowRun>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/workflows/{}/runs", pct_encode_path(&workflow_id));
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List workflow runs failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise workflow runs: {e}")))
+}
+
+// ============================================================================
+// Groups — `/groups` page server fns
+// ============================================================================
+//
+// Endpoint inventory (from `zlayer-api/src/router.rs::build_group_routes`
+// and `handlers/groups.rs`):
+//
+//   GET    /api/v1/groups                         -> list
+//   POST   /api/v1/groups                         -> create (admin)
+//   GET    /api/v1/groups/{id}                    -> get
+//   PATCH  /api/v1/groups/{id}                    -> update name/description (admin)
+//   DELETE /api/v1/groups/{id}                    -> delete (admin)
+//   POST   /api/v1/groups/{id}/members            -> add member (admin)
+//   DELETE /api/v1/groups/{id}/members/{user_id}  -> remove member (admin)
+//
+// Read endpoints accept any authenticated actor; mutations require the
+// `admin` role (enforced server-side).
+
+use crate::wire::groups::WireUserGroup;
+// `WireAddMember`, `WireCreateGroup`, `WireGroupMembers`, and
+// `WireUpdateGroup` are only used inside `#[server]` bodies (which get
+// stripped on the hydrate/WASM target), so the import is `cfg(ssr)` to
+// avoid a `dead_code` warning on the client build.
+#[cfg(feature = "ssr")]
+use crate::wire::groups::{WireAddMember, WireCreateGroup, WireGroupMembers, WireUpdateGroup};
+
+/// GET `/api/v1/groups` — list all groups.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_groups() -> Result<Vec<WireUserGroup>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            "/api/v1/groups",
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List groups failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise groups: {e}")))
+}
+
+/// POST `/api/v1/groups` — create a new group. Admin only on the backend.
+#[server(prefix = "/api/manager")]
+pub async fn manager_create_group(
+    name: String,
+    description: Option<String>,
+) -> Result<WireUserGroup, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let req = WireCreateGroup { name, description };
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            "/api/v1/groups",
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Create group failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise group: {e}")))
+}
+
+/// PATCH `/api/v1/groups/{id}` — update group name/description. Admin only.
+///
+/// The daemon accepts an empty patch body as a no-op and returns the
+/// unchanged group; the UI doesn't exercise that path (it only sends the
+/// modal's edited fields) but the round-trip is symmetric.
+#[server(prefix = "/api/manager")]
+pub async fn manager_update_group(
+    id: String,
+    name: Option<String>,
+    description: Option<String>,
+) -> Result<WireUserGroup, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let req = WireUpdateGroup { name, description };
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let path = format!("/api/v1/groups/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Patch,
+            &path,
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Update group failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise group: {e}")))
+}
+
+/// DELETE `/api/v1/groups/{id}` — cascading delete (also removes member rows).
+/// Admin only. Returns `Ok(())` on 204/200.
+#[server(prefix = "/api/manager")]
+pub async fn manager_delete_group(id: String) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/groups/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Delete,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Delete group failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+/// GET `/api/v1/groups/{id}/members` — list user ids that belong to the
+/// group. The daemon returns `{ group_id, members: [user_id, ...] }`.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_group_members(group_id: String) -> Result<Vec<String>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/groups/{}/members", pct_encode_path(&group_id));
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List group members failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    let parsed: WireGroupMembers = serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise group members: {e}")))?;
+    Ok(parsed.members)
+}
+
+/// POST `/api/v1/groups/{id}/members` — add a user to a group. Admin only.
+#[server(prefix = "/api/manager")]
+pub async fn manager_add_group_member(
+    group_id: String,
+    user_id: String,
+) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let req = WireAddMember { user_id };
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let path = format!("/api/v1/groups/{}/members", pct_encode_path(&group_id));
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            &path,
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Add group member failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+/// DELETE `/api/v1/groups/{id}/members/{user_id}` — remove a user from a
+/// group. Admin only. Returns `Ok(())` on 204/200.
+#[server(prefix = "/api/manager")]
+pub async fn manager_remove_group_member(
+    group_id: String,
+    user_id: String,
+) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!(
+        "/api/v1/groups/{}/members/{}",
+        pct_encode_path(&group_id),
+        pct_encode_path(&user_id),
+    );
+    let resp = client
+        .raw_request(
+            RawMethod::Delete,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Remove group member failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Permissions — `/permissions` page server fns
+// ============================================================================
+//
+// Endpoint inventory (from `zlayer-api/src/router.rs::build_permissions_routes`
+// and `handlers/permissions.rs`):
+//
+//   GET    /api/v1/permissions?user={id}|group={id} -> list for ONE subject
+//   POST   /api/v1/permissions                      -> grant (admin)
+//   DELETE /api/v1/permissions/{id}                 -> revoke (admin)
+//
+// The daemon's filter surface is deliberately narrow: `GET` accepts
+// EXACTLY one of `?user=<id>` or `?group=<id>` (bad request otherwise).
+// There is no multi-field server-side filter on subject_kind +
+// subject_id + resource_kind + resource_id. The page therefore fetches
+// the union of all per-user and per-group lists on load and filters
+// client-side when the user narrows by subject type / subject id /
+// resource kind.
+
+use crate::wire::permissions::{WireGrantPermissionRequest, WirePermission};
+
+/// GET `/api/v1/permissions?user={id}` or `?group={id}` — list every
+/// grant for one subject. The daemon requires exactly one of the two
+/// parameters.
+///
+/// Callers that want the full list of all permissions iterate
+/// `manager_list_users` + `manager_list_groups` and call this once per
+/// subject, then concatenate on the client. That's what the Permissions
+/// page does on mount.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_permissions_for_subject(
+    subject_kind: String,
+    subject_id: String,
+) -> Result<Vec<WirePermission>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let query_key = match subject_kind.as_str() {
+        "user" => "user",
+        "group" => "group",
+        other => {
+            return Err(ServerFnError::new(format!(
+                "invalid subject_kind {other:?}; must be \"user\" or \"group\""
+            )));
+        }
+    };
+    // Simple query-param encoding — ids are UUIDs in practice, but still
+    // pct-encode defensively in case the caller passes anything exotic.
+    let path = format!(
+        "/api/v1/permissions?{}={}",
+        query_key,
+        pct_encode_path(&subject_id)
+    );
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List permissions failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise permissions: {e}")))
+}
+
+/// POST `/api/v1/permissions` — grant a permission. Admin only.
+#[server(prefix = "/api/manager")]
+pub async fn manager_grant_permission(
+    req: WireGrantPermissionRequest,
+) -> Result<WirePermission, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let body =
+        serde_json::to_vec(&req).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            "/api/v1/permissions",
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Grant permission failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise permission: {e}")))
+}
+
+/// DELETE `/api/v1/permissions/{id}` — revoke a permission. Admin only.
+/// Returns `Ok(())` on 204/200.
+#[server(prefix = "/api/manager")]
+pub async fn manager_revoke_permission(id: String) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/permissions/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Delete,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Revoke permission failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+// ============================================================================
+// Audit — `/audit` page server fn (read-only, admin-only on the backend)
+// ============================================================================
+//
+// Daemon surface (see `crates/zlayer-api/src/handlers/audit.rs`):
+//
+//   GET /api/v1/audit?user={id}&resource_kind={k}&since={ts}&until={ts}&limit={n}
+//
+// All query params are optional. `since` / `until` are RFC-3339 timestamps
+// parsed by `chrono::DateTime<Utc>` on the daemon. Response is a bare
+// `Vec<AuditEntry>` JSON array (no envelope), ordered newest-first.
+
+use crate::wire::audit::{WireAuditEntry, WireAuditFilter};
+
+/// Percent-encode a value destined for a URL query-string. Unlike
+/// `pct_encode_path`, this encodes `+` (which some HTTP parsers treat as
+/// a literal space in query strings) and keeps `=` / `&` out of the
+/// encoded output. Anything that isn't in the unreserved set per RFC 3986
+/// gets `%HH`-escaped.
+#[cfg(feature = "ssr")]
+fn pct_encode_query(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(&mut out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// GET `/api/v1/audit` — list audit entries matching `filter`. Admin only
+/// on the backend. Returns the bare `Vec<WireAuditEntry>` array the daemon
+/// emits (ordered newest-first).
+///
+/// Empty / `None` filter fields are skipped rather than sent as empty
+/// query params (the daemon would deserialize `""` as `Some("")` which is
+/// never what the caller wants).
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_audit(
+    filter: WireAuditFilter,
+) -> Result<Vec<WireAuditEntry>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+
+    // Build the query string. Only non-empty / Some values are appended so
+    // the server's `#[serde(default)] Option<_>` fields stay `None` rather
+    // than `Some("")`.
+    let mut params: Vec<String> = Vec::new();
+    if let Some(u) = filter.user_id.as_deref().filter(|s| !s.is_empty()) {
+        params.push(format!("user={}", pct_encode_query(u)));
+    }
+    if let Some(rk) = filter.resource_kind.as_deref().filter(|s| !s.is_empty()) {
+        params.push(format!("resource_kind={}", pct_encode_query(rk)));
+    }
+    if let Some(since) = filter.since.as_deref().filter(|s| !s.is_empty()) {
+        params.push(format!("since={}", pct_encode_query(since)));
+    }
+    if let Some(until) = filter.until.as_deref().filter(|s| !s.is_empty()) {
+        params.push(format!("until={}", pct_encode_query(until)));
+    }
+    if let Some(lim) = filter.limit {
+        params.push(format!("limit={lim}"));
+    }
+    let path = if params.is_empty() {
+        "/api/v1/audit".to_string()
+    } else {
+        format!("/api/v1/audit?{}", params.join("&"))
+    };
+
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List audit failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise audit: {e}")))
+}
+
+// ============================================================================
+// Projects — `/projects` page server fns
+// ============================================================================
+
+use crate::wire::projects::{
+    WireProject, WireProjectCredential, WireProjectSpec, WirePullResult, WireWebhookInfo,
+};
+
+/// GET `/api/v1/projects` — list every project.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_projects() -> Result<Vec<WireProject>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            "/api/v1/projects",
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List projects failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise projects: {e}")))
+}
+
+/// GET `/api/v1/projects/{id}` — fetch a single project.
+#[server(prefix = "/api/manager")]
+pub async fn manager_get_project(id: String) -> Result<WireProject, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/projects/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Get project failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise project: {e}")))
+}
+
+/// POST `/api/v1/projects` — create a new project. Admin only on the backend.
+///
+/// `spec.name` must be non-empty — the daemon returns 400 otherwise. Any
+/// fields not set in `spec` are serialised as absent (via
+/// `skip_serializing_if = "Option::is_none"`) so the daemon's
+/// `#[serde(default)]` picks them up as `None`.
+#[server(prefix = "/api/manager")]
+pub async fn manager_create_project(spec: WireProjectSpec) -> Result<WireProject, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let body =
+        serde_json::to_vec(&spec).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            "/api/v1/projects",
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Create project failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise project: {e}")))
+}
+
+/// PATCH `/api/v1/projects/{id}` — partial update. Admin only on the backend.
+#[server(prefix = "/api/manager")]
+pub async fn manager_update_project(
+    id: String,
+    spec: WireProjectSpec,
+) -> Result<WireProject, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let body =
+        serde_json::to_vec(&spec).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let path = format!("/api/v1/projects/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Patch,
+            &path,
+            Some(&body),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Update project failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise project: {e}")))
+}
+
+/// DELETE `/api/v1/projects/{id}` — cascade-deletes deployment links.
+/// Admin only on the backend. Returns `Ok(())` on 204/200.
+#[server(prefix = "/api/manager")]
+pub async fn manager_delete_project(id: String) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/projects/{}", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Delete,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Delete project failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+/// POST `/api/v1/projects/{id}/pull` — clone or fast-forward the project's
+/// git working copy. Admin only on the backend.
+///
+/// This is synchronous — the call blocks until the clone / fetch completes.
+#[server(prefix = "/api/manager")]
+pub async fn manager_pull_project(id: String) -> Result<WirePullResult, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/projects/{}/pull", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Pull project failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise pull result: {e}")))
+}
+
+/// GET `/api/v1/projects/{id}/deployments` — list deployment names linked
+/// to a project. The daemon returns a `Vec<String>` (deployment names only).
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_project_deployments(id: String) -> Result<Vec<String>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/projects/{}/deployments", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "List project deployments failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise project deployments: {e}")))
+}
+
+/// POST `/api/v1/projects/{id}/deployments` — link a deployment by name
+/// to a project.
+#[server(prefix = "/api/manager")]
+pub async fn manager_link_project_deployment(
+    id: String,
+    deployment_name: String,
+) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/projects/{}/deployments", pct_encode_path(&id));
+    let body = serde_json::json!({ "deployment_name": deployment_name });
+    let body_vec =
+        serde_json::to_vec(&body).map_err(|e| ServerFnError::new(format!("serialise: {e}")))?;
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            &path,
+            Some(&body_vec),
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Link project deployment failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+/// DELETE `/api/v1/projects/{id}/deployments/{name}` — unlink a deployment
+/// from a project.
+#[server(prefix = "/api/manager")]
+pub async fn manager_unlink_project_deployment(
+    id: String,
+    deployment_name: String,
+) -> Result<(), ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!(
+        "/api/v1/projects/{}/deployments/{}",
+        pct_encode_path(&id),
+        pct_encode_path(&deployment_name)
+    );
+    let resp = client
+        .raw_request(
+            RawMethod::Delete,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Unlink project deployment failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    Ok(())
+}
+
+/// GET `/api/v1/projects/{id}/webhook` — fetch webhook URL + secret for a
+/// project. Generates the secret on first call.
+#[server(prefix = "/api/manager")]
+pub async fn manager_get_project_webhook(id: String) -> Result<WireWebhookInfo, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/projects/{}/webhook", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Get webhook info failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise webhook info: {e}")))
+}
+
+/// POST `/api/v1/projects/{id}/webhook/rotate` — regenerate the webhook
+/// secret. Admin only on the backend.
+#[server(prefix = "/api/manager")]
+pub async fn manager_rotate_project_webhook(id: String) -> Result<WireWebhookInfo, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let path = format!("/api/v1/projects/{}/webhook/rotate", pct_encode_path(&id));
+    let resp = client
+        .raw_request(
+            RawMethod::Post,
+            &path,
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+    propagate_set_cookies(&resp.set_cookies);
+    if !resp.status.is_success() {
+        let msg = parse_error_message(&resp.body);
+        return Err(ServerFnError::new(format!(
+            "Rotate webhook failed ({}): {msg}",
+            resp.status
+        )));
+    }
+    serde_json::from_slice(&resp.body)
+        .map_err(|e| ServerFnError::new(format!("deserialise webhook info: {e}")))
+}
+
+/// GET `/api/v1/credentials/registry` + `/api/v1/credentials/git`, merged
+/// into the Project-view `WireProjectCredential` shape.
+///
+/// `kind_filter` narrows to one of `"registry"`, `"git"`, or (when
+/// `None` / other) both. This server fn does one or two requests
+/// depending on the filter.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_credentials(
+    kind_filter: Option<String>,
+) -> Result<Vec<WireProjectCredential>, ServerFnError> {
+    use crate::api_client::RawMethod;
+
+    // Local parse shapes — defined up front to keep the function body flat and
+    // avoid `items_after_statements` under `--all-features` clippy.
+    #[derive(Deserialize)]
+    struct RegItem {
+        id: String,
+        registry: String,
+        username: String,
+        auth_type: String,
+    }
+    #[derive(Deserialize)]
+    struct GitItem {
+        id: String,
+        name: String,
+        kind: String,
+    }
+
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+
+    let kind = kind_filter.as_deref().unwrap_or("");
+    let want_registry = kind.is_empty() || kind == "registry";
+    let want_git = kind.is_empty() || kind == "git";
+
+    let mut out: Vec<WireProjectCredential> = Vec::new();
+
+    if want_registry {
+        let resp = client
+            .raw_request(
+                RawMethod::Get,
+                "/api/v1/credentials/registry",
+                None,
+                hdr.cookie.as_deref(),
+                hdr.csrf.as_deref(),
+            )
+            .await
+            .map_err(|e| api_error_to_server_error(&e))?;
+        if !resp.status.is_success() {
+            let msg = parse_error_message(&resp.body);
+            return Err(ServerFnError::new(format!(
+                "List registry credentials failed ({}): {msg}",
+                resp.status
+            )));
+        }
+        let items: Vec<RegItem> = serde_json::from_slice(&resp.body)
+            .map_err(|e| ServerFnError::new(format!("deserialise registry credentials: {e}")))?;
+        for it in items {
+            out.push(WireProjectCredential {
+                id: it.id,
+                kind: "registry".to_string(),
+                name: format!("{}  ({})", it.registry, it.username),
+                sub_kind: it.auth_type,
+            });
+        }
+    }
+
+    if want_git {
+        let resp = client
+            .raw_request(
+                RawMethod::Get,
+                "/api/v1/credentials/git",
+                None,
+                hdr.cookie.as_deref(),
+                hdr.csrf.as_deref(),
+            )
+            .await
+            .map_err(|e| api_error_to_server_error(&e))?;
+        if !resp.status.is_success() {
+            let msg = parse_error_message(&resp.body);
+            return Err(ServerFnError::new(format!(
+                "List git credentials failed ({}): {msg}",
+                resp.status
+            )));
+        }
+        let items: Vec<GitItem> = serde_json::from_slice(&resp.body)
+            .map_err(|e| ServerFnError::new(format!("deserialise git credentials: {e}")))?;
+        for it in items {
+            out.push(WireProjectCredential {
+                id: it.id,
+                kind: "git".to_string(),
+                name: it.name,
+                sub_kind: it.kind,
+            });
+        }
+    }
+
+    Ok(out)
 }
 
 // ============================================================================

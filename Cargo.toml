@@ -25,6 +25,7 @@ members = [
   "crates/zlayer-consensus",
   "crates/zlayer-docker",
   "crates/zlayer-wsl",
+  "crates/zlayer-git",
 ]
 
 [workspace.package]
@@ -82,9 +83,25 @@ tower-http = { version = "0.6", features = ["full"] }
 
 # Web framework (for API)
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
+axum-extra = { version = "0.10", default-features = false, features = ["cookie"] }
 
 # JWT Authentication
 jsonwebtoken = "9"
+
+# SMTP (lettre) for notifier delivery.
+# - `default-features = false` avoids pulling in OpenSSL / native-tls.
+# - `tokio1-rustls-tls` gives us an async transport backed by rustls, which
+#   matches the rest of the workspace (no OpenSSL linkage).
+# - `smtp-transport` enables `AsyncSmtpTransport::<Tokio1Executor>`.
+# - `builder` enables the `Message::builder()` fluent API.
+# - `hostname` populates the Message-ID domain automatically, which helps
+#   avoid aggressive spam filtering on outgoing mail.
+lettre = { version = "0.11", default-features = false, features = [
+    "smtp-transport",
+    "tokio1-rustls-tls",
+    "builder",
+    "hostname",
+] }
 
 # OpenAPI documentation
 utoipa = { version = "5", features = ["axum_extras"] }
@@ -117,7 +134,9 @@ secrecy = { version = "0.10", features = ["serde"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 blake2 = "0.10"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
+subtle = "2"
 
 # DNS
 hickory-server = "0.24"
@@ -207,6 +226,20 @@ zlayer-api = { version = "0.0.0-dev", path = "crates/zlayer-api" }
 zlayer-proxy = { version = "0.0.0-dev", path = "crates/zlayer-proxy" }
 zlayer-secrets = { version = "0.0.0-dev", path = "crates/zlayer-secrets" }
 zlayer-wsl = { version = "0.0.0-dev", path = "crates/zlayer-wsl" }
+zlayer-git = { version = "0.0.0-dev", path = "crates/zlayer-git" }
+
+# Git (gitoxide) — pure-Rust git implementation used by `zlayer-git`.
+# Features chosen to cover the operations we perform: blocking HTTPS transport
+# (reqwest + rustls, no OpenSSL), HTTP credential prompting, worktree mutation
+# for clone/checkout, and revision parsing for `rev_parse_single`/`merge_base`.
+gix = { version = "0.81", default-features = false, features = [
+  "blocking-network-client",
+  "blocking-http-transport-reqwest-rust-tls",
+  "credentials",
+  "worktree-mutation",
+  "revision",
+  "sha1",
+] }
 
 # =============================================================================
 # Build Profiles

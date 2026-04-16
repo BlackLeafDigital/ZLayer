@@ -209,12 +209,23 @@ pub(crate) fn validate(spec_path: &Path) -> Result<()> {
 /// lines as they arrive in real time (until the user presses Ctrl+C).
 #[cfg(unix)]
 pub(crate) async fn logs(
-    deployment: &str,
+    deployment: Option<&str>,
     service: &str,
     lines: u32,
     follow: bool,
     instance: Option<String>,
 ) -> Result<()> {
+    // Connect to the daemon (auto-starts if needed)
+    let client = crate::daemon_client::DaemonClient::connect()
+        .await
+        .context("Failed to connect to zlayer daemon")?;
+
+    let resolved = crate::commands::resolver::resolve_service(&client, service, deployment)
+        .await
+        .context("Failed to resolve service")?;
+    let deployment = resolved.deployment.as_str();
+    let service = resolved.service.as_str();
+
     info!(
         deployment = %deployment,
         service = %service,
@@ -223,11 +234,6 @@ pub(crate) async fn logs(
         instance = ?instance,
         "Fetching logs"
     );
-
-    // Connect to the daemon (auto-starts if needed)
-    let client = crate::daemon_client::DaemonClient::connect()
-        .await
-        .context("Failed to connect to zlayer daemon")?;
 
     if follow {
         // ---- Follow mode: SSE streaming ----
@@ -260,8 +266,20 @@ pub(crate) async fn logs(
 /// If a spec is found matching the deployment, it iterates over services and replicas.
 /// Also scans the state directory for any extra containers beyond the spec's replica count.
 #[cfg(unix)]
+async fn resolve_stop_deployment(hint: Option<&str>) -> Result<String> {
+    let client = crate::daemon_client::DaemonClient::connect()
+        .await
+        .context(
+        "Failed to connect to zlayer daemon (pass <DEPLOYMENT> explicitly to skip auto-resolution)",
+    )?;
+    crate::commands::resolver::resolve_deployment(&client, hint)
+        .await
+        .context("Failed to resolve deployment")
+}
+
+#[cfg(unix)]
 pub(crate) async fn stop(
-    deployment: &str,
+    deployment: Option<&str>,
     service: Option<String>,
     force: bool,
     timeout: u64,
@@ -269,9 +287,11 @@ pub(crate) async fn stop(
 ) -> Result<()> {
     use std::time::Duration;
 
+    let deployment = resolve_stop_deployment(deployment).await?;
+
     let target = match &service {
         Some(s) => format!("{deployment}/{s}"),
-        None => deployment.to_string(),
+        None => deployment.clone(),
     };
 
     info!(

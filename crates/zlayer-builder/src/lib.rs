@@ -362,10 +362,17 @@ ENTRYPOINT ["/app"]
         assert!(cmds[0].args.contains(&"config".to_string()));
         assert!(cmds[0].args.contains(&"--env".to_string()));
 
-        // WORKDIR
+        // WORKDIR materialises the directory (mkdir -p) AND records it as
+        // the working directory (config --workingdir), matching Docker's
+        // WORKDIR semantics.
         let workdir = Instruction::Workdir("/app".to_string());
         let cmds = BuildahCommand::from_instruction(container, &workdir);
-        assert_eq!(cmds.len(), 1);
-        assert!(cmds[0].args.contains(&"--workingdir".to_string()));
+        assert_eq!(cmds.len(), 2);
+        assert!(cmds
+            .iter()
+            .any(|c| c.args.contains(&"run".to_string()) && c.args.contains(&"mkdir".to_string())));
+        assert!(cmds
+            .iter()
+            .any(|c| c.args.contains(&"--workingdir".to_string())));
     }
 }

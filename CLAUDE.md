@@ -10,9 +10,8 @@ ZLayer is a lightweight, Rust-based container orchestration platform with built-
 
 ```
 bin/
-  runtime/         # zlayer-runtime binary (full orchestration runtime)
-  zlayer-build/    # Lightweight image builder CLI
-  zlayer/          # Main zlayer CLI (interactive TUI + runtime passthrough)
+  zlayer/          # Main zlayer CLI (orchestration + image building, single binary)
+  zlayer-desktop/  # Tauri-based desktop wrapper for the Manager UI (not in workspace)
 
 crates/
   zlayer-agent/    # Container runtime (libcontainer integration, storage manager)
@@ -40,23 +39,20 @@ wit/               # WebAssembly interface definitions
 
 ## Key Crates
 
-### bin/runtime
-The `zlayer-runtime` binary. Provides full orchestration including:
-- Container lifecycle management via libcontainer
+### bin/zlayer
+The `zlayer` CLI — single binary for orchestration and image building. Provides:
+- Container lifecycle management via libcontainer (the agent is built in)
 - Encrypted overlay networking (boringtun userspace WireGuard)
-- REST API server
+- REST API server via `zlayer serve` (add `--daemon` to run in the background)
 - Raft-based scheduling
 - WASM runtime via wasmtime
+- Image building: `build`, `pipeline`, `runtimes`, `validate` (plus an interactive TUI)
+- Deployment/service/job/cron subcommands: `deploy`, `logs`, `exec`, `stop`, `ps`, `status`, etc.
 
-### bin/zlayer-build
-Lightweight CLI for image building only (~10MB). Depends only on `zlayer-builder` and `zlayer-spec`. Commands:
-- `build` - Build images from Dockerfile, ZImagefile, or runtime template
-- `pipeline` - Build multiple images from ZPipeline.yaml
-- `runtimes` - List available runtime templates
-- `validate` - Parse and validate build files
+CLI subcommands talk to the running daemon over a Unix socket via `DaemonClient`.
 
-### bin/zlayer
-The main `zlayer` CLI. Provides an interactive TUI for image building (same capabilities as `zlayer-build` but menu-driven) and passes through runtime commands to `zlayer-runtime` when available.
+### bin/zlayer-desktop
+Tauri-based desktop wrapper around the `zlayer-manager` web UI. Not part of the Cargo workspace; built independently via Tauri's tooling.
 
 ### crates/zlayer-builder
 Core image building library. Key modules:
@@ -87,13 +83,7 @@ The project uses a Cargo workspace with all crates defined in the root `Cargo.to
 ### Building
 
 ```bash
-# Full runtime binary (produces zlayer-runtime)
-cargo build --release --package runtime
-
-# Lightweight builder CLI
-cargo build --release -p zlayer-build
-
-# Main CLI (produces zlayer)
+# Main zlayer CLI (single binary: orchestration + image building)
 cargo build --release -p zlayer
 
 # All tests
@@ -115,8 +105,8 @@ Multi-image build pipeline defined in `ZPipeline.yaml` (also accepts `zlayer-pip
 
 Build pipeline:
 ```bash
-zlayer-build pipeline --set VERSION=0.1.0           # Auto-discovers ZPipeline.yaml or zlayer-pipeline.yaml
-zlayer-build pipeline -f ZPipeline.yaml --set VERSION=0.1.0  # Explicit path
+zlayer pipeline --set VERSION=0.1.0           # Auto-discovers ZPipeline.yaml or zlayer-pipeline.yaml
+zlayer pipeline -f ZPipeline.yaml --set VERSION=0.1.0  # Explicit path
 ```
 
 ## Code Patterns
@@ -146,14 +136,14 @@ zlayer-build pipeline -f ZPipeline.yaml --set VERSION=0.1.0  # Explicit path
 ### Running Locally
 
 ```bash
-# Start the API server (via zlayer-runtime)
-cargo run --package runtime -- serve --bind 0.0.0.0:3669
+# Start the API server (daemon mode)
+cargo run -p zlayer -- serve --daemon --bind 0.0.0.0:3669
 
-# Deploy a spec (via zlayer-runtime)
-cargo run --package runtime -- deploy deployment.yaml
+# Deploy a spec
+cargo run -p zlayer -- deploy deployment.yaml
 
 # Build an image
-cargo run -p zlayer-build -- build . -t myapp:latest
+cargo run -p zlayer -- build . -t myapp:latest
 ```
 
 ### Formatting and Linting
@@ -181,11 +171,11 @@ Never skip it with `--no-verify`. If it fails, fix the code.
 
 ## Changelog
 
-**Always update CHANGELOG.md when making changes.** Keep it updated as you work, not just at release time.
+**Always update CHANGELOG.md when making changes.** Keep it updated as you work, not just at release time. Use the actual upcoming version number as the section header — never `[Unreleased]`.
 
 Format:
 ```markdown
-## [Unreleased]
+## 0.2.0 - 2026-04-15
 
 ### Added
 - New feature X
@@ -196,8 +186,6 @@ Format:
 ### Fixed
 - Bug fix Z
 ```
-
-When a release is cut, the [Unreleased] section becomes the new version.
 
 ## AFTER ANY CODE CHANGE: TEST IT
 

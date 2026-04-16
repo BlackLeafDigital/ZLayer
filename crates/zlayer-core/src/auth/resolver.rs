@@ -27,6 +27,11 @@ pub enum AuthSource {
         username_var: String,
         password_var: String,
     },
+
+    /// Look up credentials from the `RegistryCredentialStore` by id.
+    /// Requires the async resolver -- the sync path returns `Anonymous` with
+    /// a warning log.
+    SecretStore { credential_id: String },
 }
 
 /// Per-registry authentication configuration
@@ -116,8 +121,22 @@ impl AuthResolver {
         self.resolve_source(source, &registry)
     }
 
-    /// Resolve a specific `AuthSource` to `RegistryAuth`
-    fn resolve_source(
+    /// Return the `AuthSource` that would be used for the given registry hostname.
+    ///
+    /// Looks up the per-registry map first, falling back to the default source.
+    #[must_use]
+    pub fn source_for_registry(&self, registry: &str) -> &AuthSource {
+        self.registry_map
+            .get(registry)
+            .unwrap_or(&self.config.default)
+    }
+
+    /// Resolve a specific `AuthSource` to `RegistryAuth`.
+    ///
+    /// This is the synchronous resolution path. `AuthSource::SecretStore`
+    /// cannot be resolved synchronously and returns `Anonymous` with a
+    /// warning log.
+    pub fn resolve_source(
         &self,
         source: &AuthSource,
         registry: &str,
@@ -151,6 +170,13 @@ impl AuthResolver {
                 } else {
                     oci_client::secrets::RegistryAuth::Anonymous
                 }
+            }
+
+            AuthSource::SecretStore { .. } => {
+                tracing::warn!(
+                    "SecretStore auth source requires async resolver; returning Anonymous"
+                );
+                oci_client::secrets::RegistryAuth::Anonymous
             }
         }
     }
@@ -338,5 +364,64 @@ mod tests {
         let auth = resolver.resolve("ubuntu:latest");
 
         assert!(matches!(auth, oci_client::secrets::RegistryAuth::Anonymous));
+    }
+
+    #[test]
+    fn test_secret_store_sync_fallback_returns_anonymous() {
+        let config = AuthConfig {
+            registries: vec![RegistryAuthConfig {
+                registry: "private.registry.io".to_string(),
+                source: AuthSource::SecretStore {
+                    credential_id: "cred-uuid-123".to_string(),
+                },
+            }],
+            default: AuthSource::Anonymous,
+            ..Default::default()
+        };
+
+        let resolver = AuthResolver::new(config);
+
+        // The sync path cannot resolve SecretStore and must return Anonymous
+        let auth = resolver.resolve("private.registry.io/image:latest");
+        assert!(matches!(auth, oci_client::secrets::RegistryAuth::Anonymous));
+
+        // The default source should still work normally
+        let auth = resolver.resolve("ubuntu:latest");
+        assert!(matches!(auth, oci_client::secrets::RegistryAuth::Anonymous));
+    }
+
+    #[test]
+    fn test_source_for_registry_returns_correct_source() {
+        let config = AuthConfig {
+            registries: vec![RegistryAuthConfig {
+                registry: "ghcr.io".to_string(),
+                source: AuthSource::Basic {
+                    username: "user".to_string(),
+                    password: "pass".to_string(),
+                },
+            }],
+            default: AuthSource::Anonymous,
+            ..Default::default()
+        };
+
+        let resolver = AuthResolver::new(config);
+
+        // Known registry returns its configured source
+        let source = resolver.source_for_registry("ghcr.io");
+        assert!(matches!(source, AuthSource::Basic { .. }));
+
+        // Unknown registry returns the default
+        let source = resolver.source_for_registry("docker.io");
+        assert!(matches!(source, AuthSource::Anonymous));
+    }
+
+    #[test]
+    fn test_secret_store_serde_roundtrip() {
+        let source = AuthSource::SecretStore {
+            credential_id: "abc-123".to_string(),
+        };
+        let json = serde_json::to_string(&source).unwrap();
+        let parsed: AuthSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(source, parsed);
     }
 }

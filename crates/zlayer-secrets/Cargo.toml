@@ -36,6 +36,9 @@ zeroize = { version = "1.7", features = ["derive"] }
 # Time handling
 chrono.workspace = true
 
+# UUID generation
+uuid.workspace = true
+
 # Storage (optional)
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"], optional = true }
 

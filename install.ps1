@@ -122,6 +122,20 @@ try {
     Write-Host "Installing to $InstallDir..."
     Copy-Item -Path $ExePath.FullName -Destination $TargetExe -Force
 
+    # --- Warn if an older zlayer.exe shadows the one we just installed ---
+    # Get-Command walks PATH in order; a stale binary earlier on PATH will
+    # silently be used instead of the one we installed, which produces
+    # confusing build failures where the daemon can't resolve local images.
+    $Resolved = Get-Command $Binary -ErrorAction SilentlyContinue
+    if ($Resolved -and $Resolved.Source -and ($Resolved.Source -ne $TargetExe)) {
+        Write-Host ""
+        Write-Host "Warning: another '$Binary' binary appears earlier on PATH:" -ForegroundColor Yellow
+        Write-Host "    $($Resolved.Source)" -ForegroundColor Yellow
+        Write-Host "It will shadow the version just installed. Remove it with:" -ForegroundColor Yellow
+        Write-Host "    Remove-Item '$($Resolved.Source)'" -ForegroundColor Yellow
+        Write-Host "Then open a new terminal." -ForegroundColor Yellow
+    }
+
     # --- Download WSL2 support files (optional) ---
     Write-Host ""
     Write-Host "Downloading Linux binary for WSL2 backend support..."
