@@ -428,6 +428,34 @@ mod blocking {
         gix::open(path).with_context(|| format!("opening git repository at {}", path.display()))
     }
 
+    /// Ensure `repo` has a committer identity available for reflog writes.
+    ///
+    /// gix 0.81 refuses to update references with `RefLog::AndReference` when
+    /// the resolved config has no `user.name` / `user.email` (or their
+    /// `committer.*` / `GIT_COMMITTER_*` equivalents). On a developer's laptop
+    /// this is supplied by `~/.gitconfig`; on CI runners and inside fresh
+    /// containers / rootless sandboxes it is not. When we detect a missing
+    /// committer we install a generic in-memory fallback so every blocking
+    /// operation that writes a reflog — `fetch`, `pull_ff`, `checkout` — works
+    /// regardless of the host environment.
+    ///
+    /// This mutation is per-`Repository` only (no env vars, no process-global
+    /// state) and takes effect immediately because `commit()` drops the
+    /// cached `Personas`.
+    fn ensure_committer(repo: &mut gix::Repository) -> Result<()> {
+        if repo.committer().is_some() {
+            return Ok(());
+        }
+        let mut snap = repo.config_snapshot_mut();
+        snap.set_value(&gix::config::tree::User::NAME, "ZLayer")
+            .context("installing fallback user.name for reflog writes")?;
+        snap.set_value(&gix::config::tree::User::EMAIL, "zlayer@localhost")
+            .context("installing fallback user.email for reflog writes")?;
+        snap.commit()
+            .context("committing fallback committer identity to repo config")?;
+        Ok(())
+    }
+
     pub(super) fn clone_repo(
         url: &str,
         branch: &str,
@@ -463,7 +491,8 @@ mod blocking {
     pub(super) fn fetch(repo_path: &Path, auth: &GitAuth) -> Result<()> {
         let env = AuthEnv::build(auth)?;
         with_auth(auth, &env, || {
-            let repo = open_repo(repo_path)?;
+            let mut repo = open_repo(repo_path)?;
+            ensure_committer(&mut repo)?;
             let mut remote = repo
                 .find_remote("origin")
                 .context("locating 'origin' remote for fetch")?;
@@ -496,7 +525,8 @@ mod blocking {
     pub(super) fn pull_ff(repo_path: &Path, branch: &str, auth: &GitAuth) -> Result<String> {
         fetch(repo_path, auth)?;
 
-        let repo = open_repo(repo_path)?;
+        let mut repo = open_repo(repo_path)?;
+        ensure_committer(&mut repo)?;
         let local_ref_name = format!("refs/heads/{branch}");
         let remote_ref_name = format!("refs/remotes/origin/{branch}");
 
@@ -570,7 +600,8 @@ mod blocking {
     }
 
     pub(super) fn checkout(repo_path: &Path, target: &str) -> Result<()> {
-        let repo = open_repo(repo_path)?;
+        let mut repo = open_repo(repo_path)?;
+        ensure_committer(&mut repo)?;
         let id = repo
             .rev_parse_single(target)
             .with_context(|| format!("resolving checkout target '{target}'"))?
@@ -888,6 +919,10 @@ mod tests {
             .expect("clone");
         assert_eq!(clone_sha.len(), 40, "expected SHA-1 hex: {clone_sha}");
         assert!(second.join("hello.txt").exists(), "cloned file is missing");
+        // Defense-in-depth: if the library's `ensure_committer` fallback ever
+        // regresses, a failing test here points at the library and not at a
+        // missing fixture identity.
+        configure_identity(&second);
 
         // `rev_parse` and `current_sha` must agree.
         let parsed = rev_parse(&second, "HEAD").await.expect("rev_parse HEAD");
@@ -980,6 +1015,9 @@ mod tests {
             .await
             .expect("clone");
         assert_ne!(tip, first_sha);
+        // Defense-in-depth: regression here points at the library's
+        // `ensure_committer` fallback rather than a missing fixture identity.
+        configure_identity(&repo);
 
         checkout(&repo, &first_sha).await.expect("checkout sha");
         assert_eq!(

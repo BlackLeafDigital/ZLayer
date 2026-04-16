@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.101]
+
+### Fixed
+- **`zlayer-git` reflog failure on machines without global git config.**
+  `pull_ff` and `checkout` previously panicked with
+  `"reflog messages need a committer which isn't set"` on CI runners
+  and inside fresh containers / rootless sandboxes — any environment
+  without a `user.name` / `user.email` in `~/.gitconfig` or the
+  `GIT_COMMITTER_*` env vars. gix 0.81 is stricter than the `git` CLI
+  (which silently falls back to `whoami@hostname`) and refuses
+  reflog-writing ref updates without an identity. A new internal
+  `ensure_committer` helper installs an in-memory fallback
+  (`ZLayer <zlayer@localhost>`) on each opened `Repository` when none
+  is configured; applied at every blocking entry point that writes
+  reflogs (`fetch`, `pull_ff`, `checkout`). Per-instance mutation via
+  `Repository::config_snapshot_mut` — no env vars, no global mutex.
+  Caller-supplied identities (user config, env vars) take precedence.
+
 ## [0.10.100]
 
 ### Added
