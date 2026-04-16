@@ -49,7 +49,10 @@ COMMAND GROUPS:
   Registry:     pull, export, import
   Cluster:      node, serve, tunnel, manager
   Inspection:   validate, token, spec, wasm
-  Auth:         auth login, auth logout, auth status
+  Auth:         auth bootstrap, auth login, auth logout, auth whoami
+  Users:        user ls, user create, user set-role, user set-password, user delete
+  Projects:     project ls, project create, project show, project update, project delete
+  Credentials:  credential registry ls/add/delete, credential git ls/add/delete
   Interface:    tui
 
 Run 'zlayer <command> --help' for details on a specific command.")]
@@ -278,9 +281,9 @@ pub(crate) enum Commands {
     /// Stream logs from a service
     #[command(display_order = 8)]
     Logs {
-        /// Deployment name
+        /// Deployment name (optional — auto-resolves from service name when omitted)
         #[arg(long)]
-        deployment: String,
+        deployment: Option<String>,
 
         /// Service name
         service: String,
@@ -301,8 +304,8 @@ pub(crate) enum Commands {
     /// Stop a deployment or service
     #[command(display_order = 9)]
     Stop {
-        /// Deployment name
-        deployment: String,
+        /// Deployment name (optional — auto-resolves when only one deployment exists, else prompts)
+        deployment: Option<String>,
 
         /// Service name (optional, stops all if not specified)
         #[arg(short, long)]
@@ -577,12 +580,54 @@ pub(crate) enum Commands {
     #[command(subcommand, display_order = 38)]
     Secret(SecretCommands),
 
+    /// Environment management commands
+    ///
+    /// Manage deployment/runtime environments (e.g. `dev`, `staging`,
+    /// `prod`). Each environment is an isolated namespace for secrets and,
+    /// eventually, deployments. Optionally belongs to a project.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 38)]
+    Env(EnvCommands),
+
     /// Network management commands
     ///
     /// List, create, inspect, and remove networks. Also show overlay
     /// network status, peers, and DNS entries.
     #[command(subcommand, display_order = 39)]
     Network(NetworkCommands),
+
+    /// Variable management commands
+    ///
+    /// Manage plaintext key-value variables for template substitution in
+    /// deployment specs. Variables are NOT encrypted (unlike secrets).
+    /// They can be global or project-scoped.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 39)]
+    Variable(VariableCommands),
+
+    /// Task management commands
+    ///
+    /// Manage named runnable scripts that can be executed on demand.
+    /// Tasks can be global or project-scoped.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 39)]
+    Task(TaskCommands),
+
+    /// Workflow management commands
+    ///
+    /// Manage named DAGs of steps that compose tasks, project builds,
+    /// deploys, and sync applies. Steps run sequentially.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 39)]
+    Workflow(WorkflowCommands),
+
+    /// Notifier management commands
+    ///
+    /// Manage notification channels (Slack, Discord, webhook, SMTP)
+    /// that fire alerts when triggered.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 39)]
+    Notifier(NotifierCommands),
 
     /// Volume management commands
     ///
@@ -607,8 +652,61 @@ pub(crate) enum Commands {
     /// Authentication commands
     ///
     /// Log in to a `ZLayer` server, check status, or log out.
+    #[cfg(unix)]
     #[command(subcommand, display_order = 41)]
     Auth(AuthCommands),
+
+    /// User management commands
+    ///
+    /// Admin-only operations: create, list, update, and delete user accounts.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 43)]
+    User(UserCommands),
+
+    /// Group management commands
+    ///
+    /// Admin-only CRUD for user groups and membership management.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 44)]
+    Group(GroupCommands),
+
+    /// Permission management commands
+    ///
+    /// Admin-only: grant, list, and revoke resource-level permissions.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 44)]
+    Permission(PermissionCommands),
+
+    /// Audit log commands
+    ///
+    /// Admin-only: query the audit trail.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 44)]
+    Audit(AuditCommands),
+
+    /// Project management commands
+    ///
+    /// Create, list, update, and delete projects. Projects group
+    /// deployments, credentials, and build configuration together.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 44)]
+    Project(ProjectCommands),
+
+    /// Credential management commands
+    ///
+    /// Store and manage registry and git credentials. Secrets are
+    /// encrypted at rest; listing only exposes metadata.
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 45)]
+    Credential(CredentialCommands),
+
+    /// `GitOps` sync management commands
+    ///
+    /// Manage sync resources that point at git directories containing
+    /// `ZLayer` resource YAMLs. Supports diff and apply (dry-run in v1).
+    #[cfg(unix)]
+    #[command(subcommand, display_order = 46, name = "sync")]
+    Sync(SyncCommands),
 
     /// Specification inspection commands
     ///
@@ -978,31 +1076,782 @@ pub(crate) enum SystemCommands {
 /// Secrets management subcommands
 #[derive(Subcommand, Debug)]
 pub(crate) enum SecretCommands {
-    /// List all secrets
+    /// List secrets. Pass `--env <id|name>` to list secrets in a specific
+    /// environment; without `--env`, lists all secrets in the default scope.
     #[command(visible_alias = "list")]
     Ls {
         /// Output format (table or json)
         #[arg(long, default_value = "table")]
         output: String,
+        /// Environment id or name to scope the listing to.
+        #[arg(long)]
+        env: Option<String>,
+        /// Project id used to resolve a non-UUID environment name.
+        #[arg(long)]
+        project: Option<String>,
     },
-    /// Create a new secret
+    /// Create a new secret.
     Create {
         /// Secret name
         name: String,
         /// Secret value
         #[arg(long)]
         value: String,
+        /// Environment id or name to scope the secret to.
+        #[arg(long)]
+        env: Option<String>,
+        /// Project id used to resolve a non-UUID environment name.
+        #[arg(long)]
+        project: Option<String>,
     },
-    /// Get secret metadata (does not reveal the value)
+    /// Get secret metadata. Pass `--reveal` together with `--env` to obtain
+    /// the plaintext value (admin only).
     Get {
         /// Secret name
         name: String,
+        /// Environment id or name to scope the lookup to.
+        #[arg(long)]
+        env: Option<String>,
+        /// Project id used to resolve a non-UUID environment name.
+        #[arg(long)]
+        project: Option<String>,
+        /// Include the plaintext value in the output (requires admin and
+        /// `--env`).
+        #[arg(long, default_value_t = false)]
+        reveal: bool,
     },
-    /// Remove a secret
+    /// Remove a secret.
     #[command(visible_alias = "remove")]
     Rm {
         /// Secret name
         name: String,
+        /// Environment id or name to scope the removal to.
+        #[arg(long)]
+        env: Option<String>,
+        /// Project id used to resolve a non-UUID environment name.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Set a secret using `KEY=VALUE` syntax. Requires `--env`.
+    Set {
+        /// `NAME=VALUE` pair.
+        assignment: String,
+        /// Environment id or name to store the secret under.
+        #[arg(long)]
+        env: String,
+        /// Project id used to resolve a non-UUID environment name.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Unset (delete) a secret by name. Requires `--env`.
+    Unset {
+        /// Secret name
+        name: String,
+        /// Environment id or name to scope the removal to.
+        #[arg(long)]
+        env: String,
+        /// Project id used to resolve a non-UUID environment name.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Bulk-import secrets from a `.env`-style file into an environment.
+    Import {
+        /// Path to a `.env`-format file (`KEY=VALUE` per line).
+        #[arg(long)]
+        file: PathBuf,
+        /// Environment id or name to import into.
+        #[arg(long)]
+        env: String,
+        /// Project id used to resolve a non-UUID environment name.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Export secrets from an environment (admin only; reveals plaintext
+    /// values).
+    Export {
+        /// Environment id or name to export from.
+        #[arg(long)]
+        env: String,
+        /// Output format: `env` for `KEY=VALUE` lines, `json` for a map.
+        #[arg(long, default_value = "env")]
+        format: String,
+        /// Project id used to resolve a non-UUID environment name.
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
+/// Environment management subcommands.
+///
+/// An environment is a named, isolated namespace for secrets (and, in
+/// future phases, deployments). Environments are either global
+/// (`project_id = None`) or owned by a specific project.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum EnvCommands {
+    /// List environments.
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Filter by project id. When omitted, only global environments are
+        /// listed; pass `*` to list every environment across projects and
+        /// globals.
+        #[arg(long)]
+        project: Option<String>,
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Create a new environment.
+    Create {
+        /// Environment name (e.g. "dev", "prod").
+        name: String,
+        /// Owning project id. Omit for a global environment.
+        #[arg(long)]
+        project: Option<String>,
+        /// Free-form description shown in the UI.
+        #[arg(long)]
+        description: Option<String>,
+    },
+
+    /// Show one environment by id.
+    Show {
+        /// Environment id.
+        id: String,
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "json")]
+        output: String,
+    },
+
+    /// Update an environment's name and/or description.
+    Update {
+        /// Environment id.
+        id: String,
+        /// New display name.
+        #[arg(long)]
+        name: Option<String>,
+        /// New description. Pass an empty string to clear.
+        #[arg(long)]
+        description: Option<String>,
+    },
+
+    /// Delete an environment. Fails if it still contains secrets.
+    Delete {
+        /// Environment id.
+        id: String,
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
+/// Variable management subcommands.
+///
+/// Variables are plaintext key-value pairs for template substitution in
+/// deployment specs. Unlike secrets, variable values are NOT encrypted
+/// and are fully visible in API responses. They can be global
+/// (`scope = None`) or project-scoped.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum VariableCommands {
+    /// List variables.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Filter by scope (project id). When omitted, only global variables
+        /// are listed.
+        #[arg(long)]
+        scope: Option<String>,
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Set a variable (create or update by name+scope).
+    Set {
+        /// Variable name (e.g. `APP_VERSION`).
+        name: String,
+        /// Variable value.
+        value: String,
+        /// Scope (project id). Omit for a global variable.
+        #[arg(long)]
+        scope: Option<String>,
+    },
+
+    /// Get a variable's value by name.
+    Get {
+        /// Variable name.
+        name: String,
+        /// Scope (project id). Omit for a global variable.
+        #[arg(long)]
+        scope: Option<String>,
+    },
+
+    /// Unset (delete) a variable by name+scope.
+    Unset {
+        /// Variable name.
+        name: String,
+        /// Scope (project id). Omit for a global variable.
+        #[arg(long)]
+        scope: Option<String>,
+    },
+}
+
+/// Task management subcommands.
+///
+/// Tasks are named runnable scripts that can be executed on demand.
+/// When run, the task body is executed as a subprocess and stdout/stderr
+/// are captured.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum TaskCommands {
+    /// List tasks.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Filter by project id. When omitted, all tasks are listed.
+        #[arg(long)]
+        project: Option<String>,
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Create a new task.
+    Create {
+        /// Task name.
+        #[arg(long)]
+        name: String,
+        /// Script type.
+        #[arg(long, default_value = "bash")]
+        kind: String,
+        /// The script/command body.
+        #[arg(long)]
+        body: String,
+        /// Project id to scope the task to.
+        #[arg(long)]
+        project: Option<String>,
+    },
+
+    /// Execute a task synchronously.
+    Run {
+        /// Task id.
+        id: String,
+    },
+
+    /// Show the last run's output for a task.
+    Logs {
+        /// Task id.
+        id: String,
+    },
+
+    /// Delete a task.
+    Delete {
+        /// Task id.
+        id: String,
+        /// Skip confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
+/// Workflow management subcommands.
+///
+/// Workflows are named DAGs of steps that compose tasks, project builds,
+/// deploys, and sync applies. Steps execute sequentially; if a step fails,
+/// the optional `on_failure` handler runs before aborting.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum WorkflowCommands {
+    /// List workflows.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Create a new workflow.
+    Create {
+        /// Workflow name.
+        #[arg(long)]
+        name: String,
+        /// Steps as inline JSON array.
+        #[arg(long)]
+        steps: String,
+        /// Project id scope.
+        #[arg(long)]
+        project: Option<String>,
+    },
+
+    /// Execute a workflow synchronously.
+    Run {
+        /// Workflow id.
+        id: String,
+    },
+
+    /// Show the last run's step results for a workflow.
+    Logs {
+        /// Workflow id.
+        id: String,
+    },
+
+    /// Delete a workflow.
+    Delete {
+        /// Workflow id.
+        id: String,
+        /// Skip confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
+/// Notifier management subcommands.
+///
+/// Notifiers are named notification channels that send alerts to Slack,
+/// Discord, generic webhooks, or SMTP endpoints when triggered.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum NotifierCommands {
+    /// List notifiers.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Create a new notifier.
+    Create {
+        /// Notifier name.
+        #[arg(long)]
+        name: String,
+        /// Notification channel kind (slack, discord, webhook, smtp).
+        #[arg(long)]
+        kind: String,
+        /// Webhook URL (required for slack and discord).
+        #[arg(long)]
+        webhook_url: Option<String>,
+        /// Target URL (required for generic webhook).
+        #[arg(long)]
+        url: Option<String>,
+    },
+
+    /// Send a test notification.
+    Test {
+        /// Notifier id.
+        id: String,
+    },
+
+    /// Delete a notifier.
+    Delete {
+        /// Notifier id.
+        id: String,
+        /// Skip confirmation prompt.
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
+/// Project management subcommands.
+///
+/// Projects group deployments, credentials, environments, and build
+/// configuration under a single entity.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum ProjectCommands {
+    /// List all projects.
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Create a new project.
+    Create {
+        /// Project name.
+        name: String,
+
+        /// Git repository URL.
+        #[arg(long)]
+        git_url: Option<String>,
+
+        /// Git branch (defaults to the repo's default branch).
+        #[arg(long)]
+        git_branch: Option<String>,
+
+        /// Build kind.
+        #[arg(long, value_enum)]
+        build_kind: Option<CliBuildKind>,
+
+        /// Relative path to the build context within the repo.
+        #[arg(long)]
+        build_path: Option<String>,
+
+        /// Free-form description.
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Registry credential id to attach.
+        #[arg(long)]
+        registry_credential: Option<String>,
+
+        /// Git credential id to attach.
+        #[arg(long)]
+        git_credential: Option<String>,
+
+        /// Default environment id to assign.
+        #[arg(long)]
+        default_env: Option<String>,
+    },
+
+    /// Show one project by id.
+    Show {
+        /// Project id.
+        id: String,
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "json")]
+        output: String,
+    },
+
+    /// Update project fields (partial).
+    Update {
+        /// Project id.
+        id: String,
+
+        /// New display name.
+        #[arg(long)]
+        name: Option<String>,
+
+        /// New description. Pass an empty string to clear.
+        #[arg(long)]
+        description: Option<String>,
+
+        /// New git URL.
+        #[arg(long)]
+        git_url: Option<String>,
+
+        /// New git branch.
+        #[arg(long)]
+        git_branch: Option<String>,
+
+        /// New build kind.
+        #[arg(long, value_enum)]
+        build_kind: Option<CliBuildKind>,
+
+        /// New build path.
+        #[arg(long)]
+        build_path: Option<String>,
+
+        /// New registry credential id.
+        #[arg(long)]
+        registry_credential: Option<String>,
+
+        /// New git credential id.
+        #[arg(long)]
+        git_credential: Option<String>,
+
+        /// New default environment id.
+        #[arg(long)]
+        default_env: Option<String>,
+    },
+
+    /// Delete a project.
+    Delete {
+        /// Project id.
+        id: String,
+
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
+
+    /// Link a deployment to a project.
+    LinkDeployment {
+        /// Project id.
+        id: String,
+        /// Deployment name.
+        deployment: String,
+    },
+
+    /// Unlink a deployment from a project.
+    UnlinkDeployment {
+        /// Project id.
+        id: String,
+        /// Deployment name.
+        deployment: String,
+    },
+
+    /// List deployments linked to a project.
+    ListDeployments {
+        /// Project id.
+        id: String,
+    },
+
+    /// Clone or fast-forward pull the project's git repository on the
+    /// daemon. Uses the project's `git_credential_id` for authentication
+    /// when set; falls back to anonymous otherwise.
+    Pull {
+        /// Project id.
+        id: String,
+    },
+
+    /// Enable or disable automatic deploy on new commits.
+    AutoDeploy {
+        /// Project id.
+        id: String,
+        /// Set auto-deploy on or off.
+        #[arg(long)]
+        enabled: bool,
+    },
+
+    /// Set (or clear) the git polling interval for a project.
+    ///
+    /// When set, the daemon periodically checks the remote for new
+    /// commits and pulls them automatically.
+    PollInterval {
+        /// Project id.
+        id: String,
+        /// Polling interval in seconds.  Pass 0 to disable polling.
+        #[arg(long)]
+        seconds: u64,
+    },
+
+    /// Manage the webhook configuration for a project.
+    ///
+    /// Each project can have a webhook secret used by git hosts (GitHub,
+    /// Gitea, Forgejo, GitLab) to authenticate push events.
+    #[command(subcommand)]
+    Webhook(WebhookCommands),
+}
+
+/// Webhook management subcommands for projects.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum WebhookCommands {
+    /// Show the webhook URL and secret for a project.
+    ///
+    /// Generates the secret on first call if it does not exist yet.
+    Show {
+        /// Project id.
+        id: String,
+    },
+
+    /// Rotate (regenerate) the webhook secret for a project.
+    ///
+    /// Admin only. After rotation the old secret is invalidated and the
+    /// git host must be reconfigured with the new value.
+    Rotate {
+        /// Project id.
+        id: String,
+    },
+}
+
+/// CLI-friendly build kind. Sent as a lowercase string in the JSON body.
+#[cfg(unix)]
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub(crate) enum CliBuildKind {
+    Dockerfile,
+    Compose,
+    Zimagefile,
+    Spec,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for CliBuildKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Dockerfile => "dockerfile",
+            Self::Compose => "compose",
+            Self::Zimagefile => "zimagefile",
+            Self::Spec => "spec",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Credential management subcommands.
+///
+/// Registry and git credentials are stored encrypted at rest. Only
+/// metadata (id, registry, username, kind) is exposed through listing.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum CredentialCommands {
+    /// Registry credential subcommands.
+    #[command(subcommand)]
+    Registry(RegistryCredentialCommands),
+    /// Git credential subcommands.
+    #[command(subcommand)]
+    Git(GitCredentialCommands),
+}
+
+/// Registry credential subcommands.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum RegistryCredentialCommands {
+    /// List registry credentials.
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+    /// Add a registry credential.
+    Add {
+        /// Container registry URL (e.g. `ghcr.io`, `docker.io`).
+        #[arg(long)]
+        registry: String,
+
+        /// Registry username.
+        #[arg(long)]
+        username: String,
+
+        /// Registry password or token (prompted if omitted).
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Authentication type.
+        #[arg(long, value_enum, default_value_t = CliRegistryAuthType::Basic)]
+        auth_type: CliRegistryAuthType,
+    },
+    /// Delete a registry credential.
+    Delete {
+        /// Credential id.
+        id: String,
+
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
+/// Git credential subcommands.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum GitCredentialCommands {
+    /// List git credentials.
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+    /// Add a git credential (PAT or SSH key).
+    Add {
+        /// Credential display name.
+        #[arg(long)]
+        name: String,
+
+        /// Credential value (PAT string or SSH private key; prompted if omitted).
+        #[arg(long)]
+        value: Option<String>,
+
+        /// Credential kind.
+        #[arg(long, value_enum)]
+        kind: CliGitCredentialKind,
+    },
+    /// Delete a git credential.
+    Delete {
+        /// Credential id.
+        id: String,
+
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
+/// CLI-friendly registry auth type.
+#[cfg(unix)]
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub(crate) enum CliRegistryAuthType {
+    Basic,
+    Token,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for CliRegistryAuthType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Basic => "basic",
+            Self::Token => "token",
+        };
+        f.write_str(s)
+    }
+}
+
+/// CLI-friendly git credential kind.
+#[cfg(unix)]
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub(crate) enum CliGitCredentialKind {
+    Pat,
+    SshKey,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for CliGitCredentialKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::Pat => "pat",
+            Self::SshKey => "ssh-key",
+        };
+        f.write_str(s)
+    }
+}
+
+/// Sync management subcommands.
+///
+/// Syncs point at git directories containing `ZLayer` resource YAMLs and
+/// support diff / apply operations for `GitOps` workflows.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum SyncCommands {
+    /// List all syncs.
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Create a new sync.
+    Create {
+        /// Display name for this sync.
+        #[arg(long)]
+        name: String,
+
+        /// Linked project id.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Path within the project's checkout to scan for resource YAMLs.
+        #[arg(long)]
+        path: String,
+
+        /// Automatically apply on pull.
+        #[arg(long)]
+        auto_apply: bool,
+    },
+
+    /// Compute a diff for a sync (what would change on apply).
+    Diff {
+        /// Sync id.
+        id: String,
+    },
+
+    /// Apply a sync (dry-run in v1).
+    Apply {
+        /// Sync id.
+        id: String,
+    },
+
+    /// Delete a sync.
+    Delete {
+        /// Sync id.
+        id: String,
+
+        /// Skip confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -1081,15 +1930,15 @@ pub(crate) enum JobCommands {
     },
     /// Trigger a job
     Trigger {
-        /// Deployment name
-        deployment: String,
+        /// Deployment name (optional — auto-resolves when unambiguous)
+        deployment: Option<String>,
         /// Job name
         job: String,
     },
     /// Get job status
     Status {
-        /// Deployment name
-        deployment: String,
+        /// Deployment name (optional — auto-resolves when unambiguous)
+        deployment: Option<String>,
         /// Job name
         job: String,
     },
@@ -1110,8 +1959,8 @@ pub(crate) enum CronCommands {
     },
     /// Get cron job status
     Status {
-        /// Deployment name
-        deployment: String,
+        /// Deployment name (optional — auto-resolves when unambiguous)
+        deployment: Option<String>,
         /// Cron job name
         cron: String,
     },
@@ -1470,36 +2319,293 @@ pub(crate) enum TokenCommands {
 }
 
 /// Authentication subcommands
+#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum AuthCommands {
-    /// Log in to a `ZLayer` server
+    /// Create the first admin user (first-run setup).
     ///
-    /// Authenticates against a `ZLayer` server and stores the JWT locally.
-    /// Credentials are prompted interactively unless --api-key and
-    /// --api-secret are provided.
+    /// Fails with 409 if any user already exists on the daemon.
     ///
     /// Examples:
-    ///   zlayer auth login <http://10.0.0.1:3669>
-    ///   zlayer auth login <http://10.0.0.1:3669> --api-key admin --api-secret s3cret
+    ///   zlayer auth bootstrap --email admin@local --password hunter2
+    ///   zlayer auth bootstrap --email admin@local      # password prompted
     #[command(verbatim_doc_comment)]
-    Login {
-        /// Server URL (e.g., `http://10.0.0.1:3669`)
-        url: String,
-
-        /// API key (prompted interactively if omitted)
+    Bootstrap {
+        /// Email address of the admin user.
         #[arg(long)]
-        api_key: Option<String>,
+        email: String,
 
-        /// API secret (prompted interactively if omitted)
+        /// Password (prompted interactively if omitted).
         #[arg(long)]
-        api_secret: Option<String>,
+        password: Option<String>,
+
+        /// Optional display name (defaults to email).
+        #[arg(long)]
+        display_name: Option<String>,
     },
 
-    /// Log out (remove stored credentials)
+    /// Log in with email + password.
+    ///
+    /// Obtains a JWT from `POST /auth/token` and persists it to
+    /// `~/.zlayer/session.json`. Subsequent commands run as this user.
+    ///
+    /// Examples:
+    ///   zlayer auth login --email admin@local
+    ///   zlayer auth login --email admin@local --password hunter2
+    #[command(verbatim_doc_comment)]
+    Login {
+        /// Email address.
+        #[arg(long)]
+        email: String,
+
+        /// Password (prompted interactively if omitted).
+        #[arg(long)]
+        password: Option<String>,
+    },
+
+    /// Log out -- delete the local session file and notify the server.
     Logout,
 
-    /// Show current authentication status
-    Status,
+    /// Print the currently signed-in user.
+    Whoami,
+}
+
+/// CLI-friendly user role. Converts into `zlayer_api::storage::UserRole`.
+#[cfg(unix)]
+#[derive(Copy, Clone, Debug, ValueEnum)]
+pub(crate) enum CliUserRole {
+    Admin,
+    User,
+}
+
+#[cfg(unix)]
+impl From<CliUserRole> for zlayer_api::storage::UserRole {
+    fn from(r: CliUserRole) -> Self {
+        match r {
+            CliUserRole::Admin => zlayer_api::storage::UserRole::Admin,
+            CliUserRole::User => zlayer_api::storage::UserRole::User,
+        }
+    }
+}
+
+/// User management subcommands (admin-only).
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum UserCommands {
+    /// List all users.
+    #[command(visible_alias = "list")]
+    Ls {
+        /// Output format (table or json).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Create a new user.
+    Create {
+        /// Email address.
+        #[arg(long)]
+        email: String,
+
+        /// Password (prompted if omitted).
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Role.
+        #[arg(long, value_enum, default_value_t = CliUserRole::User)]
+        role: CliUserRole,
+
+        /// Display name (defaults to email).
+        #[arg(long)]
+        display_name: Option<String>,
+    },
+
+    /// Change a user's role.
+    SetRole {
+        /// User id.
+        id: String,
+
+        /// New role.
+        #[arg(long, value_enum)]
+        role: CliUserRole,
+    },
+
+    /// Set a user's password (prompts for the new value).
+    SetPassword {
+        /// User id.
+        id: String,
+    },
+
+    /// Delete a user.
+    Delete {
+        /// User id.
+        id: String,
+
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
+}
+
+/// Group management subcommands.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum GroupCommands {
+    /// List all groups.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Output format (table or json).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Create a new group.
+    Create {
+        /// Group name.
+        #[arg(long)]
+        name: String,
+    },
+
+    /// Delete a group.
+    Delete {
+        /// Group id.
+        id: String,
+
+        /// Skip the confirmation prompt.
+        #[arg(long, short)]
+        yes: bool,
+    },
+
+    /// Member management.
+    #[command(subcommand)]
+    Member(GroupMemberCommands),
+}
+
+/// Group member management subcommands.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum GroupMemberCommands {
+    /// Add a user to a group.
+    Add {
+        /// Group id.
+        #[arg(long)]
+        group: String,
+        /// User id.
+        #[arg(long)]
+        user: String,
+    },
+
+    /// Remove a user from a group.
+    Remove {
+        /// Group id.
+        #[arg(long)]
+        group: String,
+        /// User id.
+        #[arg(long)]
+        user: String,
+    },
+}
+
+/// Permission management subcommands.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum PermissionCommands {
+    /// List permissions for a user or group.
+    #[command(visible_alias = "ls")]
+    List {
+        /// Filter by user id.
+        #[arg(long)]
+        user: Option<String>,
+        /// Filter by group id.
+        #[arg(long)]
+        group: Option<String>,
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
+
+    /// Grant a permission.
+    Grant {
+        /// Subject kind: `user` or `group`.
+        #[arg(long, value_enum)]
+        subject_kind: CliSubjectKind,
+        /// Subject id.
+        #[arg(long)]
+        subject: String,
+        /// Resource kind (e.g. `deployment`, `project`, `secret`).
+        #[arg(long)]
+        resource_kind: String,
+        /// Specific resource id (omit for wildcard).
+        #[arg(long)]
+        resource: Option<String>,
+        /// Access level.
+        #[arg(long, value_enum)]
+        level: CliPermissionLevel,
+    },
+
+    /// Revoke a permission by id.
+    Revoke {
+        /// Permission id.
+        id: String,
+    },
+}
+
+/// CLI enum for subject kind.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub(crate) enum CliSubjectKind {
+    User,
+    Group,
+}
+
+#[cfg(unix)]
+impl From<CliSubjectKind> for zlayer_api::storage::SubjectKind {
+    fn from(k: CliSubjectKind) -> Self {
+        match k {
+            CliSubjectKind::User => zlayer_api::storage::SubjectKind::User,
+            CliSubjectKind::Group => zlayer_api::storage::SubjectKind::Group,
+        }
+    }
+}
+
+/// CLI enum for permission level.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub(crate) enum CliPermissionLevel {
+    Read,
+    Write,
+    Execute,
+}
+
+#[cfg(unix)]
+impl From<CliPermissionLevel> for zlayer_api::storage::PermissionLevel {
+    fn from(l: CliPermissionLevel) -> Self {
+        match l {
+            CliPermissionLevel::Read => zlayer_api::storage::PermissionLevel::Read,
+            CliPermissionLevel::Write => zlayer_api::storage::PermissionLevel::Write,
+            CliPermissionLevel::Execute => zlayer_api::storage::PermissionLevel::Execute,
+        }
+    }
+}
+
+/// Audit log subcommands.
+#[cfg(unix)]
+#[derive(Subcommand, Debug)]
+pub(crate) enum AuditCommands {
+    /// Show recent audit log entries.
+    Tail {
+        /// Filter by user id.
+        #[arg(long)]
+        user: Option<String>,
+        /// Filter by resource kind.
+        #[arg(long)]
+        resource: Option<String>,
+        /// Maximum number of entries to return.
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Output format (`table` or `json`).
+        #[arg(long, default_value = "table")]
+        output: String,
+    },
 }
 
 /// Spec inspection subcommands
@@ -1957,7 +3063,7 @@ mod tests {
                 follow,
                 instance,
             }) => {
-                assert_eq!(deployment, "my-deployment");
+                assert_eq!(deployment.as_deref(), Some("my-deployment"));
                 assert_eq!(service, "my-service");
                 assert_eq!(lines, 100); // default
                 assert!(!follow);

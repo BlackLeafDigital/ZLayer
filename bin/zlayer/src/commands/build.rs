@@ -97,7 +97,12 @@ pub(crate) async fn handle_build(
         .with_events(event_tx);
 
     // Wire up local registry + blob cache so built images are stored locally.
-    // Both are best-effort: if either fails we log a warning and continue.
+    // A Permission denied here is fatal: it means the daemon's data_dir is not
+    // writable by this UID, which will produce a "successful" build that the
+    // daemon can't resolve — the image never lands in the local registry and
+    // the runtime falls through to docker.io/library/* with a cryptic 401.
+    // Better to fail loud with a remediation hint than silently corrupt the
+    // deploy path. Other errors (corrupt DB, disk full) stay warn-and-continue.
     let data_dir = zlayer_paths::ZLayerDirs::detect_data_dir();
 
     let cache_path = data_dir.join("cache").join("blobs.redb");
@@ -108,6 +113,16 @@ pub(crate) async fn handle_build(
             builder = builder.with_cache_backend(backend);
         }
         Err(e) => {
+            if looks_like_permission_denied(&e.to_string()) && is_system_data_dir(&data_dir) {
+                anyhow::bail!(
+                    "cannot write to {}: Permission denied.\n\
+                     The build data directory is owned by another user or needs re-provisioning.\n\
+                     Fix: sudo zlayer daemon install   (re-runs ownership setup)\n\
+                     Verify with: ls -ld {}",
+                    cache_path.display(),
+                    data_dir.display(),
+                );
+            }
             warn!(
                 "Failed to open persistent blob cache, builds will not populate local cache: {e}"
             );
@@ -115,11 +130,21 @@ pub(crate) async fn handle_build(
     }
 
     let registry_path = data_dir.join("registry");
-    match zlayer_registry::LocalRegistry::new(registry_path).await {
+    match zlayer_registry::LocalRegistry::new(registry_path.clone()).await {
         Ok(registry) => {
             builder = builder.with_local_registry(registry);
         }
         Err(e) => {
+            if looks_like_permission_denied(&e.to_string()) && is_system_data_dir(&data_dir) {
+                anyhow::bail!(
+                    "cannot write to {}: Permission denied.\n\
+                     The build data directory is owned by another user or needs re-provisioning.\n\
+                     Fix: sudo zlayer daemon install   (re-runs ownership setup)\n\
+                     Verify with: ls -ld {}",
+                    registry_path.display(),
+                    data_dir.display(),
+                );
+            }
             warn!("Failed to open local registry, built images will not be stored locally: {e}");
         }
     }
@@ -261,4 +286,28 @@ pub(crate) fn handle_runtimes() -> Result<()> {
     );
 
     Ok(())
+}
+
+/// Match EACCES messages across redb, `std::io`, and our local-registry wrapper.
+/// redb surfaces "readonly database" on EROFS-ish opens; `std::io::Error`
+/// formats `PermissionDenied` as "Permission denied".
+fn looks_like_permission_denied(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("permission denied") || lower.contains("readonly database")
+}
+
+/// True if `data_dir` is a system-owned install (rather than a user-local one
+/// like `~/.zlayer`). We only auto-elevate EACCES to a hard error in the
+/// system case — a user's own `~/.zlayer` being unreadable is weirder and
+/// usually deserves the raw error.
+fn is_system_data_dir(data_dir: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        data_dir.starts_with("/var/lib/") || data_dir.starts_with("/usr/")
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = data_dir;
+        false
+    }
 }

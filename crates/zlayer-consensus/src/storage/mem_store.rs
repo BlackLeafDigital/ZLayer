@@ -5,7 +5,7 @@
 //! `RaftTypeConfig` so any application can plug in its own request/response types.
 //!
 //! **Not suitable for production** -- data is lost on process restart.
-//! Use [`RedbStore`](super::redb_store) for durable storage.
+//! Use [`ZqlStore`](super::zql_store) for durable storage.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;

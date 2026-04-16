@@ -23,6 +23,12 @@ mod persistent;
 #[cfg(feature = "persistent")]
 pub mod credentials;
 
+#[cfg(feature = "persistent")]
+pub mod registry_credentials;
+
+#[cfg(feature = "persistent")]
+pub mod git_credentials;
+
 #[cfg(feature = "vault")]
 mod vault;
 
@@ -37,6 +43,12 @@ pub use persistent::PersistentSecretsStore;
 
 #[cfg(feature = "persistent")]
 pub use credentials::CredentialStore;
+
+#[cfg(feature = "persistent")]
+pub use git_credentials::{GitCredential, GitCredentialKind, GitCredentialStore};
+
+#[cfg(feature = "persistent")]
+pub use registry_credentials::{RegistryAuthType, RegistryCredential, RegistryCredentialStore};
 
 #[cfg(feature = "vault")]
 pub use vault::VaultSecretsProvider;

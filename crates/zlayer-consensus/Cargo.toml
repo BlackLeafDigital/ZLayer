@@ -38,7 +38,6 @@ hex = { workspace = true }
 
 # Persistent storage (optional)
 zql = { workspace = true, optional = true }
-redb = { workspace = true, optional = true }
 postcard2 = { workspace = true }
 
 [dev-dependencies]
@@ -49,7 +48,6 @@ tempfile = "3"
 default = ["mem-store"]
 mem-store = []
 zql-store = ["dep:zql", "dep:serde_json"]
-redb-store = ["dep:redb"]
 
 [lints]
 workspace = true

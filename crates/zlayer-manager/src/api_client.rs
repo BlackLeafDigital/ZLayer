@@ -1788,6 +1788,112 @@ impl ZLayerClient {
             }
         }
     }
+
+    // ---- Raw auth passthrough ----
+
+    /// Perform a raw HTTP request against the underlying transport and return
+    /// the status, body, and `Set-Cookie` headers intact.
+    ///
+    /// Used by Manager server_fns to proxy auth and users endpoints. Unlike the
+    /// typed methods, this one forwards the caller's cookies and preserves the
+    /// upstream's response cookies so the browser session round-trips cleanly.
+    ///
+    /// # Arguments
+    /// - `method` — HTTP method.
+    /// - `path` — path-and-query segment starting with `/` (e.g. `/auth/login`
+    ///   or `/api/v1/users?x=1`).
+    /// - `body` — optional request body (sent as `application/json` when
+    ///   `Some`).
+    /// - `forward_cookie` — optional `Cookie` header value to forward from the
+    ///   browser's request (e.g. `zlayer_session=…; zlayer_csrf=…`).
+    /// - `csrf_token` — optional `X-CSRF-Token` header value (double-submit).
+    ///
+    /// # Errors
+    /// Returns `ApiClientError::Http` on transport-level failures. Does NOT
+    /// map non-2xx statuses to errors — the caller is expected to inspect
+    /// `RawResponse::status`.
+    pub async fn raw_request(
+        &self,
+        method: RawMethod,
+        path: &str,
+        body: Option<&[u8]>,
+        forward_cookie: Option<&str>,
+        csrf_token: Option<&str>,
+    ) -> Result<RawResponse> {
+        let url = format!("{}{}", self.base_url, path);
+        let mut req = self.client.request(method.as_reqwest(), &url);
+        if let Some(tok) = &self.token {
+            req = req.header(reqwest::header::AUTHORIZATION, format!("Bearer {tok}"));
+        }
+        if let Some(cookie) = forward_cookie {
+            req = req.header(reqwest::header::COOKIE, cookie);
+        }
+        if let Some(csrf) = csrf_token {
+            req = req.header("x-csrf-token", csrf);
+        }
+        if let Some(body) = body {
+            req = req
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body.to_vec());
+        }
+
+        let resp = req.send().await?;
+        let status = resp.status();
+        let set_cookies: Vec<String> = resp
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .map(str::to_string)
+            .collect();
+        let body = resp.bytes().await?.to_vec();
+        Ok(RawResponse {
+            status,
+            body,
+            set_cookies,
+        })
+    }
+}
+
+/// Raw response from a passthrough HTTP call.
+///
+/// Exposes the status, body bytes, and any `Set-Cookie` headers the upstream
+/// API wrote — used by Leptos server_fns to mirror login/logout cookies back
+/// to the browser.
+#[derive(Debug)]
+pub struct RawResponse {
+    /// Upstream HTTP status code.
+    pub status: reqwest::StatusCode,
+    /// Response body bytes.
+    pub body: Vec<u8>,
+    /// `Set-Cookie` header values from the upstream response, one entry per
+    /// header (multi-valued).
+    pub set_cookies: Vec<String>,
+}
+
+/// HTTP method selector for the raw passthrough. We don't use `reqwest::Method`
+/// directly so callers don't need a reqwest dep.
+#[derive(Debug, Clone, Copy)]
+pub enum RawMethod {
+    /// HTTP GET.
+    Get,
+    /// HTTP POST.
+    Post,
+    /// HTTP PATCH.
+    Patch,
+    /// HTTP DELETE.
+    Delete,
+}
+
+impl RawMethod {
+    fn as_reqwest(self) -> reqwest::Method {
+        match self {
+            RawMethod::Get => reqwest::Method::GET,
+            RawMethod::Post => reqwest::Method::POST,
+            RawMethod::Patch => reqwest::Method::PATCH,
+            RawMethod::Delete => reqwest::Method::DELETE,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2364,5 +2470,35 @@ mod tests {
         assert_eq!(original.enabled, restored.enabled);
         assert_eq!(original.zone, restored.zone);
         assert_eq!(original.services, restored.services);
+    }
+
+    mod raw_tests {
+        use super::super::{RawMethod, RawResponse};
+        use reqwest::StatusCode;
+
+        #[test]
+        fn raw_method_round_trip() {
+            // Each variant maps consistently across both transport conversions.
+            for m in [
+                RawMethod::Get,
+                RawMethod::Post,
+                RawMethod::Patch,
+                RawMethod::Delete,
+            ] {
+                assert_eq!(m.as_reqwest().as_str(), format!("{m:?}").to_uppercase());
+            }
+        }
+
+        #[test]
+        fn raw_response_fields_are_public() {
+            let r = RawResponse {
+                status: StatusCode::OK,
+                body: b"{}".to_vec(),
+                set_cookies: vec!["a=b".into()],
+            };
+            assert_eq!(r.status, StatusCode::OK);
+            assert_eq!(r.body, b"{}".to_vec());
+            assert_eq!(r.set_cookies.len(), 1);
+        }
     }
 }

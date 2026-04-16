@@ -1,0 +1,26 @@
+[package]
+name = "zlayer-git-zql"
+description = "Git operations for ZLayer project management"
+publish = ["forgejo"]
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gix.workspace = true
+serde.workspace = true
+serde_yaml.workspace = true
+# tempfile: SSH auth writes a PEM key to a mode-0600 TempDir for the duration
+# of the operation; retained at runtime.
+tempfile = "3"
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

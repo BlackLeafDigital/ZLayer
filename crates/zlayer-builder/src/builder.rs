@@ -113,10 +113,14 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use tokio::fs;
-use tracing::{debug, info, instrument, warn};
+#[cfg(feature = "local-registry")]
+use tracing::warn;
+use tracing::{debug, info, instrument};
 
 use crate::backend::BuildBackend;
-use crate::buildah::{BuildahCommand, BuildahExecutor};
+#[cfg(feature = "local-registry")]
+use crate::buildah::BuildahCommand;
+use crate::buildah::BuildahExecutor;
 use crate::dockerfile::{Dockerfile, RunMount};
 use crate::error::{BuildError, Result};
 use crate::templates::{get_template, Runtime};

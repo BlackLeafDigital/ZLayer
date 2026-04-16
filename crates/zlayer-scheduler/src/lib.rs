@@ -320,6 +320,8 @@ impl Scheduler {
                 replicas = replicas,
                 "Test mode: skipping agent scaling call"
             );
+            // Yield to justify the async signature (required for non-test builds)
+            tokio::task::yield_now().await;
             Ok(())
         }
 

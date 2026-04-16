@@ -578,6 +578,7 @@ fn apply_build_file(builder: ImageBuilder, file_path: &Path) -> ImageBuilder {
 ///
 /// When `platform` is `Some`, the builder is configured for that specific
 /// platform (e.g. `"linux/arm64"`), enabling cross-architecture builds.
+#[cfg_attr(not(feature = "local-registry"), allow(unused_variables))]
 async fn build_single_image(
     name: &str,
     pipeline: &ZPipeline,
@@ -632,6 +633,7 @@ async fn build_single_image(
 /// Each platform is built sequentially (QEMU can be flaky with parallel
 /// cross-arch builds), then a buildah manifest list is created that
 /// references all per-platform images.
+#[cfg_attr(not(feature = "local-registry"), allow(unused_variables))]
 async fn build_multiplatform_image(
     name: &str,
     pipeline: &ZPipeline,

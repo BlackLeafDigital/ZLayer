@@ -15,28 +15,95 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::auth::AuthState;
 use crate::config::ApiConfig;
 use crate::handlers;
+use crate::handlers::audit::AuditState;
 use crate::handlers::cluster::ClusterApiState;
 use crate::handlers::containers::ContainerApiState;
+use crate::handlers::credentials::CredentialState;
 use crate::handlers::cron::CronState;
 use crate::handlers::deployments::DeploymentState;
+use crate::handlers::environments::{EnvironmentsRouterState, EnvironmentsState};
+use crate::handlers::groups::GroupsState;
 use crate::handlers::internal::InternalState;
 use crate::handlers::jobs::JobState;
 use crate::handlers::networks::NetworkApiState;
 use crate::handlers::nodes::NodeApiState;
+use crate::handlers::notifiers::NotifiersState;
 use crate::handlers::overlay::OverlayApiState;
+use crate::handlers::permissions::PermissionsState;
+use crate::handlers::projects::ProjectState;
 use crate::handlers::proxy::ProxyApiState;
 use crate::handlers::secrets::SecretsState;
 use crate::handlers::services::ServiceState;
 use crate::handlers::storage::StorageState;
+use crate::handlers::syncs::SyncState;
+use crate::handlers::tasks::TasksState;
 use crate::handlers::tunnels::TunnelApiState;
+use crate::handlers::variables::VariableState;
 use crate::handlers::volumes::VolumeApiState;
+use crate::handlers::webhooks::WebhookState;
+use crate::handlers::workflows::WorkflowsState;
+use crate::middleware::csrf::csrf_middleware;
 use crate::openapi::ApiDoc;
 use crate::ratelimit::{rate_limit_middleware, IpRateLimiter, RateLimitState};
-use crate::storage::{DeploymentStorage, InMemoryStorage};
+use crate::storage::{DeploymentStorage, EnvironmentStorage, InMemoryStorage};
 
 use crate::handlers::build::{build_routes, BuildState};
 use zlayer_agent::{CronScheduler, JobExecutor, ServiceManager};
 use zlayer_secrets::SecretsStore;
+
+/// Build the full auth-routes sub-router (unauthenticated endpoints: token,
+/// bootstrap, login, logout, plus authenticated me/csrf).
+///
+/// Note: all routes share the same `AuthState`. `me` and `csrf` require an
+/// authenticated actor (enforced by the `AuthActor` extractor, which accepts
+/// either a Bearer token or a session cookie); the others are intentionally
+/// unauthenticated so browser clients can log in / bootstrap without an
+/// existing session.
+fn build_auth_routes(auth_state: AuthState) -> Router {
+    use axum::extract::State;
+    use axum_extra::extract::cookie::CookieJar;
+
+    // `logout` and `csrf` are sync functions in the auth handler module, so
+    // wrap them in async adapters to satisfy axum's `Handler` trait (which
+    // requires handlers to return a `Future`).
+    async fn logout_adapter(jar: CookieJar) -> impl axum::response::IntoResponse {
+        handlers::auth::logout(jar)
+    }
+    async fn csrf_adapter(
+        actor: crate::handlers::users::AuthActor,
+        state: State<AuthState>,
+        jar: CookieJar,
+    ) -> impl axum::response::IntoResponse {
+        handlers::auth::csrf(actor, state, jar)
+    }
+
+    Router::new()
+        .route("/token", post(handlers::auth::get_token))
+        .route("/bootstrap", post(handlers::auth::bootstrap))
+        .route("/login", post(handlers::auth::login))
+        .route("/logout", post(logout_adapter))
+        .route("/me", get(handlers::auth::me))
+        .route("/csrf", get(csrf_adapter))
+        .with_state(auth_state)
+}
+
+/// Build the users-CRUD sub-router.
+///
+/// All routes require authentication (Bearer or session cookie) and most
+/// require the `admin` role — those checks happen inside the handlers via
+/// the `AuthActor` extractor. The router itself does not layer extra auth
+/// middleware; the shared `Extension(auth_state)` at the top-level router
+/// provides `AuthState` to the extractors.
+fn build_users_routes(auth_state: AuthState) -> Router {
+    Router::new()
+        .route("/", get(handlers::users::list_users))
+        .route("/", post(handlers::users::create_user))
+        .route("/{id}", get(handlers::users::get_user))
+        .route("/{id}", axum::routing::patch(handlers::users::update_user))
+        .route("/{id}", delete(handlers::users::delete_user))
+        .route("/{id}/password", post(handlers::users::set_password))
+        .with_state(auth_state)
+}
 
 /// Build the API router with default in-memory storage
 pub fn build_router(config: &ApiConfig) -> Router {
@@ -53,6 +120,8 @@ pub fn build_router_with_storage(
     let auth_state = AuthState {
         jwt_secret: config.jwt_secret.clone(),
         credential_store: config.credential_store.clone(),
+        user_store: config.user_store.clone(),
+        cookie_secure: false,
     };
 
     // Deployment state (for CRUD operations)
@@ -73,10 +142,9 @@ pub fn build_router_with_storage(
         .route("/live", get(handlers::health::liveness))
         .route("/ready", get(handlers::health::readiness));
 
-    // Auth routes (no auth required for token endpoint)
-    let auth_routes = Router::new()
-        .route("/token", post(handlers::auth::get_token))
-        .with_state(auth_state.clone());
+    // Auth + users routes
+    let auth_routes = build_auth_routes(auth_state.clone());
+    let users_routes = build_users_routes(auth_state.clone());
 
     // Deployment CRUD routes (use DeploymentState)
     let deployment_crud_routes = Router::new()
@@ -127,11 +195,13 @@ pub fn build_router_with_storage(
     let mut router = Router::new()
         .nest("/health", health_routes)
         .nest("/auth", auth_routes)
+        .nest("/api/v1/users", users_routes)
         .nest("/api/v1/deployments", deployments_api)
         .layer(Extension(auth_state))
         .layer(Extension(rate_limit_state))
         .layer(Extension(ip_limiter))
         .layer(middleware::from_fn(rate_limit_middleware))
+        .layer(middleware::from_fn(csrf_middleware))
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
@@ -285,6 +355,8 @@ pub fn build_router_with_services(
     let auth_state = AuthState {
         jwt_secret: config.jwt_secret.clone(),
         credential_store: config.credential_store.clone(),
+        user_store: config.user_store.clone(),
+        cookie_secure: false,
     };
 
     // Deployment state (for deployment CRUD operations)
@@ -305,10 +377,9 @@ pub fn build_router_with_services(
         .route("/live", get(handlers::health::liveness))
         .route("/ready", get(handlers::health::readiness));
 
-    // Auth routes (no auth required for token endpoint)
-    let auth_routes = Router::new()
-        .route("/token", post(handlers::auth::get_token))
-        .with_state(auth_state.clone());
+    // Auth + users routes
+    let auth_routes = build_auth_routes(auth_state.clone());
+    let users_routes = build_users_routes(auth_state.clone());
 
     // Deployment CRUD routes (use DeploymentState)
     let deployment_crud_routes = Router::new()
@@ -359,11 +430,13 @@ pub fn build_router_with_services(
     let mut router = Router::new()
         .nest("/health", health_routes)
         .nest("/auth", auth_routes)
+        .nest("/api/v1/users", users_routes)
         .nest("/api/v1/deployments", api_v1)
         .layer(Extension(auth_state))
         .layer(Extension(rate_limit_state))
         .layer(Extension(ip_limiter))
         .layer(middleware::from_fn(rate_limit_middleware))
+        .layer(middleware::from_fn(csrf_middleware))
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
@@ -397,6 +470,8 @@ pub fn build_router_with_deployment_state(
     let auth_state = AuthState {
         jwt_secret: config.jwt_secret.clone(),
         credential_store: config.credential_store.clone(),
+        user_store: config.user_store.clone(),
+        cookie_secure: false,
     };
 
     // Service state (for service scaling operations)
@@ -414,10 +489,9 @@ pub fn build_router_with_deployment_state(
         .route("/live", get(handlers::health::liveness))
         .route("/ready", get(handlers::health::readiness));
 
-    // Auth routes (no auth required for token endpoint)
-    let auth_routes = Router::new()
-        .route("/token", post(handlers::auth::get_token))
-        .with_state(auth_state.clone());
+    // Auth + users routes
+    let auth_routes = build_auth_routes(auth_state.clone());
+    let users_routes = build_users_routes(auth_state.clone());
 
     // Deployment CRUD routes (use pre-built DeploymentState with orchestration)
     let deployment_crud_routes = Router::new()
@@ -468,11 +542,13 @@ pub fn build_router_with_deployment_state(
     let mut router = Router::new()
         .nest("/health", health_routes)
         .nest("/auth", auth_routes)
+        .nest("/api/v1/users", users_routes)
         .nest("/api/v1/deployments", api_v1)
         .layer(Extension(auth_state))
         .layer(Extension(rate_limit_state))
         .layer(Extension(ip_limiter))
         .layer(middleware::from_fn(rate_limit_middleware))
+        .layer(middleware::from_fn(csrf_middleware))
         .layer(cors)
         .layer(TraceLayer::new_for_http());
 
@@ -584,10 +660,18 @@ pub fn build_image_routes(
 /// Build routes for secrets management
 ///
 /// Creates the routes for CRUD operations on secrets. These routes require
-/// authentication and use the user's ID as the scope for secrets.
+/// authentication; mutating endpoints require the `admin` role.
+///
+/// Routes:
+/// - `POST   /`             — create or update a secret
+/// - `GET    /`             — list secrets in a scope
+/// - `POST   /bulk-import`  — admin-only dotenv bulk import
+/// - `GET    /{name}`       — get metadata (admin `?reveal=true` returns value)
+/// - `DELETE /{name}`       — delete a secret
 ///
 /// # Arguments
-/// * `secrets_state` - State containing the secrets store
+/// * `secrets_state` - State containing the secrets store and (optionally)
+///   the environment store for env-aware scope resolution.
 ///
 /// # Returns
 /// A Router with the secrets endpoints
@@ -595,9 +679,240 @@ pub fn build_secrets_routes(secrets_state: SecretsState) -> Router<()> {
     Router::new()
         .route("/", post(handlers::secrets::create_secret))
         .route("/", get(handlers::secrets::list_secrets))
+        .route("/bulk-import", post(handlers::secrets::bulk_import_secrets))
         .route("/{name}", get(handlers::secrets::get_secret_metadata))
         .route("/{name}", delete(handlers::secrets::delete_secret))
         .with_state(secrets_state)
+}
+
+/// Build routes for environment CRUD.
+///
+/// Routes:
+/// - `GET    /`        — list environments (`?project=` filters)
+/// - `POST   /`        — create (admin-only)
+/// - `GET    /{id}`    — fetch one
+/// - `PATCH  /{id}`    — rename / re-describe (admin-only)
+/// - `DELETE /{id}`    — delete (admin-only, refuses if secrets remain)
+///
+/// All routes require authentication (Bearer or session cookie) via the
+/// `AuthActor` extractor; admin enforcement happens in the handlers.
+///
+/// # Arguments
+/// * `env_state` - Environment storage state.
+/// * `secrets_state` - Secrets state, used by the cascade-safety check on
+///   delete to count remaining secrets in the env's scope.
+///
+/// # Returns
+/// A Router with the environment endpoints
+pub fn build_environment_routes(
+    env_state: EnvironmentsState,
+    secrets_state: SecretsState,
+) -> Router<()> {
+    let state = EnvironmentsRouterState::new(env_state, secrets_state);
+    Router::new()
+        .route("/", get(handlers::environments::list_environments))
+        .route("/", post(handlers::environments::create_environment))
+        .route("/{id}", get(handlers::environments::get_environment))
+        .route(
+            "/{id}",
+            axum::routing::patch(handlers::environments::update_environment),
+        )
+        .route("/{id}", delete(handlers::environments::delete_environment))
+        .with_state(state)
+}
+
+/// Build routes for variable CRUD.
+///
+/// Routes:
+/// - `GET    /`     -- list variables (filtered by scope)
+/// - `POST   /`     -- create (admin-only)
+/// - `GET    /{id}` -- fetch one
+/// - `PATCH  /{id}` -- update (admin-only)
+/// - `DELETE /{id}` -- delete (admin-only)
+///
+/// All routes require authentication (Bearer or session cookie) via the
+/// `AuthActor` extractor; admin enforcement happens in the handlers.
+///
+/// # Arguments
+/// * `variable_state` - Variable storage state.
+///
+/// # Returns
+/// A Router with the variable endpoints
+pub fn build_variable_routes(variable_state: VariableState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::variables::list_variables))
+        .route("/", post(handlers::variables::create_variable))
+        .route("/{id}", get(handlers::variables::get_variable))
+        .route(
+            "/{id}",
+            axum::routing::patch(handlers::variables::update_variable),
+        )
+        .route("/{id}", delete(handlers::variables::delete_variable))
+        .with_state(variable_state)
+}
+
+/// Build routes for task CRUD and execution.
+///
+/// Routes:
+/// - `GET    /`            -- list tasks (filtered by `project_id`)
+/// - `POST   /`            -- create (admin-only)
+/// - `GET    /{id}`         -- fetch one
+/// - `DELETE /{id}`         -- delete (admin-only)
+/// - `POST   /{id}/run`     -- execute synchronously (admin-only)
+/// - `GET    /{id}/runs`    -- list past runs
+///
+/// All routes require authentication (Bearer or session cookie) via the
+/// `AuthActor` extractor; admin enforcement happens in the handlers.
+///
+/// # Arguments
+/// * `tasks_state` - Task storage state.
+///
+/// # Returns
+/// A Router with the task endpoints
+pub fn build_task_routes(tasks_state: TasksState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::tasks::list_tasks))
+        .route("/", post(handlers::tasks::create_task))
+        .route("/{id}", get(handlers::tasks::get_task))
+        .route("/{id}", delete(handlers::tasks::delete_task))
+        .route("/{id}/run", post(handlers::tasks::run_task))
+        .route("/{id}/runs", get(handlers::tasks::list_task_runs))
+        .with_state(tasks_state)
+}
+
+/// Build routes for project CRUD and deployment linking.
+///
+/// Routes:
+/// - `GET    /`                    -- list all projects
+/// - `POST   /`                    -- create (admin-only)
+/// - `GET    /{id}`                -- fetch one
+/// - `PATCH  /{id}`                -- update (admin-only)
+/// - `DELETE /{id}`                -- delete with cascade (admin-only)
+/// - `GET    /{id}/deployments`    -- list linked deployments
+/// - `POST   /{id}/deployments`    -- link a deployment
+/// - `DELETE /{id}/deployments/{name}` -- unlink a deployment
+/// - `POST   /{id}/pull`           -- clone / fast-forward the project repo (admin-only)
+///
+/// All routes require authentication via the `AuthActor` extractor; admin
+/// enforcement happens in the handlers.
+///
+/// # Arguments
+/// * `project_state` - Project storage state.
+///
+/// # Returns
+/// A Router with the project endpoints
+pub fn build_project_routes(project_state: ProjectState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::projects::list_projects))
+        .route("/", post(handlers::projects::create_project))
+        .route("/{id}", get(handlers::projects::get_project))
+        .route(
+            "/{id}",
+            axum::routing::patch(handlers::projects::update_project),
+        )
+        .route("/{id}", delete(handlers::projects::delete_project))
+        .route(
+            "/{id}/deployments",
+            get(handlers::projects::list_project_deployments),
+        )
+        .route(
+            "/{id}/deployments",
+            post(handlers::projects::link_project_deployment),
+        )
+        .route(
+            "/{id}/deployments/{name}",
+            delete(handlers::projects::unlink_project_deployment),
+        )
+        .route("/{id}/pull", post(handlers::projects::pull_project))
+        .with_state(project_state)
+}
+
+/// Build routes for webhook management on projects.
+///
+/// Routes:
+/// - `GET    /{id}/webhook`         -- get webhook URL + secret (generates on first call)
+/// - `POST   /{id}/webhook/rotate`  -- rotate webhook secret (admin-only)
+///
+/// These routes require authentication via the `AuthActor` extractor.
+/// Mount under `/api/v1/projects` alongside (merged with) the project
+/// CRUD routes.
+///
+/// # Arguments
+/// * `webhook_state` - Webhook state including project store + secrets.
+///
+/// # Returns
+/// A Router with the webhook management endpoints
+pub fn build_project_webhook_routes(webhook_state: WebhookState) -> Router<()> {
+    Router::new()
+        .route("/{id}/webhook", get(handlers::webhooks::get_webhook_info))
+        .route(
+            "/{id}/webhook/rotate",
+            post(handlers::webhooks::rotate_webhook_secret),
+        )
+        .with_state(webhook_state)
+}
+
+/// Build the public (unauthenticated) webhook receiver route.
+///
+/// Routes:
+/// - `POST /{provider}/{project_id}` -- HMAC-verified push handler
+///
+/// This must be mounted at `/webhooks` **outside** the auth-gated API
+/// namespace.
+///
+/// # Arguments
+/// * `webhook_state` - Webhook state including project store + secrets.
+///
+/// # Returns
+/// A Router with the webhook receiver endpoint
+pub fn build_webhook_receiver_routes(webhook_state: WebhookState) -> Router<()> {
+    Router::new()
+        .route(
+            "/{provider}/{project_id}",
+            post(handlers::webhooks::receive_webhook),
+        )
+        .with_state(webhook_state)
+}
+
+/// Build routes for credential management (registry + git).
+///
+/// Routes:
+/// - `GET    /registry`       -- list registry credentials
+/// - `POST   /registry`       -- create registry credential (admin-only)
+/// - `DELETE /registry/{id}`  -- delete registry credential (admin-only)
+/// - `GET    /git`            -- list git credentials
+/// - `POST   /git`            -- create git credential (admin-only)
+/// - `DELETE /git/{id}`       -- delete git credential (admin-only)
+///
+/// All routes require authentication via the `AuthActor` extractor; admin
+/// enforcement happens in the handlers.
+///
+/// # Arguments
+/// * `credential_state` - Credential storage state.
+///
+/// # Returns
+/// A Router with the credential endpoints
+pub fn build_credential_routes(credential_state: CredentialState) -> Router<()> {
+    Router::new()
+        .route(
+            "/registry",
+            get(handlers::credentials::list_registry_credentials),
+        )
+        .route(
+            "/registry",
+            post(handlers::credentials::create_registry_credential),
+        )
+        .route(
+            "/registry/{id}",
+            delete(handlers::credentials::delete_registry_credential),
+        )
+        .route("/git", get(handlers::credentials::list_git_credentials))
+        .route("/git", post(handlers::credentials::create_git_credential))
+        .route(
+            "/git/{id}",
+            delete(handlers::credentials::delete_git_credential),
+        )
+        .with_state(credential_state)
 }
 
 /// Build routes for network management
@@ -621,29 +936,34 @@ pub fn build_network_routes(network_state: NetworkApiState) -> Router<()> {
         .with_state(network_state)
 }
 
-/// Build the API router with secrets management capabilities
+/// Build the API router with secrets and environments management.
 ///
-/// This extends the basic router with endpoints for secrets management.
-/// Secrets are scoped to the authenticated user's ID.
+/// Wires the secrets store with an environment store so the secrets handler
+/// can resolve `?environment={id}` to a scoped namespace, and mounts the
+/// environment CRUD routes under `/api/v1/environments`.
 ///
 /// # Arguments
 /// * `config` - API configuration
 /// * `storage` - Deployment storage backend
 /// * `secrets_store` - Secrets store for CRUD operations
+/// * `env_store` - Environment storage backend (pass an
+///   [`InMemoryEnvironmentStore`] for legacy callers that have not wired
+///   persistent storage yet).
 ///
 /// # Example
 ///
 /// ```no_run
 /// use zlayer_api_zql::{ApiConfig, build_router_with_secrets};
-/// use zlayer_api_zql::storage::InMemoryStorage;
+/// use zlayer_api_zql::storage::{InMemoryEnvironmentStore, InMemoryStorage};
 /// use zlayer_secrets::PersistentSecretsStore;
 /// use std::sync::Arc;
 ///
 /// # async fn example() -> anyhow::Result<()> {
 /// let config = ApiConfig::default();
 /// let storage = Arc::new(InMemoryStorage::new());
+/// let env_store = Arc::new(InMemoryEnvironmentStore::new());
 /// // let secrets_store = Arc::new(PersistentSecretsStore::open(...)?);
-/// // let router = build_router_with_secrets(&config, storage, secrets_store);
+/// // let router = build_router_with_secrets(&config, storage, secrets_store, env_store);
 /// # Ok(())
 /// # }
 /// ```
@@ -651,52 +971,53 @@ pub fn build_router_with_secrets(
     config: &ApiConfig,
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
     secrets_store: Arc<dyn SecretsStore + Send + Sync>,
+    env_store: Arc<dyn EnvironmentStorage>,
 ) -> Router {
-    // Start with the basic router with storage
     let base_router = build_router_with_storage(config, storage);
 
-    // Create secrets state
-    let secrets_state = SecretsState::new(secrets_store);
+    let secrets_state = SecretsState::with_environments(secrets_store, env_store.clone());
+    let env_state = EnvironmentsState::new(env_store);
 
-    // Build secrets routes
-    let secrets_routes = build_secrets_routes(secrets_state);
+    let secrets_routes = build_secrets_routes(secrets_state.clone());
+    let env_routes = build_environment_routes(env_state, secrets_state);
 
-    // Merge secrets routes into API v1
-    base_router.nest("/api/v1/secrets", secrets_routes)
+    base_router
+        .nest("/api/v1/secrets", secrets_routes)
+        .nest("/api/v1/environments", env_routes)
 }
 
-/// Build the API router with services and secrets capabilities
-///
-/// This extends the services router with endpoints for secrets management.
+/// Build the API router with services, secrets, and environment management.
 ///
 /// # Arguments
 /// * `config` - API configuration
 /// * `storage` - Deployment storage backend
 /// * `service_manager` - `ServiceManager` for container lifecycle operations
 /// * `secrets_store` - Secrets store for CRUD operations
+/// * `env_store` - Environment storage backend
 pub fn build_router_with_services_and_secrets(
     config: &ApiConfig,
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
     service_manager: Arc<RwLock<ServiceManager>>,
     secrets_store: Arc<dyn SecretsStore + Send + Sync>,
+    env_store: Arc<dyn EnvironmentStorage>,
 ) -> Router {
-    // Start with the services router
     let base_router = build_router_with_services(config, storage, service_manager);
 
-    // Create secrets state
-    let secrets_state = SecretsState::new(secrets_store);
+    let secrets_state = SecretsState::with_environments(secrets_store, env_store.clone());
+    let env_state = EnvironmentsState::new(env_store);
 
-    // Build secrets routes
-    let secrets_routes = build_secrets_routes(secrets_state);
+    let secrets_routes = build_secrets_routes(secrets_state.clone());
+    let env_routes = build_environment_routes(env_state, secrets_state);
 
-    // Merge secrets routes into API v1
-    base_router.nest("/api/v1/secrets", secrets_routes)
+    base_router
+        .nest("/api/v1/secrets", secrets_routes)
+        .nest("/api/v1/environments", env_routes)
 }
 
-/// Build the API router with internal and secrets capabilities
+/// Build the API router with internal, secrets, and environment management.
 ///
-/// This extends the internal router with endpoints for secrets management.
-/// Includes all features: services, internal scheduler endpoints, and secrets.
+/// Includes all features: services, internal scheduler endpoints, secrets,
+/// and environments.
 ///
 /// # Arguments
 /// * `config` - API configuration
@@ -704,24 +1025,26 @@ pub fn build_router_with_services_and_secrets(
 /// * `service_manager` - `ServiceManager` for container lifecycle operations
 /// * `internal_token` - Shared secret for authenticating internal API calls
 /// * `secrets_store` - Secrets store for CRUD operations
+/// * `env_store` - Environment storage backend
 pub fn build_router_with_internal_and_secrets(
     config: &ApiConfig,
     storage: Arc<dyn DeploymentStorage + Send + Sync>,
     service_manager: Arc<RwLock<ServiceManager>>,
     internal_token: String,
     secrets_store: Arc<dyn SecretsStore + Send + Sync>,
+    env_store: Arc<dyn EnvironmentStorage>,
 ) -> Router {
-    // Start with the internal router
     let base_router = build_router_with_internal(config, storage, service_manager, internal_token);
 
-    // Create secrets state
-    let secrets_state = SecretsState::new(secrets_store);
+    let secrets_state = SecretsState::with_environments(secrets_store, env_store.clone());
+    let env_state = EnvironmentsState::new(env_store);
 
-    // Build secrets routes
-    let secrets_routes = build_secrets_routes(secrets_state);
+    let secrets_routes = build_secrets_routes(secrets_state.clone());
+    let env_routes = build_environment_routes(env_state, secrets_state);
 
-    // Merge secrets routes into API v1
-    base_router.nest("/api/v1/secrets", secrets_routes)
+    base_router
+        .nest("/api/v1/secrets", secrets_routes)
+        .nest("/api/v1/environments", env_routes)
 }
 
 /// Build routes for node management
@@ -1014,6 +1337,161 @@ pub fn build_cron_routes(cron_state: CronState) -> Router<()> {
         .route("/{name}/enable", put(handlers::cron::enable_cron_job))
         .route("/{name}/disable", put(handlers::cron::disable_cron_job))
         .with_state(cron_state)
+}
+
+/// Build the sync routes sub-router.
+///
+/// # Arguments
+/// * `sync_state` - State containing the sync store and clone root
+///
+/// # Returns
+/// A Router with the sync endpoints mounted at `/api/v1/syncs`
+pub fn build_sync_routes(sync_state: SyncState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::syncs::list_syncs))
+        .route("/", post(handlers::syncs::create_sync))
+        .route("/{id}/diff", get(handlers::syncs::diff_sync))
+        .route("/{id}/apply", post(handlers::syncs::apply_sync))
+        .route("/{id}", delete(handlers::syncs::delete_sync))
+        .with_state(sync_state)
+}
+
+/// Build routes for workflow CRUD and execution.
+///
+/// Routes:
+/// - `GET    /`            -- list workflows
+/// - `POST   /`            -- create (admin-only)
+/// - `GET    /{id}`         -- fetch one
+/// - `DELETE /{id}`         -- delete (admin-only)
+/// - `POST   /{id}/run`     -- execute sequentially (admin-only)
+/// - `GET    /{id}/runs`    -- list past runs
+///
+/// All routes require authentication (Bearer or session cookie) via the
+/// `AuthActor` extractor; admin enforcement happens in the handlers.
+///
+/// # Arguments
+/// * `workflows_state` - Workflow storage state (includes task store for execution).
+///
+/// # Returns
+/// A Router with the workflow endpoints
+pub fn build_workflow_routes(workflows_state: WorkflowsState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::workflows::list_workflows))
+        .route("/", post(handlers::workflows::create_workflow))
+        .route("/{id}", get(handlers::workflows::get_workflow))
+        .route("/{id}", delete(handlers::workflows::delete_workflow))
+        .route("/{id}/run", post(handlers::workflows::run_workflow))
+        .route("/{id}/runs", get(handlers::workflows::list_workflow_runs))
+        .with_state(workflows_state)
+}
+
+/// Build routes for notifier CRUD and test-notification.
+///
+/// Routes:
+/// - `GET    /`             -- list notifiers
+/// - `POST   /`             -- create (admin-only)
+/// - `GET    /{id}`          -- fetch one
+/// - `PATCH  /{id}`          -- update (admin-only)
+/// - `DELETE /{id}`          -- delete (admin-only)
+/// - `POST   /{id}/test`     -- send test notification (admin-only)
+///
+/// All routes require authentication (Bearer or session cookie) via the
+/// `AuthActor` extractor; admin enforcement happens in the handlers.
+///
+/// # Arguments
+/// * `notifiers_state` - Notifier storage state (includes HTTP client).
+///
+/// # Returns
+/// A Router with the notifier endpoints
+pub fn build_notifier_routes(notifiers_state: NotifiersState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::notifiers::list_notifiers))
+        .route("/", post(handlers::notifiers::create_notifier))
+        .route("/{id}", get(handlers::notifiers::get_notifier))
+        .route(
+            "/{id}",
+            axum::routing::patch(handlers::notifiers::update_notifier),
+        )
+        .route("/{id}", delete(handlers::notifiers::delete_notifier))
+        .route("/{id}/test", post(handlers::notifiers::test_notifier))
+        .with_state(notifiers_state)
+}
+
+/// Build routes for group CRUD and membership management.
+///
+/// Routes:
+/// - `GET    /`                         -- list groups
+/// - `POST   /`                         -- create (admin-only)
+/// - `GET    /{id}`                      -- fetch one
+/// - `PATCH  /{id}`                      -- update name/description (admin-only)
+/// - `DELETE /{id}`                      -- delete (admin-only)
+/// - `POST   /{id}/members`              -- add member (admin-only)
+/// - `DELETE /{id}/members/{user_id}`    -- remove member (admin-only)
+///
+/// All routes require authentication via the `AuthActor` extractor; admin
+/// enforcement happens in the handlers.
+///
+/// # Arguments
+/// * `groups_state` - Group storage state.
+///
+/// # Returns
+/// A Router with the group endpoints
+pub fn build_group_routes(groups_state: GroupsState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::groups::list_groups))
+        .route("/", post(handlers::groups::create_group))
+        .route("/{id}", get(handlers::groups::get_group))
+        .route(
+            "/{id}",
+            axum::routing::patch(handlers::groups::update_group),
+        )
+        .route("/{id}", delete(handlers::groups::delete_group))
+        .route("/{id}/members", post(handlers::groups::add_member))
+        .route(
+            "/{id}/members/{user_id}",
+            delete(handlers::groups::remove_member),
+        )
+        .with_state(groups_state)
+}
+
+/// Build routes for permission grant/revoke/listing.
+///
+/// Routes:
+/// - `GET    /`       -- list permissions for a subject (user or group)
+/// - `POST   /`       -- grant (admin-only)
+/// - `DELETE /{id}`   -- revoke (admin-only)
+///
+/// All routes require authentication via the `AuthActor` extractor; admin
+/// enforcement happens in the handlers.
+///
+/// # Arguments
+/// * `permissions_state` - Permission storage state (includes group store
+///   for validating group grants).
+///
+/// # Returns
+/// A Router with the permission endpoints
+pub fn build_permission_routes(permissions_state: PermissionsState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::permissions::list_permissions))
+        .route("/", post(handlers::permissions::grant_permission))
+        .route("/{id}", delete(handlers::permissions::revoke_permission))
+        .with_state(permissions_state)
+}
+
+/// Build routes for the audit log query endpoint.
+///
+/// Routes:
+/// - `GET /` -- list audit entries (admin-only, supports filters)
+///
+/// # Arguments
+/// * `audit_state` - Audit storage state.
+///
+/// # Returns
+/// A Router with the audit endpoint
+pub fn build_audit_routes(audit_state: AuditState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::audit::list_audit))
+        .with_state(audit_state)
 }
 
 fn build_cors_layer(config: &ApiConfig) -> CorsLayer {

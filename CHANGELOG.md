@@ -2,6 +2,482 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.95]
+
+### Added
+- **Groups, permissions, and audit** (Phase 8.2): resource-level access
+  control and audit logging for the REST API and CLI.
+  - **Groups**: user group CRUD and membership management.
+    - `GroupsState` handler state backed by `Arc<dyn GroupStorage>`.
+    - Seven REST endpoints:
+      - `GET    /api/v1/groups` -- list (any auth)
+      - `POST   /api/v1/groups` -- create (admin)
+      - `GET    /api/v1/groups/{id}` -- get (any auth)
+      - `PATCH  /api/v1/groups/{id}` -- update name/description (admin)
+      - `DELETE /api/v1/groups/{id}` -- delete (admin)
+      - `POST   /api/v1/groups/{id}/members` -- add member (admin)
+      - `DELETE /api/v1/groups/{id}/members/{user_id}` -- remove member (admin)
+    - `zlayer group` CLI subcommands: `list`, `create`, `delete`,
+      `member add`, `member remove`.
+    - Daemon client methods: `list_groups`, `create_group`, `delete_group`,
+      `add_group_member`, `remove_group_member`.
+  - **Permissions**: resource-level permission grant/revoke/list.
+    - `PermissionsState` handler state backed by `Arc<dyn PermissionStorage>`
+      and `Arc<dyn GroupStorage>` (validates group existence on grant).
+    - Three REST endpoints:
+      - `GET    /api/v1/permissions?user={id}|group={id}` -- list (any auth)
+      - `POST   /api/v1/permissions` -- grant (admin)
+      - `DELETE /api/v1/permissions/{id}` -- revoke (admin)
+    - `zlayer permission` CLI subcommands: `list`, `grant`, `revoke`.
+    - Daemon client methods: `list_permissions`, `grant_permission`,
+      `revoke_permission`.
+  - **Audit**: audit log query endpoint and recording middleware.
+    - `AuditState` handler state backed by `Arc<dyn AuditStorage>`.
+    - One REST endpoint:
+      - `GET /api/v1/audit?user=&resource_kind=&since=&until=&limit=`
+        -- list (admin)
+    - `zlayer audit tail` CLI subcommand with `--user`, `--resource`,
+      `--limit`, `--output` options.
+    - Daemon client method: `list_audit`.
+    - `audit_middleware`: Axum middleware that records an `AuditEntry` for
+      every mutating request (POST/PUT/PATCH/DELETE) that succeeds (2xx).
+      Extracts actor from `AuthActor` extension, derives resource kind and
+      id from the URL path.
+  - OpenAPI documentation for all new endpoints, schemas, and tags
+    (Groups, Permissions, Audit).
+
+### Removed
+- Removed `sqlx` from workspace dependencies (replaced by ZQL).
+- Removed `redb` from workspace dependencies and the `redb-store` feature
+  from `zlayer-consensus`. Deleted `redb_store.rs`.
+
+## [0.10.94]
+
+### Added
+- **Notifiers resource** (Phase 7d): configurable notification channels that
+  fire alerts to Slack, Discord, generic webhooks, or SMTP endpoints.
+  - `StoredNotifier` type in `zlayer-api::storage`: UUID id, name, kind,
+    config, enabled flag, timestamps.
+  - `NotifierKind` enum: `Slack`, `Discord`, `Webhook`, `Smtp`.
+  - `NotifierConfig` tagged enum: channel-specific settings (webhook URL,
+    SMTP host/port/credentials/recipients, custom HTTP method/headers).
+  - `NotifierStorage` trait + `InMemoryNotifierStore` implementation.
+  - Six REST endpoints:
+    - `GET    /api/v1/notifiers` -- list (any auth)
+    - `POST   /api/v1/notifiers` -- create (admin)
+    - `GET    /api/v1/notifiers/{id}` -- get (any auth)
+    - `PATCH  /api/v1/notifiers/{id}` -- update (admin)
+    - `DELETE /api/v1/notifiers/{id}` -- delete (admin)
+    - `POST   /api/v1/notifiers/{id}/test` -- send test notification (admin)
+  - Test endpoint actually fires HTTP requests to Slack/Discord/Webhook
+    URLs via `reqwest`. SMTP returns 501 (deferred).
+  - `zlayer notifier` CLI subcommands: `list`, `create`, `test`, `delete`
+    -- dispatched to the daemon via Unix socket.
+  - Daemon client notifier methods: `list_notifiers`, `create_notifier`,
+    `test_notifier`, `delete_notifier`.
+  - OpenAPI documentation for all notifier endpoints and schemas.
+
+## [0.10.93]
+
+### Added
+- **Workflows resource** (Phase 7c): named DAGs of steps that compose tasks,
+  project builds, deploys, and sync applies.
+  - `StoredWorkflow` type in `zlayer-api::storage`: UUID id, name, ordered
+    steps list, optional project_id, timestamps.
+  - `WorkflowStep` struct: step name, action, optional `on_failure` handler.
+  - `WorkflowAction` tagged enum: `RunTask`, `BuildProject`, `DeployProject`,
+    `ApplySync`.
+  - `WorkflowRun` type: recorded execution with per-step results and overall
+    status.
+  - `WorkflowRunStatus` enum: `Pending`, `Running`, `Completed`, `Failed`.
+  - `StepResult` type: step name, status (`ok`/`failed`/`skipped`), output.
+  - `WorkflowStorage` trait + `InMemoryWorkflowStore` implementation.
+  - Six REST endpoints:
+    - `GET    /api/v1/workflows` -- list (any auth)
+    - `POST   /api/v1/workflows` -- create (admin)
+    - `GET    /api/v1/workflows/{id}` -- get (any auth)
+    - `DELETE /api/v1/workflows/{id}` -- delete (admin)
+    - `POST   /api/v1/workflows/{id}/run` -- execute sequentially (admin)
+    - `GET    /api/v1/workflows/{id}/runs` -- list past runs (any auth)
+  - Sequential execution: `RunTask` steps execute tasks via `sh -c`;
+    `BuildProject`, `DeployProject`, `ApplySync` log but do not execute
+    real operations (v1 limitation).
+  - On-failure handling: if a step fails and defines `on_failure`, the
+    referenced task runs before the workflow aborts; remaining steps are
+    marked as `skipped`.
+  - `zlayer workflow` CLI subcommands: `list`, `create`, `run`, `logs`,
+    `delete` -- dispatched to the daemon via Unix socket.
+  - Daemon client workflow methods: `list_workflows`, `create_workflow`,
+    `run_workflow`, `list_workflow_runs`, `delete_workflow`.
+  - OpenAPI documentation for all workflow endpoints and schemas.
+
+## [0.10.92]
+
+### Added
+- **Tasks resource** (Phase 7b): named runnable scripts that can be executed
+  on demand with output streaming.
+  - `StoredTask` type in `zlayer-api::storage`: UUID id, name, kind (bash),
+    body, project_id (optional), timestamps.
+  - `TaskKind` enum (`Bash`).
+  - `TaskRun` type: recorded execution with exit code, stdout, stderr,
+    start/end timestamps.
+  - `TaskStorage` trait + `InMemoryTaskStore` implementation.
+  - Six REST endpoints:
+    - `GET    /api/v1/tasks[?project_id=...]` -- list (any auth)
+    - `POST   /api/v1/tasks` -- create (admin)
+    - `GET    /api/v1/tasks/{id}` -- get (any auth)
+    - `DELETE /api/v1/tasks/{id}` -- delete (admin)
+    - `POST   /api/v1/tasks/{id}/run` -- execute synchronously (admin)
+    - `GET    /api/v1/tasks/{id}/runs` -- list past runs (any auth)
+  - `zlayer task` CLI subcommands: `list`, `create`, `run`, `logs`, `delete` --
+    dispatched to the daemon via Unix socket.
+  - Daemon client task methods: `list_tasks`, `create_task`, `get_task`,
+    `run_task`, `list_task_runs`, `delete_task`.
+  - OpenAPI documentation for all task endpoints and schemas.
+  - `ApiError::NotImplemented` variant for 501 responses on non-Unix
+    platforms.
+
+## [0.10.91]
+
+### Added
+- **Variables resource** (Phase 7a): plaintext shared key-value pairs for
+  template substitution in deployment specs. Variables are NOT encrypted
+  (unlike secrets) and are fully visible in API responses.
+  - `StoredVariable` type in `zlayer-api::storage`: UUID id, name, value,
+    scope (project id or global), timestamps.
+  - `VariableStorage` trait + `InMemoryVariableStore` implementation.
+  - Five REST endpoints:
+    - `GET    /api/v1/variables?scope={project_id}` -- list (any auth)
+    - `POST   /api/v1/variables` -- create (admin)
+    - `GET    /api/v1/variables/{id}` -- get (any auth)
+    - `PATCH  /api/v1/variables/{id}` -- update (admin)
+    - `DELETE /api/v1/variables/{id}` -- delete (admin)
+  - `zlayer variable` CLI subcommands: `list`, `set`, `get`, `unset` --
+    dispatched to the daemon via Unix socket.
+  - Daemon client variable methods: `list_variables`, `create_variable`,
+    `get_variable`, `update_variable`, `delete_variable`.
+  - OpenAPI documentation for all variable endpoints and schemas.
+
+## [0.10.90]
+
+### Added
+- **GitOps sync module** (`zlayer_git::sync`): `scan_resources()` walks a
+  directory for YAML files and parses each into a `SyncResource` (kind +
+  name + raw content).  `compute_diff()` compares local resources against
+  remote names to produce a `SyncDiff` (to_create / to_update / to_delete).
+- **Sync REST API** (`handlers/syncs.rs`): five endpoints for sync CRUD +
+  diff + apply:
+  - `GET  /api/v1/syncs` -- list all syncs
+  - `POST /api/v1/syncs` -- create a sync
+  - `GET  /api/v1/syncs/{id}/diff` -- compute diff
+  - `POST /api/v1/syncs/{id}/apply` -- dry-run apply (v1)
+  - `DELETE /api/v1/syncs/{id}` -- delete a sync
+- **In-memory sync store** (`InMemorySyncStore`): `SyncStorage` trait +
+  `Arc<RwLock<HashMap>>` implementation for v1 persistence.
+- **`StoredSync` type** in `zlayer-api::storage`: UUID id, name,
+  project_id, git_path, auto_apply, last_applied_sha, timestamps.
+- **`zlayer sync` CLI subcommands**: `ls`, `create`, `diff`, `apply`,
+  `delete` -- dispatched to the daemon via Unix socket.
+- **Daemon client sync methods**: `list_syncs`, `create_sync`,
+  `diff_sync`, `apply_sync`, `delete_sync`.
+- **OpenAPI documentation** for all sync endpoints and schemas.
+
+## [0.10.89]
+
+### Added
+- **Per-project git poller** (`GitPoller` in `zlayer-api::poller`).
+  A background task that periodically checks `git ls-remote` for new
+  commits on projects with `poll_interval_secs` set.  When new commits
+  are detected the local working copy is fast-forward pulled; when
+  `auto_deploy` is also true, the intent to rebuild/redeploy is logged
+  (actual build trigger integration comes in a later phase).
+- **`auto_deploy` and `poll_interval_secs` fields on `StoredProject`**
+  (`#[serde(default)]` for backward-compatible deserialization of
+  existing records).  Both fields are exposed on `CreateProjectRequest`
+  and `UpdateProjectRequest`.
+- **`git ls-remote` helper** (`zlayer_git::ls_remote`) queries the
+  remote for a branch's HEAD SHA without cloning or fetching.
+- **`zlayer project auto-deploy <id> --enabled true|false`** CLI
+  subcommand to toggle the auto-deploy flag via PATCH.
+- **`zlayer project poll-interval <id> --seconds N`** CLI subcommand
+  to set (or clear with `--seconds 0`) the polling interval via PATCH.
+
+## [0.10.88]
+
+### Added
+- **Git push webhook receiver** (`POST /webhooks/{provider}/{project_id}`)
+  -- unauthenticated endpoint that verifies HMAC signatures (GitHub,
+  Gitea, Forgejo) or constant-time token comparison (GitLab) against a
+  per-project webhook secret stored in `PersistentSecretsStore` under
+  scope `"webhook_secrets"`. On success, triggers the same clone /
+  fast-forward-pull logic as `POST /api/v1/projects/{id}/pull`. Returns
+  `{ "status": "ok", "sha": "..." }`.
+- **`GET /api/v1/projects/{id}/webhook`** (auth-required) returns the
+  webhook URL template and HMAC secret. Generates the secret on first
+  call if it does not exist.
+- **`POST /api/v1/projects/{id}/webhook/rotate`** (admin-only)
+  regenerates the webhook secret, invalidating the old one.
+- **`WebhookState`** struct and `build_project_webhook_routes()` /
+  `build_webhook_receiver_routes()` router builders in `zlayer-api`.
+- **`DaemonClient::get_project_webhook()` and `rotate_project_webhook()`**
+  methods for the CLI to talk to the new endpoints.
+- **`zlayer project webhook show <id>` / `zlayer project webhook rotate <id>`**
+  CLI subcommands.
+- **`WebhookResponse` and `WebhookInfoResponse` schemas** registered in
+  the OpenAPI doc under a new "Webhooks" tag.
+
+### Changed
+- `zlayer-api` now depends on `hmac` (workspace dep) for HMAC-SHA256
+  signature verification.
+
+## [0.10.87]
+
+### Added
+- **`POST /api/v1/projects/{id}/pull` endpoint** (admin-only) that wires
+  the `zlayer-git` crate into the Projects handler. Clones into
+  `{clone_root}/{project_id}` on first call, then fast-forward pulls on
+  subsequent calls. Resolves authentication from the project's
+  `git_credential_id` via `GitCredentialStore` (PAT or SSH key), falling
+  back to anonymous when unset or the store is not configured. Returns
+  `{ project_id, git_url, branch, sha, path }`.
+- **`ProjectState::with_git(store, git_creds, clone_root)`** constructor on
+  `zlayer-api`'s project state. The existing `ProjectState::new(store)`
+  constructor still works and leaves `git_creds` unset / defaults
+  `clone_root` to `$TMPDIR/zlayer-projects`, so callers that don't need
+  pulls are unchanged.
+- **`ProjectPullResponse` schema** registered in the OpenAPI doc.
+- **`DaemonClient::project_pull(&id)` method** posting to the new endpoint
+  and returning the parsed JSON response.
+- **`zlayer project pull <id>` CLI command** that triggers a pull and
+  prints the repo, branch, SHA, and working-copy path.
+
+### Changed
+- `zlayer-api` now depends on `zlayer-git` so the Projects handler can
+  clone and pull directly without going through a separate service.
+
+## [0.10.86]
+
+### Added
+- **`zlayer project` CLI command group** with full CRUD: `ls`, `create`,
+  `show`, `update`, `delete`, plus deployment linking (`link-deployment`,
+  `unlink-deployment`, `list-deployments`). 8 new Clap variants total.
+- **`zlayer credential` CLI command group** with two nested subcommands:
+  `registry` (ls, add, delete) and `git` (ls, add, delete). 6 new Clap
+  variants total. Passwords/tokens are prompted interactively via
+  `dialoguer` when omitted from the command line.
+- **14 `DaemonClient` methods** for projects and credentials, using
+  `serde_json::Value` to avoid pulling server-only handler types into the
+  CLI binary.
+
+## [0.10.85]
+
+### Added
+- **`AuthSource::SecretStore` variant** in `zlayer-core` auth resolver.
+  Allows per-registry auth configs to reference a stored credential by id.
+  The sync resolver returns `Anonymous` with a warning; callers needing
+  the credential must use the new async resolver.
+- **`resolve_registry_auth_async()` free function** in `zlayer-api::auth`.
+  Resolves all `AuthSource` variants including `SecretStore`, performing
+  an async lookup against a `RegistryCredentialStore<S>`.
+- **`AuthResolver::source_for_registry()` and public `resolve_source()`**
+  accessors on the sync resolver, enabling external async resolution
+  without duplicating per-registry lookup logic.
+
+## [0.10.84]
+
+### Added
+- **Project CRUD endpoints** at `/api/v1/projects`. List, create, fetch,
+  update (PATCH), and delete projects. Mutating endpoints require `admin`.
+  Deletion cascade-removes deployment links. Sub-routes for deployment
+  linking: `GET/POST /{id}/deployments`, `DELETE /{id}/deployments/{name}`.
+  8 endpoints total.
+- **Credential management endpoints** at `/api/v1/credentials`. Registry
+  credentials (list, create, delete) and git credentials (list, create,
+  delete) share a combined handler. All mutation requires `admin`.
+  6 endpoints total. Secrets are stored encrypted; only metadata is
+  returned in responses.
+- **`build_project_routes(project_state)` and
+  `build_credential_routes(credential_state)` router helpers** for
+  composing project and credential routes into existing routers.
+- `ProjectState` and `CredentialState` re-exported from `lib.rs`.
+- OpenAPI schemas for `StoredProject`, `BuildKind`, project request types,
+  and credential request/response types registered in the API doc.
+
+## [0.10.83]
+
+### Added
+- **Environment CRUD endpoints** at `/api/v1/environments`. List, create,
+  fetch, rename/re-describe (PATCH), and delete deployment/runtime
+  environments. Project-scoped or global. List filter: `?project={id}` for
+  one project, `?project=*` for everything (currently returns globals only
+  and surfaces a 503 when project rows exist that the storage trait cannot
+  enumerate — see follow-up below), or no param for globals only.
+  Mutating endpoints require the `admin` role; deletion refuses if the
+  environment still owns secrets.
+- **Environment-aware secrets routing.** `POST/GET/DELETE /api/v1/secrets`
+  now accept `?environment={env_id}` to resolve the secret scope from the
+  environment store (`env:{id}` for globals, `project:{pid}:env:{id}` for
+  project-scoped). Body `scope` and `?scope=` continue to work for legacy
+  / API-key-style clients. The two forms are mutually exclusive — sending
+  both returns `400`. New helper `env_scope(&StoredEnvironment) -> String`
+  centralises the scope-string convention.
+- **`POST /api/v1/secrets/bulk-import?environment={id}`** parses a
+  dotenv-style payload (`KEY=value` per line, with `#` comments and
+  optional surrounding quotes) and writes each entry under the env's
+  scope. Returns `{ created, updated, errors }`. Admin-only.
+- **`GET /api/v1/secrets/{name}?reveal=true`** returns the plaintext
+  value alongside metadata. Admin-only.
+- **`build_environment_routes(env_state, secrets_state) -> Router<()>`**
+  helper plus reworked `build_router_with_secrets` /
+  `build_router_with_services_and_secrets` /
+  `build_router_with_internal_and_secrets` builders that now take an
+  `Arc<dyn EnvironmentStorage>` and mount `/api/v1/environments` alongside
+  `/api/v1/secrets`. `SecretsState::with_environments(...)` is the new
+  constructor for env-aware secrets state.
+- **Extended `SecretRef` parser** in `zlayer-secrets` with environment-scoped
+  references: `$S::env/name` (global environment) and
+  `$S:project:env/name` (project-scoped). Legacy `$S:name` and
+  `$S:name/field` forms are preserved. The leading `::` disambiguates from
+  the legacy JSON-field extraction syntax (`$S:name/field`).
+- **CLI `zlayer env` command group** — `zlayer env ls [--project ID]`,
+  `zlayer env create <name> [--project ID]`, `zlayer env show <id>`,
+  `zlayer env update <id>`, `zlayer env delete <id>`. Full environment CRUD
+  from the terminal.
+- **CLI `zlayer secret` extended with `--env` flag** — all existing secret
+  subcommands (list/get/set/unset) now accept `--env <env-id-or-name>` to
+  scope operations to an environment. The `--env` flag resolves by name when
+  a non-UUID is passed. Import and export also support `--env`. All existing
+  scope-based behaviour (without `--env`) is preserved.
+
+### Changed
+- Secrets handlers (`create_secret`, `list_secrets`, `get_secret_metadata`,
+  `delete_secret`) now use the `AuthActor` extractor (admin-gated for
+  mutations) instead of `AuthUser`. The previous implementation scoped
+  every secret to the caller's user id; new code defaults to a literal
+  `"default"` scope when no `environment` / `scope` is provided.
+- `SecretMetadataResponse` gained an optional `value` field, populated
+  only on the `?reveal=true` admin path. The field is omitted from JSON
+  when unset, so existing clients see no change.
+
+### Follow-ups
+- `?reveal=true` is admin-only but does not yet require a re-authentication
+  challenge within the last 60 seconds. A future iteration should add that
+  guard.
+- `?project=*` listing of environments cannot enumerate distinct project
+  ids through the current `EnvironmentStorage` trait. The handler returns
+  `503 Service Unavailable` (with the count of unenumerable rows) when
+  project-scoped environments exist; once the trait grows a proper
+  `list_all` accessor we will switch to true cross-project listing.
+
+## [0.10.82]
+
+### Added
+- **User accounts with email/password login.** ZLayer now has a real user
+  system instead of raw API keys. First-run setup via
+  `POST /auth/bootstrap` creates the initial admin; subsequent users via
+  `POST /api/v1/users` (admin-gated). Passwords are hashed with Argon2id in
+  the existing encrypted `zlayer-secrets` credential store. New
+  `storage/users.rs` with `UserStorage` trait, `ZqlUserStore` (ZQL-backed
+  with a parallel `users_by_email` index for uniqueness), and
+  `InMemoryUserStore`.
+- **Cookie + CSRF browser sessions.** `POST /auth/login` returns an HttpOnly
+  `zlayer_session` JWT cookie plus a JS-readable `zlayer_csrf` double-submit
+  token. A new `crates/zlayer-api/src/middleware/csrf.rs` enforces the
+  double-submit on mutating cookie-authed requests; Bearer-authed API
+  clients (including local CLI over the Unix-socket auto-bearer path) pass
+  through untouched. Standard production flow — HttpOnly / Secure / SameSite=Lax /
+  constant-time token compare via `subtle`.
+- **New auth endpoints** on `zlayer-api`: `POST /auth/bootstrap`,
+  `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`,
+  `GET /auth/csrf`. Existing `POST /auth/token` (Bearer-JWT exchange) is
+  preserved for API clients and for CLI session persistence.
+- **Users CRUD** at `/api/v1/users`: list, create, get, update (PATCH),
+  delete, and `POST /{id}/password`. Self-service password change when the
+  caller provides the current password; admins can reset for any user.
+- **`AuthActor` extractor** accepts both `Authorization: Bearer …` and the
+  `zlayer_session` cookie, so every endpoint works for both API clients and
+  browsers. `SessionAuthUser` is also available when cookie-only is required.
+- **CLI auth and user command groups.** `zlayer auth bootstrap | login |
+  logout | whoami` and `zlayer user ls | create | set-role | set-password |
+  delete`. Interactive password prompts via `dialoguer` when flags are
+  omitted. Session persisted to `~/.zlayer/session.json` (mode 0600 on Unix)
+  with atomic temp-file-plus-rename writes.
+- **OpenAPI coverage.** All new endpoints and request/response schemas are
+  registered in the generated spec served at `/swagger-ui`.
+
+### Changed
+- **`AuthState` gained `user_store: Option<Arc<dyn UserStorage>>` and
+  `cookie_secure: bool` fields.** All construction sites were updated to
+  default both (`None` and `false`). Production deployments should set
+  `cookie_secure = true` behind TLS.
+- **`Claims` now carries an optional `email` field** (serde `default` for
+  back-compat with tokens minted before this release). `create_token_with_email`
+  is the new canonical minting function; the existing `create_token` forwards
+  to it with `email = None` so callers don't need to change.
+- **CLI `zlayer auth` command surface replaced.** The previous remote-server
+  API-key flow (`zlayer auth login <URL> --api-key … --api-secret …`) is
+  gone. Email/password is the new primary flow against the local daemon;
+  remote-server + `--url` support can return as a follow-up.
+
+### Security
+- Argon2id hashing for user passwords (reused from the existing encrypted
+  credential store; no downgrade).
+- HttpOnly session cookies; CSRF double-submit with constant-time compare
+  (`subtle`); short-circuit on Bearer so API clients aren't CSRF-gated.
+- Session file mode 0600 on Unix; atomic write via temp file + rename.
+
+## [0.10.81]
+
+### Fixed
+- **`ZImagefile`/Dockerfile `WORKDIR` now materialises the directory in the
+  built image's rootfs**, matching Docker's WORKDIR semantics. Previously,
+  the builder only ran `buildah config --workingdir` (metadata-only), so
+  images built from a `ZImagefile` declaring e.g. `workdir: /workspace`
+  shipped without `/workspace` in the rootfs. Containers started with
+  `cwd=/workspace` then failed at init time with `chdir(/workspace): ENOENT`,
+  surfaced as the opaque upstream message "failed to unix syscall" from
+  youki's init process. `crates/zlayer-builder/src/buildah/mod.rs` now emits
+  a `buildah run -- mkdir -p <dir>` alongside the `--workingdir` config.
+- **`zlayer build` now hard-errors with actionable remediation** when
+  `/var/lib/zlayer/{cache,registry}` isn't writable by the current UID,
+  instead of silently dropping the local registry and producing an image the
+  daemon can't find (which then falls through to `docker.io/library/*` with a
+  cryptic 401).
+
+### Changed
+- **`zlayer daemon install` chowns the build-facing data dirs**
+  (`registry`, `cache`, `bundles`) to `$SUDO_USER:zlayer` (mode 2775) instead
+  of only `chgrp zlayer`. The installing user can run `zlayer build`
+  immediately in their current shell — no `newgrp zlayer` or re-login
+  required. Group membership is still provisioned so additional users added
+  later can share the same dirs (after their own re-login).
+- **`install.sh` and `install.ps1` warn when a stale `zlayer` binary earlier
+  on `PATH` shadows the one just installed**, which otherwise produces
+  mystifying "image built but daemon can't find it" symptoms (the stale
+  binary skips the local-registry import step that the current binary
+  performs).
+
+## [0.10.77]
+
+### Changed
+- **`--deployment` is now optional on `zlayer logs`, `zlayer stop`, `zlayer exec`,
+  `zlayer job trigger`, `zlayer job status`, and `zlayer cron status`.**
+  A new shared resolver at `bin/zlayer/src/commands/resolver.rs` auto-picks the
+  deployment when the service (or deployment) name is unambiguous. When multiple
+  candidates match and stdout is a TTY, an interactive `dialoguer::Select` prompt
+  disambiguates; when non-TTY, the command errors with the list of candidates and
+  a hint to pass `--deployment` explicitly. Example: `zlayer logs my-api` now
+  works directly whenever `my-api` appears in exactly one deployment.
+- **Removed duplicated deployment-detection in `commands/exec.rs`.** The old
+  `auto_detect_deployment` helper is gone; `exec` now uses the shared resolver
+  (which additionally validates the service name and supports the TTY prompt path,
+  neither of which `exec` did before).
+- **`CLAUDE.md` aligned with the current tree.** Removed stale references to
+  `bin/runtime/` and `bin/zlayer-build/` (both consolidated into `bin/zlayer` long
+  ago), documented `bin/zlayer-desktop`, and corrected the `cargo run` examples.
+  Also updated the CHANGELOG guidance to use real version numbers (never
+  `[Unreleased]`).
+
 ## [0.10.76]
 
 ### Added
@@ -18,6 +494,23 @@ All notable changes to this project will be documented in this file.
   change on macOS (single-user data dir) or Windows.
 
 ### Fixed
+- **`zlayer-manager` dashboard failed with `error sending request for url
+  (http://0.0.0.0:3669/...)`.** `zlayer serve` was baking the bind address
+  directly into the `ZLAYER_API_URL` env var it injects into every container,
+  producing `http://0.0.0.0:3669` when the default wildcard bind was used.
+  Wildcard IPs (`0.0.0.0`, `::`) are valid listen addresses but cannot be
+  dialed — reqwest rightly refused. `bin/zlayer/src/commands/serve.rs` now
+  substitutes `127.0.0.1` / `[::1]` for wildcard binds when constructing the
+  per-container URL, so containers sharing the host netns can reach the API
+  again. Containers on isolated overlays should keep using the bind-mounted
+  `ZLAYER_SOCKET` Unix socket.
+- **CI "Install system dependencies" step hung indefinitely.** `sudo apt-get
+  install -y` was blocking on `needrestart`'s whiptail prompt on Ubuntu
+  22.04+ runners despite `-y`. All three Linux install steps in
+  `.forgejo/workflows/zdb-ci.yaml` now run with
+  `DEBIAN_FRONTEND=noninteractive`, `NEEDRESTART_MODE=a`,
+  `NEEDRESTART_SUSPEND=1`, `sudo -E`, and `Dpkg::Options::--force-confnew`
+  so no prompt can stall the job.
 - **`zlayer build` silently skipped local-registry import on permission
   errors.** When the builder's local-registry import step hit EACCES —
   typically because an unprivileged user ran `zlayer build` against the

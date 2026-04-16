@@ -37,6 +37,9 @@ pub enum ApiError {
 
     #[error("Validation error: {0}")]
     Validation(String),
+
+    #[error("Not implemented: {0}")]
+    NotImplemented(String),
 }
 
 /// JSON error response body
@@ -62,6 +65,7 @@ impl IntoResponse for ApiError {
                 (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
             }
             ApiError::Validation(_) => (StatusCode::UNPROCESSABLE_ENTITY, "validation_error"),
+            ApiError::NotImplemented(_) => (StatusCode::NOT_IMPLEMENTED, "not_implemented"),
         };
 
         let body = ErrorResponse {
@@ -83,6 +87,22 @@ impl From<anyhow::Error> for ApiError {
 impl From<serde_json::Error> for ApiError {
     fn from(err: serde_json::Error) -> Self {
         ApiError::BadRequest(format!("JSON error: {err}"))
+    }
+}
+
+impl From<crate::storage::StorageError> for ApiError {
+    fn from(err: crate::storage::StorageError) -> Self {
+        use crate::storage::StorageError;
+        match err {
+            StorageError::NotFound(msg) => ApiError::NotFound(msg),
+            StorageError::AlreadyExists(msg) => ApiError::Conflict(msg),
+            StorageError::Serialization(msg) => {
+                ApiError::Internal(format!("serialization error: {msg}"))
+            }
+            StorageError::Other(msg) => ApiError::Internal(msg),
+            StorageError::Database(msg) => ApiError::Internal(format!("database error: {msg}")),
+            StorageError::Io(e) => ApiError::Internal(format!("io error: {e}")),
+        }
     }
 }
 

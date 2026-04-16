@@ -1,255 +1,177 @@
 //! `zlayer auth` subcommand handlers.
 //!
-//! Manages authentication against a remote `ZLayer` server:
-//! - `login`  -- obtain a JWT and store it locally
-//! - `logout` -- remove stored credentials
-//! - `status` -- display current auth state
+//! The CLI talks to the local daemon over a Unix socket. The socket has an
+//! auto-injected local-admin bearer, so these commands work even on a fresh
+//! install. `login` additionally persists a user-specific JWT to
+//! `~/.zlayer/session.json` so subsequent commands run as that user rather
+//! than the local admin. `logout` deletes that file and best-effort invalidates
+//! the server-side cookie.
 
-use std::io::{self, Write};
-use std::path::PathBuf;
+use anyhow::{bail, Context, Result};
+use chrono::{Duration, Utc};
+use dialoguer::{Confirm, Password};
+use tracing::info;
+use zlayer_api::handlers::auth::BootstrapRequest;
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Utc};
-use serde::{Deserialize, Serialize};
+use crate::daemon_client::DaemonClient;
+use crate::session::{self, Session};
 
-use crate::cli::AuthCommands;
-
-/// On-disk credential store (`~/.zlayer/credentials.json`).
-#[derive(Debug, Serialize, Deserialize)]
-struct StoredCredentials {
-    server: String,
-    token: String,
-    expires_at: DateTime<Utc>,
-}
-
-/// Response from `POST /auth/token`.
-#[derive(Debug, Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    #[allow(dead_code)]
-    token_type: String,
-    expires_in: u64,
-}
-
-/// Resolve the credentials file path (`~/.zlayer/credentials.json`).
-fn credentials_path() -> PathBuf {
-    zlayer_paths::ZLayerDirs::default_data_dir().join("credentials.json")
-}
-
-/// Entry point for `zlayer auth <subcommand>`.
-pub(crate) async fn handle_auth(cmd: &AuthCommands) -> Result<()> {
-    match cmd {
-        AuthCommands::Login {
-            url,
-            api_key,
-            api_secret,
-        } => login(url, api_key.as_deref(), api_secret.as_deref()).await,
-        AuthCommands::Logout => logout(),
-        AuthCommands::Status => status(),
-    }
-}
-
-/// Prompt the user for a string value on stderr (so stdout stays clean for
-/// scripts).  The prompt is *not* hidden -- use this for the API key.
-fn prompt(label: &str) -> Result<String> {
-    eprint!("{label}: ");
-    io::stderr().flush()?;
-    let mut buf = String::new();
-    io::stdin()
-        .read_line(&mut buf)
-        .context("Failed to read input")?;
-    Ok(buf.trim().to_string())
-}
-
-/// Prompt for a secret value. On Unix we disable terminal echo; on other
-/// platforms we fall back to a plain prompt with a note.
-#[allow(unsafe_code)]
-fn prompt_secret(label: &str) -> Result<String> {
-    eprint!("{label}: ");
-    io::stderr().flush()?;
-
-    #[cfg(unix)]
-    {
-        // Disable echo
-        use std::os::unix::io::AsRawFd;
-        let fd = io::stdin().as_raw_fd();
-        let mut termios = unsafe {
-            let mut t = std::mem::zeroed();
-            if libc::tcgetattr(fd, &raw mut t) != 0 {
-                // If tcgetattr fails (e.g. piped stdin), fall back to plain read
-                return plain_read_line();
-            }
-            t
-        };
-        let orig = termios;
-        termios.c_lflag &= !libc::ECHO;
-        unsafe {
-            libc::tcsetattr(fd, libc::TCSANOW, &raw const termios);
-        }
-        let result = plain_read_line();
-        unsafe {
-            libc::tcsetattr(fd, libc::TCSANOW, &raw const orig);
-        }
-        eprintln!(); // newline after hidden input
-        result
-    }
-
-    #[cfg(not(unix))]
-    {
-        plain_read_line()
-    }
-}
-
-fn plain_read_line() -> Result<String> {
-    let mut buf = String::new();
-    io::stdin()
-        .read_line(&mut buf)
-        .context("Failed to read input")?;
-    Ok(buf.trim().to_string())
-}
-
-async fn login(url: &str, api_key: Option<&str>, api_secret: Option<&str>) -> Result<()> {
-    let key = match api_key {
-        Some(k) => k.to_string(),
-        None => prompt("API key")?,
-    };
-    let secret = match api_secret {
-        Some(s) => s.to_string(),
-        None => prompt_secret("API secret")?,
+/// `zlayer auth bootstrap` -- create the first admin user.
+///
+/// Fails with a clear error if any user already exists (the server returns
+/// 409 Conflict).
+pub async fn bootstrap(
+    email: String,
+    password: Option<String>,
+    display_name: Option<String>,
+) -> Result<()> {
+    let password = match password {
+        Some(p) => p,
+        None => prompt_password_confirmed()?,
     };
 
-    let endpoint = format!("{}/auth/token", url.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "api_key": key,
-        "api_secret": secret,
-    });
-
-    let client = reqwest::Client::new();
+    let client = DaemonClient::connect().await?;
+    let req = BootstrapRequest {
+        email: email.clone(),
+        password,
+        display_name,
+    };
     let resp = client
-        .post(&endpoint)
-        .json(&body)
-        .send()
+        .auth_bootstrap(&req)
         .await
-        .with_context(|| format!("Failed to connect to {endpoint}"))?;
+        .context("Bootstrap failed")?;
 
-    if !resp.status().is_success() {
-        let status = resp.status();
-        let text = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Authentication failed ({status}): {text}");
-    }
+    info!(email = %resp.user.email, id = %resp.user.id, "Bootstrap complete");
 
-    let token_resp: TokenResponse = resp
-        .json()
+    println!(
+        "Created admin user: {} <{}> (id: {})",
+        resp.user.display_name, resp.user.email, resp.user.id
+    );
+    println!("You can now run `zlayer auth login` to sign in as this user.");
+
+    Ok(())
+}
+
+/// `zlayer auth login` -- authenticate and save a JWT session.
+pub async fn login(email: String, password: Option<String>) -> Result<()> {
+    let password = match password {
+        Some(p) => p,
+        None => Password::new()
+            .with_prompt(format!("Password for {email}"))
+            .interact()
+            .context("Failed to read password")?,
+    };
+
+    let client = DaemonClient::connect().await?;
+
+    // CLI holds a JWT (not a cookie jar), so hit `/auth/token` rather than
+    // `/auth/login`. The endpoint accepts the email/password pair under the
+    // same `{api_key, api_secret}` wire shape.
+    let token_json = client
+        .auth_token(&email, &password)
         .await
-        .context("Failed to parse token response")?;
+        .context("Login failed")?;
 
-    let expires_at =
-        Utc::now() + Duration::seconds(i64::try_from(token_resp.expires_in).unwrap_or(3600));
+    let token = token_json
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("Login response did not include an access_token"))?
+        .to_string();
 
-    let creds = StoredCredentials {
-        server: url.trim_end_matches('/').to_string(),
-        token: token_resp.access_token,
+    let expires_in_secs = token_json
+        .get("expires_in")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(3600);
+
+    let expires_at = Utc::now()
+        + i64::try_from(expires_in_secs)
+            .ok()
+            .and_then(Duration::try_seconds)
+            .unwrap_or_else(|| Duration::hours(1));
+
+    let session = Session {
+        token,
+        email: email.clone(),
         expires_at,
     };
+    session::write_session(&session).context("Failed to persist session file")?;
 
-    let path = credentials_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    println!("Logged in as {email}");
+    println!(
+        "Session saved to ~/.zlayer/session.json (expires {})",
+        session.expires_at.format("%Y-%m-%d %H:%M:%S UTC")
+    );
+    Ok(())
+}
+
+/// `zlayer auth logout` -- delete local session, best-effort notify server.
+pub async fn logout() -> Result<()> {
+    let existed = session::delete_session().context("Failed to delete session file")?;
+
+    // Best-effort server-side logout. If the daemon isn't reachable we still
+    // consider logout successful because the local session is gone.
+    match DaemonClient::try_connect().await {
+        Ok(Some(client)) => {
+            if let Err(e) = client.auth_logout().await {
+                tracing::debug!(error = %e, "Server-side logout failed (ignoring)");
+            }
+        }
+        Ok(None) => {
+            tracing::debug!("Daemon not running; skipping server-side logout");
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "Daemon connect failed; skipping server-side logout");
+        }
     }
-    let json = serde_json::to_string_pretty(&creds)?;
-    std::fs::write(&path, &json)
-        .with_context(|| format!("Failed to write credentials to {}", path.display()))?;
 
-    // Restrict permissions on Unix so only the owner can read the file.
-    #[cfg(unix)]
+    if existed {
+        println!("Logged out");
+    } else {
+        println!("Not logged in (no session file found)");
+    }
+    Ok(())
+}
+
+/// `zlayer auth whoami` -- print the current authenticated user.
+pub async fn whoami() -> Result<()> {
+    let client = DaemonClient::connect().await?;
+    let user = client
+        .auth_whoami()
+        .await
+        .context("Failed to fetch current user")?;
+
+    println!("Signed in as: {} <{}>", user.display_name, user.email);
+    println!("  ID:     {}", user.id);
+    println!("  Role:   {}", user.role);
+    println!("  Active: {}", if user.is_active { "yes" } else { "no" });
+    if let Some(last) = user.last_login_at {
+        println!("  Last login: {}", last.format("%Y-%m-%d %H:%M:%S UTC"));
+    }
+
+    // Note: over the Unix socket this always returns "local-admin" unless the
+    // caller has written a session file. Mention that for clarity.
+    if session::read_session().ok().flatten().is_none() {
+        println!();
+        println!("(No session file; authenticated via local admin bearer)");
+    }
+    Ok(())
+}
+
+/// Prompt for a password twice and verify they match.
+fn prompt_password_confirmed() -> Result<String> {
+    let password = Password::new()
+        .with_prompt("Password")
+        .with_confirmation("Confirm password", "Passwords don't match")
+        .interact()
+        .context("Failed to read password")?;
+    if password.len() < 8
+        && !Confirm::new()
+            .with_prompt("Password is shorter than 8 characters. Continue?")
+            .default(false)
+            .interact()
+            .context("Failed to read confirmation")?
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        bail!("Aborted by user");
     }
-
-    println!("Logged in to {}", creds.server);
-    println!("Token expires at {}", creds.expires_at);
-    Ok(())
-}
-
-fn logout() -> Result<()> {
-    let path = credentials_path();
-    if path.exists() {
-        std::fs::remove_file(&path)
-            .with_context(|| format!("Failed to remove {}", path.display()))?;
-        println!("Logged out (credentials removed)");
-    } else {
-        println!("No stored credentials found");
-    }
-    Ok(())
-}
-
-fn status() -> Result<()> {
-    let path = credentials_path();
-    if !path.exists() {
-        println!("Not logged in");
-        println!("  Run `zlayer auth login <url>` to authenticate");
-        return Ok(());
-    }
-
-    let data = std::fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read {}", path.display()))?;
-    let creds: StoredCredentials =
-        serde_json::from_str(&data).context("Failed to parse credentials file")?;
-
-    println!("Server:  {}", creds.server);
-    println!("Expires: {}", creds.expires_at);
-
-    if Utc::now() >= creds.expires_at {
-        println!("Status:  EXPIRED");
-        println!(
-            "  Run `zlayer auth login {}` to re-authenticate",
-            creds.server
-        );
-    } else {
-        let remaining = creds.expires_at - Utc::now();
-        let hours = remaining.num_hours();
-        let mins = remaining.num_minutes() % 60;
-        println!("Status:  valid ({hours}h {mins}m remaining)");
-    }
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn credentials_roundtrip() {
-        let creds = StoredCredentials {
-            server: "http://10.0.0.1:3669".to_string(),
-            token: "eyJtest".to_string(),
-            expires_at: Utc::now() + Duration::hours(1),
-        };
-        let json = serde_json::to_string_pretty(&creds).unwrap();
-        let parsed: StoredCredentials = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed.server, creds.server);
-        assert_eq!(parsed.token, creds.token);
-    }
-
-    #[test]
-    fn credentials_path_ends_with_expected_name() {
-        let p = credentials_path();
-        assert_eq!(p.file_name().unwrap(), "credentials.json");
-    }
-
-    #[test]
-    fn status_handles_missing_file() {
-        // Just verify the credentials_path function works without panicking
-        let _ = credentials_path();
-    }
-
-    #[test]
-    fn token_response_deserializes() {
-        let json = r#"{"access_token":"tok","token_type":"Bearer","expires_in":3600}"#;
-        let resp: TokenResponse = serde_json::from_str(json).unwrap();
-        assert_eq!(resp.access_token, "tok");
-        assert_eq!(resp.expires_in, 3600);
-    }
+    Ok(password)
 }

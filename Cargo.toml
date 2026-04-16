@@ -23,6 +23,7 @@ members = [
   "crates/zlayer-consensus",
   "crates/zlayer-docker",
   "crates/zlayer-wsl",
+  "crates/zlayer-git",
 ]
 
 [workspace.package]
@@ -80,6 +81,7 @@ tower-http = { version = "0.6", features = ["full"] }
 
 # Web framework (for API)
 axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
+axum-extra = { version = "0.10", default-features = false, features = ["cookie"] }
 
 # JWT Authentication
 jsonwebtoken = "9"
@@ -115,7 +117,9 @@ secrecy = { version = "0.10", features = ["serde"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "getrandom"] }
 blake2 = "0.10"
 sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
+subtle = "2"
 
 # DNS
 hickory-server = "0.24"
@@ -125,8 +129,6 @@ hickory-client = "0.24"
 postcard2 = { version = "0.2.1", features = ["alloc"] }
 
 # Storage
-redb = "2.2"
-sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 zql = { version = "0.4", registry = "forgejo", default-features = false, features = ["sql-compat", "native-storage"] }
 
 # Config
@@ -214,6 +216,25 @@ zlayer-consensus = { path = "crates/zlayer-consensus", version = "0.0.0-dev", pa
 zlayer-docker = { path = "crates/zlayer-docker", version = "0.0.0-dev", package = "zlayer-docker-zql", registry = "forgejo" }
 zlayer-wsl = { path = "crates/zlayer-wsl", version = "0.0.0-dev", package = "zlayer-wsl-zql", registry = "forgejo" }
 zlayer-paths = { path = "crates/zlayer-paths", version = "0.0.0-dev", package = "zlayer-paths-zql", registry = "forgejo" }
+zlayer-git = { path = "crates/zlayer-git", version = "0.0.0-dev", package = "zlayer-git-zql", registry = "forgejo" }
+
+# Git (gitoxide) — pure-Rust git implementation used by `zlayer-git`.
+# Features: blocking HTTPS (reqwest + rustls, no OpenSSL), credential helpers,
+# worktree mutation for clone/checkout, revision parsing for rev_parse_single.
+gix = { version = "0.81", default-features = false, features = [
+  "blocking-network-client",
+  "blocking-http-transport-reqwest-rust-tls",
+  "credentials",
+  "worktree-mutation",
+  "revision",
+  "sha1",
+] }
+
+# Lettre — async SMTP client used by notifier handlers.
+# rustls-only (no OpenSSL system libs); builder + hostname for Message-ID.
+lettre = { version = "0.11", default-features = false, features = [
+  "smtp-transport", "tokio1-rustls-tls", "builder", "hostname",
+] }
 
 # =============================================================================
 # Build Profiles

@@ -485,53 +485,58 @@ async fn ensure_zlayer_group(data_dir: &Path) -> Result<()> {
     }
 
     // 2. Add the invoking user to the group (if sudo'd).
-    if let Ok(user) = std::env::var("SUDO_USER") {
-        if !user.is_empty() && user != "root" {
-            // Skip if already a member — avoids redundant usermod noise.
-            let already_member = Command::new("id")
-                .args(["-nG", &user])
+    let sudo_user = std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| !u.is_empty() && u != "root");
+
+    if let Some(ref user) = sudo_user {
+        // Skip if already a member — avoids redundant usermod noise.
+        let already_member = Command::new("id")
+            .args(["-nG", user])
+            .output()
+            .await
+            .map(|out| {
+                out.status.success()
+                    && String::from_utf8_lossy(&out.stdout)
+                        .split_whitespace()
+                        .any(|g| g == "zlayer")
+            })
+            .unwrap_or(false);
+
+        if !already_member {
+            match Command::new("usermod")
+                .args(["-aG", "zlayer", user])
                 .output()
                 .await
-                .map(|out| {
-                    out.status.success()
-                        && String::from_utf8_lossy(&out.stdout)
-                            .split_whitespace()
-                            .any(|g| g == "zlayer")
-                })
-                .unwrap_or(false);
-
-            if !already_member {
-                match Command::new("usermod")
-                    .args(["-aG", "zlayer", &user])
-                    .output()
-                    .await
-                {
-                    Ok(out) if out.status.success() => {
-                        println!("Added user '{user}' to group 'zlayer'.");
-                        println!(
-                            "  Log out and back in (or run `newgrp zlayer`) before your \
-                             next `zlayer build`."
-                        );
-                    }
-                    Ok(out) => {
-                        let stderr = String::from_utf8_lossy(&out.stderr);
-                        eprintln!(
-                            "Warning: usermod -aG zlayer {user} failed: {}",
-                            stderr.trim()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("Warning: could not run usermod: {e}");
-                    }
+            {
+                Ok(out) if out.status.success() => {
+                    println!("Added user '{user}' to group 'zlayer'.");
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    eprintln!(
+                        "Warning: usermod -aG zlayer {user} failed: {}",
+                        stderr.trim()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("Warning: could not run usermod: {e}");
                 }
             }
         }
     }
 
-    // 3. Make the build-facing subdirs group-writable.
+    // 3. Give the installing user write access to the build-facing subdirs.
     //    Only registry/cache/bundles — NOT secrets, raft, containers, rootfs, volumes.
+    //
+    //    Preferred: chown -R $SUDO_USER:zlayer. UID-based access works in the
+    //    user's existing shells immediately, sidestepping the "log out and back
+    //    in for supplementary-group membership" trap that the group-only
+    //    approach hit. Group membership is still provisioned above so
+    //    additional users added later can share these dirs (after their own
+    //    re-login). Without SUDO_USER we fall back to chgrp-only.
     let shared_dirs = ["registry", "cache", "bundles"];
-    let mut chowned_any = false;
+    let mut provisioned_any = false;
     for sub in shared_dirs {
         let path = data_dir.join(sub);
         if let Err(e) = std::fs::create_dir_all(&path) {
@@ -539,26 +544,33 @@ async fn ensure_zlayer_group(data_dir: &Path) -> Result<()> {
             continue;
         }
 
-        let chgrp_ok = Command::new("chgrp")
-            .args(["-R", "zlayer"])
-            .arg(&path)
-            .output()
-            .await
-            .is_ok_and(|out| out.status.success());
-        if !chgrp_ok {
+        let ownership_ok = if let Some(ref user) = sudo_user {
+            Command::new("chown")
+                .args(["-R", &format!("{user}:zlayer")])
+                .arg(&path)
+                .output()
+                .await
+                .is_ok_and(|out| out.status.success())
+        } else {
+            Command::new("chgrp")
+                .args(["-R", "zlayer"])
+                .arg(&path)
+                .output()
+                .await
+                .is_ok_and(|out| out.status.success())
+        };
+        if !ownership_ok {
             eprintln!(
-                "Warning: chgrp -R zlayer {} failed; group 'zlayer' members may not be \
-                 able to write here",
+                "Warning: could not set ownership on {}; unprivileged builds may fail",
                 path.display()
             );
             continue;
         }
 
-        // g+rwX → group can read/write all files, traverse directories (capital X
-        // only sets +x on dirs or already-exec files, so we don't flip regular
-        // files to executable).
+        // u+rwX,g+rwX → owner and group get read/write; capital X only sets +x
+        // on dirs or already-exec files so regular files don't flip executable.
         let _ = Command::new("chmod")
-            .args(["-R", "g+rwX"])
+            .args(["-R", "u+rwX,g+rwX"])
             .arg(&path)
             .output()
             .await;
@@ -572,14 +584,21 @@ async fn ensure_zlayer_group(data_dir: &Path) -> Result<()> {
             .output()
             .await;
 
-        chowned_any = true;
+        provisioned_any = true;
     }
 
-    if chowned_any {
-        println!(
-            "Configured group-writable data directories: {}",
-            shared_dirs.join(", ")
-        );
+    if provisioned_any {
+        if let Some(ref user) = sudo_user {
+            println!(
+                "Configured build data directories for '{user}': {}",
+                shared_dirs.join(", ")
+            );
+        } else {
+            println!(
+                "Configured group-writable data directories: {}",
+                shared_dirs.join(", ")
+            );
+        }
     }
 
     Ok(())
