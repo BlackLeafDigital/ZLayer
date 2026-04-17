@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [0.10.101]
 
+### Changed
+- **CI workflows (`.forgejo/workflows/ci.yaml`, `.forgejo/workflows/build.yml`)
+  now use the `setup-system-deps` action for all package installs.**
+  Replaced inline `apt-get install`, `brew install`, and `choco install`
+  steps with
+  `https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main`
+  so apt runs get dpkg-lock timeout + noninteractive guards uniformly
+  and OS detection / package-manager selection lives in one place.
+  The Windows `build-windows-amd64` job also gains an
+  `install-git-bash` step after `setup-rust`, which installs Git on the
+  Forgejo Windows runner and fixes the `Cannot find: bash in PATH`
+  failure that was blocking the protobuf and packaging `shell: bash`
+  steps. `ci.yaml` also now installs build deps explicitly on every
+  cargo job rather than relying on the runner image to preinstall
+  `protoc` / `libseccomp-dev`.
+
 ### Fixed
 - **`zlayer-git` reflog failure on machines without global git config.**
   `pull_ff` and `checkout` previously panicked with

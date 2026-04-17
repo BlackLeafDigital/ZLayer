@@ -35,15 +35,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
-        with:
-          packages: protobuf-compiler libseccomp-dev
-
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           components: rustfmt, clippy
+
+      - name: Install system deps
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf-compiler libseccomp-dev pkg-config libssl-dev clang'
+          cross-platform: 'true'
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
@@ -94,13 +95,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: brew install protobuf python3
-
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           components: clippy
+
+      - name: Install system deps
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf'
+          cross-platform: 'true'
 
       - name: Check compilation
         run: cargo check --workspace --all-targets
@@ -120,15 +124,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
-        with:
-          packages: protobuf-compiler libseccomp-dev
-
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
         with:
           nextest: true
+
+      - name: Install system deps
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf-compiler libseccomp-dev pkg-config libssl-dev clang'
+          cross-platform: 'true'
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
@@ -181,11 +186,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: brew install protobuf python3
-
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Install system deps
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf'
+          cross-platform: 'true'
 
       - name: Run unit tests
         run: cargo test --workspace --lib --bins
@@ -212,13 +220,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
-        with:
-          packages: protobuf-compiler libseccomp-dev
-
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Install system deps
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf-compiler libseccomp-dev cmake pkg-config libssl-dev clang'
+          cross-platform: 'true'
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
@@ -264,11 +273,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        run: brew install protobuf
-
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Install system deps
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf'
+          cross-platform: 'true'
 
       - name: Build release binary
         run: cargo build --release --package zlayer
@@ -298,13 +310,14 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
-        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
-        with:
-          packages: protobuf-compiler libseccomp-dev
-
       - name: Setup Rust
         uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - name: Install system deps
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf-compiler libseccomp-dev pkg-config libssl-dev clang'
+          cross-platform: 'true'
 
       - name: Restore cache
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
