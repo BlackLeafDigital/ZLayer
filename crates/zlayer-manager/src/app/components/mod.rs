@@ -1,4 +1,5 @@
 pub mod charts;
+pub mod forms;
 pub mod metrics_card;
 pub mod navbar;
 pub mod sidebar;

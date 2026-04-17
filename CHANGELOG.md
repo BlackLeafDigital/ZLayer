@@ -2,6 +2,1318 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.101]
+
+### Changed
+- **CI workflows (`.forgejo/workflows/ci.yaml`, `.forgejo/workflows/build.yml`)
+  now use the `setup-system-deps` action for all package installs.**
+  Replaced inline `apt-get install`, `brew install`, and `choco install`
+  steps with
+  `https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main`
+  so apt runs get dpkg-lock timeout + noninteractive guards uniformly
+  and OS detection / package-manager selection lives in one place.
+  The Windows `build-windows-amd64` job also gains an
+  `install-git-bash` step after `setup-rust`, which installs Git on the
+  Forgejo Windows runner and fixes the `Cannot find: bash in PATH`
+  failure that was blocking the protobuf and packaging `shell: bash`
+  steps. `ci.yaml` also now installs build deps explicitly on every
+  cargo job rather than relying on the runner image to preinstall
+  `protoc` / `libseccomp-dev`.
+
+### Fixed
+- **`zlayer-git` reflog failure on machines without global git config.**
+  `pull_ff` and `checkout` previously panicked with
+  `"reflog messages need a committer which isn't set"` on CI runners
+  and inside fresh containers / rootless sandboxes — any environment
+  without a `user.name` / `user.email` in `~/.gitconfig` or the
+  `GIT_COMMITTER_*` env vars. gix 0.81 is stricter than the `git` CLI
+  (which silently falls back to `whoami@hostname`) and refuses
+  reflog-writing ref updates without an identity. A new internal
+  `ensure_committer` helper installs an in-memory fallback
+  (`ZLayer <zlayer@localhost>`) on each opened `Repository` when none
+  is configured; applied at every blocking entry point that writes
+  reflogs (`fetch`, `pull_ff`, `checkout`). Per-instance mutation via
+  `Repository::config_snapshot_mut` — no env vars, no global mutex.
+  Caller-supplied identities (user config, env vars) take precedence.
+
+## [0.10.100]
+
+### Added
+- **Manager UI `/projects` + `/projects/:id` pages**
+  (`crates/zlayer-manager/src/app/pages/projects.rs` and
+  `project_detail.rs`). The largest page in the Manager — a list view
+  with a nested detail route. List page has a single table (Name, Git
+  URL, Branch, Auto-deploy badge, Updated, Actions); row clicks anywhere
+  except the Delete button navigate to `/projects/{id}` via
+  `use_navigate()`. The **New project** modal drives
+  `manager_create_project` with name + git URL + branch + build-kind
+  selector (dropdown of `dockerfile | compose | zimagefile | spec`,
+  matching the daemon's `BuildKind` exactly) + build path + auto-deploy
+  toggle + poll-interval slider (0–3600s, step 30, 0 = disabled).
+  Detail page uses the shared `TabBar` with four tabs: **Source**
+  (read-only git URL, editable branch, **Pull now** button that drives
+  `POST /api/v1/projects/{id}/pull` and shows the resulting
+  `ProjectPullResponse` inline plus the truncated HEAD SHA), **Build**
+  (segmented build-kind buttons, build path, deploy spec path,
+  auto-deploy toggle, poll-interval slider, Save button), **Credentials**
+  (merged registry + git credential picker populated from
+  `GET /api/v1/credentials/registry` and `/api/v1/credentials/git`;
+  attach writes `registry_credential_id` / `git_credential_id` via
+  `PATCH /api/v1/projects/{id}`; detach sends the empty string to clear
+  — see `update_project` in `handlers/projects.rs` for the empty-string
+  semantics), and **Envs & Deployments** (linked-deployments table
+  backed by `GET /api/v1/projects/{id}/deployments`, with a **Link
+  deployment** name picker and an unlink confirmation modal, plus a
+  webhook card showing the template URL + masked secret with a
+  Show/Hide toggle and a **Rotate webhook secret** button gated by a
+  warning `ConfirmDeleteModal`). Eleven server fns added in
+  `app/server_fns.rs`: `manager_list_projects`, `manager_get_project`,
+  `manager_create_project`, `manager_update_project`,
+  `manager_delete_project`, `manager_pull_project`,
+  `manager_list_project_deployments`,
+  `manager_link_project_deployment`,
+  `manager_unlink_project_deployment`, `manager_get_project_webhook`,
+  `manager_rotate_project_webhook`, plus a `manager_list_credentials`
+  helper that merges both credential endpoints into a single
+  `WireProjectCredential` shape for the picker. Wire types live in
+  `crates/zlayer-manager/src/wire/projects.rs`: `WireProject`,
+  `WireBuildKind` (four variants matching the daemon's `BuildKind`),
+  `WireProjectSpec` (shared create + patch body with
+  `skip_serializing_if = "Option::is_none"` everywhere so partial
+  patches stay minimal), `WirePullResult`, `WireWebhookInfo` (mirrors
+  `WebhookInfoResponse` — URL + secret), `WireProjectCredential`. Nine
+  new route smoke tests in `tests/routes_200.rs` cover the full and
+  minimum project shapes, all four build-kind wire encodings, the
+  `WireProjectSpec` omit-none serialisation, pull-result round-trip,
+  webhook-info round-trip, the `parse_wire` helper, and compile-check
+  guards for both `Projects` and `ProjectDetail`. Sidebar entry added
+  under the existing "Workspace" section using the Heroicons outline
+  `folder` icon; routes `/projects` and `/projects/:id` mounted behind
+  `<AuthGuard>` in `app/mod.rs`; pages exported via
+  `app/pages/mod.rs::{Projects, ProjectDetail}`.
+- **Manager UI `/audit` page**
+  (`crates/zlayer-manager/src/app/pages/audit.rs`). Admin-only,
+  read-only filterable/paginated audit log viewer backed by
+  `GET /api/v1/audit`. Filter bar exposes the four daemon-supported
+  predicates — user id (free-form, substring match on the server),
+  resource kind (free-form string — the Manager deliberately does NOT
+  pin this to a dropdown because new kinds get added without a client
+  upgrade), since, and until — with "Apply" committing the form into
+  the filter signals so typing doesn't spam the daemon. `datetime-local`
+  inputs are converted to RFC-3339 UTC at apply time (`YYYY-MM-DDTHH:MM`
+  → `YYYY-MM-DDTHH:MM:00Z`) so `chrono::DateTime<Utc>` on the daemon
+  can parse them. Pagination is client-side because the daemon's list
+  endpoint returns a bare `Vec<AuditEntry>` with no `{entries, total}`
+  envelope or `offset` parameter — we over-fetch
+  `(page + 1) * PER_PAGE + 1` rows at `limit = <N>` and slice the
+  current page out client-side; the trailing "probe row" decides
+  whether "Next" should be enabled. `PER_PAGE = 50` is a constant in
+  the page module. Row shape: Time (pretty-formatted, full RFC-3339 in
+  the `title=` tooltip), User (short 8-char prefix of the user id,
+  full id in the tooltip), Action (badge), Resource (`kind:id` when the
+  entry has a specific resource id, bare `kind` otherwise), IP, Details
+  (collapsed `<details>/<summary>` disclosure showing a pretty-printed
+  JSON block; the `user-agent` string is folded into the expanded
+  pane). Admin gate at the component level: non-admins see an
+  `alert-error` "Admin access required" banner and the page never
+  issues a server call; the backend independently enforces admin-only
+  via `actor.require_admin()?` in the handler. One server fn added to
+  `app/server_fns.rs` — `manager_list_audit(filter: WireAuditFilter)
+  -> Vec<WireAuditEntry>` — builds the query string by appending only
+  non-empty `Option` fields (so `None` maps to "param omitted", not
+  `?key=` which the daemon would deserialize as `Some("")`), with a
+  local `pct_encode_query()` helper for RFC 3986 unreserved-set
+  encoding of value strings. Wire types (`WireAuditEntry`,
+  `WireAuditFilter`) live in `crates/zlayer-manager/src/wire/audit.rs`
+  with round-trip tests in `tests/routes_200.rs` covering the full
+  shape, explicit-null optionals, missing-optionals-via-serde-default,
+  and `WireAuditFilter::default()` round-trip. Page-local unit tests
+  cover the datetime-local → RFC-3339 conversion (with + without
+  seconds + already-Z-terminated + empty), the pretty-printed
+  timestamp formatter, the short-id truncator, the `page_has_next()`
+  probe-row logic, and `describe_details()` for the summary preview
+  (object / array / primitive / overflow-of-4+ keys). Sidebar entry
+  added under the existing "System" section using the Heroicons
+  outline `clipboard-document-list` icon, hidden for non-admin
+  sessions via the same `CurrentUser::is_admin()` derived class that
+  Groups and Permissions use; route `/audit` mounted behind
+  `<AuthGuard>` in `app/mod.rs`; page exported via
+  `app/pages/mod.rs::Audit`.
+- **Manager UI `/permissions` page**
+  (`crates/zlayer-manager/src/app/pages/permissions.rs`). Admin-only
+  flat-list view of subject→resource access grants. Filter bar narrows
+  by subject kind (`all | user | group`), subject id (substring match),
+  and resource kind (dropdown of the eight kinds the daemon recognises:
+  `deployment | project | secret | task | workflow | notifier |
+  variable | environment`), all applied client-side on a union of the
+  per-subject grant lists. This approach was dictated by the daemon's
+  narrow filter surface (`GET /api/v1/permissions` accepts EXACTLY one
+  of `?user=<id>` or `?group=<id>`) — we fan out one request per
+  user/group rather than inventing a query parameter the server
+  doesn't understand. Grant modal has cascading pickers: flipping the
+  subject-kind toggle swaps between a user `<select>` (populated from
+  `manager_list_users`, labelled `email (id)`) and a group `<select>`
+  (from `manager_list_groups`, labelled `name (id)`), with a free-form
+  text fallback if either list hasn't loaded yet. Resource kind is a
+  fixed dropdown; resource id is a free-form text input (blank ==
+  wildcard grant). Level selector exposes `read | execute | write`
+  (the daemon also accepts `none` but a `none` grant is never useful).
+  Revoke is an inline confirmation dialog that names the subject /
+  resource / level to prevent fat-finger revocations. Admin gate at
+  the component level: non-admins see an `alert-warning` "Admin role
+  required" banner and no server calls are issued; the backend
+  independently enforces admin-only on `POST` and `DELETE`. Three
+  server fns added to `app/server_fns.rs` —
+  `manager_list_permissions_for_subject`, `manager_grant_permission`,
+  `manager_revoke_permission` — all cookie/CSRF-forwarded via
+  `raw_request`. Wire types (`WirePermission`,
+  `WireGrantPermissionRequest`) live in
+  `crates/zlayer-manager/src/wire/permissions.rs` with round-trip
+  tests in `tests/routes_200.rs` covering the specific-resource shape,
+  the wildcard (`resource_id: null`) shape, and the `skip_serializing_if`
+  on the grant request so a wildcard grant's JSON body omits
+  `resource_id` entirely (matching the daemon's `#[serde(default)]`
+  on `GrantPermissionRequest.resource_id`). Eight unit tests cover
+  filter composition, subject/resource label formatting, and the
+  fallback-to-raw-id behaviour when a grant's subject was deleted
+  after the grant was created. Sidebar entry added under the existing
+  "System" section using the Heroicons outline `shield-check` icon,
+  hidden for non-admin sessions via the same `CurrentUser::is_admin()`
+  derived class the Groups link uses; route `/permissions` mounted
+  behind `<AuthGuard>` in `app/mod.rs`; page exported via
+  `app/pages/mod.rs::Permissions`.
+- **Manager UI `/groups` page**
+  (`crates/zlayer-manager/src/app/pages/groups.rs`). Admin-only
+  master-detail layout for user group management. Left column is a
+  clickable groups table (name + description + Edit/Delete actions).
+  Right column shows the selected group's detail: a header card with
+  name/description/created timestamp, an "Add member" picker populated
+  from `manager_list_users` minus the current membership, and a
+  members table with display_name + email + Remove actions. The
+  daemon's `GET /api/v1/groups/{id}/members` endpoint returns only
+  `user_id` values — names/emails are joined client-side against the
+  users resource; unknown ids are rendered verbatim as `(unknown
+  user)` rather than dropped. Seven server fns added to
+  `app/server_fns.rs`: `manager_list_groups`, `manager_create_group`,
+  `manager_update_group` (PATCH, supported by the daemon),
+  `manager_delete_group`, `manager_list_group_members`,
+  `manager_add_group_member`, `manager_remove_group_member` — all
+  cookie/CSRF-forwarded via `raw_request`. Wire types
+  (`WireUserGroup`, `WireGroupMembers`, `WireCreateGroup`,
+  `WireUpdateGroup`, `WireAddMember`) live in
+  `crates/zlayer-manager/src/wire/groups.rs` with round-trip tests in
+  `tests/routes_200.rs` (null description, empty members list,
+  skip-serializing partial patches). Admin gate at the component
+  level — non-admins see an `alert-error` "Admin access required"
+  banner and no server calls are issued; the backend independently
+  enforces admin-only on every mutation. Sidebar entry added under
+  the existing "System" section using the Heroicons outline
+  `user-group` icon, hidden entirely for non-admin sessions via a
+  `CurrentUser::is_admin()` derived class so regular users don't see
+  a link that would only show them an error page; route `/groups`
+  mounted behind `<AuthGuard>` in `app/mod.rs`; page exported via
+  `app/pages/mod.rs::Groups`.
+- **Manager UI `/workflows` page**
+  (`crates/zlayer-manager/src/app/pages/workflows.rs`). Master-detail
+  layout for the daemon's named step-DAGs: left column is a clickable
+  workflow table (name + step count + updated timestamp), right column
+  shows the selected workflow's steps as a DaisyUI `steps steps-vertical`
+  rail (semantic action badges only — `badge-primary` for run_task,
+  `badge-secondary` for build_project, `badge-accent` for deploy_project,
+  `badge-info` for apply_sync), a Run button with an in-flight
+  spinner/disabled state, and a "Recent runs" panel where each row
+  expands inline to reveal the per-step breakdown with `step-success` /
+  `step-error` / `step-neutral` coloring keyed on the daemon's
+  `StepResult.status` strings (`"ok" | "failed" | "skipped"`). Step
+  output/error text renders in a `mockup-code` block beneath each step
+  label. The Run button surfaces the finished run in a dedicated
+  `RunResultModal` (for a side-by-side view) while ALSO prepending it to
+  the history list so the user can keep browsing. Create modal is the
+  hardest form in the manager so far — a dynamic `Vec<StepDraft>` backed
+  by per-step `RwSignal`s for name, kind selector (run_task /
+  build_project / deploy_project / apply_sync), variant-specific id
+  field, and optional on_failure task id. Each draft carries a stable
+  `key: u64` so move-up / move-down reorders don't re-mount inputs and
+  lose focus. On submit the drafts are built into a
+  `Vec<WireWorkflowStep>` via per-variant validation that surfaces
+  inline as `alert-error` text before hitting the daemon. Edit modal is
+  intentionally omitted because the daemon exposes no
+  `PATCH /api/v1/workflows/{id}` endpoint (to change a workflow, delete
+  and recreate — same pattern Tasks uses), consistent with the "match
+  daemon API shapes exactly" ground rule. Six server fns added to
+  `app/server_fns.rs` — `manager_list_workflows`, `manager_get_workflow`,
+  `manager_create_workflow`, `manager_delete_workflow`,
+  `manager_run_workflow`, `manager_list_workflow_runs` — all
+  cookie/CSRF-forwarded through `raw_request`. Wire types
+  (`WireWorkflow`, `WireWorkflowStep`, `WireWorkflowAction`,
+  `WireWorkflowRun`, `WireStepResult`, `WireWorkflowSpec`) live in
+  `crates/zlayer-manager/src/wire/workflows.rs` with round-trip tests in
+  `tests/routes_200.rs` covering the `{"type": "<snake_case>"}` action
+  tagging, null `project_id` on global workflows, and null `finished_at`
+  for still-running runs. Sidebar entry added under the existing
+  "CI/CD" section using the Heroicons outline `rectangle-stack` icon;
+  route `/workflows` mounted behind `<AuthGuard>` in `app/mod.rs`; page
+  exported via `app/pages/mod.rs::Workflows`.
+- **Manager UI `/tasks` page**
+  (`crates/zlayer-manager/src/app/pages/tasks.rs`). Master-detail layout
+  for the daemon's named runnable scripts: left column is a clickable
+  task table, right column shows the selected task's body, a Run button
+  with an in-flight spinner/disabled state, a "Recent runs" table
+  (truncated run id + started timestamp + computed duration + colored
+  exit-code badge), and a "Latest output" panel that renders the most
+  recent run's stdout/stderr in `mockup-code` blocks. Selection is
+  stored as an id in a `RwSignal<Option<String>>` so it survives list
+  refetches. Runs live in a page-local `RwSignal<Vec<WireTaskRun>>`
+  that seeds from `GET /api/v1/tasks/{id}/runs` whenever the selection
+  changes and prepends the newly-returned run after each successful
+  `POST /api/v1/tasks/{id}/run` call — no polling. Includes a
+  dependency-free RFC-3339 parser (`rfc3339_to_unix_ms`,
+  `ymd_to_unix_days`) so the WASM/hydrate build doesn't pull in chrono,
+  matching the same pattern `secrets.rs` established. Create + Delete
+  modals are wired; an Edit modal is intentionally omitted because the
+  daemon exposes no `PATCH /api/v1/tasks/{id}` endpoint (to change a
+  task, delete and recreate), consistent with the "match daemon API
+  shapes exactly" ground rule. Six server fns added to
+  `app/server_fns.rs` — `manager_list_tasks`, `manager_get_task`,
+  `manager_create_task`, `manager_delete_task`, `manager_run_task`,
+  `manager_list_task_runs` — all cookie/CSRF-forwarded through
+  `raw_request`. Wire types (`WireTask`, `WireTaskRun`, `WireTaskSpec`)
+  live in `crates/zlayer-manager/src/wire/tasks.rs` with round-trip
+  tests in `tests/routes_200.rs` (null `project_id`, null
+  `exit_code`/`finished_at` for still-running jobs). Sidebar entry
+  added under the existing "CI/CD" section using the Heroicons outline
+  `play` icon; route `/tasks` mounted behind `<AuthGuard>` in
+  `app/mod.rs`; page exported via `app/pages/mod.rs::Tasks`.
+- **Manager UI `/secrets` page**
+  (`crates/zlayer-manager/src/app/pages/secrets.rs`). Environment-scoped
+  secrets management with an env tab filter (All + one per environment,
+  including project-scoped envs via `?project=*`), a masked value column
+  with per-row reveal that auto-hides after 10 seconds (via
+  `gloo_timers::callback::Timeout` on hydrate, no-op on SSR), inline
+  create/edit/delete modals, and a bulk `.env` import modal with a
+  client-side `KEY=value` parser that mirrors the daemon's quote-stripping
+  and `export ` handling. Uses the daemon's existing
+  `GET/POST/DELETE /api/v1/secrets`, `GET /api/v1/secrets/{name}?reveal=true`,
+  and `POST /api/v1/secrets/bulk-import` endpoints — no new API surface.
+  Wire types (`WireSecret`, `WireEnvironment`, `BulkImportResult`) live in
+  `crates/zlayer-manager/src/wire/secrets.rs` and are guarded by
+  round-trip tests in `tests/routes_200.rs`. Sidebar entry added under the
+  "Workspace" section using the Heroicons outline `key` icon; route wired
+  at `/secrets` behind `<AuthGuard>`.
+- **Manager UI `/variables` page**
+  (`crates/zlayer-manager/src/app/pages/variables.rs`). First page of the
+  Phase 4-8 Manager UI roll-out: a DaisyUI table of workspace variables
+  with modals for creating, editing, and deleting. Edits push through the
+  existing `PATCH /api/v1/variables/{id}` endpoint; creates use
+  `POST /api/v1/variables` with an optional `scope` id (blank = global).
+  Wired into the sidebar under a new "Workspace" section (above "CI/CD")
+  and registered at `/variables` behind `<AuthGuard>`; the daemon still
+  enforces admin-only on every mutation so non-admins see server-side
+  errors rather than a hard client-side gate.
+- **Shared Manager UI scaffolding used by the Variables page and every
+  subsequent Phase 4-8 page**:
+  - `crates/zlayer-manager/src/app/util/errors.rs` — `humanize_error`
+    (moved out of `pages/bootstrap.rs`) plus a new `format_server_error`
+    convenience wrapper that takes a `ServerFnError` directly. Tests
+    cover the 409/bootstrap/network branches.
+  - `crates/zlayer-manager/src/app/components/forms.rs` — five reusable
+    modal/form primitives: `ConfirmDeleteModal`, `TextFieldModal`,
+    `FormField`, `TabBar`, `Pagination`. DaisyUI semantic classes only;
+    no hand-picked colors. Reactive signals for the "submitting" flag
+    and optional error banner.
+  - `crates/zlayer-manager/src/wire/` — new top-level module for wire
+    types shared between SSR and hydrate builds. Contains
+    `common::ErrorBody` and `variables::WireVariable`. Cannot depend on
+    `zlayer-api` because hydrate compiles as WASM and has no access to
+    that crate; the round-trip test in `tests/routes_200.rs` guards
+    against field drift.
+- **Real workflow action execution for `BuildProject`, `DeployProject`, and
+  `ApplySync`** (`crates/zlayer-api/src/handlers/workflows.rs`). Previously
+  these three `WorkflowAction` arms were log-only — the daemon printed a
+  "would execute …" line and returned a placeholder string without touching
+  anything. They now drive the real pipeline end-to-end:
+  - `BuildProject` looks up the project, ensures the git working copy is
+    cloned / fast-forwarded at `{clone_root}/{project_id}` (reusing the
+    shared `ensure_project_clone` helper with HTTP pulls), registers a new
+    build against the shared `BuildManager`, kicks off `spawn_build` (the
+    same code path the `/api/v1/build/json` HTTP endpoint uses), blocks on
+    `BuildManager::wait_for_build` for terminal status, and propagates
+    `Complete` as step-ok / `Failed` as step-failed so the workflow's
+    `on_failure` handler (if any) still gets a chance to run.
+  - `DeployProject` requires a new `StoredProject::deploy_spec_path` field;
+    when set, it reads that file from the cloned working copy, parses it as
+    a `DeploymentSpec` (via `zlayer_spec::from_yaml_str`, exactly like the
+    HTTP deployments endpoint and sync apply), upserts the stored
+    deployment, and links it to the project so "list project deployments"
+    surfaces the new record. When `deploy_spec_path` is `None` the step
+    fails with a clear, actionable error message rather than silently
+    succeeding.
+  - `ApplySync` delegates directly to the shared `apply_sync_inner` helper,
+    so workflow-triggered applies produce the same per-resource reconcile
+    results (create / update / delete / skip) and the same
+    `last_applied_sha` bookkeeping as a `POST /syncs/{id}/apply` HTTP
+    request. The step output is the JSON-serialized `SyncApplyResponse` so
+    downstream consumers can parse structured results rather than regexing
+    a printf'd string.
+- **`BuildManager::wait_for_build`** (`crates/zlayer-api/src/handlers/build.rs`).
+  New async helper that blocks until a registered build reaches a terminal
+  state (`Complete` or `Failed`), polling every 200ms with a hard 1-hour
+  ceiling. Returns the final `BuildStatus` for the caller to inspect, or
+  `None` when the build id is unknown. The workflow `BuildProject` action
+  uses it to turn the existing fire-and-forget `spawn_build` pipeline into
+  a synchronous step — no handler duplication, no alternate build code
+  path. Covered by two new unit tests: one asserts `Complete` propagates
+  from a concurrent writer, one asserts unknown ids return `None`.
+- **`WorkflowsState` extended with every handle workflow steps can reach:**
+  `project_store`, `deployment_store`, `sync_store`, `build_manager`,
+  `clone_root`, and (optional) `git_creds`. The old two-field constructor
+  `WorkflowsState::new(store, task_store)` is replaced with the full
+  seven-argument form; `serve.rs` hands them through from the existing
+  `StorageBundle` + `BuildState` + the shared `{data_dir}/projects` clone
+  root (same path `ProjectState` and `SyncState` already resolve, so every
+  surface that pulls a project's git repo ends up in the same place).
+  A chainable `with_git_creds(...)` method attaches a credential store
+  when private repo auth is required for `BuildProject`.
+- **`StoredProject::deploy_spec_path: Option<String>`** (`crates/zlayer-api/src/storage/mod.rs`).
+  New optional field that tells workflow `DeployProject` which YAML inside
+  the cloned working copy to parse and apply. Defaults to `None` (explicit
+  opt-in) and is serde `#[serde(default)]` so existing project rows in
+  `projects.db` deserialize without a schema migration — the
+  `SqlxProjectStore` serializes the whole struct as `data_json` so only
+  the JSON shape matters. `CreateProjectRequest` / `UpdateProjectRequest`
+  both accept the new field; passing `""` on update clears it.
+- **`pub(crate)` helper `ensure_project_clone`** (`crates/zlayer-api/src/handlers/projects.rs`).
+  Extracted from the HTTP `pull_project` handler so the workflow
+  `BuildProject` action uses the exact same clone / fast-forward / auth
+  resolution code path — no divergence between manual `POST /pull` and
+  workflow-triggered builds.
+- **Manager UI `/notifiers` page**
+  (`crates/zlayer-manager/src/app/pages/notifiers.rs`). DaisyUI table of
+  configured notifiers with columns for Name, Type (badge colored per
+  kind — slack/primary, discord/secondary, webhook/accent, smtp/info),
+  Enabled (clickable badge toggles via PATCH), Updated, and Actions
+  (Test / Edit / Delete). Establishes the **discriminated-union form
+  pattern** that future pages (workflows, syncs) should follow when they
+  pick up similarly shaped tagged unions: a single `<select>` drives the
+  active variant, variant-specific fields render conditionally, and
+  switching variants clears the other variants' inputs so stale state
+  never leaks into the POST body. The final `WireNotifierConfig` is
+  built via a `match` on the selected variant. A per-row Test modal
+  shows a spinner while `POST /api/v1/notifiers/{id}/test` is in flight,
+  then surfaces the daemon's `NotifierTestResult` as an
+  `alert-success`/`alert-error` with the returned message — the daemon
+  returns upstream failures as HTTP 200 + `success: false`, so the UI
+  never confuses "reachable but misconfigured" with "daemon unreachable".
+  - Five server fns in `app/server_fns.rs`: `manager_list_notifiers`,
+    `manager_create_notifier`, `manager_update_notifier`,
+    `manager_delete_notifier`, `manager_test_notifier` — all
+    cookie/CSRF-forwarded through `raw_request` exactly like the
+    Variables fns. `manager_create_notifier` always submits the
+    daemon's `{name, kind, config}` tuple with `kind` derived from
+    `WireNotifierConfig::kind()`, and immediately follows with a PATCH
+    when the caller asked for `enabled: false` (the daemon's create
+    handler ignores enabled and always produces `enabled: true`).
+  - Wire types in `crates/zlayer-manager/src/wire/notifiers.rs`
+    (`WireNotifier`, `WireNotifierConfig` with
+    `#[serde(tag = "type", rename_all = "snake_case")]`,
+    `NotifierTestResult`). Zero dependency on `zlayer-api` — the
+    hydrate/WASM build can consume these the same way it consumes
+    `WireVariable`. Tests in `tests/routes_200.rs` round-trip each
+    variant (slack, discord, webhook with + without optional fields,
+    smtp), exercise the `kind()` helper, and assert
+    `NotifierTestResult` parses both success and failure shapes.
+  - Route `/notifiers` mounted behind `<AuthGuard>` in
+    `app/mod.rs`; sidebar entry with a Heroicons `bell` icon in the
+    existing "CI/CD" section of `app/components/sidebar.rs`; page
+    exported via `app/pages/mod.rs::Notifiers`.
+
+### Changed
+- **`BuildManager::spawn_build` is now `pub(crate)`** so the workflow
+  `BuildProject` action can invoke it directly. No behavior change; the
+  function was previously a private helper inside the build handler.
+- **`serve.rs` constructs `BuildState` and the shared `projects` clone root
+  earlier** so `ProjectState`, `SyncState`, and the new `WorkflowsState` all
+  reference the same `Arc<BuildManager>` and the same on-disk clone root.
+  Before this change `ProjectState` and `SyncState` defaulted to
+  `std::env::temp_dir().join("zlayer-projects")`, which survived nothing
+  across reboots; they now use `{data_dir}/projects`.
+
+### Fixed
+- Workflow runs that included `BuildProject`, `DeployProject`, or `ApplySync`
+  steps previously reported `"ok"` with a `"would execute …"` output even
+  though nothing actually ran. Admins relying on workflows to automate
+  builds / deploys / syncs would see green step results and no error, but
+  find their deployments stale and registries empty. Those three arms now
+  execute the real action and propagate failures the way every other
+  workflow step does.
+
+## [0.10.99]
+
+### Added
+- **Persistent `SQLite` backend for audit log storage (`SqlxAuditStore`).**
+  Audit entries (who did what, when, to which resource) now survive daemon
+  restarts. The new store lives in `crates/zlayer-api/src/storage/audit.rs`
+  alongside the existing `InMemoryAuditStore` (kept for unit tests); both back
+  the same `AuditStorage` trait so callers are backend-agnostic. Re-exported
+  from `storage::mod` as `SqlxAuditStore`.
+  - Hand-rolled (not built on `SqlxJsonStore`) because the filter is a
+    multi-field range query — `user_id`, `resource_kind`, and `[since, until]`
+    on `occurred_at` — rather than the single-column-peel pattern the generic
+    adapter is tuned for. `list()` builds its dynamic `WHERE` clause via
+    `sqlx::QueryBuilder` with parameterised binds, so filter composition is
+    injection-safe.
+  - Append-only schema: `audit_log(id PK, user_id, resource_kind, resource_id,
+    action, data_json, occurred_at)`. Three supporting indexes —
+    `idx_audit_user (user_id, occurred_at DESC)`,
+    `idx_audit_resource (resource_kind, occurred_at DESC)`, and
+    `idx_audit_time (occurred_at DESC)` — so every common filter shape
+    (per-user timeline, per-kind timeline, global recent) serves from an
+    ordered index scan rather than an in-memory sort. The canonical
+    `AuditEntry` is also stored as `data_json` so new optional fields
+    (e.g. `ip`, `user_agent`, `details`) can be added without a schema
+    migration.
+  - `list()` semantics match `InMemoryAuditStore` exactly: `since`/`until` are
+    both inclusive bounds on `occurred_at`, `user_id` and `resource_kind` are
+    strict-equality filters, results are ordered by `occurred_at DESC`, and
+    `limit` is applied at the SQL level (so a `limit = 5` over a million rows
+    stops at 5 without materialising the rest).
+  - Seven new `#[tokio::test]` cases cover no-filter reverse-chronological
+    ordering, each single-field filter, the inclusive-window semantics (10
+    entries spread over 10s, middle 3 captured), the limit cap, the full
+    combined filter (user + kind + window with negative cases for each
+    axis), and a round-trip through an on-disk database to confirm the
+    RFC3339 timestamp, `details` JSON, `ip`, and `user_agent` all survive
+    close-and-reopen.
+- **Persistent `SQLite` backend for task storage (`SqlxTaskStore`).**
+  Named runnable scripts (tasks) and their execution records (task runs) now
+  survive daemon restarts. The new store lives in
+  `crates/zlayer-api/src/storage/tasks.rs` alongside the existing
+  `InMemoryTaskStore` (kept for unit tests); both back the same `TaskStorage`
+  trait so callers are backend-agnostic. Re-exported from `storage::mod` as
+  `SqlxTaskStore`.
+  - Primary `tasks` table managed by `SqlxJsonStore` with two peeled columns:
+    `name` (single-column `UNIQUE`, so duplicate task names surface as
+    `StorageError::AlreadyExists` directly from the adapter) and `project_id`
+    (nullable, indexed) so `list(Some(project_id))` goes through `list_where`
+    rather than a full-table scan.
+  - Secondary `task_runs` history table, hand-rolled on the shared pool via
+    the crate-private `SqlxJsonStore::pool()` accessor, with a composite
+    index on `(task_id, started_at DESC)` so `list_runs` serves its
+    newest-first ordering as an ordered index scan rather than an in-memory
+    sort pass. `record_run` upserts by run id so re-recording the same run
+    (e.g. to patch `stdout`/`finished_at` after the process exits) updates
+    in place rather than duplicating.
+  - `delete` runs a transaction that first wipes the task's runs in
+    `task_runs`, then the row in `tasks`, so a crash mid-delete cannot leave
+    orphan run rows behind.
+- **`SqlxJsonStore::pool()` accessor** (crate-private) on
+  `crates/zlayer-api/src/storage/sqlx_json.rs`. Exposes the underlying
+  `SqlitePool` to sibling stores inside `storage::*` so they can create
+  secondary tables (e.g. `task_runs`) and run cross-table transactions on
+  the same pool without opening a second connection. Not part of the public
+  API.
+- **Persistent `SQLite` backend for user group storage (`SqlxGroupStore`).**
+  User groups and their memberships now survive daemon restarts. The new
+  store lives in `crates/zlayer-api/src/storage/groups.rs` alongside the
+  existing `InMemoryGroupStore` (kept for unit tests); both back the same
+  `GroupStorage` trait so callers are backend-agnostic. Re-exported from
+  `storage::mod` as `SqlxGroupStore`.
+  - Primary `groups` table managed by `SqlxJsonStore` with a single-column
+    `UNIQUE(name)` constraint — duplicate-name inserts surface as
+    `StorageError::AlreadyExists` straight out of the adapter.
+  - Secondary `group_members` link table keyed by a composite
+    `PRIMARY KEY (group_id, user_id)`, hand-rolled on the shared pool via
+    the crate-private `SqlxJsonStore::pool()` accessor. A secondary
+    `idx_group_members_user` index on `(user_id)` powers
+    `list_groups_for_user` without a full-table scan. Double-add of the
+    same pair is idempotent via `INSERT OR IGNORE`, matching
+    `InMemoryGroupStore` which deduplicates through its `HashSet`.
+  - `delete` runs a transaction that first wipes the group's membership
+    rows in `group_members`, then the row in `groups`, so a crash
+    mid-delete cannot leave orphan membership rows behind.
+  - `add_member`, `remove_member`, and `list_members` preflight-check
+    group existence and return `StorageError::NotFound` for unknown group
+    ids, matching the existing `InMemoryGroupStore` behaviour.
+- **Persistent `SQLite` backend for workflow storage (`SqlxWorkflowStore`).**
+  Workflow definitions and their execution history now survive daemon
+  restarts. The new store lives in `crates/zlayer-api/src/storage/workflows.rs`
+  alongside the existing `InMemoryWorkflowStore` (kept for unit tests); both
+  back the same `WorkflowStorage` trait so callers are backend-agnostic.
+  Re-exported from `storage::mod` as `SqlxWorkflowStore`.
+  - Primary `workflows` table managed by `SqlxJsonStore` with a single-column
+    `UNIQUE(name)` constraint — duplicate-name inserts surface as
+    `StorageError::AlreadyExists` straight out of the adapter.
+  - Secondary `workflow_runs` history table, hand-rolled on the shared pool
+    via the crate-private `SqlxJsonStore::pool()` accessor, with a composite
+    index on `(workflow_id, started_at DESC)` so `list_runs` is an ordered
+    index scan rather than a fetch-plus-sort-in-memory pass.
+  - `delete` runs a transaction that first wipes the workflow's run history
+    in `workflow_runs`, then the row in `workflows`, so a crash mid-delete
+    cannot leave orphan run rows. The `InMemoryWorkflowStore` backend was
+    updated to cascade-delete run history too, matching the new contract.
+- **Persistent `SQLite` backend for variable storage (`SqlxVariableStore`).**
+  Plaintext template variables now survive daemon restarts. The new store
+  lives in `crates/zlayer-api/src/storage/variables.rs` alongside the
+  existing `InMemoryVariableStore` (kept for unit tests); both back the same
+  `VariableStorage` trait so callers are backend-agnostic. Re-exported from
+  `storage::mod` as `SqlxVariableStore`.
+- **Compound `UNIQUE` support in `JsonTable`.** `JsonTable<T>` gained a
+  `unique_constraints: &'static [&'static [&'static str]]` field; each inner
+  slice becomes a `UNIQUE(col_a, col_b, ...)` clause in the generated
+  `CREATE TABLE` statement. This enables multi-column uniqueness (e.g.
+  `UNIQUE(name, scope)` for variables) that `IndexSpec::unique` — a
+  single-column flag — cannot express. Compound-constraint violations still
+  surface as `StorageError::AlreadyExists` via the existing
+  `map_sqlx_err` path.
+- **Three new `SqlxJsonStore` lookup methods:**
+  `list_where(column, value)` for `column = ?` filtering,
+  `list_where_null(column)` for `column IS NULL` filtering, and
+  `list_where_opt(column, Option<&str>)` as the unified primitive that
+  accepts either. All three reject unknown columns with `StorageError::Other`
+  (not a raw `Database` string) by validating against the static index list,
+  matching the `get_by_unique` contract. Results are ordered by `id` ASC.
+  The variable store uses these to implement its `list(scope)` and
+  `get_by_name(name, scope)` trait methods without full-table scans.
+- **Scope-isolation tests for `SqlxVariableStore`.** `(name, scope)`
+  uniqueness is enforced by the schema for rows with non-`NULL` scope and by
+  an application-level pre-write `get_by_name` check for global rows
+  (SQLite treats `NULL` as distinct in `UNIQUE`, so the schema alone can't
+  cover the `scope = None` case). Persistent round-trip across database
+  reopen is covered.
+
+### Changed
+- **Sync apply is now a real reconcile (breaking change to
+  `SyncApplyResponse`).** `POST /api/v1/syncs/{id}/apply` no longer returns a
+  dry-run diff — it actually upserts `DeploymentSpec` manifests into the
+  deployment store and, when `sync.delete_missing == true`, deletes
+  deployments that are no longer present in the manifest directory.
+  - The response shape is now
+    `{ results: [SyncResourceResult], applied_sha?, summary }` where each
+    `SyncResourceResult` is `{ resource, kind, action, status, error? }`
+    with `action` in `{create, update, delete, skip}` and `status` in
+    `{ok, error}`. Per-resource errors are surfaced on the individual
+    result rather than aborting the whole apply.
+  - `SyncState` now carries an `Arc<dyn DeploymentStorage>` alongside the
+    sync store and clone root. `SyncState::new` takes the deployment store
+    as a second argument; `bin/zlayer::commands::serve` wires it from the
+    same persistent `SqlxStorage` used by the deployment routes.
+  - `CreateSyncRequest` gains an optional `delete_missing` field so syncs
+    can be created with destructive reconcile enabled up front; the default
+    is still `false` (the safer behaviour).
+  - On successful apply the sync's `last_applied_sha` is refreshed from
+    `zlayer_git::current_sha` on the scan directory and persisted, so
+    `zlayer sync ls` reflects the commit actually applied.
+  - Standalone `kind: job` and `kind: cron` YAMLs are recorded as
+    `action: skip` with a message explaining that job/cron records should
+    be scheduled via `DeploymentSpec` (no standalone `JobStorage` /
+    `CronStorage` exists on the API yet). Unknown kinds are skipped with
+    `"unknown kind: {kind}"`. This replaces silent no-ops with visible
+    skips so the caller sees what was reconciled and what wasn't.
+  - The core apply logic is extracted as
+    `handlers::syncs::apply_sync_inner(..)` (crate-private) so the
+    upcoming workflow `ApplySync` action (Fix 3) can invoke the same
+    reconcile path without going back out through HTTP.
+  - `bin/zlayer::commands::sync_cmd::apply` now tabulates
+    `results` per-row with action/status/kind/resource/detail columns and
+    prints the `summary` and `applied_sha` headers. The old
+    `diff.to_create / to_update / to_delete` summary is gone.
+  - Six new tests in `crates/zlayer-api/src/handlers/syncs.rs` cover
+    create, update, `delete_missing = false` → skip, `delete_missing = true`
+    → delete, unknown kind → skip, and `kind: job` → skip-with-message,
+    all driven through `apply_sync_inner` against in-memory sync +
+    deployment stores.
+- Existing `JsonTable` construction sites (`NOTIFIERS_TABLE`, `SYNCS_TABLE`,
+  plus in-module test fixtures) now populate `unique_constraints: &[]`.
+  No functional change — just the new field default. Downstream callers
+  outside the workspace should do the same.
+- **`SyncStorage` trait error type harmonised from `Result<_, String>` to
+  `Result<_, StorageError>`.** Every method on the trait
+  (`list`/`get`/`create`/`delete`/`update`) now returns the same structured
+  error type used by every other storage trait in the crate, so the sync
+  store is no longer the odd one out. The in-memory implementation maps its
+  duplicate-name and missing-id cases to `StorageError::AlreadyExists` and
+  `StorageError::NotFound` respectively — and the new persistent backend
+  does the same — so HTTP handlers can rely on a single conversion path.
+  This is a BREAKING change at the trait level but internal to the
+  workspace; the only caller (`crates/zlayer-api/src/handlers/syncs.rs`)
+  was updated in the same patch to drop its `.map_err(ApiError::Internal)` /
+  `.map_err(ApiError::Conflict)` noise in favour of the new
+  `From<StorageError> for ApiError` conversion, which preserves HTTP status
+  semantics (`NotFound` → 404, `AlreadyExists` → 409).
+- The `'static` bound on `SyncStorage` was dropped to match the other
+  storage traits — it was defensive, not actually required by any caller.
+
+### Added
+- **Persistent `SQLite` backend for sync storage (`SqlxSyncStore`).**
+  Sync records (git-backed resource-set pointers) now survive daemon
+  restarts. The new store lives in `crates/zlayer-api/src/storage/syncs.rs`
+  alongside the existing `InMemorySyncStore` (kept for unit tests); both
+  back the same `SyncStorage` trait so callers are backend-agnostic.
+  Re-exported from `storage::mod` and `zlayer_api::storage` as
+  `SqlxSyncStore`.
+  - Schema: `name` is a single-column `UNIQUE` peeled column (global name
+    uniqueness enforced at the schema level); `project_id` is a nullable
+    secondary index for fast project-scoped lookups.
+  - Preflight name check on `create` yields a clean `StorageError::
+    AlreadyExists` even before the adapter's upsert machinery runs; the
+    schema-level UNIQUE is the backstop.
+- **`StoredSync.delete_missing: bool` field**, defaulted to `false` via
+  `#[serde(default)]` so existing serialised blobs without the field
+  deserialise as "skip deletes" (the safer default). This is the
+  per-record toggle that the upcoming real sync-apply implementation (Fix
+  5) reads to decide whether resources present on the API but missing
+  from the manifest should be deleted. Fresh syncs default to `false`;
+  `StoredSync::new(...)` was updated to set the field explicitly.
+- **`From<StorageError> for ApiError`** in `crates/zlayer-api/src/error.rs`.
+  Maps `NotFound` → `ApiError::NotFound`, `AlreadyExists` → `Conflict`,
+  `Serialization`/`Other`/`Database`/`Io` → `Internal` with descriptive
+  prefixes. Callers can now just `.await?` on any `StorageError`-returning
+  store method and get the correct HTTP status.
+- **Persistent `SQLite` backend for permission storage (`SqlxPermissionStore`).**
+  Resource-level permission grants now survive daemon restarts. The new store
+  lives in `crates/zlayer-api/src/storage/permissions.rs` alongside the
+  existing `InMemoryPermissionStore` (kept for unit tests); both back the same
+  `PermissionStorage` trait so callers are backend-agnostic. Re-exported from
+  `storage::mod` as `SqlxPermissionStore`.
+  - Hand-rolled schema (NOT built on `SqlxJsonStore`) because `check()`
+    requires SQL-side wildcard matching (`resource_id IS NULL`) and a
+    `MAX(level)` aggregate across matching rows — neither is expressible
+    through the generic JSON-table adapter. All five query columns
+    (`subject_kind`, `subject_id`, `resource_kind`, `resource_id`, `level`)
+    are first-class indexed SQLite columns. The full record is additionally
+    serialized into `data_json` so `StoredPermission` can grow new fields
+    without schema migrations.
+  - Three covering indexes: `idx_perm_subject (subject_kind, subject_id)`
+    for `list_for_subject`, `idx_perm_resource (resource_kind, resource_id)`
+    for `list_for_resource`, and `idx_perm_check (subject_kind, subject_id,
+    resource_kind, resource_id)` so the hot-path `check()` aggregate runs as
+    an index scan instead of a table scan.
+  - `grant()` is an upsert on the `id` primary key (same as
+    `InMemoryPermissionStore` which keys by `id` in its `HashMap`) — two
+    distinct ids with the same (subject, resource) coexist, and `check()`
+    resolves them via `MAX(level)`. Deliberately no unique constraint on
+    (subject, resource); re-granting with the same id replaces every field
+    on the existing row.
+  - `check()` is a single `SELECT MAX(level) WHERE subject_kind=? AND
+    subject_id=? AND resource_kind=? AND (resource_id IS NULL OR
+    resource_id=?)` that folds wildcard and exact-id grants in one round
+    trip. `SubjectKind` serializes as `"user"`/`"group"` TEXT (matching the
+    `Display` impl and `serde` wire form); `PermissionLevel` is stored as a
+    small INTEGER (None=0, Read=1, Execute=2, Write=3) so comparisons work
+    at the SQL layer.
+
+### Fixed
+- Cleaned up two `clippy::doc_markdown` hits and one `clippy::single_match_else`
+  in `storage/sqlx_json.rs` introduced by the variable-store patch — the
+  workspace now passes `cargo clippy --workspace --all-targets --
+  -D warnings` again.
+- **`zlayer serve` wires every persistent API store through a single
+  `StorageBundle`** (`bin/zlayer/src/commands/serve.rs`). The bundle opens
+  11 `SQLite` databases under `--data-dir` — `users.db`, `environments.db`,
+  `projects.db`, `variables.db`, `tasks.db` (+ task runs), `workflows.db`
+  (+ workflow runs), `notifiers.db`, `groups.db` (+ group memberships),
+  `permissions.db`, `audit.db`, `syncs.db` — and feeds each handler its
+  corresponding store. Prior to this change `zlayer serve` constructed
+  `InMemory*Store::new()` for every resource class, so notifier configs,
+  variables, tasks, workflows, groups, permissions, audit entries, and
+  syncs were wiped on every daemon restart. Users, environments, and
+  projects had no routes mounted at all. All of that now lives on disk
+  and survives restart. The deployment database (`deployments.db`) stays
+  in `init_daemon` because the S3 `SqliteReplicator` is bound to that
+  exact path and the deployment-restore path depends on the concrete
+  `Arc<SqlxStorage>` type — documented inline on `StorageBundle`. A
+  `StorageBundle::open(None)` in-memory fallback is preserved for tests
+  and exercises the same sqlx schema / query path as the file-backed
+  variant (just with `:memory:`). Two new `#[tokio::test]` cases cover
+  a full restart round-trip (write one record per store, drop the
+  bundle, reopen at the same path, assert every record is still there)
+  and the in-memory fallback. `--data-dir` defaults to `~/.zlayer` on
+  macOS and `/var/lib/zlayer` (root) or `~/.zlayer` (user) on Linux.
+- **`ApiConfig` grows a `user_store` handle** (`crates/zlayer-api/src/config.rs`).
+  The three router builders that derive `AuthState` internally
+  (`build_router_with_storage`, `build_router_with_services`,
+  `build_router_with_deployment_state`) now propagate it, so
+  `/api/v1/users` and `/auth/bootstrap`/`/auth/login` finally have a
+  backing store when the daemon wires one in. The old behaviour
+  (`user_store: None` hardcoded in the three builders) was the reason
+  the Manager UI saw 500s on user management despite the store being
+  implemented. `ApiConfig` drops its `#[derive(Debug)]` in favour of a
+  manual impl that elides the `jwt_secret` and reports the two store
+  handles as `bool`s — trait objects can't be derived-Debug, and we
+  didn't want to slap a `Debug` supertrait on every storage trait.
+- **Re-exports for the seven `Sqlx*Store` types that were hidden inside
+  `zlayer_api::storage`** (`crates/zlayer-api/src/lib.rs`): `SqlxAuditStore`,
+  `SqlxGroupStore`, `SqlxNotifierStore`, `SqlxPermissionStore`,
+  `SqlxTaskStore`, `SqlxVariableStore`, `SqlxWorkflowStore`. Consumers that
+  wanted to open one of these from outside the crate previously had to
+  reach into `storage::...` by full path; now they're flat under
+  `zlayer_api::` like the other three Sqlx stores. No API change beyond
+  the re-exports.
+
+## [0.10.98]
+
+### Added
+- **Persistent `SQLite` backend for notifier storage (`SqlxNotifierStore`).**
+  Notifier configurations (Slack, Discord, webhook, SMTP) now survive daemon
+  restarts. The new store lives in
+  `crates/zlayer-api/src/storage/notifiers.rs` alongside the existing
+  `InMemoryNotifierStore` (kept for unit tests); both back the same
+  `NotifierStorage` trait so callers are backend-agnostic.
+- **Generic `SqlxJsonStore<T>` adapter**
+  (`crates/zlayer-api/src/storage/sqlx_json.rs`). A reusable blob-and-indexes
+  persistence engine for resources with the "opaque JSON body + zero or more
+  peeled-out unique/indexed columns" shape. Callers supply a `JsonTable<T>`
+  describing the table name and a static list of `IndexSpec<T>` extractor
+  functions; the adapter handles schema creation (`CREATE TABLE`, secondary
+  indexes, table-level `UNIQUE(...)`), upserts with `created_at` preservation,
+  `get`/`list`/`delete`/`count`, and `get_by_unique` lookups. This is the
+  foundation for the remaining persistent stores (variables, tasks, workflows,
+  groups, syncs) that will follow in subsequent patches.
+- Two new `StorageError` variants: `AlreadyExists` (surfaced on `SQLite`
+  2067 / 1555 constraint violations so callers can distinguish 409 from 500)
+  and `Other` (generic miscellaneous error, e.g. unknown column in
+  `get_by_unique`).
+
+### Changed
+- `NotifierStorage` implementations are now re-exported from
+  `storage::mod` as `{InMemoryNotifierStore, NotifierStorage,
+  SqlxNotifierStore}` (previously only the in-memory variant was exposed).
+  No call-site changes required; the new type is additive.
+
+## [0.10.97]
+
+### Added
+- **SMTP notifier sending is now fully implemented.** The
+  `POST /api/v1/notifiers/{id}/test` endpoint no longer returns
+  `501 Not Implemented` for `NotifierConfig::Smtp`; it connects to the
+  configured SMTP server, authenticates, and delivers a real email via
+  [`lettre`](https://docs.rs/lettre/0.11/). Upstream failures (bad
+  credentials, unreachable host, invalid `from`/`to` addresses) are
+  surfaced as HTTP 200 with `success: false` and a descriptive message,
+  matching the convention already used by the Slack/Discord/Webhook arms.
+  - Internals: a new `send_smtp_message(&SmtpParams, subject, body)`
+    helper in `crates/zlayer-api/src/handlers/notifiers.rs` handles
+    mailbox parsing, message construction, and transport setup, so any
+    future caller that needs to send email can reuse it.
+  - Transport features: `AsyncSmtpTransport::<Tokio1Executor>` with
+    `lettre`'s `relay()` constructor (implicit TLS on submission ports,
+    or STARTTLS as auto-negotiated). No OpenSSL linkage — TLS goes
+    through `rustls`, matching the rest of the workspace.
+  - New workspace dependency: `lettre = "0.11"` with
+    `default-features = false` and features `smtp-transport`,
+    `tokio1-rustls-tls`, `builder`, `hostname`. See the inline comment
+    in `Cargo.toml` for the rationale.
+  - Tests: four new `#[tokio::test]` cases cover the empty-recipient,
+    invalid-`from`, unreachable-host, and end-to-end-via-`send_test_notification`
+    failure paths, all without requiring a live SMTP server.
+  - Refactor: the Slack/Discord/Webhook arms of `send_test_notification`
+    have been extracted into `send_slack_test`, `send_discord_test`, and
+    `send_webhook_test` helpers. Behaviour is unchanged; the dispatcher
+    is now a thin `match` over `NotifierConfig`.
+
+## [0.10.96]
+
+### Changed
+- **`zlayer-git` now uses `gix` (gitoxide) instead of shelling out to the
+  `git` CLI.** All public operations (`clone_repo`, `fetch`, `pull_ff`,
+  `rev_parse`, `current_sha`, `checkout`, `ls_remote`) are now implemented
+  in-process via the pure-Rust `gix = "0.81"` crate. Blocking gix work is
+  dispatched through `tokio::task::spawn_blocking` so the async API is
+  preserved byte-for-byte and none of the 9 callers in `zlayer-api` had to
+  change.
+  - HTTPS PAT authentication is installed via
+    `gix::remote::Connection::with_credentials`, returning an `Outcome`
+    that carries the username/token directly. Tokens never touch the
+    filesystem and never appear on a command line.
+  - SSH authentication writes the PEM key to a mode-`0600` `TempDir` and
+    sets `GIT_SSH_COMMAND` for the duration of the operation, guarded by
+    an internal `Mutex` to serialise concurrent SSH operations.
+  - `ls_remote` uses a throwaway bare repo (`gix::init_bare`) as a scratch
+    context for the remote listing, then inspects `ref_map.remote_refs`.
+  - `checkout` and `pull_ff` rebuild the worktree by calling
+    `gix::worktree::state::checkout` with the target tree's index, then
+    delete worktree files that existed previously but are absent from the
+    new tree so that going backwards in history no longer leaves stale
+    files behind.
+  - New tests `ls_remote_against_local_bare` and
+    `gix_native_clone_reads_gix_init_bare` exercise the gix-native code
+    paths directly.
+  - Runtime dependency: `gix = "0.81"` (workspace dep) with features
+    `blocking-network-client`, `blocking-http-transport-reqwest-rust-tls`,
+    `credentials`, `worktree-mutation`, `revision`, `sha1`. The `tempfile`
+    runtime dependency is retained in `zlayer-git` because the SSH path
+    still needs an on-disk key with a stable lifetime.
+
+## [0.10.95]
+
+### Added
+- **Groups, permissions, and audit** (Phase 8.2): resource-level access
+  control and audit logging for the REST API and CLI.
+  - **Groups**: user group CRUD and membership management.
+    - `GroupsState` handler state backed by `Arc<dyn GroupStorage>`.
+    - Seven REST endpoints:
+      - `GET    /api/v1/groups` -- list (any auth)
+      - `POST   /api/v1/groups` -- create (admin)
+      - `GET    /api/v1/groups/{id}` -- get (any auth)
+      - `PATCH  /api/v1/groups/{id}` -- update name/description (admin)
+      - `DELETE /api/v1/groups/{id}` -- delete (admin)
+      - `POST   /api/v1/groups/{id}/members` -- add member (admin)
+      - `DELETE /api/v1/groups/{id}/members/{user_id}` -- remove member (admin)
+    - `zlayer group` CLI subcommands: `list`, `create`, `delete`,
+      `member add`, `member remove`.
+    - Daemon client methods: `list_groups`, `create_group`, `delete_group`,
+      `add_group_member`, `remove_group_member`.
+  - **Permissions**: resource-level permission grant/revoke/list.
+    - `PermissionsState` handler state backed by `Arc<dyn PermissionStorage>`
+      and `Arc<dyn GroupStorage>` (validates group existence on grant).
+    - Three REST endpoints:
+      - `GET    /api/v1/permissions?user={id}|group={id}` -- list (any auth)
+      - `POST   /api/v1/permissions` -- grant (admin)
+      - `DELETE /api/v1/permissions/{id}` -- revoke (admin)
+    - `zlayer permission` CLI subcommands: `list`, `grant`, `revoke`.
+    - Daemon client methods: `list_permissions`, `grant_permission`,
+      `revoke_permission`.
+  - **Audit**: audit log query endpoint and recording middleware.
+    - `AuditState` handler state backed by `Arc<dyn AuditStorage>`.
+    - One REST endpoint:
+      - `GET /api/v1/audit?user=&resource_kind=&since=&until=&limit=`
+        -- list (admin)
+    - `zlayer audit tail` CLI subcommand with `--user`, `--resource`,
+      `--limit`, `--output` options.
+    - Daemon client method: `list_audit`.
+    - `audit_middleware`: Axum middleware that records an `AuditEntry` for
+      every mutating request (POST/PUT/PATCH/DELETE) that succeeds (2xx).
+      Extracts actor from `AuthActor` extension, derives resource kind and
+      id from the URL path.
+  - OpenAPI documentation for all new endpoints, schemas, and tags
+    (Groups, Permissions, Audit).
+
+## [0.10.94]
+
+### Added
+- **Notifiers resource** (Phase 7d): configurable notification channels that
+  fire alerts to Slack, Discord, generic webhooks, or SMTP endpoints.
+  - `StoredNotifier` type in `zlayer-api::storage`: UUID id, name, kind,
+    config, enabled flag, timestamps.
+  - `NotifierKind` enum: `Slack`, `Discord`, `Webhook`, `Smtp`.
+  - `NotifierConfig` tagged enum: channel-specific settings (webhook URL,
+    SMTP host/port/credentials/recipients, custom HTTP method/headers).
+  - `NotifierStorage` trait + `InMemoryNotifierStore` implementation.
+  - Six REST endpoints:
+    - `GET    /api/v1/notifiers` -- list (any auth)
+    - `POST   /api/v1/notifiers` -- create (admin)
+    - `GET    /api/v1/notifiers/{id}` -- get (any auth)
+    - `PATCH  /api/v1/notifiers/{id}` -- update (admin)
+    - `DELETE /api/v1/notifiers/{id}` -- delete (admin)
+    - `POST   /api/v1/notifiers/{id}/test` -- send test notification (admin)
+  - Test endpoint actually fires HTTP requests to Slack/Discord/Webhook
+    URLs via `reqwest`. SMTP returns 501 (deferred).
+  - `zlayer notifier` CLI subcommands: `list`, `create`, `test`, `delete`
+    -- dispatched to the daemon via Unix socket.
+  - Daemon client notifier methods: `list_notifiers`, `create_notifier`,
+    `test_notifier`, `delete_notifier`.
+  - OpenAPI documentation for all notifier endpoints and schemas.
+
+## [0.10.93]
+
+### Added
+- **Workflows resource** (Phase 7c): named DAGs of steps that compose tasks,
+  project builds, deploys, and sync applies.
+  - `StoredWorkflow` type in `zlayer-api::storage`: UUID id, name, ordered
+    steps list, optional project_id, timestamps.
+  - `WorkflowStep` struct: step name, action, optional `on_failure` handler.
+  - `WorkflowAction` tagged enum: `RunTask`, `BuildProject`, `DeployProject`,
+    `ApplySync`.
+  - `WorkflowRun` type: recorded execution with per-step results and overall
+    status.
+  - `WorkflowRunStatus` enum: `Pending`, `Running`, `Completed`, `Failed`.
+  - `StepResult` type: step name, status (`ok`/`failed`/`skipped`), output.
+  - `WorkflowStorage` trait + `InMemoryWorkflowStore` implementation.
+  - Six REST endpoints:
+    - `GET    /api/v1/workflows` -- list (any auth)
+    - `POST   /api/v1/workflows` -- create (admin)
+    - `GET    /api/v1/workflows/{id}` -- get (any auth)
+    - `DELETE /api/v1/workflows/{id}` -- delete (admin)
+    - `POST   /api/v1/workflows/{id}/run` -- execute sequentially (admin)
+    - `GET    /api/v1/workflows/{id}/runs` -- list past runs (any auth)
+  - Sequential execution: `RunTask` steps execute tasks via `sh -c`;
+    `BuildProject`, `DeployProject`, `ApplySync` log but do not execute
+    real operations (v1 limitation).
+  - On-failure handling: if a step fails and defines `on_failure`, the
+    referenced task runs before the workflow aborts; remaining steps are
+    marked as `skipped`.
+  - `zlayer workflow` CLI subcommands: `list`, `create`, `run`, `logs`,
+    `delete` -- dispatched to the daemon via Unix socket.
+  - Daemon client workflow methods: `list_workflows`, `create_workflow`,
+    `run_workflow`, `list_workflow_runs`, `delete_workflow`.
+  - OpenAPI documentation for all workflow endpoints and schemas.
+
+## [0.10.92]
+
+### Added
+- **Tasks resource** (Phase 7b): named runnable scripts that can be executed
+  on demand with output streaming.
+  - `StoredTask` type in `zlayer-api::storage`: UUID id, name, kind (bash),
+    body, project_id (optional), timestamps.
+  - `TaskKind` enum (`Bash`).
+  - `TaskRun` type: recorded execution with exit code, stdout, stderr,
+    start/end timestamps.
+  - `TaskStorage` trait + `InMemoryTaskStore` implementation.
+  - Six REST endpoints:
+    - `GET    /api/v1/tasks[?project_id=...]` -- list (any auth)
+    - `POST   /api/v1/tasks` -- create (admin)
+    - `GET    /api/v1/tasks/{id}` -- get (any auth)
+    - `DELETE /api/v1/tasks/{id}` -- delete (admin)
+    - `POST   /api/v1/tasks/{id}/run` -- execute synchronously (admin)
+    - `GET    /api/v1/tasks/{id}/runs` -- list past runs (any auth)
+  - `zlayer task` CLI subcommands: `list`, `create`, `run`, `logs`, `delete` --
+    dispatched to the daemon via Unix socket.
+  - Daemon client task methods: `list_tasks`, `create_task`, `get_task`,
+    `run_task`, `list_task_runs`, `delete_task`.
+  - OpenAPI documentation for all task endpoints and schemas.
+  - `ApiError::NotImplemented` variant for 501 responses on non-Unix
+    platforms.
+
+## [0.10.91]
+
+### Added
+- **Variables resource** (Phase 7a): plaintext shared key-value pairs for
+  template substitution in deployment specs. Variables are NOT encrypted
+  (unlike secrets) and are fully visible in API responses.
+  - `StoredVariable` type in `zlayer-api::storage`: UUID id, name, value,
+    scope (project id or global), timestamps.
+  - `VariableStorage` trait + `InMemoryVariableStore` implementation.
+  - Five REST endpoints:
+    - `GET    /api/v1/variables?scope={project_id}` -- list (any auth)
+    - `POST   /api/v1/variables` -- create (admin)
+    - `GET    /api/v1/variables/{id}` -- get (any auth)
+    - `PATCH  /api/v1/variables/{id}` -- update (admin)
+    - `DELETE /api/v1/variables/{id}` -- delete (admin)
+  - `zlayer variable` CLI subcommands: `list`, `set`, `get`, `unset` --
+    dispatched to the daemon via Unix socket.
+  - Daemon client variable methods: `list_variables`, `create_variable`,
+    `get_variable`, `update_variable`, `delete_variable`.
+  - OpenAPI documentation for all variable endpoints and schemas.
+
+## [0.10.90]
+
+### Added
+- **GitOps sync module** (`zlayer_git::sync`): `scan_resources()` walks a
+  directory for YAML files and parses each into a `SyncResource` (kind +
+  name + raw content).  `compute_diff()` compares local resources against
+  remote names to produce a `SyncDiff` (to_create / to_update / to_delete).
+- **Sync REST API** (`handlers/syncs.rs`): five endpoints for sync CRUD +
+  diff + apply:
+  - `GET  /api/v1/syncs` -- list all syncs
+  - `POST /api/v1/syncs` -- create a sync
+  - `GET  /api/v1/syncs/{id}/diff` -- compute diff
+  - `POST /api/v1/syncs/{id}/apply` -- dry-run apply (v1)
+  - `DELETE /api/v1/syncs/{id}` -- delete a sync
+- **In-memory sync store** (`InMemorySyncStore`): `SyncStorage` trait +
+  `Arc<RwLock<HashMap>>` implementation for v1 persistence.
+- **`StoredSync` type** in `zlayer-api::storage`: UUID id, name,
+  project_id, git_path, auto_apply, last_applied_sha, timestamps.
+- **`zlayer sync` CLI subcommands**: `ls`, `create`, `diff`, `apply`,
+  `delete` -- dispatched to the daemon via Unix socket.
+- **Daemon client sync methods**: `list_syncs`, `create_sync`,
+  `diff_sync`, `apply_sync`, `delete_sync`.
+- **OpenAPI documentation** for all sync endpoints and schemas.
+
+## [0.10.89]
+
+### Added
+- **Per-project git poller** (`GitPoller` in `zlayer-api::poller`).
+  A background task that periodically checks `git ls-remote` for new
+  commits on projects with `poll_interval_secs` set.  When new commits
+  are detected the local working copy is fast-forward pulled; when
+  `auto_deploy` is also true, the intent to rebuild/redeploy is logged
+  (actual build trigger integration comes in a later phase).
+- **`auto_deploy` and `poll_interval_secs` fields on `StoredProject`**
+  (`#[serde(default)]` for backward-compatible deserialization of
+  existing records).  Both fields are exposed on `CreateProjectRequest`
+  and `UpdateProjectRequest`.
+- **`git ls-remote` helper** (`zlayer_git::ls_remote`) queries the
+  remote for a branch's HEAD SHA without cloning or fetching.
+- **`zlayer project auto-deploy <id> --enabled true|false`** CLI
+  subcommand to toggle the auto-deploy flag via PATCH.
+- **`zlayer project poll-interval <id> --seconds N`** CLI subcommand
+  to set (or clear with `--seconds 0`) the polling interval via PATCH.
+
+## [0.10.88]
+
+### Added
+- **Git push webhook receiver** (`POST /webhooks/{provider}/{project_id}`)
+  -- unauthenticated endpoint that verifies HMAC signatures (GitHub,
+  Gitea, Forgejo) or constant-time token comparison (GitLab) against a
+  per-project webhook secret stored in `PersistentSecretsStore` under
+  scope `"webhook_secrets"`. On success, triggers the same clone /
+  fast-forward-pull logic as `POST /api/v1/projects/{id}/pull`. Returns
+  `{ "status": "ok", "sha": "..." }`.
+- **`GET /api/v1/projects/{id}/webhook`** (auth-required) returns the
+  webhook URL template and HMAC secret. Generates the secret on first
+  call if it does not exist.
+- **`POST /api/v1/projects/{id}/webhook/rotate`** (admin-only)
+  regenerates the webhook secret, invalidating the old one.
+- **`WebhookState`** struct and `build_project_webhook_routes()` /
+  `build_webhook_receiver_routes()` router builders in `zlayer-api`.
+- **`DaemonClient::get_project_webhook()` and `rotate_project_webhook()`**
+  methods for the CLI to talk to the new endpoints.
+- **`zlayer project webhook show <id>` / `zlayer project webhook rotate <id>`**
+  CLI subcommands.
+- **`WebhookResponse` and `WebhookInfoResponse` schemas** registered in
+  the OpenAPI doc under a new "Webhooks" tag.
+
+### Changed
+- `zlayer-api` now depends on `hmac` (workspace dep) for HMAC-SHA256
+  signature verification.
+
+## [0.10.87]
+
+### Added
+- **`POST /api/v1/projects/{id}/pull` endpoint** (admin-only) that wires
+  the `zlayer-git` crate into the Projects handler. Clones into
+  `{clone_root}/{project_id}` on first call, then fast-forward pulls on
+  subsequent calls. Resolves authentication from the project's
+  `git_credential_id` via `GitCredentialStore` (PAT or SSH key), falling
+  back to anonymous when unset or the store is not configured. Returns
+  `{ project_id, git_url, branch, sha, path }`.
+- **`ProjectState::with_git(store, git_creds, clone_root)`** constructor on
+  `zlayer-api`'s project state. The existing `ProjectState::new(store)`
+  constructor still works and leaves `git_creds` unset / defaults
+  `clone_root` to `$TMPDIR/zlayer-projects`, so callers that don't need
+  pulls are unchanged.
+- **`ProjectPullResponse` schema** registered in the OpenAPI doc.
+- **`DaemonClient::project_pull(&id)` method** posting to the new endpoint
+  and returning the parsed JSON response.
+- **`zlayer project pull <id>` CLI command** that triggers a pull and
+  prints the repo, branch, SHA, and working-copy path.
+
+### Changed
+- `zlayer-api` now depends on `zlayer-git` so the Projects handler can
+  clone and pull directly without going through a separate service.
+
+## [0.10.86]
+
+### Added
+- **`zlayer project` CLI command group** with full CRUD: `ls`, `create`,
+  `show`, `update`, `delete`, plus deployment linking (`link-deployment`,
+  `unlink-deployment`, `list-deployments`). 8 new Clap variants total.
+- **`zlayer credential` CLI command group** with two nested subcommands:
+  `registry` (ls, add, delete) and `git` (ls, add, delete). 6 new Clap
+  variants total. Passwords/tokens are prompted interactively via
+  `dialoguer` when omitted from the command line.
+- **14 `DaemonClient` methods** for projects and credentials, using
+  `serde_json::Value` to avoid pulling server-only handler types into the
+  CLI binary.
+
+## [0.10.85]
+
+### Added
+- **`AuthSource::SecretStore` variant** in `zlayer-core` auth resolver.
+  Allows per-registry auth configs to reference a stored credential by id.
+  The sync resolver returns `Anonymous` with a warning; callers needing
+  the credential must use the new async resolver.
+- **`resolve_registry_auth_async()` free function** in `zlayer-api::auth`.
+  Resolves all `AuthSource` variants including `SecretStore`, performing
+  an async lookup against a `RegistryCredentialStore<S>`.
+- **`AuthResolver::source_for_registry()` and public `resolve_source()`**
+  accessors on the sync resolver, enabling external async resolution
+  without duplicating per-registry lookup logic.
+
+## [0.10.84]
+
+### Added
+- **Project CRUD endpoints** at `/api/v1/projects`. List, create, fetch,
+  update (PATCH), and delete projects. Mutating endpoints require `admin`.
+  Deletion cascade-removes deployment links. Sub-routes for deployment
+  linking: `GET/POST /{id}/deployments`, `DELETE /{id}/deployments/{name}`.
+  8 endpoints total.
+- **Credential management endpoints** at `/api/v1/credentials`. Registry
+  credentials (list, create, delete) and git credentials (list, create,
+  delete) share a combined handler. All mutation requires `admin`.
+  6 endpoints total. Secrets are stored encrypted; only metadata is
+  returned in responses.
+- **`build_project_routes(project_state)` and
+  `build_credential_routes(credential_state)` router helpers** for
+  composing project and credential routes into existing routers.
+- `ProjectState` and `CredentialState` re-exported from `lib.rs`.
+- OpenAPI schemas for `StoredProject`, `BuildKind`, project request types,
+  and credential request/response types registered in the API doc.
+
+## [0.10.83]
+
+### Added
+- **Environment CRUD endpoints** at `/api/v1/environments`. List, create,
+  fetch, rename/re-describe (PATCH), and delete deployment/runtime
+  environments. Project-scoped or global. List filter: `?project={id}` for
+  one project, `?project=*` for everything (currently returns globals only
+  and surfaces a 503 when project rows exist that the storage trait cannot
+  enumerate — see follow-up below), or no param for globals only.
+  Mutating endpoints require the `admin` role; deletion refuses if the
+  environment still owns secrets.
+- **Environment-aware secrets routing.** `POST/GET/DELETE /api/v1/secrets`
+  now accept `?environment={env_id}` to resolve the secret scope from the
+  environment store (`env:{id}` for globals, `project:{pid}:env:{id}` for
+  project-scoped). Body `scope` and `?scope=` continue to work for legacy
+  / API-key-style clients. The two forms are mutually exclusive — sending
+  both returns `400`. New helper `env_scope(&StoredEnvironment) -> String`
+  centralises the scope-string convention.
+- **`POST /api/v1/secrets/bulk-import?environment={id}`** parses a
+  dotenv-style payload (`KEY=value` per line, with `#` comments and
+  optional surrounding quotes) and writes each entry under the env's
+  scope. Returns `{ created, updated, errors }`. Admin-only.
+- **`GET /api/v1/secrets/{name}?reveal=true`** returns the plaintext
+  value alongside metadata. Admin-only.
+- **`build_environment_routes(env_state, secrets_state) -> Router<()>`**
+  helper plus reworked `build_router_with_secrets` /
+  `build_router_with_services_and_secrets` /
+  `build_router_with_internal_and_secrets` builders that now take an
+  `Arc<dyn EnvironmentStorage>` and mount `/api/v1/environments` alongside
+  `/api/v1/secrets`. `SecretsState::with_environments(...)` is the new
+  constructor for env-aware secrets state.
+- **Extended `SecretRef` parser** in `zlayer-secrets` with environment-scoped
+  references: `$S::env/name` (global environment) and
+  `$S:project:env/name` (project-scoped). Legacy `$S:name` and
+  `$S:name/field` forms are preserved. The leading `::` disambiguates from
+  the legacy JSON-field extraction syntax (`$S:name/field`).
+- **CLI `zlayer env` command group** — `zlayer env ls [--project ID]`,
+  `zlayer env create <name> [--project ID]`, `zlayer env show <id>`,
+  `zlayer env update <id>`, `zlayer env delete <id>`. Full environment CRUD
+  from the terminal.
+- **CLI `zlayer secret` extended with `--env` flag** — all existing secret
+  subcommands (list/get/set/unset) now accept `--env <env-id-or-name>` to
+  scope operations to an environment. The `--env` flag resolves by name when
+  a non-UUID is passed. Import and export also support `--env`. All existing
+  scope-based behaviour (without `--env`) is preserved.
+
+### Changed
+- Secrets handlers (`create_secret`, `list_secrets`, `get_secret_metadata`,
+  `delete_secret`) now use the `AuthActor` extractor (admin-gated for
+  mutations) instead of `AuthUser`. The previous implementation scoped
+  every secret to the caller's user id; new code defaults to a literal
+  `"default"` scope when no `environment` / `scope` is provided.
+- `SecretMetadataResponse` gained an optional `value` field, populated
+  only on the `?reveal=true` admin path. The field is omitted from JSON
+  when unset, so existing clients see no change.
+
+### Follow-ups
+- `?reveal=true` is admin-only but does not yet require a re-authentication
+  challenge within the last 60 seconds. A future iteration should add that
+  guard.
+- `?project=*` listing of environments cannot enumerate distinct project
+  ids through the current `EnvironmentStorage` trait. The handler returns
+  `503 Service Unavailable` (with the count of unenumerable rows) when
+  project-scoped environments exist; once the trait grows a proper
+  `list_all` accessor we will switch to true cross-project listing.
+
+## [0.10.82]
+
+### Added
+- **User accounts with email/password login.** ZLayer now has a real user
+  system instead of raw API keys. First-run setup via
+  `POST /auth/bootstrap` creates the initial admin; subsequent users via
+  `POST /api/v1/users` (admin-gated). Passwords are hashed with Argon2id in
+  the existing encrypted `zlayer-secrets` credential store. New
+  `storage/users.rs` with `UserStorage` trait, `SqlxUserStore`
+  (SQLite/sqlx), and `InMemoryUserStore`.
+- **Cookie + CSRF browser sessions.** `POST /auth/login` returns an HttpOnly
+  `zlayer_session` JWT cookie plus a JS-readable `zlayer_csrf` double-submit
+  token. A new `crates/zlayer-api/src/middleware/csrf.rs` enforces the
+  double-submit on mutating cookie-authed requests; Bearer-authed API
+  clients (including local CLI over the Unix-socket auto-bearer path) pass
+  through untouched. Standard production flow — HttpOnly / Secure / SameSite=Lax /
+  constant-time token compare via `subtle`.
+- **New auth endpoints** on `zlayer-api`: `POST /auth/bootstrap`,
+  `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`,
+  `GET /auth/csrf`. Existing `POST /auth/token` (Bearer-JWT exchange) is
+  preserved for API clients and for CLI session persistence.
+- **Users CRUD** at `/api/v1/users`: list, create, get, update (PATCH),
+  delete, and `POST /{id}/password`. Self-service password change when the
+  caller provides the current password; admins can reset for any user.
+- **`AuthActor` extractor** accepts both `Authorization: Bearer …` and the
+  `zlayer_session` cookie, so every endpoint works for both API clients and
+  browsers. `SessionAuthUser` is also available when cookie-only is required.
+- **CLI auth and user command groups.** `zlayer auth bootstrap | login |
+  logout | whoami` and `zlayer user ls | create | set-role | set-password |
+  delete`. Interactive password prompts via `dialoguer` when flags are
+  omitted. Session persisted to `~/.zlayer/session.json` (mode 0600 on Unix)
+  with atomic temp-file-plus-rename writes.
+- **OpenAPI coverage.** All new endpoints and request/response schemas are
+  registered in the generated spec served at `/swagger-ui`.
+
+### Changed
+- **`AuthState` gained `user_store: Option<Arc<dyn UserStorage>>` and
+  `cookie_secure: bool` fields.** All construction sites were updated to
+  default both (`None` and `false`). Production deployments should set
+  `cookie_secure = true` behind TLS.
+- **`Claims` now carries an optional `email` field** (serde `default` for
+  back-compat with tokens minted before this release). `create_token_with_email`
+  is the new canonical minting function; the existing `create_token` forwards
+  to it with `email = None` so callers don't need to change.
+- **CLI `zlayer auth` command surface replaced.** The previous remote-server
+  API-key flow (`zlayer auth login <URL> --api-key … --api-secret …`) is
+  gone. Email/password is the new primary flow against the local daemon;
+  remote-server + `--url` support can return as a follow-up.
+
+### Security
+- Argon2id hashing for user passwords (reused from the existing encrypted
+  credential store; no downgrade).
+- HttpOnly session cookies; CSRF double-submit with constant-time compare
+  (`subtle`); short-circuit on Bearer so API clients aren't CSRF-gated.
+- Session file mode 0600 on Unix; atomic write via temp file + rename.
+
+## [0.10.81]
+
+### Fixed
+- **`ZImagefile`/Dockerfile `WORKDIR` now materialises the directory in the
+  built image's rootfs**, matching Docker's WORKDIR semantics. Previously,
+  the builder only ran `buildah config --workingdir` (metadata-only), so
+  images built from a `ZImagefile` declaring e.g. `workdir: /workspace`
+  shipped without `/workspace` in the rootfs. Containers started with
+  `cwd=/workspace` then failed at init time with `chdir(/workspace): ENOENT`,
+  surfaced as the opaque upstream message "failed to unix syscall" from
+  youki's init process. `crates/zlayer-builder/src/buildah/mod.rs` now emits
+  a `buildah run -- mkdir -p <dir>` alongside the `--workingdir` config.
+- **`zlayer build` now hard-errors with actionable remediation** when
+  `/var/lib/zlayer/{cache,registry}` isn't writable by the current UID,
+  instead of silently dropping the local registry and producing an image the
+  daemon can't find (which then falls through to `docker.io/library/*` with a
+  cryptic 401).
+
+### Changed
+- **`zlayer daemon install` chowns the build-facing data dirs**
+  (`registry`, `cache`, `bundles`) to `$SUDO_USER:zlayer` (mode 2775) instead
+  of only `chgrp zlayer`. The installing user can run `zlayer build`
+  immediately in their current shell — no `newgrp zlayer` or re-login
+  required. Group membership is still provisioned so additional users added
+  later can share the same dirs (after their own re-login).
+- **`install.sh` and `install.ps1` warn when a stale `zlayer` binary earlier
+  on `PATH` shadows the one just installed**, which otherwise produces
+  mystifying "image built but daemon can't find it" symptoms (the stale
+  binary skips the local-registry import step that the current binary
+  performs).
+
+## [0.10.77]
+
+### Changed
+- **`--deployment` is now optional on `zlayer logs`, `zlayer stop`, `zlayer exec`,
+  `zlayer job trigger`, `zlayer job status`, and `zlayer cron status`.**
+  A new shared resolver at `bin/zlayer/src/commands/resolver.rs` auto-picks the
+  deployment when the service (or deployment) name is unambiguous. When multiple
+  candidates match and stdout is a TTY, an interactive `dialoguer::Select` prompt
+  disambiguates; when non-TTY, the command errors with the list of candidates and
+  a hint to pass `--deployment` explicitly. Example: `zlayer logs my-api` now
+  works directly whenever `my-api` appears in exactly one deployment.
+- **Removed duplicated deployment-detection in `commands/exec.rs`.** The old
+  `auto_detect_deployment` helper is gone; `exec` now uses the shared resolver
+  (which additionally validates the service name and supports the TTY prompt path,
+  neither of which `exec` did before).
+- **`CLAUDE.md` aligned with the current tree.** Removed stale references to
+  `bin/runtime/` and `bin/zlayer-build/` (both consolidated into `bin/zlayer` long
+  ago), documented `bin/zlayer-desktop`, and corrected the `cargo run` examples.
+  Also updated the CHANGELOG guidance to use real version numbers (never
+  `[Unreleased]`).
+
 ## [0.10.76]
 
 ### Added
@@ -18,6 +1330,30 @@ All notable changes to this project will be documented in this file.
   change on macOS (single-user data dir) or Windows.
 
 ### Fixed
+- **`zlayer-manager` dashboard failed with `error sending request for url
+  (http://0.0.0.0:3669/...)`.** Two compounding issues. First, `zlayer serve`
+  was baking the bind address directly into the `ZLAYER_API_URL` env var it
+  injects into every container, producing `http://0.0.0.0:3669` when the
+  default wildcard bind was used — wildcard IPs can't be dialed.
+  `bin/zlayer/src/commands/serve.rs` now substitutes `127.0.0.1` / `[::1]`
+  for wildcard binds when constructing the per-container URL. Second, even
+  with a valid TCP URL the manager can't reach the host's loopback from
+  inside an overlay-networked container. `crates/zlayer-manager/src/api_client.rs`
+  now supports HTTP-over-Unix-Domain-Socket via `ZLayerClient::new_unix`,
+  backed by a `hyper_util::client::legacy::Client` + `tower::Service<Uri>`
+  UnixConnector (pattern copied from `bin/zlayer/src/daemon_client.rs`).
+  `get_api_client()` in `server_fns.rs` now prefers `ZLAYER_SOCKET` when
+  set + file exists, falling back to `ZLAYER_API_URL` TCP. Works regardless
+  of container network mode. All ~40 existing public API methods were
+  refactored to route through a transport-aware `execute()` helper; the
+  reqwest-backed TCP path is preserved for external/remote manager
+  deployments.
+- **CI "Install system dependencies" step hung indefinitely.** `sudo apt-get
+  install -y` was blocking on `needrestart`'s whiptail prompt on Ubuntu
+  22.04+ runners despite `-y`. All four Linux install steps in
+  `.forgejo/workflows/ci.yaml` now run with `DEBIAN_FRONTEND=noninteractive`,
+  `NEEDRESTART_MODE=a`, `NEEDRESTART_SUSPEND=1`, `sudo -E`, and
+  `Dpkg::Options::--force-confnew` so no prompt can stall the job.
 - **`zlayer build` silently skipped local-registry import on permission
   errors.** When the builder's local-registry import step hit EACCES —
   typically because an unprivileged user ran `zlayer build` against the

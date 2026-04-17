@@ -12,8 +12,8 @@ use crate::daemon_client::DaemonClient;
 pub(crate) async fn handle_job(_cli: &Cli, cmd: &JobCommands) -> Result<()> {
     match cmd {
         JobCommands::Ls { output } => list_jobs(output).await,
-        JobCommands::Trigger { deployment, job } => trigger_job(deployment, job).await,
-        JobCommands::Status { deployment, job } => get_job_status(deployment, job).await,
+        JobCommands::Trigger { deployment, job } => trigger_job(deployment.as_deref(), job).await,
+        JobCommands::Status { deployment, job } => get_job_status(deployment.as_deref(), job).await,
         JobCommands::Cron(cron_cmd) => handle_cron(cron_cmd).await,
     }
 }
@@ -48,9 +48,10 @@ async fn list_jobs(output: &str) -> Result<()> {
     Ok(())
 }
 
-async fn trigger_job(deployment: &str, job: &str) -> Result<()> {
+async fn trigger_job(deployment: Option<&str>, job: &str) -> Result<()> {
     let client = DaemonClient::connect().await?;
-    let resp = client.trigger_job(deployment, job).await?;
+    let deployment = crate::commands::resolver::resolve_deployment(&client, deployment).await?;
+    let resp = client.trigger_job(&deployment, job).await?;
 
     if let Some(exec_id) = resp.get("execution_id").and_then(|v| v.as_str()) {
         println!("Triggered job '{job}' in deployment '{deployment}'");
@@ -62,9 +63,10 @@ async fn trigger_job(deployment: &str, job: &str) -> Result<()> {
     Ok(())
 }
 
-async fn get_job_status(deployment: &str, job: &str) -> Result<()> {
+async fn get_job_status(deployment: Option<&str>, job: &str) -> Result<()> {
     let client = DaemonClient::connect().await?;
-    let resp = client.get_job_status(deployment, job).await?;
+    let deployment = crate::commands::resolver::resolve_deployment(&client, deployment).await?;
+    let resp = client.get_job_status(&deployment, job).await?;
     let json = serde_json::to_string_pretty(&resp)?;
     println!("{json}");
     Ok(())
@@ -73,7 +75,9 @@ async fn get_job_status(deployment: &str, job: &str) -> Result<()> {
 async fn handle_cron(cmd: &CronCommands) -> Result<()> {
     match cmd {
         CronCommands::Ls { output } => list_cron_jobs(output).await,
-        CronCommands::Status { deployment, cron } => get_cron_status(deployment, cron).await,
+        CronCommands::Status { deployment, cron } => {
+            get_cron_status(deployment.as_deref(), cron).await
+        }
     }
 }
 
@@ -111,9 +115,10 @@ async fn list_cron_jobs(output: &str) -> Result<()> {
     Ok(())
 }
 
-async fn get_cron_status(deployment: &str, cron: &str) -> Result<()> {
+async fn get_cron_status(deployment: Option<&str>, cron: &str) -> Result<()> {
     let client = DaemonClient::connect().await?;
-    let resp = client.get_cron_status(deployment, cron).await?;
+    let deployment = crate::commands::resolver::resolve_deployment(&client, deployment).await?;
+    let resp = client.get_cron_status(&deployment, cron).await?;
     let json = serde_json::to_string_pretty(&resp)?;
     println!("{json}");
     Ok(())

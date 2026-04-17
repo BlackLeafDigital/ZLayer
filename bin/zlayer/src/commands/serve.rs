@@ -396,6 +396,20 @@ fn parse_port_from_bind(bind: &str) -> Option<u16> {
         .and_then(|(_, port_str)| port_str.parse::<u16>().ok())
 }
 
+/// Build the `ZLAYER_API_URL` injected into container env from the API
+/// bind address. Bind addresses can be wildcard (`0.0.0.0`, `::`) which are
+/// valid for listening but not for dialing — substitute loopback in that case.
+fn container_reachable_api_url(addr: &std::net::SocketAddr) -> String {
+    use std::net::IpAddr;
+    let port = addr.port();
+    match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => format!("http://127.0.0.1:{port}"),
+        IpAddr::V6(ip) if ip.is_unspecified() => format!("http://[::1]:{port}"),
+        IpAddr::V4(ip) => format!("http://{ip}:{port}"),
+        IpAddr::V6(ip) => format!("http://[{ip}]:{port}"),
+    }
+}
+
 /// Read the overlay port from `{data_dir}/node_config.json`, falling back to
 /// [`zlayer_core::DEFAULT_WG_PORT`] on any error.
 fn load_overlay_port(data_dir: &std::path::Path) -> u16 {
@@ -532,7 +546,7 @@ pub(crate) async fn serve(
         run_dir,
         s3_storage,
         auth_context: Some(zlayer_agent::ContainerAuthContext {
-            api_url: format!("http://{bind}"),
+            api_url: container_reachable_api_url(&bind_addr),
             jwt_secret: jwt_secret_raw.clone(),
             socket_path: socket_path.to_string(),
         }),
@@ -677,6 +691,14 @@ pub(crate) async fn serve(
     };
 
     // -----------------------------------------------------------------------
+    // 3c. Open the persistent API store bundle (11 databases under data_dir).
+    //     Opened AFTER init_daemon so the data dir exists; kept separate from
+    //     the deployment SqlxStorage in daemon.rs which is tied to the S3
+    //     SqliteReplicator path.
+    // -----------------------------------------------------------------------
+    let bundle = StorageBundle::open(Some(config.data_dir.as_path())).await?;
+
+    // -----------------------------------------------------------------------
     // 4. Build the full API router
     // -----------------------------------------------------------------------
     let api_config = ApiConfig {
@@ -684,6 +706,7 @@ pub(crate) async fn serve(
         jwt_secret,
         swagger_enabled: !no_swagger,
         credential_store: Some(credential_store),
+        user_store: Some(bundle.users.clone()),
         ..Default::default()
     };
 
@@ -740,10 +763,99 @@ pub(crate) async fn serve(
     let internal_routes = zlayer_api::build_internal_routes(internal_state);
     let base_router = base_router.nest("/api/v1/internal", internal_routes);
 
-    // Add secrets routes
-    let secrets_state = zlayer_api::SecretsState::new(secrets);
-    let secrets_routes = zlayer_api::build_secrets_routes(secrets_state);
+    // Add secrets routes — env-aware so secrets handlers can resolve the
+    // environment scope from the bundle's persistent environments store.
+    let secrets_state =
+        zlayer_api::SecretsState::with_environments(secrets, bundle.environments.clone());
+    let environments_state = zlayer_api::EnvironmentsState::new(bundle.environments.clone());
+    let secrets_routes = zlayer_api::build_secrets_routes(secrets_state.clone());
     let mut router = base_router.nest("/api/v1/secrets", secrets_routes);
+
+    // Add environment routes (CRUD; cascade-safety check against secrets state)
+    let environment_routes =
+        zlayer_api::build_environment_routes(environments_state, secrets_state);
+    router = router.nest("/api/v1/environments", environment_routes);
+
+    // Shared on-disk root for project working copies. `ProjectState`,
+    // `SyncState`, and `WorkflowsState` (constructed further below) all
+    // resolve `{clone_root}/{project_id}` so every surface that pulls a
+    // project's git repo lands in the same place.
+    let projects_clone_root = config.data_dir.join("projects");
+
+    // Add project routes (CRUD + deployment linking + pull)
+    let mut project_state = zlayer_api::ProjectState::new(bundle.projects.clone());
+    project_state.clone_root.clone_from(&projects_clone_root);
+    let project_routes = zlayer_api::build_project_routes(project_state);
+    router = router.nest("/api/v1/projects", project_routes);
+
+    // Add sync routes (git-backed resource reconciliation).
+    // Sync apply upserts / deletes `DeploymentSpec` manifests, so it needs a
+    // handle to the persistent deployment store (the same one wired into the
+    // deployment routes above).
+    let sync_state = zlayer_api::SyncState::with_clone_root(
+        bundle.syncs.clone(),
+        storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
+        projects_clone_root.clone(),
+    );
+    let sync_routes = zlayer_api::build_sync_routes(sync_state);
+    router = router.nest("/api/v1/syncs", sync_routes);
+
+    // Add variable routes (plaintext key-value config) — persistent store
+    let variable_state = zlayer_api::VariableState::new(bundle.variables.clone());
+    let variable_routes = zlayer_api::build_variable_routes(variable_state);
+    router = router.nest("/api/v1/variables", variable_routes);
+
+    // Add task routes (named runnable scripts) — persistent store
+    let tasks_state = zlayer_api::TasksState::new(bundle.tasks.clone());
+    let task_routes = zlayer_api::build_task_routes(tasks_state);
+    router = router.nest("/api/v1/tasks", task_routes);
+
+    // Build the BuildState up front so it can be shared by both the build
+    // routes (mounted further below) and the workflow state (which needs
+    // the BuildManager for `BuildProject` actions).
+    let build_dir = config.data_dir.join("builds");
+    let build_state = BuildState::new(build_dir);
+
+    // Add workflow routes (DAGs of steps composing tasks, builds, deploys, syncs).
+    // WorkflowsState carries every handle the action arms need so they execute
+    // for real (not a placeholder "would execute" string).
+    let workflows_state = zlayer_api::WorkflowsState::new(
+        bundle.workflows.clone(),
+        bundle.tasks.clone(),
+        bundle.projects.clone(),
+        storage.clone() as Arc<dyn zlayer_api::DeploymentStorage + Send + Sync>,
+        bundle.syncs.clone(),
+        build_state.manager.clone(),
+        projects_clone_root.clone(),
+    );
+    let workflow_routes = zlayer_api::build_workflow_routes(workflows_state);
+    router = router.nest("/api/v1/workflows", workflow_routes);
+
+    // Add notifier routes (Slack, Discord, webhook, SMTP) — persistent store
+    let notifiers_state = zlayer_api::NotifiersState::new(bundle.notifiers.clone());
+    let notifier_routes = zlayer_api::build_notifier_routes(notifiers_state);
+    router = router.nest("/api/v1/notifiers", notifier_routes);
+
+    // Add group routes (user group CRUD and membership) — persistent store
+    let groups_state = zlayer_api::GroupsState::new(bundle.groups.clone());
+    let group_routes = zlayer_api::build_group_routes(groups_state);
+    router = router.nest("/api/v1/groups", group_routes);
+
+    // Add permission routes (grant/revoke/list) — persistent stores
+    let permissions_state =
+        zlayer_api::PermissionsState::new(bundle.permissions.clone(), bundle.groups.clone());
+    let permission_routes = zlayer_api::build_permission_routes(permissions_state);
+    router = router.nest("/api/v1/permissions", permission_routes);
+
+    // Add audit routes (query audit log, admin only) — persistent store
+    let audit_state = zlayer_api::AuditState::new(bundle.audit.clone());
+    let audit_routes = zlayer_api::build_audit_routes(audit_state);
+    router = router.nest("/api/v1/audit", audit_routes);
+
+    // Layer audit middleware so mutating requests are recorded
+    router = router.layer(zlayer_api::Extension(zlayer_api::AuditStoreExtension(
+        bundle.audit.clone(),
+    )));
 
     // Merge network access-control routes (shares the same policy list as the proxy)
     let network_state = NetworkApiState {
@@ -850,9 +962,8 @@ pub(crate) async fn serve(
     let cluster_routes = build_cluster_routes(cluster_state);
     router = router.nest("/api/v1/cluster", cluster_routes);
 
-    // Merge build routes
-    let build_dir = config.data_dir.join("builds");
-    let build_state = BuildState::new(build_dir);
+    // Merge build routes (build_state was created earlier so WorkflowsState
+    // can share the same BuildManager).
     let build_api_routes = build_routes().with_state(build_state);
     router = router.nest("/api/v1", build_api_routes);
 
@@ -884,6 +995,8 @@ pub(crate) async fn serve(
     let auth_state = zlayer_api::AuthState {
         jwt_secret: api_config.jwt_secret.clone(),
         credential_store: api_config.credential_store.clone(),
+        user_store: api_config.user_store.clone(),
+        cookie_secure: false,
     };
     router = router.layer(zlayer_api::Extension(auth_state));
 
@@ -1025,4 +1138,429 @@ pub(crate) async fn serve(
 
     info!("Daemon shutdown complete");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Persistent API storage bundle
+// ---------------------------------------------------------------------------
+
+/// Aggregate handle for every persistent API store the daemon needs beyond
+/// the deployment database.
+///
+/// [`DaemonState::storage`] (the deployment `SqlxStorage`) is still opened
+/// inside `init_daemon` because the S3 `SqliteReplicator` is bound to its
+/// exact `{data_dir}/deployments.db` path and the restore path depends on
+/// the concrete `Arc<SqlxStorage>` type. Every *other* persistent store flows
+/// through this bundle so serve.rs has a single source of truth.
+///
+/// When a `data_dir` is provided, each field is backed by a `SQLite` file at
+/// `{data_dir}/<name>.db`, matching the one-file-per-store layout used for
+/// `deployments.db`. When `data_dir` is `None`, every store falls back to an
+/// in-memory `SQLite` database — used by tests and any hypothetical ephemeral
+/// mode. No bare `InMemory*::new()` is used in the production path: the
+/// fallback still exercises the sqlx code path (just with `:memory:`), which
+/// keeps schema and query coverage identical.
+pub(crate) struct StorageBundle {
+    pub users: std::sync::Arc<dyn zlayer_api::UserStorage>,
+    pub environments: std::sync::Arc<dyn zlayer_api::EnvironmentStorage>,
+    pub projects: std::sync::Arc<dyn zlayer_api::ProjectStorage>,
+    pub variables: std::sync::Arc<dyn zlayer_api::VariableStorage>,
+    pub tasks: std::sync::Arc<dyn zlayer_api::TaskStorage>,
+    pub workflows: std::sync::Arc<dyn zlayer_api::WorkflowStorage>,
+    pub notifiers: std::sync::Arc<dyn zlayer_api::NotifierStorage>,
+    pub groups: std::sync::Arc<dyn zlayer_api::GroupStorage>,
+    pub permissions: std::sync::Arc<dyn zlayer_api::PermissionStorage>,
+    pub audit: std::sync::Arc<dyn zlayer_api::AuditStorage>,
+    pub syncs: std::sync::Arc<dyn zlayer_api::SyncStorage>,
+}
+
+impl StorageBundle {
+    /// Open every persistent API store rooted at `data_dir`, or fall back to
+    /// per-store `:memory:` `SQLite` databases when `data_dir` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any individual store fails to open. Failures are
+    /// short-circuited (we'd rather fail fast than bring up a half-persistent
+    /// daemon).
+    #[allow(clippy::too_many_lines)]
+    pub(crate) async fn open(data_dir: Option<&std::path::Path>) -> Result<Self> {
+        if let Some(dir) = data_dir {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .with_context(|| format!("Failed to create storage data dir: {}", dir.display()))?;
+
+            let users = zlayer_api::SqlxUserStore::open(dir.join("users.db"))
+                .await
+                .context("Failed to open users.db")?;
+            let environments = zlayer_api::SqlxEnvironmentStore::open(dir.join("environments.db"))
+                .await
+                .context("Failed to open environments.db")?;
+            let projects = zlayer_api::SqlxProjectStore::open(dir.join("projects.db"))
+                .await
+                .context("Failed to open projects.db")?;
+            let variables = zlayer_api::SqlxVariableStore::open(dir.join("variables.db"))
+                .await
+                .context("Failed to open variables.db")?;
+            let tasks = zlayer_api::SqlxTaskStore::open(dir.join("tasks.db"))
+                .await
+                .context("Failed to open tasks.db")?;
+            let workflows = zlayer_api::SqlxWorkflowStore::open(dir.join("workflows.db"))
+                .await
+                .context("Failed to open workflows.db")?;
+            let notifiers = zlayer_api::SqlxNotifierStore::open(dir.join("notifiers.db"))
+                .await
+                .context("Failed to open notifiers.db")?;
+            let groups = zlayer_api::SqlxGroupStore::open(dir.join("groups.db"))
+                .await
+                .context("Failed to open groups.db")?;
+            let permissions = zlayer_api::SqlxPermissionStore::open(dir.join("permissions.db"))
+                .await
+                .context("Failed to open permissions.db")?;
+            let audit = zlayer_api::SqlxAuditStore::open(dir.join("audit.db"))
+                .await
+                .context("Failed to open audit.db")?;
+            let syncs = zlayer_api::SqlxSyncStore::open(dir.join("syncs.db"))
+                .await
+                .context("Failed to open syncs.db")?;
+
+            info!(
+                dir = %dir.display(),
+                "Opened persistent API stores (11 databases)"
+            );
+
+            Ok(Self {
+                users: std::sync::Arc::new(users),
+                environments: std::sync::Arc::new(environments),
+                projects: std::sync::Arc::new(projects),
+                variables: std::sync::Arc::new(variables),
+                tasks: std::sync::Arc::new(tasks),
+                workflows: std::sync::Arc::new(workflows),
+                notifiers: std::sync::Arc::new(notifiers),
+                groups: std::sync::Arc::new(groups),
+                permissions: std::sync::Arc::new(permissions),
+                audit: std::sync::Arc::new(audit),
+                syncs: std::sync::Arc::new(syncs),
+            })
+        } else {
+            let users = zlayer_api::SqlxUserStore::in_memory()
+                .await
+                .context("Failed to create in-memory users store")?;
+            let environments = zlayer_api::SqlxEnvironmentStore::in_memory()
+                .await
+                .context("Failed to create in-memory environments store")?;
+            let projects = zlayer_api::SqlxProjectStore::in_memory()
+                .await
+                .context("Failed to create in-memory projects store")?;
+            let variables = zlayer_api::SqlxVariableStore::in_memory()
+                .await
+                .context("Failed to create in-memory variables store")?;
+            let tasks = zlayer_api::SqlxTaskStore::in_memory()
+                .await
+                .context("Failed to create in-memory tasks store")?;
+            let workflows = zlayer_api::SqlxWorkflowStore::in_memory()
+                .await
+                .context("Failed to create in-memory workflows store")?;
+            let notifiers = zlayer_api::SqlxNotifierStore::in_memory()
+                .await
+                .context("Failed to create in-memory notifiers store")?;
+            let groups = zlayer_api::SqlxGroupStore::in_memory()
+                .await
+                .context("Failed to create in-memory groups store")?;
+            let permissions = zlayer_api::SqlxPermissionStore::in_memory()
+                .await
+                .context("Failed to create in-memory permissions store")?;
+            let audit = zlayer_api::SqlxAuditStore::in_memory()
+                .await
+                .context("Failed to create in-memory audit store")?;
+            let syncs = zlayer_api::SqlxSyncStore::in_memory()
+                .await
+                .context("Failed to create in-memory syncs store")?;
+
+            info!("Opened in-memory API stores (ephemeral / test mode)");
+
+            Ok(Self {
+                users: std::sync::Arc::new(users),
+                environments: std::sync::Arc::new(environments),
+                projects: std::sync::Arc::new(projects),
+                variables: std::sync::Arc::new(variables),
+                tasks: std::sync::Arc::new(tasks),
+                workflows: std::sync::Arc::new(workflows),
+                notifiers: std::sync::Arc::new(notifiers),
+                groups: std::sync::Arc::new(groups),
+                permissions: std::sync::Arc::new(permissions),
+                audit: std::sync::Arc::new(audit),
+                syncs: std::sync::Arc::new(syncs),
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::container_reachable_api_url;
+
+    #[test]
+    fn wildcard_v4_bind_becomes_loopback() {
+        let addr = "0.0.0.0:3669".parse().unwrap();
+        assert_eq!(container_reachable_api_url(&addr), "http://127.0.0.1:3669");
+    }
+
+    #[test]
+    fn wildcard_v6_bind_becomes_loopback() {
+        let addr = "[::]:3669".parse().unwrap();
+        assert_eq!(container_reachable_api_url(&addr), "http://[::1]:3669");
+    }
+
+    #[test]
+    fn specific_v4_bind_is_preserved() {
+        let addr = "10.0.0.5:3669".parse().unwrap();
+        assert_eq!(container_reachable_api_url(&addr), "http://10.0.0.5:3669");
+    }
+
+    #[test]
+    fn specific_v6_bind_is_bracketed() {
+        let addr = "[2001:db8::1]:3669".parse().unwrap();
+        assert_eq!(
+            container_reachable_api_url(&addr),
+            "http://[2001:db8::1]:3669"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // StorageBundle — restart persistence
+    // -------------------------------------------------------------------
+
+    /// Round-trip every bundle field through a fresh `TempDir`: write one
+    /// record, drop the bundle, reopen at the same path, and confirm each
+    /// record survived. This is the high-signal proof that `StorageBundle`
+    /// actually hit the disk for every store — an in-memory fallback or an
+    /// accidentally-rebuilt `InMemory*` would fail this test.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn storage_bundle_survives_restart() {
+        use zlayer_api::{
+            NotifierConfig, NotifierKind, PermissionLevel, StoredEnvironment, StoredNotifier,
+            StoredPermission, StoredProject, StoredSync, StoredTask, StoredUser, StoredUserGroup,
+            StoredVariable, StoredWorkflow, SubjectKind, TaskKind, UserRole, WorkflowAction,
+            WorkflowStep,
+        };
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path().to_path_buf();
+
+        // ---- first run: open bundle, write one record per store ----
+        let user = StoredUser::new("alice@example.com", "Alice", UserRole::Admin);
+        let env = StoredEnvironment::new("dev", None);
+        let project = StoredProject::new("demo");
+        let variable = StoredVariable::new("APP_VERSION", "1.2.3", None);
+        let task = StoredTask::new("smoke", TaskKind::Bash, "echo hi", None);
+        let workflow = StoredWorkflow::new(
+            "release",
+            vec![WorkflowStep {
+                name: "run-smoke".into(),
+                action: WorkflowAction::RunTask {
+                    task_id: task.id.clone(),
+                },
+                on_failure: None,
+            }],
+        );
+        let notifier = StoredNotifier::new(
+            "alerts",
+            NotifierKind::Webhook,
+            NotifierConfig::Webhook {
+                url: "https://hooks.example.com/x".into(),
+                method: None,
+                headers: None,
+            },
+        );
+        let group = StoredUserGroup::new("ops");
+        let permission = StoredPermission::new(
+            SubjectKind::User,
+            user.id.clone(),
+            "deployment",
+            Some("prod".into()),
+            PermissionLevel::Write,
+        );
+        let sync = StoredSync::new("infra", "manifests/");
+
+        {
+            let bundle = super::StorageBundle::open(Some(dir.as_path()))
+                .await
+                .expect("open bundle 1");
+
+            bundle.users.store(&user).await.expect("write user");
+            bundle
+                .environments
+                .store(&env)
+                .await
+                .expect("write environment");
+            bundle
+                .projects
+                .store(&project)
+                .await
+                .expect("write project");
+            bundle
+                .variables
+                .store(&variable)
+                .await
+                .expect("write variable");
+            bundle.tasks.store(&task).await.expect("write task");
+            bundle
+                .workflows
+                .store(&workflow)
+                .await
+                .expect("write workflow");
+            bundle
+                .notifiers
+                .store(&notifier)
+                .await
+                .expect("write notifier");
+            bundle.groups.store(&group).await.expect("write group");
+            bundle
+                .permissions
+                .grant(&permission)
+                .await
+                .expect("grant permission");
+            bundle
+                .syncs
+                .create(sync.clone())
+                .await
+                .expect("create sync");
+        }
+
+        // ---- second run: reopen at the same directory, assert all reads ----
+        let bundle = super::StorageBundle::open(Some(dir.as_path()))
+            .await
+            .expect("open bundle 2");
+
+        assert_eq!(
+            bundle
+                .users
+                .get(&user.id)
+                .await
+                .expect("read user")
+                .map(|u| u.id),
+            Some(user.id.clone()),
+            "user record did not survive restart"
+        );
+        assert_eq!(
+            bundle
+                .environments
+                .get(&env.id)
+                .await
+                .expect("read environment")
+                .map(|e| e.id),
+            Some(env.id.clone()),
+            "environment record did not survive restart"
+        );
+        assert_eq!(
+            bundle
+                .projects
+                .get(&project.id)
+                .await
+                .expect("read project")
+                .map(|p| p.id),
+            Some(project.id.clone()),
+            "project record did not survive restart"
+        );
+        assert_eq!(
+            bundle
+                .variables
+                .get(&variable.id)
+                .await
+                .expect("read variable")
+                .map(|v| v.id),
+            Some(variable.id.clone()),
+            "variable record did not survive restart"
+        );
+        assert_eq!(
+            bundle
+                .tasks
+                .get(&task.id)
+                .await
+                .expect("read task")
+                .map(|t| t.id),
+            Some(task.id.clone()),
+            "task record did not survive restart"
+        );
+        assert_eq!(
+            bundle
+                .workflows
+                .get(&workflow.id)
+                .await
+                .expect("read workflow")
+                .map(|w| w.id),
+            Some(workflow.id.clone()),
+            "workflow record did not survive restart"
+        );
+        assert_eq!(
+            bundle
+                .notifiers
+                .get(&notifier.id)
+                .await
+                .expect("read notifier")
+                .map(|n| n.id),
+            Some(notifier.id.clone()),
+            "notifier record did not survive restart"
+        );
+        assert_eq!(
+            bundle
+                .groups
+                .get(&group.id)
+                .await
+                .expect("read group")
+                .map(|g| g.id),
+            Some(group.id.clone()),
+            "group record did not survive restart"
+        );
+        let perms = bundle
+            .permissions
+            .list_for_subject(SubjectKind::User, &user.id)
+            .await
+            .expect("list permissions");
+        assert!(
+            perms.iter().any(|p| p.id == permission.id),
+            "permission record did not survive restart"
+        );
+        let syncs = bundle.syncs.list().await.expect("list syncs");
+        assert!(
+            syncs.iter().any(|s| s.id == sync.id),
+            "sync record did not survive restart"
+        );
+
+        // audit is append-only and has a separate trait — query via list_filtered
+        let audit_entry = zlayer_api::AuditEntry::new(&user.id, "create", "deployment");
+        bundle
+            .audit
+            .record(&audit_entry)
+            .await
+            .expect("record audit");
+        drop(bundle);
+
+        let bundle2 = super::StorageBundle::open(Some(dir.as_path()))
+            .await
+            .expect("open bundle 3");
+        let entries = bundle2
+            .audit
+            .list(zlayer_api::AuditFilter::default())
+            .await
+            .expect("list audit");
+        assert!(
+            entries.iter().any(|e| e.id == audit_entry.id),
+            "audit entry did not survive restart"
+        );
+    }
+
+    /// A lighter smoke test that just exercises the in-memory fallback,
+    /// guaranteeing `StorageBundle::open(None)` stays working for
+    /// test harnesses.
+    #[tokio::test]
+    async fn storage_bundle_in_memory_fallback_opens() {
+        let bundle = super::StorageBundle::open(None)
+            .await
+            .expect("open in-memory bundle");
+        assert_eq!(bundle.users.list().await.unwrap().len(), 0);
+        assert_eq!(bundle.variables.list(None).await.unwrap().len(), 0);
+    }
 }

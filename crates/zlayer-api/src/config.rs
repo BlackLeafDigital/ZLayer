@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 /// API server configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ApiConfig {
     /// Bind address
     #[serde(default = "default_bind")]
@@ -39,6 +39,14 @@ pub struct ApiConfig {
             zlayer_secrets::CredentialStore<std::sync::Arc<zlayer_secrets::PersistentSecretsStore>>,
         >,
     >,
+
+    /// User store for the `/api/v1/users` endpoints (not serialised).
+    ///
+    /// When `Some`, the router injects this store into `AuthState.user_store`
+    /// so user CRUD handlers can read/write persistent user records. When
+    /// `None`, the user endpoints return an internal error.
+    #[serde(skip)]
+    pub user_store: Option<std::sync::Arc<dyn crate::storage::UserStorage>>,
 }
 
 fn default_bind() -> SocketAddr {
@@ -53,6 +61,21 @@ fn default_true() -> bool {
     true
 }
 
+impl std::fmt::Debug for ApiConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiConfig")
+            .field("bind", &self.bind)
+            .field("jwt_secret", &"<redacted>")
+            .field("token_expiry", &self.token_expiry)
+            .field("swagger_enabled", &self.swagger_enabled)
+            .field("rate_limit", &self.rate_limit)
+            .field("cors", &self.cors)
+            .field("credential_store", &self.credential_store.is_some())
+            .field("user_store", &self.user_store.is_some())
+            .finish()
+    }
+}
+
 impl Default for ApiConfig {
     fn default() -> Self {
         Self {
@@ -63,6 +86,7 @@ impl Default for ApiConfig {
             rate_limit: RateLimitConfig::default(),
             cors: CorsConfig::default(),
             credential_store: None,
+            user_store: None,
         }
     }
 }

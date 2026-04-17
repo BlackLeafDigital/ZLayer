@@ -94,7 +94,9 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
       - name: Install system deps
         if: steps.check.outputs.completed != 'true'
-        run: apt-get update && apt-get install -y protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git'
       - name: Set workspace version
         if: steps.check.outputs.completed != 'true'
         shell: bash
@@ -172,7 +174,10 @@ jobs:
         run: cargo clean
       - name: Install protobuf
         if: steps.check.outputs.completed != 'true'
-        run: brew install protobuf
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf'
+          cross-platform: 'true'
       - name: Set workspace version
         if: steps.check.outputs.completed != 'true'
         shell: bash
@@ -218,6 +223,8 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+      - name: Install Git Bash
+        uses: https://forge.blackleafdigital.com/Public/actions/install-git-bash@main
       - name: Check step status
         id: check
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
@@ -242,10 +249,14 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
       - name: Install protobuf
         if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protoc'
+          cross-platform: 'true'
+      - name: Export PROTOC env
+        if: steps.check.outputs.completed != 'true'
         shell: bash
-        run: |
-          choco install protoc -y
-          echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
+        run: echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
       - name: Set workspace version
         if: steps.check.outputs.completed != 'true'
         shell: bash
@@ -257,12 +268,16 @@ jobs:
       - name: Build (thin Windows CLI)
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --package zlayer --no-default-features --features wsl
+      - name: Install 7zip
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: '7zip'
+          cross-platform: 'true'
       - name: Package
         if: steps.check.outputs.completed != 'true'
         shell: bash
-        run: |
-          command -v 7z >/dev/null 2>&1 || choco install 7zip -y
-          7z a zlayer-windows-amd64.zip target/release/zlayer.exe
+        run: 7z a zlayer-windows-amd64.zip target/release/zlayer.exe
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
         uses: actions/upload-artifact@v3
@@ -307,7 +322,10 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Install buildah
         if: steps.check.outputs.completed != 'true'
-        run: sudo apt-get update && sudo apt-get install -y buildah
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'buildah'
+          cross-platform: 'true'
       - name: Download zlayer
         if: steps.check.outputs.completed != 'true'
         uses: actions/download-artifact@v3
@@ -400,7 +418,10 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
       - name: Install protobuf
         if: steps.check.outputs.completed != 'true'
-        run: brew install protobuf
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf'
+          cross-platform: 'true'
       - name: Set workspace version
         if: steps.check.outputs.completed != 'true'
         shell: bash
@@ -478,7 +499,9 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
       - name: Install system deps
         if: steps.check.outputs.completed != 'true'
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libseccomp-dev
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf-compiler libseccomp-dev'
       - name: Create target directory
         if: steps.check.outputs.completed != 'true'
         run: mkdir -p $CROSS_TARGET_DIR

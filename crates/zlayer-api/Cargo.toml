@@ -19,6 +19,9 @@ path = "src/bin/openapi_spec.rs"
 # Internal crates
 zlayer-agent.workspace = true
 zlayer-builder.workspace = true
+zlayer-core.workspace = true
+oci-client.workspace = true
+zlayer-git.workspace = true
 zlayer-proxy.workspace = true
 zlayer-overlay.workspace = true
 zlayer-spec.workspace = true
@@ -29,6 +32,7 @@ zlayer-storage.workspace = true
 
 # Web framework
 axum.workspace = true
+axum-extra.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 hyper.workspace = true
@@ -73,10 +77,18 @@ base64.workspace = true
 
 # Cryptography (for token hashing)
 sha2.workspace = true
+hmac.workspace = true
 hex.workspace = true
+subtle.workspace = true
+
+# Random number generation (for CSRF tokens)
+rand.workspace = true
 
 # HTTP client (for peer broadcast)
 reqwest.workspace = true
+
+# SMTP (for the SMTP notifier test/send endpoint).
+lettre.workspace = true
 
 # Synchronization
 parking_lot.workspace = true

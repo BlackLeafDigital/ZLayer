@@ -187,18 +187,36 @@ impl SecretScope {
 ///
 /// ## Formats
 /// - `$S:name` - Deployment-level secret
-/// - `$S:@service/name` - Service-level secret
-/// - `$S:name/field` - Deployment-level secret with field extraction
-/// - `$S:@service/name/field` - Service-level secret with field extraction
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// - `$S:name/field` - Deployment-level secret with JSON field extraction
+/// - `$S:@service/name[/field]` - Service-level secret
+/// - `$S::env/name[/field]` - Environment-scoped secret (global environment)
+/// - `$S:project:env/name[/field]` - Project-scoped environment secret
+///
+/// ## Environment-scope disambiguation
+/// Environment-scoped references require a colon in the scope segment so
+/// they cannot be confused with the legacy deployment-level `name/field`
+/// form. The leading colon in `$S::env/name` marks "no project, scope is
+/// environment `env`". The `$S:project:env/name` form is unambiguous
+/// because it already contains a colon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretRef {
     /// The name of the secret.
     pub name: String,
 
     /// Optional service name (for service-scoped secrets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
 
+    /// Optional project name (for project-scoped environment secrets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+
+    /// Optional environment name (for environment-scoped secrets).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+
     /// Optional field to extract from a structured secret (e.g., JSON).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
 }
 
@@ -216,9 +234,10 @@ impl SecretRef {
     ///
     /// ## Formats
     /// - `$S:name` - Deployment-level secret
-    /// - `$S:@service/name` - Service-level secret
-    /// - `$S:name/field` - Deployment-level secret with field extraction
-    /// - `$S:@service/name/field` - Service-level secret with field extraction
+    /// - `$S:name/field` - Deployment-level secret with JSON field extraction
+    /// - `$S:@service/name[/field]` - Service-level secret
+    /// - `$S::env/name[/field]` - Environment-scoped secret (global environment)
+    /// - `$S:project:env/name[/field]` - Project-scoped environment secret
     ///
     /// Returns `None` if the string is not a valid secret reference.
     #[must_use]
@@ -231,9 +250,8 @@ impl SecretRef {
             return None;
         }
 
-        // Check if it's a service-scoped secret (starts with @)
+        // Service-scoped: $S:@service/name[/field]
         if let Some(service_rest) = rest.strip_prefix('@') {
-            // Format: @service/name or @service/name/field
             let mut parts = service_rest.splitn(3, '/');
 
             let service = parts.next()?;
@@ -251,34 +269,116 @@ impl SecretRef {
                 .map(ToString::to_string)
                 .filter(|s| !s.is_empty());
 
-            Some(Self {
+            return Some(Self {
                 name: name.to_string(),
                 service: Some(service.to_string()),
+                project: None,
+                environment: None,
                 field,
-            })
-        } else {
-            // Format: name or name/field
-            let mut parts = rest.splitn(2, '/');
+            });
+        }
 
-            let name = parts.next()?;
-            if name.is_empty() {
+        // Reject leading '/' (e.g. "$S:/name"): no scope/name segment.
+        if rest.starts_with('/') {
+            return None;
+        }
+
+        // Environment-scoped forms: the scope segment (everything before the
+        // first '/') must contain a ':'. This disambiguates against the
+        // legacy deployment-level `name/field` form, which contains no ':'.
+        // Supported:
+        //   $S::env/name[/field]        -> environment-only (empty project)
+        //   $S:project:env/name[/field] -> project-scoped environment
+        if let Some((scope, tail)) = rest.split_once('/') {
+            if scope.contains(':') {
+                return Self::parse_env_scoped(scope, tail);
+            }
+            // Legacy deployment-level with field: name/field
+            if scope.is_empty() {
                 return None;
             }
-
-            let field = parts
-                .next()
-                .map(ToString::to_string)
-                .filter(|s| !s.is_empty());
-
-            Some(Self {
-                name: name.to_string(),
+            // Reject stray ':' inside a plain name (e.g. "$S:foo:bar/baz")
+            // is handled above (scope contains ':'); also reject the "name
+            // only" form when it contains colons further down.
+            if tail.is_empty() {
+                return None;
+            }
+            // Tail itself must not contain further '/' after the field
+            // (legacy grammar is exactly `name/field`).
+            if tail.contains('/') {
+                return None;
+            }
+            return Some(Self {
+                name: scope.to_string(),
                 service: None,
-                field,
-            })
+                project: None,
+                environment: None,
+                field: Some(tail.to_string()),
+            });
         }
+
+        // No '/' in rest: it's either a plain deployment name or malformed.
+        // A name containing ':' is treated as malformed (e.g. "$S:::name").
+        if rest.contains(':') {
+            return None;
+        }
+        Some(Self {
+            name: rest.to_string(),
+            service: None,
+            project: None,
+            environment: None,
+            field: None,
+        })
+    }
+
+    /// Parse the environment-scoped forms (scope segment contains ':').
+    ///
+    /// `scope` is the pre-'/' segment, `tail` is everything after the first
+    /// '/', which must contain at least a non-empty name, optionally
+    /// followed by `/field`.
+    fn parse_env_scoped(scope: &str, tail: &str) -> Option<Self> {
+        // Extract the project/env split.
+        let (project_raw, environment) = scope.split_once(':')?;
+        // Reject environments containing further colons (e.g. "a:b:c").
+        if environment.is_empty() || environment.contains(':') {
+            return None;
+        }
+        let project = if project_raw.is_empty() {
+            None
+        } else {
+            Some(project_raw.to_string())
+        };
+
+        // Split tail into name and optional field.
+        let (name, field) = match tail.split_once('/') {
+            Some((name, field)) => {
+                if field.is_empty() || field.contains('/') {
+                    return None;
+                }
+                (name, Some(field.to_string()))
+            }
+            None => (tail, None),
+        };
+
+        if name.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            name: name.to_string(),
+            service: None,
+            project,
+            environment: Some(environment.to_string()),
+            field,
+        })
     }
 
     /// Convert this reference to a `SecretScope` for a given deployment.
+    ///
+    /// Environment/project scopes are not representable by `SecretScope`
+    /// (which only models deployment vs service); those references fall
+    /// back to a deployment-level scope and must be resolved by a higher
+    /// layer that understands environment and project scoping.
     #[must_use]
     pub fn to_scope(&self, deployment: &str) -> SecretScope {
         match &self.service {
@@ -293,7 +393,7 @@ impl SecretRef {
     /// Check if this is a deployment-level secret reference.
     #[must_use]
     pub fn is_deployment_level(&self) -> bool {
-        self.service.is_none()
+        self.service.is_none() && self.project.is_none() && self.environment.is_none()
     }
 
     /// Check if this is a service-level secret reference.
@@ -302,10 +402,50 @@ impl SecretRef {
         self.service.is_some()
     }
 
+    /// Check if this reference is environment-scoped (with or without a project).
+    #[must_use]
+    pub fn is_environment_level(&self) -> bool {
+        self.environment.is_some()
+    }
+
+    /// Check if this reference is scoped to a project environment.
+    #[must_use]
+    pub fn is_project_environment_level(&self) -> bool {
+        self.project.is_some() && self.environment.is_some()
+    }
+
     /// Check if this reference includes field extraction.
     #[must_use]
     pub fn has_field(&self) -> bool {
         self.field.is_some()
+    }
+}
+
+impl std::fmt::Display for SecretRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(Self::PREFIX)?;
+        if let Some(service) = &self.service {
+            write!(f, "@{service}/{}", self.name)?;
+            if let Some(field) = &self.field {
+                write!(f, "/{field}")?;
+            }
+        } else if let Some(environment) = &self.environment {
+            if let Some(project) = &self.project {
+                write!(f, "{project}:{environment}/{}", self.name)?;
+            } else {
+                write!(f, ":{environment}/{}", self.name)?;
+            }
+            if let Some(field) = &self.field {
+                write!(f, "/{field}")?;
+            }
+        } else {
+            // Deployment-level: `name` or `name/field`.
+            f.write_str(&self.name)?;
+            if let Some(field) = &self.field {
+                write!(f, "/{field}")?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -401,6 +541,8 @@ mod tests {
         let secret_ref = SecretRef::parse("$S:database-password").unwrap();
         assert_eq!(secret_ref.name, "database-password");
         assert!(secret_ref.service.is_none());
+        assert!(secret_ref.project.is_none());
+        assert!(secret_ref.environment.is_none());
         assert!(secret_ref.field.is_none());
         assert!(secret_ref.is_deployment_level());
     }
@@ -410,24 +552,74 @@ mod tests {
         let secret_ref = SecretRef::parse("$S:@api/database-password").unwrap();
         assert_eq!(secret_ref.name, "database-password");
         assert_eq!(secret_ref.service, Some("api".to_string()));
+        assert!(secret_ref.project.is_none());
+        assert!(secret_ref.environment.is_none());
         assert!(secret_ref.field.is_none());
         assert!(secret_ref.is_service_level());
     }
 
     #[test]
-    fn test_secret_ref_parse_with_field() {
-        // Deployment-level with field
-        let secret_ref = SecretRef::parse("$S:database/password").unwrap();
-        assert_eq!(secret_ref.name, "database");
-        assert!(secret_ref.service.is_none());
-        assert_eq!(secret_ref.field, Some("password".to_string()));
-        assert!(secret_ref.has_field());
-
-        // Service-level with field
+    fn test_secret_ref_parse_service_level_with_field() {
         let secret_ref = SecretRef::parse("$S:@api/database/password").unwrap();
         assert_eq!(secret_ref.name, "database");
         assert_eq!(secret_ref.service, Some("api".to_string()));
         assert_eq!(secret_ref.field, Some("password".to_string()));
+        assert!(secret_ref.has_field());
+    }
+
+    #[test]
+    fn test_secret_ref_parse_deployment_with_field_legacy() {
+        // Legacy deployment-level with field: `name/field`.
+        let secret_ref = SecretRef::parse("$S:database/password").unwrap();
+        assert_eq!(secret_ref.name, "database");
+        assert!(secret_ref.service.is_none());
+        assert!(secret_ref.project.is_none());
+        assert!(secret_ref.environment.is_none());
+        assert_eq!(secret_ref.field, Some("password".to_string()));
+        assert!(secret_ref.has_field());
+    }
+
+    #[test]
+    fn test_secret_ref_parse_environment_level() {
+        let secret_ref = SecretRef::parse("$S::staging/db-password").unwrap();
+        assert_eq!(secret_ref.name, "db-password");
+        assert_eq!(secret_ref.environment, Some("staging".to_string()));
+        assert!(secret_ref.project.is_none());
+        assert!(secret_ref.service.is_none());
+        assert!(secret_ref.field.is_none());
+        assert!(secret_ref.is_environment_level());
+        assert!(!secret_ref.is_project_environment_level());
+        assert!(!secret_ref.is_deployment_level());
+    }
+
+    #[test]
+    fn test_secret_ref_parse_environment_level_with_field() {
+        let secret_ref = SecretRef::parse("$S::staging/db-creds/password").unwrap();
+        assert_eq!(secret_ref.name, "db-creds");
+        assert_eq!(secret_ref.environment, Some("staging".to_string()));
+        assert!(secret_ref.project.is_none());
+        assert_eq!(secret_ref.field, Some("password".to_string()));
+    }
+
+    #[test]
+    fn test_secret_ref_parse_project_environment_level() {
+        let secret_ref = SecretRef::parse("$S:myproj:staging/db-password").unwrap();
+        assert_eq!(secret_ref.name, "db-password");
+        assert_eq!(secret_ref.project, Some("myproj".to_string()));
+        assert_eq!(secret_ref.environment, Some("staging".to_string()));
+        assert!(secret_ref.service.is_none());
+        assert!(secret_ref.field.is_none());
+        assert!(secret_ref.is_environment_level());
+        assert!(secret_ref.is_project_environment_level());
+    }
+
+    #[test]
+    fn test_secret_ref_parse_project_environment_with_field() {
+        let secret_ref = SecretRef::parse("$S:myproj:prod/creds/api_key").unwrap();
+        assert_eq!(secret_ref.name, "creds");
+        assert_eq!(secret_ref.project, Some("myproj".to_string()));
+        assert_eq!(secret_ref.environment, Some("prod".to_string()));
+        assert_eq!(secret_ref.field, Some("api_key".to_string()));
     }
 
     #[test]
@@ -446,6 +638,75 @@ mod tests {
 
         // Just @ with no service
         assert!(SecretRef::parse("$S:@").is_none());
+
+        // Leading slash (empty scope/name)
+        assert!(SecretRef::parse("$S:/name").is_none());
+
+        // Empty name in legacy `name/field` form
+        assert!(SecretRef::parse("$S:database/").is_none());
+
+        // Triple-colon flat form (no '/'): colons disallowed in bare names
+        assert!(SecretRef::parse("$S:::name").is_none());
+
+        // Empty environment in env-only form ("$S::/name")
+        assert!(SecretRef::parse("$S::/name").is_none());
+
+        // Empty environment with project ("proj:/name")
+        assert!(SecretRef::parse("$S:proj:/name").is_none());
+
+        // Extra colon in scope ("a:b:c/name")
+        assert!(SecretRef::parse("$S:a:b:c/name").is_none());
+
+        // Env-scoped with empty name
+        assert!(SecretRef::parse("$S::env/").is_none());
+
+        // Extra trailing segment on legacy deployment form
+        assert!(SecretRef::parse("$S:name/field/extra").is_none());
+    }
+
+    #[test]
+    fn test_secret_ref_display_roundtrip() {
+        let cases = [
+            "$S:database-password",
+            "$S:database/password",
+            "$S:@api/database-password",
+            "$S:@api/database/password",
+            "$S::staging/db-password",
+            "$S::staging/db-creds/password",
+            "$S:myproj:staging/db-password",
+            "$S:myproj:prod/creds/api_key",
+        ];
+
+        for input in cases {
+            let parsed =
+                SecretRef::parse(input).unwrap_or_else(|| panic!("failed to parse {input}"));
+            let rendered = parsed.to_string();
+            assert_eq!(rendered, input, "round-trip mismatch for {input}");
+            let reparsed = SecretRef::parse(&rendered)
+                .unwrap_or_else(|| panic!("failed to re-parse {rendered}"));
+            assert_eq!(parsed, reparsed);
+        }
+    }
+
+    #[test]
+    fn test_secret_ref_serde_backcompat() {
+        // Pre-existing JSON without project/environment fields must still deserialize.
+        let json = r#"{"name":"db","service":"api","field":"password"}"#;
+        let parsed: SecretRef = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.name, "db");
+        assert_eq!(parsed.service, Some("api".to_string()));
+        assert_eq!(parsed.field, Some("password".to_string()));
+        assert!(parsed.project.is_none());
+        assert!(parsed.environment.is_none());
+
+        // Minimal form (just a name).
+        let minimal = r#"{"name":"db"}"#;
+        let parsed: SecretRef = serde_json::from_str(minimal).unwrap();
+        assert_eq!(parsed.name, "db");
+        assert!(parsed.service.is_none());
+        assert!(parsed.project.is_none());
+        assert!(parsed.environment.is_none());
+        assert!(parsed.field.is_none());
     }
 
     #[test]

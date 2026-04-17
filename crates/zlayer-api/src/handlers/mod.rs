@@ -1,24 +1,37 @@
 //! REST API handlers
 
+pub mod audit;
 pub mod auth;
 pub mod build;
 pub mod cluster;
 pub mod containers;
+pub mod credentials;
 pub mod cron;
 pub mod deployments;
+pub mod environments;
+pub mod groups;
 pub mod health;
 pub mod images;
 pub mod internal;
 pub mod jobs;
 pub mod networks;
 pub mod nodes;
+pub mod notifiers;
 pub mod overlay;
+pub mod permissions;
+pub mod projects;
 pub mod proxy;
 pub mod secrets;
 pub mod services;
 pub mod storage;
+pub mod syncs;
+pub mod tasks;
 pub mod tunnels;
+pub mod users;
+pub mod variables;
 pub mod volumes;
+pub mod webhooks;
+pub mod workflows;
 
 pub use auth::*;
 pub use build::*;

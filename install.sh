@@ -176,6 +176,21 @@ fi
 echo ""
 echo "${BINARY} ${TAG} installed to ${INSTALL_DIR}/${BINARY}"
 
+# --- Warn if an older zlayer binary shadows the one we just installed ---
+# command -v walks PATH in order, so a stale binary earlier on PATH (typically
+# ~/.local/bin/zlayer left over from a previous manual install) will silently
+# be used instead, which produces "it builds but the daemon can't find the
+# image" failures that are miserable to debug.
+RESOLVED="$(command -v "$BINARY" 2>/dev/null || true)"
+if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "${INSTALL_DIR}/${BINARY}" ]; then
+    echo ""
+    echo "Warning: another '${BINARY}' binary appears earlier on your PATH:"
+    echo "    $RESOLVED"
+    echo "It will shadow the version just installed. Remove with:"
+    echo "    rm '$RESOLVED'"
+    echo "Then re-open your shell (or run 'hash -r')."
+fi
+
 case ":${PATH}:" in
     *":${INSTALL_DIR}:"*) ;;
     *)
