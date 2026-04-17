@@ -9,7 +9,7 @@ description = "Container runtime agent using libcontainer/youki"
 keywords = ["container", "runtime", "youki", "libcontainer", "orchestration"]
 categories = ["os", "virtualization"]
 readme = "README.md"
-publish = false
+publish = ["forgejo"]
 
 [features]
 default = []

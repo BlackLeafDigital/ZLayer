@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [0.10.95]
 
+### Changed
+- **CI workflow (`.forgejo/workflows/build.yml`) now uses the
+  `setup-system-deps` action for all package installs.**
+  Replaced inline `apt-get install`, `brew install`, and `choco install`
+  steps with
+  `https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main`
+  so apt runs get dpkg-lock timeout + noninteractive guards uniformly.
+  The Windows `build-windows-amd64` job also gains an
+  `install-git-bash` step after `setup-rust`, which installs Git on the
+  Forgejo Windows runner and fixes the `Cannot find: bash in PATH`
+  failure that was blocking protobuf and packaging `shell: bash` steps.
+
 ### Added
 - **Groups, permissions, and audit** (Phase 8.2): resource-level access
   control and audit logging for the REST API and CLI.
