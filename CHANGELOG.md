@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 ## [0.10.95]
 
 ### Changed
+- **`zlayer-agent-zql` and `zlayer-proxy-zql` are now publishable to the
+  `forgejo` registry** (`publish = ["forgejo"]` in their `Cargo.toml`).
+  `zlayer-agent-zql` is required by zfunctions in Zatabase;
+  `zlayer-proxy-zql` is a transitive path dep of `zlayer-agent-zql` and
+  cargo refuses to publish a crate whose path deps aren't publishable.
+- **Added `crates/zlayer-proxy/README.md`** so cargo publish stops failing
+  with `readme 'README.md' does not appear to exist` (the crate's
+  `Cargo.toml` already had `readme = "README.md"`).
+
 - **CI workflow (`.forgejo/workflows/build.yml`) now uses the
   `setup-system-deps` action for all package installs.**
   Replaced inline `apt-get install`, `brew install`, and `choco install`
