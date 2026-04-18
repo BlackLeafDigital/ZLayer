@@ -12,6 +12,7 @@ publish = false
 # Internal crates
 zlayer-spec.workspace = true
 zlayer-core.workspace = true
+zlayer-client.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -30,12 +31,17 @@ clap.workspace = true
 
 # Async runtime
 tokio.workspace = true
+tokio-stream.workspace = true
+futures-util.workspace = true
 
 # Web/HTTP
 axum.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 tower.workspace = true
+
+# System info
+num_cpus.workspace = true
 
 # Optional dependencies
 zlayer-builder = { workspace = true, optional = true }

@@ -28,7 +28,10 @@ pub mod local_registry;
 #[cfg(feature = "local")]
 pub mod oci_export;
 
-#[cfg(feature = "local")]
+// `wasm_export` only depends on `cache::compute_digest` and the always-on
+// `wasm` module, so it is available unconditionally — needed by
+// `zlayer-builder` to export WASM OCI artifacts without pulling in the
+// `local` feature's local-registry machinery.
 pub mod wasm_export;
 
 pub use cache::*;
@@ -54,7 +57,6 @@ pub use oci_export::{
     OciIndex, OciLayout, OciManifest, OciPlatform,
 };
 
-#[cfg(feature = "local")]
 pub use wasm_export::{export_wasm_as_oci, WasmExportConfig, WasmExportError, WasmExportResult};
 
 // Re-export oci_client types that users need

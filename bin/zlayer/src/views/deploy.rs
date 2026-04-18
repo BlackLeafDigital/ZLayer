@@ -481,7 +481,7 @@ pub fn submit_deployment(rt: &tokio::runtime::Runtime, state: &mut DeployState) 
     let result = rt.block_on(async {
         let client = match tokio::time::timeout(
             std::time::Duration::from_secs(5),
-            crate::daemon_client::DaemonClient::connect(),
+            zlayer_client::DaemonClient::connect(),
         )
         .await
         {

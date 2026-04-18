@@ -9,7 +9,7 @@
 use anyhow::{bail, Context, Result};
 use tracing::info;
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// Execute the `exec` command.
 pub(crate) async fn exec(

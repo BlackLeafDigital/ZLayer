@@ -1,0 +1,45 @@
+services:
+  sdks:
+    services:
+      py-binding:
+        paths:
+          - crates/zlayer-py/**
+        registry:
+          type: pypi
+          name: zlayer
+          url: https://pypi.org/pypi
+      ts-client:
+        paths:
+          - clients/typescript-client/**
+          - clients/typescript/**
+        registry:
+          type: npm
+          name: "@zlayer/client"
+          url: https://registry.npmjs.org
+      plugin-sdk-rust:
+        paths:
+          - clients/zlayer-sdk/rust/**
+        registry:
+          type: cargo
+          name: zlayer-sdk
+          url: https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/
+      plugin-sdk-python:
+        paths:
+          - clients/zlayer-sdk/python/**
+        registry:
+          type: pypi
+          name: zlayer-sdk
+          url: https://pypi.org/pypi
+      plugin-sdk-typescript:
+        paths:
+          - clients/zlayer-sdk/typescript/**
+        registry:
+          type: npm
+          name: "@zlayer/sdk"
+          url: https://registry.npmjs.org
+      plugin-sdk-go:
+        paths:
+          - clients/zlayer-sdk/go/**
+      plugin-sdk-c:
+        paths:
+          - clients/zlayer-sdk/c/**

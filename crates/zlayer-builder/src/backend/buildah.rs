@@ -319,6 +319,18 @@ impl BuildBackend for BuildahBackend {
         let stages = self.resolve_stages(dockerfile, options.target.as_deref())?;
         debug!("Building {} stages", stages.len());
 
+        // Emit the total stage / instruction count up-front so the TUI
+        // progress bar has a stable denominator (otherwise it would
+        // grow in lockstep with the numerator as events arrive).
+        let total_instructions_planned: usize = stages.iter().map(|s| s.instructions.len()).sum();
+        Self::send_event(
+            event_tx.as_ref(),
+            BuildEvent::BuildStarted {
+                total_stages: stages.len(),
+                total_instructions: total_instructions_planned,
+            },
+        );
+
         // Build each stage.
         let mut stage_images: HashMap<String, String> = HashMap::new();
         // Track the final WORKDIR for each committed stage, used to resolve

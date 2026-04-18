@@ -2567,4 +2567,64 @@ impl Runtime for SandboxRuntime {
 
         Ok(Some(container.assigned_port))
     }
+
+    /// Send a signal to the sandboxed process using `libc::kill`.
+    #[allow(unsafe_code)]
+    #[allow(clippy::cast_possible_wrap)]
+    async fn kill_container(&self, id: &ContainerId, signal: Option<&str>) -> Result<()> {
+        let canonical = crate::runtime::validate_signal(signal.unwrap_or("SIGKILL"))?;
+        let dir_name = Self::container_dir_name(id);
+
+        let pid = {
+            let containers = self.containers.read().await;
+            let container = containers
+                .get(&dir_name)
+                .ok_or_else(|| AgentError::NotFound {
+                    container: dir_name.clone(),
+                    reason: "Container not found".to_string(),
+                })?;
+            container.pid
+        };
+
+        if pid == 0 {
+            return Err(AgentError::InvalidSpec(format!(
+                "container '{dir_name}' is not running (no pid)"
+            )));
+        }
+
+        let signum = match canonical.as_str() {
+            "SIGKILL" => libc::SIGKILL,
+            "SIGTERM" => libc::SIGTERM,
+            "SIGINT" => libc::SIGINT,
+            "SIGHUP" => libc::SIGHUP,
+            "SIGUSR1" => libc::SIGUSR1,
+            "SIGUSR2" => libc::SIGUSR2,
+            other => {
+                return Err(AgentError::InvalidSpec(format!(
+                    "unsupported signal '{other}'"
+                )));
+            }
+        };
+
+        tracing::info!(container = %dir_name, pid = pid, signal = %canonical, "killing sandboxed process");
+
+        let ret = unsafe { libc::kill(pid as i32, signum) };
+        if ret != 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(AgentError::Internal(format!(
+                "kill({pid}, {canonical}) failed: {err}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Tagging is not supported by the macOS sandbox runtime.
+    ///
+    /// Images are pulled directly into per-container rootfs directories rather
+    /// than a shared content-addressed store, so there is nothing to tag.
+    async fn tag_image(&self, _source: &str, _target: &str) -> Result<()> {
+        Err(AgentError::Unsupported(
+            "tag_image is not supported by the macOS sandbox runtime".into(),
+        ))
+    }
 }

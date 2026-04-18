@@ -368,6 +368,16 @@ impl SandboxImageBuilder {
             ..Default::default()
         };
 
+        // Emit the total stage / instruction count up-front so the TUI
+        // progress bar has a stable denominator (otherwise it would
+        // grow in lockstep with the numerator as events arrive).
+        let total_instructions_planned: usize =
+            dockerfile.stages.iter().map(|s| s.instructions.len()).sum();
+        self.send_event(BuildEvent::BuildStarted {
+            total_stages: num_stages,
+            total_instructions: total_instructions_planned,
+        });
+
         for (stage_idx, stage) in dockerfile.stages.iter().enumerate() {
             let is_final_stage = stage_idx == num_stages - 1;
 

@@ -1,0 +1,19 @@
+{
+  "name": "@zlayer/api-client",
+  "version": "0.10.104",
+  "description": "Raw ZLayer REST API client (auto-generated from OpenAPI). For an ergonomic wrapper, use @zlayer/client.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BlackLeafDigital/ZLayer.git"
+  },
+  "license": "Apache-2.0"
+}

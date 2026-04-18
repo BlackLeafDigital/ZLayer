@@ -96,8 +96,9 @@
 //! ```
 
 // Youki runtime is Linux-only as it depends on libcontainer which uses
-// Linux-specific APIs (cgroups, namespaces, procfs)
-#[cfg(target_os = "linux")]
+// Linux-specific APIs (cgroups, namespaces, procfs). Gated behind the
+// `youki-runtime` feature so the crate publishes without pulling libcontainer.
+#[cfg(all(target_os = "linux", feature = "youki-runtime"))]
 mod youki;
 
 #[cfg(feature = "docker")]
@@ -127,7 +128,7 @@ pub mod macos_sandbox;
 #[cfg(target_os = "macos")]
 pub mod macos_vm;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "youki-runtime"))]
 pub use youki::{YoukiConfig, YoukiRuntime};
 
 #[cfg(target_os = "macos")]

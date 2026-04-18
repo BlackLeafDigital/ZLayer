@@ -151,6 +151,12 @@ pub enum BuildOutput {
         wasm_path: PathBuf,
         /// Path to the OCI artifact directory (if exported).
         oci_path: Option<PathBuf>,
+        /// OCI manifest digest (e.g. `sha256:...`) for the exported artifact,
+        /// or `None` if export did not run (should always be `Some` when
+        /// `oci_path` is `Some`).
+        manifest_digest: Option<String>,
+        /// OCI artifact type (e.g. `application/vnd.wasm.component.v1+wasm`).
+        artifact_type: Option<String>,
         /// Source language used.
         language: String,
         /// Whether optimization was applied.
@@ -1314,7 +1320,13 @@ impl ImageBuilder {
         // If this is a WASM build, return early with the artifact info.
         if let BuildOutput::WasmArtifact {
             wasm_path,
-            oci_path: _,
+            // `oci_path` drives the optional push branch below; when the
+            // `local-registry` feature is off the push branch is compiled
+            // out, so the binding is unused.
+            #[cfg_attr(not(feature = "local-registry"), allow(unused_variables))]
+            oci_path,
+            manifest_digest,
+            artifact_type: _,
             language,
             optimized,
             size,
@@ -1323,21 +1335,51 @@ impl ImageBuilder {
             #[allow(clippy::cast_possible_truncation)]
             let build_time_ms = start_time.elapsed().as_millis() as u64;
 
+            // Prefer a user tag as the image id; otherwise fall back to the
+            // OCI manifest digest (sha256:...), which is what WASM tooling
+            // references in `oci-archive:` / `oci:` URIs. As a last resort
+            // (no tag, no digest — only possible if export somehow produced
+            // no digest) use a `wasm-path:` marker so downstream code can
+            // tell this was a WASM build.
+            let image_id = if let Some(tag) = self.options.tags.first() {
+                tag.clone()
+            } else if let Some(digest) = manifest_digest.as_ref() {
+                format!("wasm:{digest}")
+            } else {
+                format!("wasm-path:{}", wasm_path.display())
+            };
+
+            // Push WASM OCI artifact(s) to the remote registry if the user
+            // both supplied tags and requested a push (e.g. `zlayer build
+            // -t ghcr.io/org/mod:v1 --push`). Mirrors the container flow at
+            // `BuildahBackend::build_image` where `options.push` drives
+            // `push_image_internal` for each tag.
+            //
+            // Gated on `local-registry` because `ImagePuller::push_wasm` is
+            // behind the `zlayer-registry/local` feature, matching the other
+            // push-to-registry sites in this crate.
+            #[cfg(feature = "local-registry")]
+            if oci_path.is_some() && self.options.push && !self.options.tags.is_empty() {
+                let oci_dir = oci_path.as_ref().expect("checked oci_path.is_some() above");
+                self.push_wasm_oci(&wasm_path, oci_dir).await?;
+            }
+
             self.send_event(BuildEvent::BuildComplete {
-                image_id: wasm_path.display().to_string(),
+                image_id: image_id.clone(),
             });
 
             info!(
-                "WASM build completed in {}ms: {} ({}, {} bytes, optimized={})",
+                "WASM build completed in {}ms: {} ({}, {} bytes, optimized={}, image_id={})",
                 build_time_ms,
                 wasm_path.display(),
                 language,
                 size,
-                optimized
+                optimized,
+                image_id,
             );
 
             return Ok(BuiltImage {
-                image_id: format!("wasm:{}", wasm_path.display()),
+                image_id,
                 tags: self.options.tags.clone(),
                 layer_count: 1,
                 size,
@@ -1529,8 +1571,8 @@ impl ImageBuilder {
         }
 
         // WASM mode: build a WASM component.
-        if let Some(ref wasm_config) = zimage.wasm {
-            return self.handle_wasm_build(wasm_config).await;
+        if zimage.wasm.is_some() {
+            return self.handle_wasm_build(zimage).await;
         }
 
         // Resolve any `build:` directives to concrete base image tags.
@@ -1547,11 +1589,16 @@ impl ImageBuilder {
     /// Converts [`ZWasmConfig`](crate::zimage::ZWasmConfig) into a
     /// [`WasmBuildConfig`](crate::wasm_builder::WasmBuildConfig) and invokes
     /// the WASM builder pipeline.
-    async fn handle_wasm_build(
-        &self,
-        wasm_config: &crate::zimage::ZWasmConfig,
-    ) -> Result<BuildOutput> {
+    #[allow(clippy::too_many_lines)]
+    async fn handle_wasm_build(&self, zimage: &crate::zimage::ZImage) -> Result<BuildOutput> {
         use crate::wasm_builder::{build_wasm, WasiTarget, WasmBuildConfig, WasmLanguage};
+        use zlayer_registry::wasm::WasiVersion;
+        use zlayer_registry::{export_wasm_as_oci, WasmExportConfig};
+
+        // Caller guarantees `zimage.wasm` is `Some`.
+        let wasm_config = zimage.wasm.as_ref().expect(
+            "handle_wasm_build invoked without a wasm section in ZImage; caller must check",
+        );
 
         info!("ZImagefile specifies WASM mode, running WASM build");
 
@@ -1617,9 +1664,90 @@ impl ImageBuilder {
             wasm_config.optimize
         );
 
+        // `wasm.oci: false` opts out of OCI artifact packaging and push —
+        // the compilation pipeline above still runs (with caching, wasm-opt,
+        // and the preview1 -> preview2 adapter), we simply skip the layout
+        // write and leave `oci_path`/`manifest_digest`/`artifact_type` as
+        // `None`. The push branch in `build()` keys off `oci_path.is_some()`
+        // so skipping it here transparently disables push for this build.
+        if !wasm_config.oci {
+            info!(
+                "WASM OCI export skipped (wasm.oci = false); raw .wasm at {}",
+                wasm_path.display()
+            );
+            return Ok(BuildOutput::WasmArtifact {
+                wasm_path,
+                oci_path: None,
+                manifest_digest: None,
+                artifact_type: None,
+                language: language_name,
+                optimized: wasm_config.optimize,
+                size,
+            });
+        }
+
+        // Derive a module name for OCI annotations. Prefer the first tag's
+        // repository component (`repo` from `repo:version` or `host/repo`),
+        // falling back to the wasm file stem, then "wasm-module".
+        let module_name = self
+            .options
+            .tags
+            .first()
+            .map(|t| module_name_from_tag(t))
+            .or_else(|| {
+                wasm_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "wasm-module".to_string());
+
+        // Map the selected WASI target to a WasiVersion so the export uses
+        // the correct artifact_type without re-analyzing the binary.
+        let wasi_version = match target {
+            WasiTarget::Preview1 => Some(WasiVersion::Preview1),
+            WasiTarget::Preview2 => Some(WasiVersion::Preview2),
+        };
+
+        // Carry ZImage labels across as OCI manifest annotations, matching
+        // the behaviour of container image builds that emit LABEL -> annotations.
+        let annotations: HashMap<String, String> = zimage.labels.clone();
+
+        let export_config = WasmExportConfig {
+            wasm_path: wasm_path.clone(),
+            module_name: module_name.clone(),
+            wasi_version,
+            annotations,
+        };
+
+        let export =
+            export_wasm_as_oci(&export_config)
+                .await
+                .map_err(|e| BuildError::RegistryError {
+                    message: format!("failed to export WASM as OCI artifact: {e}"),
+                })?;
+
+        // Write the OCI image layout to disk next to the WASM file. The
+        // layout directory name is `<module>-oci`, mirroring the CLI
+        // `zlayer wasm export` layout in bin/zlayer/src/commands/wasm.rs.
+        let layout_parent = wasm_path
+            .parent()
+            .map_or_else(|| self.context.clone(), Path::to_path_buf);
+        let oci_dir = layout_parent.join(format!("{module_name}-oci"));
+        write_wasm_oci_layout(&oci_dir, &export, &module_name).await?;
+
+        info!(
+            manifest_digest = %export.manifest_digest,
+            artifact_type = %export.artifact_type,
+            oci_path = %oci_dir.display(),
+            "WASM OCI artifact written"
+        );
+
         Ok(BuildOutput::WasmArtifact {
             wasm_path,
-            oci_path: None,
+            oci_path: Some(oci_dir),
+            manifest_digest: Some(export.manifest_digest),
+            artifact_type: Some(export.artifact_type),
             language: language_name,
             optimized: wasm_config.optimize,
             size,
@@ -1738,6 +1866,113 @@ impl ImageBuilder {
         Ok(tag)
     }
 
+    /// Push the WASM OCI artifact produced by `handle_wasm_build` to every
+    /// user-supplied registry tag.
+    ///
+    /// Mirrors the container push flow in [`BuildahBackend::build_image`]:
+    /// when `options.push` is true, each tag in `options.tags` is pushed.
+    /// Tags that look like bare image names (no registry host, e.g.
+    /// `myapp:wasm`) are skipped with an info log, matching how bare tags
+    /// are treated elsewhere — a registryless tag has nowhere to be pushed.
+    ///
+    /// Re-runs [`export_wasm_as_oci`] on the produced `wasm_path` to obtain
+    /// the [`WasmExportResult`] blobs required by [`ImagePuller::push_wasm`].
+    /// The export is deterministic (same WASM binary produces the same
+    /// blobs and digests), so the digests match the layout on disk at
+    /// `oci_dir` that A1.2 wrote.
+    ///
+    /// [`BuildahBackend::build_image`]: crate::backend::buildah::BuildahBackend
+    /// [`export_wasm_as_oci`]: zlayer_registry::export_wasm_as_oci
+    /// [`WasmExportResult`]: zlayer_registry::WasmExportResult
+    /// [`ImagePuller::push_wasm`]: zlayer_registry::ImagePuller::push_wasm
+    #[cfg(feature = "local-registry")]
+    async fn push_wasm_oci(&self, wasm_path: &Path, oci_dir: &Path) -> Result<()> {
+        use zlayer_registry::wasm::WasiVersion;
+        use zlayer_registry::{export_wasm_as_oci, BlobCache, ImagePuller, WasmExportConfig};
+
+        // Derive the module name the same way `handle_wasm_build` did so the
+        // re-exported artifact carries identical OCI annotations.
+        let module_name = self
+            .options
+            .tags
+            .first()
+            .map(|t| module_name_from_tag(t))
+            .or_else(|| {
+                wasm_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "wasm-module".to_string());
+
+        // Reconstruct the export result from the on-disk WASM binary. The
+        // `wasi_version` is left `None` so it is re-detected from the binary
+        // (matches whatever A1.2 wrote unless the user mutated the file).
+        let export_config = WasmExportConfig {
+            wasm_path: wasm_path.to_path_buf(),
+            module_name,
+            wasi_version: None::<WasiVersion>,
+            annotations: HashMap::new(),
+        };
+        let export =
+            export_wasm_as_oci(&export_config)
+                .await
+                .map_err(|e| BuildError::RegistryError {
+                    message: format!(
+                        "failed to re-export WASM for push from {}: {e}",
+                        wasm_path.display()
+                    ),
+                })?;
+
+        // Build the puller once; reuse for every tag.
+        let cache = BlobCache::new().map_err(|e| BuildError::RegistryError {
+            message: format!("failed to create blob cache for WASM push: {e}"),
+        })?;
+        let puller = ImagePuller::new(cache);
+
+        for tag in &self.options.tags {
+            if !tag_has_registry_host(tag) {
+                info!(
+                    "Skipping WASM push for bare tag '{}' (no registry host); \
+                     OCI layout still available at {}",
+                    tag,
+                    oci_dir.display()
+                );
+                continue;
+            }
+
+            let oci_auth = Self::resolve_wasm_push_auth(self.options.registry_auth.as_ref());
+
+            info!("Pushing WASM artifact: {}", tag);
+            let push_result = puller
+                .push_wasm(tag, &export, &oci_auth)
+                .await
+                .map_err(|e| BuildError::RegistryError {
+                    message: format!("failed to push WASM artifact '{tag}': {e}"),
+                })?;
+            info!(
+                "Pushed WASM artifact: {} (manifest digest: {})",
+                tag, push_result.manifest_digest
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Resolve registry auth for a WASM push.
+    ///
+    /// Uses the explicitly provided credentials when set; otherwise falls
+    /// back to anonymous. Mirrors the minimal behaviour of the buildah push
+    /// path (`--creds user:pass` when provided, otherwise let the registry
+    /// decide).
+    #[cfg(feature = "local-registry")]
+    fn resolve_wasm_push_auth(auth: Option<&RegistryAuth>) -> zlayer_registry::RegistryAuth {
+        match auth {
+            Some(a) => zlayer_registry::RegistryAuth::Basic(a.username.clone(), a.password.clone()),
+            None => zlayer_registry::RegistryAuth::Anonymous,
+        }
+    }
+
     /// Send an event to the TUI (if configured)
     fn send_event(&self, event: BuildEvent) {
         if let Some(tx) = &self.event_tx {
@@ -1766,6 +2001,123 @@ fn zcommand_to_args(cmd: &crate::zimage::ZCommand) -> Vec<String> {
         }
         crate::zimage::ZCommand::Exec(args) => args.clone(),
     }
+}
+
+/// Extract a short "module name" suitable for OCI annotations from an image
+/// tag. Strips any registry host, leading path segments, and tag/digest.
+///
+/// Examples:
+/// - `myapp:latest` -> `myapp`
+/// - `ghcr.io/org/myapp:v1.2.3` -> `myapp`
+/// - `myapp@sha256:...` -> `myapp`
+fn module_name_from_tag(tag: &str) -> String {
+    let last_segment = tag.rsplit('/').next().unwrap_or(tag);
+    let without_tag = last_segment.split(':').next().unwrap_or(last_segment);
+    let without_digest = without_tag.split('@').next().unwrap_or(without_tag);
+    without_digest.to_string()
+}
+
+/// Heuristic: does `tag` include an explicit registry host?
+///
+/// Used to decide which tags are push-eligible. A tag is treated as
+/// registry-qualified when it has at least one `/` and the first path
+/// component looks like a host — it contains a `.` (FQDN like `ghcr.io`,
+/// `registry.example.com`), a `:` (host:port like `localhost:5000`), or
+/// equals the literal `localhost`. Bare names like `myapp:wasm` and
+/// Docker-Hub-style `org/app:v1` are skipped because there is no explicit
+/// registry to push to.
+#[cfg(feature = "local-registry")]
+fn tag_has_registry_host(tag: &str) -> bool {
+    // No `/` means the whole string is `name[:tag]` with no host component.
+    if !tag.contains('/') {
+        return false;
+    }
+    let Some(first) = tag.split('/').next() else {
+        return false;
+    };
+    first.contains('.') || first.contains(':') || first == "localhost"
+}
+
+/// Write an OCI image layout directory (`oci-layout`, `index.json`,
+/// `blobs/sha256/...`) for a WASM artifact on disk. This mirrors the layout
+/// emitted by the `zlayer wasm export` CLI command so the directory can be
+/// consumed by tools that expect a standard OCI layout.
+async fn write_wasm_oci_layout(
+    oci_dir: &Path,
+    export: &zlayer_registry::WasmExportResult,
+    ref_name: &str,
+) -> Result<()> {
+    let map_io = |path: PathBuf| {
+        move |e: std::io::Error| BuildError::ContextRead {
+            path: path.clone(),
+            source: e,
+        }
+    };
+
+    fs::create_dir_all(oci_dir)
+        .await
+        .map_err(map_io(oci_dir.to_path_buf()))?;
+
+    // `oci-layout` marker file.
+    let layout_marker = oci_dir.join("oci-layout");
+    let oci_layout = serde_json::json!({ "imageLayoutVersion": "1.0.0" });
+    fs::write(
+        &layout_marker,
+        serde_json::to_vec_pretty(&oci_layout).map_err(|e| BuildError::RegistryError {
+            message: format!("failed to serialize oci-layout marker: {e}"),
+        })?,
+    )
+    .await
+    .map_err(map_io(layout_marker.clone()))?;
+
+    // `blobs/sha256/` directory.
+    let blobs_dir = oci_dir.join("blobs").join("sha256");
+    fs::create_dir_all(&blobs_dir)
+        .await
+        .map_err(map_io(blobs_dir.clone()))?;
+
+    // Write config, wasm-layer, and manifest blobs under their digests.
+    let write_blob = |digest: &str, data: &[u8]| {
+        let hash = digest.strip_prefix("sha256:").unwrap_or(digest).to_string();
+        let path = blobs_dir.join(hash);
+        let data = data.to_vec();
+        async move {
+            fs::write(&path, &data)
+                .await
+                .map_err(map_io(path.clone()))?;
+            Ok::<(), BuildError>(())
+        }
+    };
+
+    write_blob(&export.config_digest, &export.config_blob).await?;
+    write_blob(&export.wasm_layer_digest, &export.wasm_binary).await?;
+    write_blob(&export.manifest_digest, &export.manifest_json).await?;
+
+    // Write `index.json` pointing at the manifest.
+    let index = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [{
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "digest": export.manifest_digest,
+            "size": export.manifest_size,
+            "artifactType": export.artifact_type,
+            "annotations": {
+                "org.opencontainers.image.ref.name": ref_name,
+            }
+        }]
+    });
+    let index_path = oci_dir.join("index.json");
+    fs::write(
+        &index_path,
+        serde_json::to_vec_pretty(&index).map_err(|e| BuildError::RegistryError {
+            message: format!("failed to serialize OCI index.json: {e}"),
+        })?,
+    )
+    .await
+    .map_err(map_io(index_path.clone()))?;
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -5,7 +5,7 @@
 use anyhow::{Context, Result};
 use zlayer_api::storage::AuditEntry;
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// `zlayer audit tail` -- print recent audit log entries.
 pub async fn tail(

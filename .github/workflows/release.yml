@@ -95,9 +95,17 @@ jobs:
 
       - name: Create or update tag
         run: |
+          set -euo pipefail
           TAG="${{ steps.version.outputs.tag }}"
-          git tag -f "${TAG}"
-          git push origin "${TAG}" --force
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists locally — reusing."
+          else
+            git tag "${TAG}"
+          fi
+          # Non-force push. If the remote tag already points elsewhere this
+          # will fail and the release job stops — a human must investigate
+          # rather than silently rewriting history for downstream consumers.
+          git push origin "${TAG}"
 
       - name: Delete existing release
         env:

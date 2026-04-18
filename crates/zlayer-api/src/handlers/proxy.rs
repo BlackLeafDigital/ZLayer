@@ -205,6 +205,16 @@ pub struct StreamsResponse {
 /// # Errors
 ///
 /// Returns `ApiError::ServiceUnavailable` if the service registry is not initialised.
+#[utoipa::path(
+    get,
+    path = "/api/v1/proxy/routes",
+    responses(
+        (status = 200, description = "List of routes", body = RoutesResponse),
+        (status = 503, description = "Service registry not available"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Proxy"
+)]
 pub async fn list_routes(State(state): State<ProxyApiState>) -> Result<Json<RoutesResponse>> {
     let registry = state.registry.as_ref().ok_or(ApiError::ServiceUnavailable(
         "Service registry not available".to_string(),
@@ -245,6 +255,16 @@ pub async fn list_routes(State(state): State<ProxyApiState>) -> Result<Json<Rout
 /// # Errors
 ///
 /// Returns `ApiError::ServiceUnavailable` if the load balancer is not initialised.
+#[utoipa::path(
+    get,
+    path = "/api/v1/proxy/backends",
+    responses(
+        (status = 200, description = "Load-balancer backend groups", body = BackendsResponse),
+        (status = 503, description = "Load balancer not available"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Proxy"
+)]
 pub async fn list_backends(State(state): State<ProxyApiState>) -> Result<Json<BackendsResponse>> {
     let lb = state
         .load_balancer
@@ -299,6 +319,16 @@ pub async fn list_backends(State(state): State<ProxyApiState>) -> Result<Json<Ba
 /// # Errors
 ///
 /// Returns `ApiError::ServiceUnavailable` if the certificate manager is not initialised.
+#[utoipa::path(
+    get,
+    path = "/api/v1/proxy/tls",
+    responses(
+        (status = 200, description = "Loaded TLS certificates", body = TlsResponse),
+        (status = 503, description = "Certificate manager not available"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Proxy"
+)]
 pub async fn list_tls(State(state): State<ProxyApiState>) -> Result<Json<TlsResponse>> {
     let cm = state
         .cert_manager
@@ -341,6 +371,16 @@ pub async fn list_tls(State(state): State<ProxyApiState>) -> Result<Json<TlsResp
 /// # Errors
 ///
 /// Returns `ApiError::ServiceUnavailable` if the stream registry is not initialised.
+#[utoipa::path(
+    get,
+    path = "/api/v1/proxy/streams",
+    responses(
+        (status = 200, description = "L4 stream proxies", body = StreamsResponse),
+        (status = 503, description = "Stream registry not available"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Proxy"
+)]
 pub async fn list_streams(State(state): State<ProxyApiState>) -> Result<Json<StreamsResponse>> {
     let sr = state
         .stream_registry

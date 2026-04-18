@@ -17,7 +17,7 @@ use anyhow::{anyhow, bail, Result};
 use dialoguer::Select;
 use tracing::debug;
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// A candidate (deployment, service) pair matched during resolution.
 #[derive(Debug, Clone, PartialEq, Eq)]

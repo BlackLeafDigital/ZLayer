@@ -1612,6 +1612,87 @@ impl Runtime for WasmRuntime {
         // They're reachable at localhost but don't have a separate container IP.
         Ok(Some(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
     }
+
+    /// Abort a running WASM instance.
+    ///
+    /// WASM modules don't have POSIX signals; the `signal` parameter is
+    /// validated for API parity with container backends but otherwise ignored
+    /// — any accepted signal triggers a wasmtime interruption via the
+    /// execution handle's abort.
+    async fn kill_container(&self, id: &ContainerId, signal: Option<&str>) -> Result<()> {
+        let _canonical = crate::runtime::validate_signal(signal.unwrap_or("SIGKILL"))?;
+        let instance_id = self.instance_id(id);
+
+        tracing::info!(instance = %instance_id, "killing WASM instance");
+
+        let mut instances = self.instances.write().await;
+        let instance = instances
+            .get_mut(&instance_id)
+            .ok_or_else(|| AgentError::NotFound {
+                container: instance_id.clone(),
+                reason: "WASM instance not found".to_string(),
+            })?;
+
+        if !matches!(instance.state, InstanceState::Running { .. }) {
+            // Idempotent: already terminal, nothing to do.
+            return Ok(());
+        }
+
+        if let Some(handle) = instance.execution_handle.take() {
+            handle.abort();
+        }
+        instance.state = InstanceState::Failed {
+            reason: "killed".to_string(),
+        };
+        Ok(())
+    }
+
+    /// Tag a cached WASM image.
+    ///
+    /// The WASM runtime caches modules on disk keyed by the source reference.
+    /// Tagging re-uses that cache entry under the new reference so subsequent
+    /// pulls with the new reference resolve locally.
+    async fn tag_image(&self, source: &str, target: &str) -> Result<()> {
+        if source.trim().is_empty() || target.trim().is_empty() {
+            return Err(AgentError::InvalidSpec(
+                "source and target must be non-empty image references".to_string(),
+            ));
+        }
+        if source == target {
+            return Ok(());
+        }
+
+        let sanitize = |s: &str| s.replace(['/', ':', '@'], "_");
+        let src_path = self
+            .config
+            .cache_dir
+            .join(format!("{}.wasm", sanitize(source)));
+        let dst_path = self
+            .config
+            .cache_dir
+            .join(format!("{}.wasm", sanitize(target)));
+
+        if !src_path.exists() {
+            return Err(AgentError::NotFound {
+                container: source.to_string(),
+                reason: format!(
+                    "source WASM module '{source}' not found in cache ({})",
+                    src_path.display()
+                ),
+            });
+        }
+
+        // Overwrite dst_path by copying the module bytes. Copying (vs. hard
+        // linking) keeps behaviour identical across filesystems.
+        tokio::fs::copy(&src_path, &dst_path).await.map_err(|e| {
+            AgentError::Internal(format!(
+                "failed to tag WASM module '{source}' -> '{target}': {e}"
+            ))
+        })?;
+
+        tracing::info!(source = %source, target = %target, "tagged WASM module");
+        Ok(())
+    }
 }
 
 #[cfg(test)]

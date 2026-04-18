@@ -10,7 +10,7 @@
 use anyhow::Result;
 
 use crate::cli::{Cli, ContainerCommands};
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// Entry point for `zlayer container <subcommand>`.
 pub(crate) async fn handle_container(_cli: &Cli, cmd: &ContainerCommands) -> Result<()> {

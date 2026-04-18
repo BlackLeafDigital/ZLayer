@@ -45,6 +45,7 @@ zlayer-tui.workspace = true
 
 # CLI
 clap = { workspace = true, features = ["derive", "env"] }
+clap_complete = "4"
 # Interactive prompts for disambiguation
 dialoguer = { version = "0.11", default-features = false, features = ["password"] }
 
@@ -84,9 +85,15 @@ tokio-stream = { workspace = true }
 num_cpus = { workspace = true }
 zlayer-paths.workspace = true
 
+# Daemon HTTP-over-UDS client + session file (extracted from this crate)
+zlayer-client.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 # Internal crates (Unix-only -- depend on boringtun, libcontainer, etc.)
-zlayer-agent.workspace = true
+# Enable `youki-runtime` so this binary builds with the libcontainer-backed
+# Linux runtime. The feature is a no-op on macOS (libcontainer dep is target-
+# gated to Linux) but keeps the manifest declaration uniform across Unix.
+zlayer-agent = { workspace = true, features = ["youki-runtime"] }
 zlayer-overlay.workspace = true
 zlayer-api.workspace = true
 zlayer-proxy.workspace = true

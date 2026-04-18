@@ -208,6 +208,66 @@ pub trait Runtime: Send + Sync {
             "prune_images is not supported by this runtime".into(),
         ))
     }
+
+    /// Send a signal to a running container.
+    ///
+    /// When `signal` is `None`, the runtime sends `SIGKILL` (matching Docker's
+    /// `docker kill` default). Backends validate the signal name and reject
+    /// anything outside the standard POSIX set (`SIGKILL`, `SIGTERM`, `SIGINT`,
+    /// `SIGHUP`, `SIGUSR1`, `SIGUSR2`).
+    ///
+    /// Used by `POST /api/v1/containers/{id}/kill` and Docker-compat
+    /// `docker kill`. The default implementation returns
+    /// [`AgentError::Unsupported`].
+    async fn kill_container(&self, _id: &ContainerId, _signal: Option<&str>) -> Result<()> {
+        Err(AgentError::Unsupported(
+            "kill_container is not supported by this runtime".into(),
+        ))
+    }
+
+    /// Create a new tag pointing at an existing image.
+    ///
+    /// `source` is the reference to an already-cached image. `target` is the
+    /// new reference to create — it must be a full reference (repository + tag).
+    ///
+    /// Used by `POST /api/v1/images/tag` and Docker-compat `docker tag`. The
+    /// default implementation returns [`AgentError::Unsupported`].
+    async fn tag_image(&self, _source: &str, _target: &str) -> Result<()> {
+        Err(AgentError::Unsupported(
+            "tag_image is not supported by this runtime".into(),
+        ))
+    }
+}
+
+/// Validate a signal name for [`Runtime::kill_container`].
+///
+/// Accepts both the `SIG`-prefixed form (`"SIGKILL"`) and the bare form
+/// (`"KILL"`). Returns the canonical uppercase `SIG`-prefixed name on success.
+///
+/// # Errors
+///
+/// Returns [`AgentError::InvalidSpec`] when `signal` is not one of the
+/// supported signals: `SIGKILL`, `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGUSR1`,
+/// `SIGUSR2`.
+pub fn validate_signal(signal: &str) -> Result<String> {
+    let trimmed = signal.trim();
+    if trimmed.is_empty() {
+        return Err(AgentError::InvalidSpec(
+            "signal must not be empty".to_string(),
+        ));
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    let canonical = if upper.starts_with("SIG") {
+        upper
+    } else {
+        format!("SIG{upper}")
+    };
+    match canonical.as_str() {
+        "SIGKILL" | "SIGTERM" | "SIGINT" | "SIGHUP" | "SIGUSR1" | "SIGUSR2" => Ok(canonical),
+        other => Err(AgentError::InvalidSpec(format!(
+            "unsupported signal '{other}'; allowed: SIGKILL, SIGTERM, SIGINT, SIGHUP, SIGUSR1, SIGUSR2"
+        ))),
+    }
 }
 
 /// Auth context injected into every container so it can talk back to the host
@@ -453,6 +513,24 @@ impl Runtime for MockRuntime {
     async fn prune_images(&self) -> Result<PruneResult> {
         Ok(PruneResult::default())
     }
+
+    async fn kill_container(&self, id: &ContainerId, signal: Option<&str>) -> Result<()> {
+        // Validate signal even in the mock so callers exercise the same error
+        // path. Default to SIGKILL when omitted.
+        let _canonical = validate_signal(signal.unwrap_or("SIGKILL"))?;
+        let mut containers = self.containers.write().await;
+        let container = containers.get_mut(id).ok_or_else(|| AgentError::NotFound {
+            container: id.to_string(),
+            reason: "container not found".to_string(),
+        })?;
+        container.state = ContainerState::Exited { code: 137 };
+        Ok(())
+    }
+
+    async fn tag_image(&self, _source: &str, _target: &str) -> Result<()> {
+        // The in-memory mock doesn't store images; treat tag as a no-op success.
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -473,6 +551,88 @@ mod tests {
 
         let state = runtime.container_state(&id).await.unwrap();
         assert_eq!(state, ContainerState::Running);
+    }
+
+    #[test]
+    fn validate_signal_accepts_known_signals() {
+        // SIG-prefixed form
+        assert_eq!(validate_signal("SIGKILL").unwrap(), "SIGKILL");
+        assert_eq!(validate_signal("SIGTERM").unwrap(), "SIGTERM");
+        assert_eq!(validate_signal("SIGINT").unwrap(), "SIGINT");
+        assert_eq!(validate_signal("SIGHUP").unwrap(), "SIGHUP");
+        assert_eq!(validate_signal("SIGUSR1").unwrap(), "SIGUSR1");
+        assert_eq!(validate_signal("SIGUSR2").unwrap(), "SIGUSR2");
+
+        // Bare form (no "SIG" prefix) should be canonicalised.
+        assert_eq!(validate_signal("KILL").unwrap(), "SIGKILL");
+        assert_eq!(validate_signal("term").unwrap(), "SIGTERM");
+        // Whitespace around the name is tolerated.
+        assert_eq!(validate_signal(" INT ").unwrap(), "SIGINT");
+    }
+
+    #[test]
+    fn validate_signal_rejects_unknown_or_empty() {
+        assert!(matches!(
+            validate_signal(""),
+            Err(AgentError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            validate_signal("   "),
+            Err(AgentError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            validate_signal("SIGSEGV"),
+            Err(AgentError::InvalidSpec(_))
+        ));
+        assert!(matches!(
+            validate_signal("NOPE"),
+            Err(AgentError::InvalidSpec(_))
+        ));
+        // Signals outside the POSIX allowlist are rejected even if real.
+        assert!(matches!(
+            validate_signal("SIGPIPE"),
+            Err(AgentError::InvalidSpec(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn mock_kill_container_defaults_to_sigkill() {
+        let runtime = MockRuntime::new();
+        let id = ContainerId {
+            service: "kill-me".to_string(),
+            replica: 0,
+        };
+        runtime.create_container(&id, &mock_spec()).await.unwrap();
+        runtime.start_container(&id).await.unwrap();
+
+        // `None` -> defaults to SIGKILL; returns Ok and marks the container
+        // as exited.
+        runtime.kill_container(&id, None).await.unwrap();
+        let state = runtime.container_state(&id).await.unwrap();
+        assert!(
+            matches!(state, ContainerState::Exited { code: 137 }),
+            "expected Exited(137), got {state:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_kill_container_rejects_bogus_signal() {
+        let runtime = MockRuntime::new();
+        let id = ContainerId {
+            service: "kill-me".to_string(),
+            replica: 0,
+        };
+        runtime.create_container(&id, &mock_spec()).await.unwrap();
+        runtime.start_container(&id).await.unwrap();
+
+        let err = runtime
+            .kill_container(&id, Some("SIGFOO"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AgentError::InvalidSpec(_)),
+            "expected InvalidSpec, got {err:?}"
+        );
     }
 
     fn mock_spec() -> ServiceSpec {

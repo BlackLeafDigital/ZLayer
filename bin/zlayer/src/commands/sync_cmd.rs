@@ -6,7 +6,7 @@
 use anyhow::{bail, Context, Result};
 use dialoguer::Confirm;
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// `zlayer sync ls [--output table|json]`.
 pub async fn list(output: &str) -> Result<()> {

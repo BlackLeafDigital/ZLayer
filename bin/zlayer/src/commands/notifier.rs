@@ -9,7 +9,7 @@
 use anyhow::{Context, Result};
 use zlayer_api::storage::{NotifierConfig, NotifierKind, StoredNotifier};
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// `zlayer notifier list [--output table|json]`.
 pub async fn list(output: &str) -> Result<()> {

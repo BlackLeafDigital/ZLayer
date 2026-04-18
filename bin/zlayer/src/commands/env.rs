@@ -14,7 +14,7 @@ use anyhow::{bail, Context, Result};
 use dialoguer::Confirm;
 use zlayer_api::storage::StoredEnvironment;
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// `zlayer env ls [--project <id>] [--output table|json]`.
 pub async fn list(project: Option<String>, output: &str) -> Result<()> {

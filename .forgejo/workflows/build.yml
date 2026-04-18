@@ -108,15 +108,37 @@ jobs:
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --package zlayer || cargo build --release --package zlayer
+      - name: Generate shell completions
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          mkdir -p completions
+          "$CARGO_TARGET_DIR/release/zlayer" completions bash > completions/zlayer.bash
+          "$CARGO_TARGET_DIR/release/zlayer" completions zsh > completions/_zlayer
+          "$CARGO_TARGET_DIR/release/zlayer" completions fish > completions/zlayer.fish
+          "$CARGO_TARGET_DIR/release/zlayer" completions powershell > completions/zlayer.ps1
+          "$CARGO_TARGET_DIR/release/zlayer" completions elvish > completions/zlayer.elv
       - name: Package
         if: steps.check.outputs.completed != 'true'
-        run: tar czf "zlayer-linux-amd64.tar.gz" -C $CARGO_TARGET_DIR/release zlayer
+        run: |
+          cp -r completions "$CARGO_TARGET_DIR/release/completions"
+          tar czf "zlayer-linux-amd64.tar.gz" -C "$CARGO_TARGET_DIR/release" zlayer completions
+      - name: Package completions (standalone)
+        if: steps.check.outputs.completed != 'true'
+        run: tar czf "zlayer-completions.tar.gz" completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: zlayer-linux-amd64
           path: zlayer-linux-amd64.tar.gz
+          retention-days: 1
+      - name: Upload completions artifact
+        if: steps.check.outputs.completed != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: zlayer-completions
+          path: zlayer-completions.tar.gz
           retention-days: 1
       - name: Mark step complete
         if: steps.check.outputs.completed != 'true'
@@ -130,7 +152,7 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Cleanup
         if: steps.check.outputs.completed != 'true'
-        run: rm -rf $CARGO_TARGET_DIR zlayer-linux-amd64.tar.gz
+        run: rm -rf $CARGO_TARGET_DIR zlayer-linux-amd64.tar.gz zlayer-completions.tar.gz completions
 
   build-macos-arm64:
     needs: [check-existing]
@@ -189,12 +211,26 @@ jobs:
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --target aarch64-apple-darwin --package zlayer
+      - name: Generate shell completions
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          # macos-latest runners on Forgejo are Apple Silicon, so the
+          # aarch64-apple-darwin binary runs natively on the host.
+          mkdir -p completions
+          "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/zlayer" completions bash > completions/zlayer.bash
+          "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/zlayer" completions zsh > completions/_zlayer
+          "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/zlayer" completions fish > completions/zlayer.fish
+          "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/zlayer" completions powershell > completions/zlayer.ps1
+          "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/zlayer" completions elvish > completions/zlayer.elv
       - name: Package
         if: steps.check.outputs.completed != 'true'
-        run: tar czf "zlayer-darwin-arm64.tar.gz" -C $CARGO_TARGET_DIR/aarch64-apple-darwin/release zlayer
+        run: |
+          cp -r completions "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/completions"
+          tar czf "zlayer-darwin-arm64.tar.gz" -C "$CARGO_TARGET_DIR/aarch64-apple-darwin/release" zlayer completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: zlayer-darwin-arm64
           path: zlayer-darwin-arm64.tar.gz
@@ -211,7 +247,7 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Cleanup
         if: steps.check.outputs.completed != 'true'
-        run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-arm64.tar.gz
+        run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-arm64.tar.gz completions
 
   build-windows-amd64:
     needs: [check-existing]
@@ -274,13 +310,24 @@ jobs:
         with:
           packages: '7zip'
           cross-platform: 'true'
+      - name: Generate shell completions
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          # Runner and binary target are both windows-x86_64; binary runs natively.
+          mkdir -p completions
+          ./target/release/zlayer.exe completions bash > completions/zlayer.bash
+          ./target/release/zlayer.exe completions zsh > completions/_zlayer
+          ./target/release/zlayer.exe completions fish > completions/zlayer.fish
+          ./target/release/zlayer.exe completions powershell > completions/zlayer.ps1
+          ./target/release/zlayer.exe completions elvish > completions/zlayer.elv
       - name: Package
         if: steps.check.outputs.completed != 'true'
         shell: bash
-        run: 7z a zlayer-windows-amd64.zip target/release/zlayer.exe
+        run: 7z a zlayer-windows-amd64.zip target/release/zlayer.exe completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: zlayer-windows-amd64
           path: zlayer-windows-amd64.zip
@@ -328,7 +375,7 @@ jobs:
           cross-platform: 'true'
       - name: Download zlayer
         if: steps.check.outputs.completed != 'true'
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: zlayer-linux-amd64
       - name: Install zlayer
@@ -359,7 +406,7 @@ jobs:
 
       - name: Upload image artifacts
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: container-images
           path: |
@@ -380,7 +427,7 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   build-macos-amd64:
-    needs: [check-existing, build-macos-arm64]
+    needs: [check-existing, build-macos-arm64, build-linux-amd64]
     if: needs.check-existing.outputs.need_build == 'true'
     runs-on: macos-latest
     timeout-minutes: 45
@@ -433,12 +480,27 @@ jobs:
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cargo build --release --target x86_64-apple-darwin --package zlayer
+      - name: Download shell completions
+        if: steps.check.outputs.completed != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: zlayer-completions
+      - name: Unpack completions
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          # Completion scripts are platform-agnostic text (generated from
+          # the clap tree). The x86_64-apple-darwin binary can't run on the
+          # Apple Silicon runner without Rosetta, so reuse the bytes
+          # produced by build-linux-amd64.
+          tar xzf zlayer-completions.tar.gz
+          cp -r completions "$CARGO_TARGET_DIR/x86_64-apple-darwin/release/completions"
       - name: Package
         if: steps.check.outputs.completed != 'true'
-        run: tar czf "zlayer-darwin-amd64.tar.gz" -C $CARGO_TARGET_DIR/x86_64-apple-darwin/release zlayer
+        run: tar czf "zlayer-darwin-amd64.tar.gz" -C "$CARGO_TARGET_DIR/x86_64-apple-darwin/release" zlayer completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: zlayer-darwin-amd64
           path: zlayer-darwin-amd64.tar.gz
@@ -455,7 +517,7 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Cleanup
         if: steps.check.outputs.completed != 'true'
-        run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-amd64.tar.gz
+        run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-amd64.tar.gz zlayer-completions.tar.gz completions
 
   # ===========================================
   # Wave 3: Linux arm64 (cross-compile, slowest)
@@ -516,12 +578,26 @@ jobs:
       - name: Build
         if: steps.check.outputs.completed != 'true'
         run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer --target-dir $CROSS_TARGET_DIR
+      - name: Download shell completions
+        if: steps.check.outputs.completed != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: zlayer-completions
+      - name: Unpack completions
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          # Cross-compile: aarch64 binary can't run on x86_64 runner without
+          # qemu. Completion scripts are platform-agnostic so we reuse the
+          # bytes produced by build-linux-amd64.
+          tar xzf zlayer-completions.tar.gz
+          cp -r completions "$CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release/completions"
       - name: Package
         if: steps.check.outputs.completed != 'true'
-        run: tar czf "zlayer-linux-arm64.tar.gz" -C $CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release zlayer
+        run: tar czf "zlayer-linux-arm64.tar.gz" -C "$CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release" zlayer completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: zlayer-linux-arm64
           path: zlayer-linux-arm64.tar.gz
@@ -538,7 +614,7 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Cleanup
         if: steps.check.outputs.completed != 'true'
-        run: rm -rf $CROSS_TARGET_DIR zlayer-linux-arm64.tar.gz
+        run: rm -rf $CROSS_TARGET_DIR zlayer-linux-arm64.tar.gz zlayer-completions.tar.gz completions
 
   # ===========================================
   # Verify all builds passed
@@ -584,7 +660,7 @@ jobs:
 
       - name: Download all artifacts
         if: steps.check.outputs.completed != 'true'
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
 

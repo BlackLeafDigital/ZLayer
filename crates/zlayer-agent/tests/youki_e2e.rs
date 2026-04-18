@@ -1,4 +1,4 @@
-#![cfg(target_os = "linux")]
+#![cfg(all(target_os = "linux", feature = "youki-runtime"))]
 #![allow(deprecated)]
 //! End-to-end integration tests for `ZLayer` with youki/libcontainer runtime
 //!

@@ -1,0 +1,745 @@
+name: Publish SDKs
+
+# Dispatched by release.yml on general releases. Uses detect-changes with
+# registry checks to skip SDKs that are already published at the target version.
+# Covers the Python binding (zlayer-py), TypeScript API clients, and the
+# WASM plugin SDKs (rust, python, typescript, go, c).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish (e.g., 0.10.104)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
+
+jobs:
+  # ===========================================
+  # Detect which SDKs actually need publishing
+  # ===========================================
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      services-to-release: ${{ steps.detect.outputs.services-to-release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Detect changes
+        id: detect
+        uses: https://forge.blackleafdigital.com/Public/actions/detect-changes@main
+        with:
+          config-path: .forgejo/build-config.yaml
+          check-registry: 'true'
+          version: ${{ inputs.version }}
+
+  # ===========================================
+  # zlayer-py (Python binding) -> PyPI as `zlayer`
+  # ===========================================
+  publish-py-binding-build-linux-x86_64:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    name: Build wheel (linux-x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set pyproject version
+        shell: bash
+        working-directory: crates/zlayer-py
+        run: |
+          VERSION="${{ inputs.version }}"
+          if grep -qE '^version = ' pyproject.toml; then
+            sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
+          else
+            sed -i "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
+          fi
+          grep -E '^(version|dynamic) = ' pyproject.toml || true
+
+      - name: Build wheel (manylinux_2_28 x86_64)
+        uses: https://github.com/PyO3/maturin-action@v1
+        with:
+          working-directory: crates/zlayer-py
+          target: x86_64-unknown-linux-gnu
+          manylinux: '2_28'
+          args: --release --out dist --find-interpreter
+
+      - name: Upload artifact
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: wheels-linux-x86_64
+          path: crates/zlayer-py/dist/*.whl
+          retention-days: 7
+
+  publish-py-binding-build-linux-aarch64:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    name: Build wheel (linux-aarch64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set pyproject version
+        shell: bash
+        working-directory: crates/zlayer-py
+        run: |
+          VERSION="${{ inputs.version }}"
+          if grep -qE '^version = ' pyproject.toml; then
+            sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
+          else
+            sed -i "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
+          fi
+          grep -E '^(version|dynamic) = ' pyproject.toml || true
+
+      - name: Build wheel (manylinux_2_28 aarch64)
+        uses: https://github.com/PyO3/maturin-action@v1
+        with:
+          working-directory: crates/zlayer-py
+          target: aarch64-unknown-linux-gnu
+          manylinux: '2_28'
+          args: --release --out dist --find-interpreter
+
+      - name: Upload artifact
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: wheels-linux-aarch64
+          path: crates/zlayer-py/dist/*.whl
+          retention-days: 7
+
+  publish-py-binding-build-macos-x86_64:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    name: Build wheel (macos-x86_64)
+    runs-on: macos-13
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system deps
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf'
+          cross-platform: 'true'
+
+      - name: Set pyproject version
+        shell: bash
+        working-directory: crates/zlayer-py
+        run: |
+          VERSION="${{ inputs.version }}"
+          if grep -qE '^version = ' pyproject.toml; then
+            sed -i '' "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
+          else
+            sed -i '' "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
+          fi
+          grep -E '^(version|dynamic) = ' pyproject.toml || true
+
+      - name: Build wheel (macOS x86_64)
+        uses: https://github.com/PyO3/maturin-action@v1
+        with:
+          working-directory: crates/zlayer-py
+          target: x86_64-apple-darwin
+          args: --release --out dist --find-interpreter
+
+      - name: Upload artifact
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: wheels-macos-x86_64
+          path: crates/zlayer-py/dist/*.whl
+          retention-days: 7
+
+  publish-py-binding-build-macos-aarch64:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    name: Build wheel (macos-aarch64)
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install system deps
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf'
+          cross-platform: 'true'
+
+      - name: Set pyproject version
+        shell: bash
+        working-directory: crates/zlayer-py
+        run: |
+          VERSION="${{ inputs.version }}"
+          if grep -qE '^version = ' pyproject.toml; then
+            sed -i '' "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
+          else
+            sed -i '' "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
+          fi
+          grep -E '^(version|dynamic) = ' pyproject.toml || true
+
+      - name: Build wheel (macOS aarch64)
+        uses: https://github.com/PyO3/maturin-action@v1
+        with:
+          working-directory: crates/zlayer-py
+          target: aarch64-apple-darwin
+          args: --release --out dist --find-interpreter
+
+      - name: Upload artifact
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: wheels-macos-aarch64
+          path: crates/zlayer-py/dist/*.whl
+          retention-days: 7
+
+  publish-py-binding-build-windows-x86_64:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    name: Build wheel (windows-x86_64)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install protobuf
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protoc'
+          cross-platform: 'true'
+
+      - name: Export PROTOC env
+        shell: bash
+        run: echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
+
+      - name: Set pyproject version
+        shell: bash
+        working-directory: crates/zlayer-py
+        run: |
+          VERSION="${{ inputs.version }}"
+          if grep -qE '^version = ' pyproject.toml; then
+            sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
+          else
+            sed -i "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
+          fi
+          grep -E '^(version|dynamic) = ' pyproject.toml || true
+
+      - name: Build wheel (Windows x86_64)
+        uses: https://github.com/PyO3/maturin-action@v1
+        with:
+          working-directory: crates/zlayer-py
+          target: x86_64-pc-windows-msvc
+          args: --release --out dist --find-interpreter
+
+      - name: Upload artifact
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: wheels-windows-x86_64
+          path: crates/zlayer-py/dist/*.whl
+          retention-days: 7
+
+  publish-py-binding-build-sdist:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    name: Build sdist
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set pyproject version
+        shell: bash
+        working-directory: crates/zlayer-py
+        run: |
+          VERSION="${{ inputs.version }}"
+          if grep -qE '^version = ' pyproject.toml; then
+            sed -i "s/^version = .*/version = \"${VERSION}\"/" pyproject.toml
+          else
+            sed -i "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
+          fi
+
+      - name: Build sdist
+        uses: https://github.com/PyO3/maturin-action@v1
+        with:
+          working-directory: crates/zlayer-py
+          command: sdist
+          args: --out dist
+
+      - name: Upload artifact
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: sdist
+          path: crates/zlayer-py/dist/*.tar.gz
+          retention-days: 7
+
+  publish-py-binding:
+    needs:
+      - detect
+      - publish-py-binding-build-linux-x86_64
+      - publish-py-binding-build-linux-aarch64
+      - publish-py-binding-build-macos-x86_64
+      - publish-py-binding-build-macos-aarch64
+      - publish-py-binding-build-windows-x86_64
+      - publish-py-binding-build-sdist
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    name: Publish to PyPI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: publish-py-binding
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.completed != 'true'
+        with:
+          python-version: '3.12'
+
+      - name: Download all wheel artifacts
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/christopherhx/gitea-download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List collected distributions
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          echo "=== dist/ ==="
+          find dist -type f -name '*.whl' -o -name '*.tar.gz' | sort
+
+      - name: Publish to PyPI
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+          TWINE_NON_INTERACTIVE: '1'
+        run: |
+          pip install --upgrade twine
+          twine upload --skip-existing dist/*.whl dist/*.tar.gz
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: publish-py-binding
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # ===========================================
+  # TypeScript clients: @zlayer/api-client + @zlayer/client
+  # ===========================================
+  publish-ts-client:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"ts-client"}'))
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: publish-ts-client
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.completed != 'true'
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org/'
+
+      - name: Publish @zlayer/api-client (raw generated client)
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          DIR="clients/typescript"
+          if [ ! -f "${DIR}/package.json" ]; then
+            echo "Skipping ${DIR}: no package.json found"
+            exit 0
+          fi
+          cd "${DIR}"
+          VERSION="${{ inputs.version }}"
+          npm version "${VERSION}" --no-git-tag-version --allow-same-version
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
+
+          if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
+            npm run build
+          else
+            echo "No build script; skipping build step"
+          fi
+
+          npm publish --access public || echo "npm publish failed or version already exists"
+
+      - name: Publish @zlayer/client (façade)
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          DIR="clients/typescript-client"
+          if [ ! -f "${DIR}/package.json" ]; then
+            echo "Skipping ${DIR}: no package.json found"
+            exit 0
+          fi
+          cd "${DIR}"
+          VERSION="${{ inputs.version }}"
+          npm version "${VERSION}" --no-git-tag-version --allow-same-version
+
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install --no-audit --no-fund
+          fi
+
+          if node -e "const p=require('./package.json'); process.exit(p.scripts && p.scripts.build ? 0 : 1)"; then
+            npm run build
+          else
+            echo "No build script; skipping build step"
+          fi
+
+          npm publish --access public || echo "npm publish failed or version already exists"
+
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: publish-ts-client
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # ===========================================
+  # WASM Plugin SDKs
+  # ===========================================
+  publish-plugin-sdk-rust:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-rust"}'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: publish-plugin-sdk-rust
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        if: steps.check.outputs.completed != 'true'
+      - name: Check and publish
+        if: steps.check.outputs.completed != 'true'
+        working-directory: clients/zlayer-sdk/rust
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          INPUT_VERSION="${{ inputs.version }}"
+          LATEST_TAG=$(git tag -l "rust-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
+          if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
+            echo "Setting zlayer-sdk version to ${INPUT_VERSION}..."
+            sed -i "s/^version = .*/version = \"${INPUT_VERSION}\"/" Cargo.toml
+            echo "Publishing rust-sdk ${INPUT_VERSION}..."
+            cargo publish --allow-dirty
+          else
+            echo "Skipping rust-sdk (already at or above $INPUT_VERSION)"
+          fi
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: publish-plugin-sdk-rust
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  publish-plugin-sdk-python:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-python"}'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: publish-plugin-sdk-python
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.completed != 'true'
+        with:
+          python-version: '3.12'
+      - name: Check and publish
+        if: steps.check.outputs.completed != 'true'
+        working-directory: clients/zlayer-sdk/python
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
+        run: |
+          INPUT_VERSION="${{ inputs.version }}"
+          LATEST_TAG=$(git tag -l "py-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
+          if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
+            echo "Publishing python-sdk..."
+            sed -i "s/^version = .*/version = \"$INPUT_VERSION\"/" pyproject.toml
+            sed -i "s/__version__ = .*/__version__ = \"$INPUT_VERSION\"/" zlayer/__init__.py
+            pip install build twine
+            python -m build
+            twine upload dist/* || echo "May already exist"
+          else
+            echo "Skipping python-sdk (already at or above $INPUT_VERSION)"
+          fi
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: publish-plugin-sdk-python
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  publish-plugin-sdk-typescript:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-typescript"}'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: publish-plugin-sdk-typescript
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - uses: actions/setup-node@v4
+        if: steps.check.outputs.completed != 'true'
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Check and publish
+        if: steps.check.outputs.completed != 'true'
+        working-directory: clients/zlayer-sdk/typescript
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          INPUT_VERSION="${{ inputs.version }}"
+          LATEST_TAG=$(git tag -l "ts-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
+          if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
+            echo "Publishing typescript-sdk..."
+            npm version "$INPUT_VERSION" --no-git-tag-version
+            npm ci
+            npm run build
+            npm publish --access public || echo "May already exist"
+          else
+            echo "Skipping typescript-sdk (already at or above $INPUT_VERSION)"
+          fi
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: publish-plugin-sdk-typescript
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # Go modules publish via git tags matching the module subpath. Tagging
+  # `clients/zlayer-sdk/go/v<VERSION>` lets consumers `go get` it at
+  # `github.com/BlackLeafDigital/ZLayer/clients/zlayer-sdk/go@v<VERSION>`.
+  publish-plugin-sdk-go:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-go"}'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.FORGEJO_TOKEN }}
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: publish-plugin-sdk-go
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - uses: actions/setup-go@v5
+        if: steps.check.outputs.completed != 'true'
+        with:
+          go-version: '1.24'
+      - name: Verify Go module
+        if: steps.check.outputs.completed != 'true'
+        working-directory: clients/zlayer-sdk/go
+        run: go mod verify
+      - name: Tag and push Go SDK release
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          set -euo pipefail
+          TAG="clients/zlayer-sdk/go/v${{ inputs.version }}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists — skipping."
+            exit 0
+          fi
+          git config user.name "Forgejo CI"
+          git config user.email "ci@forge.blackleafdigital.com"
+          git tag -a "${TAG}" -m "zlayer-sdk-go ${{ inputs.version }}"
+          git push origin "${TAG}"
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: publish-plugin-sdk-go
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
+  # C SDK is shipped as a source tarball uploaded to Forgejo generic
+  # packages. Consumers download, extract, and build with cmake themselves.
+  publish-plugin-sdk-c:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-c"}'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: publish-plugin-sdk-c
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - name: Install build dependencies
+        if: steps.check.outputs.completed != 'true'
+        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+      - name: Verify C SDK builds
+        if: steps.check.outputs.completed != 'true'
+        working-directory: clients/zlayer-sdk/c
+        run: |
+          cmake -B build
+          cmake --build build
+      - name: Package C SDK tarball
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          TARBALL="zlayer-sdk-c-v${VERSION}.tar.gz"
+          # Tarball excludes the build directory so consumers get clean sources.
+          tar --exclude='./build' -czf "${TARBALL}" -C clients/zlayer-sdk/c .
+          echo "Packaged ${TARBALL} ($(stat -c%s "${TARBALL}") bytes)"
+      - name: Upload C SDK tarball to Forgejo Packages
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          set -euo pipefail
+          VERSION="${{ inputs.version }}"
+          TARBALL="zlayer-sdk-c-v${VERSION}.tar.gz"
+          AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
+          URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-sdk-c/${VERSION}/${TARBALL}"
+          # If the exact tarball already exists skip; otherwise re-upload.
+          local_size=$(stat -c%s "${TARBALL}")
+          remote_size=$(curl -sI --user "${AUTH}" "${URL}" 2>/dev/null \
+            | grep -i content-length | tail -1 | tr -dc '0-9') || true
+          if [ -n "${remote_size}" ] && [ "${remote_size}" = "${local_size}" ]; then
+            echo "= Skipping ${TARBALL} (already uploaded, ${local_size} bytes)"
+            exit 0
+          elif [ -n "${remote_size}" ]; then
+            echo "~ Size mismatch, re-uploading..."
+            curl -s -X DELETE --user "${AUTH}" "${URL}" || true
+            sleep 1
+          fi
+          echo "Uploading ${TARBALL} (${local_size} bytes)..."
+          curl --fail --max-time 600 --connect-timeout 30 --retry 3 --retry-delay 10 \
+            --user "${AUTH}" \
+            --upload-file "${TARBALL}" \
+            "${URL}"
+          echo "OK ${TARBALL} uploaded"
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: publish-plugin-sdk-c
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}

@@ -1951,6 +1951,117 @@ impl Runtime for YoukiRuntime {
             space_reclaimed,
         })
     }
+
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.kill",
+            container.id = %self.container_id_str(id),
+            service.name = %id.service,
+            signal = ?signal,
+        )
+    )]
+    async fn kill_container(&self, id: &ContainerId, signal: Option<&str>) -> Result<()> {
+        use std::convert::TryFrom;
+
+        let canonical = crate::runtime::validate_signal(signal.unwrap_or("SIGKILL"))?;
+        let container_id = self.container_id_str(id);
+        let container_root = self.container_root(id);
+
+        tracing::info!(
+            container = %container_id,
+            signal = %canonical,
+            "sending signal to container"
+        );
+
+        let container_id_clone = container_id.clone();
+        let canonical_clone = canonical.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut container =
+                Container::load(container_root).map_err(|e| AgentError::NotFound {
+                    container: container_id_clone.clone(),
+                    reason: format!("failed to load container: {e}"),
+                })?;
+
+            if !container.status().can_kill() {
+                return Err(AgentError::InvalidSpec(format!(
+                    "container '{container_id_clone}' is not in a killable state ({:?})",
+                    container.status()
+                )));
+            }
+
+            let sig = Signal::try_from(canonical_clone.as_str()).map_err(|e| {
+                AgentError::InvalidSpec(format!("invalid signal '{canonical_clone}': {e:?}"))
+            })?;
+            container.kill(sig, true).map_err(|e| {
+                AgentError::Internal(format!(
+                    "failed to deliver signal {canonical_clone} to '{container_id_clone}': {e}"
+                ))
+            })?;
+
+            Ok::<(), AgentError>(())
+        })
+        .await
+        .map_err(|e| AgentError::Internal(format!("task join error during kill: {e}")))??;
+
+        Ok(())
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "image.tag",
+            source = %source,
+            target = %target,
+        )
+    )]
+    async fn tag_image(&self, source: &str, target: &str) -> Result<()> {
+        if source.trim().is_empty() || target.trim().is_empty() {
+            return Err(AgentError::InvalidSpec(
+                "source and target must be non-empty image references".to_string(),
+            ));
+        }
+        if source == target {
+            // Nothing to do; idempotent.
+            return Ok(());
+        }
+
+        // Copy the source manifest and its digest sidecar under the target
+        // reference. All blobs remain shared content-addressed in the cache.
+        let src_manifest_key = format!("manifest:{source}");
+        let manifest_bytes = self
+            .blob_cache
+            .get(&src_manifest_key)
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to read manifest cache: {e}")))?
+            .ok_or_else(|| AgentError::NotFound {
+                container: source.to_string(),
+                reason: format!("source image '{source}' not found in cache"),
+            })?;
+
+        let dst_manifest_key = format!("manifest:{target}");
+        self.blob_cache
+            .put(&dst_manifest_key, &manifest_bytes)
+            .await
+            .map_err(|e| AgentError::Internal(format!("failed to write manifest for tag: {e}")))?;
+
+        // Best-effort: carry over the registry digest sidecar if present.
+        let src_digest_key = format!("manifest-digest:{source}");
+        if let Ok(Some(digest_bytes)) = self.blob_cache.get(&src_digest_key).await {
+            let dst_digest_key = format!("manifest-digest:{target}");
+            if let Err(e) = self.blob_cache.put(&dst_digest_key, &digest_bytes).await {
+                tracing::warn!(
+                    source = %source,
+                    target = %target,
+                    error = %e,
+                    "failed to copy manifest-digest sidecar for tag (non-fatal)"
+                );
+            }
+        }
+
+        tracing::info!(source = %source, target = %target, "tagged image");
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use anyhow::{bail, Context, Result};
 use zlayer_api::storage::StoredUserGroup;
 use zlayer_api::CreateGroupRequest;
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// `zlayer group list` -- print all groups as a table or JSON.
 pub async fn list(output: &str) -> Result<()> {

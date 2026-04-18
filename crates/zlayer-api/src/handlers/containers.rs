@@ -188,6 +188,36 @@ pub struct ContainerExecResponse {
     pub stderr: String,
 }
 
+/// Request body for stopping a container. Matches the Docker-compat
+/// `POST /containers/{id}/stop` shape.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct StopContainerRequest {
+    /// Graceful shutdown timeout in seconds before the runtime force-kills
+    /// the container. Defaults to 30 seconds when omitted.
+    #[serde(default)]
+    pub timeout: Option<u64>,
+}
+
+/// Request body for restarting a container. Matches the Docker-compat
+/// `POST /containers/{id}/restart` shape.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct RestartContainerRequest {
+    /// Graceful shutdown timeout in seconds before the runtime force-kills
+    /// the container. Defaults to 30 seconds when omitted.
+    #[serde(default)]
+    pub timeout: Option<u64>,
+}
+
+/// Request body for killing (sending a signal to) a container. Matches the
+/// Docker-compat `POST /containers/{id}/kill` shape.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct KillContainerRequest {
+    /// Signal name to send (e.g. `"SIGTERM"`, `"SIGINT"`). Accepts both the
+    /// `SIG`-prefixed and bare forms. When omitted, defaults to `SIGKILL`.
+    #[serde(default)]
+    pub signal: Option<String>,
+}
+
 /// Wait response with container exit code
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ContainerWaitResponse {
@@ -678,6 +708,263 @@ pub async fn delete_container(
 
     // Remove from tracking
     state.containers.write().await.remove(&id);
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Stop a running container.
+///
+/// Sends the runtime's graceful stop signal and waits up to `timeout` seconds
+/// before force-killing. The container is **not** removed; use
+/// `DELETE /api/v1/containers/{id}` to stop-and-remove. Idempotent: calling
+/// stop on an already-stopped container is not an error.
+///
+/// # Errors
+///
+/// Returns an error if the container is not found, stop fails, or the user
+/// lacks the operator role.
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/{id}/stop",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    request_body = StopContainerRequest,
+    responses(
+        (status = 204, description = "Container stopped"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn stop_container(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<StopContainerRequest>,
+) -> Result<axum::http::StatusCode> {
+    user.require_role("operator")?;
+
+    let container_id = {
+        let containers = state.containers.read().await;
+        let meta = containers
+            .get(&id)
+            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+        meta.container_id.clone()
+    };
+
+    let timeout = Duration::from_secs(request.timeout.unwrap_or(30));
+
+    info!(container_id = %container_id, timeout_secs = timeout.as_secs(), "Stopping standalone container");
+
+    state
+        .runtime
+        .stop_container(&container_id, timeout)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            other => ApiError::Internal(format!("Failed to stop container: {other}")),
+        })?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Start a previously-created container.
+///
+/// Useful for re-starting a container that was stopped via
+/// `POST /api/v1/containers/{id}/stop` without being removed.
+///
+/// # Errors
+///
+/// Returns an error if the container is not found, start fails, or the user
+/// lacks the operator role.
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/{id}/start",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    responses(
+        (status = 204, description = "Container started"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn start_container(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+) -> Result<axum::http::StatusCode> {
+    user.require_role("operator")?;
+
+    let container_id = {
+        let containers = state.containers.read().await;
+        let meta = containers
+            .get(&id)
+            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+        meta.container_id.clone()
+    };
+
+    info!(container_id = %container_id, "Starting standalone container");
+
+    state
+        .runtime
+        .start_container(&container_id)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            other => ApiError::Internal(format!("Failed to start container: {other}")),
+        })?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Restart a container: stop then start.
+///
+/// Composes `stop_container(timeout)` followed by `start_container`. Errors
+/// during the stop phase are ignored (the container may already be stopped);
+/// errors during the start phase are surfaced.
+///
+/// # Errors
+///
+/// Returns an error if the container is not found, the start phase fails, or
+/// the user lacks the operator role.
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/{id}/restart",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    request_body = RestartContainerRequest,
+    responses(
+        (status = 204, description = "Container restarted"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn restart_container(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<RestartContainerRequest>,
+) -> Result<axum::http::StatusCode> {
+    user.require_role("operator")?;
+
+    let container_id = {
+        let containers = state.containers.read().await;
+        let meta = containers
+            .get(&id)
+            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+        meta.container_id.clone()
+    };
+
+    let timeout = Duration::from_secs(request.timeout.unwrap_or(30));
+
+    info!(container_id = %container_id, timeout_secs = timeout.as_secs(), "Restarting standalone container");
+
+    // Best-effort stop: ignore errors (container may already be stopped).
+    if let Err(e) = state.runtime.stop_container(&container_id, timeout).await {
+        debug!(error = %e, "Stop returned error during restart (container may already be stopped)");
+    }
+
+    state
+        .runtime
+        .start_container(&container_id)
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            other => {
+                ApiError::Internal(format!("Failed to start container during restart: {other}"))
+            }
+        })?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Send a signal to a running container.
+///
+/// Mirrors Docker-compat `POST /containers/{id}/kill`. When the request body's
+/// `signal` field is omitted, the runtime sends `SIGKILL`. Accepted signals
+/// are `SIGKILL`, `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2` (with
+/// or without the `SIG` prefix); any other value is rejected with `400`.
+///
+/// # Errors
+///
+/// Returns `400` for unknown signals, `404` if the container is not found,
+/// `403` if the caller lacks the `operator` role, `501` if the runtime does
+/// not support `kill_container`, and `500` for other runtime errors.
+#[utoipa::path(
+    post,
+    path = "/api/v1/containers/{id}/kill",
+    params(
+        ("id" = String, Path, description = "Container identifier"),
+    ),
+    request_body = KillContainerRequest,
+    responses(
+        (status = 204, description = "Signal delivered"),
+        (status = 400, description = "Invalid signal"),
+        (status = 404, description = "Container not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - operator role required"),
+        (status = 501, description = "Runtime does not support kill"),
+        (status = 500, description = "Internal error"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Containers"
+)]
+pub async fn kill_container(
+    user: AuthUser,
+    State(state): State<ContainerApiState>,
+    Path(id): Path<String>,
+    Json(request): Json<KillContainerRequest>,
+) -> Result<axum::http::StatusCode> {
+    user.require_role("operator")?;
+
+    let container_id = {
+        let containers = state.containers.read().await;
+        let meta = containers
+            .get(&id)
+            .ok_or_else(|| ApiError::NotFound(format!("Container '{id}' not found")))?;
+        meta.container_id.clone()
+    };
+
+    info!(
+        container_id = %container_id,
+        signal = ?request.signal,
+        "Killing standalone container"
+    );
+
+    state
+        .runtime
+        .kill_container(&container_id, request.signal.as_deref())
+        .await
+        .map_err(|e| match e {
+            zlayer_agent::AgentError::NotFound { reason, .. } => {
+                ApiError::NotFound(format!("Container not found: {reason}"))
+            }
+            zlayer_agent::AgentError::InvalidSpec(reason) => ApiError::BadRequest(reason),
+            zlayer_agent::AgentError::Unsupported(reason) => {
+                ApiError::Internal(format!("Runtime does not support kill: {reason}"))
+            }
+            other => ApiError::Internal(format!("Failed to kill container: {other}")),
+        })?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

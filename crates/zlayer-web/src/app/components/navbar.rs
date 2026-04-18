@@ -102,7 +102,7 @@ pub fn Navbar() -> impl IntoView {
                 <div class="navbar-actions">
                     <ThemeToggle/>
                     <a
-                        href="https://github.com/zachhandley/ZLayer"
+                        href="https://github.com/BlackLeafDigital/ZLayer"
                         target="_blank"
                         rel="noopener noreferrer"
                         class="github-link"

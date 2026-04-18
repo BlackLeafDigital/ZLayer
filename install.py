@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # Constants
 # ---------------------------------------------------------------------------
 
-GITHUB_REPO = "zachhandley/ZLayer"
+GITHUB_REPO = "BlackLeafDigital/ZLayer"
 GITHUB_API_LATEST = "https://api.github.com/repos/{repo}/releases/latest"
 GITHUB_DOWNLOAD = (
     "https://github.com/{repo}/releases/download/{tag}/{filename}"
@@ -917,6 +917,199 @@ def verify_binary(binary_path: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
+# Shell completions (fail-soft)
+# ---------------------------------------------------------------------------
+
+def _generate_completion_script(binary_path: str, shell: str) -> Optional[str]:
+    """Run `<binary> completions <shell>` and return stdout, or None on failure."""
+    try:
+        result = subprocess.run(
+            [binary_path, "completions", shell],
+            capture_output=True,
+            timeout=15,
+        )
+        if result.returncode != 0:
+            return None
+        text = result.stdout.decode("utf-8", errors="replace")
+        return text if text.strip() else None
+    except Exception:
+        return None
+
+
+def _write_completion_file(path: str, contents: str) -> bool:
+    """Write `contents` to `path`, creating parents. Uses sudo if the location
+    isn't user-writable. Returns True on success."""
+    path = os.path.expanduser(path)
+    parent = os.path.dirname(path)
+    try:
+        if parent and not os.path.exists(parent):
+            if needs_sudo(parent):
+                try:
+                    _run_sudo(["mkdir", "-p", parent])
+                except RuntimeError:
+                    return False
+            else:
+                os.makedirs(parent, exist_ok=True)
+
+        if parent and needs_sudo(parent) and not os.access(parent, os.W_OK):
+            # Use a temp file + sudo cp, since our process can't write directly.
+            tmp = tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", delete=False, suffix=".completion",
+            )
+            try:
+                tmp.write(contents)
+                if not contents.endswith("\n"):
+                    tmp.write("\n")
+                tmp.close()
+                _run_sudo(["cp", tmp.name, path])
+                _run_sudo(["chmod", "644", path])
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+        else:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(contents)
+                if not contents.endswith("\n"):
+                    f.write("\n")
+        return True
+    except Exception:
+        return False
+
+
+def _brew_prefix() -> Optional[str]:
+    """Return the Homebrew prefix, or None if not installed."""
+    try:
+        result = subprocess.run(
+            ["brew", "--prefix"],
+            capture_output=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            out = result.stdout.decode("utf-8", errors="replace").strip()
+            return out or None
+    except Exception:
+        return None
+    return None
+
+
+def _install_completions(binary_path: str) -> None:
+    """Install shell completions for the zlayer binary. Fail-soft: warnings
+    only, never raises. Picks destinations appropriate for the host OS."""
+    write()
+    info("Installing shell completions...")
+
+    sysname = platform.system().lower()
+    home = os.path.expanduser("~")
+
+    if sysname == "windows":
+        # PowerShell completion. Drop alongside $PROFILE.
+        script = _generate_completion_script(binary_path, "powershell")
+        if not script:
+            warn("Could not generate PowerShell completion; skipping.")
+            return
+        # Default PowerShell 7+ profile dir on Windows:
+        #   ~/Documents/PowerShell/
+        # Windows PowerShell 5.1 uses WindowsPowerShell. Pick PowerShell 7 first
+        # if the directory exists, else fall back to WindowsPowerShell.
+        candidates = [
+            os.path.join(home, "Documents", "PowerShell"),
+            os.path.join(home, "Documents", "WindowsPowerShell"),
+        ]
+        dest_dir = None
+        for c in candidates:
+            if os.path.isdir(c):
+                dest_dir = c
+                break
+        if dest_dir is None:
+            dest_dir = candidates[0]
+            try:
+                os.makedirs(dest_dir, exist_ok=True)
+            except OSError:
+                warn("Could not create {}; skipping PowerShell completion.".format(dest_dir))
+                return
+        dest = os.path.join(dest_dir, "zlayer.completions.ps1")
+        if _write_completion_file(dest, script):
+            success("Installed zlayer PowerShell completion to {}".format(dest))
+            info("To load it, dot-source from your $PROFILE:")
+            info("  . '{}'".format(dest))
+        else:
+            warn("Could not write {}; skipping PowerShell completion.".format(dest))
+        return
+
+    # Linux / macOS: bash, zsh, fish.
+    # --- bash ---
+    if shutil.which("bash"):
+        bash_script = _generate_completion_script(binary_path, "bash")
+        if bash_script:
+            bash_dest = None
+            brew = _brew_prefix() if sysname == "darwin" or shutil.which("brew") else None
+            if brew:
+                candidate = os.path.join(brew, "etc", "bash_completion.d", "zlayer")
+                bash_dest = candidate
+            elif os.geteuid() == 0 or not needs_sudo("/etc/bash_completion.d"):
+                bash_dest = "/etc/bash_completion.d/zlayer"
+            else:
+                # Try system-wide via sudo if available; else user-local.
+                bash_dest = "/etc/bash_completion.d/zlayer"
+                if not shutil.which("sudo"):
+                    bash_dest = os.path.join(
+                        home, ".local", "share", "bash-completion", "completions", "zlayer"
+                    )
+            if _write_completion_file(bash_dest, bash_script):
+                success("Installed zlayer bash completion to {}".format(bash_dest))
+            else:
+                # Fall back to user-local on failure.
+                user_dest = os.path.join(
+                    home, ".local", "share", "bash-completion", "completions", "zlayer"
+                )
+                if user_dest != bash_dest and _write_completion_file(user_dest, bash_script):
+                    success("Installed zlayer bash completion to {}".format(user_dest))
+                else:
+                    warn("Could not write bash completion; skipping.")
+        else:
+            warn("Could not generate bash completion; skipping.")
+
+    # --- zsh ---
+    if shutil.which("zsh"):
+        zsh_script = _generate_completion_script(binary_path, "zsh")
+        if zsh_script:
+            zsh_dir = os.path.join(home, ".zsh", "completions")
+            zsh_dest = os.path.join(zsh_dir, "_zlayer")
+            if _write_completion_file(zsh_dest, zsh_script):
+                success("Installed zlayer zsh completion to {}".format(zsh_dest))
+                zshrc = os.path.join(home, ".zshrc")
+                hint_needed = True
+                try:
+                    if os.path.isfile(zshrc):
+                        with open(zshrc, "r", encoding="utf-8", errors="replace") as f:
+                            contents = f.read()
+                        if ".zsh/completions" in contents:
+                            hint_needed = False
+                except OSError:
+                    pass
+                if hint_needed:
+                    info("Hint: add 'fpath+=~/.zsh/completions' to ~/.zshrc before 'compinit'.")
+            else:
+                warn("Could not write zsh completion; skipping.")
+        else:
+            warn("Could not generate zsh completion; skipping.")
+
+    # --- fish ---
+    if shutil.which("fish"):
+        fish_script = _generate_completion_script(binary_path, "fish")
+        if fish_script:
+            fish_dest = os.path.join(home, ".config", "fish", "completions", "zlayer.fish")
+            if _write_completion_file(fish_dest, fish_script):
+                success("Installed zlayer fish completion to {}".format(fish_dest))
+            else:
+                warn("Could not write fish completion; skipping.")
+        else:
+            warn("Could not generate fish completion; skipping.")
+
+
+# ---------------------------------------------------------------------------
 # PATH management
 # ---------------------------------------------------------------------------
 
@@ -1518,6 +1711,13 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     # Step 5: Container runtime setup (Linux only)
     setup_container_runtime(use_sudo=use_sudo)
+
+    # Step 5b: Shell completions (fail-soft — never abort on failure).
+    try:
+        if installed_paths:
+            _install_completions(installed_paths[0])
+    except Exception as e:
+        warn("Shell completion install failed: {}".format(e))
 
     # Step 6: PATH management
     if not args.no_modify_path and not is_on_path(install_dir):

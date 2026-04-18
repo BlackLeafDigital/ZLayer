@@ -72,7 +72,7 @@ pub enum NetlinkError {
 /// the current netns. Returns [`NetlinkError::Netlink`] for any other
 /// netlink-level failure (permission denied, name collision in the
 /// target netns, etc.).
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "youki-runtime"))]
 pub fn move_link_into_netns_fd_and_rename(
     link_name: &str,
     ns_fd: std::os::fd::BorrowedFd<'_>,
@@ -123,15 +123,17 @@ pub fn move_link_into_netns_fd_and_rename(
     Ok(())
 }
 
-/// Non-Linux stub.
-#[cfg(not(target_os = "linux"))]
+/// Stub for non-Linux platforms and for Linux builds without the
+/// `youki-runtime` feature (which provides the libcontainer-backed impl).
+#[cfg(any(not(target_os = "linux"), not(feature = "youki-runtime")))]
 pub fn move_link_into_netns_fd_and_rename(
     _link_name: &str,
     _ns_fd: std::os::fd::BorrowedFd<'_>,
     _new_name: &str,
 ) -> Result<(), NetlinkError> {
     Err(NetlinkError::Netlink(
-        "move_link_into_netns_fd_and_rename is only supported on Linux".to_string(),
+        "move_link_into_netns_fd_and_rename requires Linux with the 'youki-runtime' feature"
+            .to_string(),
     ))
 }
 

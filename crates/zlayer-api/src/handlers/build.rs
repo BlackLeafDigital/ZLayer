@@ -285,6 +285,16 @@ pub struct BuildEventWrapper {
 impl From<BuildEvent> for BuildEventWrapper {
     fn from(event: BuildEvent) -> Self {
         match event {
+            BuildEvent::BuildStarted {
+                total_stages,
+                total_instructions,
+            } => BuildEventWrapper {
+                event_type: "build_started".to_string(),
+                data: serde_json::json!({
+                    "total_stages": total_stages,
+                    "total_instructions": total_instructions,
+                }),
+            },
             BuildEvent::StageStarted {
                 index,
                 name,

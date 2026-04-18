@@ -369,13 +369,9 @@ jobs:
           git tag -a "$TAG" -m "Auto-tagged from CI: $TAG"
           git push origin "$TAG"
 
-      - name: Trigger build workflow
-        run: |
-          curl -X POST \
-            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches" \
-            -d '{"ref": "dev", "inputs": {"version": "v${{ steps.version.outputs.version }}", "sha": "${{ github.sha }}"}}'
+      # Note: build.yml is dispatched by the trigger-e2e → e2e.yml chain
+      # below (see e2e.yml's `trigger-build` job). Dispatching it here
+      # would double-run the build for every dev push.
 
   # ===========================================
   # Trigger E2E Tests

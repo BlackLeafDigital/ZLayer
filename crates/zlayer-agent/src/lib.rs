@@ -54,8 +54,8 @@ pub use proxy_manager::{ProxyManager, ProxyManagerConfig};
 pub use runtime::*;
 pub use runtimes::{create_runtime_for_image, detect_image_artifact_type};
 
-// Youki runtime types are only available on Linux
-#[cfg(target_os = "linux")]
+// Youki runtime types are only available on Linux with the `youki-runtime` feature.
+#[cfg(all(target_os = "linux", feature = "youki-runtime"))]
 pub use runtimes::{YoukiConfig, YoukiRuntime};
 
 #[cfg(feature = "docker")]
@@ -121,8 +121,8 @@ pub enum RuntimeConfig {
     Auto,
     /// Use the mock runtime for testing and development
     Mock,
-    /// Use youki/libcontainer as the container runtime (Linux only)
-    #[cfg(target_os = "linux")]
+    /// Use youki/libcontainer as the container runtime (Linux only, requires the `youki-runtime` feature)
+    #[cfg(all(target_os = "linux", feature = "youki-runtime"))]
     Youki(YoukiConfig),
     /// Use Docker daemon as the container runtime (cross-platform)
     #[cfg(feature = "docker")]
@@ -242,7 +242,7 @@ pub async fn create_runtime(
     match config {
         RuntimeConfig::Auto => create_auto_runtime(auth_ctx).await,
         RuntimeConfig::Mock => Ok(Arc::new(MockRuntime::new())),
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "youki-runtime"))]
         RuntimeConfig::Youki(youki_config) => {
             let runtime = YoukiRuntime::new(youki_config, auth_ctx).await?;
             Ok(Arc::new(runtime))
@@ -278,14 +278,25 @@ pub async fn create_runtime(
 /// - On macOS: `SandboxRuntime` (native Metal/MPS) → `VmRuntime` (libkrun Linux compat with GPU) → Docker
 /// - On Windows: Use Docker directly
 /// - Returns an error if no runtime can be initialized
-#[cfg_attr(not(target_os = "linux"), allow(clippy::unused_async))]
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "youki-runtime")),
+    allow(clippy::unused_async)
+)]
+#[cfg_attr(
+    not(any(
+        all(target_os = "linux", feature = "youki-runtime"),
+        target_os = "macos",
+        feature = "docker"
+    )),
+    allow(unused_variables)
+)]
 async fn create_auto_runtime(
     auth_ctx: Option<ContainerAuthContext>,
 ) -> Result<Arc<dyn Runtime + Send + Sync>> {
     tracing::info!("Auto-selecting container runtime");
 
     // On Linux, use bundled libcontainer runtime (no daemon overhead, no external binary needed)
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "youki-runtime"))]
     {
         match YoukiRuntime::new(YoukiConfig::default(), auth_ctx.clone()).await {
             Ok(runtime) => {

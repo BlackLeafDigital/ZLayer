@@ -44,6 +44,21 @@ pub struct BuildState {
     pub error: Option<String>,
     /// Final image ID if build succeeded
     pub image_id: Option<String>,
+    /// Total stages pre-declared by the backend via `BuildEvent::BuildStarted`.
+    ///
+    /// Populated once up-front. Used by `current_stage_display` so the
+    /// denominator is stable rather than growing as stages arrive.
+    /// `0` means no backend pre-declaration was received; fall back to
+    /// `stages.len()` in that case.
+    pub total_stages: usize,
+    /// Total instructions pre-declared by the backend via
+    /// `BuildEvent::BuildStarted`.
+    ///
+    /// Populated once up-front. Used by `total_instructions` so the
+    /// progress-bar denominator is stable rather than growing as
+    /// `InstructionStarted` events arrive. `0` means no backend
+    /// pre-declaration was received; fall back to the event-sum.
+    pub total_instructions: usize,
 }
 
 /// State of a single build stage
@@ -148,6 +163,14 @@ impl BuildTui {
     /// Handle a single build event
     fn handle_build_event(&mut self, event: BuildEvent) {
         match event {
+            BuildEvent::BuildStarted {
+                total_stages,
+                total_instructions,
+            } => {
+                self.state.total_stages = total_stages;
+                self.state.total_instructions = total_instructions;
+            }
+
             BuildEvent::StageStarted {
                 index,
                 name,
@@ -300,10 +323,16 @@ impl BuildTui {
 }
 
 impl BuildState {
-    /// Get the total number of instructions across all stages
+    /// Get the total number of instructions across all stages.
+    ///
+    /// Prefers the pre-declared total from `BuildEvent::BuildStarted`
+    /// (so the progress-bar denominator is stable); falls back to
+    /// summing the stages we've learned about so far for older tests
+    /// or backends that don't emit `BuildStarted`.
     #[must_use]
     pub fn total_instructions(&self) -> usize {
-        self.stages.iter().map(|s| s.instructions.len()).sum()
+        let event_sum: usize = self.stages.iter().map(|s| s.instructions.len()).sum();
+        self.total_instructions.max(event_sum)
     }
 
     /// Get the number of completed instructions across all stages
@@ -328,7 +357,7 @@ impl BuildState {
             format!(
                 "Stage {}/{}: {}({})",
                 self.current_stage + 1,
-                self.stages.len().max(1),
+                self.total_stages.max(self.stages.len()).max(1),
                 name_part,
                 stage.base_image
             )
@@ -374,6 +403,45 @@ mod tests {
 
         assert_eq!(state.total_instructions(), 2);
         assert_eq!(state.completed_instructions(), 1);
+    }
+
+    #[test]
+    fn total_instructions_uses_predeclared_total() {
+        // Reproduces the old bug: before this fix, `total_instructions()`
+        // summed stages as `InstructionStarted` events arrived, so the
+        // TUI denominator grew in lockstep with the numerator. With the
+        // up-front `BuildStarted` event, the denominator is stable from
+        // the first instruction onward.
+        let (tx, rx) = mpsc::channel();
+        let mut tui = BuildTui::new(rx);
+
+        tx.send(BuildEvent::BuildStarted {
+            total_stages: 2,
+            total_instructions: 7,
+        })
+        .unwrap();
+
+        tx.send(BuildEvent::StageStarted {
+            index: 0,
+            name: None,
+            base_image: "alpine".to_string(),
+        })
+        .unwrap();
+
+        tx.send(BuildEvent::InstructionStarted {
+            stage: 0,
+            index: 0,
+            instruction: "RUN foo".to_string(),
+        })
+        .unwrap();
+
+        drop(tx);
+        tui.process_events();
+
+        // Pre-declared total wins over the in-progress event-sum of 1.
+        assert_eq!(tui.state.total_instructions(), 7);
+        // Current-stage denominator is also populated up-front.
+        assert!(tui.state.current_stage_display().contains("Stage 1/2"));
     }
 
     #[test]

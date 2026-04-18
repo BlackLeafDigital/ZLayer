@@ -252,6 +252,8 @@ mod tests {
             completed: false,
             error: None,
             image_id: None,
+            total_stages: 0,
+            total_instructions: 0,
         }
     }
 

@@ -34,7 +34,7 @@ pub(crate) async fn status(cli: &Cli) -> Result<()> {
     let metadata = read_daemon_metadata(&data_dir).await;
 
     // Try connecting to the daemon without auto-starting it
-    let client = crate::daemon_client::DaemonClient::try_connect_to(&socket_path).await;
+    let client = zlayer_client::DaemonClient::try_connect_to(&socket_path).await;
 
     if let Ok(Some(client)) = client {
         // Daemon is running -- show rich status
@@ -216,7 +216,7 @@ pub(crate) async fn logs(
     instance: Option<String>,
 ) -> Result<()> {
     // Connect to the daemon (auto-starts if needed)
-    let client = crate::daemon_client::DaemonClient::connect()
+    let client = zlayer_client::DaemonClient::connect()
         .await
         .context("Failed to connect to zlayer daemon")?;
 
@@ -267,9 +267,7 @@ pub(crate) async fn logs(
 /// Also scans the state directory for any extra containers beyond the spec's replica count.
 #[cfg(unix)]
 async fn resolve_stop_deployment(hint: Option<&str>) -> Result<String> {
-    let client = crate::daemon_client::DaemonClient::connect()
-        .await
-        .context(
+    let client = zlayer_client::DaemonClient::connect().await.context(
         "Failed to connect to zlayer daemon (pass <DEPLOYMENT> explicitly to skip auto-resolution)",
     )?;
     crate::commands::resolver::resolve_deployment(&client, hint)

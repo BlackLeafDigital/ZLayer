@@ -9,7 +9,7 @@
 use anyhow::Result;
 
 use crate::cli::{Cli, ImageCommands};
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// Entry point for `zlayer image <subcommand>`.
 pub(crate) async fn handle_image(_cli: &Cli, cmd: &ImageCommands) -> Result<()> {

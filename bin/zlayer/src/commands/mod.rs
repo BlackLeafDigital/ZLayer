@@ -1,5 +1,6 @@
 // Cross-platform commands
 pub mod build;
+pub mod completions;
 pub mod lifecycle;
 pub mod manager;
 pub mod pipeline;

@@ -181,6 +181,67 @@ try {
         Write-Host "  Note: Open a new terminal for the PATH change to take effect in other sessions."
     }
 
+    # --- Install PowerShell completions (fail-soft) ---
+    # Drop a completion script next to $PROFILE and dot-source it from the
+    # profile if not already referenced. Never abort the installer on failure.
+    Write-Host ""
+    Write-Host "Installing PowerShell completion..."
+    try {
+        $CompletionScript = & $TargetExe completions powershell 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $CompletionScript) {
+            Write-Host "  Warning: '$Binary completions powershell' failed; skipping." -ForegroundColor Yellow
+        }
+        else {
+            $CompletionDir = Join-Path $HOME "Documents\PowerShell"
+            if (-not (Test-Path $CompletionDir)) {
+                # Fall back to WindowsPowerShell if it already exists; else create PowerShell.
+                $WinPSDir = Join-Path $HOME "Documents\WindowsPowerShell"
+                if (Test-Path $WinPSDir) {
+                    $CompletionDir = $WinPSDir
+                }
+                else {
+                    New-Item -ItemType Directory -Path $CompletionDir -Force | Out-Null
+                }
+            }
+            $CompletionPath = Join-Path $CompletionDir "zlayer-completions.ps1"
+            # -Join the script lines with newlines (completions command emits a string array).
+            if ($CompletionScript -is [array]) {
+                $CompletionText = $CompletionScript -join "`n"
+            }
+            else {
+                $CompletionText = [string]$CompletionScript
+            }
+            Set-Content -Path $CompletionPath -Value $CompletionText -Encoding UTF8 -Force
+            Write-Host "  Installed zlayer PowerShell completion to $CompletionPath"
+
+            # Append dot-source line to $PROFILE if not present.
+            $ProfilePath = $PROFILE
+            if ($ProfilePath) {
+                $ProfileDir = Split-Path -Path $ProfilePath -Parent
+                if ($ProfileDir -and -not (Test-Path $ProfileDir)) {
+                    New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
+                }
+                if (-not (Test-Path $ProfilePath)) {
+                    New-Item -ItemType File -Path $ProfilePath -Force | Out-Null
+                }
+                $DotSourceLine = ". '$CompletionPath'"
+                $ExistingProfile = Get-Content -Path $ProfilePath -Raw -ErrorAction SilentlyContinue
+                if (-not $ExistingProfile) { $ExistingProfile = "" }
+                if ($ExistingProfile -notlike "*$CompletionPath*") {
+                    Add-Content -Path $ProfilePath -Value "`n# Added by ZLayer installer`n$DotSourceLine"
+                    Write-Host "  Appended dot-source line to $ProfilePath"
+                }
+                else {
+                    Write-Host "  Profile already references completion script; skipping profile edit."
+                }
+                Write-Host "  Open a new PowerShell session (or run '. `$PROFILE') to enable completions."
+            }
+        }
+    }
+    catch {
+        Write-Host "  Warning: failed to install PowerShell completion: $_" -ForegroundColor Yellow
+    }
+
     # --- Success ---
     Write-Host ""
     Write-Host "$Binary $Tag installed to $TargetExe" -ForegroundColor Green

@@ -6,6 +6,7 @@
 //! [`DaemonClient::connect`] will auto-start it and wait with exponential backoff
 //! until the socket becomes available.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -18,10 +19,12 @@ use http_body_util::{BodyExt, Full};
 use hyper::Uri;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
+use serde::{Deserialize, Serialize};
 use tokio::net::UnixStream;
 use tracing::{debug, info};
 use zlayer_api::handlers::auth::{BootstrapRequest, LoginRequest, LoginResponse, UserView};
-use zlayer_api::handlers::images::{ImageInfoDto, PruneResultDto};
+use zlayer_api::handlers::containers::ContainerExecResponse;
+use zlayer_api::handlers::images::{ImageInfoDto, PruneResultDto, PullImageResponse};
 use zlayer_api::handlers::secrets::SecretMetadataResponse;
 use zlayer_api::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
 use zlayer_api::storage::{StoredEnvironment, StoredVariable};
@@ -194,7 +197,7 @@ impl DaemonClient {
         // Otherwise, explicitly pass --data-dir so the child doesn't fall back
         // to /var/lib/zlayer when $HOME is unavailable (e.g. launchd context).
         if std::env::var_os("ZLAYER_DATA_DIR").is_none() {
-            let data_dir = crate::cli::default_data_dir();
+            let data_dir = zlayer_paths::ZLayerDirs::detect_data_dir();
             cmd.arg("--data-dir").arg(&data_dir);
         }
 
@@ -256,7 +259,7 @@ impl DaemonClient {
             delay = std::cmp::min(delay * 2, max_delay);
         }
 
-        let log_dir = crate::cli::default_log_dir(&crate::cli::default_data_dir());
+        let log_dir = zlayer_paths::ZLayerDirs::default_log_dir();
         let log_path = log_dir.join("daemon.log");
         let timeout_secs = 10;
         eprintln!("Failed to start ZLayer daemon after {timeout_secs}s.");
@@ -504,7 +507,7 @@ impl DaemonClient {
         match status.as_u16() {
             404 => bail!("404 Not Found: {msg}. Check deployment name with 'zlayer ps'."),
             500 => {
-                let log_dir = crate::cli::default_log_dir(&crate::cli::default_data_dir());
+                let log_dir = zlayer_paths::ZLayerDirs::default_log_dir();
                 let log_path = log_dir.join("daemon.log");
                 bail!(
                     "500 Internal Server Error: {}. Check logs at {}",
@@ -1031,6 +1034,47 @@ impl DaemonClient {
         Self::parse_json(&body)
     }
 
+    /// Ask the daemon to pull an OCI image reference into its local cache.
+    ///
+    /// `POST /api/v1/images/pull` with
+    /// `{"reference": "<ref>", "pull_policy": "always"|"if_not_present"|"never"}`.
+    ///
+    /// `pull_policy` is optional and defaults to `"always"` server-side when
+    /// omitted. Returns the canonical reference plus the best-effort digest
+    /// and on-disk size reported by the runtime.
+    pub async fn pull_image_from_server(
+        &self,
+        reference: &str,
+        pull_policy: Option<&str>,
+    ) -> Result<PullImageResponse> {
+        let mut payload = serde_json::json!({ "reference": reference });
+        if let Some(policy) = pull_policy {
+            payload["pull_policy"] = serde_json::json!(policy);
+        }
+        let (status, body) = self
+            .post_json("/api/v1/images/pull", &payload.to_string())
+            .await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Create a new reference (`target`) pointing at an already-cached
+    /// image (`source`). Matches Docker-compat `docker tag` semantics.
+    ///
+    /// `POST /api/v1/images/tag` with `{"source": "<ref>", "target": "<ref>"}`.
+    /// Returns `Ok(())` on 204 No Content.
+    pub async fn tag_image(&self, source: &str, target: &str) -> Result<()> {
+        let payload = serde_json::json!({
+            "source": source,
+            "target": target,
+        });
+        let (status, body) = self
+            .post_json("/api/v1/images/tag", &payload.to_string())
+            .await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
     // ------------------------------------------------------------------
     // Container management
     // ------------------------------------------------------------------
@@ -1088,6 +1132,91 @@ impl DaemonClient {
     pub async fn get_container_stats(&self, id: &str) -> Result<serde_json::Value> {
         let path = format!("/api/v1/containers/{}/stats", urlencoding(id));
         let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
+    }
+
+    /// Stop a running standalone container.
+    ///
+    /// `POST /api/v1/containers/{id}/stop` with `{"timeout": <secs>}`.
+    /// `timeout` is the graceful-shutdown window in seconds before the
+    /// runtime force-kills the container; the server defaults to 30s when
+    /// omitted. Returns `Ok(())` on 204 No Content.
+    pub async fn stop_container(&self, id: &str, timeout: Option<u64>) -> Result<()> {
+        let path = format!("/api/v1/containers/{}/stop", urlencoding(id));
+        let payload = match timeout {
+            Some(t) => serde_json::json!({ "timeout": t }),
+            None => serde_json::json!({}),
+        };
+        let (status, body) = self.post_json(&path, &payload.to_string()).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Start a previously-created standalone container.
+    ///
+    /// `POST /api/v1/containers/{id}/start` with an empty body.
+    /// Returns `Ok(())` on 204 No Content.
+    pub async fn start_container(&self, id: &str) -> Result<()> {
+        let path = format!("/api/v1/containers/{}/start", urlencoding(id));
+        let (status, body) = self.post_json(&path, "{}").await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Restart a standalone container (stop then start).
+    ///
+    /// `POST /api/v1/containers/{id}/restart` with `{"timeout": <secs>}`.
+    /// `timeout` is the graceful-shutdown window in seconds before force-kill;
+    /// the server defaults to 30s when omitted. Returns `Ok(())` on 204.
+    pub async fn restart_container(&self, id: &str, timeout: Option<u64>) -> Result<()> {
+        let path = format!("/api/v1/containers/{}/restart", urlencoding(id));
+        let payload = match timeout {
+            Some(t) => serde_json::json!({ "timeout": t }),
+            None => serde_json::json!({}),
+        };
+        let (status, body) = self.post_json(&path, &payload.to_string()).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Send a signal to a running standalone container.
+    ///
+    /// `POST /api/v1/containers/{id}/kill` with `{"signal": "<name>"}`.
+    /// `signal` accepts either the `SIG`-prefixed or bare form (e.g.
+    /// `"SIGTERM"` or `"TERM"`). When omitted, the server defaults to
+    /// `SIGKILL`. Returns `Ok(())` on 204 No Content.
+    pub async fn kill_container(&self, id: &str, signal: Option<&str>) -> Result<()> {
+        let path = format!("/api/v1/containers/{}/kill", urlencoding(id));
+        let payload = match signal {
+            Some(s) => serde_json::json!({ "signal": s }),
+            None => serde_json::json!({}),
+        };
+        let (status, body) = self.post_json(&path, &payload.to_string()).await?;
+        Self::check_status(status, &body)?;
+        Ok(())
+    }
+
+    /// Execute a command inside a standalone container and wait for it to
+    /// finish.
+    ///
+    /// `POST /api/v1/containers/{id}/exec` with `{"command": [...]}`.
+    /// Returns a [`ContainerExecResponse`] with `exit_code`, `stdout`, and
+    /// `stderr`.
+    ///
+    /// Note: the daemon's container exec endpoint is non-interactive -- it
+    /// runs the command to completion and buffers the output. It does not
+    /// accept `tty` or `interactive` flags. For attached/TTY exec against a
+    /// managed service, use
+    /// [`exec_command`](Self::exec_command) instead.
+    pub async fn exec_in_container(
+        &self,
+        id: &str,
+        cmd: Vec<String>,
+    ) -> Result<ContainerExecResponse> {
+        let path = format!("/api/v1/containers/{}/exec", urlencoding(id));
+        let payload = serde_json::json!({ "command": cmd });
+        let (status, body) = self.post_json(&path, &payload.to_string()).await?;
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
     }
@@ -2352,6 +2481,78 @@ impl DaemonClient {
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
     }
+
+    // ------------------------------------------------------------------
+    // Image builds
+    // ------------------------------------------------------------------
+
+    /// Kick off an image build against a server-side context path.
+    ///
+    /// `POST /api/v1/build/json` with a JSON [`BuildSpec`]
+    /// (`context_path`, `runtime`, `build_args`, `target`, `tags`,
+    /// `no_cache`, `push`). The daemon returns `202 Accepted` with a
+    /// [`BuildHandle`] carrying the `build_id` used to poll
+    /// `GET /api/v1/build/{id}`, stream via
+    /// `GET /api/v1/build/{id}/stream`, or collect logs from
+    /// `GET /api/v1/build/{id}/logs`.
+    ///
+    /// The `context_path` must reference a directory that already exists on
+    /// the daemon host; this method does not upload a tarball. For
+    /// multipart-upload builds use the `/api/v1/build` endpoint directly.
+    pub async fn start_build(&self, spec: BuildSpec) -> Result<BuildHandle> {
+        let body = serde_json::to_string(&spec).context("Failed to serialize BuildSpec")?;
+        let (status, resp) = self.post_json("/api/v1/build/json", &body).await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Build DTOs (client-side mirrors of zlayer-api build request/response shapes)
+// ---------------------------------------------------------------------------
+
+/// Specification sent to the daemon's `POST /api/v1/build/json` endpoint to
+/// start an image build against a server-side context path.
+///
+/// Mirrors `zlayer_api::handlers::build::BuildRequestWithContext` on the
+/// wire; the server-side type is `Deserialize`-only so we carry a
+/// `Serialize` mirror here.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct BuildSpec {
+    /// Path to the build context on the daemon host. Must already exist.
+    pub context_path: String,
+    /// Runtime template name (e.g. `"node20"`) to use instead of a Dockerfile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// Build arguments (Dockerfile `ARG` values).
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub build_args: HashMap<String, String>,
+    /// Target stage for multi-stage Dockerfiles.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Tags to apply to the resulting image.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+    /// Disable the buildah layer cache.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub no_cache: bool,
+    /// Push the resulting image to its registry after the build succeeds.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub push: bool,
+}
+
+/// Handle returned by [`DaemonClient::start_build`]. Mirrors the wire shape
+/// of `zlayer_api::handlers::build::TriggerBuildResponse` (which is
+/// `Serialize`-only, so we carry a `Deserialize` mirror here).
+///
+/// The `build_id` can be fed to `GET /api/v1/build/{id}`,
+/// `GET /api/v1/build/{id}/stream`, and `GET /api/v1/build/{id}/logs`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BuildHandle {
+    /// Unique build ID for tracking.
+    pub build_id: String,
+    /// Human-readable message from the daemon.
+    pub message: String,
 }
 
 // ---------------------------------------------------------------------------

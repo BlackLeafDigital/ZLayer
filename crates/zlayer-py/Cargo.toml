@@ -28,7 +28,9 @@ pyo3 = { version = "0.28", features = ["extension-module", "abi3-py38"] }
 pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
 
 # ZLayer crates
-zlayer-agent.workspace = true
+# Enable `youki-runtime` so the Python bindings expose the YoukiConfig type and
+# the Linux libcontainer-backed runtime. No-op on non-Linux targets.
+zlayer-agent = { workspace = true, features = ["youki-runtime"] }
 zlayer-spec.workspace = true
 zlayer-builder.workspace = true
 
@@ -51,6 +53,10 @@ indexmap = "2"
 
 # Random number generation (for container name generation)
 rand.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# DaemonClient for the Python `zlayer.Client` class (Unix socket only).
+zlayer-client.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

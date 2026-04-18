@@ -321,7 +321,7 @@ pub fn refresh_data(rt: &tokio::runtime::Runtime, state: &mut DashboardState) {
         let result = rt.block_on(async {
             let client = match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                crate::daemon_client::DaemonClient::connect(),
+                zlayer_client::DaemonClient::connect(),
             )
             .await
             {
@@ -422,7 +422,7 @@ pub fn refresh_detail(
         let result = rt.block_on(async {
             let client = match tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                crate::daemon_client::DaemonClient::connect(),
+                zlayer_client::DaemonClient::connect(),
             )
             .await
             {
@@ -502,7 +502,7 @@ pub fn start_daemon(rt: &tokio::runtime::Runtime) {
     {
         // Use DaemonClient::connect which auto-starts the daemon
         rt.block_on(async {
-            let _ = crate::daemon_client::DaemonClient::connect().await;
+            let _ = zlayer_client::DaemonClient::connect().await;
         });
     }
 }

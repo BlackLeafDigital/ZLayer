@@ -1017,7 +1017,7 @@ async fn wait_for_daemon_ready(timeout_secs: u64) -> Result<()> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
 
     loop {
-        match crate::daemon_client::DaemonClient::try_connect().await {
+        match zlayer_client::DaemonClient::try_connect().await {
             Ok(Some(_)) => return Ok(()),
             _ if tokio::time::Instant::now() < deadline => {
                 tokio::time::sleep(poll_interval).await;
