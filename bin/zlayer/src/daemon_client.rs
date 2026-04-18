@@ -476,6 +476,13 @@ impl DaemonClient {
         serde_json::from_slice(body).context("Failed to parse JSON response from daemon")
     }
 
+    /// Decode a response body as a UTF-8 `String`, returning a contextual
+    /// error on invalid UTF-8.  Used for endpoints (such as container logs)
+    /// that return plain text rather than JSON.
+    fn decode_text_body(body: &[u8]) -> Result<String> {
+        String::from_utf8(body.to_vec()).context("Container logs body was not valid UTF-8")
+    }
+
     /// Check that a response has a successful (2xx) status code.  If not,
     /// extract the error message from the body and return it with actionable
     /// guidance.
@@ -1060,11 +1067,11 @@ impl DaemonClient {
     /// Get logs for a container.
     ///
     /// `GET /api/v1/containers/{id}/logs[?tail=N]`
-    pub async fn get_container_logs(
-        &self,
-        id: &str,
-        tail: Option<u32>,
-    ) -> Result<serde_json::Value> {
+    ///
+    /// The daemon returns the non-follow log response as plain UTF-8 text
+    /// (entries joined by newlines), so the body is decoded as a `String`
+    /// rather than parsed as JSON.
+    pub async fn get_container_logs(&self, id: &str, tail: Option<u32>) -> Result<String> {
         let mut path = format!("/api/v1/containers/{}/logs", urlencoding(id));
         if let Some(n) = tail {
             use std::fmt::Write;
@@ -1072,7 +1079,7 @@ impl DaemonClient {
         }
         let (status, body) = self.get(&path).await?;
         Self::check_status(status, &body)?;
-        Self::parse_json(&body)
+        Self::decode_text_body(&body)
     }
 
     /// Get resource statistics for a container.
@@ -2445,6 +2452,20 @@ mod tests {
         let body = b"not json";
         let result: Result<serde_json::Value> = DaemonClient::parse_json(body);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn container_logs_cli_decodes_plain_text() {
+        let body: &[u8] = b"[stdout] hello\n[stderr] world\n";
+        let out = DaemonClient::decode_text_body(body).expect("should decode");
+        assert_eq!(out, "[stdout] hello\n[stderr] world\n");
+    }
+
+    #[test]
+    fn container_logs_cli_rejects_invalid_utf8() {
+        // 0xFF is not valid UTF-8
+        let bad: &[u8] = &[0xFF, 0xFE, 0xFD];
+        assert!(DaemonClient::decode_text_body(bad).is_err());
     }
 
     #[test]

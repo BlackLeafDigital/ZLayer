@@ -752,6 +752,8 @@ struct ContainerLogFollowState {
     seen_line_count: usize,
     initial: bool,
     poll_interval: Duration,
+    poll_counter: u64,
+    terminated: bool,
 }
 
 /// Build an SSE stream that polls for new log output.
@@ -768,8 +770,15 @@ fn container_log_follow_stream(
             seen_line_count: 0,
             initial: true,
             poll_interval: Duration::from_millis(500),
+            poll_counter: 0,
+            terminated: false,
         },
         |mut state| async move {
+            // Once terminated on a previous iteration, close the stream.
+            if state.terminated {
+                return None;
+            }
+
             if !state.initial {
                 tokio::time::sleep(state.poll_interval).await;
             }
@@ -785,6 +794,7 @@ fn container_log_follow_stream(
             let all_lines: Vec<String> = entries.iter().map(ToString::to_string).collect();
             let total = all_lines.len();
 
+            let was_initial = state.initial;
             let new_lines = if state.initial {
                 state.initial = false;
                 state.seen_line_count = total;
@@ -797,10 +807,51 @@ fn container_log_follow_stream(
                 vec![]
             };
 
-            let events: Vec<std::result::Result<Event, Infallible>> = new_lines
+            let mut events: Vec<std::result::Result<Event, Infallible>> = new_lines
                 .into_iter()
                 .map(|line| Ok(Event::default().data(line)))
                 .collect();
+
+            // Decide whether to poll container state this tick. Always check on
+            // the first iteration (catches already-exited containers); after
+            // that, check every fourth poll to keep overhead low.
+            let should_check = was_initial || state.poll_counter % 4 == 0;
+            state.poll_counter = state.poll_counter.wrapping_add(1);
+
+            if should_check {
+                let exit_observed = matches!(
+                    state.runtime.container_state(&state.container_id).await,
+                    Ok(ContainerState::Exited { .. } | ContainerState::Failed { .. })
+                );
+
+                if exit_observed {
+                    // Final log drain: fetch a large tail and append any lines
+                    // we haven't already emitted to the current batch.
+                    let final_entries = state
+                        .runtime
+                        .container_logs(&state.container_id, 10_000)
+                        .await
+                        .unwrap_or_default();
+                    let all: Vec<String> = final_entries.iter().map(ToString::to_string).collect();
+                    if all.len() > state.seen_line_count {
+                        for line in &all[state.seen_line_count..] {
+                            events.push(Ok(Event::default().data(line.clone())));
+                        }
+                        state.seen_line_count = all.len();
+                    }
+
+                    state.terminated = true;
+
+                    debug!(
+                        container_id = %state.container_id,
+                        new_events = events.len(),
+                        total_seen = state.seen_line_count,
+                        "container log follow terminating after exit"
+                    );
+
+                    return Some((futures_util::stream::iter(events), state));
+                }
+            }
 
             debug!(
                 container_id = %state.container_id,
@@ -1197,5 +1248,202 @@ mod tests {
         let state = ContainerApiState::new(runtime);
         // State builds without error
         assert!(Arc::strong_count(&state.containers) >= 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // Log-follow stream: termination-on-exit test
+    // -----------------------------------------------------------------------
+
+    /// State backing `MockStateRuntime`.
+    struct MockState {
+        logs: Vec<zlayer_observability::logs::LogEntry>,
+        state: ContainerState,
+        state_calls: u32,
+    }
+
+    /// Minimal runtime used exclusively by
+    /// `container_log_follow_stream_terminates_on_exit`. Only `container_state`
+    /// and `container_logs` are ever called; every other method traps.
+    struct MockStateRuntime {
+        inner: std::sync::Arc<std::sync::Mutex<MockState>>,
+    }
+
+    #[async_trait::async_trait]
+    impl zlayer_agent::runtime::Runtime for MockStateRuntime {
+        async fn pull_image(&self, _image: &str) -> zlayer_agent::error::Result<()> {
+            unimplemented!()
+        }
+
+        async fn pull_image_with_policy(
+            &self,
+            _image: &str,
+            _policy: zlayer_spec::PullPolicy,
+        ) -> zlayer_agent::error::Result<()> {
+            unimplemented!()
+        }
+
+        async fn create_container(
+            &self,
+            _id: &ContainerId,
+            _spec: &zlayer_spec::ServiceSpec,
+        ) -> zlayer_agent::error::Result<()> {
+            unimplemented!()
+        }
+
+        async fn start_container(&self, _id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            unimplemented!()
+        }
+
+        async fn stop_container(
+            &self,
+            _id: &ContainerId,
+            _timeout: Duration,
+        ) -> zlayer_agent::error::Result<()> {
+            unimplemented!()
+        }
+
+        async fn remove_container(&self, _id: &ContainerId) -> zlayer_agent::error::Result<()> {
+            unimplemented!()
+        }
+
+        async fn container_state(
+            &self,
+            _id: &ContainerId,
+        ) -> zlayer_agent::error::Result<ContainerState> {
+            let mut guard = self.inner.lock().expect("mock state mutex poisoned");
+            guard.state_calls += 1;
+            // First 5 calls: Running. Sixth call: append a post-exit log line
+            // and flip to Exited. Subsequent calls (if any) see the already-
+            // flipped Exited state.
+            if guard.state_calls == 6 {
+                guard.logs.push(zlayer_observability::logs::LogEntry {
+                    timestamp: chrono::Utc::now(),
+                    stream: zlayer_observability::logs::LogStream::Stdout,
+                    message: "post-exit line".to_string(),
+                    source: zlayer_observability::logs::LogSource::Container("mock".to_string()),
+                    service: None,
+                    deployment: None,
+                });
+                guard.state = ContainerState::Exited { code: 0 };
+            }
+            Ok(guard.state.clone())
+        }
+
+        async fn container_logs(
+            &self,
+            _id: &ContainerId,
+            tail: usize,
+        ) -> zlayer_agent::error::Result<Vec<zlayer_observability::logs::LogEntry>> {
+            let guard = self.inner.lock().expect("mock state mutex poisoned");
+            let skip = guard.logs.len().saturating_sub(tail);
+            Ok(guard.logs.iter().skip(skip).cloned().collect())
+        }
+
+        async fn exec(
+            &self,
+            _id: &ContainerId,
+            _cmd: &[String],
+        ) -> zlayer_agent::error::Result<(i32, String, String)> {
+            unimplemented!()
+        }
+
+        async fn get_container_stats(
+            &self,
+            _id: &ContainerId,
+        ) -> zlayer_agent::error::Result<zlayer_agent::cgroups_stats::ContainerStats> {
+            unimplemented!()
+        }
+
+        async fn wait_container(&self, _id: &ContainerId) -> zlayer_agent::error::Result<i32> {
+            unimplemented!()
+        }
+
+        async fn get_logs(
+            &self,
+            _id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Vec<zlayer_observability::logs::LogEntry>> {
+            unimplemented!()
+        }
+
+        async fn get_container_pid(
+            &self,
+            _id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Option<u32>> {
+            unimplemented!()
+        }
+
+        async fn get_container_ip(
+            &self,
+            _id: &ContainerId,
+        ) -> zlayer_agent::error::Result<Option<std::net::IpAddr>> {
+            unimplemented!()
+        }
+    }
+
+    fn make_log_entry(message: &str) -> zlayer_observability::logs::LogEntry {
+        zlayer_observability::logs::LogEntry {
+            timestamp: chrono::Utc::now(),
+            stream: zlayer_observability::logs::LogStream::Stdout,
+            message: message.to_string(),
+            source: zlayer_observability::logs::LogSource::Container("mock".to_string()),
+            service: None,
+            deployment: None,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn container_log_follow_stream_terminates_on_exit() {
+        use futures_util::StreamExt;
+
+        let mock_state = std::sync::Arc::new(std::sync::Mutex::new(MockState {
+            logs: vec![
+                make_log_entry("line 1"),
+                make_log_entry("line 2"),
+                make_log_entry("line 3"),
+            ],
+            state: ContainerState::Running,
+            state_calls: 0,
+        }));
+
+        let runtime: Arc<dyn Runtime + Send + Sync> = Arc::new(MockStateRuntime {
+            inner: mock_state.clone(),
+        });
+
+        let container_id = ContainerId {
+            service: "test".to_string(),
+            replica: 0,
+        };
+
+        let stream = container_log_follow_stream(runtime, container_id, 100);
+
+        // With `start_paused = true`, tokio auto-advances time when the
+        // runtime is otherwise idle, so the 500ms poll sleeps collapse. Wrap
+        // in a wall-clock timeout so a regression that fails to terminate
+        // surfaces as a test failure instead of a hang.
+        let collected = tokio::time::timeout(Duration::from_secs(30), stream.collect::<Vec<_>>())
+            .await
+            .expect("stream should terminate within timeout");
+
+        // 3 initial lines + 1 post-exit line = at least 4 events.
+        assert!(
+            collected.len() >= 4,
+            "expected at least 4 events, got {}",
+            collected.len()
+        );
+
+        // Every element is Ok since `Event`'s error type is Infallible.
+        let payloads: Vec<String> = collected
+            .into_iter()
+            .map(|r| r.expect("Infallible"))
+            .map(|e| format!("{e:?}"))
+            .collect();
+        let joined = payloads.join("\n");
+        assert!(joined.contains("line 1"), "missing 'line 1' in {joined}");
+        assert!(joined.contains("line 2"), "missing 'line 2' in {joined}");
+        assert!(joined.contains("line 3"), "missing 'line 3' in {joined}");
+        assert!(
+            joined.contains("post-exit line"),
+            "missing 'post-exit line' in {joined}"
+        );
     }
 }

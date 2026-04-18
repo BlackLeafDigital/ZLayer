@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.97]
+
+### Fixed
+- **Container log-follow SSE now terminates when the container exits.**
+  `GET /api/v1/containers/{id}/logs?follow=true` previously polled forever,
+  keeping the SSE body open even after the container had exited. Clients
+  (notably ZArcRunner) blocked indefinitely on the next read. The follow
+  stream now checks `Runtime::container_state` every fourth poll (plus the
+  initial poll), performs a final log drain on observing `Exited` or
+  `Failed`, and closes the stream. Detection latency ≤ 2s. Covered by
+  `container_log_follow_stream_terminates_on_exit`.
+- **`zlayer container logs` no longer fails with "Failed to parse JSON
+  response from daemon".** The `/logs` (non-follow) endpoint returns plain
+  text, but the daemon client was calling `serde_json::from_slice` on the
+  body. `DaemonClient::get_container_logs` now returns `Result<String>`
+  via a new `decode_text_body` helper; the caller in `commands/container`
+  was simplified to a direct print. Covered by
+  `container_logs_cli_decodes_plain_text` and
+  `container_logs_cli_rejects_invalid_utf8`.
+
+## [0.10.96]
+
+### Fixed
+- **`zlayer-agent-zql` cargo publish**: added `version = "0.6.0"` to the
+  `libcontainer` git dependency in `crates/zlayer-agent/Cargo.toml`. Cargo
+  publish refuses to publish a crate whose deps lack a version requirement;
+  this was the only git-only dep in the workspace and the only blocker for
+  publishing `zlayer-agent-zql`. In-workspace builds still resolve to the
+  pinned youki rev (`a68a38c`) for the socket bind-mount fix; registry
+  consumers resolve `libcontainer = "0.6.0"` from crates.io.
+
 ## [0.10.95]
 
 ### Changed
