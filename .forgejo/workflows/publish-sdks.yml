@@ -124,7 +124,7 @@ jobs:
     needs: [detect]
     if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
     name: Build wheel (macos-x86_64)
-    runs-on: macos-13
+    runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -169,7 +169,7 @@ jobs:
     needs: [detect]
     if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
     name: Build wheel (macos-aarch64)
-    runs-on: macos-14
+    runs-on: macos-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
