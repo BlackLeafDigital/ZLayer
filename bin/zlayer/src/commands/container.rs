@@ -82,21 +82,9 @@ async fn remove_container(id: &str, force: bool) -> Result<()> {
 async fn container_logs(id: &str, tail: Option<u32>) -> Result<()> {
     let client = DaemonClient::connect().await?;
     let logs = client.get_container_logs(id, tail).await?;
-
-    // If the response is a JSON string, print it directly; otherwise pretty-print
-    if let Some(text) = logs.as_str() {
-        print!("{text}");
-    } else if let Some(arr) = logs.as_array() {
-        for line in arr {
-            if let Some(s) = line.as_str() {
-                println!("{s}");
-            } else {
-                println!("{line}");
-            }
-        }
-    } else {
-        let json = serde_json::to_string_pretty(&logs)?;
-        println!("{json}");
+    print!("{logs}");
+    if !logs.ends_with('\n') {
+        println!();
     }
     Ok(())
 }

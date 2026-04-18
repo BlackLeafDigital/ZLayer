@@ -2,7 +2,33 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.102]
+
+### Fixed
+- **Container log-follow SSE now terminates when the container exits.**
+  `GET /api/v1/containers/{id}/logs?follow=true` previously polled forever,
+  keeping the SSE body open even after the container had exited. Clients
+  (notably ZArcRunner) blocked indefinitely on the next read. The follow
+  stream now checks `Runtime::container_state` every fourth poll (plus the
+  initial poll), performs a final log drain on observing `Exited` or
+  `Failed`, and closes the stream. Detection latency ≤ 2s. Covered by
+  `container_log_follow_stream_terminates_on_exit`.
+- **`zlayer container logs` no longer fails with "Failed to parse JSON
+  response from daemon".** The `/logs` (non-follow) endpoint returns plain
+  text, but the daemon client was calling `serde_json::from_slice` on the
+  body. `DaemonClient::get_container_logs` now returns `Result<String>`
+  via a new `decode_text_body` helper; the caller in `commands/container`
+  was simplified to a direct print. Covered by
+  `container_logs_cli_decodes_plain_text` and
+  `container_logs_cli_rejects_invalid_utf8`.
+
 ## [0.10.101]
+
+### Added
+- **`crates/zlayer-proxy/README.md`** so the crate's `Cargo.toml`
+  `readme = "README.md"` line points at an actual file. Latent bug
+  hidden by `publish = false`; surfaced in the `zlayer-zql` mirror
+  where the crate is now published to the `forgejo` registry.
 
 ### Changed
 - **CI workflows (`.forgejo/workflows/ci.yaml`, `.forgejo/workflows/build.yml`)
