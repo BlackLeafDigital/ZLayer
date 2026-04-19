@@ -62,6 +62,7 @@ All notable changes to this project will be documented in this file.
   succeeds even if completion drop fails.
 
 ### Fixed
+- Forgejo CI: `build.yml` now uses `christopherhx/gitea-upload-artifact` and `christopherhx/gitea-download-artifact` forks (upstream `actions/upload-artifact@v4` and `actions/download-artifact@v4` error with `GHESNotSupportedError` on Forgejo).
 - TUI build progress counter denominator (`[X/Y] instructions`) previously grew in lockstep with the numerator because totals were summed from events as they arrived; now emitted once up-front via `BuildEvent::BuildStarted { total_stages, total_instructions }`.
 - **Latent clap CLI-definition bugs that made `zlayer completions` (and
   `--help` on the affected subcommands) panic in debug builds.** Four

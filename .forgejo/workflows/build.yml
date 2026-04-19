@@ -128,14 +128,14 @@ jobs:
         run: tar czf "zlayer-completions.tar.gz" completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v4
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: zlayer-linux-amd64
           path: zlayer-linux-amd64.tar.gz
           retention-days: 1
       - name: Upload completions artifact
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v4
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: zlayer-completions
           path: zlayer-completions.tar.gz
@@ -230,7 +230,7 @@ jobs:
           tar czf "zlayer-darwin-arm64.tar.gz" -C "$CARGO_TARGET_DIR/aarch64-apple-darwin/release" zlayer completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v4
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: zlayer-darwin-arm64
           path: zlayer-darwin-arm64.tar.gz
@@ -327,7 +327,7 @@ jobs:
         run: 7z a zlayer-windows-amd64.zip target/release/zlayer.exe completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v4
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: zlayer-windows-amd64
           path: zlayer-windows-amd64.zip
@@ -375,7 +375,7 @@ jobs:
           cross-platform: 'true'
       - name: Download zlayer
         if: steps.check.outputs.completed != 'true'
-        uses: actions/download-artifact@v4
+        uses: https://github.com/christopherhx/gitea-download-artifact@v4
         with:
           name: zlayer-linux-amd64
       - name: Install zlayer
@@ -406,7 +406,7 @@ jobs:
 
       - name: Upload image artifacts
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v4
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: container-images
           path: |
@@ -482,7 +482,7 @@ jobs:
         run: cargo build --release --target x86_64-apple-darwin --package zlayer
       - name: Download shell completions
         if: steps.check.outputs.completed != 'true'
-        uses: actions/download-artifact@v4
+        uses: https://github.com/christopherhx/gitea-download-artifact@v4
         with:
           name: zlayer-completions
       - name: Unpack completions
@@ -500,7 +500,7 @@ jobs:
         run: tar czf "zlayer-darwin-amd64.tar.gz" -C "$CARGO_TARGET_DIR/x86_64-apple-darwin/release" zlayer completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v4
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: zlayer-darwin-amd64
           path: zlayer-darwin-amd64.tar.gz
@@ -580,7 +580,7 @@ jobs:
         run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer --target-dir $CROSS_TARGET_DIR
       - name: Download shell completions
         if: steps.check.outputs.completed != 'true'
-        uses: actions/download-artifact@v4
+        uses: https://github.com/christopherhx/gitea-download-artifact@v4
         with:
           name: zlayer-completions
       - name: Unpack completions
@@ -597,7 +597,7 @@ jobs:
         run: tar czf "zlayer-linux-arm64.tar.gz" -C "$CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release" zlayer completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
-        uses: actions/upload-artifact@v4
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: zlayer-linux-arm64
           path: zlayer-linux-arm64.tar.gz
@@ -660,7 +660,7 @@ jobs:
 
       - name: Download all artifacts
         if: steps.check.outputs.completed != 'true'
-        uses: actions/download-artifact@v4
+        uses: https://github.com/christopherhx/gitea-download-artifact@v4
         with:
           path: artifacts
 
