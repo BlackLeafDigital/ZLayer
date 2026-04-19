@@ -61,6 +61,18 @@ All notable changes to this project will be documented in this file.
   conditionals from ci.yaml — the workflow has no `tags:` filter, so those
   branches were dead code and were what made the broken reasoning look
   plausible.
+- CI: `publish-sdks.yml` now actually runs. The `if:` gates used
+  `contains(fromJson(services-to-release), fromJson('{"group":"sdks",...}'))`,
+  but Forgejo's Act-based runner can't compare objects
+  ("Compare not implemented for types: left: map, right: map"). Switched
+  all 13 SDK gates to the flat form
+  `contains(fromJson(services-to-release-flat), 'sdks/<service>')` and
+  added a new `services-to-release-flat` output to the detect-changes
+  action emitting a JSON array of `"group/service"` strings. A prior
+  output-name mismatch (action.yml declared hyphenated names but the
+  source called `core.setOutput("services_to_release", ...)` with
+  underscores) was also fixed — every `fromJson(output)` was receiving
+  an empty string and blowing up downstream.
 
 ## [0.10.103]
 

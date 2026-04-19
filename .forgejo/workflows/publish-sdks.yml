@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       services-to-release: ${{ steps.detect.outputs.services-to-release }}
+      services-to-release-flat: ${{ steps.detect.outputs.services-to-release-flat }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -42,7 +43,7 @@ jobs:
   # ===========================================
   publish-py-binding-build-linux-x86_64:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (linux-x86_64)
     runs-on: ubuntu-latest
     timeout-minutes: 45
@@ -82,7 +83,7 @@ jobs:
 
   publish-py-binding-build-linux-aarch64:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (linux-aarch64)
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -122,7 +123,7 @@ jobs:
 
   publish-py-binding-build-macos-x86_64:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (macos-x86_64)
     runs-on: macos-latest
     timeout-minutes: 45
@@ -167,7 +168,7 @@ jobs:
 
   publish-py-binding-build-macos-aarch64:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (macos-aarch64)
     runs-on: macos-latest
     timeout-minutes: 45
@@ -212,7 +213,7 @@ jobs:
 
   publish-py-binding-build-windows-x86_64:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (windows-x86_64)
     runs-on: windows-latest
     timeout-minutes: 45
@@ -261,7 +262,7 @@ jobs:
 
   publish-py-binding-build-sdist:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build sdist
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -306,7 +307,7 @@ jobs:
       - publish-py-binding-build-macos-aarch64
       - publish-py-binding-build-windows-x86_64
       - publish-py-binding-build-sdist
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Publish to PyPI
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -370,7 +371,7 @@ jobs:
   # ===========================================
   publish-ts-client:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"ts-client"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/ts-client')
     name: Publish to npm
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -468,7 +469,7 @@ jobs:
   # ===========================================
   publish-plugin-sdk-rust:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-rust"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/plugin-sdk-rust')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -516,7 +517,7 @@ jobs:
 
   publish-plugin-sdk-python:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-python"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/plugin-sdk-python')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -568,7 +569,7 @@ jobs:
 
   publish-plugin-sdk-typescript:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-typescript"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/plugin-sdk-typescript')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -622,7 +623,7 @@ jobs:
   # `github.com/BlackLeafDigital/ZLayer/clients/zlayer-sdk/go@v<VERSION>`.
   publish-plugin-sdk-go:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-go"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/plugin-sdk-go')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -675,7 +676,7 @@ jobs:
   # packages. Consumers download, extract, and build with cmake themselves.
   publish-plugin-sdk-c:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-c"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/plugin-sdk-c')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
