@@ -80,6 +80,16 @@ impl PlainLogger {
     /// Handle a build event and print appropriate output
     pub fn handle_event(&self, event: &BuildEvent) {
         match event {
+            BuildEvent::BuildStarted {
+                total_stages,
+                total_instructions,
+            } => {
+                let header = format!(
+                    "==> Building {total_stages} stages, {total_instructions} instructions total"
+                );
+                println!("{}", self.colorize(&header, ansi::CYAN));
+            }
+
             BuildEvent::StageStarted {
                 index,
                 name,

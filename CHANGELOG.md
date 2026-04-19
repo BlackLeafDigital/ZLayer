@@ -2,6 +2,94 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.104]
+
+### Added
+- `wasm.oci: false` ZImagefile opt-out — skip OCI layout + push, still produce the raw `.wasm` with full caching / wasm-opt / adapter support.
+- `docs/wasm-portability.md` — consumer compatibility matrix (wkg, Spin, wasmCloud, runwasi, ORAS, crane) + WIT-world portability guidance.
+- ZImagefile `runtime: wasm` now delegates to WASM build mode with target autodetection (cargo-component, wasm32-wasip*, jco, componentize-py).
+- `zlayer build` with `-t <tag>` now pushes WASM OCI artifacts to the registry, matching the container push flow.
+- Integration test `wasm_oci_e2e` verifies the WASM builder->OCI pipeline end-to-end (manifest artifactType, layer media type, runtime routing).
+- Docker-compat server endpoints: per-container stop/kill/start/restart/exec
+  under `/api/v1/containers/{id}/{action}`; `POST /api/v1/images/{tag,pull}`
+  for single-image ops. OpenAPI coverage included.
+- `Runtime::kill_container(signal)` and `Runtime::tag_image(src, dst)` added on all backends (youki, docker, macos_*, wasm). Exposed as `POST /api/v1/containers/{id}/kill` and `POST /api/v1/images/tag`. Unblocks full Docker CLI compatibility (kill/tag).
+- `zlayer docker` image subcommands (images, rmi, tag, pull, push, build) now work — bridged via zlayer-client. `build` maps Docker args to BuildSpec and returns the build id.
+- `zlayer docker` container subcommands (ps, logs, stop, kill, start, restart, rm, exec, run) now work — bridged to the daemon via `zlayer-client`. `run` converts Docker args to a ServiceSpec and deploys.
+- `zlayer docker compose up/down/ps/logs` now work end-to-end. `up` converts compose YAML to DeploymentSpec via existing `compose_to_deployment` and deploys via `DaemonClient`.
+- Docker Engine API compat: `GET /info` returns real container/image counts, host OS/arch/ncpu. `GET /events` emits a live SSE-style event stream.
+- Docker Engine API compat: real `GET /images/json`, `GET /images/{name}/json`, `POST /images/create` (pull), `POST /images/{name}/tag`, `DELETE /images/{name}`. `docker images`, `docker pull`, `docker tag`, `docker rmi` now work.
+- Docker Engine API compat: real `GET /containers/json`, `GET /containers/{id}/json`, `GET /containers/{id}/logs`, `POST /containers/{id}/{start,stop,kill,restart}`, `DELETE /containers/{id}`. `docker ps`, `docker logs`, `docker start/stop/kill/restart/rm` now work against the zlayer-managed socket.
+- Python binding (`zlayer-py`): new `zlayer.Client(socket=None, host=None)`
+  class for driving a remote zlayer daemon from Python
+  (ps/deploy/logs/exec/build/stop/status/scale). Unix-only (the daemon
+  socket is Unix).
+- Python binding: `zlayer.ensure_daemon(system=False, version=None)` bootstraps the zlayer binary from Python (userland to `~/.local/share/zlayer/bin/`; `system=True` runs `sudo zlayer daemon install`).
+- Example: `examples/python/deploy_hello.py` — complete end-to-end example deploying a trivial service via the Python binding.
+- Python binding: `tests/test_client.py` integration tests spawn a real daemon and exercise `Client` end-to-end (ps, status, deploy/stop).
+- Python binding packaged for PyPI (full `pyproject.toml` metadata, `zlayer` distribution name, abi3-py38 wheels).
+- Internal: DaemonClient extracted to zlayer-client library crate for reuse
+  by zlayer-docker / zlayer-py / language SDKs. No behavior change.
+- `zlayer-client` gains per-container stop/start/restart/exec and server-side `pull_image` + `start_build` methods, matching the Docker-compat and Python SDK needs.
+- `zlayer-client::DaemonClient` gains `kill_container(id, signal)` and `tag_image(src, dst)` methods, completing the Docker-compat API surface.
+- OpenAPI spec coverage: regenerated `openapi.json` now documents all REST domains (>=50 paths including nodes, overlay, tunnels, networks, proxy, cluster, environments, variables, projects, webhooks, credentials, groups, permissions, audit, users, tasks, workflows, notifiers, syncs, volumes, storage, cron, jobs, and the existing deployments/services/builds/secrets).
+- Generated TypeScript REST client at `clients/typescript/` (from `openapi.json`, 117 paths, typescript-fetch generator). Ready for a façade package to wrap.
+- New npm package `@zlayer/client` (at `clients/typescript-client/`): ergonomic TypeScript SDK wrapping the generated OpenAPI client. Methods: deploy, ps, logs, exec, build, stop, status, scale, kill, tag. `ensureDaemon()` optional binary bootstrap (userland default, `system: true` escalates).
+- CI: shell completions (bash/zsh/fish/powershell/elvish) emitted during release builds and bundled into every platform's release artifacts.
+- CI: `.forgejo/workflows/python-publish.yml` builds wheels for manylinux x86_64/aarch64, macOS x86_64/aarch64, and Windows, and publishes `zlayer` to PyPI on version tags.
+- CI: `.forgejo/workflows/node-publish.yml` publishes `@zlayer/client` (and `@zlayer/api-client`) to npm on version tags.
+
+### Changed
+- CI: SDK publishing moved to `.forgejo/workflows/publish-sdks.yml`, guarded by `detect-changes` registry-check. `release.yml` triggers it via workflow_dispatch. `python-publish.yml` and `node-publish.yml` folded in. New `.forgejo/build-config.yaml` defines the `sdks` service group.
+- WASM builds via `zlayer build` now produce a real OCI artifact
+  (`artifactType: application/vnd.wasm.component.v1+wasm` or
+  `module.v1+wasm`) instead of a bare `.wasm` file with null `oci_path`. The
+  builder writes a full OCI image layout (`oci-layout`, `blobs/sha256/...`,
+  `index.json`) next to the compiled WASM binary in a `<module>-oci`
+  directory, and `BuiltImage.image_id` now uses the first user tag when
+  present or a proper `wasm:sha256:...` manifest digest ref as a fallback
+  (previously the image id embedded the full filesystem path).
+
+### Fixed
+- CI: dev pushes now actually dispatch `build.yml` after `auto-tag`. The
+  earlier removal of the direct dispatch assumed the `trigger-e2e → e2e.yml
+  → trigger-build` chain would handle it, but that chain is gated on
+  `inputs.version != ''` which is always empty for branch pushes, so
+  `build.yml` never ran. Restored the explicit `curl` dispatch inside the
+  `auto-tag` job, passing the freshly-created `vX.Y.Z` as `version`. Also
+  removed all unreachable `startsWith(github.ref, 'refs/tags/')`
+  conditionals from ci.yaml — the workflow has no `tags:` filter, so those
+  branches were dead code and were what made the broken reasoning look
+  plausible.
+
+## [0.10.103]
+
+### Added
+- **Shell completion generation.** New `zlayer completions <SHELL>` subcommand
+  emits a completion script for `bash`, `zsh`, `fish`, `powershell`, or
+  `elvish` to stdout, built from the live clap command tree. Install with
+  e.g. `zlayer completions bash > /etc/bash_completion.d/zlayer`.
+- Install scripts now drop shell completions for bash, zsh, fish (Linux/macOS)
+  and PowerShell (Windows) after installing the binary. Fail-soft: install
+  succeeds even if completion drop fails.
+
+### Fixed
+- Forgejo CI: `build.yml` now uses `christopherhx/gitea-upload-artifact` and `christopherhx/gitea-download-artifact` forks (upstream `actions/upload-artifact@v4` and `actions/download-artifact@v4` error with `GHESNotSupportedError` on Forgejo).
+- TUI build progress counter denominator (`[X/Y] instructions`) previously grew in lockstep with the numerator because totals were summed from events as they arrived; now emitted once up-front via `BuildEvent::BuildStarted { total_stages, total_instructions }`.
+- **Latent clap CLI-definition bugs that made `zlayer completions` (and
+  `--help` on the affected subcommands) panic in debug builds.** Four
+  issues in `bin/zlayer/src/cli.rs` surfaced by `clap_complete::generate`
+  walking the whole subcommand tree:
+  - `manager init`'s custom `--version` flag collided with clap's
+    auto-injected `--version`; now annotated with `disable_version_flag`.
+  - `job trigger`, `job status`, and `cron status` declared a non-required
+    positional (`deployment`) before a required one (`job`/`cron`).
+    `deployment` is now a `--deployment` flag, matching the pattern
+    already used by `zlayer logs`.
+  - The global `--detach` flag's `short = 'd'` collided with docker
+    compat's `docker volume create -d <driver>`. The short form is
+    dropped (use `--detach`); `-b/--background` is unaffected.
+
 ## [0.10.102]
 
 ### Fixed
@@ -26,9 +114,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - **`crates/zlayer-proxy/README.md`** so the crate's `Cargo.toml`
-  `readme = "README.md"` line points at an actual file. Latent bug
-  hidden by `publish = false`; surfaced in the `zlayer-zql` mirror
-  where the crate is now published to the `forgejo` registry.
+  `readme = "README.md"` line points at an actual file.
 
 ### Changed
 - **CI workflows (`.forgejo/workflows/ci.yaml`, `.forgejo/workflows/build.yml`)

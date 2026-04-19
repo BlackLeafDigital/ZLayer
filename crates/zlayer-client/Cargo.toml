@@ -1,0 +1,45 @@
+[package]
+name = "zlayer-client"
+description = "HTTP-over-Unix-socket client for the ZLayer daemon, shared between the zlayer CLI, zlayer-docker, zlayer-py, and language SDKs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+# Error handling
+anyhow = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# Session file timestamps
+chrono = { workspace = true }
+
+# Central filesystem path resolution (sockets, data/log dirs).
+zlayer-paths.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# HTTP-over-Unix-socket client
+tokio = { workspace = true, features = ["full"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = "0.1"
+bytes = { workspace = true }
+tower = { workspace = true }
+tokio-stream = { workspace = true }
+
+# Typed request/response structs used by the daemon API.
+zlayer-api.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

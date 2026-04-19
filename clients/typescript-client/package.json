@@ -1,0 +1,55 @@
+{
+  "name": "@zlayer/client",
+  "version": "0.10.104",
+  "description": "Ergonomic TypeScript SDK for ZLayer. Wraps the auto-generated OpenAPI client (@zlayer/api-client) with convenience methods and a Unix-socket-aware fetch.",
+  "keywords": [
+    "zlayer",
+    "container",
+    "orchestration",
+    "sdk",
+    "openapi"
+  ],
+  "license": "Apache-2.0",
+  "author": "ZLayer contributors",
+  "homepage": "https://zlayer.dev",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BlackLeafDigital/ZLayer.git",
+    "directory": "clients/typescript-client"
+  },
+  "bugs": {
+    "url": "https://github.com/BlackLeafDigital/ZLayer/issues"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "scripts/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "postinstall": "node scripts/postinstall.cjs"
+  },
+  "dependencies": {
+    "@zlayer/api-client": "file:../typescript",
+    "undici": "^6.19.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

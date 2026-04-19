@@ -26,13 +26,14 @@ members = [
   "crates/zlayer-docker",
   "crates/zlayer-wsl",
   "crates/zlayer-git",
+  "crates/zlayer-client",
 ]
 
 [workspace.package]
 version = "0.0.0-dev"
 edition = "2021"
 license = "Apache-2.0"
-repository = "https://github.com/zachhandley/ZLayer"
+repository = "https://github.com/BlackLeafDigital/ZLayer"
 homepage = "https://zlayer.dev"
 rust-version = "1.85"  # Minimum supported version
 
@@ -227,6 +228,7 @@ zlayer-proxy = { version = "0.0.0-dev", path = "crates/zlayer-proxy" }
 zlayer-secrets = { version = "0.0.0-dev", path = "crates/zlayer-secrets" }
 zlayer-wsl = { version = "0.0.0-dev", path = "crates/zlayer-wsl" }
 zlayer-git = { version = "0.0.0-dev", path = "crates/zlayer-git" }
+zlayer-client = { version = "0.0.0-dev", path = "crates/zlayer-client" }
 
 # Git (gitoxide) — pure-Rust git implementation used by `zlayer-git`.
 # Features chosen to cover the operations we perform: blocking HTTPS transport

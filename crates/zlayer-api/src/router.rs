@@ -1259,6 +1259,13 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
             "/{id}/stats",
             get(handlers::containers::get_container_stats),
         )
+        .route("/{id}/stop", post(handlers::containers::stop_container))
+        .route("/{id}/start", post(handlers::containers::start_container))
+        .route(
+            "/{id}/restart",
+            post(handlers::containers::restart_container),
+        )
+        .route("/{id}/kill", post(handlers::containers::kill_container))
         .with_state(container_state)
 }
 

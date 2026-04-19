@@ -7,7 +7,7 @@
 use anyhow::{bail, Context, Result};
 use dialoguer::{Confirm, Password};
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 // ---- Registry credentials ----
 

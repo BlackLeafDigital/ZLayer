@@ -3,9 +3,9 @@ use tracing::info;
 
 use crate::cli::{Cli, TunnelCommands};
 #[cfg(unix)]
-use crate::daemon_client::DaemonClient;
-#[cfg(unix)]
 use crate::util::parse_duration;
+#[cfg(unix)]
+use zlayer_client::DaemonClient;
 
 /// Handle tunnel subcommands
 pub(crate) async fn handle_tunnel(_cli: &Cli, cmd: &TunnelCommands) -> Result<()> {

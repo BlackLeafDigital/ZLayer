@@ -137,7 +137,7 @@ jobs:
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
           mkdir -p artifacts
 
-          for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64; do
+          for name in zlayer-linux-amd64 zlayer-linux-arm64 zlayer-darwin-amd64 zlayer-darwin-arm64 zlayer-completions; do
             echo "Downloading ${name}.tar.gz..."
             curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
               --user "$AUTH" \
@@ -299,245 +299,20 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
-  # SDK Publishing
+  # Trigger SDK publishing workflow
   # ===========================================
-  publish-rust-sdk:
-    needs: [detect]
-    if: |
-      needs.detect.outputs.sdk_name == 'rust' ||
-      needs.detect.outputs.is_general == 'true'
+  trigger-sdk-publish:
+    needs: [detect, upload-binaries, merge-to-main]
+    if: needs.detect.outputs.is_general == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.ref }}
-          fetch-depth: 0
-      - name: Check step status
-        id: check
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: check
-          version: ${{ needs.detect.outputs.version }}
-          step: publish-rust-sdk
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
-        if: steps.check.outputs.completed != 'true'
-      - name: Check and publish
-        if: steps.check.outputs.completed != 'true'
-        working-directory: clients/zlayer-sdk/rust
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      - name: Dispatch publish-sdks workflow
         run: |
-          INPUT_VERSION="${{ needs.detect.outputs.version }}"
-          LATEST_TAG=$(git tag -l "rust-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
-          if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
-            echo "Publishing rust-sdk..."
-            cargo publish --allow-dirty || echo "May already exist"
-          else
-            echo "Skipping rust-sdk (already at or above $INPUT_VERSION)"
-          fi
-      - name: Mark step complete
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: mark
-          version: ${{ needs.detect.outputs.version }}
-          step: publish-rust-sdk
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-
-  publish-python-sdk:
-    needs: [detect]
-    if: |
-      needs.detect.outputs.sdk_name == 'python' ||
-      needs.detect.outputs.is_general == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.ref }}
-          fetch-depth: 0
-      - name: Check step status
-        id: check
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: check
-          version: ${{ needs.detect.outputs.version }}
-          step: publish-python-sdk
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-      - uses: actions/setup-python@v5
-        if: steps.check.outputs.completed != 'true'
-        with:
-          python-version: '3.12'
-      - name: Check and publish
-        if: steps.check.outputs.completed != 'true'
-        working-directory: clients/zlayer-sdk/python
-        env:
-          TWINE_USERNAME: __token__
-          TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
-        run: |
-          INPUT_VERSION="${{ needs.detect.outputs.version }}"
-          LATEST_TAG=$(git tag -l "py-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
-          if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
-            echo "Publishing python-sdk..."
-            # Update version in pyproject.toml and __init__.py
-            sed -i "s/^version = .*/version = \"$INPUT_VERSION\"/" pyproject.toml
-            sed -i "s/__version__ = .*/__version__ = \"$INPUT_VERSION\"/" zlayer/__init__.py
-            pip install build twine
-            python -m build
-            twine upload dist/* || echo "May already exist"
-          else
-            echo "Skipping python-sdk (already at or above $INPUT_VERSION)"
-          fi
-      - name: Mark step complete
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: mark
-          version: ${{ needs.detect.outputs.version }}
-          step: publish-python-sdk
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-
-  publish-typescript-sdk:
-    needs: [detect]
-    if: |
-      needs.detect.outputs.sdk_name == 'typescript' ||
-      needs.detect.outputs.is_general == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.ref }}
-          fetch-depth: 0
-      - name: Check step status
-        id: check
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: check
-          version: ${{ needs.detect.outputs.version }}
-          step: publish-typescript-sdk
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-      - uses: actions/setup-node@v4
-        if: steps.check.outputs.completed != 'true'
-        with:
-          node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
-      - name: Check and publish
-        if: steps.check.outputs.completed != 'true'
-        working-directory: clients/zlayer-sdk/typescript
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          INPUT_VERSION="${{ needs.detect.outputs.version }}"
-          LATEST_TAG=$(git tag -l "ts-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
-          if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
-            echo "Publishing typescript-sdk..."
-            # Update version in package.json
-            npm version "$INPUT_VERSION" --no-git-tag-version
-            npm ci
-            npm run build
-            npm publish --access public || echo "May already exist"
-          else
-            echo "Skipping typescript-sdk (already at or above $INPUT_VERSION)"
-          fi
-      - name: Mark step complete
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: mark
-          version: ${{ needs.detect.outputs.version }}
-          step: publish-typescript-sdk
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-
-  publish-go-sdk:
-    needs: [detect]
-    if: |
-      needs.detect.outputs.sdk_name == 'go' ||
-      needs.detect.outputs.is_general == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.ref }}
-      - name: Check step status
-        id: check
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: check
-          version: ${{ needs.detect.outputs.version }}
-          step: publish-go-sdk
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-      - uses: actions/setup-go@v5
-        if: steps.check.outputs.completed != 'true'
-        with:
-          go-version: '1.24'
-      - name: Verify Go module
-        if: steps.check.outputs.completed != 'true'
-        working-directory: clients/zlayer-sdk/go
-        run: go mod verify
-      - name: Mark step complete
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: mark
-          version: ${{ needs.detect.outputs.version }}
-          step: publish-go-sdk
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-
-  publish-c-sdk:
-    needs: [detect]
-    if: |
-      needs.detect.outputs.sdk_name == 'c' ||
-      needs.detect.outputs.is_general == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.ref }}
-      - name: Check step status
-        id: check
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: check
-          version: ${{ needs.detect.outputs.version }}
-          step: publish-c-sdk
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-      - name: Install build dependencies
-        if: steps.check.outputs.completed != 'true'
-        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
-      - name: Verify C SDK builds
-        if: steps.check.outputs.completed != 'true'
-        working-directory: clients/zlayer-sdk/c
-        run: |
-          cmake -B build
-          cmake --build build
-      - name: Mark step complete
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: mark
-          version: ${{ needs.detect.outputs.version }}
-          step: publish-c-sdk
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/publish-sdks.yml/dispatches" \
+            -d '{"ref":"main","inputs":{"version":"${{ needs.detect.outputs.version }}"}}'
 
   # ===========================================
   # Docker Push (uses pre-built images from build workflow)
@@ -709,7 +484,11 @@ jobs:
   # Create Forgejo Release
   # ===========================================
   create-forgejo-release:
-    needs: [detect, upload-binaries, docker-push]
+    # Intentionally does NOT need docker-push: a Docker Hub / GHCR outage
+    # must not block the Forgejo release. The release notes still advertise
+    # the container images, but users pulling them just retry the image
+    # push if it failed.
+    needs: [detect, upload-binaries]
     if: always() && needs.detect.outputs.is_general == 'true' && needs.upload-binaries.result == 'success'
     runs-on: ubuntu-latest
     steps:
@@ -751,6 +530,29 @@ jobs:
           | Binary | Linux | macOS | Windows |
           |--------|-------|-------|---------|
           | `zlayer` | [amd64](${PACKAGES_URL}/zlayer-linux-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-linux-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-darwin-amd64.tar.gz) / [arm64](${PACKAGES_URL}/zlayer-darwin-arm64.tar.gz) | [amd64](${PACKAGES_URL}/zlayer-windows-amd64.zip) |
+
+          Every platform tarball/zip now ships with a `completions/` directory
+          containing bash/zsh/fish/powershell/elvish scripts. A standalone
+          [zlayer-completions.tar.gz](${PACKAGES_URL}/zlayer-completions.tar.gz)
+          is also published for package maintainers.
+
+          ### Python (PyPI)
+
+          ```bash
+          pip install zlayer==${VERSION}
+          ```
+
+          Python bindings for ZLayer — in-process runtime (Linux) and a remote `Client` for driving a daemon.
+
+          ### TypeScript / JavaScript (npm)
+
+          ```bash
+          npm install @zlayer/client@${VERSION}
+          # or the raw generated client
+          npm install @zlayer/api-client@${VERSION}
+          ```
+
+          `@zlayer/client` wraps the OpenAPI-generated `@zlayer/api-client` with ergonomic methods.
 
           ### Container Images
 
@@ -852,7 +654,7 @@ jobs:
   # Cleanup temp packages (runs after all jobs)
   # ===========================================
   cleanup:
-    needs: [detect, upload-binaries, merge-to-main, docker-push, publish-all-crates, publish-rust-sdk, publish-python-sdk, publish-typescript-sdk, publish-go-sdk, publish-c-sdk, create-forgejo-release, trigger-github, macos-sandbox-images]
+    needs: [detect, upload-binaries, merge-to-main, docker-push, publish-all-crates, trigger-sdk-publish, create-forgejo-release, trigger-github, macos-sandbox-images]
     if: always()
     runs-on: ubuntu-latest
     steps:

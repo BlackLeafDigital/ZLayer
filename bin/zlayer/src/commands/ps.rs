@@ -7,7 +7,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// A row in the ps output table.
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,10 +1,16 @@
-# zlayer-py
+# zlayer
 
-Python bindings for the ZLayer container runtime.
+Python bindings for [ZLayer](https://zlayer.dev) — a lightweight, Rust-based
+container orchestration platform with built-in networking, scaling, and
+observability. ZLayer uses libcontainer (from youki) for direct container
+management without requiring a daemon.
+
+This package ships prebuilt abi3 wheels (one wheel per OS/arch works on
+CPython 3.8+), so `pip install zlayer` does not require a Rust toolchain.
 
 ## Installation
 
-### From PyPI (when published)
+### From PyPI
 
 ```bash
 pip install zlayer
@@ -19,7 +25,38 @@ cd crates/zlayer-py
 maturin develop
 ```
 
-## Quick Start
+## Quickstart: driving a remote daemon from Python
+
+The `zlayer.Client` class talks to a running `zlayer` daemon over its Unix
+socket — the same socket the `zlayer` CLI uses. `zlayer.ensure_daemon()`
+bootstraps the `zlayer` binary if it isn't on `PATH` yet (downloaded into
+`~/.local/share/zlayer/bin/`).
+
+```python
+import asyncio
+import zlayer
+
+async def main():
+    # Make sure a `zlayer` binary is installed and the daemon is running.
+    # Returns the path to the binary. Use system=True to install system-wide
+    # via `sudo zlayer daemon install`.
+    zlayer.ensure_daemon()
+
+    # Connect to the local daemon (defaults to the standard Unix socket).
+    client = zlayer.Client()
+
+    # Deploy a spec and list running containers.
+    await client.deploy("deployment.yaml")
+    for container in await client.ps():
+        print(container)
+
+asyncio.run(main())
+```
+
+## Embedded runtime and builder
+
+For in-process orchestration (no daemon required), ZLayer exposes a full
+`Runtime` and `ImageBuilder` API:
 
 ```python
 import asyncio

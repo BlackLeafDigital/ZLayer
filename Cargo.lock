@@ -1435,6 +1435,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.6.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3ff7a1dccbdd8b078c2bdebff47e404615151534d5043da397ec50286816f9cb"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.5.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11460,6 +11469,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "clap_complete",
  "crossterm",
  "dialoguer",
  "hex",
@@ -11488,6 +11498,7 @@ dependencies = [
  "zlayer-agent",
  "zlayer-api",
  "zlayer-builder",
+ "zlayer-client",
  "zlayer-core",
  "zlayer-docker",
  "zlayer-init-actions",
@@ -11645,12 +11656,34 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "wat",
  "xz2",
  "zip 2.4.2",
  "zlayer-core",
  "zlayer-paths",
  "zlayer-registry",
  "zlayer-tui",
+]
+
+[[package]]
+name = "zlayer-client"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "bytes",
+ "chrono",
+ "http-body-util",
+ "hyper 1.8.1",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-stream",
+ "tower",
+ "tracing",
+ "zlayer-api",
+ "zlayer-paths",
 ]
 
 [[package]]
@@ -11690,17 +11723,21 @@ dependencies = [
  "anyhow",
  "axum",
  "clap",
+ "futures-util",
  "hyper 1.8.1",
  "hyper-util",
+ "num_cpus",
  "serde",
  "serde_json",
  "serde_yaml",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tower",
  "tracing",
  "zlayer-builder",
+ "zlayer-client",
  "zlayer-core",
  "zlayer-spec",
 ]
@@ -11872,6 +11909,7 @@ dependencies = [
  "tracing",
  "zlayer-agent",
  "zlayer-builder",
+ "zlayer-client",
  "zlayer-spec",
 ]
 

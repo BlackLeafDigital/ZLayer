@@ -172,7 +172,7 @@ spec:
                             <a href="/docs" class="btn btn-primary">
                                 "Read the Docs"
                             </a>
-                            <a href="https://github.com/zachhandley/ZLayer" target="_blank" rel="noopener noreferrer" class="btn btn-secondary">
+                            <a href="https://github.com/BlackLeafDigital/ZLayer" target="_blank" rel="noopener noreferrer" class="btn btn-secondary">
                                 "View on GitHub"
                             </a>
                         </div>

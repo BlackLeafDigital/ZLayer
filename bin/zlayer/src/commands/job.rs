@@ -6,7 +6,7 @@
 use anyhow::Result;
 
 use crate::cli::{Cli, CronCommands, JobCommands};
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// Entry point for `zlayer job <subcommand>`.
 pub(crate) async fn handle_job(_cli: &Cli, cmd: &JobCommands) -> Result<()> {

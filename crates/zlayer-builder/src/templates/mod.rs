@@ -65,6 +65,41 @@ pub enum Runtime {
     Deno,
     /// Bun (latest)
     Bun,
+    /// `WebAssembly` (delegates to `wasm:` build mode).
+    ///
+    /// The associated [`WasmTargetHint`] is a best-effort indicator of whether
+    /// the project builds a raw WASI module or a WASI component. Downstream
+    /// build logic treats this as guidance only; the actual target is still
+    /// driven by the `ZImagefile` `wasm:` section (or its defaults).
+    Wasm(WasmTargetHint),
+}
+
+/// Hint for the kind of `WebAssembly` artifact a project produces.
+///
+/// This is populated by [`Runtime::detect_from_path`] (via the `detect` module)
+/// and carried through `Runtime::Wasm(hint)` so callers can pick reasonable
+/// defaults when delegating to the `wasm:` build mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum WasmTargetHint {
+    /// WASI preview1 / preview2 raw module (no component wrapper).
+    Module,
+    /// WASI component (cargo-component, jco, componentize-py, ...).
+    Component,
+    /// Unknown / let the builder pick its own default (currently preview2).
+    #[default]
+    Auto,
+}
+
+impl WasmTargetHint {
+    /// Short lowercase name used in diagnostics and YAML emission.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Module => "module",
+            Self::Component => "component",
+            Self::Auto => "auto",
+        }
+    }
 }
 
 impl Runtime {
@@ -120,6 +155,12 @@ impl Runtime {
                 description: "Bun - Fast JavaScript runtime and bundler",
                 detect_files: &["bun.lockb"],
             },
+            RuntimeInfo {
+                runtime: Runtime::Wasm(WasmTargetHint::Auto),
+                name: "wasm",
+                description: "WebAssembly - Delegates to wasm: build mode (auto-detects target)",
+                detect_files: &["cargo-component.toml", "componentize-py.config"],
+            },
         ]
     }
 
@@ -136,6 +177,11 @@ impl Runtime {
             "go" | "golang" => Some(Runtime::Go),
             "deno" => Some(Runtime::Deno),
             "bun" => Some(Runtime::Bun),
+            "wasm" | "webassembly" => Some(Runtime::Wasm(WasmTargetHint::Auto)),
+            "wasm-module" | "wasm-preview1" | "wasm-preview2" => {
+                Some(Runtime::Wasm(WasmTargetHint::Module))
+            }
+            "wasm-component" | "wasi-component" => Some(Runtime::Wasm(WasmTargetHint::Component)),
             _ => None,
         }
     }
@@ -147,13 +193,29 @@ impl Runtime {
     /// Panics if the runtime variant is missing from the static info table (internal invariant).
     #[must_use]
     pub fn info(&self) -> &'static RuntimeInfo {
+        // WASM variants all share a single info entry regardless of the
+        // [`WasmTargetHint`] payload, so we collapse to the `Auto` hint for
+        // lookup.
+        let lookup = match self {
+            Runtime::Wasm(_) => Runtime::Wasm(WasmTargetHint::Auto),
+            other => *other,
+        };
         Runtime::all()
             .iter()
-            .find(|info| info.runtime == *self)
+            .find(|info| info.runtime == lookup)
             .expect("All runtimes must have info")
     }
 
     /// Get the Dockerfile template for this runtime
+    ///
+    /// # Note on `Runtime::Wasm`
+    ///
+    /// The WASM variant does not produce a Dockerfile — it is a sentinel that
+    /// tells the builder to delegate to the `wasm:` build mode. The returned
+    /// string is a `ZImagefile` YAML snippet (see [`Runtime::wasm_zimagefile`])
+    /// so callers that feed `template()` output through the `ZImagefile` parser
+    /// will cleanly route into the WASM build path. Callers that feed it
+    /// through the Dockerfile parser must special-case `Runtime::Wasm(_)`.
     #[must_use]
     pub fn template(&self) -> &'static str {
         match self {
@@ -165,6 +227,25 @@ impl Runtime {
             Runtime::Go => include_str!("dockerfiles/go.Dockerfile"),
             Runtime::Deno => include_str!("dockerfiles/deno.Dockerfile"),
             Runtime::Bun => include_str!("dockerfiles/bun.Dockerfile"),
+            Runtime::Wasm(hint) => Self::wasm_zimagefile(*hint),
+        }
+    }
+
+    /// Return a minimal `ZImagefile` YAML snippet for the WASM runtime.
+    ///
+    /// The snippet sets `wasm:` mode with defaults appropriate for the given
+    /// [`WasmTargetHint`]. The parser's `validate_wasm` accepts these defaults,
+    /// and the builder's WASM path will auto-detect the source language when
+    /// `language` is omitted.
+    fn wasm_zimagefile(hint: WasmTargetHint) -> &'static str {
+        match hint {
+            // Components default to preview2 (WASI component model).
+            WasmTargetHint::Component => "wasm:\n  target: preview2\n",
+            // Raw modules default to preview1, which is what a bare
+            // `wasm32-wasip1` Cargo build produces.
+            WasmTargetHint::Module => "wasm:\n  target: preview1\n",
+            // Unknown — pick the modern default and let the builder decide.
+            WasmTargetHint::Auto => "wasm: {}\n",
         }
     }
 
@@ -271,6 +352,13 @@ mod tests {
     #[test]
     fn test_all_templates_parse_correctly() {
         for info in Runtime::all() {
+            // The WASM runtime emits a ZImagefile YAML snippet (routed to the
+            // `wasm:` build mode), not a Dockerfile — skip the Dockerfile
+            // parser for that variant.
+            if matches!(info.runtime, Runtime::Wasm(_)) {
+                continue;
+            }
+
             let template = info.runtime.template();
             let result = Dockerfile::parse(template);
             assert!(
@@ -287,6 +375,54 @@ mod tests {
                 info.name
             );
         }
+    }
+
+    #[test]
+    fn test_runtime_wasm_from_name() {
+        assert_eq!(
+            Runtime::from_name("wasm"),
+            Some(Runtime::Wasm(WasmTargetHint::Auto))
+        );
+        assert_eq!(
+            Runtime::from_name("WASM"),
+            Some(Runtime::Wasm(WasmTargetHint::Auto))
+        );
+        assert_eq!(
+            Runtime::from_name("webassembly"),
+            Some(Runtime::Wasm(WasmTargetHint::Auto))
+        );
+        assert_eq!(
+            Runtime::from_name("wasm-component"),
+            Some(Runtime::Wasm(WasmTargetHint::Component))
+        );
+        assert_eq!(
+            Runtime::from_name("wasm-module"),
+            Some(Runtime::Wasm(WasmTargetHint::Module))
+        );
+    }
+
+    #[test]
+    fn test_runtime_wasm_template_is_zimagefile_yaml() {
+        let t = Runtime::Wasm(WasmTargetHint::Auto).template();
+        assert!(t.contains("wasm:"), "template should set wasm mode: {t}");
+
+        let component = Runtime::Wasm(WasmTargetHint::Component).template();
+        assert!(component.contains("preview2"), "component → preview2");
+
+        let module = Runtime::Wasm(WasmTargetHint::Module).template();
+        assert!(module.contains("preview1"), "module → preview1");
+    }
+
+    #[test]
+    fn test_runtime_wasm_info_lookup() {
+        // All WasmTargetHint variants must resolve through info() without
+        // panicking.
+        let auto = Runtime::Wasm(WasmTargetHint::Auto).info();
+        let module = Runtime::Wasm(WasmTargetHint::Module).info();
+        let component = Runtime::Wasm(WasmTargetHint::Component).info();
+        assert_eq!(auto.name, "wasm");
+        assert_eq!(module.name, "wasm");
+        assert_eq!(component.name, "wasm");
     }
 
     #[test]

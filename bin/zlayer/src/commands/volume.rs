@@ -10,7 +10,7 @@
 use anyhow::Result;
 
 use crate::cli::{Cli, VolumeCommands};
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// Entry point for `zlayer volume <subcommand>`.
 pub(crate) async fn handle_volume(_cli: &Cli, cmd: &VolumeCommands) -> Result<()> {

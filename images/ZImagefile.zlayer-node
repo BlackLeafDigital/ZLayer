@@ -45,6 +45,6 @@ cmd: ["serve"]
 labels:
   org.opencontainers.image.title: "ZLayer Node"
   org.opencontainers.image.description: "ZLayer runtime with embedded containerd"
-  org.opencontainers.image.source: "https://github.com/zachhandley/ZLayer"
+  org.opencontainers.image.source: "https://github.com/BlackLeafDigital/ZLayer"
   org.opencontainers.image.licenses: "MIT"
   maintainer: "Zach Handley <zachhandley@gmail.com>"

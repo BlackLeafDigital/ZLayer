@@ -56,6 +56,20 @@ pub use zlayer_tui::widgets::scrollable_pane::OutputLine;
 /// The TUI processes these events asynchronously and updates the display.
 #[derive(Debug, Clone)]
 pub enum BuildEvent {
+    /// Build has started — sent once up-front, before any `StageStarted`.
+    ///
+    /// Carries the total number of stages and instructions so that
+    /// progress-bar denominators can be populated before any work
+    /// begins. Backends that have the full instruction tree at entry
+    /// (Dockerfile/ZImagefile) should emit this; if it is not emitted,
+    /// the TUI falls back to counting stages/instructions as events arrive.
+    BuildStarted {
+        /// Total number of stages in this build.
+        total_stages: usize,
+        /// Total number of instructions across all stages.
+        total_instructions: usize,
+    },
+
     /// Starting a new stage
     StageStarted {
         /// Stage index (0-based)

@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use zlayer_api::storage::{StoredTask, TaskRun};
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// `zlayer task list [--project project_id] [--output table|json]`.
 pub async fn list(project_id: Option<String>, output: &str) -> Result<()> {

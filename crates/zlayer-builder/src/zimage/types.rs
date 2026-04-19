@@ -579,6 +579,14 @@ pub struct ZWasmConfig {
     /// Component adapter path for WASI preview1 -> preview2 lifting
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub adapter: Option<String>,
+
+    /// When false, skip OCI artifact packaging and push — only produce the raw .wasm.
+    /// Compilation and caching are unaffected. Default: true.
+    #[serde(
+        default = "default_wasm_oci",
+        skip_serializing_if = "crate::zimage::types::is_true"
+    )]
+    pub oci: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -600,6 +608,17 @@ fn default_wasm_opt_level() -> Option<String> {
 #[allow(clippy::trivially_copy_pass_by_ref)]
 fn is_false(v: &bool) -> bool {
     !v
+}
+
+/// Helper for `skip_serializing_if` on boolean fields whose default is `true`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+pub(crate) fn is_true(v: &bool) -> bool {
+    *v
+}
+
+/// Default for `wasm.oci`: produce the OCI layout alongside the raw `.wasm`.
+fn default_wasm_oci() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -717,6 +736,24 @@ wasm: {}
         assert!(wasm.pre_build.is_empty());
         assert!(wasm.post_build.is_empty());
         assert!(wasm.adapter.is_none());
+        assert!(
+            wasm.oci,
+            "default ZWasmConfig.oci must be true so OCI packaging still happens unless explicitly opted out"
+        );
+    }
+
+    #[test]
+    fn test_wasm_oci_opt_out() {
+        let yaml = r"
+wasm:
+  oci: false
+";
+        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        let wasm = img.wasm.as_ref().unwrap();
+        assert!(
+            !wasm.oci,
+            "wasm.oci: false must deserialize to ZWasmConfig.oci == false"
+        );
     }
 
     #[test]

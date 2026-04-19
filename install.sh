@@ -275,5 +275,98 @@ if [ -z "$SKIP_SERVICE" ]; then
     esac
 fi
 
+# --- Install shell completions (fail-soft) ---
+# Drop completion scripts for bash/zsh/fish. Never abort the installer on
+# failure — completions are a UX nicety, not a correctness requirement.
+install_completion_shell() {
+    # $1 = shell name (bash|zsh|fish), $2 = destination path
+    _sh="$1"
+    _dest="$2"
+    _dir="$(dirname "$_dest")"
+    _script=""
+    if ! _script="$("${INSTALL_DIR}/${BINARY}" completions "$_sh" 2>/dev/null)"; then
+        echo "  Warning: '${BINARY} completions ${_sh}' failed; skipping ${_sh} completion."
+        return 0
+    fi
+    if [ -z "$_script" ]; then
+        echo "  Warning: empty ${_sh} completion script; skipping."
+        return 0
+    fi
+    # Decide whether we need sudo for this destination.
+    case "$_dir" in
+        "$HOME"/*|"$HOME")
+            if ! mkdir -p "$_dir" 2>/dev/null; then
+                echo "  Warning: could not create ${_dir}; skipping ${_sh} completion."
+                return 0
+            fi
+            if ! printf '%s\n' "$_script" > "$_dest" 2>/dev/null; then
+                echo "  Warning: could not write ${_dest}; skipping ${_sh} completion."
+                return 0
+            fi
+            ;;
+        *)
+            if ! sudo mkdir -p "$_dir" 2>/dev/null; then
+                echo "  Warning: could not create ${_dir}; skipping ${_sh} completion."
+                return 0
+            fi
+            if ! printf '%s\n' "$_script" | sudo tee "$_dest" >/dev/null 2>&1; then
+                echo "  Warning: could not write ${_dest}; skipping ${_sh} completion."
+                return 0
+            fi
+            ;;
+    esac
+    echo "  Installed zlayer ${_sh} completion to ${_dest}"
+    return 0
+}
+
+echo ""
+echo "Installing shell completions..."
+
+# Bash: prefer Homebrew prefix if detected, else system-wide if root writable,
+# else user-local XDG path.
+if command -v bash >/dev/null 2>&1; then
+    BASH_DEST=""
+    if command -v brew >/dev/null 2>&1; then
+        BREW_PREFIX="$(brew --prefix 2>/dev/null || true)"
+        if [ -n "$BREW_PREFIX" ] && [ -d "${BREW_PREFIX}/etc/bash_completion.d" ]; then
+            BASH_DEST="${BREW_PREFIX}/etc/bash_completion.d/zlayer"
+        fi
+    fi
+    if [ -z "$BASH_DEST" ]; then
+        if [ "$(id -u)" = "0" ] || sudo -n true 2>/dev/null; then
+            if [ -d /etc/bash_completion.d ] || sudo mkdir -p /etc/bash_completion.d 2>/dev/null; then
+                BASH_DEST="/etc/bash_completion.d/zlayer"
+            fi
+        fi
+    fi
+    if [ -z "$BASH_DEST" ]; then
+        BASH_DEST="${HOME}/.local/share/bash-completion/completions/zlayer"
+    fi
+    install_completion_shell bash "$BASH_DEST" || true
+fi
+
+# Zsh: user-local fpath directory. Hint user to add fpath if not present.
+if command -v zsh >/dev/null 2>&1; then
+    ZSH_DIR="${HOME}/.zsh/completions"
+    ZSH_DEST="${ZSH_DIR}/_zlayer"
+    install_completion_shell zsh "$ZSH_DEST" || true
+    ZSHRC="${HOME}/.zshrc"
+    if [ -f "$ZSHRC" ]; then
+        if ! grep -q "fpath+=${ZSH_DIR}" "$ZSHRC" 2>/dev/null \
+            && ! grep -q "fpath+=~/.zsh/completions" "$ZSHRC" 2>/dev/null \
+            && ! grep -q "fpath+=(~/.zsh/completions)" "$ZSHRC" 2>/dev/null; then
+            echo "  Hint: add 'fpath+=~/.zsh/completions' to ~/.zshrc before 'compinit' to enable zsh completions."
+        fi
+    else
+        echo "  Hint: add 'fpath+=~/.zsh/completions' to ~/.zshrc before 'compinit' to enable zsh completions."
+    fi
+fi
+
+# Fish: XDG completions directory.
+if command -v fish >/dev/null 2>&1; then
+    FISH_DEST="${HOME}/.config/fish/completions/zlayer.fish"
+    install_completion_shell fish "$FISH_DEST" || true
+fi
+
 echo ""
 echo "Run 'zlayer --help' to get started."

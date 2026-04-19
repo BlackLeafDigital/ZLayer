@@ -4,19 +4,21 @@ build-backend = "maturin"
 
 [project]
 name = "zlayer"
-version = "0.1.0"
-description = "Python bindings for ZLayer container runtime"
-readme = "README.md"
+description = "Python bindings for ZLayer, a lightweight Rust-based container orchestrator with built-in networking, scaling, and observability."
+readme = { file = "README.md", content-type = "text/markdown" }
 license = { text = "Apache-2.0" }
 requires-python = ">=3.8"
 authors = [
-    { name = "Zach Handley", email = "zachhandley@gmail.com" }
+    { name = "Zach Handley", email = "zach@blackleafdigital.com" },
 ]
-keywords = ["container", "runtime", "orchestration", "docker", "kubernetes"]
+keywords = ["container", "orchestration", "docker", "kubernetes", "wasm", "zlayer"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
     "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
     "Programming Language :: Python :: 3.9",
@@ -24,23 +26,34 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Rust",
     "Topic :: Software Development :: Libraries :: Python Modules",
-    "Topic :: System :: Containers",
+    "Topic :: System :: Distributed Computing",
+    "Topic :: System :: Systems Administration",
+    "Typing :: Typed",
 ]
+dynamic = ["version"]
 
 [project.urls]
 Homepage = "https://zlayer.dev"
-Repository = "https://github.com/zachhandley/ZLayer"
+Repository = "https://github.com/BlackLeafDigital/ZLayer"
 Documentation = "https://zlayer.dev/docs"
+Issues = "https://github.com/BlackLeafDigital/ZLayer/issues"
+Changelog = "https://github.com/BlackLeafDigital/ZLayer/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
+test = [
+    "pytest>=7",
+    "pytest-asyncio>=0.21",
+]
 dev = [
     "pytest>=7.0",
     "pytest-asyncio>=0.21",
+    "maturin>=1.4,<2.0",
 ]
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["pyo3/abi3-py38"]
 python-source = "python"
 module-name = "zlayer._zlayer"

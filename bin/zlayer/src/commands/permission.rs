@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use zlayer_api::storage::{PermissionLevel, StoredPermission, SubjectKind};
 use zlayer_api::GrantPermissionRequest;
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// `zlayer permission list` -- list permissions for a user or group.
 pub async fn list(user: Option<String>, group: Option<String>, output: &str) -> Result<()> {

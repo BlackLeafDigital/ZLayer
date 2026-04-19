@@ -248,6 +248,18 @@ impl ClusterApiState {
 ///
 /// Returns an error if the Raft coordinator is unavailable, the join token is
 /// invalid, IP allocation fails, or the Raft membership change fails.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cluster/join",
+    request_body = ClusterJoinRequest,
+    responses(
+        (status = 200, description = "Node joined successfully", body = ClusterJoinResponse),
+        (status = 401, description = "Invalid join token"),
+        (status = 500, description = "Failed to add member to Raft"),
+        (status = 503, description = "Raft coordinator not available"),
+    ),
+    tag = "Cluster"
+)]
 #[allow(clippy::too_many_lines)]
 pub async fn cluster_join(
     State(state): State<ClusterApiState>,
@@ -432,6 +444,15 @@ pub async fn cluster_join(
 /// # Errors
 ///
 /// Returns an error if the cluster state cannot be read.
+#[utoipa::path(
+    get,
+    path = "/api/v1/cluster/nodes",
+    responses(
+        (status = 200, description = "List of cluster nodes", body = Vec<ClusterNodeSummary>),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Cluster"
+)]
 pub async fn cluster_list_nodes(
     State(state): State<ClusterApiState>,
 ) -> Result<Json<Vec<ClusterNodeSummary>>> {
@@ -482,7 +503,7 @@ pub async fn cluster_list_nodes(
 }
 
 /// Heartbeat request from a worker node.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct HeartbeatRequest {
     pub node_id: u64,
     pub cpu_used: f64,
@@ -502,6 +523,17 @@ pub struct HeartbeatRequest {
 /// # Panics
 ///
 /// Panics if the system clock is before the Unix epoch.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cluster/heartbeat",
+    request_body = HeartbeatRequest,
+    responses(
+        (status = 200, description = "Heartbeat accepted"),
+        (status = 500, description = "Failed to propose heartbeat"),
+        (status = 503, description = "Raft coordinator not available"),
+    ),
+    tag = "Cluster"
+)]
 #[allow(clippy::cast_possible_truncation)]
 pub async fn cluster_heartbeat(
     State(state): State<ClusterApiState>,
@@ -596,6 +628,19 @@ pub struct ForceLeaderResponse {
 /// Returns an error if the confirmation string is wrong, the Raft coordinator
 /// is unavailable, this node is already the leader, or the recovery state
 /// cannot be saved.
+#[utoipa::path(
+    post,
+    path = "/api/v1/cluster/force-leader",
+    request_body = ForceLeaderRequest,
+    responses(
+        (status = 200, description = "Force-leader initiated", body = ForceLeaderResponse),
+        (status = 400, description = "Invalid confirmation or leader still reachable"),
+        (status = 500, description = "Failed to save recovery state"),
+        (status = 503, description = "Raft coordinator not available"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Cluster"
+)]
 pub async fn cluster_force_leader(
     State(state): State<ClusterApiState>,
     Json(req): Json<ForceLeaderRequest>,

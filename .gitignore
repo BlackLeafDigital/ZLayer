@@ -22,3 +22,7 @@ target/
 .claude/settings.local.json
 __pycache__
 crates/zlayer-manager/node_modules
+clients/typescript/node_modules/
+clients/typescript/dist/
+clients/typescript-client/node_modules/
+clients/typescript-client/dist/

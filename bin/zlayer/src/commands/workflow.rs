@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use zlayer_api::storage::{StoredWorkflow, WorkflowRun};
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// `zlayer workflow list [--output table|json]`.
 pub async fn list(output: &str) -> Result<()> {

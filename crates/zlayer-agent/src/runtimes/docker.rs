@@ -1241,6 +1241,92 @@ impl Runtime for DockerRuntime {
             space_reclaimed,
         })
     }
+
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "container.kill",
+            container.id = %container_name(id),
+            service.name = %id.service,
+            signal = ?signal,
+        )
+    )]
+    async fn kill_container(&self, id: &ContainerId, signal: Option<&str>) -> Result<()> {
+        use bollard::query_parameters::KillContainerOptionsBuilder;
+        let canonical = crate::runtime::validate_signal(signal.unwrap_or("SIGKILL"))?;
+        let name = container_name(id);
+
+        tracing::info!(container = %name, signal = %canonical, "killing container");
+
+        let options = KillContainerOptionsBuilder::default()
+            .signal(&canonical)
+            .build();
+
+        self.docker
+            .kill_container(&name, Some(options))
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: name.clone(),
+                    reason: format!("container '{name}' not found"),
+                },
+                other => AgentError::Internal(format!(
+                    "failed to send {canonical} to container '{name}': {other}"
+                )),
+            })?;
+
+        Ok(())
+    }
+
+    #[instrument(
+        skip(self),
+        fields(
+            otel.name = "image.tag",
+            source = %source,
+            target = %target,
+        )
+    )]
+    async fn tag_image(&self, source: &str, target: &str) -> Result<()> {
+        use bollard::query_parameters::TagImageOptionsBuilder;
+        if source.trim().is_empty() || target.trim().is_empty() {
+            return Err(AgentError::InvalidSpec(
+                "source and target must be non-empty image references".to_string(),
+            ));
+        }
+        // Split target into repo + tag (defaulting tag to "latest"). Docker's
+        // `POST /images/{name}/tag` takes them as separate query parameters.
+        let (repo, tag) = match target.rsplit_once(':') {
+            Some((r, t)) if !r.is_empty() && !t.is_empty() && !t.contains('/') => {
+                (r.to_string(), t.to_string())
+            }
+            _ => (target.to_string(), "latest".to_string()),
+        };
+
+        let options = TagImageOptionsBuilder::default()
+            .repo(&repo)
+            .tag(&tag)
+            .build();
+
+        self.docker
+            .tag_image(source, Some(options))
+            .await
+            .map_err(|e| match e {
+                BollardError::DockerResponseServerError {
+                    status_code: 404, ..
+                } => AgentError::NotFound {
+                    container: source.to_string(),
+                    reason: format!("source image '{source}' not found"),
+                },
+                other => AgentError::Internal(format!(
+                    "failed to tag image '{source}' -> '{target}': {other}"
+                )),
+            })?;
+
+        tracing::info!(source = %source, target = %target, "tagged image");
+        Ok(())
+    }
 }
 
 #[cfg(test)]

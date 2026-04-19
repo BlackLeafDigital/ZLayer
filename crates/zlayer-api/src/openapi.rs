@@ -12,47 +12,66 @@ use crate::handlers::build::{
     BuildRequest, BuildRequestWithContext, BuildStateEnum, BuildStatus, TemplateInfo,
     TriggerBuildResponse,
 };
+use crate::handlers::cluster::{
+    ClusterJoinRequest, ClusterJoinResponse, ClusterNodeSummary, ClusterPeer, ForceLeaderRequest,
+    ForceLeaderResponse, HeartbeatRequest,
+};
+use crate::handlers::containers::{
+    ContainerExecRequest, ContainerExecResponse, ContainerInfo, ContainerResourceLimits,
+    ContainerStatsResponse, ContainerWaitResponse, CreateContainerRequest, KillContainerRequest,
+    RestartContainerRequest, StopContainerRequest, VolumeMount,
+};
 use crate::handlers::credentials::{
     CreateGitCredentialRequest, CreateRegistryCredentialRequest, GitCredentialKindSchema,
     GitCredentialResponse, RegistryAuthTypeSchema, RegistryCredentialResponse,
 };
+use crate::handlers::cron::{CronJobResponse, CronStatusResponse, TriggerCronResponse};
 use crate::handlers::deployments::{CreateDeploymentRequest, DeploymentDetails, DeploymentSummary};
 use crate::handlers::environments::{CreateEnvironmentRequest, UpdateEnvironmentRequest};
-use crate::handlers::health::HealthResponse;
-use crate::handlers::projects::{
-    CreateProjectRequest, LinkDeploymentRequest, ProjectPullResponse, UpdateProjectRequest,
-};
-use crate::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
-use crate::handlers::webhooks::{WebhookInfoResponse, WebhookResponse};
-// Note: Node and overlay types are not yet exposed in OpenAPI paths
-// They will be uncommented when the corresponding endpoints are added
-// use crate::handlers::nodes::{
-//     JoinTokenResponse, NodeDetails, NodeResourceInfo, NodeSummary, UpdateLabelsRequest,
-//     UpdateLabelsResponse,
-// };
-// use crate::handlers::overlay::{
-//     DnsStatusResponse, IpAllocationResponse, OverlayStatusResponse, PeerInfo, PeerListResponse,
-// };
-use crate::handlers::containers::{
-    ContainerExecRequest, ContainerExecResponse, ContainerInfo, ContainerResourceLimits,
-    ContainerStatsResponse, ContainerWaitResponse, CreateContainerRequest, VolumeMount,
-};
 use crate::handlers::groups::{
     AddMemberRequest, CreateGroupRequest, GroupMembersResponse, UpdateGroupRequest,
 };
+use crate::handlers::health::HealthResponse;
+use crate::handlers::images::{
+    ImageInfoDto, PruneResultDto, PullImageRequest, PullImageResponse, TagImageRequest,
+};
+use crate::handlers::jobs::{JobExecutionResponse, TriggerJobResponse};
+use crate::handlers::networks::NetworkSummary;
+use crate::handlers::nodes::{
+    JoinTokenResponse, NodeDetails, NodeResourceInfo, NodeSummary, UpdateLabelsRequest,
+    UpdateLabelsResponse,
+};
 use crate::handlers::notifiers::{
     CreateNotifierRequest, TestNotifierResponse, UpdateNotifierRequest,
+};
+use crate::handlers::overlay::{
+    DnsStatusResponse, IpAllocationResponse, OverlayStatusResponse, PeerInfo, PeerListResponse,
+};
+use crate::handlers::projects::{
+    CreateProjectRequest, LinkDeploymentRequest, ProjectPullResponse, UpdateProjectRequest,
+};
+use crate::handlers::proxy::{
+    BackendGroupInfo, BackendInfo, BackendsResponse, CertInfo, RouteInfo, RoutesResponse,
+    StreamBackendInfo, StreamInfo, StreamsResponse, TlsResponse,
 };
 use crate::handlers::secrets::{BulkImportResponse, CreateSecretRequest, SecretMetadataResponse};
 use crate::handlers::services::{
     ScaleRequest, ServiceDetails, ServiceEndpoint, ServiceMetrics, ServiceSummary,
 };
+use crate::handlers::storage::{ReplicationInfo, StorageStatusResponse};
 use crate::handlers::syncs::{
     CreateSyncRequest, SyncApplyResponse, SyncDiffResponse, SyncResourceResponse,
     SyncResourceResult,
 };
 use crate::handlers::tasks::CreateTaskRequest;
+use crate::handlers::tunnels::{
+    CreateNodeTunnelRequest, CreateNodeTunnelResponse, CreateTunnelRequest, CreateTunnelResponse,
+    RegisteredServiceInfo, SuccessResponse, TunnelStatus, TunnelSummary,
+};
+use crate::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
 use crate::handlers::variables::{CreateVariableRequest, UpdateVariableRequest};
+use crate::handlers::volumes::VolumeSummary;
+use crate::handlers::webhooks::{WebhookInfoResponse, WebhookResponse};
 use crate::handlers::workflows::CreateWorkflowRequest;
 
 // Internal API types
@@ -70,10 +89,24 @@ use crate::handlers::build::{
     __path_list_runtime_templates, __path_start_build, __path_start_build_json,
     __path_stream_build,
 };
+use crate::handlers::cluster::{
+    __path_cluster_force_leader, __path_cluster_heartbeat, __path_cluster_join,
+    __path_cluster_list_nodes,
+};
+use crate::handlers::containers::{
+    __path_create_container, __path_delete_container, __path_exec_in_container,
+    __path_get_container, __path_get_container_logs, __path_get_container_stats,
+    __path_kill_container, __path_list_containers, __path_restart_container,
+    __path_start_container, __path_stop_container, __path_wait_container,
+};
 use crate::handlers::credentials::{
     __path_create_git_credential, __path_create_registry_credential, __path_delete_git_credential,
     __path_delete_registry_credential, __path_list_git_credentials,
     __path_list_registry_credentials,
+};
+use crate::handlers::cron::{
+    __path_disable_cron_job, __path_enable_cron_job, __path_get_cron_job, __path_list_cron_jobs,
+    __path_trigger_cron_job,
 };
 use crate::handlers::deployments::{
     __path_create_deployment, __path_delete_deployment, __path_get_deployment,
@@ -88,36 +121,40 @@ use crate::handlers::groups::{
     __path_list_groups, __path_remove_member, __path_update_group,
 };
 use crate::handlers::health::{__path_liveness, __path_readiness};
+use crate::handlers::images::{
+    __path_list_images_handler, __path_prune_images_handler, __path_pull_image_handler,
+    __path_remove_image_handler, __path_tag_image_handler,
+};
 use crate::handlers::internal::{__path_get_replicas_internal, __path_scale_service_internal};
-use crate::handlers::permissions::{
-    __path_grant_permission, __path_list_permissions, __path_revoke_permission,
+use crate::handlers::jobs::{
+    __path_cancel_execution, __path_get_execution_status, __path_list_job_executions,
+    __path_trigger_job,
 };
-use crate::handlers::users::{
-    __path_create_user, __path_delete_user, __path_get_user, __path_list_users,
-    __path_set_password, __path_update_user,
+use crate::handlers::networks::{
+    __path_create_network, __path_delete_network, __path_get_network, __path_list_networks,
+    __path_update_network,
 };
-// Note: Node and overlay paths are not yet exposed in OpenAPI
-// They will be uncommented when the corresponding endpoints are added
-// use crate::handlers::nodes::{
-//     __path_generate_join_token, __path_get_node, __path_list_nodes, __path_update_node_labels,
-// };
-// use crate::handlers::overlay::{
-//     __path_get_dns_status, __path_get_ip_allocation, __path_get_overlay_peers,
-//     __path_get_overlay_status,
-// };
-use crate::handlers::containers::{
-    __path_create_container, __path_delete_container, __path_exec_in_container,
-    __path_get_container, __path_get_container_logs, __path_get_container_stats,
-    __path_list_containers, __path_wait_container,
+use crate::handlers::nodes::{
+    __path_generate_join_token, __path_get_node, __path_list_nodes, __path_update_node_labels,
 };
 use crate::handlers::notifiers::{
     __path_create_notifier, __path_delete_notifier, __path_get_notifier, __path_list_notifiers,
     __path_test_notifier, __path_update_notifier,
 };
+use crate::handlers::overlay::{
+    __path_get_dns_status, __path_get_ip_allocation, __path_get_overlay_peers,
+    __path_get_overlay_status,
+};
+use crate::handlers::permissions::{
+    __path_grant_permission, __path_list_permissions, __path_revoke_permission,
+};
 use crate::handlers::projects::{
     __path_create_project, __path_delete_project, __path_get_project,
     __path_link_project_deployment, __path_list_project_deployments, __path_list_projects,
     __path_pull_project, __path_unlink_project_deployment, __path_update_project,
+};
+use crate::handlers::proxy::{
+    __path_list_backends, __path_list_routes, __path_list_streams, __path_list_tls,
 };
 use crate::handlers::secrets::{
     __path_bulk_import_secrets, __path_create_secret, __path_delete_secret,
@@ -126,6 +163,7 @@ use crate::handlers::secrets::{
 use crate::handlers::services::{
     __path_get_service, __path_get_service_logs, __path_list_services, __path_scale_service,
 };
+use crate::handlers::storage::__path_get_storage_status;
 use crate::handlers::syncs::{
     __path_apply_sync, __path_create_sync, __path_delete_sync, __path_diff_sync, __path_list_syncs,
 };
@@ -133,10 +171,19 @@ use crate::handlers::tasks::{
     __path_create_task, __path_delete_task, __path_get_task, __path_list_task_runs,
     __path_list_tasks, __path_run_task,
 };
+use crate::handlers::tunnels::{
+    __path_create_node_tunnel, __path_create_tunnel, __path_get_tunnel_status, __path_list_tunnels,
+    __path_remove_node_tunnel, __path_revoke_tunnel,
+};
+use crate::handlers::users::{
+    __path_create_user, __path_delete_user, __path_get_user, __path_list_users,
+    __path_set_password, __path_update_user,
+};
 use crate::handlers::variables::{
     __path_create_variable, __path_delete_variable, __path_get_variable, __path_list_variables,
     __path_update_variable,
 };
+use crate::handlers::volumes::{__path_delete_volume, __path_list_volumes};
 use crate::handlers::webhooks::{
     __path_get_webhook_info, __path_receive_webhook, __path_rotate_webhook_secret,
 };
@@ -222,6 +269,16 @@ impl Modify for SecurityAddon {
         exec_in_container,
         wait_container,
         get_container_stats,
+        stop_container,
+        start_container,
+        restart_container,
+        kill_container,
+        // Images
+        list_images_handler,
+        remove_image_handler,
+        prune_images_handler,
+        pull_image_handler,
+        tag_image_handler,
         // Internal (scheduler-to-agent)
         scale_service_internal,
         get_replicas_internal,
@@ -305,6 +362,55 @@ impl Modify for SecurityAddon {
         revoke_permission,
         // Audit
         list_audit,
+        // Nodes
+        list_nodes,
+        get_node,
+        update_node_labels,
+        generate_join_token,
+        // Overlay
+        get_overlay_status,
+        get_overlay_peers,
+        get_ip_allocation,
+        get_dns_status,
+        // Tunnels
+        create_tunnel,
+        list_tunnels,
+        revoke_tunnel,
+        get_tunnel_status,
+        create_node_tunnel,
+        remove_node_tunnel,
+        // Networks
+        list_networks,
+        get_network,
+        create_network,
+        update_network,
+        delete_network,
+        // Proxy
+        list_routes,
+        list_backends,
+        list_tls,
+        list_streams,
+        // Cluster
+        cluster_join,
+        cluster_list_nodes,
+        cluster_heartbeat,
+        cluster_force_leader,
+        // Volumes
+        list_volumes,
+        delete_volume,
+        // Storage
+        get_storage_status,
+        // Cron
+        list_cron_jobs,
+        get_cron_job,
+        trigger_cron_job,
+        enable_cron_job,
+        disable_cron_job,
+        // Jobs
+        trigger_job,
+        get_execution_status,
+        list_job_executions,
+        cancel_execution,
     ),
     components(
         schemas(
@@ -348,6 +454,15 @@ impl Modify for SecurityAddon {
             ContainerExecResponse,
             ContainerWaitResponse,
             ContainerStatsResponse,
+            StopContainerRequest,
+            RestartContainerRequest,
+            KillContainerRequest,
+            // Image schemas
+            ImageInfoDto,
+            PruneResultDto,
+            PullImageRequest,
+            PullImageResponse,
+            TagImageRequest,
             // Secrets schemas
             CreateSecretRequest,
             SecretMetadataResponse,
@@ -417,6 +532,61 @@ impl Modify for SecurityAddon {
             GrantPermissionRequest,
             // Audit schemas
             crate::storage::AuditEntry,
+            // Node schemas
+            NodeSummary,
+            NodeDetails,
+            NodeResourceInfo,
+            UpdateLabelsRequest,
+            UpdateLabelsResponse,
+            JoinTokenResponse,
+            // Overlay schemas
+            OverlayStatusResponse,
+            PeerInfo,
+            PeerListResponse,
+            IpAllocationResponse,
+            DnsStatusResponse,
+            // Tunnel schemas
+            CreateTunnelRequest,
+            CreateTunnelResponse,
+            TunnelSummary,
+            TunnelStatus,
+            RegisteredServiceInfo,
+            CreateNodeTunnelRequest,
+            CreateNodeTunnelResponse,
+            SuccessResponse,
+            // Network schemas
+            NetworkSummary,
+            // Proxy schemas
+            RouteInfo,
+            RoutesResponse,
+            BackendInfo,
+            BackendGroupInfo,
+            BackendsResponse,
+            CertInfo,
+            TlsResponse,
+            StreamBackendInfo,
+            StreamInfo,
+            StreamsResponse,
+            // Cluster schemas
+            ClusterJoinRequest,
+            ClusterJoinResponse,
+            ClusterPeer,
+            ClusterNodeSummary,
+            HeartbeatRequest,
+            ForceLeaderRequest,
+            ForceLeaderResponse,
+            // Volume schemas
+            VolumeSummary,
+            // Storage schemas
+            ReplicationInfo,
+            StorageStatusResponse,
+            // Cron schemas
+            CronJobResponse,
+            TriggerCronResponse,
+            CronStatusResponse,
+            // Jobs schemas
+            TriggerJobResponse,
+            JobExecutionResponse,
         )
     ),
     modifiers(&SecurityAddon),
@@ -428,6 +598,7 @@ impl Modify for SecurityAddon {
         (name = "Services", description = "Service management"),
         (name = "Build", description = "Container image building"),
         (name = "Containers", description = "Raw container lifecycle management"),
+        (name = "Images", description = "OCI image management (list, pull, tag, remove, prune)"),
         (name = "Internal", description = "Internal scheduler-to-agent communication"),
         (name = "Secrets", description = "Secrets management"),
         (name = "Environments", description = "Environment CRUD"),
@@ -442,6 +613,16 @@ impl Modify for SecurityAddon {
         (name = "Groups", description = "User group CRUD and membership management"),
         (name = "Permissions", description = "Resource-level permission grant/revoke"),
         (name = "Audit", description = "Audit log query"),
+        (name = "Nodes", description = "Cluster node management"),
+        (name = "Overlay", description = "Overlay network status and diagnostics"),
+        (name = "Tunnels", description = "Tunnel token and node-to-node tunnel management"),
+        (name = "Networks", description = "Network access-control group management"),
+        (name = "Proxy", description = "Reverse proxy status (routes, backends, TLS, L4 streams)"),
+        (name = "Cluster", description = "Cluster membership, heartbeats, and disaster recovery"),
+        (name = "Volumes", description = "Named volume listing and deletion"),
+        (name = "Storage", description = "Storage replication status"),
+        (name = "Cron", description = "Cron job listing, triggering, and enable/disable"),
+        (name = "Jobs", description = "Job execution triggering, status, and cancellation"),
     )
 )]
 pub struct ApiDoc;

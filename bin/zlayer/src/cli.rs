@@ -89,7 +89,7 @@ pub(crate) struct Cli {
     /// Shows full deployment progress, waits for services to stabilize,
     /// then automatically exits without waiting for Ctrl+C.
     /// Unlike -b/--background, this waits for services to be confirmed running.
-    #[arg(short = 'd', long = "detach", global = true)]
+    #[arg(long = "detach", global = true)]
     pub(crate) detach: bool,
 
     /// Disable interactive TUI (use plain text output)
@@ -746,6 +746,20 @@ pub(crate) enum Commands {
         /// Build context directory
         #[arg(short = 'c', long)]
         context: Option<PathBuf>,
+    },
+
+    /// Generate shell completion script
+    ///
+    /// Writes a completion script for the requested shell to stdout. Pipe
+    /// the output into the shell's completion directory. Examples:
+    ///   `zlayer completions bash > /etc/bash_completion.d/zlayer`
+    ///   `zlayer completions zsh  > "${fpath[1]}/_zlayer"`
+    ///   `zlayer completions fish > ~/.config/fish/completions/zlayer.fish`
+    #[command(display_order = 51, verbatim_doc_comment)]
+    Completions {
+        /// Target shell (bash, zsh, fish, powershell, elvish)
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
     },
 }
 
@@ -1930,17 +1944,19 @@ pub(crate) enum JobCommands {
     },
     /// Trigger a job
     Trigger {
-        /// Deployment name (optional — auto-resolves when unambiguous)
-        deployment: Option<String>,
         /// Job name
         job: String,
+        /// Deployment name (optional — auto-resolves when unambiguous)
+        #[arg(long)]
+        deployment: Option<String>,
     },
     /// Get job status
     Status {
-        /// Deployment name (optional — auto-resolves when unambiguous)
-        deployment: Option<String>,
         /// Job name
         job: String,
+        /// Deployment name (optional — auto-resolves when unambiguous)
+        #[arg(long)]
+        deployment: Option<String>,
     },
     /// Cron job management
     #[command(subcommand)]
@@ -1959,10 +1975,11 @@ pub(crate) enum CronCommands {
     },
     /// Get cron job status
     Status {
-        /// Deployment name (optional — auto-resolves when unambiguous)
-        deployment: Option<String>,
         /// Cron job name
         cron: String,
+        /// Deployment name (optional — auto-resolves when unambiguous)
+        #[arg(long)]
+        deployment: Option<String>,
     },
 }
 
@@ -1978,7 +1995,7 @@ pub(crate) enum ManagerCommands {
     ///   zlayer manager init
     ///   zlayer manager init --port 8080
     ///   zlayer manager init --deploy
-    #[command(verbatim_doc_comment)]
+    #[command(verbatim_doc_comment, disable_version_flag = true)]
     Init {
         /// Output directory for spec file (default: current directory)
         #[arg(short, long, default_value = ".")]

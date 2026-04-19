@@ -36,10 +36,10 @@ pub fn Footer() -> impl IntoView {
                         <h4>"Resources"</h4>
                         <div class="footer-links">
                             <a href="/playground" class="footer-link">"Playground"</a>
-                            <a href="https://github.com/zachhandley/ZLayer/releases" target="_blank" rel="noopener noreferrer" class="footer-link">
+                            <a href="https://github.com/BlackLeafDigital/ZLayer/releases" target="_blank" rel="noopener noreferrer" class="footer-link">
                                 "Releases"
                             </a>
-                            <a href="https://github.com/zachhandley/ZLayer/blob/main/CHANGELOG.md" target="_blank" rel="noopener noreferrer" class="footer-link">
+                            <a href="https://github.com/BlackLeafDigital/ZLayer/blob/main/CHANGELOG.md" target="_blank" rel="noopener noreferrer" class="footer-link">
                                 "Changelog"
                             </a>
                         </div>
@@ -48,13 +48,13 @@ pub fn Footer() -> impl IntoView {
                     <div class="footer-section">
                         <h4>"Community"</h4>
                         <div class="footer-links">
-                            <a href="https://github.com/zachhandley/ZLayer" target="_blank" rel="noopener noreferrer" class="footer-link">
+                            <a href="https://github.com/BlackLeafDigital/ZLayer" target="_blank" rel="noopener noreferrer" class="footer-link">
                                 "GitHub"
                             </a>
-                            <a href="https://github.com/zachhandley/ZLayer/issues" target="_blank" rel="noopener noreferrer" class="footer-link">
+                            <a href="https://github.com/BlackLeafDigital/ZLayer/issues" target="_blank" rel="noopener noreferrer" class="footer-link">
                                 "Issues"
                             </a>
-                            <a href="https://github.com/zachhandley/ZLayer/discussions" target="_blank" rel="noopener noreferrer" class="footer-link">
+                            <a href="https://github.com/BlackLeafDigital/ZLayer/discussions" target="_blank" rel="noopener noreferrer" class="footer-link">
                                 "Discussions"
                             </a>
                         </div>
@@ -66,7 +66,7 @@ pub fn Footer() -> impl IntoView {
                         "Copyright 2025 ZLayer Contributors. Licensed under Apache-2.0."
                     </p>
                     <div class="footer-social">
-                        <a href="https://github.com/zachhandley/ZLayer" target="_blank" rel="noopener noreferrer" title="GitHub">
+                        <a href="https://github.com/BlackLeafDigital/ZLayer" target="_blank" rel="noopener noreferrer" title="GitHub">
                             {icons::github_icon("20")}
                         </a>
                     </div>

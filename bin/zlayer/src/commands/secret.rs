@@ -25,7 +25,7 @@ use anyhow::{bail, Context, Result};
 use zlayer_api::handlers::secrets::SecretMetadataResponse;
 
 use crate::cli::{Cli, SecretCommands};
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// Entry point for `zlayer secret <subcommand>`.
 pub(crate) async fn handle_secret(_cli: &Cli, cmd: &SecretCommands) -> Result<()> {

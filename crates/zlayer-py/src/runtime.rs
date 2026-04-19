@@ -4,6 +4,10 @@
 
 use crate::container::Container;
 use crate::error::{to_py_result, ZLayerError};
+#[cfg(not(target_os = "linux"))]
+use pyo3::exceptions::PyNotImplementedError;
+#[cfg(target_os = "linux")]
+use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::collections::HashMap;
@@ -76,40 +80,50 @@ pub struct Runtime {
 
 #[pymethods]
 impl Runtime {
-    /// Create a new Runtime instance
+    /// Constructing a Runtime synchronously is not supported.
     ///
-    /// Args:
-    ///     options: Optional `RuntimeOptions` for configuration
+    /// The real container runtime requires async initialization (opening
+    /// cgroups, the OCI state dir, and the image store). Use the async
+    /// constructor instead:
     ///
-    /// Returns:
-    ///     A new Runtime instance
+    /// ```python
+    /// runtime = await Runtime.create()
+    /// ```
+    ///
+    /// On non-Linux platforms, there is no in-process runtime at all; use
+    /// `zlayer.Client(...)` to drive a remote daemon over the REST API.
     ///
     /// Raises:
-    ///     `RuntimeError`: If runtime initialization fails
+    ///     `RuntimeError`: on Linux, instructing the caller to use
+    ///         `await Runtime.create()`.
+    ///     `NotImplementedError`: on macOS/Windows, instructing the caller
+    ///         to use `zlayer.Client(...)` against a remote daemon.
     #[new]
     #[pyo3(signature = (options=None))]
-    #[allow(clippy::unnecessary_wraps)]
+    #[allow(clippy::needless_pass_by_value)]
     fn new(options: Option<RuntimeOptions>) -> PyResult<Self> {
-        let opts = options.unwrap_or_default();
+        // Silence unused-variable warnings when a platform branch doesn't
+        // consume `options`; the argument is kept for API compatibility and
+        // so Python callers get a clear error instead of a signature error.
+        let _ = options;
 
-        // Create the appropriate runtime based on options
-        let runtime: Arc<dyn AgentRuntime + Send + Sync> = if opts.mock {
-            Arc::new(MockRuntime::new())
-        } else {
-            // For now, default to mock runtime
-            // In production, this would create a YoukiRuntime
-            Arc::new(MockRuntime::new())
-        };
-
-        let service_manager = ServiceManager::builder(runtime.clone()).build();
-
-        Ok(Self {
-            inner: Arc::new(RwLock::new(RuntimeInner {
-                runtime,
-                service_manager,
-                deployment_name: None,
-            })),
-        })
+        #[cfg(target_os = "linux")]
+        {
+            Err(PyRuntimeError::new_err(
+                "Runtime() cannot be constructed synchronously. \
+                 Use `await Runtime.create(options)` instead. \
+                 The in-process runtime requires async initialization \
+                 (cgroups, OCI state dir, image store).",
+            ))
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(PyNotImplementedError::new_err(
+                "In-process Runtime requires Linux. \
+                 On macOS/Windows, use `zlayer.Client(...)` to drive a remote daemon \
+                 instead. See https://zlayer.dev/docs/python/remote-client.",
+            ))
+        }
     }
 
     /// Create a runtime asynchronously with full initialization

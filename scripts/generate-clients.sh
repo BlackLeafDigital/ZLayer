@@ -52,14 +52,14 @@ generate_typescript() {
         -i "$OPENAPI_SPEC" \
         -g typescript-fetch \
         -o "$CLIENTS_DIR/typescript" \
-        --additional-properties=npmName=@zlayer/client,npmVersion=0.1.0,supportsES6=true,typescriptThreePlus=true
+        --additional-properties=npmName=@zlayer/api-client,npmVersion=0.10.104,supportsES6=true,typescriptThreePlus=true
 
     # Create package.json if not exists
     cat > "$CLIENTS_DIR/typescript/package.json" << 'EOF'
 {
-  "name": "@zlayer/client",
-  "version": "0.1.0",
-  "description": "ZLayer API client for TypeScript/JavaScript",
+  "name": "@zlayer/api-client",
+  "version": "0.10.104",
+  "description": "Raw ZLayer REST API client (auto-generated from OpenAPI). For an ergonomic wrapper, use @zlayer/client.",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
   "scripts": {

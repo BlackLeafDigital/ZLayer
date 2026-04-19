@@ -20,12 +20,9 @@ mod commands;
 mod config;
 #[cfg(unix)]
 pub mod daemon;
-#[cfg(unix)]
-pub mod daemon_client;
 #[allow(dead_code)]
 mod deploy_tui;
 pub mod resources;
-pub mod session;
 mod util;
 mod views;
 mod widgets;
@@ -49,6 +46,13 @@ fn main() -> ExitCode {
     match &cli.command {
         None => return run_tui_entry(None),
         Some(Commands::Tui { context }) => return run_tui_entry(context.clone()),
+        Some(Commands::Completions { shell }) => match commands::completions::run(*shell) {
+            Ok(()) => return ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        },
         _ => {}
     }
 
@@ -438,6 +442,9 @@ async fn run(mut cli: Cli) -> Result<()> {
         // Cross-platform commands (build, registry, inspection, etc.)
         // =================================================================
         Commands::Tui { .. } => unreachable!("TUI handled before async runtime"),
+        Commands::Completions { .. } => {
+            unreachable!("completions handled before async runtime")
+        }
         Commands::Build {
             context,
             file,

@@ -1123,7 +1123,7 @@ cargo build --release --features wasm
 cargo build --release --features "docker,wasm"
 ```
 
-For detailed WASM plugin documentation, see [WASM_PLUGINS.md](./docs/WASM_PLUGINS.md).
+For detailed WASM plugin documentation, see [WASM_PLUGINS.md](./docs/WASM_PLUGINS.md). For portability across external WASM loaders (Spin, wasmCloud, runwasi, ORAS, wasmtime CLI, jco, wazero), see [wasm-portability.md](./docs/wasm-portability.md).
 
 ## Runtime Modes
 

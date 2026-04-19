@@ -13,8 +13,8 @@ use dialoguer::{Confirm, Password};
 use tracing::info;
 use zlayer_api::handlers::auth::BootstrapRequest;
 
-use crate::daemon_client::DaemonClient;
-use crate::session::{self, Session};
+use zlayer_client::session::{self, Session};
+use zlayer_client::DaemonClient;
 
 /// `zlayer auth bootstrap` -- create the first admin user.
 ///

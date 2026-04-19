@@ -13,6 +13,13 @@ readme = "README.md"
 
 [features]
 default = []
+# Linux-native container runtime via libcontainer/youki. OFF by default so the
+# crate publishes cleanly: the published `libcontainer 0.6.0` on crates.io has
+# strict pins (`protobuf = =3.2.0`, `rust-criu = ^0.4.0`) that conflict with
+# our git-rev pin's relaxed deps. `bin/zlayer` enables this feature; downstream
+# consumers (e.g. zfunctions in Zatabase) that don't need the Linux runtime
+# leave it off.
+youki-runtime = ["dep:libcontainer"]
 docker = ["dep:bollard"]
 wasm = [
     "dep:wasmtime",
@@ -92,7 +99,7 @@ zlayer-paths.workspace = true
 # Pinned to commit that fixes socket bind mount (youki-dev/youki#3484).
 # TODO: Switch to libcontainer = "0.6.1" once released (youki-dev/youki#3440)
 [target.'cfg(target_os = "linux")'.dependencies]
-libcontainer = { version = "0.6.0", git = "https://github.com/youki-dev/youki", rev = "a68a38c422b56125620749f7a7c072a01d245e87" }
+libcontainer = { version = "0.6.0", git = "https://github.com/youki-dev/youki", rev = "a68a38c422b56125620749f7a7c072a01d245e87", optional = true }
 rtnetlink = "0.14"
 # Must match the version used internally by rtnetlink 0.14 so
 # RouteScope and other route-message types line up across crate boundaries.

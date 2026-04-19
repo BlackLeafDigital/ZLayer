@@ -97,6 +97,9 @@ from zlayer._zlayer import (
     __author__,
 )
 
+# Pure-Python daemon bootstrapper (no Rust component needed).
+from ._install import ensure_daemon, ZLayerInstallError
+
 __all__ = [
     # Container
     "Container",
@@ -127,6 +130,9 @@ __all__ = [
     "is_buildah_available",
     "buildah_install_instructions",
     "create_service_spec",
+    # Daemon bootstrapping (pure Python)
+    "ensure_daemon",
+    "ZLayerInstallError",
     # Metadata
     "__version__",
     "__author__",

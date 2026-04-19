@@ -10,7 +10,7 @@
 use anyhow::Result;
 
 use crate::cli::{Cli, NetworkCommands};
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// Entry point for `zlayer network <subcommand>`.
 pub(crate) async fn handle_network(_cli: &Cli, cmd: &NetworkCommands) -> Result<()> {

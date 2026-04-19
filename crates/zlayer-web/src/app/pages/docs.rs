@@ -32,7 +32,7 @@ pub fn DocsPage() -> impl IntoView {
                     <pre><code>"# Download the latest release
 curl -fsSL https://zlayer.dev/install.sh | bash
 # Or download directly:
-# curl -LO https://github.com/zachhandley/ZLayer/releases/latest/download/zlayer-linux-amd64
+# curl -LO https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-linux-amd64
 chmod +x zlayer-linux-amd64
 sudo mv zlayer-linux-amd64 /usr/local/bin/zlayer
 
@@ -171,7 +171,7 @@ spec:
 
                     <p>
                         "ZLayer can be configured via environment variables or a configuration file. "
-                        "See the "<a href="https://github.com/zachhandley/ZLayer/blob/main/README.md" target="_blank" rel="noopener noreferrer">"README"</a>
+                        "See the "<a href="https://github.com/BlackLeafDigital/ZLayer/blob/main/README.md" target="_blank" rel="noopener noreferrer">"README"</a>
                         " for a complete list of configuration options."
                     </p>
 
@@ -194,7 +194,7 @@ spec:
                     </ul>
 
                     <p>
-                        "For more help, please "<a href="https://github.com/zachhandley/ZLayer/issues" target="_blank" rel="noopener noreferrer">"open an issue"</a>
+                        "For more help, please "<a href="https://github.com/BlackLeafDigital/ZLayer/issues" target="_blank" rel="noopener noreferrer">"open an issue"</a>
                         " on GitHub."
                     </p>
                 </div>

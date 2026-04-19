@@ -506,6 +506,13 @@ General:
                         Ok(event) => {
                             use zlayer_builder::BuildEvent;
                             match event {
+                                BuildEvent::BuildStarted {
+                                    total_stages,
+                                    total_instructions,
+                                } => {
+                                    build_state.total_stages = total_stages;
+                                    build_state.total_instructions = total_instructions;
+                                }
                                 BuildEvent::StageStarted {
                                     index,
                                     name,

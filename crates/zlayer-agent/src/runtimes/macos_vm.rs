@@ -1542,6 +1542,38 @@ impl Runtime for VmRuntime {
         // All VM containers appear as localhost from the host's perspective.
         Ok(Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)))
     }
+
+    /// Kill a VM container.
+    ///
+    /// libkrun exposes no POSIX-signal interface into the guest; only
+    /// `SIGKILL`-equivalent termination is available, which is achieved by
+    /// destroying the VM context via `stop_container`. The `signal` parameter
+    /// is validated for API parity but only `SIGKILL` and `SIGTERM` map to a
+    /// meaningful action (both tear the VM down). Other accepted signals are
+    /// rejected with [`AgentError::Unsupported`].
+    async fn kill_container(&self, id: &ContainerId, signal: Option<&str>) -> Result<()> {
+        let canonical = crate::runtime::validate_signal(signal.unwrap_or("SIGKILL"))?;
+        match canonical.as_str() {
+            "SIGKILL" | "SIGTERM" => {
+                // Tear down the VM context immediately.
+                self.stop_container(id, Duration::from_secs(0)).await
+            }
+            other => Err(AgentError::Unsupported(format!(
+                "signal '{other}' is not supported by the macOS VM runtime (only SIGKILL and SIGTERM map to VM teardown)"
+            ))),
+        }
+    }
+
+    /// Tagging is not supported by the macOS VM runtime.
+    ///
+    /// Images are materialized as VM disk images inside per-container state
+    /// directories, not stored in a shared content-addressed registry, so
+    /// there is nothing to tag.
+    async fn tag_image(&self, _source: &str, _target: &str) -> Result<()> {
+        Err(AgentError::Unsupported(
+            "tag_image is not supported by the macOS VM runtime".into(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------

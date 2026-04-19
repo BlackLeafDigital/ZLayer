@@ -11,7 +11,7 @@ use std::io::{self, Write};
 use anyhow::Result;
 
 use crate::cli::{Cli, SystemCommands};
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// Entry point for `zlayer system <subcommand>`.
 pub(crate) async fn handle_system(_cli: &Cli, cmd: &SystemCommands) -> Result<()> {

@@ -38,6 +38,8 @@
 //! ```
 
 mod builder;
+#[cfg(unix)]
+mod client;
 mod container;
 mod error;
 mod run;
@@ -48,6 +50,8 @@ use pyo3::prelude::*;
 
 // Re-export types for internal use
 pub use builder::{DetectedRuntime, Image, ImageBuilder};
+#[cfg(unix)]
+pub use client::Client;
 pub use container::{Container, PyContainerState};
 pub use error::{Result, ZLayerError};
 pub use runtime::{Runtime, RuntimeOptions};
@@ -93,6 +97,10 @@ fn _zlayer(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Runtime classes
     m.add_class::<Runtime>()?;
     m.add_class::<RuntimeOptions>()?;
+
+    // Remote daemon client (Unix-only; daemon socket is Unix).
+    #[cfg(unix)]
+    m.add_class::<Client>()?;
 
     // Builder classes
     m.add_class::<ImageBuilder>()?;

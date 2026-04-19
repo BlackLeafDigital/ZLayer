@@ -11,7 +11,7 @@ use zlayer_api::handlers::auth::UserView;
 use zlayer_api::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
 use zlayer_api::storage::UserRole;
 
-use crate::daemon_client::DaemonClient;
+use zlayer_client::DaemonClient;
 
 /// `zlayer user list` -- print all users as a table or JSON.
 pub async fn list(output: &str) -> Result<()> {

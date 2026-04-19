@@ -4,7 +4,7 @@
 //! deserializes it into a [`ZImage`], and then runs validation rules that
 //! cannot be expressed through serde alone.
 
-use super::types::{ZImage, ZStep};
+use super::types::{ZImage, ZStep, ZWasmConfig};
 use crate::error::{BuildError, Result};
 
 /// Parse and validate a `ZImagefile` from its YAML content.
@@ -19,8 +19,23 @@ use crate::error::{BuildError, Result};
 /// [`BuildError::ZImagefileValidation`] for semantic rule violations.
 pub fn parse_zimagefile(content: &str) -> Result<ZImage> {
     // Phase 1: Deserialize YAML into the ZImage struct.
-    let image: ZImage =
+    let mut image: ZImage =
         serde_yaml::from_str(content).map_err(|e| BuildError::zimagefile_parse(e.to_string()))?;
+
+    // `runtime: wasm` is a shorthand that routes to WASM build mode. Rewrite
+    // it to an explicit `wasm:` section with defaults so the rest of the
+    // pipeline (validation + builder dispatch) treats it uniformly as WASM
+    // mode. Keeps `runtime: wasm` distinct from language runtime templates
+    // which expand into Dockerfiles.
+    if image
+        .runtime
+        .as_deref()
+        .is_some_and(|r| r.eq_ignore_ascii_case("wasm") || r.eq_ignore_ascii_case("webassembly"))
+        && image.wasm.is_none()
+    {
+        image.runtime = None;
+        image.wasm = Some(default_wasm_config());
+    }
 
     // Phase 2: Semantic validation.
     validate_version(&image)?;
@@ -29,6 +44,15 @@ pub fn parse_zimagefile(content: &str) -> Result<ZImage> {
     validate_wasm(&image)?;
 
     Ok(image)
+}
+
+/// Construct a default [`ZWasmConfig`] by routing through serde so the
+/// `#[serde(default = ...)]` attributes on [`ZWasmConfig`] populate fields
+/// like `target` and `opt_level`. This avoids needing a `Default` impl on
+/// [`ZWasmConfig`] just for this path.
+fn default_wasm_config() -> ZWasmConfig {
+    serde_yaml::from_str::<ZWasmConfig>("{}")
+        .expect("empty ZWasmConfig must deserialize from '{}' via serde defaults")
 }
 
 // ---------------------------------------------------------------------------
@@ -850,6 +874,50 @@ wasm:
         let msg = err.to_string();
         assert!(msg.contains("wasm.language"), "got: {msg}");
         assert!(msg.contains("java"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_runtime_wasm_rewrites_to_wasm_mode() {
+        // `runtime: wasm` is shorthand: it should be transparently rewritten
+        // to the `wasm:` mode with serde-default values so the rest of the
+        // pipeline dispatches it through the WASM build path.
+        let yaml = r#"
+version: "1"
+runtime: wasm
+"#;
+        let img = parse_zimagefile(yaml).unwrap();
+        assert!(img.runtime.is_none(), "runtime should be cleared");
+        let wasm = img.wasm.expect("wasm mode should be set");
+        assert_eq!(wasm.target, "preview2");
+        assert_eq!(wasm.opt_level.as_deref(), Some("Oz"));
+    }
+
+    #[test]
+    fn test_runtime_webassembly_alias_rewrites_to_wasm_mode() {
+        let yaml = r#"
+version: "1"
+runtime: WebAssembly
+"#;
+        let img = parse_zimagefile(yaml).unwrap();
+        assert!(img.runtime.is_none());
+        assert!(img.wasm.is_some());
+    }
+
+    #[test]
+    fn test_runtime_wasm_does_not_override_explicit_wasm_mode() {
+        // If the user sets both `runtime: wasm` and an explicit `wasm:`
+        // block... actually, the mode exclusivity check should reject that.
+        let yaml = r#"
+version: "1"
+runtime: wasm
+wasm:
+  target: preview1
+"#;
+        // Since we only rewrite when `image.wasm.is_none()`, both fields
+        // remain set and mode exclusivity rejects the combination.
+        let err = parse_zimagefile(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("multiple were found"), "got: {msg}");
     }
 
     #[test]

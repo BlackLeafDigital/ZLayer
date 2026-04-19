@@ -21,11 +21,11 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::cli::Cli;
-use crate::daemon_client::DaemonClient;
 use crate::deploy_tui::{
     app::DeployTui, DeployEvent, InfraPhase, LogLevel, PlainDeployLogger, ServicePlan,
 };
 use crate::util::{discover_spec_path, parse_spec};
+use zlayer_client::DaemonClient;
 
 // ---------------------------------------------------------------------------
 // Helpers (kept for dry-run display)
