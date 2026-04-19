@@ -50,6 +50,18 @@ All notable changes to this project will be documented in this file.
   present or a proper `wasm:sha256:...` manifest digest ref as a fallback
   (previously the image id embedded the full filesystem path).
 
+### Fixed
+- CI: dev pushes now actually dispatch `build.yml` after `auto-tag`. The
+  earlier removal of the direct dispatch assumed the `trigger-e2e → e2e.yml
+  → trigger-build` chain would handle it, but that chain is gated on
+  `inputs.version != ''` which is always empty for branch pushes, so
+  `build.yml` never ran. Restored the explicit `curl` dispatch inside the
+  `auto-tag` job, passing the freshly-created `vX.Y.Z` as `version`. Also
+  removed all unreachable `startsWith(github.ref, 'refs/tags/')`
+  conditionals from ci.yaml — the workflow has no `tags:` filter, so those
+  branches were dead code and were what made the broken reasoning look
+  plausible.
+
 ## [0.10.103]
 
 ### Added

@@ -24,13 +24,11 @@ env:
 
 jobs:
   # ===========================================
-  # Check (fmt, clippy) — skipped for tags
-  # (tagged commits already passed CI on their branch)
+  # Check (fmt, clippy)
   # ===========================================
   check:
     name: Check
     runs-on: ubuntu-latest
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -81,14 +79,13 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
   # ===========================================
-  # Check macOS (check, clippy) — skipped for tags
+  # Check macOS (check, clippy)
   # Runs in parallel with Linux check to catch macOS-specific
   # compilation errors in #[cfg(target_os = "macos")] code
   # ===========================================
   check-macos:
     name: Check (macOS)
     runs-on: macos-latest
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     env:
       CARGO_BUILD_JOBS: "4"
     steps:
@@ -113,13 +110,12 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   # ===========================================
-  # Test — skipped for tags
+  # Test
   # ===========================================
   test:
     name: Test
     runs-on: ubuntu-latest
     needs: [check, check-macos]
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -171,7 +167,7 @@ jobs:
           secret-key: ${{ secrets.S3_ACCESS_SECRET }}
 
   # ===========================================
-  # Test macOS — skipped for tags
+  # Test macOS
   # Runs unit and doc tests on macOS. Integration tests
   # requiring root/containers are auto-skipped via cfg(target_os).
   # ===========================================
@@ -179,7 +175,6 @@ jobs:
     name: Test (macOS)
     runs-on: macos-latest
     needs: check-macos
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     env:
       CARGO_BUILD_JOBS: "4"
     steps:
@@ -202,20 +197,14 @@ jobs:
         run: cargo test --workspace --doc
 
   # ===========================================
-  # Build Release (Linux)
-  # For tags: runs directly (tests already passed on the branch)
-  # For branches: waits for test + feature-tests
+  # Build Release (Linux) — sanity-check only.
+  # The real multi-platform release build runs in build.yml,
+  # dispatched by auto-tag below.
   # ===========================================
   build:
     name: Build Release
     runs-on: ubuntu-latest
     needs: [test, feature-tests]
-    if: |-
-      ${{
-        always() &&
-        (startsWith(github.ref, 'refs/tags/') ||
-         (needs.test.result == 'success' && needs.feature-tests.result == 'success'))
-      }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -253,9 +242,9 @@ jobs:
           retention-days: 7
 
   # ===========================================
-  # Build Release (macOS ARM64)
-  # For tags: runs directly (tests already passed on the branch)
-  # For branches: waits for test-macos
+  # Build Release (macOS ARM64) — sanity-check only.
+  # The real multi-platform release build runs in build.yml,
+  # dispatched by auto-tag below.
   # ===========================================
   build-macos:
     name: Build Release (macOS)
@@ -263,12 +252,6 @@ jobs:
     needs: [test-macos]
     env:
       CARGO_BUILD_JOBS: "4"
-    if: |-
-      ${{
-        always() &&
-        (startsWith(github.ref, 'refs/tags/') ||
-         needs.test-macos.result == 'success')
-      }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -294,13 +277,12 @@ jobs:
           retention-days: 7
 
   # ===========================================
-  # Feature Matrix Tests — skipped for tags
+  # Feature Matrix Tests
   # ===========================================
   feature-tests:
     name: Feature Tests
     runs-on: ubuntu-latest
     needs: [check, check-macos]
-    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
     strategy:
       matrix:
         features:
@@ -369,31 +351,30 @@ jobs:
           git tag -a "$TAG" -m "Auto-tagged from CI: $TAG"
           git push origin "$TAG"
 
-      # Note: build.yml is dispatched by the trigger-e2e → e2e.yml chain
-      # below (see e2e.yml's `trigger-build` job). Dispatching it here
-      # would double-run the build for every dev push.
+      - name: Trigger build workflow
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches" \
+            -d "{\"ref\": \"dev\", \"inputs\": {\"version\": \"${TAG}\", \"sha\": \"${{ github.sha }}\"}}"
 
   # ===========================================
-  # Trigger E2E Tests
-  # For tags: runs after build (tests were skipped)
-  # For branches: runs after build + feature-tests
+  # Trigger E2E Tests (runs against the dev SHA; no version).
+  # build.yml is dispatched independently by auto-tag above.
   # ===========================================
   trigger-e2e:
     name: Trigger E2E
     runs-on: ubuntu-latest
     needs: [build, build-macos, feature-tests]
-    if: |-
-      ${{
-        always() && needs.build.result == 'success'
-      }}
+    if: ${{ needs.build.result == 'success' }}
     steps:
       - name: Determine version
         id: version
         run: |
           if [[ -n "${{ inputs.version }}" ]]; then
             echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "version=${{ github.ref_name }}" >> $GITHUB_OUTPUT
           else
             echo "version=" >> $GITHUB_OUTPUT
           fi
