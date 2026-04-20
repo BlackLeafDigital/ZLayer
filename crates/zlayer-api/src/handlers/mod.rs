@@ -17,6 +17,7 @@ pub mod jobs;
 pub mod networks;
 pub mod nodes;
 pub mod notifiers;
+pub mod oidc;
 pub mod overlay;
 pub mod permissions;
 pub mod projects;

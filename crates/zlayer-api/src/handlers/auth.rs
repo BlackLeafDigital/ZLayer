@@ -176,45 +176,22 @@ pub async fn bootstrap(
     jar: CookieJar,
     Json(req): Json<BootstrapRequest>,
 ) -> Result<(StatusCode, CookieJar, Json<LoginResponse>)> {
-    let user_store = auth
-        .user_store
+    let identity = auth
+        .identity
         .as_ref()
-        .ok_or_else(|| ApiError::Internal("User store not configured".to_string()))?;
-    let cred_store = auth
-        .credential_store
-        .as_ref()
-        .ok_or_else(|| ApiError::Internal("Credential store not configured".to_string()))?;
+        .ok_or_else(|| ApiError::Internal("Identity manager not configured".to_string()))?;
 
-    if req.email.trim().is_empty() || req.password.is_empty() {
-        return Err(ApiError::BadRequest(
-            "Email and password are required".to_string(),
-        ));
-    }
-
-    let count = user_store
-        .count()
-        .await
-        .map_err(|e| ApiError::Internal(format!("User store: {e}")))?;
-    if count > 0 {
+    if identity.users().count().await? > 0 {
         return Err(ApiError::Conflict(
             "Bootstrap already completed; sign in instead".to_string(),
         ));
     }
 
-    // Create the admin user record
-    let email_lc = req.email.to_lowercase();
+    let email_lc = req.email.trim().to_lowercase();
     let display_name = req.display_name.unwrap_or_else(|| email_lc.clone());
-    let user = StoredUser::new(email_lc.clone(), display_name, UserRole::Admin);
-    user_store
-        .store(&user)
-        .await
-        .map_err(|e| ApiError::Internal(format!("User store: {e}")))?;
-
-    // Store the password hash keyed by email
-    cred_store
-        .create_api_key(&email_lc, &req.password, &[UserRole::Admin.as_str()])
-        .await
-        .map_err(|e| ApiError::Internal(format!("Credential store: {e}")))?;
+    let user = identity
+        .create_user(&email_lc, display_name, UserRole::Admin, &req.password)
+        .await?;
 
     let (jar, body) = issue_session(&auth, &user, jar)?;
     Ok((StatusCode::CREATED, jar, Json(body)))
@@ -352,7 +329,7 @@ pub fn csrf(
 }
 
 /// Build a fresh session cookie + CSRF cookie and the login response body.
-fn issue_session(
+pub(crate) fn issue_session(
     auth: &AuthState,
     user: &StoredUser,
     jar: CookieJar,

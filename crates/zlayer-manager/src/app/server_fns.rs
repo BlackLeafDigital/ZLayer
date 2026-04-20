@@ -192,6 +192,13 @@ pub struct ManagerLoginResponse {
     pub csrf_token: String,
 }
 
+/// Public view of an OIDC provider (for login-page buttons).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagerOidcProvider {
+    pub name: String,
+    pub display_name: String,
+}
+
 /// First-run admin-creation payload.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ManagerBootstrapRequest {
@@ -1597,6 +1604,31 @@ pub async fn manager_login(
         )));
     }
 
+    serde_json::from_slice(&resp.body).map_err(|e| ServerFnError::new(format!("deserialise: {e}")))
+}
+
+/// GET `/auth/oidc/providers` — list configured SSO providers for the login
+/// page. Empty vec when OIDC is disabled.
+#[server(prefix = "/api/manager")]
+pub async fn manager_list_oidc_providers() -> Result<Vec<ManagerOidcProvider>, ServerFnError> {
+    use crate::api_client::RawMethod;
+    let hdr = extract_forwarded_headers().await;
+    let client = get_api_client();
+    let resp = client
+        .raw_request(
+            RawMethod::Get,
+            "/auth/oidc/providers",
+            None,
+            hdr.cookie.as_deref(),
+            hdr.csrf.as_deref(),
+        )
+        .await
+        .map_err(|e| api_error_to_server_error(&e))?;
+
+    if !resp.status.is_success() {
+        // On any non-2xx just return empty so the UI degrades gracefully.
+        return Ok(Vec::new());
+    }
     serde_json::from_slice(&resp.body).map_err(|e| ServerFnError::new(format!("deserialise: {e}")))
 }
 

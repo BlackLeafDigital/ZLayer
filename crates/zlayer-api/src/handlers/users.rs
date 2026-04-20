@@ -15,7 +15,7 @@ use utoipa::ToSchema;
 use crate::auth::{AuthState, AuthUser, SessionAuthUser};
 use crate::error::{ApiError, Result};
 use crate::handlers::auth::UserView;
-use crate::storage::{StoredUser, UserRole, UserStorage};
+use crate::storage::{UserRole, UserStorage};
 
 /// Authentication actor — either a Bearer-token user or a cookie-session user.
 ///
@@ -134,6 +134,12 @@ fn cred_store(
         .ok_or_else(|| ApiError::Internal("Credential store not configured".to_string()))
 }
 
+fn identity(auth: &AuthState) -> Result<&std::sync::Arc<crate::identity::IdentityManager>> {
+    auth.identity
+        .as_ref()
+        .ok_or_else(|| ApiError::Internal("Identity manager not configured".to_string()))
+}
+
 // ---- Endpoints ----
 
 /// List all users. Admin only.
@@ -190,40 +196,12 @@ pub async fn create_user(
 ) -> Result<(StatusCode, Json<UserView>)> {
     actor.require_admin()?;
 
-    if req.email.trim().is_empty() || req.password.is_empty() {
-        return Err(ApiError::BadRequest(
-            "Email and password are required".to_string(),
-        ));
-    }
-
-    let email_lc = req.email.to_lowercase();
-    let store = user_store(&auth)?;
-    let creds = cred_store(&auth)?;
-
-    if store
-        .get_by_email(&email_lc)
-        .await
-        .map_err(|e| ApiError::Internal(format!("User store: {e}")))?
-        .is_some()
-    {
-        return Err(ApiError::Conflict(format!(
-            "Email '{email_lc}' is already registered"
-        )));
-    }
-
+    let identity = identity(&auth)?;
+    let email_lc = req.email.trim().to_lowercase();
     let display_name = req.display_name.unwrap_or_else(|| email_lc.clone());
-    let user = StoredUser::new(email_lc.clone(), display_name, req.role);
-
-    store
-        .store(&user)
-        .await
-        .map_err(|e| ApiError::Internal(format!("User store: {e}")))?;
-
-    creds
-        .create_api_key(&email_lc, &req.password, &[req.role.as_str()])
-        .await
-        .map_err(|e| ApiError::Internal(format!("Credential store: {e}")))?;
-
+    let user = identity
+        .create_user(&email_lc, display_name, req.role, &req.password)
+        .await?;
     Ok((StatusCode::CREATED, Json(UserView::from(&user))))
 }
 
@@ -290,32 +268,33 @@ pub async fn update_user(
 ) -> Result<Json<UserView>> {
     actor.require_admin()?;
 
+    // Role changes go through IdentityManager so the credential-store roles
+    // stay in sync with the user-store role. Other field updates stay on
+    // the user store directly.
+    if let Some(role) = req.role {
+        identity(&auth)?.set_role(&id, role).await?;
+    }
+
     let store = user_store(&auth)?;
     let mut user = store
         .get(&id)
-        .await
-        .map_err(|e| ApiError::Internal(format!("User store: {e}")))?
+        .await?
         .ok_or_else(|| ApiError::NotFound(format!("User {id} not found")))?;
 
+    let mut dirty = false;
     if let Some(name) = req.display_name {
         user.display_name = name;
-    }
-    if let Some(role) = req.role {
-        user.role = role;
+        dirty = true;
     }
     if let Some(active) = req.is_active {
         user.is_active = active;
+        dirty = true;
     }
-    user.updated_at = chrono::Utc::now();
+    if dirty {
+        user.updated_at = chrono::Utc::now();
+        store.store(&user).await?;
+    }
 
-    store
-        .store(&user)
-        .await
-        .map_err(|e| ApiError::Internal(format!("User store: {e}")))?;
-
-    // Role changes propagate to the credential-store roles at the next
-    // password set. Login already reads roles from the user store, so this
-    // is intentionally a no-op here.
     Ok(Json(UserView::from(&user)))
 }
 
@@ -351,36 +330,7 @@ pub async fn delete_user(
         ));
     }
 
-    let store = user_store(&auth)?;
-    let creds = cred_store(&auth)?;
-
-    let user = store
-        .get(&id)
-        .await
-        .map_err(|e| ApiError::Internal(format!("User store: {e}")))?
-        .ok_or_else(|| ApiError::NotFound(format!("User {id} not found")))?;
-
-    // Delete credential first (keyed by email) so a later re-create of the
-    // same email is not blocked by a stale hash.
-    if creds
-        .exists(&user.email)
-        .await
-        .map_err(|e| ApiError::Internal(format!("Credential store: {e}")))?
-    {
-        creds
-            .delete_api_key(&user.email)
-            .await
-            .map_err(|e| ApiError::Internal(format!("Credential store: {e}")))?;
-    }
-
-    let deleted = store
-        .delete(&id)
-        .await
-        .map_err(|e| ApiError::Internal(format!("User store: {e}")))?;
-    if !deleted {
-        return Err(ApiError::NotFound(format!("User {id} not found")));
-    }
-
+    identity(&auth)?.delete_user(&id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

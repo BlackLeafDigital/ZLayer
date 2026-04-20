@@ -47,6 +47,25 @@ pub struct ApiConfig {
     /// `None`, the user endpoints return an internal error.
     #[serde(skip)]
     pub user_store: Option<std::sync::Arc<dyn crate::storage::UserStorage>>,
+
+    /// Identity facade that coordinates user-store + credential-store
+    /// mutations. Handlers doing combined writes (`bootstrap`, `create_user`,
+    /// `delete_user`, `update_user` role path) MUST go through this to keep
+    /// the two stores consistent. Optional for legacy tests that build a
+    /// router without persistent stores.
+    #[serde(skip)]
+    pub identity: Option<std::sync::Arc<crate::identity::IdentityManager>>,
+
+    /// Configured OIDC providers, keyed by provider slug (`google`, `okta`,
+    /// ...). Empty when no `ZLAYER_OIDC_<NAME>_*` env vars were set — in
+    /// that case the `/auth/oidc/*` handlers respond with 404.
+    #[serde(skip)]
+    pub oidc_clients: std::collections::HashMap<String, crate::oidc::OidcClient>,
+
+    /// In-flight OIDC authorisation state (CSRF / nonce / PKCE verifier).
+    /// A default (empty) store is fine when no providers are configured.
+    #[serde(skip)]
+    pub oidc_state: std::sync::Arc<crate::oidc::StateTokenStore>,
 }
 
 fn default_bind() -> SocketAddr {
@@ -61,6 +80,7 @@ fn default_true() -> bool {
     true
 }
 
+#[allow(clippy::missing_fields_in_debug)]
 impl std::fmt::Debug for ApiConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiConfig")
@@ -72,6 +92,8 @@ impl std::fmt::Debug for ApiConfig {
             .field("cors", &self.cors)
             .field("credential_store", &self.credential_store.is_some())
             .field("user_store", &self.user_store.is_some())
+            .field("identity", &self.identity.is_some())
+            .field("oidc_providers", &self.oidc_clients.len())
             .finish()
     }
 }
@@ -87,6 +109,9 @@ impl Default for ApiConfig {
             cors: CorsConfig::default(),
             credential_store: None,
             user_store: None,
+            identity: None,
+            oidc_clients: std::collections::HashMap::new(),
+            oidc_state: std::sync::Arc::new(crate::oidc::StateTokenStore::new()),
         }
     }
 }

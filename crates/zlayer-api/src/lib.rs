@@ -23,7 +23,9 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod handlers;
+pub mod identity;
 pub mod middleware;
+pub mod oidc;
 #[allow(clippy::needless_for_each)]
 pub mod openapi;
 pub mod poller;
@@ -38,6 +40,7 @@ pub use auth::{
 };
 pub use config::ApiConfig;
 pub use error::{ApiError, Result};
+pub use identity::{IdentityError, IdentityManager};
 pub use openapi::ApiDoc;
 pub use poller::GitPoller;
 pub use ratelimit::{
@@ -123,15 +126,15 @@ pub use middleware::audit::{audit_middleware, AuditStoreExtension};
 pub use storage::{
     AuditEntry, AuditFilter, AuditStorage, BuildKind, DeploymentStatus, DeploymentStorage,
     EnvironmentStorage, GroupStorage, InMemoryAuditStore, InMemoryEnvironmentStore,
-    InMemoryGroupStore, InMemoryNotifierStore, InMemoryPermissionStore, InMemoryProjectStore,
-    InMemoryStorage, InMemorySyncStore, InMemoryTaskStore, InMemoryUserStore,
+    InMemoryGroupStore, InMemoryNotifierStore, InMemoryOidcIdentityStore, InMemoryPermissionStore,
+    InMemoryProjectStore, InMemoryStorage, InMemorySyncStore, InMemoryTaskStore, InMemoryUserStore,
     InMemoryVariableStore, InMemoryWorkflowStore, NotifierConfig, NotifierKind, NotifierStorage,
-    PermissionLevel, PermissionStorage, ProjectStorage, SqlxAuditStore, SqlxEnvironmentStore,
-    SqlxGroupStore, SqlxNotifierStore, SqlxPermissionStore, SqlxProjectStore, SqlxStorage,
-    SqlxSyncStore, SqlxTaskStore, SqlxUserStore, SqlxVariableStore, SqlxWorkflowStore, StepResult,
-    StorageError, StoredDeployment, StoredEnvironment, StoredNotifier, StoredPermission,
-    StoredProject, StoredSync, StoredTask, StoredUser, StoredUserGroup, StoredVariable,
-    StoredWorkflow, SubjectKind, SyncStorage, TaskKind, TaskRun, TaskStorage, UserRole,
-    UserStorage, VariableStorage, WorkflowAction, WorkflowRun, WorkflowRunStatus, WorkflowStep,
-    WorkflowStorage,
+    OidcIdentity, OidcIdentityStorage, PermissionLevel, PermissionStorage, ProjectStorage,
+    SqlxAuditStore, SqlxEnvironmentStore, SqlxGroupStore, SqlxNotifierStore, SqlxOidcIdentityStore,
+    SqlxPermissionStore, SqlxProjectStore, SqlxStorage, SqlxSyncStore, SqlxTaskStore,
+    SqlxUserStore, SqlxVariableStore, SqlxWorkflowStore, StepResult, StorageError,
+    StoredDeployment, StoredEnvironment, StoredNotifier, StoredPermission, StoredProject,
+    StoredSync, StoredTask, StoredUser, StoredUserGroup, StoredVariable, StoredWorkflow,
+    SubjectKind, SyncStorage, TaskKind, TaskRun, TaskStorage, UserRole, UserStorage,
+    VariableStorage, WorkflowAction, WorkflowRun, WorkflowRunStatus, WorkflowStep, WorkflowStorage,
 };

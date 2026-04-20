@@ -20,6 +20,7 @@ mod deployments;
 mod environments;
 mod groups;
 mod notifiers;
+mod oidc_identities;
 mod permissions;
 mod projects;
 mod sqlx_json;
@@ -34,6 +35,9 @@ pub use deployments::{DeploymentStorage, InMemoryStorage, SqlxStorage, StorageEr
 pub use environments::{EnvironmentStorage, InMemoryEnvironmentStore, SqlxEnvironmentStore};
 pub use groups::{GroupStorage, InMemoryGroupStore, SqlxGroupStore};
 pub use notifiers::{InMemoryNotifierStore, NotifierStorage, SqlxNotifierStore};
+pub use oidc_identities::{
+    InMemoryOidcIdentityStore, OidcIdentity, OidcIdentityStorage, SqlxOidcIdentityStore,
+};
 pub use permissions::{InMemoryPermissionStore, PermissionStorage, SqlxPermissionStore};
 pub use projects::{InMemoryProjectStore, ProjectStorage, SqlxProjectStore};
 pub use sqlx_json::{IndexSpec, JsonTable, SqlxJsonStore};

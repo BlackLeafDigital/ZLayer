@@ -2446,10 +2446,37 @@ pub(crate) enum UserCommands {
         role: CliUserRole,
     },
 
-    /// Set a user's password (prompts for the new value).
+    /// Set a user's password. Interactive by default; supply
+    /// `--password`/`--password-file`/`--random` for non-interactive use.
     SetPassword {
-        /// User id.
-        id: String,
+        /// User id. Mutually exclusive with `--email`.
+        id: Option<String>,
+
+        /// User email (resolved to id via `list_users`). Mutually
+        /// exclusive with the positional id.
+        #[arg(long)]
+        email: Option<String>,
+
+        /// New password (inline). Mutually exclusive with
+        /// `--password-file` and `--random`.
+        #[arg(long, conflicts_with_all = ["password_file", "random"])]
+        password: Option<String>,
+
+        /// Path to a file containing the new password. Trailing
+        /// newline/CR is trimmed. Mutually exclusive with `--password`
+        /// and `--random`.
+        #[arg(long, value_name = "PATH", conflicts_with_all = ["password", "random"])]
+        password_file: Option<PathBuf>,
+
+        /// Generate a random 32-char password and print it once on
+        /// stdout. Mutually exclusive with `--password` and
+        /// `--password-file`.
+        #[arg(long, conflicts_with_all = ["password", "password_file"])]
+        random: bool,
+
+        /// Skip the "are you sure" confirmation prompt.
+        #[arg(long)]
+        no_confirm: bool,
     },
 
     /// Delete a user.

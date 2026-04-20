@@ -35,7 +35,7 @@ pub(crate) fn handle_manager_init(
     // We use target_port to tell the proxy where the container actually listens,
     // while `port` is the external-facing proxy listen port.
     let spec = format!(
-        r"version: v1
+        r#"version: v1
 deployment: zlayer-manager
 
 services:
@@ -60,7 +60,17 @@ services:
       check:
         type: http
         url: http://localhost:6677/health
-"
+    # Optional: non-interactive admin bootstrap.
+    # Read ONLY when the users table is empty on first startup;
+    # subsequent restarts ignore these vars. The file-based form
+    # (`ZLAYER_BOOTSTRAP_PASSWORD_FILE`) is preferred in production
+    # so the password doesn't appear in /proc/<pid>/environ.
+    # env:
+    #   ZLAYER_BOOTSTRAP_EMAIL: "admin@example.com"
+    #   ZLAYER_BOOTSTRAP_PASSWORD: "<long-random-string>"
+    #   ZLAYER_BOOTSTRAP_PASSWORD_FILE: "/run/secrets/zlayer_admin_pw"
+    #   ZLAYER_BOOTSTRAP_DISPLAY_NAME: "Admin"
+"#
     );
 
     // Ensure output directory exists

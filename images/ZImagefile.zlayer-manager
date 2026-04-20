@@ -112,6 +112,16 @@ stages:
       LEPTOS_SITE_PKG_DIR: "pkg"
       LEPTOS_HASH_FILES: "true"
       RUST_LOG: "info"
+      # Optional: non-interactive admin bootstrap.
+      # Read ONLY when the users table is empty on first startup;
+      # subsequent restarts ignore these vars. Set at deploy time via
+      # docker-compose / k8s Secret / zlayer spec -- NOT baked into the
+      # image. The file-based form is preferred in production so the
+      # password doesn't appear in /proc/<pid>/environ.
+      # ZLAYER_BOOTSTRAP_EMAIL: "admin@example.com"
+      # ZLAYER_BOOTSTRAP_PASSWORD: "<long-random-string>"
+      # ZLAYER_BOOTSTRAP_PASSWORD_FILE: "/run/secrets/zlayer_admin_pw"
+      # ZLAYER_BOOTSTRAP_DISPLAY_NAME: "Admin"
     cmd: ["/app/zlayer-manager"]
 
 expose: 6677

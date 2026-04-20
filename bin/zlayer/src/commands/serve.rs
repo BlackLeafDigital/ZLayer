@@ -698,6 +698,33 @@ pub(crate) async fn serve(
     // -----------------------------------------------------------------------
     let bundle = StorageBundle::open(Some(config.data_dir.as_path())).await?;
 
+    let identity = Arc::new(
+        zlayer_api::IdentityManager::new(bundle.users.clone(), credential_store.clone())
+            .with_oidc(bundle.oidc_identities.clone()),
+    );
+
+    // Non-interactive admin bootstrap: if the users table is empty and
+    // ZLAYER_BOOTSTRAP_EMAIL + password source envs are set, seed the
+    // initial admin before the listener accepts. Idempotent.
+    crate::bootstrap_admin::maybe_bootstrap_admin(&identity).await?;
+
+    // Load OIDC providers from env (ZLAYER_OIDC_<NAME>_*). Empty map when
+    // SSO is disabled — callers get 404 on /auth/oidc/* endpoints.
+    let oidc_providers =
+        zlayer_api::oidc::OidcProviderConfig::load_all().context("loading OIDC provider config")?;
+    let oidc_clients: std::collections::HashMap<String, zlayer_api::oidc::OidcClient> =
+        oidc_providers
+            .into_iter()
+            .map(|cfg| (cfg.name.clone(), zlayer_api::oidc::OidcClient::new(cfg)))
+            .collect();
+    if !oidc_clients.is_empty() {
+        info!(
+            providers = ?oidc_clients.keys().collect::<Vec<_>>(),
+            "OIDC / SSO enabled",
+        );
+    }
+    let oidc_state = Arc::new(zlayer_api::oidc::StateTokenStore::new());
+
     // -----------------------------------------------------------------------
     // 4. Build the full API router
     // -----------------------------------------------------------------------
@@ -707,6 +734,9 @@ pub(crate) async fn serve(
         swagger_enabled: !no_swagger,
         credential_store: Some(credential_store),
         user_store: Some(bundle.users.clone()),
+        identity: Some(identity),
+        oidc_clients,
+        oidc_state,
         ..Default::default()
     };
 
@@ -996,6 +1026,9 @@ pub(crate) async fn serve(
         jwt_secret: api_config.jwt_secret.clone(),
         credential_store: api_config.credential_store.clone(),
         user_store: api_config.user_store.clone(),
+        identity: api_config.identity.clone(),
+        oidc_clients: api_config.oidc_clients.clone(),
+        oidc_state: api_config.oidc_state.clone(),
         cookie_secure: false,
     };
     router = router.layer(zlayer_api::Extension(auth_state));
@@ -1172,6 +1205,7 @@ pub(crate) struct StorageBundle {
     pub permissions: std::sync::Arc<dyn zlayer_api::PermissionStorage>,
     pub audit: std::sync::Arc<dyn zlayer_api::AuditStorage>,
     pub syncs: std::sync::Arc<dyn zlayer_api::SyncStorage>,
+    pub oidc_identities: std::sync::Arc<dyn zlayer_api::OidcIdentityStorage>,
 }
 
 impl StorageBundle {
@@ -1223,10 +1257,14 @@ impl StorageBundle {
             let syncs = zlayer_api::SqlxSyncStore::open(dir.join("syncs.db"))
                 .await
                 .context("Failed to open syncs.db")?;
+            let oidc_identities =
+                zlayer_api::SqlxOidcIdentityStore::open(dir.join("oidc_identities.db"))
+                    .await
+                    .context("Failed to open oidc_identities.db")?;
 
             info!(
                 dir = %dir.display(),
-                "Opened persistent API stores (11 databases)"
+                "Opened persistent API stores (12 databases)"
             );
 
             Ok(Self {
@@ -1241,6 +1279,7 @@ impl StorageBundle {
                 permissions: std::sync::Arc::new(permissions),
                 audit: std::sync::Arc::new(audit),
                 syncs: std::sync::Arc::new(syncs),
+                oidc_identities: std::sync::Arc::new(oidc_identities),
             })
         } else {
             let users = zlayer_api::SqlxUserStore::in_memory()
@@ -1276,6 +1315,9 @@ impl StorageBundle {
             let syncs = zlayer_api::SqlxSyncStore::in_memory()
                 .await
                 .context("Failed to create in-memory syncs store")?;
+            let oidc_identities = zlayer_api::SqlxOidcIdentityStore::in_memory()
+                .await
+                .context("Failed to create in-memory oidc_identities store")?;
 
             info!("Opened in-memory API stores (ephemeral / test mode)");
 
@@ -1291,6 +1333,7 @@ impl StorageBundle {
                 permissions: std::sync::Arc::new(permissions),
                 audit: std::sync::Arc::new(audit),
                 syncs: std::sync::Arc::new(syncs),
+                oidc_identities: std::sync::Arc::new(oidc_identities),
             })
         }
     }

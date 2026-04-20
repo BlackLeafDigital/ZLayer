@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.10.86]
+
+### Added
+- **OpenID Connect / SSO sign-in.** Configure one or more providers via `ZLAYER_OIDC_<NAME>_{ISSUER,CLIENT_ID,CLIENT_SECRET,REDIRECT_URL}` env vars (optional `DISPLAY_NAME` + `SCOPES`). New endpoints: `GET /auth/oidc/providers` (list), `GET /auth/oidc/{provider}/start` (302 to provider's authorize URL with CSRF + PKCE + nonce), `GET /auth/oidc/{provider}/callback` (verifies the ID token and issues a ZLayer session). First sign-in creates a passwordless local user row and a `(provider, subject) → user_id` link (new `oidc_identities.db`); repeat sign-ins return the linked user. Existing password-login users are linked by email on first OIDC sign-in rather than duplicated. Built on the `openidconnect` crate with lazy discovery caching — a provider whose discovery URL is unreachable at boot does not block daemon startup. Manager login page surfaces "Sign in with X" buttons for each configured provider.
+
+### Changed
+- User account lifecycle routed through a new `IdentityManager` facade (`crates/zlayer-api/src/identity.rs`). Creating, deleting, or changing the role of a user now updates the user store AND the credential store atomically (with rollback on partial failure), closing a drift window where `PATCH /api/v1/users/{id}` could change a role without propagating it to the credential's role array. Handlers `bootstrap`, `create_user`, `delete_user`, `update_user`, and the env-var admin bootstrap in `bin/zlayer` all now go through the facade. Added `CredentialStore::set_roles` as the supporting primitive. Read paths (`list_users`, `get_user`, `me`) unchanged.
+
+### Added
+- `zlayer user set-password`: non-interactive password rotation. New flags: `--email <addr>` (alternative to the positional user id, resolved via `list_users`), `--password <value>` (inline), `--password-file <path>` (trailing newline trimmed), `--random` (generate + print a 32-char alphanumeric once), and `--no-confirm` to skip the "are you sure" prompt. Interactive prompt remains the default when no source flag is supplied. Backing API (`POST /api/v1/users/{id}/password`) was already present and is unchanged.
+- `zlayer-manager`: non-interactive admin bootstrap via `ZLAYER_BOOTSTRAP_EMAIL` + `ZLAYER_BOOTSTRAP_PASSWORD` (or `ZLAYER_BOOTSTRAP_PASSWORD_FILE`, preferred in production so the secret doesn't leak via `/proc/<pid>/environ`). When the users table is empty at startup the daemon creates the initial admin (Argon2id hash + user row) **before** the HTTP listener accepts, closing the "first-request-wins-admin" race for CI / IaC / k8s deployments. `ZLAYER_BOOTSTRAP_DISPLAY_NAME` optional (defaults to email local-part). Browser `/auth/bootstrap` flow unchanged for interactive installs. `images/ZImagefile.zlayer-manager` and the spec emitted by `zlayer manager init` now document the contract as commented-out env entries.
+
 ## [0.10.104]
 
 ### Added

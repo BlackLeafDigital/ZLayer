@@ -84,6 +84,9 @@ fn build_auth_routes(auth_state: AuthState) -> Router {
         .route("/logout", post(logout_adapter))
         .route("/me", get(handlers::auth::me))
         .route("/csrf", get(csrf_adapter))
+        .route("/oidc/providers", get(handlers::oidc::list_providers))
+        .route("/oidc/{provider}/start", get(handlers::oidc::start))
+        .route("/oidc/{provider}/callback", get(handlers::oidc::callback))
         .with_state(auth_state)
 }
 
@@ -121,6 +124,9 @@ pub fn build_router_with_storage(
         jwt_secret: config.jwt_secret.clone(),
         credential_store: config.credential_store.clone(),
         user_store: config.user_store.clone(),
+        identity: config.identity.clone(),
+        oidc_clients: config.oidc_clients.clone(),
+        oidc_state: config.oidc_state.clone(),
         cookie_secure: false,
     };
 
@@ -356,6 +362,9 @@ pub fn build_router_with_services(
         jwt_secret: config.jwt_secret.clone(),
         credential_store: config.credential_store.clone(),
         user_store: config.user_store.clone(),
+        identity: config.identity.clone(),
+        oidc_clients: config.oidc_clients.clone(),
+        oidc_state: config.oidc_state.clone(),
         cookie_secure: false,
     };
 
@@ -471,6 +480,9 @@ pub fn build_router_with_deployment_state(
         jwt_secret: config.jwt_secret.clone(),
         credential_store: config.credential_store.clone(),
         user_store: config.user_store.clone(),
+        identity: config.identity.clone(),
+        oidc_clients: config.oidc_clients.clone(),
+        oidc_state: config.oidc_state.clone(),
         cookie_secure: false,
     };
 

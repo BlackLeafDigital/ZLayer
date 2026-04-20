@@ -14,6 +14,8 @@
 //! - `observability`: Axum metrics and trace propagation
 
 mod app;
+#[cfg(unix)]
+mod bootstrap_admin;
 mod cli;
 mod commands;
 #[cfg(unix)]
@@ -954,7 +956,24 @@ async fn run(mut cli: Cli) -> Result<()> {
             cli::UserCommands::SetRole { id, role } => {
                 commands::user::set_role(id.clone(), (*role).into()).await
             }
-            cli::UserCommands::SetPassword { id } => commands::user::set_password(id.clone()).await,
+            cli::UserCommands::SetPassword {
+                id,
+                email,
+                password,
+                password_file,
+                random,
+                no_confirm,
+            } => {
+                commands::user::set_password(
+                    id.clone(),
+                    email.clone(),
+                    password.clone(),
+                    password_file.clone(),
+                    *random,
+                    *no_confirm,
+                )
+                .await
+            }
             cli::UserCommands::Delete { id, yes } => commands::user::delete(id.clone(), *yes).await,
         },
         #[cfg(unix)]

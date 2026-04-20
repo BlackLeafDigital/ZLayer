@@ -73,6 +73,11 @@ reqwest = { version = "0.13", features = ["json"] }
 hyper = { version = "1.8", features = ["full", "http2"] }
 hyper-util = { version = "0.1", features = ["full"] }
 
+# OIDC / OAuth2 (used by zlayer-api for /auth/oidc handlers)
+openidconnect = "3.5"
+oauth2 = "4.4"
+url = "2.5"
+
 # TLS
 rustls = "0.23"
 rustls-pemfile = "2"

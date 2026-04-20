@@ -141,6 +141,7 @@ use crate::handlers::notifiers::{
     __path_create_notifier, __path_delete_notifier, __path_get_notifier, __path_list_notifiers,
     __path_test_notifier, __path_update_notifier,
 };
+use crate::handlers::oidc::{__path_callback, __path_list_providers, __path_start};
 use crate::handlers::overlay::{
     __path_get_dns_status, __path_get_ip_allocation, __path_get_overlay_peers,
     __path_get_overlay_status,
@@ -235,6 +236,10 @@ impl Modify for SecurityAddon {
         logout,
         me,
         csrf,
+        // OIDC / SSO
+        list_providers,
+        start,
+        callback,
         // Users
         list_users,
         create_user,
