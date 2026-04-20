@@ -387,15 +387,24 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
-  # Trigger Build (if version provided)
+  # Dispatch Build (release chain gate).
+  #
+  # This is the *only* path that dispatches build.yml. If an e2e job fails,
+  # `needs: [...]` blocks this job and no build happens. If the trigger that
+  # started this workflow didn't supply a version (PR runs, [np] dev pushes,
+  # manual dispatch without a version), e2e still runs for signal but this
+  # job skips — no build, no tag, no release.
+  #
+  # build.yml is responsible for creating the git tag after all platform
+  # builds succeed. The tag never exists speculatively.
   # ===========================================
-  trigger-build:
-    name: Trigger Build
+  dispatch-build:
+    name: Dispatch Build
     runs-on: ubuntu-latest
     needs: [e2e-tests, wasm-e2e-tests, docker-e2e-tests, manager-tests, macos-sandbox-e2e]
     if: inputs.version != ''
     steps:
-      - name: Trigger Build workflow
+      - name: Dispatch Build workflow
         run: |
           curl -X POST \
             -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
@@ -405,9 +414,9 @@ jobs:
 
       - name: Summary
         run: |
-          echo "## E2E Tests Passed" >> $GITHUB_STEP_SUMMARY
+          echo "## E2E Tests Passed — Build Dispatched" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "- **Version**: ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "- **SHA**: ${{ inputs.sha || github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Build workflow triggered." >> $GITHUB_STEP_SUMMARY
+          echo "The tag will be created by build.yml once all platform builds succeed." >> $GITHUB_STEP_SUMMARY

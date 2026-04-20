@@ -16,6 +16,8 @@
 mod app;
 #[cfg(unix)]
 mod bootstrap_admin;
+#[cfg(unix)]
+mod bootstrap_admin_env_grants;
 mod cli;
 mod commands;
 #[cfg(unix)]
@@ -509,7 +511,7 @@ async fn run(mut cli: Cli) -> Result<()> {
         }
         Commands::Wasm(wasm_cmd) => commands::wasm::handle_wasm(&cli, wasm_cmd).await,
         Commands::Tunnel(tunnel_cmd) => commands::tunnel::handle_tunnel(&cli, tunnel_cmd).await,
-        Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd),
+        Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd).await,
         #[cfg(feature = "docker-compat")]
         Commands::Docker(_) => unreachable!("Docker handled before borrow"),
         Commands::Export {
@@ -686,6 +688,27 @@ async fn run(mut cli: Cli) -> Result<()> {
         Commands::System(system_cmd) => commands::system::handle_system(&cli, system_cmd).await,
         #[cfg(unix)]
         Commands::Secret(secret_cmd) => commands::secret::handle_secret(&cli, secret_cmd).await,
+        #[cfg(unix)]
+        Commands::Run {
+            env,
+            no_global,
+            merge,
+            project,
+            dry_run,
+            unmask,
+            command,
+        } => {
+            commands::run::handle_run(
+                env,
+                *no_global,
+                merge,
+                project.as_deref(),
+                *dry_run,
+                *unmask,
+                command,
+            )
+            .await
+        }
         #[cfg(unix)]
         Commands::Network(network_cmd) => {
             commands::network::handle_network(&cli, network_cmd).await

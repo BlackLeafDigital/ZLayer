@@ -708,6 +708,22 @@ pub(crate) async fn serve(
     // initial admin before the listener accepts. Idempotent.
     crate::bootstrap_admin::maybe_bootstrap_admin(&identity).await?;
 
+    // One-shot migration: give every existing admin an explicit
+    // `environment:write` grant for every existing environment. Admins
+    // short-circuit permission checks so this isn't required for correctness,
+    // but the `GET /permissions/by-resource?kind=environment` endpoint and the
+    // manager UI's permission listings want the grants to be visible rather
+    // than implicit. Idempotent — gated on an audit-log marker row.
+    crate::bootstrap_admin_env_grants::run(
+        bundle.users.clone(),
+        bundle.environments.clone(),
+        bundle.projects.clone(),
+        bundle.permissions.clone(),
+        bundle.audit.clone(),
+    )
+    .await
+    .context("Failed to run admin env-grants migration")?;
+
     // Load OIDC providers from env (ZLAYER_OIDC_<NAME>_*). Empty map when
     // SSO is disabled — callers get 404 on /auth/oidc/* endpoints.
     let oidc_providers =
@@ -795,8 +811,13 @@ pub(crate) async fn serve(
 
     // Add secrets routes — env-aware so secrets handlers can resolve the
     // environment scope from the bundle's persistent environments store.
-    let secrets_state =
-        zlayer_api::SecretsState::with_environments(secrets, bundle.environments.clone());
+    // Wired with the permission store so env-scoped endpoints can enforce
+    // per-env RBAC instead of blanket admin.
+    let secrets_state = zlayer_api::SecretsState::with_rbac(
+        secrets,
+        bundle.environments.clone(),
+        bundle.permissions.clone(),
+    );
     let environments_state = zlayer_api::EnvironmentsState::new(bundle.environments.clone());
     let secrets_routes = zlayer_api::build_secrets_routes(secrets_state.clone());
     let mut router = base_router.nest("/api/v1/secrets", secrets_routes);

@@ -25,7 +25,9 @@ use tracing::{debug, info};
 use zlayer_api::handlers::auth::{BootstrapRequest, LoginRequest, LoginResponse, UserView};
 use zlayer_api::handlers::containers::ContainerExecResponse;
 use zlayer_api::handlers::images::{ImageInfoDto, PruneResultDto, PullImageResponse};
-use zlayer_api::handlers::secrets::SecretMetadataResponse;
+use zlayer_api::handlers::secrets::{
+    RevealAllSecretsResponse, RotateSecretResponse, SecretMetadataResponse,
+};
 use zlayer_api::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
 use zlayer_api::storage::{StoredEnvironment, StoredVariable};
 
@@ -2037,6 +2039,33 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Rotate a secret under a specific environment (admin only).
+    ///
+    /// `POST /api/v1/secrets/{name}/rotate?environment={env_id}` with
+    /// `{ value }`. Returns the version before and after rotation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the daemon is unreachable, the caller lacks admin
+    /// rights (`403`), the secret or environment is unknown (`404`), or the
+    /// response body cannot be deserialized into [`RotateSecretResponse`].
+    pub async fn rotate_secret_in_env(
+        &self,
+        env_id: &str,
+        name: &str,
+        new_value: &str,
+    ) -> Result<RotateSecretResponse> {
+        let path = format!(
+            "/api/v1/secrets/{}/rotate?environment={}",
+            urlencoding(name),
+            urlencoding(env_id),
+        );
+        let body = serde_json::json!({ "value": new_value }).to_string();
+        let (status, resp) = self.post_json(&path, &body).await?;
+        Self::check_status(status, &resp)?;
+        Self::parse_json(&resp)
+    }
+
     /// Reveal a secret value under a specific environment (admin only).
     ///
     /// `GET /api/v1/secrets/{name}?environment={env_id}&reveal=true`.
@@ -2052,6 +2081,27 @@ impl DaemonClient {
         let resp: SecretMetadataResponse = Self::parse_json(&body)?;
         resp.value
             .ok_or_else(|| anyhow::anyhow!("Daemon did not return a value for revealed secret"))
+    }
+
+    /// Reveal every secret in an env as plaintext (admin only). Single round-trip.
+    ///
+    /// `GET /api/v1/secrets/reveal-all?environment={env_id}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails, the caller lacks admin, or the env is unknown.
+    pub async fn reveal_all_secrets_in_env(
+        &self,
+        env_id: &str,
+    ) -> Result<std::collections::HashMap<String, String>> {
+        let path = format!(
+            "/api/v1/secrets/reveal-all?environment={}",
+            urlencoding(env_id),
+        );
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        let resp: RevealAllSecretsResponse = Self::parse_json(&body)?;
+        Ok(resp.secrets)
     }
 
     /// Bulk-import secrets from a `.env`-style body into a specific environment.
@@ -2447,6 +2497,30 @@ impl DaemonClient {
         let (status, body) = self.delete(&path).await?;
         Self::check_status(status, &body)?;
         Ok(())
+    }
+
+    /// List permissions granted on a specific resource.
+    ///
+    /// `GET /api/v1/permissions/by-resource?kind={kind}&id={id}`.
+    ///
+    /// When `resource_id` is `Some`, returns exact-resource grants; when
+    /// `None`, returns wildcard grants for the given `resource_kind`.
+    pub async fn list_permissions_for_resource(
+        &self,
+        resource_kind: &str,
+        resource_id: Option<&str>,
+    ) -> Result<Vec<zlayer_api::storage::StoredPermission>> {
+        use std::fmt::Write as _;
+        let mut path = format!(
+            "/api/v1/permissions/by-resource?kind={}",
+            urlencoding(resource_kind)
+        );
+        if let Some(id) = resource_id {
+            write!(path, "&id={}", urlencoding(id)).expect("writing to String is infallible");
+        }
+        let (status, body) = self.get(&path).await?;
+        Self::check_status(status, &body)?;
+        Self::parse_json(&body)
     }
 
     // ------------------------------------------------------------------

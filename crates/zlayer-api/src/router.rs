@@ -692,6 +692,8 @@ pub fn build_secrets_routes(secrets_state: SecretsState) -> Router<()> {
         .route("/", post(handlers::secrets::create_secret))
         .route("/", get(handlers::secrets::list_secrets))
         .route("/bulk-import", post(handlers::secrets::bulk_import_secrets))
+        .route("/reveal-all", get(handlers::secrets::reveal_all_secrets))
+        .route("/{name}/rotate", post(handlers::secrets::rotate_secret))
         .route("/{name}", get(handlers::secrets::get_secret_metadata))
         .route("/{name}", delete(handlers::secrets::delete_secret))
         .with_state(secrets_state)
@@ -1456,9 +1458,10 @@ pub fn build_group_routes(groups_state: GroupsState) -> Router<()> {
 /// Build routes for permission grant/revoke/listing.
 ///
 /// Routes:
-/// - `GET    /`       -- list permissions for a subject (user or group)
-/// - `POST   /`       -- grant (admin-only)
-/// - `DELETE /{id}`   -- revoke (admin-only)
+/// - `GET    /`              -- list permissions for a subject (user or group)
+/// - `GET    /by-resource`   -- list permissions granted on a specific resource
+/// - `POST   /`              -- grant (admin-only)
+/// - `DELETE /{id}`          -- revoke (admin-only)
 ///
 /// All routes require authentication via the `AuthActor` extractor; admin
 /// enforcement happens in the handlers.
@@ -1472,6 +1475,10 @@ pub fn build_group_routes(groups_state: GroupsState) -> Router<()> {
 pub fn build_permission_routes(permissions_state: PermissionsState) -> Router<()> {
     Router::new()
         .route("/", get(handlers::permissions::list_permissions))
+        .route(
+            "/by-resource",
+            get(handlers::permissions::list_permissions_by_resource),
+        )
         .route("/", post(handlers::permissions::grant_permission))
         .route("/{id}", delete(handlers::permissions::revoke_permission))
         .with_state(permissions_state)

@@ -5461,14 +5461,14 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.184"
+version = "0.2.185"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
+checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
 name = "libcgroups"
 version = "0.6.0"
-source = "git+https://github.com/youki-dev/youki?rev=a68a38c422b56125620749f7a7c072a01d245e87#a68a38c422b56125620749f7a7c072a01d245e87"
+source = "git+https://github.com/ZachHandley/youki?branch=zlayer-patches#e89e3ab9cc752e5cab44dee9a8595ab176dfeb03"
 dependencies = [
  "fixedbitset",
  "nix 0.29.0",
@@ -5483,7 +5483,7 @@ dependencies = [
 [[package]]
 name = "libcontainer"
 version = "0.6.0"
-source = "git+https://github.com/youki-dev/youki?rev=a68a38c422b56125620749f7a7c072a01d245e87#a68a38c422b56125620749f7a7c072a01d245e87"
+source = "git+https://github.com/ZachHandley/youki?branch=zlayer-patches#e89e3ab9cc752e5cab44dee9a8595ab176dfeb03"
 dependencies = [
  "caps",
  "chrono",

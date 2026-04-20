@@ -320,49 +320,19 @@ jobs:
         run: cargo test --package zlayer ${{ matrix.features }}
 
   # ===========================================
-  # Auto Tag & Publish — only on push to dev
-  # After successful build, finds latest dev-v* tag,
-  # bumps patch number, creates new tag, triggers publish.
-  # ===========================================
-  auto-tag:
-    name: Auto Tag & Publish
-    runs-on: ubuntu-latest
-    needs: [build, build-macos]
-    if: ${{ github.ref == 'refs/heads/dev' && !contains(github.event.head_commit.message, '[np]') }}
-    steps:
-      - name: Checkout (full history)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          token: ${{ secrets.FORGEJO_TOKEN }}
-
-      - name: Calculate next version
-        id: version
-        uses: https://forge.blackleafdigital.com/Public/actions/resolve-version@main
-        with:
-          tag-prefix: v
-          bump: patch
-
-      - name: Create and push tag
-        run: |
-          TAG="v${{ steps.version.outputs.version }}"
-          git config user.name "Zach Handley"
-          git config user.email "zachhandley@gmail.com"
-          git tag -a "$TAG" -m "Auto-tagged from CI: $TAG"
-          git push origin "$TAG"
-
-      - name: Trigger build workflow
-        run: |
-          TAG="v${{ steps.version.outputs.version }}"
-          curl -X POST \
-            -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
-            -H "Content-Type: application/json" \
-            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/workflows/build.yml/dispatches" \
-            -d "{\"ref\": \"dev\", \"inputs\": {\"version\": \"${TAG}\", \"sha\": \"${{ github.sha }}\"}}"
-
-  # ===========================================
-  # Trigger E2E Tests (runs against the dev SHA; no version).
-  # build.yml is dispatched independently by auto-tag above.
+  # Dispatch E2E (gate for the release chain)
+  #
+  # Runs on every successful check+test+feature-tests+sanity-build. On dev
+  # pushes (without a `[np]` marker in the commit message), this job also
+  # computes the next version and forwards it to e2e.yml, which in turn
+  # dispatches build.yml on success. build.yml is responsible for
+  # auto-tagging after the multi-platform build succeeds — the tag is
+  # never created speculatively.
+  #
+  # - PR run:        dispatch e2e with version="" (sanity only, no release).
+  # - Dev push:      dispatch e2e with computed version (starts release chain).
+  # - [np] dev push: dispatch e2e with version="" (no release).
+  # - Manual dispatch with inputs.version: forwarded verbatim.
   # ===========================================
   trigger-e2e:
     name: Trigger E2E
@@ -370,12 +340,32 @@ jobs:
     needs: [build, build-macos, feature-tests]
     if: ${{ needs.build.result == 'success' }}
     steps:
-      - name: Determine version
+      - name: Checkout (full history for tag lookup)
+        if: ${{ github.ref == 'refs/heads/dev' && !contains(github.event.head_commit.message, '[np]') }}
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate next version
+        id: resolve
+        if: ${{ github.ref == 'refs/heads/dev' && !contains(github.event.head_commit.message, '[np]') }}
+        uses: https://forge.blackleafdigital.com/Public/actions/resolve-version@main
+        with:
+          tag-prefix: v
+          bump: patch
+
+      - name: Determine version to forward
         id: version
         run: |
           if [[ -n "${{ inputs.version }}" ]]; then
+            # Manual workflow_dispatch with an explicit version wins.
             echo "version=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          elif [[ -n "${{ steps.resolve.outputs.version }}" ]]; then
+            # Dev push without [np]: tag prefix + computed next version.
+            echo "version=v${{ steps.resolve.outputs.version }}" >> $GITHUB_OUTPUT
           else
+            # PR runs and [np] dev pushes: e2e still runs for signal, but
+            # no build/tag/release chain fires.
             echo "version=" >> $GITHUB_OUTPUT
           fi
 

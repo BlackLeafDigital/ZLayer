@@ -49,6 +49,8 @@ pub mod ps;
 #[cfg(unix)]
 pub mod resolver;
 #[cfg(unix)]
+pub mod run;
+#[cfg(unix)]
 pub mod secret;
 #[cfg(unix)]
 pub mod serve;

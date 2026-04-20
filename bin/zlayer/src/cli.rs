@@ -580,6 +580,56 @@ pub(crate) enum Commands {
     #[command(subcommand, display_order = 38)]
     Secret(SecretCommands),
 
+    /// Run a local command with secrets injected as env vars.
+    ///
+    /// Resolution order (later wins on collision):
+    ///   1. Parent env (inherited)
+    ///   2. `global` env secrets (auto-merged unless --no-global)
+    ///   3. Each --merge <slug> env in order
+    ///   4. --env <slug> secrets (highest priority)
+    ///
+    /// Examples:
+    ///   zlayer run --env dev -- pnpm run dev
+    ///   zlayer run --env staging --no-global -- bash ./deploy.sh
+    ///   zlayer run --env prod --merge global --merge baseline -- ./bin/server
+    ///   zlayer run --env dev --dry-run         # masked preview
+    ///   zlayer run --env dev --dry-run --unmask  # plaintext (admin)
+    #[cfg(unix)]
+    #[command(verbatim_doc_comment, display_order = 39)]
+    Run {
+        /// Primary environment to resolve secrets from (id or name).
+        #[arg(long)]
+        env: String,
+
+        /// Skip the implicit `global` env merge. Off by default.
+        #[arg(long, default_value_t = false)]
+        no_global: bool,
+
+        /// Additional env(s) to merge under the primary env. Left-to-right
+        /// order: later flags win over earlier ones (but the primary --env
+        /// always wins).
+        #[arg(long = "merge", value_name = "SLUG")]
+        merge: Vec<String>,
+
+        /// Project id used to resolve non-UUID env names.
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Print the resolved env instead of spawning. Values are masked
+        /// as `***` unless --unmask is also passed.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+
+        /// Reveal plaintext values in --dry-run output (admin only).
+        #[arg(long, default_value_t = false, requires = "dry_run")]
+        unmask: bool,
+
+        /// Command and arguments to run. Use `--` to separate from zlayer args.
+        /// Example: `zlayer run --env dev -- pnpm run dev`
+        #[arg(trailing_var_arg = true, required = true, num_args = 1..)]
+        command: Vec<String>,
+    },
+
     /// Environment management commands
     ///
     /// Manage deployment/runtime environments (e.g. `dev`, `staging`,
@@ -1104,13 +1154,28 @@ pub(crate) enum SecretCommands {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Create a new secret.
+    /// Create a new secret. Exactly one of `--value`, `--from-stdin`,
+    /// `--from-file`, or `--random` must be provided.
     Create {
         /// Secret name
         name: String,
-        /// Secret value
-        #[arg(long)]
-        value: String,
+        /// Inline value. Exposed on argv — prefer `--from-file` / `--from-stdin`
+        /// for anything sensitive.
+        #[arg(long, group = "value_source")]
+        value: Option<String>,
+        /// Read the value from stdin (no newline trim beyond a single trailing newline).
+        #[arg(long, group = "value_source")]
+        from_stdin: bool,
+        /// Read the value from a file (trailing newline trimmed).
+        #[arg(long, group = "value_source", value_name = "PATH")]
+        from_file: Option<PathBuf>,
+        /// Generate a random alphanumeric value and store it. Prints the
+        /// generated value once to stdout after creation.
+        #[arg(long, group = "value_source")]
+        random: bool,
+        /// Length of the generated random value (requires `--random`).
+        #[arg(long, default_value_t = 32)]
+        random_length: usize,
         /// Environment id or name to scope the secret to.
         #[arg(long)]
         env: Option<String>,
@@ -1146,11 +1211,56 @@ pub(crate) enum SecretCommands {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Set a secret using `KEY=VALUE` syntax. Requires `--env`.
+    /// Set (create-or-update) a secret. Exactly one of `--value`,
+    /// `--from-stdin`, `--from-file`, or `--random` is required.
     Set {
-        /// `NAME=VALUE` pair.
-        assignment: String,
+        /// Secret name.
+        name: String,
+        /// Inline value. Prefer `--from-file` / `--from-stdin` for sensitive data.
+        #[arg(long, group = "value_source_set")]
+        value: Option<String>,
+        /// Read the value from stdin (no newline trim beyond a single trailing newline).
+        #[arg(long, group = "value_source_set")]
+        from_stdin: bool,
+        /// Read the value from a file (trailing newline trimmed).
+        #[arg(long, group = "value_source_set", value_name = "PATH")]
+        from_file: Option<PathBuf>,
+        /// Generate a random alphanumeric value and store it. Prints the
+        /// generated value once to stdout after setting.
+        #[arg(long, group = "value_source_set")]
+        random: bool,
+        /// Length of the generated random value (requires `--random`).
+        #[arg(long, default_value_t = 32)]
+        random_length: usize,
         /// Environment id or name to store the secret under.
+        #[arg(long)]
+        env: String,
+        /// Project id used to resolve a non-UUID environment name.
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Rotate an existing secret: overwrite with a new value and return the
+    /// version before+after. Fails if the secret does not exist.
+    Rotate {
+        /// Secret name.
+        name: String,
+        /// Inline value. Prefer `--from-file` / `--from-stdin` for sensitive data.
+        #[arg(long, group = "value_source_rotate")]
+        value: Option<String>,
+        /// Read the value from stdin (no newline trim beyond a single trailing newline).
+        #[arg(long, group = "value_source_rotate")]
+        from_stdin: bool,
+        /// Read the value from a file (trailing newline trimmed).
+        #[arg(long, group = "value_source_rotate", value_name = "PATH")]
+        from_file: Option<PathBuf>,
+        /// Generate a random alphanumeric value and store it. Prints the
+        /// generated value once to stdout after rotation.
+        #[arg(long, group = "value_source_rotate")]
+        random: bool,
+        /// Length of the generated random value (requires `--random`).
+        #[arg(long, default_value_t = 32)]
+        random_length: usize,
+        /// Environment id or name.
         #[arg(long)]
         env: String,
         /// Project id used to resolve a non-UUID environment name.
@@ -1192,6 +1302,66 @@ pub(crate) enum SecretCommands {
         /// Project id used to resolve a non-UUID environment name.
         #[arg(long)]
         project: Option<String>,
+    },
+
+    /// Grant a user access to an environment's secrets.
+    ///
+    /// Wraps `POST /api/v1/permissions` with `resource_kind = "environment"`.
+    /// Admin only.
+    ///
+    /// Examples:
+    ///   zlayer secret grant alice@example.com dev read
+    ///   zlayer secret grant u-1234 prod write --project p-1
+    #[command(verbatim_doc_comment)]
+    Grant {
+        /// User email or id.
+        user: String,
+        /// Environment id or name.
+        env: String,
+        /// Access level: `read`, `execute`, or `write` (case-insensitive).
+        level: String,
+        /// Project id used to resolve a non-UUID env name.
+        #[arg(long)]
+        project: Option<String>,
+    },
+
+    /// Revoke a user's access to an environment's secrets.
+    ///
+    /// Resolves the grant row by listing the user's permissions and filtering
+    /// on `resource_kind = "environment"` + `resource_id = <env_id>`, then
+    /// calls `DELETE /api/v1/permissions/{id}`.
+    ///
+    /// Examples:
+    ///   zlayer secret revoke alice@example.com dev
+    ///   zlayer secret revoke u-1234 prod --project p-1
+    #[command(verbatim_doc_comment)]
+    Revoke {
+        /// User email or id.
+        user: String,
+        /// Environment id or name.
+        env: String,
+        /// Project id used to resolve a non-UUID env name.
+        #[arg(long)]
+        project: Option<String>,
+    },
+
+    /// List every grant on a given environment.
+    ///
+    /// Wraps `GET /api/v1/permissions/by-resource?kind=environment&id=<env>`.
+    ///
+    /// Examples:
+    ///   zlayer secret permissions dev
+    ///   zlayer secret permissions prod --project p-1 --output json
+    #[command(verbatim_doc_comment)]
+    Permissions {
+        /// Environment id or name.
+        env: String,
+        /// Project id used to resolve a non-UUID env name.
+        #[arg(long)]
+        project: Option<String>,
+        /// Output format: `table` or `json`.
+        #[arg(long, default_value = "table")]
+        output: String,
     },
 }
 
@@ -1989,12 +2159,18 @@ pub(crate) enum ManagerCommands {
     /// Initialize zlayer-manager deployment
     ///
     /// Creates a deployment spec file for zlayer-manager and optionally
-    /// deploys it immediately.
+    /// deploys it immediately. When run interactively, prompts for an admin
+    /// email + password, stores the password in the daemon's `bootstrap`
+    /// environment via the secrets API, and emits a spec that references the
+    /// secret via `$secret://bootstrap/ZLAYER_BOOTSTRAP_PASSWORD`.
     ///
     /// Examples:
     ///   zlayer manager init
     ///   zlayer manager init --port 8080
     ///   zlayer manager init --deploy
+    ///   zlayer manager init --email admin@example.com --random
+    ///   zlayer manager init --env-file /run/secrets/manager.env
+    ///   zlayer manager init --no-bootstrap
     #[command(verbatim_doc_comment, disable_version_flag = true)]
     Init {
         /// Output directory for spec file (default: current directory)
@@ -2012,6 +2188,38 @@ pub(crate) enum ManagerCommands {
         /// `ZLayer` version to use (default: latest)
         #[arg(long)]
         version: Option<String>,
+
+        /// Admin email (interactive prompt if missing, unless --no-prompt is set).
+        #[arg(long)]
+        email: Option<String>,
+
+        /// Inline admin password. Exposed on argv — prefer --password-file or --random.
+        #[arg(long, group = "bootstrap_pw")]
+        password: Option<String>,
+
+        /// Read the admin password from a file.
+        #[arg(long, group = "bootstrap_pw", value_name = "PATH")]
+        password_file: Option<PathBuf>,
+
+        /// Generate a random 32-char alphanumeric admin password. Printed once.
+        #[arg(long, group = "bootstrap_pw", default_value_t = false)]
+        random: bool,
+
+        /// Skip the interactive prompt. When set without --password/--password-file/--random,
+        /// the spec is emitted WITHOUT a bootstrap block (equivalent to --no-bootstrap).
+        #[arg(long, default_value_t = false)]
+        no_prompt: bool,
+
+        /// Emit the spec with `ZLAYER_BOOTSTRAP_PASSWORD_FILE` pointing at the
+        /// given file instead of generating+storing a password. Skips all
+        /// prompts and secret-store writes.
+        #[arg(long, value_name = "PATH")]
+        env_file: Option<PathBuf>,
+
+        /// Emit the legacy spec with commented-out bootstrap env examples.
+        /// Skip prompts + secret-store writes. Mutually exclusive with --env-file.
+        #[arg(long, default_value_t = false)]
+        no_bootstrap: bool,
     },
 
     /// Show manager status

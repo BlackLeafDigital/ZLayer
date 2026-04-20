@@ -39,8 +39,8 @@ use utoipa::ToSchema;
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
 use crate::handlers::users::AuthActor;
-use crate::storage::{EnvironmentStorage, StoredEnvironment};
-use zlayer_secrets::{Secret, SecretMetadata, SecretsStore};
+use crate::storage::{EnvironmentStorage, PermissionLevel, PermissionStorage, StoredEnvironment};
+use zlayer_secrets::{RotationResult, Secret, SecretMetadata, SecretsStore};
 
 /// Default scope used when no explicit scope and no environment are provided.
 pub const DEFAULT_SCOPE: &str = "default";
@@ -116,6 +116,47 @@ impl From<&SecretMetadata> for SecretMetadataResponse {
     }
 }
 
+/// Request body for secret rotation.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RotateSecretRequest {
+    /// The new secret value (will be encrypted at rest).
+    pub value: String,
+}
+
+/// Response returned by the rotate endpoint.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RotateSecretResponse {
+    /// The secret name.
+    pub name: String,
+    /// Version prior to rotation. `None` if the secret did not exist (won't
+    /// happen today — rotate rejects missing secrets — but preserved for
+    /// forward compatibility).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_version: Option<u32>,
+    /// Version after rotation.
+    pub new_version: u32,
+}
+
+impl From<(String, RotationResult)> for RotateSecretResponse {
+    fn from((name, r): (String, RotationResult)) -> Self {
+        Self {
+            name,
+            previous_version: r.previous_version,
+            new_version: r.new_version,
+        }
+    }
+}
+
+/// Response for the batch reveal endpoint — returns every secret in an env as plaintext.
+/// Admin-only for now (Phase 3 will gate this on per-env Read permission instead).
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct RevealAllSecretsResponse {
+    /// The environment id the secrets were revealed from.
+    pub environment: String,
+    /// Name → plaintext value map. Includes every secret in the scope.
+    pub secrets: std::collections::HashMap<String, String>,
+}
+
 /// Result body for `POST /api/v1/secrets/bulk-import`.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct BulkImportResponse {
@@ -135,6 +176,10 @@ pub struct SecretsState {
     /// Optional environment store for env-aware routing. Without it, only
     /// the legacy `scope`-based code paths are usable.
     pub env_store: Option<Arc<dyn EnvironmentStorage>>,
+    /// Permission store for per-env RBAC checks. When `None`, all endpoints
+    /// fall back to blanket admin-only gates (used by tests or legacy setups
+    /// without the permission store wired up yet).
+    pub perm_store: Option<Arc<dyn PermissionStorage>>,
 }
 
 impl SecretsState {
@@ -145,6 +190,7 @@ impl SecretsState {
         Self {
             store,
             env_store: None,
+            perm_store: None,
         }
     }
 
@@ -158,6 +204,21 @@ impl SecretsState {
         Self {
             store,
             env_store: Some(env_store),
+            perm_store: None,
+        }
+    }
+
+    /// Full wiring: secrets + env store + permission store. Enables per-env RBAC.
+    #[must_use]
+    pub fn with_rbac(
+        store: Arc<dyn SecretsStore + Send + Sync>,
+        env_store: Arc<dyn EnvironmentStorage>,
+        perm_store: Arc<dyn PermissionStorage>,
+    ) -> Self {
+        Self {
+            store,
+            env_store: Some(env_store),
+            perm_store: Some(perm_store),
         }
     }
 
@@ -278,6 +339,39 @@ async fn resolve_scope_get(state: &SecretsState, query: &GetSecretQuery) -> Resu
     Ok(DEFAULT_SCOPE.to_string())
 }
 
+// ---- RBAC helpers ----
+
+/// Gate a mutating env-scoped operation: require `Write` on the env.
+/// Admin short-circuits via [`AuthActor::require_env_access`].
+///
+/// Falls back to [`AuthActor::require_admin`] when `perm_store` is not wired
+/// (legacy setups).
+async fn require_env_write(state: &SecretsState, actor: &AuthActor, env_id: &str) -> Result<()> {
+    match state.perm_store.as_ref() {
+        Some(ps) => {
+            actor
+                .require_env_access(ps.as_ref(), env_id, PermissionLevel::Write)
+                .await
+        }
+        None => actor.require_admin(),
+    }
+}
+
+/// Gate a read-only env-scoped operation: require `Read` on the env.
+/// Admin short-circuits via [`AuthActor::require_env_access`].
+///
+/// Falls back to [`AuthActor::require_admin`] when `perm_store` is not wired.
+async fn require_env_read(state: &SecretsState, actor: &AuthActor, env_id: &str) -> Result<()> {
+    match state.perm_store.as_ref() {
+        Some(ps) => {
+            actor
+                .require_env_access(ps.as_ref(), env_id, PermissionLevel::Read)
+                .await
+        }
+        None => actor.require_admin(),
+    }
+}
+
 // ---- Endpoints ----
 
 /// Create or update a secret.
@@ -316,7 +410,12 @@ pub async fn create_secret(
     Query(query): Query<SecretsScopeQuery>,
     Json(request): Json<CreateSecretRequest>,
 ) -> Result<(StatusCode, Json<SecretMetadataResponse>)> {
-    actor.require_admin()?;
+    if let Some(env_id) = &query.environment {
+        require_env_write(&state, &actor, env_id).await?;
+    } else {
+        // Legacy scope path stays admin-only.
+        actor.require_admin()?;
+    }
 
     if request.name.is_empty() {
         return Err(ApiError::BadRequest(
@@ -389,10 +488,15 @@ pub async fn create_secret(
     tag = "Secrets"
 )]
 pub async fn list_secrets(
-    _actor: AuthActor,
+    actor: AuthActor,
     State(state): State<SecretsState>,
     Query(query): Query<SecretsScopeQuery>,
 ) -> Result<Json<Vec<SecretMetadataResponse>>> {
+    if let Some(env_id) = &query.environment {
+        require_env_read(&state, &actor, env_id).await?;
+    }
+    // else: authenticated actor can list legacy scope (unchanged).
+
     let scope = resolve_scope(&state, None, &query).await?;
 
     let metadata_list = state
@@ -443,7 +547,17 @@ pub async fn get_secret_metadata(
     Query(query): Query<GetSecretQuery>,
 ) -> Result<Json<SecretMetadataResponse>> {
     let reveal = query.reveal;
-    if reveal {
+    if let Some(env_id) = &query.environment {
+        if reveal {
+            // Design choice: reveal on an env-scoped secret requires Write —
+            // plaintext exfil is a more sensitive op than simply listing/
+            // reading metadata.
+            require_env_write(&state, &actor, env_id).await?;
+        } else {
+            require_env_read(&state, &actor, env_id).await?;
+        }
+    } else if reveal {
+        // Legacy scope reveal stays admin-only.
         actor.require_admin()?;
     }
     let scope = resolve_scope_get(&state, &query).await?;
@@ -514,7 +628,11 @@ pub async fn delete_secret(
     Path(name): Path<String>,
     Query(query): Query<SecretsScopeQuery>,
 ) -> Result<StatusCode> {
-    actor.require_admin()?;
+    if let Some(env_id) = &query.environment {
+        require_env_write(&state, &actor, env_id).await?;
+    } else {
+        actor.require_admin()?;
+    }
 
     let scope = resolve_scope(&state, None, &query).await?;
 
@@ -534,6 +652,71 @@ pub async fn delete_secret(
         .map_err(|e| ApiError::Internal(format!("Failed to delete secret: {e}")))?;
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Rotate a secret — overwrite with a new value and return the version before+after.
+///
+/// Admin-only in v1. Mutually exclusive scope query like the other endpoints.
+///
+/// # Errors
+///
+/// Returns `ApiError::BadRequest` for empty names or conflicting scope params,
+/// `ApiError::Forbidden` for non-admin callers, `ApiError::NotFound` when the
+/// secret or environment is unknown, and `ApiError::Internal` for storage
+/// failures.
+#[utoipa::path(
+    post,
+    path = "/api/v1/secrets/{name}/rotate",
+    params(
+        ("name" = String, Path, description = "Secret name"),
+        ("environment" = Option<String>, Query, description = "Environment id"),
+        ("scope" = Option<String>, Query, description = "Explicit scope (legacy)"),
+    ),
+    request_body = RotateSecretRequest,
+    responses(
+        (status = 200, description = "Secret rotated", body = RotateSecretResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Secret or environment not found"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Secrets"
+)]
+pub async fn rotate_secret(
+    actor: AuthActor,
+    State(state): State<SecretsState>,
+    Path(name): Path<String>,
+    Query(query): Query<SecretsScopeQuery>,
+    Json(request): Json<RotateSecretRequest>,
+) -> Result<Json<RotateSecretResponse>> {
+    if let Some(env_id) = &query.environment {
+        require_env_write(&state, &actor, env_id).await?;
+    } else {
+        actor.require_admin()?;
+    }
+
+    if name.is_empty() {
+        return Err(ApiError::BadRequest(
+            "Secret name cannot be empty".to_string(),
+        ));
+    }
+
+    let scope = resolve_scope(&state, None, &query).await?;
+    let new_secret = Secret::new(&request.value);
+
+    let result = state
+        .store
+        .rotate_secret(&scope, &name, &new_secret)
+        .await
+        .map_err(|e| match e {
+            zlayer_secrets::SecretsError::NotFound { .. } => {
+                ApiError::NotFound(format!("Secret '{name}' not found"))
+            }
+            other => ApiError::Internal(format!("Failed to rotate secret: {other}")),
+        })?;
+
+    Ok(Json(RotateSecretResponse::from((name, result))))
 }
 
 /// Bulk-import secrets from a dotenv-style payload (`KEY=value\n…`).
@@ -570,7 +753,9 @@ pub async fn bulk_import_secrets(
     Query(query): Query<BulkImportQuery>,
     body: String,
 ) -> Result<Json<BulkImportResponse>> {
-    actor.require_admin()?;
+    // `environment` is required on bulk-import, so always route through
+    // per-env RBAC. Admin short-circuits inside `require_env_write`.
+    require_env_write(&state, &actor, &query.environment).await?;
 
     let env = state.lookup_env(&query.environment).await?;
     let scope = env_scope(&env);
@@ -626,6 +811,63 @@ pub async fn bulk_import_secrets(
         created,
         updated,
         errors,
+    }))
+}
+
+/// Reveal every secret in an environment at once (admin only).
+///
+/// Used by `zlayer run` to build the child-process env in a single round-trip.
+///
+/// # Errors
+///
+/// Returns `ApiError::Forbidden` if the caller is not admin, `ApiError::NotFound`
+/// if the environment is unknown, and `ApiError::Internal` for storage failures.
+#[utoipa::path(
+    get,
+    path = "/api/v1/secrets/reveal-all",
+    params(
+        ("environment" = String, Query, description = "Environment id (required)"),
+    ),
+    responses(
+        (status = 200, description = "Every secret revealed", body = RevealAllSecretsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Admin required"),
+        (status = 404, description = "Environment not found"),
+    ),
+    security(("bearer_auth" = [])),
+    tag = "Secrets"
+)]
+pub async fn reveal_all_secrets(
+    actor: AuthActor,
+    State(state): State<SecretsState>,
+    Query(query): Query<SecretsScopeQuery>,
+) -> Result<Json<RevealAllSecretsResponse>> {
+    let env_id = query.environment.clone().ok_or_else(|| {
+        ApiError::BadRequest("`?environment=` is required for reveal-all".to_string())
+    })?;
+    require_env_read(&state, &actor, &env_id).await?;
+
+    // Resolve env -> scope string
+    let scope = resolve_scope(&state, None, &query).await?;
+
+    let metadata_list = state
+        .store
+        .list_secrets(&scope)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to list secrets: {e}")))?;
+
+    let mut secrets = std::collections::HashMap::new();
+    for m in metadata_list {
+        let v =
+            state.store.get_secret(&scope, &m.name).await.map_err(|e| {
+                ApiError::Internal(format!("Failed to read secret {}: {e}", m.name))
+            })?;
+        secrets.insert(m.name, v.expose().to_string());
+    }
+
+    Ok(Json(RevealAllSecretsResponse {
+        environment: env_id,
+        secrets,
     }))
 }
 
@@ -890,6 +1132,112 @@ mod tests {
     fn test_strip_dotenv_quotes_trims_outside() {
         assert_eq!(strip_dotenv_quotes("   value   "), "value");
         assert_eq!(strip_dotenv_quotes("  \"v\"  "), "v");
+    }
+
+    // ---- per-env RBAC tests ----
+
+    #[tokio::test]
+    async fn test_list_secrets_env_read_grant_succeeds() {
+        use crate::storage::{
+            InMemoryPermissionStore, PermissionLevel, PermissionStorage, StoredPermission,
+            SubjectKind,
+        };
+        use axum::extract::{Query, State};
+
+        // Build state: secrets + env + perm stores.
+        let secrets_store: Arc<dyn SecretsStore + Send + Sync> = Arc::new(MockSecretsStore::new());
+        let env_store = Arc::new(InMemoryEnvironmentStore::new());
+        let env = StoredEnvironment::new("dev", None);
+        let env_id = env.id.clone();
+        env_store.store(&env).await.unwrap();
+
+        let perm_store = Arc::new(InMemoryPermissionStore::new());
+
+        // Grant user u1 Read on env dev.
+        let grant = StoredPermission::new(
+            SubjectKind::User,
+            "u1",
+            "environment",
+            Some(env_id.clone()),
+            PermissionLevel::Read,
+        );
+        <InMemoryPermissionStore as PermissionStorage>::grant(perm_store.as_ref(), &grant)
+            .await
+            .unwrap();
+
+        let state = SecretsState::with_rbac(secrets_store, env_store, perm_store);
+
+        let actor = AuthActor {
+            user_id: "u1".into(),
+            roles: vec!["user".into()],
+            email: None,
+        };
+        let query = SecretsScopeQuery {
+            environment: Some(env_id),
+            scope: None,
+        };
+
+        let result = list_secrets(actor, State(state), Query(query)).await;
+        assert!(
+            result.is_ok(),
+            "list_secrets with Read grant should succeed, got {result:?}"
+        );
+        let Json(list) = result.unwrap();
+        assert!(list.is_empty(), "fresh env should have no secrets");
+    }
+
+    #[tokio::test]
+    async fn test_create_secret_env_without_write_grant_is_forbidden() {
+        use crate::storage::{
+            InMemoryPermissionStore, PermissionLevel, PermissionStorage, StoredPermission,
+            SubjectKind,
+        };
+        use axum::extract::{Query, State};
+
+        let secrets_store: Arc<dyn SecretsStore + Send + Sync> = Arc::new(MockSecretsStore::new());
+        let env_store = Arc::new(InMemoryEnvironmentStore::new());
+        let env = StoredEnvironment::new("dev", None);
+        let env_id = env.id.clone();
+        env_store.store(&env).await.unwrap();
+
+        let perm_store = Arc::new(InMemoryPermissionStore::new());
+
+        // Grant Read only — not Write.
+        let grant = StoredPermission::new(
+            SubjectKind::User,
+            "u1",
+            "environment",
+            Some(env_id.clone()),
+            PermissionLevel::Read,
+        );
+        <InMemoryPermissionStore as PermissionStorage>::grant(perm_store.as_ref(), &grant)
+            .await
+            .unwrap();
+
+        let state = SecretsState::with_rbac(secrets_store, env_store, perm_store);
+
+        let actor = AuthActor {
+            user_id: "u1".into(),
+            roles: vec!["user".into()],
+            email: None,
+        };
+        let query = SecretsScopeQuery {
+            environment: Some(env_id),
+            scope: None,
+        };
+        let body = CreateSecretRequest {
+            name: "my-secret".into(),
+            value: "hunter2".into(),
+            scope: None,
+        };
+
+        let err = create_secret(actor, State(state), Query(query), Json(body))
+            .await
+            .expect_err("create_secret without Write grant should return Forbidden");
+        assert!(
+            matches!(err, ApiError::Forbidden(_)),
+            "expected Forbidden, got {err:?}"
+        );
     }
 
     // ---- minimal mock secrets store for unit tests above ----

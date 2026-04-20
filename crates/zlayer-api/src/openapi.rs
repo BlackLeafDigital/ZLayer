@@ -54,7 +54,10 @@ use crate::handlers::proxy::{
     BackendGroupInfo, BackendInfo, BackendsResponse, CertInfo, RouteInfo, RoutesResponse,
     StreamBackendInfo, StreamInfo, StreamsResponse, TlsResponse,
 };
-use crate::handlers::secrets::{BulkImportResponse, CreateSecretRequest, SecretMetadataResponse};
+use crate::handlers::secrets::{
+    BulkImportResponse, CreateSecretRequest, RevealAllSecretsResponse, RotateSecretRequest,
+    RotateSecretResponse, SecretMetadataResponse,
+};
 use crate::handlers::services::{
     ScaleRequest, ServiceDetails, ServiceEndpoint, ServiceMetrics, ServiceSummary,
 };
@@ -147,7 +150,8 @@ use crate::handlers::overlay::{
     __path_get_overlay_status,
 };
 use crate::handlers::permissions::{
-    __path_grant_permission, __path_list_permissions, __path_revoke_permission,
+    __path_grant_permission, __path_list_permissions, __path_list_permissions_by_resource,
+    __path_revoke_permission,
 };
 use crate::handlers::projects::{
     __path_create_project, __path_delete_project, __path_get_project,
@@ -159,7 +163,8 @@ use crate::handlers::proxy::{
 };
 use crate::handlers::secrets::{
     __path_bulk_import_secrets, __path_create_secret, __path_delete_secret,
-    __path_get_secret_metadata, __path_list_secrets,
+    __path_get_secret_metadata, __path_list_secrets, __path_reveal_all_secrets,
+    __path_rotate_secret,
 };
 use crate::handlers::services::{
     __path_get_service, __path_get_service_logs, __path_list_services, __path_scale_service,
@@ -289,10 +294,12 @@ impl Modify for SecurityAddon {
         get_replicas_internal,
         // Secrets
         create_secret,
+        rotate_secret,
         list_secrets,
         get_secret_metadata,
         delete_secret,
         bulk_import_secrets,
+        reveal_all_secrets,
         // Environments
         list_environments,
         create_environment,
@@ -363,6 +370,7 @@ impl Modify for SecurityAddon {
         remove_member,
         // Permissions
         list_permissions,
+        list_permissions_by_resource,
         grant_permission,
         revoke_permission,
         // Audit
@@ -471,7 +479,10 @@ impl Modify for SecurityAddon {
             // Secrets schemas
             CreateSecretRequest,
             SecretMetadataResponse,
+            RotateSecretRequest,
+            RotateSecretResponse,
             BulkImportResponse,
+            RevealAllSecretsResponse,
             // Environments schemas
             crate::storage::StoredEnvironment,
             CreateEnvironmentRequest,

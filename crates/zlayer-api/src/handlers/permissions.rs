@@ -57,6 +57,16 @@ pub struct ListPermissionsQuery {
     pub group: Option<String>,
 }
 
+/// Query parameters for `GET /api/v1/permissions/by-resource`.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ListByResourceQuery {
+    /// Resource kind (e.g. `"environment"`).
+    pub kind: String,
+    /// Specific resource id. Omit for wildcard grants only.
+    #[serde(default)]
+    pub id: Option<String>,
+}
+
 /// Body for `POST /api/v1/permissions`.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct GrantPermissionRequest {
@@ -114,6 +124,36 @@ pub async fn list_permissions(
         .await
         .map_err(|e| ApiError::Internal(format!("Permission store: {e}")))?;
 
+    Ok(Json(perms))
+}
+
+/// List permissions granted on a specific resource.
+///
+/// When `id` is supplied, returns exact-resource grants; when omitted, returns
+/// wildcard grants for the given `kind`.
+///
+/// # Errors
+///
+/// Returns [`ApiError::Internal`] on store failure.
+#[utoipa::path(
+    get,
+    path = "/api/v1/permissions/by-resource",
+    params(ListByResourceQuery),
+    responses(
+        (status = 200, description = "Grants on the resource", body = Vec<StoredPermission>),
+    ),
+    tag = "Permissions"
+)]
+pub async fn list_permissions_by_resource(
+    _actor: AuthActor,
+    State(state): State<PermissionsState>,
+    Query(q): Query<ListByResourceQuery>,
+) -> Result<Json<Vec<StoredPermission>>> {
+    let perms = state
+        .store
+        .list_for_resource(&q.kind, q.id.as_deref())
+        .await
+        .map_err(|e| ApiError::Internal(format!("Permission store: {e}")))?;
     Ok(Json(perms))
 }
 

@@ -49,6 +49,45 @@ impl AuthActor {
             Err(ApiError::Forbidden("Admin role required".to_string()))
         }
     }
+
+    /// Check whether the actor has at least `required_level` on the given
+    /// environment. Admin role short-circuits to allow.
+    ///
+    /// Used by secrets handlers to gate env-scoped reads/writes on per-env
+    /// RBAC without requiring full admin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ApiError::Forbidden`] if the actor is neither admin nor
+    /// holds a sufficient permission grant on the env. Returns
+    /// [`ApiError::Internal`] if the permission store fails.
+    pub async fn require_env_access(
+        &self,
+        perm_store: &(dyn crate::storage::PermissionStorage + 'static),
+        env_id: &str,
+        required_level: crate::storage::PermissionLevel,
+    ) -> Result<()> {
+        if self.has_role("admin") {
+            return Ok(());
+        }
+        let allowed = perm_store
+            .check(
+                crate::storage::SubjectKind::User,
+                &self.user_id,
+                "environment",
+                Some(env_id),
+                required_level,
+            )
+            .await
+            .map_err(|e| ApiError::Internal(format!("Permission store: {e}")))?;
+        if allowed {
+            Ok(())
+        } else {
+            Err(ApiError::Forbidden(format!(
+                "Missing {required_level:?} on environment {env_id}"
+            )))
+        }
+    }
 }
 
 impl<S> FromRequestParts<S> for AuthActor
@@ -483,5 +522,66 @@ mod tests {
         };
         let err = actor.require_admin().unwrap_err();
         assert!(matches!(err, ApiError::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn test_require_env_access_admin_shortcut() {
+        use crate::storage::{InMemoryPermissionStore, PermissionLevel};
+
+        let admin = AuthActor {
+            user_id: "admin-1".into(),
+            roles: vec!["admin".into()],
+            email: None,
+        };
+        let store = InMemoryPermissionStore::new();
+
+        // Admin short-circuits even when the permission store is empty.
+        admin
+            .require_env_access(&store, "env-xyz", PermissionLevel::Write)
+            .await
+            .expect("admin should always be allowed");
+    }
+
+    #[tokio::test]
+    async fn test_require_env_access_explicit_grant() {
+        use crate::storage::{
+            InMemoryPermissionStore, PermissionLevel, PermissionStorage, StoredPermission,
+            SubjectKind,
+        };
+
+        let actor = AuthActor {
+            user_id: "u1".into(),
+            roles: vec!["user".into()],
+            email: None,
+        };
+        let store = InMemoryPermissionStore::new();
+
+        // Grant u1 Read on env "env-1".
+        let grant = StoredPermission::new(
+            SubjectKind::User,
+            "u1",
+            "environment",
+            Some("env-1".to_string()),
+            PermissionLevel::Read,
+        );
+        <InMemoryPermissionStore as PermissionStorage>::grant(&store, &grant)
+            .await
+            .unwrap();
+
+        // Read on env-1 is allowed.
+        actor
+            .require_env_access(&store, "env-1", PermissionLevel::Read)
+            .await
+            .expect("read grant should allow read");
+
+        // Write on env-1 is denied with Forbidden.
+        let err = actor
+            .require_env_access(&store, "env-1", PermissionLevel::Write)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, ApiError::Forbidden(_)),
+            "expected Forbidden, got {err:?}"
+        );
     }
 }

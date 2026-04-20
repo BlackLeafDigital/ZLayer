@@ -125,6 +125,11 @@ pub fn move_link_into_netns_fd_and_rename(
 
 /// Stub for non-Linux platforms and for Linux builds without the
 /// `youki-runtime` feature (which provides the libcontainer-backed impl).
+///
+/// # Errors
+///
+/// Always returns [`NetlinkError::Netlink`] — this function is unsupported on
+/// the current target/feature combination.
 #[cfg(any(not(target_os = "linux"), not(feature = "youki-runtime")))]
 pub fn move_link_into_netns_fd_and_rename(
     _link_name: &str,
