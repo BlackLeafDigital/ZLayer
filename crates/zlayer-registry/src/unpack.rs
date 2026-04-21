@@ -21,6 +21,64 @@ pub mod media_types {
     pub const TAR_ZSTD: &str = "application/vnd.oci.image.layer.v1.tar+zstd";
     /// Docker gzip compressed layer (legacy)
     pub const DOCKER_TAR_GZIP: &str = "application/vnd.docker.image.rootfs.diff.tar.gzip";
+
+    // Windows container layer media types.
+    //
+    // Windows base-OS layers are published as "foreign" / "nondistributable"
+    // blobs hosted on mcr.microsoft.com. Unpacking them requires the
+    // Windows-specific pipeline (wclayer / backup-stream / HCS) which lives in
+    // `zlayer-agent`, *not* the Linux overlayfs+whiteouts flow in this module.
+    // The constants are declared here so the rest of the registry can
+    // recognize and classify them; see [`is_windows_layer`] for the matcher.
+
+    /// Legacy Docker foreign-layer (gzip) — Windows base OS layers on MCR.
+    pub const DOCKER_FOREIGN_TAR_GZIP: &str =
+        "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip";
+    /// OCI nondistributable layer, uncompressed tar (Windows).
+    pub const OCI_NONDISTRIBUTABLE_TAR: &str =
+        "application/vnd.oci.image.layer.nondistributable.v1.tar";
+    /// OCI nondistributable layer, gzip compressed (Windows).
+    pub const OCI_NONDISTRIBUTABLE_TAR_GZIP: &str =
+        "application/vnd.oci.image.layer.nondistributable.v1.tar+gzip";
+    /// OCI nondistributable layer, zstd compressed (Windows).
+    pub const OCI_NONDISTRIBUTABLE_TAR_ZSTD: &str =
+        "application/vnd.oci.image.layer.nondistributable.v1.tar+zstd";
+}
+
+/// Returns `true` if a layer media type is a recognized Linux tar layer
+/// (overlayfs + whiteouts pipeline).
+///
+/// This covers both the modern OCI types and the legacy Docker v2.2 type.
+/// It does *not* include Windows nondistributable/foreign layer types —
+/// see [`is_windows_layer`] for that classification.
+#[must_use]
+pub fn is_linux_layer(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        media_types::TAR
+            | media_types::TAR_GZIP
+            | media_types::TAR_ZSTD
+            | media_types::DOCKER_TAR_GZIP
+    )
+}
+
+/// Returns `true` if a layer media type indicates a Windows container layer
+/// (nondistributable / foreign).
+///
+/// Windows layers require a different unpack path (wclayer / backup-stream /
+/// HCS) than the standard Linux tar+overlayfs flow this module implements.
+/// Callers that receive a `true` here should route the blob to the
+/// Windows-specific unpacker in `zlayer-agent` rather than invoking
+/// [`LayerUnpacker::unpack_layer`].
+#[must_use]
+pub fn is_windows_layer(media_type: &str) -> bool {
+    matches!(
+        media_type,
+        media_types::DOCKER_FOREIGN_TAR_GZIP
+            | media_types::OCI_NONDISTRIBUTABLE_TAR
+            | media_types::OCI_NONDISTRIBUTABLE_TAR_GZIP
+            | media_types::OCI_NONDISTRIBUTABLE_TAR_ZSTD
+    )
 }
 
 /// Whiteout file prefix for deletions
@@ -743,6 +801,64 @@ mod tests {
             fs::read_to_string(rootfs.join("file.txt")).unwrap(),
             "modified"
         );
+    }
+
+    #[test]
+    fn test_is_linux_layer_classifier() {
+        assert!(is_linux_layer(media_types::TAR));
+        assert!(is_linux_layer(media_types::TAR_GZIP));
+        assert!(is_linux_layer(media_types::TAR_ZSTD));
+        assert!(is_linux_layer(media_types::DOCKER_TAR_GZIP));
+
+        // Windows types must NOT be classified as Linux.
+        assert!(!is_linux_layer(media_types::DOCKER_FOREIGN_TAR_GZIP));
+        assert!(!is_linux_layer(media_types::OCI_NONDISTRIBUTABLE_TAR));
+        assert!(!is_linux_layer(media_types::OCI_NONDISTRIBUTABLE_TAR_GZIP));
+        assert!(!is_linux_layer(media_types::OCI_NONDISTRIBUTABLE_TAR_ZSTD));
+
+        assert!(!is_linux_layer("application/vnd.oci.image.config.v1+json"));
+        assert!(!is_linux_layer("application/unknown"));
+    }
+
+    #[test]
+    fn test_is_windows_layer_classifier() {
+        assert!(is_windows_layer(media_types::DOCKER_FOREIGN_TAR_GZIP));
+        assert!(is_windows_layer(media_types::OCI_NONDISTRIBUTABLE_TAR));
+        assert!(is_windows_layer(media_types::OCI_NONDISTRIBUTABLE_TAR_GZIP));
+        assert!(is_windows_layer(media_types::OCI_NONDISTRIBUTABLE_TAR_ZSTD));
+
+        // Linux types must NOT be classified as Windows.
+        assert!(!is_windows_layer(media_types::TAR));
+        assert!(!is_windows_layer(media_types::TAR_GZIP));
+        assert!(!is_windows_layer(media_types::TAR_ZSTD));
+        assert!(!is_windows_layer(media_types::DOCKER_TAR_GZIP));
+
+        assert!(!is_windows_layer(
+            "application/vnd.oci.image.config.v1+json"
+        ));
+        assert!(!is_windows_layer("application/unknown"));
+    }
+
+    #[test]
+    fn test_linux_and_windows_classifiers_are_disjoint() {
+        // Every supported media type must classify as exactly one of
+        // Linux or Windows (never both, never neither).
+        let all = [
+            media_types::TAR,
+            media_types::TAR_GZIP,
+            media_types::TAR_ZSTD,
+            media_types::DOCKER_TAR_GZIP,
+            media_types::DOCKER_FOREIGN_TAR_GZIP,
+            media_types::OCI_NONDISTRIBUTABLE_TAR,
+            media_types::OCI_NONDISTRIBUTABLE_TAR_GZIP,
+            media_types::OCI_NONDISTRIBUTABLE_TAR_ZSTD,
+        ];
+        for mt in all {
+            assert!(
+                is_linux_layer(mt) ^ is_windows_layer(mt),
+                "media type {mt} must be exactly one of linux/windows"
+            );
+        }
     }
 
     #[test]

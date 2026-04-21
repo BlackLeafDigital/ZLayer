@@ -28,6 +28,9 @@ pub mod service;
 pub mod stabilization;
 pub mod storage_manager;
 
+#[cfg(target_os = "windows")]
+pub mod windows;
+
 pub use autoscale_controller::{has_adaptive_scaling, AutoscaleController};
 pub use bundle::*;
 pub use container_supervisor::{
@@ -136,9 +139,25 @@ pub enum RuntimeConfig {
     /// Use macOS Virtualization.framework for full VM isolation
     #[cfg(target_os = "macos")]
     MacVm,
-    /// WSL2 backend (Windows only).
+    /// WSL2 backend (deprecated).
+    ///
+    /// Preserved for one release for back-compat with existing `runtime: wsl2`
+    /// configs. No real WSL2-specific backend was ever shipped — this variant
+    /// was a stub that suggested using Docker Desktop with the WSL2 backend.
     #[cfg(target_os = "windows")]
+    #[deprecated(
+        note = "Wsl2 is deprecated in favor of Hcs (native Windows containers via the \
+                Host Compute Service). This variant is preserved for one release and \
+                currently aliases to Hcs with a default config at dispatch time."
+    )]
     Wsl2,
+    /// Native Windows container runtime via the Host Compute Service (HCS).
+    ///
+    /// Windows-only. Drives containers directly against the Windows HCS API
+    /// (see [`crate::runtimes::hcs`]) without requiring Docker Desktop or a
+    /// WSL2 VM.
+    #[cfg(target_os = "windows")]
+    Hcs(crate::runtimes::hcs::HcsConfig),
 }
 
 /// Check if Docker daemon is available and responsive
@@ -264,10 +283,21 @@ pub async fn create_runtime(
         #[cfg(target_os = "macos")]
         RuntimeConfig::MacVm => Ok(Arc::new(runtimes::macos_vm::VmRuntime::new(auth_ctx)?)),
         #[cfg(target_os = "windows")]
-        RuntimeConfig::Wsl2 => Err(AgentError::Configuration(
-            "WSL2 runtime is not yet implemented. Use Docker Desktop with WSL2 backend."
-                .to_string(),
-        )),
+        #[allow(deprecated)]
+        RuntimeConfig::Wsl2 => {
+            tracing::warn!(
+                "RuntimeConfig::Wsl2 is deprecated; treating as RuntimeConfig::Hcs with default config"
+            );
+            let runtime =
+                crate::runtimes::hcs::HcsRuntime::new(crate::runtimes::hcs::HcsConfig::default())
+                    .await?;
+            Ok(Arc::new(runtime))
+        }
+        #[cfg(target_os = "windows")]
+        RuntimeConfig::Hcs(hcs_config) => {
+            let runtime = crate::runtimes::hcs::HcsRuntime::new(hcs_config).await?;
+            Ok(Arc::new(runtime))
+        }
     }
 }
 
@@ -327,10 +357,20 @@ async fn create_auto_runtime(
         }
     }
 
-    // On Windows, log that we are using Docker via WSL2/Docker Desktop
+    // On Windows, try the native HCS runtime first, then fall back to Docker.
     #[cfg(target_os = "windows")]
     {
-        tracing::info!("Windows detected -- will use Docker Desktop (WSL2 backend)");
+        match crate::runtimes::hcs::HcsRuntime::new(crate::runtimes::hcs::HcsConfig::default())
+            .await
+        {
+            Ok(rt) => {
+                tracing::info!(
+                    "Using native Windows HCS runtime (no Docker Desktop / WSL2 required)"
+                );
+                return Ok(Arc::new(rt));
+            }
+            Err(e) => tracing::warn!(error = %e, "HCS runtime unavailable, falling back to Docker"),
+        }
     }
 
     // On non-Linux or if libcontainer failed, try Docker

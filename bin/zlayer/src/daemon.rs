@@ -700,6 +700,8 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                             disk_total: sys_res.disk_total,
                             gpus: vec![],
                             mode: "full".to_string(),
+                            os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
+                            arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
                         })
                         .await
                     {

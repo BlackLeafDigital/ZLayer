@@ -286,6 +286,18 @@ pub struct NodeState {
     pub resources: NodeResources,
     /// Whether the node is healthy and available for placement
     pub healthy: bool,
+    /// Operating system reported by the agent on this node.
+    ///
+    /// `None` means this is a legacy agent that predates os/arch reporting.
+    /// Platform-constrained services treat legacy nodes as wildcard matches
+    /// so a rolling upgrade doesn't render old agents unschedulable.
+    pub os: Option<zlayer_spec::OsKind>,
+    /// CPU architecture reported by the agent on this node.
+    ///
+    /// `None` means this is a legacy agent that predates os/arch reporting.
+    /// Platform-constrained services treat legacy nodes as wildcard matches
+    /// so a rolling upgrade doesn't render old agents unschedulable.
+    pub arch: Option<zlayer_spec::ArchKind>,
 }
 
 impl NodeState {
@@ -297,6 +309,8 @@ impl NodeState {
             labels: HashMap::new(),
             resources: NodeResources::default(),
             healthy: true,
+            os: None,
+            arch: None,
         }
     }
 
@@ -512,6 +526,28 @@ pub fn can_place_on_node(
         return false;
     }
 
+    // Platform filter: if the service targets a specific platform, skip nodes
+    // whose platform doesn't match. Nodes reporting `None` for os OR arch are
+    // legacy registrations -- skip the check entirely for those (wildcard match)
+    // so a rolling upgrade doesn't suddenly render old agents unschedulable.
+    if let Some(spec) = service_spec {
+        if let Some(target) = spec.platform.as_ref() {
+            if let (Some(node_os), Some(node_arch)) = (node.os, node.arch) {
+                if node_os != target.os || node_arch != target.arch {
+                    debug!(
+                        node = %node.id,
+                        required = %target,
+                        node_os = ?node_os,
+                        node_arch = ?node_arch,
+                        "Node rejected: platform mismatch"
+                    );
+                    return false;
+                }
+            }
+            // Legacy node (os or arch is None) -- treat as wildcard match.
+        }
+    }
+
     // Check node selector labels if provided
     if let Some(selector) = node_selector {
         if !node.matches_required_labels(selector) {
@@ -597,6 +633,34 @@ pub fn can_place_on_node(
     }
 }
 
+/// Build a human-readable reason string when no node could accept a replica.
+///
+/// If the service targets a specific platform AND no cluster node reports a
+/// matching `(os, arch)` pair, the reason highlights the platform mismatch so
+/// operators can see why placement stayed pending. Otherwise a generic reason
+/// mentioning the node mode is returned.
+fn no_suitable_node_reason(
+    service_name: &str,
+    service_spec: &ServiceSpec,
+    nodes: &[NodeState],
+) -> String {
+    if let Some(target) = service_spec.platform.as_ref() {
+        let any_match = nodes.iter().any(|n| {
+            matches!(
+                (n.os, n.arch),
+                (Some(os), Some(arch)) if os == target.os && arch == target.arch
+            )
+        });
+        if !any_match {
+            return format!("no agent matches required platform {target}");
+        }
+    }
+    format!(
+        "No node available for service '{}' with mode {:?}",
+        service_name, service_spec.node_mode
+    )
+}
+
 /// Place replicas of a service according to its `node_mode`
 ///
 /// # Arguments
@@ -643,10 +707,7 @@ pub fn place_service_replicas(
                 container_id,
                 node_id: None,
                 reason: PlacementReason::NoSuitableNode {
-                    reason: format!(
-                        "No node available for service '{}' with mode {:?}",
-                        service_name, service_spec.node_mode
-                    ),
+                    reason: no_suitable_node_reason(service_name, service_spec, nodes),
                 },
                 gpu_indices: Vec::new(),
             });
@@ -1023,6 +1084,7 @@ mod tests {
             dns: Vec::new(),
             extra_hosts: Vec::new(),
             restart_policy: None,
+            platform: None,
         }
     }
 
@@ -1342,6 +1404,94 @@ mod tests {
         for node_id in assigned_nodes {
             assert!(node_id == 1 || node_id == 3);
         }
+    }
+
+    /// Build a node with a specific (os, arch) platform reported.
+    fn make_node_with_platform(
+        id: NodeId,
+        os: zlayer_spec::OsKind,
+        arch: zlayer_spec::ArchKind,
+    ) -> NodeState {
+        let mut node = NodeState::new(id, format!("192.168.1.{id}:8000"));
+        node.os = Some(os);
+        node.arch = Some(arch);
+        node
+    }
+
+    #[test]
+    fn service_with_platform_does_not_place_on_mismatched_nodes() {
+        // Service requires windows/amd64; cluster has only linux/amd64 and linux/arm64.
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.platform = Some(zlayer_spec::TargetPlatform::new(
+            zlayer_spec::OsKind::Windows,
+            zlayer_spec::ArchKind::Amd64,
+        ));
+
+        let mut nodes = vec![
+            make_node_with_platform(1, zlayer_spec::OsKind::Linux, zlayer_spec::ArchKind::Amd64),
+            make_node_with_platform(2, zlayer_spec::OsKind::Linux, zlayer_spec::ArchKind::Arm64),
+        ];
+        let mut placements = PlacementState::new();
+
+        let decisions = place_service_replicas("api", &spec, 2, &mut nodes, &mut placements);
+
+        // Every replica should stay pending (no candidate node matches the target).
+        assert_eq!(decisions.len(), 2);
+        for decision in &decisions {
+            assert!(
+                decision.node_id.is_none(),
+                "expected pending replica, got placement on {:?}",
+                decision.node_id
+            );
+            match &decision.reason {
+                PlacementReason::NoSuitableNode { reason } => {
+                    assert!(
+                        reason.contains("platform") && reason.contains("windows/amd64"),
+                        "unexpected reason: {reason}"
+                    );
+                }
+                other => panic!("expected NoSuitableNode, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn service_without_platform_places_on_any_node() {
+        let spec = make_service_spec(NodeMode::Shared, None);
+        let mut nodes = vec![make_node_with_platform(
+            1,
+            zlayer_spec::OsKind::Linux,
+            zlayer_spec::ArchKind::Amd64,
+        )];
+        let mut placements = PlacementState::new();
+
+        let decisions = place_service_replicas("api", &spec, 1, &mut nodes, &mut placements);
+
+        // At least one replica should be placed.
+        assert!(decisions.iter().any(|d| d.node_id.is_some()));
+    }
+
+    #[test]
+    fn service_with_platform_places_on_legacy_node_without_platform() {
+        // Regression: a freshly-upgraded scheduler shouldn't refuse to place
+        // on nodes that predate os/arch reporting (os/arch = None).
+        let mut spec = make_service_spec(NodeMode::Shared, None);
+        spec.platform = Some(zlayer_spec::TargetPlatform::new(
+            zlayer_spec::OsKind::Linux,
+            zlayer_spec::ArchKind::Amd64,
+        ));
+
+        let mut legacy =
+            make_node_with_platform(1, zlayer_spec::OsKind::Linux, zlayer_spec::ArchKind::Amd64);
+        legacy.os = None;
+        legacy.arch = None;
+
+        let mut nodes = vec![legacy];
+        let mut placements = PlacementState::new();
+
+        let decisions = place_service_replicas("api", &spec, 1, &mut nodes, &mut placements);
+
+        assert!(decisions.iter().any(|d| d.node_id.is_some()));
     }
 
     #[test]

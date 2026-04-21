@@ -55,6 +55,13 @@ pub struct ClusterJoinRequest {
     /// Detected GPUs
     #[serde(default)]
     pub gpus: Vec<zlayer_scheduler::raft::GpuInfoSummary>,
+    /// Operating system of the joining agent. `None` = legacy client that did
+    /// not report platform info.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<zlayer_spec::OsKind>,
+    /// CPU architecture of the joining agent. Same legacy semantics as `os`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<zlayer_spec::ArchKind>,
 }
 
 fn default_mode() -> String {
@@ -321,6 +328,8 @@ pub async fn cluster_join(
             disk_total: req.disk_total,
             gpus: req.gpus.clone(),
             mode: req.mode.clone(),
+            os: req.os,
+            arch: req.arch,
         })
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to add member to Raft: {e}")))?;

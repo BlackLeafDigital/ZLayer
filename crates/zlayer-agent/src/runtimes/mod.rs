@@ -128,6 +128,15 @@ pub mod macos_sandbox;
 #[cfg(target_os = "macos")]
 pub mod macos_vm;
 
+// HCS-backed native Windows container runtime. Compiled only on Windows
+// because it depends on the `zlayer-hcs` crate and the `crate::windows`
+// submodule, both of which are Windows-only.
+#[cfg(target_os = "windows")]
+pub mod hcs;
+
+#[cfg(target_os = "windows")]
+pub use hcs::{HcsConfig, HcsRuntime, IsolationMode};
+
 #[cfg(all(target_os = "linux", feature = "youki-runtime"))]
 pub use youki::{YoukiConfig, YoukiRuntime};
 

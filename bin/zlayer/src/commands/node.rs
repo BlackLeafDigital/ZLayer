@@ -68,6 +68,12 @@ struct NodeJoinRequest {
     mode: String,
     /// Services to replicate (if mode is replicate)
     services: Option<Vec<String>>,
+    /// Operating system of the joining agent (detected via `std::env::consts::OS`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    os: Option<zlayer_spec::OsKind>,
+    /// CPU architecture of the joining agent (detected via `std::env::consts::ARCH`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    arch: Option<zlayer_spec::ArchKind>,
 }
 
 /// Join response from the leader
@@ -429,6 +435,8 @@ pub(crate) async fn handle_node_init(
         disk_total: 0,
         gpus: vec![],
         mode: "full".to_string(),
+        os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
+        arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
     })
     .await
     .context("Failed to register leader in Raft state")?;
@@ -541,6 +549,8 @@ pub(crate) async fn handle_node_join(
         wg_public_key: public_key.clone(),
         mode: mode.clone(),
         services: services.clone(),
+        os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
+        arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
     };
 
     let response = client

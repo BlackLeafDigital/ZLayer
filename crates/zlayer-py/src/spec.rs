@@ -207,6 +207,18 @@ impl ServiceSpec {
         self.inner.schedule.clone()
     }
 
+    /// Target platform as an `(os, arch)` tuple of OCI-style lowercase strings,
+    /// or `None` if this service runs on any platform.
+    #[getter]
+    fn platform(&self) -> Option<(String, String)> {
+        self.inner.platform.as_ref().map(|p| {
+            (
+                p.os.as_oci_str().to_string(),
+                p.arch.as_oci_str().to_string(),
+            )
+        })
+    }
+
     /// Convert to a dict representation
     fn to_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let dict = PyDict::new(py);
@@ -515,19 +527,57 @@ impl HealthSpec {
     }
 }
 
+/// Parse a `(os, arch)` string tuple into a `TargetPlatform`.
+///
+/// `os` accepts the Rust-style names (`linux`, `windows`, `macos`) consistent with
+/// `std::env::consts::OS`. `arch` accepts the OCI-style names (`amd64`, `arm64`).
+fn parse_target_platform(os_s: &str, arch_s: &str) -> PyResult<zlayer_spec::TargetPlatform> {
+    let os = match os_s {
+        "linux" => zlayer_spec::OsKind::Linux,
+        "windows" => zlayer_spec::OsKind::Windows,
+        "macos" => zlayer_spec::OsKind::Macos,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown OsKind: {other} (expected linux|windows|macos)"
+            )));
+        }
+    };
+    let arch = match arch_s {
+        "amd64" => zlayer_spec::ArchKind::Amd64,
+        "arm64" => zlayer_spec::ArchKind::Arm64,
+        other => {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "unknown ArchKind: {other} (expected amd64|arm64)"
+            )));
+        }
+    };
+    Ok(zlayer_spec::TargetPlatform::new(os, arch))
+}
+
 /// Create a minimal service spec programmatically
 ///
 /// Args:
 ///     name: The service name
 ///     image: The container image
 ///     port: Optional port to expose
+///     platform: Optional `(os, arch)` tuple of lowercase strings. `os` is one of
+///         `linux`, `windows`, `macos`; `arch` is one of `amd64`, `arm64`. `None`
+///         means "any platform".
 ///
 /// Returns:
 ///     A `ServiceSpec` instance
 #[pyfunction]
-#[pyo3(signature = (name, image, port=None))]
-#[allow(clippy::unnecessary_wraps)]
-pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResult<ServiceSpec> {
+#[pyo3(signature = (name, image, port=None, platform=None))]
+pub fn create_service_spec(
+    name: &str,
+    image: &str,
+    port: Option<u16>,
+    platform: Option<(String, String)>,
+) -> PyResult<ServiceSpec> {
+    let platform = match platform {
+        Some((os_s, arch_s)) => Some(parse_target_platform(&os_s, &arch_s)?),
+        None => None,
+    };
     let mut endpoints = Vec::new();
     if let Some(p) = port {
         endpoints.push(zlayer_spec::EndpointSpec {
@@ -583,6 +633,7 @@ pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResu
         dns: Vec::new(),
         extra_hosts: Vec::new(),
         restart_policy: None,
+        platform,
     };
 
     Ok(ServiceSpec {

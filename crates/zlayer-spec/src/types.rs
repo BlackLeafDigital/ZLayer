@@ -128,6 +128,150 @@ pub struct NodeSelector {
     pub prefer_labels: HashMap<String, String>,
 }
 
+/// Operating system a service needs to run on.
+///
+/// Mirrors the OS half of an OCI platform descriptor. Canonical wire strings
+/// match Go's `GOOS` values (e.g. `"linux"`, `"windows"`, `"darwin"`).
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum OsKind {
+    Linux,
+    Windows,
+    Macos,
+}
+
+impl OsKind {
+    /// Canonical OCI-style string (`"linux"` / `"windows"` / `"darwin"`).
+    /// This is the same convention `Runtime.platform_resolver` uses.
+    #[must_use]
+    pub const fn as_oci_str(self) -> &'static str {
+        match self {
+            OsKind::Linux => "linux",
+            OsKind::Windows => "windows",
+            OsKind::Macos => "darwin",
+        }
+    }
+
+    /// Detect from `std::env::consts::OS`. Unknown values return `None`.
+    #[must_use]
+    pub fn from_rust_os(s: &str) -> Option<Self> {
+        match s {
+            "linux" => Some(Self::Linux),
+            "windows" => Some(Self::Windows),
+            "macos" => Some(Self::Macos),
+            _ => None,
+        }
+    }
+}
+
+/// CPU architecture a service needs. Mirrors the arch half of an OCI platform.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchKind {
+    Amd64,
+    Arm64,
+}
+
+impl ArchKind {
+    /// Canonical OCI-style string (`"amd64"` / `"arm64"`).
+    #[must_use]
+    pub const fn as_oci_str(self) -> &'static str {
+        match self {
+            ArchKind::Amd64 => "amd64",
+            ArchKind::Arm64 => "arm64",
+        }
+    }
+
+    /// Detect from `std::env::consts::ARCH`. Unknown values return `None`.
+    #[must_use]
+    pub fn from_rust_arch(s: &str) -> Option<Self> {
+        match s {
+            "x86_64" => Some(Self::Amd64),
+            "aarch64" => Some(Self::Arm64),
+            _ => None,
+        }
+    }
+}
+
+/// Platform a service targets. `None` on `ServiceSpec.platform` means
+/// "any agent is acceptable" (preserves backward compatibility).
+//
+// NOTE: no `Copy`. `os_version: Option<String>` rules it out. `OsKind` / `ArchKind`
+// are still `Copy`, so field-level borrows stay ergonomic.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+pub struct TargetPlatform {
+    pub os: OsKind,
+    pub arch: ArchKind,
+    /// Optional OS version constraint — primarily for Windows multi-platform
+    /// images, where `platform.os.version` in the OCI index distinguishes build
+    /// families (e.g. `10.0.26100.*` for Server 2025 / Win11 24H2,
+    /// `10.0.20348.*` for Server 2022). When set on a Windows target the
+    /// registry platform resolver prefers manifest entries whose `os.version`
+    /// matches this value exactly or shares a `major.minor.build` prefix.
+    /// Unused on Linux/macOS platforms.
+    #[serde(default, rename = "osVersion", skip_serializing_if = "Option::is_none")]
+    pub os_version: Option<String>,
+}
+
+impl TargetPlatform {
+    #[must_use]
+    pub const fn new(os: OsKind, arch: ArchKind) -> Self {
+        Self {
+            os,
+            arch,
+            os_version: None,
+        }
+    }
+
+    /// Constrain the platform to a specific `os.version` string.
+    ///
+    /// Applies to Windows targets: the registry resolver matches manifest
+    /// entries whose `platform.os.version` equals this value or starts with it
+    /// (treated as a `major.minor.build` prefix). Has no effect on Linux/macOS.
+    #[must_use]
+    pub fn with_os_version(mut self, v: impl Into<String>) -> Self {
+        self.os_version = Some(v.into());
+        self
+    }
+
+    /// Canonical OCI-style string (`"linux/amd64"`, `"windows/arm64"`).
+    ///
+    /// Does NOT include `os_version` — use [`Self::as_detailed_str`] when the
+    /// version matters (e.g. for error/log messages that need to distinguish
+    /// between Windows build families).
+    #[must_use]
+    pub fn as_oci_str(self) -> String {
+        format!("{}/{}", self.os.as_oci_str(), self.arch.as_oci_str())
+    }
+
+    /// Like [`Self::as_oci_str`] but appends ` (os.version=…)` when an
+    /// `os_version` constraint is set. Intended for diagnostics, not for
+    /// matching against manifest entries.
+    #[must_use]
+    pub fn as_detailed_str(&self) -> String {
+        match &self.os_version {
+            Some(v) => format!(
+                "{}/{} (os.version={v})",
+                self.os.as_oci_str(),
+                self.arch.as_oci_str()
+            ),
+            None => format!("{}/{}", self.os.as_oci_str(), self.arch.as_oci_str()),
+        }
+    }
+}
+
+impl std::fmt::Display for TargetPlatform {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.os.as_oci_str(), self.arch.as_oci_str())
+    }
+}
+
 /// Explicit capability declarations for WASM modules.
 /// Controls which host interfaces are linked and available to the component.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -724,6 +868,12 @@ pub struct ServiceSpec {
     /// Node selection constraints (required/preferred labels)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<NodeSelector>,
+
+    /// Target platform for this service. When `None` (default), the service is
+    /// eligible to run on any agent regardless of OS/architecture. When `Some`,
+    /// the scheduler will only place replicas on agents whose platform matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<TargetPlatform>,
 
     /// Service type (standard, `wasm_http`, `wasm_plugin`, etc.)
     #[serde(default)]
@@ -2882,5 +3032,144 @@ name: bob
         let json = r#"{"username":"oauth2accesstoken","password":"ghp_abc","auth_type":"token"}"#;
         let parsed: RegistryAuth = serde_json::from_str(json).expect("parse");
         assert_eq!(parsed.auth_type, RegistryAuthType::Token);
+    }
+
+    #[test]
+    fn target_platform_as_oci_str() {
+        assert_eq!(
+            TargetPlatform::new(OsKind::Linux, ArchKind::Amd64).as_oci_str(),
+            "linux/amd64"
+        );
+        assert_eq!(
+            TargetPlatform::new(OsKind::Windows, ArchKind::Arm64).as_oci_str(),
+            "windows/arm64"
+        );
+        assert_eq!(
+            TargetPlatform::new(OsKind::Macos, ArchKind::Arm64).as_oci_str(),
+            "darwin/arm64"
+        );
+    }
+
+    #[test]
+    fn os_kind_from_rust_consts() {
+        assert_eq!(OsKind::from_rust_os("linux"), Some(OsKind::Linux));
+        assert_eq!(OsKind::from_rust_os("windows"), Some(OsKind::Windows));
+        assert_eq!(OsKind::from_rust_os("macos"), Some(OsKind::Macos));
+        assert_eq!(OsKind::from_rust_os("freebsd"), None);
+    }
+
+    #[test]
+    fn arch_kind_from_rust_consts() {
+        assert_eq!(ArchKind::from_rust_arch("x86_64"), Some(ArchKind::Amd64));
+        assert_eq!(ArchKind::from_rust_arch("aarch64"), Some(ArchKind::Arm64));
+        assert_eq!(ArchKind::from_rust_arch("riscv64"), None);
+    }
+
+    #[test]
+    fn service_spec_platform_yaml_round_trip_none() {
+        // Omitting `platform` from YAML should deserialize as None without error,
+        // even though ServiceSpec has `#[serde(deny_unknown_fields)]`.
+        let yaml = r"
+version: v1
+deployment: test
+services:
+  app:
+    rtype: service
+    image:
+      name: nginx:latest
+";
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).expect("yaml parse");
+        assert!(spec.services["app"].platform.is_none());
+    }
+
+    #[test]
+    fn service_spec_platform_yaml_round_trip_some() {
+        let yaml = r"
+version: v1
+deployment: test
+services:
+  app:
+    rtype: service
+    image:
+      name: nginx:latest
+    platform:
+      os: windows
+      arch: amd64
+";
+        let spec: DeploymentSpec = serde_yaml::from_str(yaml).expect("yaml parse");
+        assert_eq!(
+            spec.services["app"].platform,
+            Some(TargetPlatform::new(OsKind::Windows, ArchKind::Amd64))
+        );
+    }
+
+    #[test]
+    fn service_spec_platform_serializes_omitted_when_none() {
+        // Build a minimal ServiceSpec via YAML to avoid enumerating every field
+        // (ServiceSpec has no Default impl and no named-struct helper).
+        let yaml = r"
+version: v1
+deployment: test
+services:
+  app:
+    rtype: service
+    image:
+      name: nginx:latest
+";
+        let mut spec: DeploymentSpec = serde_yaml::from_str(yaml).expect("yaml parse");
+        let service = spec.services.get_mut("app").expect("service present");
+        service.platform = None;
+        let rendered = serde_yaml::to_string(service).expect("render");
+        assert!(
+            !rendered.contains("platform"),
+            "platform must be omitted when None: {rendered}"
+        );
+    }
+
+    #[test]
+    fn target_platform_os_version_builder() {
+        let p =
+            TargetPlatform::new(OsKind::Windows, ArchKind::Amd64).with_os_version("10.0.26100.1");
+        assert_eq!(p.os_version.as_deref(), Some("10.0.26100.1"));
+        assert_eq!(p.os, OsKind::Windows);
+        assert_eq!(p.arch, ArchKind::Amd64);
+    }
+
+    #[test]
+    fn target_platform_os_version_yaml_roundtrip() {
+        let yaml = "os: windows\narch: amd64\nosVersion: 10.0.26100.1\n";
+        let p: TargetPlatform = serde_yaml::from_str(yaml).expect("yaml parse");
+        assert_eq!(p.os_version.as_deref(), Some("10.0.26100.1"));
+        assert_eq!(p.os, OsKind::Windows);
+        assert_eq!(p.arch, ArchKind::Amd64);
+    }
+
+    #[test]
+    fn target_platform_os_version_yaml_omits_when_none() {
+        let p = TargetPlatform::new(OsKind::Linux, ArchKind::Amd64);
+        let rendered = serde_yaml::to_string(&p).expect("render");
+        assert!(
+            !rendered.contains("osVersion"),
+            "osVersion must be omitted when None: {rendered}"
+        );
+    }
+
+    #[test]
+    fn target_platform_as_detailed_str_includes_version() {
+        let without = TargetPlatform::new(OsKind::Windows, ArchKind::Amd64).as_detailed_str();
+        assert_eq!(without, "windows/amd64");
+
+        let with = TargetPlatform::new(OsKind::Windows, ArchKind::Amd64)
+            .with_os_version("10.0.26100.1")
+            .as_detailed_str();
+        assert_eq!(with, "windows/amd64 (os.version=10.0.26100.1)");
+    }
+
+    #[test]
+    fn target_platform_display_ignores_version() {
+        // Display deliberately stays terse so existing log lines don't change.
+        let p =
+            TargetPlatform::new(OsKind::Windows, ArchKind::Amd64).with_os_version("10.0.26100.1");
+        assert_eq!(format!("{p}"), "windows/amd64");
     }
 }

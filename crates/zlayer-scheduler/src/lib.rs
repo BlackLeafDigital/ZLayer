@@ -403,6 +403,8 @@ impl Scheduler {
                     labels: std::collections::HashMap::new(),
                     resources,
                     healthy: true,
+                    os: n.os,
+                    arch: n.arch,
                 }
             })
             .collect()
@@ -462,6 +464,7 @@ impl Scheduler {
             dns: Vec::new(),
             extra_hosts: Vec::new(),
             restart_policy: None,
+            platform: None,
         };
 
         let effective_spec = spec.unwrap_or(&default_spec);

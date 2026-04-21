@@ -18,6 +18,7 @@ aws-sdk-s3 = { version = "1.96.0", optional = true }
 flate2 = "1.1.8"
 hex.workspace = true
 oci-client.workspace = true
+reqwest.workspace = true
 serde = { workspace = true }
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"], optional = true }
 serde_json.workspace = true
@@ -28,6 +29,7 @@ tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 zstd = "0.13.3"
 zlayer-paths.workspace = true
+zlayer-spec.workspace = true
 
 [dev-dependencies]
 serial_test = "3"

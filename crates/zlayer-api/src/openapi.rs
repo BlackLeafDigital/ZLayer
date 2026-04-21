@@ -616,6 +616,10 @@ impl Modify for SecurityAddon {
             zlayer_spec::BridgeNetwork,
             zlayer_spec::BridgeNetworkDriver,
             zlayer_spec::BridgeNetworkAttachment,
+            // Target platform (multi-arch scheduling)
+            zlayer_spec::TargetPlatform,
+            zlayer_spec::OsKind,
+            zlayer_spec::ArchKind,
             // Container restart policy (§3.4)
             zlayer_spec::ContainerRestartPolicy,
             zlayer_spec::ContainerRestartKind,

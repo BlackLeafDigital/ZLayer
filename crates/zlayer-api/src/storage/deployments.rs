@@ -297,6 +297,7 @@ mod tests {
                 privileged: false,
                 node_mode: zlayer_spec::NodeMode::default(),
                 node_selector: None,
+                platform: None,
                 service_type: zlayer_spec::ServiceType::default(),
                 wasm: None,
                 logs: None,
