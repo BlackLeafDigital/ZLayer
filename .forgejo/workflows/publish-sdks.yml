@@ -40,6 +40,16 @@ jobs:
           config-path: .forgejo/build-config.yaml
           check-registry: 'true'
           version: ${{ inputs.version }}
+      - name: Purge stale ci-status markers
+        if: steps.detect.outputs.services-to-release-flat != '[]'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: purge-version
+          version: ${{ inputs.version }}
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          keep-markers: ''
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # zlayer-py (Python binding) -> PyPI as `zlayer`

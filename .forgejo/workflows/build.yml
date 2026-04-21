@@ -55,6 +55,16 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "All artifacts already exist for version **${{ inputs.version }}**." >> $GITHUB_STEP_SUMMARY
           echo "Use \`force: true\` to rebuild." >> $GITHUB_STEP_SUMMARY
+      - name: Purge stale ci-status markers
+        if: steps.check.outputs.need_build == 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: purge-version
+          version: ${{ inputs.version }}
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          keep-markers: ''
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # Wave 1: Linux amd64 + macOS arm64 (2 parallel)
