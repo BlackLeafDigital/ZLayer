@@ -68,6 +68,8 @@ jsonwebtoken.workspace = true
 
 # Streaming utilities (needed for Docker streaming)
 futures-util.workspace = true
+# ReceiverStream wrapper for exec_stream (bollard output -> mpsc -> Stream).
+tokio-stream.workspace = true
 
 # Docker runtime support (optional)
 # Features:

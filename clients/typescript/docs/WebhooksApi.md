@@ -24,11 +24,11 @@ Returns the webhook URL pattern and the HMAC secret. Generates the secret on fir
 import {
   Configuration,
   WebhooksApi,
-} from '@zlayer/client';
-import type { GetWebhookInfoRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetWebhookInfoRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -96,11 +96,11 @@ This endpoint is **unauthenticated** -- it relies on HMAC signature verification
 import {
   Configuration,
   WebhooksApi,
-} from '@zlayer/client';
-import type { ReceiveWebhookRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ReceiveWebhookRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new WebhooksApi();
 
   const body = {
@@ -173,11 +173,11 @@ Admin only.  # Errors  Returns [&#x60;ApiError::Forbidden&#x60;] for non-admins,
 import {
   Configuration,
   WebhooksApi,
-} from '@zlayer/client';
-import type { RotateWebhookSecretRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { RotateWebhookSecretRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

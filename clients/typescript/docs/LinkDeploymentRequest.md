@@ -12,7 +12,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { LinkDeploymentRequest } from '@zlayer/client'
+import type { LinkDeploymentRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

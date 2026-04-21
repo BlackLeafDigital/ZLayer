@@ -21,11 +21,11 @@ Liveness probe - basic health check
 import {
   Configuration,
   HealthApi,
-} from '@zlayer/client';
-import type { LivenessRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { LivenessRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new HealthApi();
 
   try {
@@ -78,11 +78,11 @@ Readiness probe - full health check
 import {
   Configuration,
   HealthApi,
-} from '@zlayer/client';
-import type { ReadinessRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ReadinessRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new HealthApi();
 
   try {

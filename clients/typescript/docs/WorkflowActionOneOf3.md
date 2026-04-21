@@ -13,7 +13,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { WorkflowActionOneOf3 } from '@zlayer/client'
+import type { WorkflowActionOneOf3 } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

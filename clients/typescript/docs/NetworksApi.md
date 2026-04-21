@@ -26,11 +26,11 @@ The network name must be unique. Returns the created spec.  # Errors  Returns an
 import {
   Configuration,
   NetworksApi,
-} from '@zlayer/client';
-import type { CreateNetworkRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateNetworkRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -101,11 +101,11 @@ Permanently removes a network definition.  # Errors  Returns an error if the net
 import {
   Configuration,
   NetworksApi,
-} from '@zlayer/client';
-import type { DeleteNetworkRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteNetworkRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -175,11 +175,11 @@ Returns the full &#x60;NetworkPolicySpec&#x60; for the named network.  # Errors 
 import {
   Configuration,
   NetworksApi,
-} from '@zlayer/client';
-import type { GetNetworkRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetNetworkRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -248,11 +248,11 @@ Returns a summary of every network defined in the system.  # Errors  Returns an 
 import {
   Configuration,
   NetworksApi,
-} from '@zlayer/client';
-import type { ListNetworksRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListNetworksRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -312,11 +312,11 @@ Replaces the network definition for the given name. The name in the URL must mat
 import {
   Configuration,
   NetworksApi,
-} from '@zlayer/client';
-import type { UpdateNetworkRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { UpdateNetworkRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

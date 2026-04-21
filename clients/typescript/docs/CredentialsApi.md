@@ -27,11 +27,11 @@ Create a new git credential. Admin only.
 import {
   Configuration,
   CredentialsApi,
-} from '@zlayer/client';
-import type { CreateGitCredentialOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateGitCredentialOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -100,11 +100,11 @@ Create a new registry credential. Admin only.
 import {
   Configuration,
   CredentialsApi,
-} from '@zlayer/client';
-import type { CreateRegistryCredentialOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateRegistryCredentialOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -173,11 +173,11 @@ Delete a git credential. Admin only.
 import {
   Configuration,
   CredentialsApi,
-} from '@zlayer/client';
-import type { DeleteGitCredentialRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteGitCredentialRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -246,11 +246,11 @@ Delete a registry credential. Admin only.
 import {
   Configuration,
   CredentialsApi,
-} from '@zlayer/client';
-import type { DeleteRegistryCredentialRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteRegistryCredentialRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -319,11 +319,11 @@ List all git credentials (metadata only, no secret values).
 import {
   Configuration,
   CredentialsApi,
-} from '@zlayer/client';
-import type { ListGitCredentialsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListGitCredentialsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -383,11 +383,11 @@ List all registry credentials (metadata only, no passwords).
 import {
   Configuration,
   CredentialsApi,
-} from '@zlayer/client';
-import type { ListRegistryCredentialsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListRegistryCredentialsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

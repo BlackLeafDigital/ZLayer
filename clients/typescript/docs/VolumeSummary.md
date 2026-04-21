@@ -1,7 +1,7 @@
 
 # VolumeSummary
 
-Summary of a single volume returned by the list endpoint.
+Legacy response shape kept for backwards compatibility with older SDK consumers that deserialize strictly. New consumers should use [`VolumeInfo`]. `list_volumes` now returns [`VolumeInfo`] which is a strict superset of the fields in `VolumeSummary`.
 
 ## Properties
 
@@ -14,7 +14,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { VolumeSummary } from '@zlayer/client'
+import type { VolumeSummary } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

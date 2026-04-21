@@ -16,7 +16,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { SecretMetadataResponse } from '@zlayer/client'
+import type { SecretMetadataResponse } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

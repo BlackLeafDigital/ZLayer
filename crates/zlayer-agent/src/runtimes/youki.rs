@@ -20,7 +20,7 @@ use tokio::fs;
 use tokio::sync::RwLock;
 use tracing::instrument;
 use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
-use zlayer_spec::ServiceSpec;
+use zlayer_spec::{RegistryAuth, ServiceSpec};
 
 /// Configuration for `YoukiRuntime`
 #[derive(Debug, Clone)]
@@ -680,7 +680,7 @@ impl Runtime for YoukiRuntime {
         )
     )]
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent)
+        self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent, None)
             .await
     }
 
@@ -688,8 +688,13 @@ impl Runtime for YoukiRuntime {
     ///
     /// This downloads image layers to the blob cache. Layers are extracted
     /// per-container in `create_container` to avoid race conditions.
+    ///
+    /// The `_auth` parameter is accepted for trait conformance (§3.10) but
+    /// currently ignored: `zlayer-registry` resolves credentials through the
+    /// existing `AuthResolver` (hostname lookup in the persistent secret
+    /// store). Callers that need inline auth should use the Docker runtime.
     #[instrument(
-        skip(self),
+        skip(self, _auth),
         fields(
             otel.name = "image.pull",
             container.image.name = %image,
@@ -700,6 +705,7 @@ impl Runtime for YoukiRuntime {
         &self,
         image: &str,
         policy: zlayer_spec::PullPolicy,
+        _auth: Option<&RegistryAuth>,
     ) -> Result<()> {
         let puller = {
             let p = zlayer_registry::ImagePuller::with_cache(self.blob_cache.clone());

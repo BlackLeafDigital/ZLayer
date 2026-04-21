@@ -11943,6 +11943,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-stream",
  "tracing",
  "ulid",
  "uuid",
@@ -11972,6 +11973,7 @@ dependencies = [
  "axum",
  "axum-extra",
  "base64 0.22.1",
+ "bollard",
  "chrono",
  "dashmap",
  "flate2",
@@ -11979,8 +11981,10 @@ dependencies = [
  "governor",
  "hex",
  "hmac",
+ "humantime",
  "hyper 1.8.1",
  "hyper-util",
+ "ipnetwork",
  "jsonwebtoken",
  "lettre",
  "oauth2",
@@ -12392,6 +12396,7 @@ dependencies = [
 name = "zlayer-spec"
 version = "0.0.0-dev"
 dependencies = [
+ "chrono",
  "cron",
  "humantime",
  "regex",
@@ -12399,6 +12404,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.18",
+ "utoipa",
  "validator",
 ]
 

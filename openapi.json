@@ -498,6 +498,294 @@
         ]
       }
     },
+    "/api/v1/container-networks": {
+      "get": {
+        "tags": [
+          "ContainerNetworks"
+        ],
+        "summary": "List all bridge networks, optionally filtered by label.",
+        "description": "# Errors\n\n[`ApiError::BadRequest`] when the `label` query param is not in\n`key=value` form.",
+        "operationId": "list_container_networks",
+        "parameters": [
+          {
+            "name": "label",
+            "in": "query",
+            "description": "Optional label filter in `key=value` form. Only networks whose\nlabels contain a matching pair are returned.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "List of bridge networks",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BridgeNetwork"
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid label filter"
+          },
+          "401": {
+            "description": "Unauthorized"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "ContainerNetworks"
+        ],
+        "summary": "Create a new bridge or overlay network.",
+        "description": "# Errors\n\n- [`ApiError::BadRequest`] if the network name or subnet is malformed.\n- [`ApiError::Conflict`] if a network with the same name already exists.\n- [`ApiError::Forbidden`] / [`ApiError::Unauthorized`] from the auth layer.",
+        "operationId": "create_container_network",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBridgeNetworkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Network created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BridgeNetwork"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "409": {
+            "description": "Network with that name already exists"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/container-networks/{id_or_name}": {
+      "get": {
+        "tags": [
+          "ContainerNetworks"
+        ],
+        "summary": "Inspect a single bridge network by id or by name.",
+        "description": "# Errors\n\n[`ApiError::NotFound`] when no network matches `id_or_name`.",
+        "operationId": "get_container_network",
+        "parameters": [
+          {
+            "name": "id_or_name",
+            "in": "path",
+            "description": "Network id or name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Network details",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BridgeNetworkDetails"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Network not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "ContainerNetworks"
+        ],
+        "summary": "Delete a bridge network. Refuses if the network still has attachments\nunless `?force=true` is set.",
+        "description": "# Errors\n\n- [`ApiError::NotFound`] when no network matches `id_or_name`.\n- [`ApiError::Conflict`] when the network still has attachments and\n  `force` is false.\n- Auth errors propagated from the `operator` role check.",
+        "operationId": "delete_container_network",
+        "parameters": [
+          {
+            "name": "id_or_name",
+            "in": "path",
+            "description": "Network id or name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "force",
+            "in": "query",
+            "description": "If true, delete even if the network still has attachments.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Network deleted"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Network not found"
+          },
+          "409": {
+            "description": "Network still has attachments (use ?force=true)"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/container-networks/{id_or_name}/connect": {
+      "post": {
+        "tags": [
+          "ContainerNetworks"
+        ],
+        "summary": "Attach a container to a network.",
+        "description": "# Errors\n\n- [`ApiError::BadRequest`] for an empty `container_id` or invalid\n  `ipv4_address`.\n- [`ApiError::NotFound`] when no network matches `id_or_name`.",
+        "operationId": "connect_container_network",
+        "parameters": [
+          {
+            "name": "id_or_name",
+            "in": "path",
+            "description": "Network id or name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ConnectBridgeNetworkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Container connected"
+          },
+          "400": {
+            "description": "Invalid request (e.g. bad ipv4_address)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Network not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/container-networks/{id_or_name}/disconnect": {
+      "post": {
+        "tags": [
+          "ContainerNetworks"
+        ],
+        "summary": "Detach a container from a network.",
+        "description": "# Errors\n\n- [`ApiError::BadRequest`] when `container_id` is empty.\n- [`ApiError::NotFound`] when the network or the container-on-network\n  pair is not known (unless `force` was passed).",
+        "operationId": "disconnect_container_network",
+        "parameters": [
+          {
+            "name": "id_or_name",
+            "in": "path",
+            "description": "Network id or name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DisconnectBridgeNetworkRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Container disconnected"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Network or container not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/containers": {
       "get": {
         "tags": [
@@ -680,7 +968,7 @@
           "Containers"
         ],
         "summary": "Execute a command in a running container.",
-        "description": "# Errors\n\nReturns an error if the container is not found, the command is invalid,\nexecution fails, or the user lacks the operator role.",
+        "description": "When `stream=true` is passed as a query parameter, this endpoint upgrades\nto a Server-Sent Events stream emitting:\n- `event: stdout\\ndata: <line>\\n\\n` for each stdout line\n- `event: stderr\\ndata: <line>\\n\\n` for each stderr line\n- `event: exit\\ndata: {\"exit_code\": N}\\n\\n` as the final event\n\n# Errors\n\nReturns an error if the container is not found, the command is invalid,\nexecution fails, or the user lacks the operator role.",
         "operationId": "exec_in_container",
         "parameters": [
           {
@@ -690,6 +978,15 @@
             "required": true,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "name": "stream",
+            "in": "query",
+            "description": "Stream exec events as SSE instead of returning a buffered JSON body.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
             }
           }
         ],
@@ -705,7 +1002,7 @@
         },
         "responses": {
           "200": {
-            "description": "Command executed",
+            "description": "Command executed (JSON body when stream=false, SSE stream when stream=true)",
             "content": {
               "application/json": {
                 "schema": {
@@ -958,7 +1255,7 @@
           "Containers"
         ],
         "summary": "Get container resource statistics.",
-        "description": "Returns CPU and memory usage statistics for the specified container.\n\n# Errors\n\nReturns an error if the container is not found or stats retrieval fails.",
+        "description": "Returns CPU and memory usage statistics for the specified container.\nBy default this is a one-shot JSON response. When the query string\ncontains `stream=true`, the handler switches to Server-Sent Events and\nemits one `ContainerStatsResponse` sample every `interval` seconds\n(default 2, clamped to `[1, 60]`). The stream ends with a final\n`event: close` when the container exits or the runtime reports an\nunrecoverable error.\n\n# Errors\n\nReturns an error if the container is not found or stats retrieval fails.",
         "operationId": "get_container_stats",
         "parameters": [
           {
@@ -969,11 +1266,34 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "stream",
+            "in": "query",
+            "description": "Stream periodic samples as SSE events instead of a one-shot JSON\nresponse.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "interval",
+            "in": "query",
+            "description": "Sample cadence in seconds (only used when `stream=true`). Clamped to\n`[1, 60]`. Defaults to `2` seconds.",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int32",
+              "minimum": 0
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Container statistics",
+            "description": "Container statistics (JSON one-shot or SSE stream)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2144,6 +2464,55 @@
           },
           "409": {
             "description": "Name collides with another environment"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/events": {
+      "get": {
+        "tags": [
+          "Events"
+        ],
+        "summary": "Stream container lifecycle events as Server-Sent Events.",
+        "description": "# Errors\n\nReturns `400` if a `label` query parameter is malformed, `401` if the\ncaller is not authenticated.",
+        "operationId": "stream_events",
+        "parameters": [
+          {
+            "name": "follow",
+            "in": "query",
+            "description": "Follow the event stream. Default: `true`. Reserved for parity with\nDocker-compat tooling; this endpoint is always streaming.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "label",
+            "in": "query",
+            "description": "Label filter in `k=v` form. Repeatable. An event passes only if all\nfilters match (AND semantics).",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "SSE stream of container lifecycle events"
+          },
+          "400": {
+            "description": "Invalid label filter"
+          },
+          "401": {
+            "description": "Unauthorized"
           }
         },
         "security": [
@@ -3692,6 +4061,54 @@
         }
       }
     },
+    "/api/v1/permissions/by-resource": {
+      "get": {
+        "tags": [
+          "Permissions"
+        ],
+        "summary": "List permissions granted on a specific resource.",
+        "description": "When `id` is supplied, returns exact-resource grants; when omitted, returns\nwildcard grants for the given `kind`.\n\n# Errors\n\nReturns [`ApiError::Internal`] on store failure.",
+        "operationId": "list_permissions_by_resource",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "query",
+            "description": "Resource kind (e.g. `\"environment\"`).",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "query",
+            "description": "Specific resource id. Omit for wildcard grants only.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Grants on the resource",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/StoredPermission"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/permissions/{id}": {
       "delete": {
         "tags": [
@@ -4512,6 +4929,53 @@
         ]
       }
     },
+    "/api/v1/secrets/reveal-all": {
+      "get": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "Reveal every secret in an environment at once (admin only).",
+        "description": "Used by `zlayer run` to build the child-process env in a single round-trip.\n\n# Errors\n\nReturns `ApiError::Forbidden` if the caller is not admin, `ApiError::NotFound`\nif the environment is unknown, and `ApiError::Internal` for storage failures.",
+        "operationId": "reveal_all_secrets",
+        "parameters": [
+          {
+            "name": "environment",
+            "in": "query",
+            "description": "Environment id (required)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every secret revealed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RevealAllSecretsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Admin required"
+          },
+          "404": {
+            "description": "Environment not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/secrets/{name}": {
       "get": {
         "tags": [
@@ -4633,6 +5097,84 @@
           },
           "404": {
             "description": "Secret not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/secrets/{name}/rotate": {
+      "post": {
+        "tags": [
+          "Secrets"
+        ],
+        "summary": "Rotate a secret — overwrite with a new value and return the version before+after.",
+        "description": "Admin-only in v1. Mutually exclusive scope query like the other endpoints.\n\n# Errors\n\nReturns `ApiError::BadRequest` for empty names or conflicting scope params,\n`ApiError::Forbidden` for non-admin callers, `ApiError::NotFound` when the\nsecret or environment is unknown, and `ApiError::Internal` for storage\nfailures.",
+        "operationId": "rotate_secret",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Secret name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "environment",
+            "in": "query",
+            "description": "Environment id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "description": "Explicit scope (legacy)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RotateSecretRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Secret rotated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RotateSecretResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Secret or environment not found"
           }
         },
         "security": [
@@ -5879,7 +6421,7 @@
           "Volumes"
         ],
         "summary": "List all volumes on disk.",
-        "description": "Enumerates subdirectories under the volume base directory and returns\nmetadata for each one.\n\n# Errors\n\nReturns an error if the volume directory cannot be read.",
+        "description": "Enumerates subdirectories under the volume base directory, reads each\nsidecar when present, and returns a [`VolumeInfo`] for each entry\n(including `in_use_by` when a [`VolumeUsageSource`] is wired).\n\n# Errors\n\nReturns an error if the volume directory cannot be read.",
         "operationId": "list_volumes",
         "responses": {
           "200": {
@@ -5889,7 +6431,7 @@
                 "schema": {
                   "type": "array",
                   "items": {
-                    "$ref": "#/components/schemas/VolumeSummary"
+                    "$ref": "#/components/schemas/VolumeInfo"
                   }
                 }
               }
@@ -5904,15 +6446,104 @@
             "bearer_auth": []
           }
         ]
+      },
+      "post": {
+        "tags": [
+          "Volumes"
+        ],
+        "summary": "Create a new named volume.",
+        "description": "Creates `state.volume_dir/{name}` on disk and writes a\n`.metadata.json` sidecar capturing labels, size, tier, and the\ncreation timestamp.\n\n# Errors\n\n- 400 Bad Request — invalid name, size, or tier.\n- 403 Forbidden — caller lacks the `operator` role.\n- 409 Conflict — a volume with this name already exists.\n- 500 Internal — filesystem errors.",
+        "operationId": "create_volume",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateVolumeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Volume created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VolumeInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "409": {
+            "description": "Volume already exists"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
       }
     },
     "/api/v1/volumes/{name}": {
+      "get": {
+        "tags": [
+          "Volumes"
+        ],
+        "summary": "Inspect a single volume by name.",
+        "description": "Reads the sidecar when present, synthesizes defaults for legacy\nvolumes, and populates `in_use_by` when a [`VolumeUsageSource`] is\nwired.\n\n# Errors\n\n- 404 Not Found — no such volume.\n- 500 Internal — filesystem or parse errors.",
+        "operationId": "get_volume",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Volume name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Volume metadata",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VolumeInfo"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "404": {
+            "description": "Volume not found"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      },
       "delete": {
         "tags": [
           "Volumes"
         ],
         "summary": "Delete a volume by name.",
-        "description": "Removes a volume directory from disk. By default, only empty volumes\ncan be deleted. Use `?force=true` to remove non-empty volumes.\n\n# Errors\n\nReturns an error if the volume is not found or cannot be removed.",
+        "description": "By default, refuses to remove a volume that is non-empty OR that any\ncontainer currently reports mounting. `?force=true` overrides both\nchecks.\n\n# Errors\n\n- 404 Not Found — no such volume.\n- 409 Conflict — non-empty or in-use without `?force=true`.\n- 403 Forbidden — caller lacks the `operator` role.",
         "operationId": "delete_volume",
         "parameters": [
           {
@@ -5927,7 +6558,7 @@
           {
             "name": "force",
             "in": "query",
-            "description": "Force removal of non-empty volumes",
+            "description": "Force removal of non-empty or in-use volumes",
             "required": true,
             "schema": {
               "type": "boolean"
@@ -5948,7 +6579,7 @@
             "description": "Volume not found"
           },
           "409": {
-            "description": "Volume is non-empty (use ?force=true)"
+            "description": "Volume is non-empty or in use (use ?force=true)"
           }
         },
         "security": [
@@ -6335,6 +6966,99 @@
         }
       }
     },
+    "/auth/oidc/providers": {
+      "get": {
+        "tags": [
+          "Authentication"
+        ],
+        "summary": "`GET /auth/oidc/providers`.",
+        "operationId": "list_providers",
+        "responses": {
+          "200": {
+            "description": "List of configured OIDC providers",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OidcProviderPublic"
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/auth/oidc/{provider}/callback": {
+      "get": {
+        "tags": [
+          "Authentication"
+        ],
+        "summary": "`GET /auth/oidc/:provider/callback`.",
+        "operationId": "callback",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Provider slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Signed in via OIDC",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OidcCallbackResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid callback parameters"
+          },
+          "401": {
+            "description": "Provider returned an error"
+          },
+          "404": {
+            "description": "Unknown provider"
+          }
+        }
+      }
+    },
+    "/auth/oidc/{provider}/start": {
+      "get": {
+        "tags": [
+          "Authentication"
+        ],
+        "summary": "`GET /auth/oidc/:provider/start` — 302 to the provider's authorize URL.",
+        "operationId": "start",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "description": "Provider slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Redirect to provider's authorize URL"
+          },
+          "404": {
+            "description": "Unknown provider"
+          }
+        }
+      }
+    },
     "/auth/token": {
       "post": {
         "tags": [
@@ -6671,6 +7395,121 @@
             "type": "string"
           }
         }
+      },
+      "BridgeNetwork": {
+        "type": "object",
+        "description": "A user-defined bridge or overlay network that containers can attach to.",
+        "required": [
+          "id",
+          "name",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Creation timestamp (UTC, RFC 3339)."
+          },
+          "driver": {
+            "$ref": "#/components/schemas/BridgeNetworkDriver",
+            "description": "Driver backing the network (bridge vs. overlay)."
+          },
+          "id": {
+            "type": "string",
+            "description": "Opaque server-generated identifier (UUID v4)."
+          },
+          "internal": {
+            "type": "boolean",
+            "description": "If true, containers attached to this network cannot reach the outside\nworld — only other containers on the same network."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Arbitrary key/value labels for filtering and grouping.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable, unique name (must match `^[a-z0-9][a-z0-9_-]{0,63}$`)."
+          },
+          "subnet": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "IPv4/IPv6 subnet in CIDR notation (e.g. `\"10.240.0.0/24\"`)."
+          }
+        }
+      },
+      "BridgeNetworkAttachment": {
+        "type": "object",
+        "description": "A container attached to a [`BridgeNetwork`].",
+        "required": [
+          "container_id"
+        ],
+        "properties": {
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "DNS aliases the container can be reached by on this network."
+          },
+          "container_id": {
+            "type": "string",
+            "description": "Runtime-provided container id."
+          },
+          "container_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Container name, if known."
+          },
+          "ipv4": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Assigned IPv4 address on the network (if any)."
+          }
+        }
+      },
+      "BridgeNetworkDetails": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/BridgeNetwork",
+            "description": "Core network metadata. Flattened so the JSON stays close to the\nlist-item shape returned by `list_container_networks`."
+          },
+          {
+            "type": "object",
+            "required": [
+              "attached_containers"
+            ],
+            "properties": {
+              "attached_containers": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/BridgeNetworkAttachment"
+                },
+                "description": "Containers currently attached to the network."
+              }
+            }
+          }
+        ],
+        "description": "Response body for `GET /api/v1/container-networks/{id_or_name}`."
+      },
+      "BridgeNetworkDriver": {
+        "type": "string",
+        "description": "Backing driver for a [`BridgeNetwork`].",
+        "enum": [
+          "bridge",
+          "overlay"
+        ]
       },
       "BuildKind": {
         "type": "string",
@@ -7156,6 +7995,99 @@
           }
         }
       },
+      "ConnectBridgeNetworkRequest": {
+        "type": "object",
+        "description": "Body for `POST /api/v1/container-networks/{id_or_name}/connect`.",
+        "required": [
+          "container_id"
+        ],
+        "properties": {
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional DNS aliases on this network."
+          },
+          "container_id": {
+            "type": "string",
+            "description": "Container id to attach."
+          },
+          "ipv4_address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional static IPv4 to pin this container to. Validated as\n[`Ipv4Addr`]."
+          }
+        }
+      },
+      "ContainerEvent": {
+        "type": "object",
+        "description": "A container lifecycle event published on the bus.",
+        "required": [
+          "kind",
+          "id",
+          "at"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Wall-clock time the event was emitted.\n\nSerialized as an RFC 3339 string on the wire. Typed as\n[`chrono::DateTime<Utc>`] in-process for ergonomic manipulation;\nthe `#[schema(value_type = String, format = DateTime)]` attribute\nteaches `utoipa` to render a proper string schema in the `OpenAPI`\noutput."
+          },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Exit code, when known. Populated for `Die` events where a wait has\nalready resolved; otherwise `None`."
+          },
+          "id": {
+            "type": "string",
+            "description": "Container identifier (the API's id string, not the raw runtime id)."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ContainerEventKind",
+            "description": "What kind of transition this event represents."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Labels on the container at the time of the event. Used by subscribers\nto filter via the `label=k=v` query param (AND semantics).",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Free-form human-readable reason. For `Die`, may indicate \"stopped\",\n\"killed\", \"oom-killed\"; for `Oom`, the OOM detail; for `Health`, may\necho the probe failure message."
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Health status, only populated for `Health` events (e.g. \"healthy\",\n\"unhealthy\", \"starting\")."
+          }
+        }
+      },
+      "ContainerEventKind": {
+        "type": "string",
+        "description": "Kind of container lifecycle event.",
+        "enum": [
+          "start",
+          "die",
+          "oom",
+          "health"
+        ]
+      },
       "ContainerExecRequest": {
         "type": "object",
         "description": "Exec request for running a command in a container",
@@ -7196,6 +8128,35 @@
           }
         }
       },
+      "ContainerHealthInfo": {
+        "type": "object",
+        "description": "Runtime-native health snapshot on [`ContainerInfo::health`].\n\nSourced from bollard's `ContainerState.health` for Docker-backed\ncontainers. The internal `HealthMonitor` in\n`crates/zlayer-agent/src/health.rs` drives service-level health events\nagainst user-configured health specs; for standalone containers the API\nreports the runtime-native status instead so images with a baked-in\n`HEALTHCHECK` still surface correctly.",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "failing_streak": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Consecutive failing probe count, when the runtime tracks it.",
+            "minimum": 0
+          },
+          "last_output": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Output from the most recent failing probe, when available."
+          },
+          "status": {
+            "type": "string",
+            "description": "One of `\"none\"`, `\"starting\"`, `\"healthy\"`, `\"unhealthy\"` (Docker\n`HealthStatusEnum`). Empty / missing upstream values normalise to\n`\"none\"`."
+          }
+        }
+      },
       "ContainerInfo": {
         "type": "object",
         "description": "Container information returned by the API",
@@ -7211,6 +8172,25 @@
             "type": "string",
             "description": "Creation timestamp (ISO 8601)"
           },
+          "exit_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Most-recent exit code. `None` for containers still running and for\ncontainers that have never exited."
+          },
+          "health": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContainerHealthInfo",
+                "description": "Runtime-native health status, when the container image declares a\n`HEALTHCHECK` (or equivalent). `None` when the runtime doesn't track\nhealth for this container."
+              }
+            ]
+          },
           "id": {
             "type": "string",
             "description": "Container identifier"
@@ -7218,6 +8198,13 @@
           "image": {
             "type": "string",
             "description": "OCI image reference"
+          },
+          "ipv4": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Primary IPv4 address (first non-empty IP across attached networks).\nDocker's `bridge` network is preferred when present."
           },
           "labels": {
             "type": "object",
@@ -7236,6 +8223,13 @@
             ],
             "description": "Human-readable name (if set)"
           },
+          "networks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NetworkAttachmentInfo"
+            },
+            "description": "Networks this container is attached to, with per-network aliases\nand IPv4. Empty when the runtime doesn't surface network detail."
+          },
           "pid": {
             "type": [
               "integer",
@@ -7244,6 +8238,13 @@
             "format": "int32",
             "description": "Process ID (if running)",
             "minimum": 0
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortMapping"
+            },
+            "description": "Published port mappings (container → host). Populated from the\nruntime's inspect response; empty when the runtime doesn't expose\nport-level detail or the container has no published ports."
           },
           "state": {
             "type": "string",
@@ -7271,6 +8272,46 @@
             "description": "Memory limit (e.g., \"256Mi\", \"1Gi\")"
           }
         }
+      },
+      "ContainerRestartKind": {
+        "type": "string",
+        "description": "Which flavor of container restart policy to apply.",
+        "enum": [
+          "no",
+          "always",
+          "unless_stopped",
+          "on_failure"
+        ]
+      },
+      "ContainerRestartPolicy": {
+        "type": "object",
+        "description": "Container-runtime-level restart policy.\n\nMaps onto Docker's `HostConfig.RestartPolicy`. Distinct from\n[`PanicPolicy`], which governs what `ZLayer` does in response to an\napplication panic (it does not set a Docker restart policy).",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "delay": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Humantime-formatted delay between restarts (e.g. `\"500ms\"`,\n`\"2s\"`). Accepted for forward-compatibility but currently ignored\nby the Docker backend: bollard's `RestartPolicy` has no per-kind\ndelay field. When set, the runtime emits a warning."
+          },
+          "kind": {
+            "$ref": "#/components/schemas/ContainerRestartKind",
+            "description": "Which restart policy to apply."
+          },
+          "max_attempts": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "For `on_failure` only: maximum number of restart attempts before\ngiving up. Ignored by other kinds. `None` means \"retry forever\".",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
       },
       "ContainerStatsResponse": {
         "type": "object",
@@ -7314,7 +8355,7 @@
       },
       "ContainerWaitResponse": {
         "type": "object",
-        "description": "Wait response with container exit code",
+        "description": "Wait response with container exit code plus optional classification\nfields (added in §3.12 of the SDK-fixes spec).\n\nThe three optional fields (`reason`, `signal`, `finished_at`) are\nadditive — clients that only read `exit_code` keep working unchanged.",
         "required": [
           "id",
           "exit_code"
@@ -7323,11 +8364,77 @@
           "exit_code": {
             "type": "integer",
             "format": "int32",
-            "description": "Exit code (0 = success)"
+            "description": "Exit code (0 = success). When the container was killed by signal\n`N`, this is typically `128 + N`."
+          },
+          "finished_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC3339 timestamp of when the container exited, if reported by\nthe runtime."
           },
           "id": {
             "type": "string",
             "description": "Container identifier"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Classification of the exit. One of `\"exited\"`, `\"signal\"`,\n`\"oom_killed\"`, or `\"runtime_error\"`. Absent when the runtime\ndidn't classify the exit."
+          },
+          "signal": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Signal name when `reason == \"signal\"`, e.g. `\"SIGKILL\"`. Absent\nwhen the runtime couldn't determine it (or the exit wasn't a\nsignal death)."
+          }
+        }
+      },
+      "CreateBridgeNetworkRequest": {
+        "type": "object",
+        "description": "Body for `POST /api/v1/container-networks`.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "driver": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BridgeNetworkDriver",
+                "description": "Driver, defaults to `bridge`."
+              }
+            ]
+          },
+          "internal": {
+            "type": "boolean",
+            "description": "Internal-only (no egress) network."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Arbitrary labels.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string",
+            "description": "Network name (must match `^[a-z0-9][a-z0-9_-]{0,63}$`)."
+          },
+          "subnet": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Subnet CIDR (e.g. `\"10.240.0.0/24\"`). Validated as\n[`ipnetwork::IpNetwork`]."
           }
         }
       },
@@ -7348,6 +8455,13 @@
             },
             "description": "Command to run (overrides image entrypoint)"
           },
+          "dns": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Additional DNS servers (maps to Docker's `--dns`). Each entry must be\na plausible IPv4 or IPv6 address."
+          },
           "env": {
             "type": "object",
             "description": "Environment variables",
@@ -7357,6 +8471,31 @@
             "propertyNames": {
               "type": "string"
             }
+          },
+          "extra_hosts": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Extra `hostname:ip` entries appended to `/etc/hosts` (maps to Docker's\n`--add-host`). The special literal `host-gateway` is accepted as the\n`ip` half."
+          },
+          "health_check": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HealthCheckRequest",
+                "description": "Optional health check. When omitted, the daemon installs a no-op\nplaceholder (`HealthCheck::Tcp { port: 0 }`) matching the current\ndefault; the health monitor treats `port == 0` as \"skip\"."
+              }
+            ]
+          },
+          "hostname": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional container hostname (maps to Docker's `--hostname`)."
           },
           "image": {
             "type": "string",
@@ -7379,12 +8518,44 @@
             ],
             "description": "Optional human-readable name"
           },
+          "networks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NetworkAttachmentRequest"
+            },
+            "description": "User-defined bridge/overlay networks to attach the newly-created\ncontainer to. Each entry references a network by id or name and is\nattached after the container is successfully started. If any\nattachment fails, the partially-started container is rolled back\n(stopped + removed) and the request is failed."
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortMapping"
+            },
+            "description": "Published ports (Docker's `-p host:container/proto`). When omitted,\nthe container is created without any host port publishing."
+          },
           "pull_policy": {
             "type": [
               "string",
               "null"
             ],
             "description": "Image pull policy: \"always\", \"`if_not_present`\", or \"never\""
+          },
+          "registry_auth": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RegistryAuth",
+                "description": "Inline Docker/OCI registry credentials used for this pull only. Not\npersisted, never logged, never echoed back on a response. When both\n`registry_credential_id` and `registry_auth` are set, this field\ntakes precedence."
+              }
+            ]
+          },
+          "registry_credential_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Id of a persisted registry credential (from\n`POST /api/v1/credentials/registry`) to use when pulling the image.\nIgnored when [`Self::registry_auth`] is also supplied (inline auth\nwins). Requires the daemon to be configured with a credential store\n— otherwise the request is rejected with `400`."
           },
           "resources": {
             "oneOf": [
@@ -7394,6 +8565,17 @@
               {
                 "$ref": "#/components/schemas/ContainerResourceLimits",
                 "description": "Resource limits (CPU, memory)"
+              }
+            ]
+          },
+          "restart_policy": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ContainerRestartPolicy",
+                "description": "Container restart policy (Docker-style). When omitted, the runtime\napplies no explicit restart policy (Docker default: `\"no\"`)."
               }
             ]
           },
@@ -7947,6 +9129,46 @@
           }
         }
       },
+      "CreateVolumeRequest": {
+        "type": "object",
+        "description": "Request body for `POST /api/v1/volumes`.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "labels": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Optional labels to attach to the volume.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string",
+            "description": "Volume name. Required. Must match `^[a-z0-9][a-z0-9_-]{0,63}$`."
+          },
+          "size": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional size hint (humansize format: `\"512Mi\"`, `\"10Gi\"`).\nRecorded in the sidecar for display and future quota enforcement."
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional storage tier. Accepts `\"local\"` (default), `\"cached\"`,\n`\"network\"`, matching `zlayer_spec::StorageTier`."
+          }
+        }
+      },
       "CreateWorkflowRequest": {
         "type": "object",
         "description": "Body for `POST /api/v1/workflows`.",
@@ -8116,6 +9338,23 @@
           "status": {
             "type": "string",
             "description": "Deployment status"
+          }
+        }
+      },
+      "DisconnectBridgeNetworkRequest": {
+        "type": "object",
+        "description": "Body for `POST /api/v1/container-networks/{id_or_name}/disconnect`.",
+        "required": [
+          "container_id"
+        ],
+        "properties": {
+          "container_id": {
+            "type": "string",
+            "description": "Container id to detach."
+          },
+          "force": {
+            "type": "boolean",
+            "description": "If true, the runtime is asked to forcibly detach."
           }
         }
       },
@@ -8371,6 +9610,84 @@
               "type": "string"
             },
             "description": "List of user ids in the group."
+          }
+        }
+      },
+      "HealthCheckRequest": {
+        "type": "object",
+        "description": "Container health check request.\n\nMirrors the on-disk `HealthCheck` enum (see `zlayer_spec::HealthCheck`) as a\ndiscriminated union keyed on `type`. Translated to `zlayer_spec::HealthSpec`\nby `HealthCheckRequest::to_health_spec`. Durations are humantime strings\n(for example `\"10s\"`, `\"500ms\"`, `\"1m\"`).\n\n## Variants\n- `type: \"tcp\"` — requires `port` (1-65535).\n- `type: \"http\"` — requires `url`; `expect_status` defaults to 200.\n- `type: \"command\"` — requires `command` (array of argv tokens; joined with\n  spaces and passed to `sh -c` by the health monitor, matching the existing\n  compose-to-ZLayer conversion in `zlayer-docker`).",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "command": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Command argv (required when `type == \"command\"`). Joined with spaces\nand passed to `sh -c`."
+          },
+          "expect_status": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "HTTP status code expected from `url` (defaults to 200).",
+            "minimum": 0
+          },
+          "interval": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Interval between checks, humantime format (e.g. `\"30s\"`). Defaults to 30s."
+          },
+          "port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "TCP port (required when `type == \"tcp\"`).",
+            "minimum": 0
+          },
+          "retries": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Number of consecutive failures before marking unhealthy. Defaults to 3.",
+            "minimum": 0
+          },
+          "start_period": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Grace period before the first check runs, humantime format. Maps to\n`HealthSpec::start_grace`."
+          },
+          "timeout": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Timeout per individual check, humantime format."
+          },
+          "type": {
+            "type": "string",
+            "description": "Check variant: `\"tcp\"`, `\"http\"`, or `\"command\"`."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "HTTP URL (required when `type == \"http\"`)."
           }
         }
       },
@@ -8742,6 +10059,60 @@
           }
         }
       },
+      "NetworkAttachmentInfo": {
+        "type": "object",
+        "description": "Per-network attachment entry on [`ContainerInfo::networks`].\n\nPopulated from the runtime's inspect response — mirrors the subset of\nbollard's `EndpointSettings` that API clients need to correlate a container\nwith its `container_networks` entries.",
+        "required": [
+          "network"
+        ],
+        "properties": {
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "DNS aliases the container answers to on this network."
+          },
+          "ipv4": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Assigned IPv4 on this network, if any."
+          },
+          "network": {
+            "type": "string",
+            "description": "Network name as reported by the runtime. Matches the `name` field on\nentries returned by `GET /api/v1/container-networks`."
+          }
+        }
+      },
+      "NetworkAttachmentRequest": {
+        "type": "object",
+        "description": "A request to attach a freshly-created container to a user-defined bridge\nor overlay network, mirroring the wire-shape used by `POST\n/api/v1/container-networks/{id_or_name}/connect`.\n\nIncluded on [`CreateContainerRequest::networks`] so callers can wire up\nevery attachment in a single call instead of issuing a separate connect\nrequest per network after container create.",
+        "required": [
+          "network"
+        ],
+        "properties": {
+          "aliases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional DNS aliases for this container on the network."
+          },
+          "ipv4_address": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional static IPv4 to pin this container to. Validated as\n[`std::net::Ipv4Addr`] before the runtime is called."
+          },
+          "network": {
+            "type": "string",
+            "description": "Bridge-network id or name to attach to."
+          }
+        }
+      },
       "NetworkSummary": {
         "type": "object",
         "description": "Summary returned when listing networks.",
@@ -9089,6 +10460,42 @@
           "smtp"
         ]
       },
+      "OidcCallbackResponse": {
+        "type": "object",
+        "description": "Callback response body (returned as JSON unless the operator prefers a\nredirect; initial integration keeps JSON so the Manager UI can show a\nwelcome screen post-exchange).",
+        "required": [
+          "user",
+          "csrf_token",
+          "provider"
+        ],
+        "properties": {
+          "csrf_token": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "user": {
+            "$ref": "#/components/schemas/UserView"
+          }
+        }
+      },
+      "OidcProviderPublic": {
+        "type": "object",
+        "description": "Public-facing projection — what the Manager UI needs to render a login\nbutton. Never includes the client secret.",
+        "required": [
+          "name",
+          "display_name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "OverlayStatusResponse": {
         "type": "object",
         "description": "Overlay network status response",
@@ -9244,6 +10651,46 @@
           "write"
         ]
       },
+      "PortMapping": {
+        "type": "object",
+        "description": "A single host-to-container port publish rule (Docker's `-p`).\n\nWhen `host_port` is `None` (or explicitly `Some(0)`), the container runtime\nassigns an ephemeral host port. `host_ip` defaults to `\"0.0.0.0\"` to bind\non all interfaces.",
+        "required": [
+          "container_port"
+        ],
+        "properties": {
+          "container_port": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Container-side port.",
+            "minimum": 0
+          },
+          "host_ip": {
+            "type": "string",
+            "description": "Host interface to bind on. Defaults to `\"0.0.0.0\"` (all interfaces)."
+          },
+          "host_port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Host port. `None` (or zero) means \"assign an ephemeral port\".",
+            "minimum": 0
+          },
+          "protocol": {
+            "$ref": "#/components/schemas/PortProtocol",
+            "description": "Transport protocol (defaults to TCP)."
+          }
+        }
+      },
+      "PortProtocol": {
+        "type": "string",
+        "description": "Transport protocol for a published container port.",
+        "enum": [
+          "tcp",
+          "udp"
+        ]
+      },
       "ProjectPullResponse": {
         "type": "object",
         "description": "Response body for `POST /api/v1/projects/{id}/pull`.",
@@ -9317,6 +10764,24 @@
           "reference": {
             "type": "string",
             "description": "OCI image reference to pull, e.g. `docker.io/library/nginx:latest`."
+          },
+          "registry_auth": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RegistryAuth",
+                "description": "Inline Docker/OCI registry credentials used for this pull only. Not\npersisted, never logged, never echoed back on a response. Takes\nprecedence over `registry_credential_id`."
+              }
+            ]
+          },
+          "registry_credential_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Id of a persisted registry credential (from\n`POST /api/v1/credentials/registry`) to use for this pull. Ignored\nwhen [`Self::registry_auth`] is also supplied (inline auth wins).\nRequires the daemon to be configured with a credential store."
           }
         }
       },
@@ -9390,6 +10855,36 @@
             "description": "Current status"
           }
         }
+      },
+      "RegistryAuth": {
+        "type": "object",
+        "description": "Inline Docker/OCI registry credentials attached to a single pull request.\n\nPrefer persistent credentials via `/api/v1/credentials/registry` for\nlong-lived services. Use this inline form for one-off pulls (e.g. CI\nrunners fetching a private image for a single job) where persisting a\ncredential is undesirable.",
+        "required": [
+          "username",
+          "password"
+        ],
+        "properties": {
+          "auth_type": {
+            "$ref": "#/components/schemas/RegistryAuthType",
+            "description": "Which authentication scheme to use against the registry."
+          },
+          "password": {
+            "type": "string",
+            "description": "Password or bearer token. **Never** logged or returned on any\nresponse — consumed once and dropped."
+          },
+          "username": {
+            "type": "string",
+            "description": "Username for the registry (for basic auth) or a placeholder\nidentifier when `auth_type == Token`."
+          }
+        }
+      },
+      "RegistryAuthType": {
+        "type": "string",
+        "description": "Authentication scheme for a [`RegistryAuth`].",
+        "enum": [
+          "basic",
+          "token"
+        ]
       },
       "RegistryAuthTypeSchema": {
         "type": "string",
@@ -9469,6 +10964,72 @@
             ],
             "format": "int64",
             "description": "Graceful shutdown timeout in seconds before the runtime force-kills\nthe container. Defaults to 30 seconds when omitted.",
+            "minimum": 0
+          }
+        }
+      },
+      "RevealAllSecretsResponse": {
+        "type": "object",
+        "description": "Response for the batch reveal endpoint — returns every secret in an env as plaintext.\nAdmin-only for now (Phase 3 will gate this on per-env Read permission instead).",
+        "required": [
+          "environment",
+          "secrets"
+        ],
+        "properties": {
+          "environment": {
+            "type": "string",
+            "description": "The environment id the secrets were revealed from."
+          },
+          "secrets": {
+            "type": "object",
+            "description": "Name → plaintext value map. Includes every secret in the scope.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
+      "RotateSecretRequest": {
+        "type": "object",
+        "description": "Request body for secret rotation.",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "value": {
+            "type": "string",
+            "description": "The new secret value (will be encrypted at rest)."
+          }
+        }
+      },
+      "RotateSecretResponse": {
+        "type": "object",
+        "description": "Response returned by the rotate endpoint.",
+        "required": [
+          "name",
+          "new_version"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "The secret name."
+          },
+          "new_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Version after rotation.",
+            "minimum": 0
+          },
+          "previous_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Version prior to rotation. `None` if the secret did not exist (won't\nhappen today — rotate rejects missing secrets — but preserved for\nforward compatibility).",
             "minimum": 0
           }
         }
@@ -11266,11 +12827,59 @@
           }
         }
       },
+      "VolumeInfo": {
+        "type": "object",
+        "description": "Full volume response shape used by the list, inspect, and create\nendpoints.",
+        "required": [
+          "name",
+          "path",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "RFC 3339 creation timestamp. For volumes without a sidecar this is\nthe directory's mtime (best-effort)."
+          },
+          "in_use_by": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Container IDs currently mounting this volume. Empty when no\n[`VolumeUsageSource`] is wired."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Labels from the sidecar. Empty when no sidecar is present.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "name": {
+            "type": "string",
+            "description": "Volume name (directory name)."
+          },
+          "path": {
+            "type": "string",
+            "description": "Host filesystem path."
+          },
+          "size_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Approximate size in bytes (sum of regular files in the volume\ndirectory). `None` when the directory could not be walked, or for\nfreshly created empty volumes where `0` would be equally\ninformative.",
+            "minimum": 0
+          }
+        }
+      },
       "VolumeMount": {
         "type": "object",
-        "description": "Volume mount specification",
+        "description": "Volume mount specification.\n\nThe `type` field (a Docker-compatible discriminator) selects how `source`\nis interpreted:\n- `\"bind\"` (default): `source` is an absolute host path.\n- `\"volume\"`: `source` is a named-volume identifier.\n- `\"tmpfs\"`: no `source`; a memory-backed mount is provisioned.",
         "required": [
-          "source",
           "target"
         ],
         "properties": {
@@ -11279,18 +12888,41 @@
             "description": "Mount as read-only"
           },
           "source": {
-            "type": "string",
-            "description": "Host path or volume name"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Host path (bind), volume name (volume), or unused (tmpfs)."
           },
           "target": {
             "type": "string",
             "description": "Container mount path"
+          },
+          "type": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VolumeMountType",
+                "description": "Mount kind. Omit (or `\"bind\"`) for legacy host-path binds."
+              }
+            ]
           }
         }
       },
+      "VolumeMountType": {
+        "type": "string",
+        "description": "Volume mount kind discriminator.\n\nSelects which [`zlayer_spec::StorageSpec`] variant [`VolumeMount`] is\ntranslated into by [`build_service_spec`]. When omitted on the wire,\ndefaults to [`VolumeMountType::Bind`] (legacy behavior).",
+        "enum": [
+          "bind",
+          "volume",
+          "tmpfs"
+        ]
+      },
       "VolumeSummary": {
         "type": "object",
-        "description": "Summary of a single volume returned by the list endpoint.",
+        "description": "Legacy response shape kept for backwards compatibility with older SDK\nconsumers that deserialize strictly. New consumers should use\n[`VolumeInfo`]. `list_volumes` now returns [`VolumeInfo`] which is a\nstrict superset of the fields in `VolumeSummary`.",
         "required": [
           "name",
           "path"
@@ -11298,11 +12930,11 @@
         "properties": {
           "name": {
             "type": "string",
-            "description": "Volume name (directory name)"
+            "description": "Volume name (directory name)."
           },
           "path": {
             "type": "string",
-            "description": "Host filesystem path"
+            "description": "Host filesystem path."
           },
           "size_bytes": {
             "type": [
@@ -11310,7 +12942,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Approximate size in bytes (sum of files in the volume directory)",
+            "description": "Approximate size in bytes.",
             "minimum": 0
           }
         }
@@ -11571,6 +13203,10 @@
       "description": "Environment CRUD"
     },
     {
+      "name": "Events",
+      "description": "Daemon-wide container lifecycle event stream (SSE)"
+    },
+    {
       "name": "Projects",
       "description": "Project CRUD and deployment linking"
     },
@@ -11629,6 +13265,10 @@
     {
       "name": "Networks",
       "description": "Network access-control group management"
+    },
+    {
+      "name": "ContainerNetworks",
+      "description": "User-defined bridge / overlay networks for standalone containers"
     },
     {
       "name": "Proxy",

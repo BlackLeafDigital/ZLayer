@@ -33,11 +33,11 @@ Pulls the image if needed, creates the container, and starts it. Returns the con
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { CreateContainerOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateContainerOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -108,11 +108,11 @@ Sends a stop signal (with a 30-second timeout), then removes the container.  # E
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { DeleteContainerRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteContainerRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -170,11 +170,11 @@ example().catch(console.error);
 
 ## execInContainer
 
-> ContainerExecResponse execInContainer(id, containerExecRequest)
+> ContainerExecResponse execInContainer(id, containerExecRequest, stream)
 
 Execute a command in a running container.
 
-# Errors  Returns an error if the container is not found, the command is invalid, execution fails, or the user lacks the operator role.
+When &#x60;stream&#x3D;true&#x60; is passed as a query parameter, this endpoint upgrades to a Server-Sent Events stream emitting: - &#x60;event: stdout\\ndata: &lt;line&gt;\\n\\n&#x60; for each stdout line - &#x60;event: stderr\\ndata: &lt;line&gt;\\n\\n&#x60; for each stderr line - &#x60;event: exit\\ndata: {\&quot;exit_code\&quot;: N}\\n\\n&#x60; as the final event  # Errors  Returns an error if the container is not found, the command is invalid, execution fails, or the user lacks the operator role.
 
 ### Example
 
@@ -182,11 +182,11 @@ Execute a command in a running container.
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { ExecInContainerRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ExecInContainerRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -198,6 +198,8 @@ async function example() {
     id: id_example,
     // ContainerExecRequest
     containerExecRequest: ...,
+    // boolean | Stream exec events as SSE instead of returning a buffered JSON body. (optional)
+    stream: true,
   } satisfies ExecInContainerRequest;
 
   try {
@@ -219,6 +221,7 @@ example().catch(console.error);
 |------------- | ------------- | ------------- | -------------|
 | **id** | `string` | Container identifier | [Defaults to `undefined`] |
 | **containerExecRequest** | [ContainerExecRequest](ContainerExecRequest.md) |  | |
+| **stream** | `boolean` | Stream exec events as SSE instead of returning a buffered JSON body. | [Optional] [Defaults to `undefined`] |
 
 ### Return type
 
@@ -237,7 +240,7 @@ example().catch(console.error);
 ### HTTP response details
 | Status code | Description | Response headers |
 |-------------|-------------|------------------|
-| **200** | Command executed |  -  |
+| **200** | Command executed (JSON body when stream&#x3D;false, SSE stream when stream&#x3D;true) |  -  |
 | **400** | Invalid request |  -  |
 | **401** | Unauthorized |  -  |
 | **403** | Forbidden - operator role required |  -  |
@@ -260,11 +263,11 @@ Get details for a specific container.
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { GetContainerRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetContainerRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -333,11 +336,11 @@ Returns the last N lines of container logs as plain text, or streams logs as Ser
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { GetContainerLogsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetContainerLogsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -400,11 +403,11 @@ example().catch(console.error);
 
 ## getContainerStats
 
-> ContainerStatsResponse getContainerStats(id)
+> ContainerStatsResponse getContainerStats(id, stream, interval)
 
 Get container resource statistics.
 
-Returns CPU and memory usage statistics for the specified container.  # Errors  Returns an error if the container is not found or stats retrieval fails.
+Returns CPU and memory usage statistics for the specified container. By default this is a one-shot JSON response. When the query string contains &#x60;stream&#x3D;true&#x60;, the handler switches to Server-Sent Events and emits one &#x60;ContainerStatsResponse&#x60; sample every &#x60;interval&#x60; seconds (default 2, clamped to &#x60;[1, 60]&#x60;). The stream ends with a final &#x60;event: close&#x60; when the container exits or the runtime reports an unrecoverable error.  # Errors  Returns an error if the container is not found or stats retrieval fails.
 
 ### Example
 
@@ -412,11 +415,11 @@ Returns CPU and memory usage statistics for the specified container.  # Errors  
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { GetContainerStatsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetContainerStatsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -426,6 +429,10 @@ async function example() {
   const body = {
     // string | Container identifier
     id: id_example,
+    // boolean | Stream periodic samples as SSE events instead of a one-shot JSON response. (optional)
+    stream: true,
+    // number | Sample cadence in seconds (only used when `stream=true`). Clamped to `[1, 60]`. Defaults to `2` seconds. (optional)
+    interval: 56,
   } satisfies GetContainerStatsRequest;
 
   try {
@@ -446,6 +453,8 @@ example().catch(console.error);
 | Name | Type | Description  | Notes |
 |------------- | ------------- | ------------- | -------------|
 | **id** | `string` | Container identifier | [Defaults to `undefined`] |
+| **stream** | `boolean` | Stream periodic samples as SSE events instead of a one-shot JSON response. | [Optional] [Defaults to `undefined`] |
+| **interval** | `number` | Sample cadence in seconds (only used when &#x60;stream&#x3D;true&#x60;). Clamped to &#x60;[1, 60]&#x60;. Defaults to &#x60;2&#x60; seconds. | [Optional] [Defaults to `undefined`] |
 
 ### Return type
 
@@ -464,7 +473,7 @@ example().catch(console.error);
 ### HTTP response details
 | Status code | Description | Response headers |
 |-------------|-------------|------------------|
-| **200** | Container statistics |  -  |
+| **200** | Container statistics (JSON one-shot or SSE stream) |  -  |
 | **401** | Unauthorized |  -  |
 | **404** | Container not found |  -  |
 
@@ -485,11 +494,11 @@ Mirrors Docker-compat &#x60;POST /containers/{id}/kill&#x60;. When the request b
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { KillContainerOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { KillContainerOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -565,11 +574,11 @@ Returns all containers managed through this API. Optionally filter by label usin
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { ListContainersRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListContainersRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -637,11 +646,11 @@ Composes &#x60;stop_container(timeout)&#x60; followed by &#x60;start_container&#
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { RestartContainerOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { RestartContainerOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -715,11 +724,11 @@ Useful for re-starting a container that was stopped via &#x60;POST /api/v1/conta
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { StartContainerRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { StartContainerRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -790,11 +799,11 @@ Sends the runtime\&#39;s graceful stop signal and waits up to &#x60;timeout&#x60
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { StopContainerOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { StopContainerOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -868,11 +877,11 @@ This endpoint blocks until the container exits. Useful for CI runners that need 
 import {
   Configuration,
   ContainersApi,
-} from '@zlayer/client';
-import type { WaitContainerRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { WaitContainerRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

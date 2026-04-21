@@ -12,7 +12,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { LoginRequest } from '@zlayer/client'
+import type { LoginRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

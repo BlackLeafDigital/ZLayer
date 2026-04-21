@@ -28,11 +28,11 @@ Add a member to a group. Admin only.
 import {
   Configuration,
   GroupsApi,
-} from '@zlayer/client';
-import type { AddMemberOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { AddMemberOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new GroupsApi();
 
   const body = {
@@ -101,11 +101,11 @@ Create a new group. Admin only.
 import {
   Configuration,
   GroupsApi,
-} from '@zlayer/client';
-import type { CreateGroupOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateGroupOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new GroupsApi();
 
   const body = {
@@ -170,11 +170,11 @@ Delete a group. Admin only.
 import {
   Configuration,
   GroupsApi,
-} from '@zlayer/client';
-import type { DeleteGroupRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteGroupRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new GroupsApi();
 
   const body = {
@@ -239,11 +239,11 @@ Fetch a single group by id.
 import {
   Configuration,
   GroupsApi,
-} from '@zlayer/client';
-import type { GetGroupRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetGroupRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new GroupsApi();
 
   const body = {
@@ -307,11 +307,11 @@ List all groups.
 import {
   Configuration,
   GroupsApi,
-} from '@zlayer/client';
-import type { ListGroupsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListGroupsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new GroupsApi();
 
   try {
@@ -366,11 +366,11 @@ Remove a member from a group. Admin only.
 import {
   Configuration,
   GroupsApi,
-} from '@zlayer/client';
-import type { RemoveMemberRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { RemoveMemberRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new GroupsApi();
 
   const body = {
@@ -438,11 +438,11 @@ Update a group\&#39;s name and/or description. Admin only.
 import {
   Configuration,
   GroupsApi,
-} from '@zlayer/client';
-import type { UpdateGroupOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { UpdateGroupOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new GroupsApi();
 
   const body = {

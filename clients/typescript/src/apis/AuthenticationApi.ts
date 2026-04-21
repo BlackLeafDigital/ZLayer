@@ -19,6 +19,8 @@ import type {
   CsrfResponse,
   LoginRequest,
   LoginResponse,
+  OidcCallbackResponse,
+  OidcProviderPublic,
   TokenRequest,
   TokenResponse,
   UserView,
@@ -32,6 +34,10 @@ import {
     LoginRequestToJSON,
     LoginResponseFromJSON,
     LoginResponseToJSON,
+    OidcCallbackResponseFromJSON,
+    OidcCallbackResponseToJSON,
+    OidcProviderPublicFromJSON,
+    OidcProviderPublicToJSON,
     TokenRequestFromJSON,
     TokenRequestToJSON,
     TokenResponseFromJSON,
@@ -44,12 +50,20 @@ export interface BootstrapOperationRequest {
     bootstrapRequest: BootstrapRequest;
 }
 
+export interface CallbackRequest {
+    provider: string;
+}
+
 export interface GetTokenRequest {
     tokenRequest: TokenRequest;
 }
 
 export interface LoginOperationRequest {
     loginRequest: LoginRequest;
+}
+
+export interface StartRequest {
+    provider: string;
 }
 
 /**
@@ -103,6 +117,51 @@ export class AuthenticationApi extends runtime.BaseAPI {
      */
     async bootstrap(requestParameters: BootstrapOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<LoginResponse> {
         const response = await this.bootstrapRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Creates request options for callback without sending the request
+     */
+    async callbackRequestOpts(requestParameters: CallbackRequest): Promise<runtime.RequestOpts> {
+        if (requestParameters['provider'] == null) {
+            throw new runtime.RequiredError(
+                'provider',
+                'Required parameter "provider" was null or undefined when calling callback().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+
+        let urlPath = `/auth/oidc/{provider}/callback`;
+        urlPath = urlPath.replace(`{${"provider"}}`, encodeURIComponent(String(requestParameters['provider'])));
+
+        return {
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        };
+    }
+
+    /**
+     * `GET /auth/oidc/:provider/callback`.
+     */
+    async callbackRaw(requestParameters: CallbackRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<OidcCallbackResponse>> {
+        const requestOptions = await this.callbackRequestOpts(requestParameters);
+        const response = await this.request(requestOptions, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => OidcCallbackResponseFromJSON(jsonValue));
+    }
+
+    /**
+     * `GET /auth/oidc/:provider/callback`.
+     */
+    async callback(requestParameters: CallbackRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<OidcCallbackResponse> {
+        const response = await this.callbackRaw(requestParameters, initOverrides);
         return await response.value();
     }
 
@@ -189,6 +248,43 @@ export class AuthenticationApi extends runtime.BaseAPI {
      */
     async getToken(requestParameters: GetTokenRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<TokenResponse> {
         const response = await this.getTokenRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Creates request options for listProviders without sending the request
+     */
+    async listProvidersRequestOpts(): Promise<runtime.RequestOpts> {
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+
+        let urlPath = `/auth/oidc/providers`;
+
+        return {
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        };
+    }
+
+    /**
+     * `GET /auth/oidc/providers`.
+     */
+    async listProvidersRaw(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Array<OidcProviderPublic>>> {
+        const requestOptions = await this.listProvidersRequestOpts();
+        const response = await this.request(requestOptions, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => jsonValue.map(OidcProviderPublicFromJSON));
+    }
+
+    /**
+     * `GET /auth/oidc/providers`.
+     */
+    async listProviders(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Array<OidcProviderPublic>> {
+        const response = await this.listProvidersRaw(initOverrides);
         return await response.value();
     }
 
@@ -314,6 +410,50 @@ export class AuthenticationApi extends runtime.BaseAPI {
     async me(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<UserView> {
         const response = await this.meRaw(initOverrides);
         return await response.value();
+    }
+
+    /**
+     * Creates request options for start without sending the request
+     */
+    async startRequestOpts(requestParameters: StartRequest): Promise<runtime.RequestOpts> {
+        if (requestParameters['provider'] == null) {
+            throw new runtime.RequiredError(
+                'provider',
+                'Required parameter "provider" was null or undefined when calling start().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+
+        let urlPath = `/auth/oidc/{provider}/start`;
+        urlPath = urlPath.replace(`{${"provider"}}`, encodeURIComponent(String(requestParameters['provider'])));
+
+        return {
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        };
+    }
+
+    /**
+     * `GET /auth/oidc/:provider/start` — 302 to the provider\'s authorize URL.
+     */
+    async startRaw(requestParameters: StartRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<void>> {
+        const requestOptions = await this.startRequestOpts(requestParameters);
+        const response = await this.request(requestOptions, initOverrides);
+
+        return new runtime.VoidApiResponse(response);
+    }
+
+    /**
+     * `GET /auth/oidc/:provider/start` — 302 to the provider\'s authorize URL.
+     */
+    async start(requestParameters: StartRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<void> {
+        await this.startRaw(requestParameters, initOverrides);
     }
 
 }

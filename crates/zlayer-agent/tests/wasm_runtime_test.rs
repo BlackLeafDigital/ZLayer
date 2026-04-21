@@ -233,6 +233,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         errors: ErrorsSpec::default(),
         devices: vec![],
         storage: vec![],
+        port_mappings: vec![],
         capabilities: vec![],
         privileged: false,
         node_mode: NodeMode::default(),
@@ -241,6 +242,10 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         wasm: None,
         logs: None,
         host_network: false,
+        hostname: None,
+        dns: Vec::new(),
+        extra_hosts: Vec::new(),
+        restart_policy: None,
     }
 }
 

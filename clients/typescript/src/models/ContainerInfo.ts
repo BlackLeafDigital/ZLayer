@@ -13,6 +13,28 @@
  */
 
 import { mapValues } from '../runtime';
+import type { ContainerHealthInfo } from './ContainerHealthInfo';
+import {
+    ContainerHealthInfoFromJSON,
+    ContainerHealthInfoFromJSONTyped,
+    ContainerHealthInfoToJSON,
+    ContainerHealthInfoToJSONTyped,
+} from './ContainerHealthInfo';
+import type { PortMapping } from './PortMapping';
+import {
+    PortMappingFromJSON,
+    PortMappingFromJSONTyped,
+    PortMappingToJSON,
+    PortMappingToJSONTyped,
+} from './PortMapping';
+import type { NetworkAttachmentInfo } from './NetworkAttachmentInfo';
+import {
+    NetworkAttachmentInfoFromJSON,
+    NetworkAttachmentInfoFromJSONTyped,
+    NetworkAttachmentInfoToJSON,
+    NetworkAttachmentInfoToJSONTyped,
+} from './NetworkAttachmentInfo';
+
 /**
  * Container information returned by the API
  * @export
@@ -26,6 +48,21 @@ export interface ContainerInfo {
      */
     createdAt: string;
     /**
+     * Most-recent exit code. `None` for containers still running and for
+     * containers that have never exited.
+     * @type {number}
+     * @memberof ContainerInfo
+     */
+    exitCode?: number | null;
+    /**
+     * Runtime-native health status, when the container image declares a
+     * `HEALTHCHECK` (or equivalent). `None` when the runtime doesn't track
+     * health for this container.
+     * @type {ContainerHealthInfo}
+     * @memberof ContainerInfo
+     */
+    health?: ContainerHealthInfo | null;
+    /**
      * Container identifier
      * @type {string}
      * @memberof ContainerInfo
@@ -37,6 +74,13 @@ export interface ContainerInfo {
      * @memberof ContainerInfo
      */
     image: string;
+    /**
+     * Primary IPv4 address (first non-empty IP across attached networks).
+     * Docker's `bridge` network is preferred when present.
+     * @type {string}
+     * @memberof ContainerInfo
+     */
+    ipv4?: string | null;
     /**
      * Labels
      * @type {{ [key: string]: string; }}
@@ -50,11 +94,26 @@ export interface ContainerInfo {
      */
     name?: string | null;
     /**
+     * Networks this container is attached to, with per-network aliases
+     * and IPv4. Empty when the runtime doesn't surface network detail.
+     * @type {Array<NetworkAttachmentInfo>}
+     * @memberof ContainerInfo
+     */
+    networks?: Array<NetworkAttachmentInfo>;
+    /**
      * Process ID (if running)
      * @type {number}
      * @memberof ContainerInfo
      */
     pid?: number | null;
+    /**
+     * Published port mappings (container → host). Populated from the
+     * runtime's inspect response; empty when the runtime doesn't expose
+     * port-level detail or the container has no published ports.
+     * @type {Array<PortMapping>}
+     * @memberof ContainerInfo
+     */
+    ports?: Array<PortMapping>;
     /**
      * Container state (pending, running, exited, failed)
      * @type {string}
@@ -86,11 +145,16 @@ export function ContainerInfoFromJSONTyped(json: any, ignoreDiscriminator: boole
     return {
         
         'createdAt': json['created_at'],
+        'exitCode': json['exit_code'] == null ? undefined : json['exit_code'],
+        'health': json['health'] == null ? undefined : ContainerHealthInfoFromJSON(json['health']),
         'id': json['id'],
         'image': json['image'],
+        'ipv4': json['ipv4'] == null ? undefined : json['ipv4'],
         'labels': json['labels'],
         'name': json['name'] == null ? undefined : json['name'],
+        'networks': json['networks'] == null ? undefined : ((json['networks'] as Array<any>).map(NetworkAttachmentInfoFromJSON)),
         'pid': json['pid'] == null ? undefined : json['pid'],
+        'ports': json['ports'] == null ? undefined : ((json['ports'] as Array<any>).map(PortMappingFromJSON)),
         'state': json['state'],
     };
 }
@@ -107,11 +171,16 @@ export function ContainerInfoToJSONTyped(value?: ContainerInfo | null, ignoreDis
     return {
         
         'created_at': value['createdAt'],
+        'exit_code': value['exitCode'],
+        'health': ContainerHealthInfoToJSON(value['health']),
         'id': value['id'],
         'image': value['image'],
+        'ipv4': value['ipv4'],
         'labels': value['labels'],
         'name': value['name'],
+        'networks': value['networks'] == null ? undefined : ((value['networks'] as Array<any>).map(NetworkAttachmentInfoToJSON)),
         'pid': value['pid'],
+        'ports': value['ports'] == null ? undefined : ((value['ports'] as Array<any>).map(PortMappingToJSON)),
         'state': value['state'],
     };
 }

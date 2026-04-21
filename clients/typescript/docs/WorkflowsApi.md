@@ -27,11 +27,11 @@ Create a new workflow. Admin only.
 import {
   Configuration,
   WorkflowsApi,
-} from '@zlayer/client';
-import type { CreateWorkflowOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateWorkflowOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -100,11 +100,11 @@ Delete a workflow. Admin only.
 import {
   Configuration,
   WorkflowsApi,
-} from '@zlayer/client';
-import type { DeleteWorkflowRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteWorkflowRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -173,11 +173,11 @@ Fetch a single workflow by id.
 import {
   Configuration,
   WorkflowsApi,
-} from '@zlayer/client';
-import type { GetWorkflowRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetWorkflowRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -245,11 +245,11 @@ List past runs for a workflow, most recent first.
 import {
   Configuration,
   WorkflowsApi,
-} from '@zlayer/client';
-import type { ListWorkflowRunsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListWorkflowRunsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -317,11 +317,11 @@ List workflows.
 import {
   Configuration,
   WorkflowsApi,
-} from '@zlayer/client';
-import type { ListWorkflowsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListWorkflowsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -381,11 +381,11 @@ Iterates steps sequentially: - &#x60;RunTask&#x60; — looks up the task and exe
 import {
   Configuration,
   WorkflowsApi,
-} from '@zlayer/client';
-import type { RunWorkflowRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { RunWorkflowRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

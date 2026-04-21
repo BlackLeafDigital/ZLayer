@@ -27,11 +27,11 @@ Create a new task. Admin only.
 import {
   Configuration,
   TasksApi,
-} from '@zlayer/client';
-import type { CreateTaskOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateTaskOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -100,11 +100,11 @@ Delete a task. Admin only.
 import {
   Configuration,
   TasksApi,
-} from '@zlayer/client';
-import type { DeleteTaskRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteTaskRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -173,11 +173,11 @@ Fetch a single task by id.
 import {
   Configuration,
   TasksApi,
-} from '@zlayer/client';
-import type { GetTaskRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetTaskRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -245,11 +245,11 @@ List past runs for a task, most recent first.
 import {
   Configuration,
   TasksApi,
-} from '@zlayer/client';
-import type { ListTaskRunsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListTaskRunsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -317,11 +317,11 @@ List tasks.
 import {
   Configuration,
   TasksApi,
-} from '@zlayer/client';
-import type { ListTasksRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListTasksRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -389,11 +389,11 @@ Runs the task\&#39;s body via &#x60;sh -c&#x60; on Unix, captures stdout/stderr,
 import {
   Configuration,
   TasksApi,
-} from '@zlayer/client';
-import type { RunTaskRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { RunTaskRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

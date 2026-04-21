@@ -94,6 +94,7 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         errors: ErrorsSpec::default(),
         devices: vec![],
         storage: vec![],
+        port_mappings: vec![],
         capabilities: vec![],
         privileged: false,
         node_mode: NodeMode::default(),
@@ -102,6 +103,10 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         wasm: None,
         logs: None,
         host_network: false,
+        hostname: None,
+        dns: Vec::new(),
+        extra_hosts: Vec::new(),
+        restart_policy: None,
     }
 }
 
@@ -251,7 +256,7 @@ async fn test_pull_image_if_not_present() {
 
     let result = tokio::time::timeout(
         SHORT_TIMEOUT,
-        runtime.pull_image_with_policy(TEST_IMAGE, PullPolicy::IfNotPresent),
+        runtime.pull_image_with_policy(TEST_IMAGE, PullPolicy::IfNotPresent, None),
     )
     .await;
 
@@ -873,7 +878,7 @@ async fn test_pull_never_policy() {
 
     println!("Testing Never pull policy with non-existent image");
     let result = runtime
-        .pull_image_with_policy(nonexistent_image, PullPolicy::Never)
+        .pull_image_with_policy(nonexistent_image, PullPolicy::Never, None)
         .await;
 
     // Never policy should return Ok immediately without pulling
@@ -895,7 +900,7 @@ async fn test_pull_always_policy() {
     println!("Testing Always pull policy");
     let result = tokio::time::timeout(
         LONG_TIMEOUT,
-        runtime.pull_image_with_policy(TEST_IMAGE, PullPolicy::Always),
+        runtime.pull_image_with_policy(TEST_IMAGE, PullPolicy::Always, None),
     )
     .await;
 

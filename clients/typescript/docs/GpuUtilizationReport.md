@@ -17,7 +17,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { GpuUtilizationReport } from '@zlayer/client'
+import type { GpuUtilizationReport } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

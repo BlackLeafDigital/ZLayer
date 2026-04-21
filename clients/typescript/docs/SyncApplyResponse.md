@@ -14,7 +14,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { SyncApplyResponse } from '@zlayer/client'
+import type { SyncApplyResponse } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

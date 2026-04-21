@@ -98,6 +98,51 @@ pub(crate) async fn handle_manager_init(
 
     // Branch C: full integration — resolve email + password, write to the
     // `bootstrap` env via the secrets API, emit a spec with a `$secret://` ref.
+    // Delegated to a platform-gated helper: the Unix version talks to the
+    // daemon, the Windows version bails with a WSL2 hint.
+    integrated_bootstrap_init(
+        &output,
+        port,
+        &version,
+        deploy,
+        email,
+        password,
+        password_file,
+        random,
+        no_prompt,
+    )
+    .await
+}
+
+// ---------------------------------------------------------------------------
+// Branch C: integrated bootstrap init (Unix-only; Windows bails)
+// ---------------------------------------------------------------------------
+
+/// Full integration path for `zlayer manager init`: resolve an admin email +
+/// password, stash the password in the daemon's `bootstrap` environment via
+/// the secrets API, and emit a spec that references
+/// `$secret://bootstrap/ZLAYER_BOOTSTRAP_PASSWORD`.
+///
+/// This requires the daemon, which only runs on Unix. The Windows build
+/// exposes a matching signature that bails with a WSL2 hint so the rest of
+/// the `handle_manager` dispatcher remains cross-platform.
+#[cfg(unix)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::needless_pass_by_value
+)]
+async fn integrated_bootstrap_init(
+    output: &Path,
+    port: u16,
+    version: &str,
+    deploy: bool,
+    email: Option<String>,
+    password: Option<String>,
+    password_file: Option<PathBuf>,
+    random: bool,
+    no_prompt: bool,
+) -> Result<()> {
     let email = if let Some(e) = email {
         validate_email(&e)?;
         e
@@ -122,7 +167,7 @@ pub(crate) async fn handle_manager_init(
         .await
         .context("Failed to store bootstrap password in the secrets store")?;
 
-    emit_integrated_spec(&output, port, &version, deploy, &email)?;
+    emit_integrated_spec(output, port, version, deploy, &email)?;
 
     let spec_path = output.join("manager.zlayer.yml");
 
@@ -153,10 +198,42 @@ pub(crate) async fn handle_manager_init(
     Ok(())
 }
 
+/// Windows stub for [`integrated_bootstrap_init`]: the daemon is Unix-only,
+/// so we can't resolve `$secret://` refs or talk to the secrets API from the
+/// thin Windows CLI. Point the user at the two cross-platform branches or at
+/// WSL2.
+#[cfg(not(unix))]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::needless_pass_by_value,
+    clippy::unused_async
+)]
+async fn integrated_bootstrap_init(
+    _output: &Path,
+    _port: u16,
+    _version: &str,
+    _deploy: bool,
+    _email: Option<String>,
+    _password: Option<String>,
+    _password_file: Option<PathBuf>,
+    _random: bool,
+    _no_prompt: bool,
+) -> Result<()> {
+    bail!(
+        "`zlayer manager init` with bootstrap password integration requires \
+         the daemon, which only runs on Unix.\n\
+         On Windows, use `--no-bootstrap` or `--env-file`, or run `zlayer serve` inside WSL2 \
+         and use the daemon API."
+    )
+}
+
 // ---------------------------------------------------------------------------
-// Helpers: email + password resolution
+// Helpers: email + password resolution (Unix-only; consumed by
+// `integrated_bootstrap_init`'s Unix arm)
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 fn validate_email(email: &str) -> Result<()> {
     let trimmed = email.trim();
     if trimmed.is_empty() || !trimmed.contains('@') {
@@ -165,6 +242,7 @@ fn validate_email(email: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn prompt_email_interactive() -> Result<String> {
     use std::io::{stdin, stdout, Write};
     print!("Admin email: ");
@@ -183,6 +261,7 @@ fn prompt_email_interactive() -> Result<String> {
 /// Returns `(plaintext, was_random)`. Exactly one of `--password`,
 /// `--password-file`, or `--random` may be set; otherwise the password is
 /// read interactively (or we error out when `--no-prompt` is set).
+#[cfg(unix)]
 fn resolve_password(
     inline: Option<String>,
     file: Option<PathBuf>,
@@ -237,6 +316,7 @@ fn resolve_password(
     }
 }
 
+#[cfg(unix)]
 fn prompt_password_interactive() -> Result<String> {
     // `dialoguer::Password` suppresses echo and handles confirmation for us.
     // The `password` feature is already enabled in bin/zlayer/Cargo.toml.
@@ -253,10 +333,11 @@ fn prompt_password_interactive() -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers: daemon interaction
+// Helpers: daemon interaction (Unix-only; `DaemonClient` is gated to Unix)
 // ---------------------------------------------------------------------------
 
 /// Look up (or create) the global `bootstrap` environment and return its id.
+#[cfg(unix)]
 async fn ensure_bootstrap_env(client: &zlayer_client::DaemonClient) -> Result<String> {
     const NAME: &str = "bootstrap";
 
@@ -413,6 +494,7 @@ services:
 
 /// Spec that references the secret stored in the `bootstrap` environment.
 /// The `$secret://` reference is resolved by zlayer-agent at container start.
+#[cfg(unix)]
 fn emit_integrated_spec(
     output: &Path,
     port: u16,

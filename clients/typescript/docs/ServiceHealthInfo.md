@@ -16,7 +16,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { ServiceHealthInfo } from '@zlayer/client'
+import type { ServiceHealthInfo } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

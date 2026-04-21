@@ -9,6 +9,8 @@ All URIs are relative to *http://localhost*
 | [**deleteSecret**](SecretsApi.md#deletesecret) | **DELETE** /api/v1/secrets/{name} | Delete a secret. |
 | [**getSecretMetadata**](SecretsApi.md#getsecretmetadata) | **GET** /api/v1/secrets/{name} | Get metadata for a specific secret. With &#x60;?reveal&#x3D;true&#x60; (admin only), the response also includes the plaintext &#x60;value&#x60;. |
 | [**listSecrets**](SecretsApi.md#listsecrets) | **GET** /api/v1/secrets | List secrets in a scope. |
+| [**revealAllSecrets**](SecretsApi.md#revealallsecrets) | **GET** /api/v1/secrets/reveal-all | Reveal every secret in an environment at once (admin only). |
+| [**rotateSecret**](SecretsApi.md#rotatesecretoperation) | **POST** /api/v1/secrets/{name}/rotate | Rotate a secret — overwrite with a new value and return the version before+after. |
 
 
 
@@ -26,11 +28,11 @@ Each non-empty, non-comment line is parsed into a (name, value) pair and written
 import {
   Configuration,
   SecretsApi,
-} from '@zlayer/client';
-import type { BulkImportSecretsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { BulkImportSecretsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -103,11 +105,11 @@ Stores a new secret or updates an existing one. The secret value is encrypted at
 import {
   Configuration,
   SecretsApi,
-} from '@zlayer/client';
-import type { CreateSecretOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateSecretOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -185,11 +187,11 @@ Scope resolution: see [&#x60;resolve_scope_get&#x60;] (the same query type is re
 import {
   Configuration,
   SecretsApi,
-} from '@zlayer/client';
-import type { DeleteSecretRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteSecretRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -265,11 +267,11 @@ Scope resolution: see [&#x60;resolve_scope_get&#x60;].  # Errors  Returns an err
 import {
   Configuration,
   SecretsApi,
-} from '@zlayer/client';
-import type { GetSecretMetadataRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetSecretMetadataRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -348,11 +350,11 @@ Scope resolution: see [&#x60;resolve_scope&#x60;].  # Errors  Returns an error i
 import {
   Configuration,
   SecretsApi,
-} from '@zlayer/client';
-import type { ListSecretsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListSecretsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -406,6 +408,164 @@ example().catch(console.error);
 | **200** | List of secret metadata |  -  |
 | **401** | Unauthorized |  -  |
 | **404** | Environment id unknown |  -  |
+
+[[Back to top]](#) [[Back to API list]](../README.md#api-endpoints) [[Back to Model list]](../README.md#models) [[Back to README]](../README.md)
+
+
+## revealAllSecrets
+
+> RevealAllSecretsResponse revealAllSecrets(environment)
+
+Reveal every secret in an environment at once (admin only).
+
+Used by &#x60;zlayer run&#x60; to build the child-process env in a single round-trip.  # Errors  Returns &#x60;ApiError::Forbidden&#x60; if the caller is not admin, &#x60;ApiError::NotFound&#x60; if the environment is unknown, and &#x60;ApiError::Internal&#x60; for storage failures.
+
+### Example
+
+```ts
+import {
+  Configuration,
+  SecretsApi,
+} from '@zlayer/api-client';
+import type { RevealAllSecretsRequest } from '@zlayer/api-client';
+
+async function example() {
+  console.log("🚀 Testing @zlayer/api-client SDK...");
+  const config = new Configuration({ 
+    // Configure HTTP bearer authorization: bearer_auth
+    accessToken: "YOUR BEARER TOKEN",
+  });
+  const api = new SecretsApi(config);
+
+  const body = {
+    // string | Environment id (required)
+    environment: environment_example,
+  } satisfies RevealAllSecretsRequest;
+
+  try {
+    const data = await api.revealAllSecrets(body);
+    console.log(data);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+// Run the test
+example().catch(console.error);
+```
+
+### Parameters
+
+
+| Name | Type | Description  | Notes |
+|------------- | ------------- | ------------- | -------------|
+| **environment** | `string` | Environment id (required) | [Defaults to `undefined`] |
+
+### Return type
+
+[**RevealAllSecretsResponse**](RevealAllSecretsResponse.md)
+
+### Authorization
+
+[bearer_auth](../README.md#bearer_auth)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: `application/json`
+
+
+### HTTP response details
+| Status code | Description | Response headers |
+|-------------|-------------|------------------|
+| **200** | Every secret revealed |  -  |
+| **401** | Unauthorized |  -  |
+| **403** | Admin required |  -  |
+| **404** | Environment not found |  -  |
+
+[[Back to top]](#) [[Back to API list]](../README.md#api-endpoints) [[Back to Model list]](../README.md#models) [[Back to README]](../README.md)
+
+
+## rotateSecret
+
+> RotateSecretResponse rotateSecret(name, rotateSecretRequest, environment, scope)
+
+Rotate a secret — overwrite with a new value and return the version before+after.
+
+Admin-only in v1. Mutually exclusive scope query like the other endpoints.  # Errors  Returns &#x60;ApiError::BadRequest&#x60; for empty names or conflicting scope params, &#x60;ApiError::Forbidden&#x60; for non-admin callers, &#x60;ApiError::NotFound&#x60; when the secret or environment is unknown, and &#x60;ApiError::Internal&#x60; for storage failures.
+
+### Example
+
+```ts
+import {
+  Configuration,
+  SecretsApi,
+} from '@zlayer/api-client';
+import type { RotateSecretOperationRequest } from '@zlayer/api-client';
+
+async function example() {
+  console.log("🚀 Testing @zlayer/api-client SDK...");
+  const config = new Configuration({ 
+    // Configure HTTP bearer authorization: bearer_auth
+    accessToken: "YOUR BEARER TOKEN",
+  });
+  const api = new SecretsApi(config);
+
+  const body = {
+    // string | Secret name
+    name: name_example,
+    // RotateSecretRequest
+    rotateSecretRequest: ...,
+    // string | Environment id (optional)
+    environment: environment_example,
+    // string | Explicit scope (legacy) (optional)
+    scope: scope_example,
+  } satisfies RotateSecretOperationRequest;
+
+  try {
+    const data = await api.rotateSecret(body);
+    console.log(data);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+// Run the test
+example().catch(console.error);
+```
+
+### Parameters
+
+
+| Name | Type | Description  | Notes |
+|------------- | ------------- | ------------- | -------------|
+| **name** | `string` | Secret name | [Defaults to `undefined`] |
+| **rotateSecretRequest** | [RotateSecretRequest](RotateSecretRequest.md) |  | |
+| **environment** | `string` | Environment id | [Optional] [Defaults to `undefined`] |
+| **scope** | `string` | Explicit scope (legacy) | [Optional] [Defaults to `undefined`] |
+
+### Return type
+
+[**RotateSecretResponse**](RotateSecretResponse.md)
+
+### Authorization
+
+[bearer_auth](../README.md#bearer_auth)
+
+### HTTP request headers
+
+- **Content-Type**: `application/json`
+- **Accept**: `application/json`
+
+
+### HTTP response details
+| Status code | Description | Response headers |
+|-------------|-------------|------------------|
+| **200** | Secret rotated |  -  |
+| **400** | Invalid request |  -  |
+| **401** | Unauthorized |  -  |
+| **403** | Forbidden |  -  |
+| **404** | Secret or environment not found |  -  |
 
 [[Back to top]](#) [[Back to API list]](../README.md#api-endpoints) [[Back to Model list]](../README.md#models) [[Back to README]](../README.md)
 

@@ -302,7 +302,7 @@ impl JobExecutor {
 
         // Pull image
         if let Err(e) = runtime
-            .pull_image_with_policy(&spec.image.name, spec.image.pull_policy)
+            .pull_image_with_policy(&spec.image.name, spec.image.pull_policy, None)
             .await
         {
             error!(

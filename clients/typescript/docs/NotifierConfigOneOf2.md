@@ -15,7 +15,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { NotifierConfigOneOf2 } from '@zlayer/client'
+import type { NotifierConfigOneOf2 } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

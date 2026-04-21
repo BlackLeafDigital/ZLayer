@@ -17,6 +17,9 @@ import * as runtime from '../runtime';
 import type {
   BulkImportResponse,
   CreateSecretRequest,
+  RevealAllSecretsResponse,
+  RotateSecretRequest,
+  RotateSecretResponse,
   SecretMetadataResponse,
 } from '../models/index';
 import {
@@ -24,6 +27,12 @@ import {
     BulkImportResponseToJSON,
     CreateSecretRequestFromJSON,
     CreateSecretRequestToJSON,
+    RevealAllSecretsResponseFromJSON,
+    RevealAllSecretsResponseToJSON,
+    RotateSecretRequestFromJSON,
+    RotateSecretRequestToJSON,
+    RotateSecretResponseFromJSON,
+    RotateSecretResponseToJSON,
     SecretMetadataResponseFromJSON,
     SecretMetadataResponseToJSON,
 } from '../models/index';
@@ -53,6 +62,17 @@ export interface GetSecretMetadataRequest {
 }
 
 export interface ListSecretsRequest {
+    environment?: string;
+    scope?: string;
+}
+
+export interface RevealAllSecretsRequest {
+    environment: string;
+}
+
+export interface RotateSecretOperationRequest {
+    name: string;
+    rotateSecretRequest: RotateSecretRequest;
     environment?: string;
     scope?: string;
 }
@@ -376,6 +396,137 @@ export class SecretsApi extends runtime.BaseAPI {
      */
     async listSecrets(requestParameters: ListSecretsRequest = {}, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Array<SecretMetadataResponse>> {
         const response = await this.listSecretsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Creates request options for revealAllSecrets without sending the request
+     */
+    async revealAllSecretsRequestOpts(requestParameters: RevealAllSecretsRequest): Promise<runtime.RequestOpts> {
+        if (requestParameters['environment'] == null) {
+            throw new runtime.RequiredError(
+                'environment',
+                'Required parameter "environment" was null or undefined when calling revealAllSecrets().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        if (requestParameters['environment'] != null) {
+            queryParameters['environment'] = requestParameters['environment'];
+        }
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearer_auth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/api/v1/secrets/reveal-all`;
+
+        return {
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        };
+    }
+
+    /**
+     * Used by `zlayer run` to build the child-process env in a single round-trip.  # Errors  Returns `ApiError::Forbidden` if the caller is not admin, `ApiError::NotFound` if the environment is unknown, and `ApiError::Internal` for storage failures.
+     * Reveal every secret in an environment at once (admin only).
+     */
+    async revealAllSecretsRaw(requestParameters: RevealAllSecretsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<RevealAllSecretsResponse>> {
+        const requestOptions = await this.revealAllSecretsRequestOpts(requestParameters);
+        const response = await this.request(requestOptions, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => RevealAllSecretsResponseFromJSON(jsonValue));
+    }
+
+    /**
+     * Used by `zlayer run` to build the child-process env in a single round-trip.  # Errors  Returns `ApiError::Forbidden` if the caller is not admin, `ApiError::NotFound` if the environment is unknown, and `ApiError::Internal` for storage failures.
+     * Reveal every secret in an environment at once (admin only).
+     */
+    async revealAllSecrets(requestParameters: RevealAllSecretsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<RevealAllSecretsResponse> {
+        const response = await this.revealAllSecretsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Creates request options for rotateSecret without sending the request
+     */
+    async rotateSecretRequestOpts(requestParameters: RotateSecretOperationRequest): Promise<runtime.RequestOpts> {
+        if (requestParameters['name'] == null) {
+            throw new runtime.RequiredError(
+                'name',
+                'Required parameter "name" was null or undefined when calling rotateSecret().'
+            );
+        }
+
+        if (requestParameters['rotateSecretRequest'] == null) {
+            throw new runtime.RequiredError(
+                'rotateSecretRequest',
+                'Required parameter "rotateSecretRequest" was null or undefined when calling rotateSecret().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        if (requestParameters['environment'] != null) {
+            queryParameters['environment'] = requestParameters['environment'];
+        }
+
+        if (requestParameters['scope'] != null) {
+            queryParameters['scope'] = requestParameters['scope'];
+        }
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        headerParameters['Content-Type'] = 'application/json';
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearer_auth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/api/v1/secrets/{name}/rotate`;
+        urlPath = urlPath.replace(`{${"name"}}`, encodeURIComponent(String(requestParameters['name'])));
+
+        return {
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: RotateSecretRequestToJSON(requestParameters['rotateSecretRequest']),
+        };
+    }
+
+    /**
+     * Admin-only in v1. Mutually exclusive scope query like the other endpoints.  # Errors  Returns `ApiError::BadRequest` for empty names or conflicting scope params, `ApiError::Forbidden` for non-admin callers, `ApiError::NotFound` when the secret or environment is unknown, and `ApiError::Internal` for storage failures.
+     * Rotate a secret — overwrite with a new value and return the version before+after.
+     */
+    async rotateSecretRaw(requestParameters: RotateSecretOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<RotateSecretResponse>> {
+        const requestOptions = await this.rotateSecretRequestOpts(requestParameters);
+        const response = await this.request(requestOptions, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => RotateSecretResponseFromJSON(jsonValue));
+    }
+
+    /**
+     * Admin-only in v1. Mutually exclusive scope query like the other endpoints.  # Errors  Returns `ApiError::BadRequest` for empty names or conflicting scope params, `ApiError::Forbidden` for non-admin callers, `ApiError::NotFound` when the secret or environment is unknown, and `ApiError::Internal` for storage failures.
+     * Rotate a secret — overwrite with a new value and return the version before+after.
+     */
+    async rotateSecret(requestParameters: RotateSecretOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<RotateSecretResponse> {
+        const response = await this.rotateSecretRaw(requestParameters, initOverrides);
         return await response.value();
     }
 

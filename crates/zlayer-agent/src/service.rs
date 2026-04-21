@@ -117,7 +117,7 @@ impl ServiceInstance {
         if replicas > current_replicas {
             // Pull image ONCE before creating any replicas (cached layers are reused)
             self.runtime
-                .pull_image_with_policy(&self.spec.image.name, self.spec.image.pull_policy)
+                .pull_image_with_policy(&self.spec.image.name, self.spec.image.pull_policy, None)
                 .await
                 .map_err(|e| AgentError::PullFailed {
                     image: self.spec.image.name.clone(),

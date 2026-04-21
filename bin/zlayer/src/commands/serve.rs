@@ -12,13 +12,13 @@ use zlayer_api::handlers::cluster::ClusterApiState;
 use zlayer_api::handlers::nodes::NodeApiState;
 use zlayer_api::handlers::overlay::OverlayApiState;
 use zlayer_api::router::{
-    build_cluster_routes, build_container_routes, build_cron_routes, build_job_routes,
-    build_network_routes, build_node_routes, build_overlay_routes, build_tunnel_routes,
-    build_volume_routes,
+    build_cluster_routes, build_container_network_routes, build_container_routes,
+    build_cron_routes, build_event_routes, build_job_routes, build_network_routes,
+    build_node_routes, build_overlay_routes, build_tunnel_routes, build_volume_routes,
 };
 use zlayer_api::{
-    ApiConfig, BuildState, ContainerApiState, CronState, JobState, NetworkApiState, TunnelApiState,
-    VolumeApiState,
+    ApiConfig, BridgeNetworkApiState, BuildState, ContainerApiState, CronState, JobState,
+    NetworkApiState, TunnelApiState, VolumeApiState,
 };
 use zlayer_overlay::IpAllocator;
 
@@ -1018,10 +1018,28 @@ pub(crate) async fn serve(
     let build_api_routes = build_routes().with_state(build_state);
     router = router.nest("/api/v1", build_api_routes);
 
-    // Merge container lifecycle routes
-    let container_state = ContainerApiState::new(runtime);
-    let container_routes = build_container_routes(container_state);
+    // Build the bridge-network (Docker-style `docker network create`) state.
+    // When the `docker` feature is enabled AND the daemon can connect to a
+    // Docker socket, we wire a `DockerBridgeNetworkRuntime` into the state so
+    // `POST /api/v1/container-networks` actually creates real Docker
+    // networks; otherwise the state stays in metadata-only mode and a
+    // warning is logged the first time a handler would need the runtime.
+    let bridge_network_state = build_bridge_network_state().await;
+    let container_network_routes = build_container_network_routes(bridge_network_state.clone());
+    router = router.nest("/api/v1/container-networks", container_network_routes);
+
+    // Merge container lifecycle routes. The same `container_state` is used
+    // for the daemon-wide event stream at `/api/v1/events` so lifecycle
+    // handlers and event subscribers share the broadcast bus. The
+    // bridge-network state is threaded in so `CreateContainerRequest.networks`
+    // can attach freshly-created containers to user-defined networks.
+    let container_state =
+        ContainerApiState::new(runtime).with_bridge_networks(bridge_network_state);
+    let container_routes = build_container_routes(container_state.clone());
     router = router.nest("/api/v1/containers", container_routes);
+
+    let event_routes = build_event_routes(container_state);
+    router = router.nest("/api/v1/events", event_routes);
 
     // Merge volume management routes
     let volume_dir = config.data_dir.join("volumes");
@@ -1358,6 +1376,42 @@ impl StorageBundle {
             })
         }
     }
+}
+
+/// Build the bridge-network ([`BridgeNetworkApiState`]) with a Docker-backed
+/// runtime attached when possible.
+///
+/// When the `docker` feature is enabled and `bollard` can reach the local
+/// Docker daemon, we wrap a [`DockerBridgeNetworkRuntime`] into the state so
+/// `POST /api/v1/container-networks` and the `networks` field on
+/// `CreateContainerRequest` actually create / attach real Docker networks.
+///
+/// When the feature is disabled, or Docker is unavailable at startup, the
+/// state falls back to metadata-only mode (the in-memory registry still
+/// tracks network specs and attachments, but nothing happens on the
+/// container-runtime side). The `BridgeNetworkApiState` logs a single
+/// warning on the first handler call in that mode.
+async fn build_bridge_network_state() -> BridgeNetworkApiState {
+    let state = BridgeNetworkApiState::new();
+
+    #[cfg(feature = "docker")]
+    {
+        match zlayer_api::DockerBridgeNetworkRuntime::connect_local().await {
+            Ok(rt) => {
+                info!("Docker bridge-network runtime attached");
+                return state.with_runtime(std::sync::Arc::new(rt));
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Docker not reachable; /api/v1/container-networks runs in \
+                     metadata-only mode"
+                );
+            }
+        }
+    }
+
+    state
 }
 
 #[cfg(test)]

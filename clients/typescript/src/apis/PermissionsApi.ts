@@ -34,6 +34,11 @@ export interface ListPermissionsRequest {
     group?: string | null;
 }
 
+export interface ListPermissionsByResourceRequest {
+    kind: string;
+    id?: string | null;
+}
+
 export interface RevokePermissionRequest {
     id: string;
 }
@@ -136,6 +141,60 @@ export class PermissionsApi extends runtime.BaseAPI {
      */
     async listPermissions(requestParameters: ListPermissionsRequest = {}, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Array<StoredPermission>> {
         const response = await this.listPermissionsRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
+
+    /**
+     * Creates request options for listPermissionsByResource without sending the request
+     */
+    async listPermissionsByResourceRequestOpts(requestParameters: ListPermissionsByResourceRequest): Promise<runtime.RequestOpts> {
+        if (requestParameters['kind'] == null) {
+            throw new runtime.RequiredError(
+                'kind',
+                'Required parameter "kind" was null or undefined when calling listPermissionsByResource().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        if (requestParameters['kind'] != null) {
+            queryParameters['kind'] = requestParameters['kind'];
+        }
+
+        if (requestParameters['id'] != null) {
+            queryParameters['id'] = requestParameters['id'];
+        }
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+
+        let urlPath = `/api/v1/permissions/by-resource`;
+
+        return {
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        };
+    }
+
+    /**
+     * When `id` is supplied, returns exact-resource grants; when omitted, returns wildcard grants for the given `kind`.  # Errors  Returns [`ApiError::Internal`] on store failure.
+     * List permissions granted on a specific resource.
+     */
+    async listPermissionsByResourceRaw(requestParameters: ListPermissionsByResourceRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Array<StoredPermission>>> {
+        const requestOptions = await this.listPermissionsByResourceRequestOpts(requestParameters);
+        const response = await this.request(requestOptions, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => jsonValue.map(StoredPermissionFromJSON));
+    }
+
+    /**
+     * When `id` is supplied, returns exact-resource grants; when omitted, returns wildcard grants for the given `kind`.  # Errors  Returns [`ApiError::Internal`] on store failure.
+     * List permissions granted on a specific resource.
+     */
+    async listPermissionsByResource(requestParameters: ListPermissionsByResourceRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Array<StoredPermission>> {
+        const response = await this.listPermissionsByResourceRaw(requestParameters, initOverrides);
         return await response.value();
     }
 

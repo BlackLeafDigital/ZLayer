@@ -13,6 +13,14 @@
  */
 
 import { mapValues } from '../runtime';
+import type { RegistryAuth } from './RegistryAuth';
+import {
+    RegistryAuthFromJSON,
+    RegistryAuthFromJSONTyped,
+    RegistryAuthToJSON,
+    RegistryAuthToJSONTyped,
+} from './RegistryAuth';
+
 /**
  * Request body for [`pull_image_handler`]. Blocking pull of an OCI image.
  * @export
@@ -32,6 +40,23 @@ export interface PullImageRequest {
      * @memberof PullImageRequest
      */
     reference: string;
+    /**
+     * Inline Docker/OCI registry credentials used for this pull only. Not
+     * persisted, never logged, never echoed back on a response. Takes
+     * precedence over `registry_credential_id`.
+     * @type {RegistryAuth}
+     * @memberof PullImageRequest
+     */
+    registryAuth?: RegistryAuth | null;
+    /**
+     * Id of a persisted registry credential (from
+     * `POST /api/v1/credentials/registry`) to use for this pull. Ignored
+     * when [`Self::registry_auth`] is also supplied (inline auth wins).
+     * Requires the daemon to be configured with a credential store.
+     * @type {string}
+     * @memberof PullImageRequest
+     */
+    registryCredentialId?: string | null;
 }
 
 /**
@@ -54,6 +79,8 @@ export function PullImageRequestFromJSONTyped(json: any, ignoreDiscriminator: bo
         
         'pullPolicy': json['pull_policy'] == null ? undefined : json['pull_policy'],
         'reference': json['reference'],
+        'registryAuth': json['registry_auth'] == null ? undefined : RegistryAuthFromJSON(json['registry_auth']),
+        'registryCredentialId': json['registry_credential_id'] == null ? undefined : json['registry_credential_id'],
     };
 }
 
@@ -70,6 +97,8 @@ export function PullImageRequestToJSONTyped(value?: PullImageRequest | null, ign
         
         'pull_policy': value['pullPolicy'],
         'reference': value['reference'],
+        'registry_auth': RegistryAuthToJSON(value['registryAuth']),
+        'registry_credential_id': value['registryCredentialId'],
     };
 }
 

@@ -8,26 +8,36 @@ Container information returned by the API
 Name | Type
 ------------ | -------------
 `createdAt` | string
+`exitCode` | number
+`health` | [ContainerHealthInfo](ContainerHealthInfo.md)
 `id` | string
 `image` | string
+`ipv4` | string
 `labels` | { [key: string]: string; }
 `name` | string
+`networks` | [Array&lt;NetworkAttachmentInfo&gt;](NetworkAttachmentInfo.md)
 `pid` | number
+`ports` | [Array&lt;PortMapping&gt;](PortMapping.md)
 `state` | string
 
 ## Example
 
 ```typescript
-import type { ContainerInfo } from '@zlayer/client'
+import type { ContainerInfo } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {
   "createdAt": null,
+  "exitCode": null,
+  "health": null,
   "id": null,
   "image": null,
+  "ipv4": null,
   "labels": null,
   "name": null,
+  "networks": null,
   "pid": null,
+  "ports": null,
   "state": null,
 } satisfies ContainerInfo
 

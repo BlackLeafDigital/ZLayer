@@ -9,16 +9,20 @@ Name | Type
 ------------ | -------------
 `pullPolicy` | string
 `reference` | string
+`registryAuth` | [RegistryAuth](RegistryAuth.md)
+`registryCredentialId` | string
 
 ## Example
 
 ```typescript
-import type { PullImageRequest } from '@zlayer/client'
+import type { PullImageRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {
   "pullPolicy": null,
   "reference": null,
+  "registryAuth": null,
+  "registryCredentialId": null,
 } satisfies PullImageRequest
 
 console.log(example)

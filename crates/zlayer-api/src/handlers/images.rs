@@ -27,13 +27,38 @@ use zlayer_spec::PullPolicy;
 pub struct ImageState {
     /// Container runtime (Youki / Docker / WASM / mock depending on daemon).
     pub runtime: Arc<dyn Runtime + Send + Sync>,
+    // -- §3.10: registry credential resolution -------------------------------
+    /// Optional persistent registry-credential store. When present, the
+    /// `POST /images/pull` handler honours
+    /// [`PullImageRequest::registry_credential_id`]; when absent, only
+    /// inline [`PullImageRequest::registry_auth`] is supported.
+    pub registry_store: Option<
+        Arc<zlayer_secrets::RegistryCredentialStore<Arc<zlayer_secrets::PersistentSecretsStore>>>,
+    >,
 }
 
 impl ImageState {
     /// Create a new image state from a runtime handle.
     #[must_use]
     pub fn new(runtime: Arc<dyn Runtime + Send + Sync>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            registry_store: None,
+        }
+    }
+
+    /// Attach the persistent registry-credential store so the pull handler
+    /// can resolve [`PullImageRequest::registry_credential_id`] into inline
+    /// credentials. Added for §3.10 of `ZLAYER_SDK_FIXES.md`.
+    #[must_use]
+    pub fn with_registry_store(
+        mut self,
+        registry_store: Arc<
+            zlayer_secrets::RegistryCredentialStore<Arc<zlayer_secrets::PersistentSecretsStore>>,
+        >,
+    ) -> Self {
+        self.registry_store = Some(registry_store);
+        self
     }
 }
 
@@ -86,6 +111,18 @@ pub struct PullImageRequest {
     /// `"never"`. Defaults to `"always"` when omitted.
     #[serde(default)]
     pub pull_policy: Option<String>,
+    // -- §3.10: registry auth -----------------------------------------------
+    /// Id of a persisted registry credential (from
+    /// `POST /api/v1/credentials/registry`) to use for this pull. Ignored
+    /// when [`Self::registry_auth`] is also supplied (inline auth wins).
+    /// Requires the daemon to be configured with a credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_credential_id: Option<String>,
+    /// Inline Docker/OCI registry credentials used for this pull only. Not
+    /// persisted, never logged, never echoed back on a response. Takes
+    /// precedence over `registry_credential_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_auth: Option<zlayer_spec::RegistryAuth>,
 }
 
 /// Response body for [`pull_image_handler`]. Reports the pulled reference
@@ -109,6 +146,54 @@ pub struct RemoveImageQuery {
     /// Force removal even if the image is referenced by containers.
     #[serde(default)]
     pub force: bool,
+}
+
+/// Resolve inline or stored registry credentials for the `/images/pull`
+/// handler (§3.10).
+///
+/// Mirrors the precedence rules used by the container-create handler:
+/// 1. Inline `registry_auth` — used verbatim, no store lookup.
+/// 2. `registry_credential_id` — fetched from the provided credential store.
+/// 3. Neither — returns `None` so the runtime falls back to its existing
+///    hostname-based lookup (or anonymous access).
+async fn resolve_pull_auth(
+    inline: Option<&zlayer_spec::RegistryAuth>,
+    credential_id: Option<&str>,
+    store: Option<
+        &zlayer_secrets::RegistryCredentialStore<Arc<zlayer_secrets::PersistentSecretsStore>>,
+    >,
+) -> Result<Option<zlayer_spec::RegistryAuth>> {
+    if let Some(auth) = inline {
+        return Ok(Some(auth.clone()));
+    }
+    let Some(id) = credential_id else {
+        return Ok(None);
+    };
+    let Some(store) = store else {
+        return Err(ApiError::BadRequest(
+            "registry_credential_id is set but the daemon has no registry credential store \
+             configured; either omit the field or configure the store at startup"
+                .to_string(),
+        ));
+    };
+    let meta = store
+        .get(id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to look up registry credential: {e}")))?
+        .ok_or_else(|| ApiError::NotFound(format!("registry credential '{id}' not found")))?;
+    let password = store
+        .get_password(id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("failed to load registry credential: {e}")))?;
+    let auth_type = match meta.auth_type {
+        zlayer_secrets::RegistryAuthType::Basic => zlayer_spec::RegistryAuthType::Basic,
+        zlayer_secrets::RegistryAuthType::Token => zlayer_spec::RegistryAuthType::Token,
+    };
+    Ok(Some(zlayer_spec::RegistryAuth {
+        username: meta.username,
+        password: password.expose().to_string(),
+        auth_type,
+    }))
 }
 
 /// Request body for [`tag_image_handler`]. Matches Docker-compat
@@ -262,9 +347,17 @@ pub async fn pull_image_handler(
         _ => PullPolicy::Always,
     };
 
+    // §3.10: resolve inline / stored registry credentials (inline wins).
+    let resolved_auth = resolve_pull_auth(
+        request.registry_auth.as_ref(),
+        request.registry_credential_id.as_deref(),
+        state.registry_store.as_deref(),
+    )
+    .await?;
+
     state
         .runtime
-        .pull_image_with_policy(&request.reference, policy)
+        .pull_image_with_policy(&request.reference, policy, resolved_auth.as_ref())
         .await
         .map_err(|e| ApiError::Internal(format!("failed to pull image: {e}")))?;
 

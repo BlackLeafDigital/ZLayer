@@ -26,11 +26,11 @@ List all cached images known to the runtime.
 import {
   Configuration,
   ImagesApi,
-} from '@zlayer/client';
-import type { ListImagesHandlerRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListImagesHandlerRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -91,11 +91,11 @@ Prune dangling / unused images from the runtime\&#39;s cache.
 import {
   Configuration,
   ImagesApi,
-} from '@zlayer/client';
-import type { PruneImagesHandlerRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { PruneImagesHandlerRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -156,11 +156,11 @@ This is a blocking pull: the handler returns only after the image is resolved an
 import {
   Configuration,
   ImagesApi,
-} from '@zlayer/client';
-import type { PullImageHandlerRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { PullImageHandlerRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -231,11 +231,11 @@ Remove an image from the runtime\&#39;s cache.
 import {
   Configuration,
   ImagesApi,
-} from '@zlayer/client';
-import type { RemoveImageHandlerRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { RemoveImageHandlerRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -308,11 +308,11 @@ Docker-compat &#x60;POST /api/v1/images/tag&#x60;: takes &#x60;{ source, target 
 import {
   Configuration,
   ImagesApi,
-} from '@zlayer/client';
-import type { TagImageHandlerRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { TagImageHandlerRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

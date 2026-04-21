@@ -22,11 +22,11 @@ List audit log entries. Admin only.
 import {
   Configuration,
   AuditApi,
-} from '@zlayer/client';
-import type { ListAuditRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListAuditRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new AuditApi();
 
   const body = {

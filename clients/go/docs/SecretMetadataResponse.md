@@ -4,10 +4,11 @@
 
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
-**CreatedAt** | **int64** | Unix timestamp when the secret was created | 
-**Name** | **string** | The name/identifier of the secret | 
-**UpdatedAt** | **int64** | Unix timestamp when the secret was last updated | 
-**Version** | **int32** | Version number of the secret (incremented on each update) | 
+**CreatedAt** | **int64** | Unix timestamp when the secret was created. | 
+**Name** | **string** | The name/identifier of the secret. | 
+**UpdatedAt** | **int64** | Unix timestamp when the secret was last updated. | 
+**Value** | Pointer to **NullableString** | Plaintext value — populated only on &#x60;?reveal&#x3D;true&#x60; admin reads. | [optional] 
+**Version** | **int32** | Version number of the secret (incremented on each update). | 
 
 ## Methods
 
@@ -88,6 +89,41 @@ and a boolean to check if the value has been set.
 SetUpdatedAt sets UpdatedAt field to given value.
 
 
+### GetValue
+
+`func (o *SecretMetadataResponse) GetValue() string`
+
+GetValue returns the Value field if non-nil, zero value otherwise.
+
+### GetValueOk
+
+`func (o *SecretMetadataResponse) GetValueOk() (*string, bool)`
+
+GetValueOk returns a tuple with the Value field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetValue
+
+`func (o *SecretMetadataResponse) SetValue(v string)`
+
+SetValue sets Value field to given value.
+
+### HasValue
+
+`func (o *SecretMetadataResponse) HasValue() bool`
+
+HasValue returns a boolean if a field has been set.
+
+### SetValueNil
+
+`func (o *SecretMetadataResponse) SetValueNil(b bool)`
+
+ SetValueNil sets the value for Value to be an explicit nil
+
+### UnsetValue
+`func (o *SecretMetadataResponse) UnsetValue()`
+
+UnsetValue ensures that no value is present for Value, not even an explicit nil
 ### GetVersion
 
 `func (o *SecretMetadataResponse) GetVersion() int32`

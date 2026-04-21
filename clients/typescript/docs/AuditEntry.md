@@ -20,7 +20,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { AuditEntry } from '@zlayer/client'
+import type { AuditEntry } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

@@ -14,23 +14,51 @@
 
 import { mapValues } from '../runtime';
 /**
- * Wait response with container exit code
+ * Wait response with container exit code plus optional classification
+ * fields (added in §3.12 of the SDK-fixes spec).
+ * 
+ * The three optional fields (`reason`, `signal`, `finished_at`) are
+ * additive — clients that only read `exit_code` keep working unchanged.
  * @export
  * @interface ContainerWaitResponse
  */
 export interface ContainerWaitResponse {
     /**
-     * Exit code (0 = success)
+     * Exit code (0 = success). When the container was killed by signal
+     * `N`, this is typically `128 + N`.
      * @type {number}
      * @memberof ContainerWaitResponse
      */
     exitCode: number;
+    /**
+     * RFC3339 timestamp of when the container exited, if reported by
+     * the runtime.
+     * @type {string}
+     * @memberof ContainerWaitResponse
+     */
+    finishedAt?: string | null;
     /**
      * Container identifier
      * @type {string}
      * @memberof ContainerWaitResponse
      */
     id: string;
+    /**
+     * Classification of the exit. One of `"exited"`, `"signal"`,
+     * `"oom_killed"`, or `"runtime_error"`. Absent when the runtime
+     * didn't classify the exit.
+     * @type {string}
+     * @memberof ContainerWaitResponse
+     */
+    reason?: string | null;
+    /**
+     * Signal name when `reason == "signal"`, e.g. `"SIGKILL"`. Absent
+     * when the runtime couldn't determine it (or the exit wasn't a
+     * signal death).
+     * @type {string}
+     * @memberof ContainerWaitResponse
+     */
+    signal?: string | null;
 }
 
 /**
@@ -53,7 +81,10 @@ export function ContainerWaitResponseFromJSONTyped(json: any, ignoreDiscriminato
     return {
         
         'exitCode': json['exit_code'],
+        'finishedAt': json['finished_at'] == null ? undefined : json['finished_at'],
         'id': json['id'],
+        'reason': json['reason'] == null ? undefined : json['reason'],
+        'signal': json['signal'] == null ? undefined : json['signal'],
     };
 }
 
@@ -69,7 +100,10 @@ export function ContainerWaitResponseToJSONTyped(value?: ContainerWaitResponse |
     return {
         
         'exit_code': value['exitCode'],
+        'finished_at': value['finishedAt'],
         'id': value['id'],
+        'reason': value['reason'],
+        'signal': value['signal'],
     };
 }
 

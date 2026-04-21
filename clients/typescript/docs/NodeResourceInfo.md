@@ -17,7 +17,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { NodeResourceInfo } from '@zlayer/client'
+import type { NodeResourceInfo } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

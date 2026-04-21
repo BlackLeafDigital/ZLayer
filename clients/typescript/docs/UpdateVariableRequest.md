@@ -13,7 +13,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { UpdateVariableRequest } from '@zlayer/client'
+import type { UpdateVariableRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

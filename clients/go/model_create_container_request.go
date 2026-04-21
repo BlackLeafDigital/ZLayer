@@ -23,16 +23,36 @@ var _ MappedNullable = &CreateContainerRequest{}
 type CreateContainerRequest struct {
 	// Command to run (overrides image entrypoint)
 	Command []string `json:"command,omitempty"`
+	// Additional DNS servers (maps to Docker's `--dns`). Each entry must be a plausible IPv4 or IPv6 address.
+	Dns []string `json:"dns,omitempty"`
 	// Environment variables
 	Env map[string]string `json:"env,omitempty"`
+	// Extra `hostname:ip` entries appended to `/etc/hosts` (maps to Docker's `--add-host`). The special literal `host-gateway` is accepted as the `ip` half.
+	ExtraHosts []string `json:"extra_hosts,omitempty"`
+	// Optional health check. When omitted, the daemon installs a no-op placeholder (`HealthCheck::Tcp { port: 0 }`) matching the current default; the health monitor treats `port == 0` as \"skip\".
+	HealthCheck NullableHealthCheckRequest `json:"health_check,omitempty"`
+	// Optional container hostname (maps to Docker's `--hostname`).
+	Hostname NullableString `json:"hostname,omitempty"`
 	// OCI image reference (e.g., \"nginx:latest\", \"ubuntu:22.04\")
 	Image string `json:"image"`
 	// Labels for filtering and grouping
 	Labels map[string]string `json:"labels,omitempty"`
 	// Optional human-readable name
 	Name NullableString `json:"name,omitempty"`
+	// User-defined bridge/overlay networks to attach the newly-created container to. Each entry references a network by id or name and is attached after the container is successfully started. If any attachment fails, the partially-started container is rolled back (stopped + removed) and the request is failed.
+	Networks []NetworkAttachmentRequest `json:"networks,omitempty"`
+	// Published ports (Docker's `-p host:container/proto`). When omitted, the container is created without any host port publishing.
+	Ports []PortMapping `json:"ports,omitempty"`
+	// Image pull policy: \"always\", \"`if_not_present`\", or \"never\"
+	PullPolicy NullableString `json:"pull_policy,omitempty"`
+	// Inline Docker/OCI registry credentials used for this pull only. Not persisted, never logged, never echoed back on a response. When both `registry_credential_id` and `registry_auth` are set, this field takes precedence.
+	RegistryAuth NullableRegistryAuth `json:"registry_auth,omitempty"`
+	// Id of a persisted registry credential (from `POST /api/v1/credentials/registry`) to use when pulling the image. Ignored when [`Self::registry_auth`] is also supplied (inline auth wins). Requires the daemon to be configured with a credential store — otherwise the request is rejected with `400`.
+	RegistryCredentialId NullableString `json:"registry_credential_id,omitempty"`
 	// Resource limits (CPU, memory)
 	Resources NullableContainerResourceLimits `json:"resources,omitempty"`
+	// Container restart policy (Docker-style). When omitted, the runtime applies no explicit restart policy (Docker default: `\"no\"`).
+	RestartPolicy NullableContainerRestartPolicy `json:"restart_policy,omitempty"`
 	// Volume mounts
 	Volumes []VolumeMount `json:"volumes,omitempty"`
 	// Working directory inside the container
@@ -92,6 +112,38 @@ func (o *CreateContainerRequest) SetCommand(v []string) {
 	o.Command = v
 }
 
+// GetDns returns the Dns field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetDns() []string {
+	if o == nil || IsNil(o.Dns) {
+		var ret []string
+		return ret
+	}
+	return o.Dns
+}
+
+// GetDnsOk returns a tuple with the Dns field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetDnsOk() ([]string, bool) {
+	if o == nil || IsNil(o.Dns) {
+		return nil, false
+	}
+	return o.Dns, true
+}
+
+// HasDns returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasDns() bool {
+	if o != nil && !IsNil(o.Dns) {
+		return true
+	}
+
+	return false
+}
+
+// SetDns gets a reference to the given []string and assigns it to the Dns field.
+func (o *CreateContainerRequest) SetDns(v []string) {
+	o.Dns = v
+}
+
 // GetEnv returns the Env field value if set, zero value otherwise.
 func (o *CreateContainerRequest) GetEnv() map[string]string {
 	if o == nil || IsNil(o.Env) {
@@ -122,6 +174,122 @@ func (o *CreateContainerRequest) HasEnv() bool {
 // SetEnv gets a reference to the given map[string]string and assigns it to the Env field.
 func (o *CreateContainerRequest) SetEnv(v map[string]string) {
 	o.Env = v
+}
+
+// GetExtraHosts returns the ExtraHosts field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetExtraHosts() []string {
+	if o == nil || IsNil(o.ExtraHosts) {
+		var ret []string
+		return ret
+	}
+	return o.ExtraHosts
+}
+
+// GetExtraHostsOk returns a tuple with the ExtraHosts field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetExtraHostsOk() ([]string, bool) {
+	if o == nil || IsNil(o.ExtraHosts) {
+		return nil, false
+	}
+	return o.ExtraHosts, true
+}
+
+// HasExtraHosts returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasExtraHosts() bool {
+	if o != nil && !IsNil(o.ExtraHosts) {
+		return true
+	}
+
+	return false
+}
+
+// SetExtraHosts gets a reference to the given []string and assigns it to the ExtraHosts field.
+func (o *CreateContainerRequest) SetExtraHosts(v []string) {
+	o.ExtraHosts = v
+}
+
+// GetHealthCheck returns the HealthCheck field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetHealthCheck() HealthCheckRequest {
+	if o == nil || IsNil(o.HealthCheck.Get()) {
+		var ret HealthCheckRequest
+		return ret
+	}
+	return *o.HealthCheck.Get()
+}
+
+// GetHealthCheckOk returns a tuple with the HealthCheck field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetHealthCheckOk() (*HealthCheckRequest, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.HealthCheck.Get(), o.HealthCheck.IsSet()
+}
+
+// HasHealthCheck returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasHealthCheck() bool {
+	if o != nil && o.HealthCheck.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetHealthCheck gets a reference to the given NullableHealthCheckRequest and assigns it to the HealthCheck field.
+func (o *CreateContainerRequest) SetHealthCheck(v HealthCheckRequest) {
+	o.HealthCheck.Set(&v)
+}
+// SetHealthCheckNil sets the value for HealthCheck to be an explicit nil
+func (o *CreateContainerRequest) SetHealthCheckNil() {
+	o.HealthCheck.Set(nil)
+}
+
+// UnsetHealthCheck ensures that no value is present for HealthCheck, not even an explicit nil
+func (o *CreateContainerRequest) UnsetHealthCheck() {
+	o.HealthCheck.Unset()
+}
+
+// GetHostname returns the Hostname field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetHostname() string {
+	if o == nil || IsNil(o.Hostname.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.Hostname.Get()
+}
+
+// GetHostnameOk returns a tuple with the Hostname field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetHostnameOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Hostname.Get(), o.Hostname.IsSet()
+}
+
+// HasHostname returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasHostname() bool {
+	if o != nil && o.Hostname.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetHostname gets a reference to the given NullableString and assigns it to the Hostname field.
+func (o *CreateContainerRequest) SetHostname(v string) {
+	o.Hostname.Set(&v)
+}
+// SetHostnameNil sets the value for Hostname to be an explicit nil
+func (o *CreateContainerRequest) SetHostnameNil() {
+	o.Hostname.Set(nil)
+}
+
+// UnsetHostname ensures that no value is present for Hostname, not even an explicit nil
+func (o *CreateContainerRequest) UnsetHostname() {
+	o.Hostname.Unset()
 }
 
 // GetImage returns the Image field value
@@ -222,6 +390,196 @@ func (o *CreateContainerRequest) UnsetName() {
 	o.Name.Unset()
 }
 
+// GetNetworks returns the Networks field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetNetworks() []NetworkAttachmentRequest {
+	if o == nil || IsNil(o.Networks) {
+		var ret []NetworkAttachmentRequest
+		return ret
+	}
+	return o.Networks
+}
+
+// GetNetworksOk returns a tuple with the Networks field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetNetworksOk() ([]NetworkAttachmentRequest, bool) {
+	if o == nil || IsNil(o.Networks) {
+		return nil, false
+	}
+	return o.Networks, true
+}
+
+// HasNetworks returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasNetworks() bool {
+	if o != nil && !IsNil(o.Networks) {
+		return true
+	}
+
+	return false
+}
+
+// SetNetworks gets a reference to the given []NetworkAttachmentRequest and assigns it to the Networks field.
+func (o *CreateContainerRequest) SetNetworks(v []NetworkAttachmentRequest) {
+	o.Networks = v
+}
+
+// GetPorts returns the Ports field value if set, zero value otherwise.
+func (o *CreateContainerRequest) GetPorts() []PortMapping {
+	if o == nil || IsNil(o.Ports) {
+		var ret []PortMapping
+		return ret
+	}
+	return o.Ports
+}
+
+// GetPortsOk returns a tuple with the Ports field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *CreateContainerRequest) GetPortsOk() ([]PortMapping, bool) {
+	if o == nil || IsNil(o.Ports) {
+		return nil, false
+	}
+	return o.Ports, true
+}
+
+// HasPorts returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasPorts() bool {
+	if o != nil && !IsNil(o.Ports) {
+		return true
+	}
+
+	return false
+}
+
+// SetPorts gets a reference to the given []PortMapping and assigns it to the Ports field.
+func (o *CreateContainerRequest) SetPorts(v []PortMapping) {
+	o.Ports = v
+}
+
+// GetPullPolicy returns the PullPolicy field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetPullPolicy() string {
+	if o == nil || IsNil(o.PullPolicy.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.PullPolicy.Get()
+}
+
+// GetPullPolicyOk returns a tuple with the PullPolicy field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetPullPolicyOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.PullPolicy.Get(), o.PullPolicy.IsSet()
+}
+
+// HasPullPolicy returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasPullPolicy() bool {
+	if o != nil && o.PullPolicy.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetPullPolicy gets a reference to the given NullableString and assigns it to the PullPolicy field.
+func (o *CreateContainerRequest) SetPullPolicy(v string) {
+	o.PullPolicy.Set(&v)
+}
+// SetPullPolicyNil sets the value for PullPolicy to be an explicit nil
+func (o *CreateContainerRequest) SetPullPolicyNil() {
+	o.PullPolicy.Set(nil)
+}
+
+// UnsetPullPolicy ensures that no value is present for PullPolicy, not even an explicit nil
+func (o *CreateContainerRequest) UnsetPullPolicy() {
+	o.PullPolicy.Unset()
+}
+
+// GetRegistryAuth returns the RegistryAuth field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetRegistryAuth() RegistryAuth {
+	if o == nil || IsNil(o.RegistryAuth.Get()) {
+		var ret RegistryAuth
+		return ret
+	}
+	return *o.RegistryAuth.Get()
+}
+
+// GetRegistryAuthOk returns a tuple with the RegistryAuth field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetRegistryAuthOk() (*RegistryAuth, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.RegistryAuth.Get(), o.RegistryAuth.IsSet()
+}
+
+// HasRegistryAuth returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasRegistryAuth() bool {
+	if o != nil && o.RegistryAuth.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetRegistryAuth gets a reference to the given NullableRegistryAuth and assigns it to the RegistryAuth field.
+func (o *CreateContainerRequest) SetRegistryAuth(v RegistryAuth) {
+	o.RegistryAuth.Set(&v)
+}
+// SetRegistryAuthNil sets the value for RegistryAuth to be an explicit nil
+func (o *CreateContainerRequest) SetRegistryAuthNil() {
+	o.RegistryAuth.Set(nil)
+}
+
+// UnsetRegistryAuth ensures that no value is present for RegistryAuth, not even an explicit nil
+func (o *CreateContainerRequest) UnsetRegistryAuth() {
+	o.RegistryAuth.Unset()
+}
+
+// GetRegistryCredentialId returns the RegistryCredentialId field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetRegistryCredentialId() string {
+	if o == nil || IsNil(o.RegistryCredentialId.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.RegistryCredentialId.Get()
+}
+
+// GetRegistryCredentialIdOk returns a tuple with the RegistryCredentialId field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetRegistryCredentialIdOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.RegistryCredentialId.Get(), o.RegistryCredentialId.IsSet()
+}
+
+// HasRegistryCredentialId returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasRegistryCredentialId() bool {
+	if o != nil && o.RegistryCredentialId.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetRegistryCredentialId gets a reference to the given NullableString and assigns it to the RegistryCredentialId field.
+func (o *CreateContainerRequest) SetRegistryCredentialId(v string) {
+	o.RegistryCredentialId.Set(&v)
+}
+// SetRegistryCredentialIdNil sets the value for RegistryCredentialId to be an explicit nil
+func (o *CreateContainerRequest) SetRegistryCredentialIdNil() {
+	o.RegistryCredentialId.Set(nil)
+}
+
+// UnsetRegistryCredentialId ensures that no value is present for RegistryCredentialId, not even an explicit nil
+func (o *CreateContainerRequest) UnsetRegistryCredentialId() {
+	o.RegistryCredentialId.Unset()
+}
+
 // GetResources returns the Resources field value if set, zero value otherwise (both if not set or set to explicit null).
 func (o *CreateContainerRequest) GetResources() ContainerResourceLimits {
 	if o == nil || IsNil(o.Resources.Get()) {
@@ -262,6 +620,48 @@ func (o *CreateContainerRequest) SetResourcesNil() {
 // UnsetResources ensures that no value is present for Resources, not even an explicit nil
 func (o *CreateContainerRequest) UnsetResources() {
 	o.Resources.Unset()
+}
+
+// GetRestartPolicy returns the RestartPolicy field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateContainerRequest) GetRestartPolicy() ContainerRestartPolicy {
+	if o == nil || IsNil(o.RestartPolicy.Get()) {
+		var ret ContainerRestartPolicy
+		return ret
+	}
+	return *o.RestartPolicy.Get()
+}
+
+// GetRestartPolicyOk returns a tuple with the RestartPolicy field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateContainerRequest) GetRestartPolicyOk() (*ContainerRestartPolicy, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.RestartPolicy.Get(), o.RestartPolicy.IsSet()
+}
+
+// HasRestartPolicy returns a boolean if a field has been set.
+func (o *CreateContainerRequest) HasRestartPolicy() bool {
+	if o != nil && o.RestartPolicy.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetRestartPolicy gets a reference to the given NullableContainerRestartPolicy and assigns it to the RestartPolicy field.
+func (o *CreateContainerRequest) SetRestartPolicy(v ContainerRestartPolicy) {
+	o.RestartPolicy.Set(&v)
+}
+// SetRestartPolicyNil sets the value for RestartPolicy to be an explicit nil
+func (o *CreateContainerRequest) SetRestartPolicyNil() {
+	o.RestartPolicy.Set(nil)
+}
+
+// UnsetRestartPolicy ensures that no value is present for RestartPolicy, not even an explicit nil
+func (o *CreateContainerRequest) UnsetRestartPolicy() {
+	o.RestartPolicy.Unset()
 }
 
 // GetVolumes returns the Volumes field value if set, zero value otherwise.
@@ -351,8 +751,20 @@ func (o CreateContainerRequest) ToMap() (map[string]interface{}, error) {
 	if o.Command != nil {
 		toSerialize["command"] = o.Command
 	}
+	if !IsNil(o.Dns) {
+		toSerialize["dns"] = o.Dns
+	}
 	if !IsNil(o.Env) {
 		toSerialize["env"] = o.Env
+	}
+	if !IsNil(o.ExtraHosts) {
+		toSerialize["extra_hosts"] = o.ExtraHosts
+	}
+	if o.HealthCheck.IsSet() {
+		toSerialize["health_check"] = o.HealthCheck.Get()
+	}
+	if o.Hostname.IsSet() {
+		toSerialize["hostname"] = o.Hostname.Get()
 	}
 	toSerialize["image"] = o.Image
 	if !IsNil(o.Labels) {
@@ -361,8 +773,26 @@ func (o CreateContainerRequest) ToMap() (map[string]interface{}, error) {
 	if o.Name.IsSet() {
 		toSerialize["name"] = o.Name.Get()
 	}
+	if !IsNil(o.Networks) {
+		toSerialize["networks"] = o.Networks
+	}
+	if !IsNil(o.Ports) {
+		toSerialize["ports"] = o.Ports
+	}
+	if o.PullPolicy.IsSet() {
+		toSerialize["pull_policy"] = o.PullPolicy.Get()
+	}
+	if o.RegistryAuth.IsSet() {
+		toSerialize["registry_auth"] = o.RegistryAuth.Get()
+	}
+	if o.RegistryCredentialId.IsSet() {
+		toSerialize["registry_credential_id"] = o.RegistryCredentialId.Get()
+	}
 	if o.Resources.IsSet() {
 		toSerialize["resources"] = o.Resources.Get()
+	}
+	if o.RestartPolicy.IsSet() {
+		toSerialize["restart_policy"] = o.RestartPolicy.Get()
 	}
 	if !IsNil(o.Volumes) {
 		toSerialize["volumes"] = o.Volumes

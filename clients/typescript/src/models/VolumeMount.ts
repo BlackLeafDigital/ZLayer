@@ -13,8 +13,22 @@
  */
 
 import { mapValues } from '../runtime';
+import type { VolumeMountType } from './VolumeMountType';
+import {
+    VolumeMountTypeFromJSON,
+    VolumeMountTypeFromJSONTyped,
+    VolumeMountTypeToJSON,
+    VolumeMountTypeToJSONTyped,
+} from './VolumeMountType';
+
 /**
- * Volume mount specification
+ * Volume mount specification.
+ * 
+ * The `type` field (a Docker-compatible discriminator) selects how `source`
+ * is interpreted:
+ * - `"bind"` (default): `source` is an absolute host path.
+ * - `"volume"`: `source` is a named-volume identifier.
+ * - `"tmpfs"`: no `source`; a memory-backed mount is provisioned.
  * @export
  * @interface VolumeMount
  */
@@ -26,24 +40,31 @@ export interface VolumeMount {
      */
     readonly?: boolean;
     /**
-     * Host path or volume name
+     * Host path (bind), volume name (volume), or unused (tmpfs).
      * @type {string}
      * @memberof VolumeMount
      */
-    source: string;
+    source?: string | null;
     /**
      * Container mount path
      * @type {string}
      * @memberof VolumeMount
      */
     target: string;
+    /**
+     * Mount kind. Omit (or `"bind"`) for legacy host-path binds.
+     * @type {VolumeMountType}
+     * @memberof VolumeMount
+     */
+    type?: VolumeMountType | null;
 }
+
+
 
 /**
  * Check if a given object implements the VolumeMount interface.
  */
 export function instanceOfVolumeMount(value: object): value is VolumeMount {
-    if (!('source' in value) || value['source'] === undefined) return false;
     if (!('target' in value) || value['target'] === undefined) return false;
     return true;
 }
@@ -59,8 +80,9 @@ export function VolumeMountFromJSONTyped(json: any, ignoreDiscriminator: boolean
     return {
         
         'readonly': json['readonly'] == null ? undefined : json['readonly'],
-        'source': json['source'],
+        'source': json['source'] == null ? undefined : json['source'],
         'target': json['target'],
+        'type': json['type'] == null ? undefined : VolumeMountTypeFromJSON(json['type']),
     };
 }
 
@@ -78,6 +100,7 @@ export function VolumeMountToJSONTyped(value?: VolumeMount | null, ignoreDiscrim
         'readonly': value['readonly'],
         'source': value['source'],
         'target': value['target'],
+        'type': VolumeMountTypeToJSON(value['type']),
     };
 }
 

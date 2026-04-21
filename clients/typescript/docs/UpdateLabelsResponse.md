@@ -12,7 +12,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { UpdateLabelsResponse } from '@zlayer/client'
+import type { UpdateLabelsResponse } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

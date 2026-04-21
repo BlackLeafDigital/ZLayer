@@ -23,7 +23,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { ClusterJoinRequest } from '@zlayer/client'
+import type { ClusterJoinRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

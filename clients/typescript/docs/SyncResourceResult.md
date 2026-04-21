@@ -16,7 +16,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { SyncResourceResult } from '@zlayer/client'
+import type { SyncResourceResult } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

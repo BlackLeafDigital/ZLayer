@@ -12,7 +12,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { KillContainerRequest } from '@zlayer/client'
+import type { KillContainerRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

@@ -6,6 +6,7 @@ All URIs are relative to *http://localhost*
 |------------- | ------------- | -------------|
 | [**grantPermission**](PermissionsApi.md#grantpermissionoperation) | **POST** /api/v1/permissions | Grant a permission. Admin only. |
 | [**listPermissions**](PermissionsApi.md#listpermissions) | **GET** /api/v1/permissions | List permissions for a subject (user or group). |
+| [**listPermissionsByResource**](PermissionsApi.md#listpermissionsbyresource) | **GET** /api/v1/permissions/by-resource | List permissions granted on a specific resource. |
 | [**revokePermission**](PermissionsApi.md#revokepermission) | **DELETE** /api/v1/permissions/{id} | Revoke a permission by id. Admin only. |
 
 
@@ -24,11 +25,11 @@ Grant a permission. Admin only.
 import {
   Configuration,
   PermissionsApi,
-} from '@zlayer/client';
-import type { GrantPermissionOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GrantPermissionOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new PermissionsApi();
 
   const body = {
@@ -93,11 +94,11 @@ Exactly one of &#x60;user&#x60; or &#x60;group&#x60; must be provided.  # Errors
 import {
   Configuration,
   PermissionsApi,
-} from '@zlayer/client';
-import type { ListPermissionsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListPermissionsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new PermissionsApi();
 
   const body = {
@@ -150,6 +151,76 @@ No authorization required
 [[Back to top]](#) [[Back to API list]](../README.md#api-endpoints) [[Back to Model list]](../README.md#models) [[Back to README]](../README.md)
 
 
+## listPermissionsByResource
+
+> Array&lt;StoredPermission&gt; listPermissionsByResource(kind, id)
+
+List permissions granted on a specific resource.
+
+When &#x60;id&#x60; is supplied, returns exact-resource grants; when omitted, returns wildcard grants for the given &#x60;kind&#x60;.  # Errors  Returns [&#x60;ApiError::Internal&#x60;] on store failure.
+
+### Example
+
+```ts
+import {
+  Configuration,
+  PermissionsApi,
+} from '@zlayer/api-client';
+import type { ListPermissionsByResourceRequest } from '@zlayer/api-client';
+
+async function example() {
+  console.log("🚀 Testing @zlayer/api-client SDK...");
+  const api = new PermissionsApi();
+
+  const body = {
+    // string | Resource kind (e.g. `\"environment\"`).
+    kind: kind_example,
+    // string | Specific resource id. Omit for wildcard grants only. (optional)
+    id: id_example,
+  } satisfies ListPermissionsByResourceRequest;
+
+  try {
+    const data = await api.listPermissionsByResource(body);
+    console.log(data);
+  } catch (error) {
+    console.error(error);
+  }
+}
+
+// Run the test
+example().catch(console.error);
+```
+
+### Parameters
+
+
+| Name | Type | Description  | Notes |
+|------------- | ------------- | ------------- | -------------|
+| **kind** | `string` | Resource kind (e.g. &#x60;\&quot;environment\&quot;&#x60;). | [Defaults to `undefined`] |
+| **id** | `string` | Specific resource id. Omit for wildcard grants only. | [Optional] [Defaults to `undefined`] |
+
+### Return type
+
+[**Array&lt;StoredPermission&gt;**](StoredPermission.md)
+
+### Authorization
+
+No authorization required
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: `application/json`
+
+
+### HTTP response details
+| Status code | Description | Response headers |
+|-------------|-------------|------------------|
+| **200** | Grants on the resource |  -  |
+
+[[Back to top]](#) [[Back to API list]](../README.md#api-endpoints) [[Back to Model list]](../README.md#models) [[Back to README]](../README.md)
+
+
 ## revokePermission
 
 > revokePermission(id)
@@ -164,11 +235,11 @@ Revoke a permission by id. Admin only.
 import {
   Configuration,
   PermissionsApi,
-} from '@zlayer/client';
-import type { RevokePermissionRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { RevokePermissionRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new PermissionsApi();
 
   const body = {

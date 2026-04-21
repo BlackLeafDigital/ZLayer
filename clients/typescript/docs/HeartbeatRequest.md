@@ -16,7 +16,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { HeartbeatRequest } from '@zlayer/client'
+import type { HeartbeatRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

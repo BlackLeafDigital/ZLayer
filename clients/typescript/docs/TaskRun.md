@@ -18,7 +18,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { TaskRun } from '@zlayer/client'
+import type { TaskRun } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

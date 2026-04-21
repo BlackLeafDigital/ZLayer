@@ -14,7 +14,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { CreateEnvironmentRequest } from '@zlayer/client'
+import type { CreateEnvironmentRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

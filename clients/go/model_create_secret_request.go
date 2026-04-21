@@ -19,11 +19,13 @@ import (
 // checks if the CreateSecretRequest type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &CreateSecretRequest{}
 
-// CreateSecretRequest Request to create or update a secret
+// CreateSecretRequest Request to create or update a secret.  `scope` is optional and only honored on the legacy code path — when set alongside `?environment=`, the request is rejected.
 type CreateSecretRequest struct {
-	// The name of the secret
+	// The name of the secret.
 	Name string `json:"name"`
-	// The secret value (will be encrypted at rest)
+	// Optional explicit scope (legacy form). Mutually exclusive with the `?environment=` query parameter.
+	Scope NullableString `json:"scope,omitempty"`
+	// The secret value (will be encrypted at rest).
 	Value string `json:"value"`
 }
 
@@ -72,6 +74,48 @@ func (o *CreateSecretRequest) SetName(v string) {
 	o.Name = v
 }
 
+// GetScope returns the Scope field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *CreateSecretRequest) GetScope() string {
+	if o == nil || IsNil(o.Scope.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.Scope.Get()
+}
+
+// GetScopeOk returns a tuple with the Scope field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *CreateSecretRequest) GetScopeOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Scope.Get(), o.Scope.IsSet()
+}
+
+// HasScope returns a boolean if a field has been set.
+func (o *CreateSecretRequest) HasScope() bool {
+	if o != nil && o.Scope.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetScope gets a reference to the given NullableString and assigns it to the Scope field.
+func (o *CreateSecretRequest) SetScope(v string) {
+	o.Scope.Set(&v)
+}
+// SetScopeNil sets the value for Scope to be an explicit nil
+func (o *CreateSecretRequest) SetScopeNil() {
+	o.Scope.Set(nil)
+}
+
+// UnsetScope ensures that no value is present for Scope, not even an explicit nil
+func (o *CreateSecretRequest) UnsetScope() {
+	o.Scope.Unset()
+}
+
 // GetValue returns the Value field value
 func (o *CreateSecretRequest) GetValue() string {
 	if o == nil {
@@ -107,6 +151,9 @@ func (o CreateSecretRequest) MarshalJSON() ([]byte, error) {
 func (o CreateSecretRequest) ToMap() (map[string]interface{}, error) {
 	toSerialize := map[string]interface{}{}
 	toSerialize["name"] = o.Name
+	if o.Scope.IsSet() {
+		toSerialize["scope"] = o.Scope.Get()
+	}
 	toSerialize["value"] = o.Value
 	return toSerialize, nil
 }

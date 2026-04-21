@@ -49,7 +49,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
-use zlayer_spec::ServiceSpec;
+use zlayer_spec::{RegistryAuth, ServiceSpec};
 
 // ---------------------------------------------------------------------------
 // Seatbelt profile types and generation
@@ -1456,7 +1456,7 @@ impl SandboxRuntime {
 impl Runtime for SandboxRuntime {
     /// Pull an image to local storage with default policy (`IfNotPresent`).
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent)
+        self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent, None)
             .await
     }
 
@@ -1466,11 +1466,17 @@ impl Runtime for SandboxRuntime {
     /// `{data_dir}/images/{sanitized_name}/rootfs/`. On macOS, OCI images
     /// from registries contain Linux binaries -- the sandbox runtime expects
     /// macOS-native binaries or cross-platform scripts.
+    ///
+    /// The `_auth` parameter is accepted for trait conformance (§3.10) but
+    /// currently ignored: credentials flow through the existing
+    /// `AuthResolver` hostname lookup. Callers that need inline auth should
+    /// use the Docker runtime.
     #[allow(clippy::too_many_lines)]
     async fn pull_image_with_policy(
         &self,
         image: &str,
         policy: zlayer_spec::PullPolicy,
+        _auth: Option<&RegistryAuth>,
     ) -> Result<()> {
         let safe_name = sanitize_image_name(image);
         let image_dir = self.images_dir().join(&safe_name);

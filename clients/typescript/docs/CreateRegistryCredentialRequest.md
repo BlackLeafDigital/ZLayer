@@ -15,7 +15,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { CreateRegistryCredentialRequest } from '@zlayer/client'
+import type { CreateRegistryCredentialRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

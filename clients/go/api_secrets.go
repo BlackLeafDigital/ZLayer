@@ -23,14 +23,158 @@ import (
 // SecretsAPIService SecretsAPI service
 type SecretsAPIService service
 
+type ApiBulkImportSecretsRequest struct {
+	ctx context.Context
+	ApiService *SecretsAPIService
+	environment *string
+	body *string
+}
+
+// Environment id to import into
+func (r ApiBulkImportSecretsRequest) Environment(environment string) ApiBulkImportSecretsRequest {
+	r.environment = &environment
+	return r
+}
+
+func (r ApiBulkImportSecretsRequest) Body(body string) ApiBulkImportSecretsRequest {
+	r.body = &body
+	return r
+}
+
+func (r ApiBulkImportSecretsRequest) Execute() (*BulkImportResponse, *http.Response, error) {
+	return r.ApiService.BulkImportSecretsExecute(r)
+}
+
+/*
+BulkImportSecrets Bulk-import secrets from a dotenv-style payload (`KEY=value\\n…`).
+
+Each non-empty, non-comment line is parsed into a (name, value) pair and
+written to the env's scope. Lines that fail to parse are returned in
+`errors` and do not abort the import. Each successful write is counted
+as either `created` or `updated`.
+
+# Errors
+
+Returns [`ApiError::Forbidden`] for non-admins, [`ApiError::NotFound`]
+when the environment id is unknown, or [`ApiError::Internal`] when the
+secrets store fails.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @return ApiBulkImportSecretsRequest
+*/
+func (a *SecretsAPIService) BulkImportSecrets(ctx context.Context) ApiBulkImportSecretsRequest {
+	return ApiBulkImportSecretsRequest{
+		ApiService: a,
+		ctx: ctx,
+	}
+}
+
+// Execute executes the request
+//  @return BulkImportResponse
+func (a *SecretsAPIService) BulkImportSecretsExecute(r ApiBulkImportSecretsRequest) (*BulkImportResponse, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *BulkImportResponse
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "SecretsAPIService.BulkImportSecrets")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/secrets/bulk-import"
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if r.environment == nil {
+		return localVarReturnValue, nil, reportError("environment is required and must be specified")
+	}
+	if r.body == nil {
+		return localVarReturnValue, nil, reportError("body is required and must be specified")
+	}
+
+	parameterAddToHeaderOrQuery(localVarQueryParams, "environment", r.environment, "form", "")
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{"text/plain"}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	// body params
+	localVarPostBody = r.body
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
 type ApiCreateSecretRequest struct {
 	ctx context.Context
 	ApiService *SecretsAPIService
 	createSecretRequest *CreateSecretRequest
+	environment *string
+	scope *string
 }
 
 func (r ApiCreateSecretRequest) CreateSecretRequest(createSecretRequest CreateSecretRequest) ApiCreateSecretRequest {
 	r.createSecretRequest = &createSecretRequest
+	return r
+}
+
+// Environment id (mutually exclusive with body &#39;scope&#39;)
+func (r ApiCreateSecretRequest) Environment(environment string) ApiCreateSecretRequest {
+	r.environment = &environment
+	return r
+}
+
+// Explicit scope (legacy)
+func (r ApiCreateSecretRequest) Scope(scope string) ApiCreateSecretRequest {
+	r.scope = &scope
 	return r
 }
 
@@ -41,13 +185,15 @@ func (r ApiCreateSecretRequest) Execute() (*SecretMetadataResponse, *http.Respon
 /*
 CreateSecret Create or update a secret.
 
-Stores a new secret or updates an existing one. The secret value is encrypted
-at rest and the version number is incremented on updates.
+Stores a new secret or updates an existing one. The secret value is
+encrypted at rest and the version number is incremented on updates.
+
+Scope resolution: see [`resolve_scope`].
 
 # Errors
 
-Returns an error if validation fails, storage operations fail, or the user
-lacks permission.
+Returns an error if validation fails, storage operations fail, or the
+caller lacks permission.
 
  @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
  @return ApiCreateSecretRequest
@@ -83,6 +229,12 @@ func (a *SecretsAPIService) CreateSecretExecute(r ApiCreateSecretRequest) (*Secr
 		return localVarReturnValue, nil, reportError("createSecretRequest is required and must be specified")
 	}
 
+	if r.environment != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "environment", r.environment, "form", "")
+	}
+	if r.scope != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "scope", r.scope, "form", "")
+	}
 	// to determine the Content-Type header
 	localVarHTTPContentTypes := []string{"application/json"}
 
@@ -143,6 +295,20 @@ type ApiDeleteSecretRequest struct {
 	ctx context.Context
 	ApiService *SecretsAPIService
 	name string
+	environment *string
+	scope *string
+}
+
+// Environment id
+func (r ApiDeleteSecretRequest) Environment(environment string) ApiDeleteSecretRequest {
+	r.environment = &environment
+	return r
+}
+
+// Explicit scope
+func (r ApiDeleteSecretRequest) Scope(scope string) ApiDeleteSecretRequest {
+	r.scope = &scope
+	return r
 }
 
 func (r ApiDeleteSecretRequest) Execute() (*http.Response, error) {
@@ -152,12 +318,13 @@ func (r ApiDeleteSecretRequest) Execute() (*http.Response, error) {
 /*
 DeleteSecret Delete a secret.
 
-Permanently removes a secret from the store.
+Scope resolution: see [`resolve_scope_get`] (the same query type is
+reused minus `reveal`).
 
 # Errors
 
 Returns an error if the secret is not found, storage access fails, or
-the user lacks permission.
+the caller lacks permission.
 
  @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
  @param name Secret name
@@ -191,6 +358,12 @@ func (a *SecretsAPIService) DeleteSecretExecute(r ApiDeleteSecretRequest) (*http
 	localVarQueryParams := url.Values{}
 	localVarFormParams := url.Values{}
 
+	if r.environment != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "environment", r.environment, "form", "")
+	}
+	if r.scope != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "scope", r.scope, "form", "")
+	}
 	// to determine the Content-Type header
 	localVarHTTPContentTypes := []string{}
 
@@ -240,6 +413,27 @@ type ApiGetSecretMetadataRequest struct {
 	ctx context.Context
 	ApiService *SecretsAPIService
 	name string
+	environment *string
+	scope *string
+	reveal *bool
+}
+
+// Environment id
+func (r ApiGetSecretMetadataRequest) Environment(environment string) ApiGetSecretMetadataRequest {
+	r.environment = &environment
+	return r
+}
+
+// Explicit scope
+func (r ApiGetSecretMetadataRequest) Scope(scope string) ApiGetSecretMetadataRequest {
+	r.scope = &scope
+	return r
+}
+
+// Include plaintext value (admin only)
+func (r ApiGetSecretMetadataRequest) Reveal(reveal bool) ApiGetSecretMetadataRequest {
+	r.reveal = &reveal
+	return r
 }
 
 func (r ApiGetSecretMetadataRequest) Execute() (*SecretMetadataResponse, *http.Response, error) {
@@ -247,14 +441,14 @@ func (r ApiGetSecretMetadataRequest) Execute() (*SecretMetadataResponse, *http.R
 }
 
 /*
-GetSecretMetadata Get metadata for a specific secret.
+GetSecretMetadata Get metadata for a specific secret. With `?reveal=true` (admin only), the response also includes the plaintext `value`.
 
-Returns metadata for a single secret. The secret value is never exposed
-through this endpoint.
+Scope resolution: see [`resolve_scope_get`].
 
 # Errors
 
-Returns an error if the secret is not found or storage access fails.
+Returns an error if the secret is not found, the caller is unauthorised
+to reveal, or storage access fails.
 
  @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
  @param name Secret name
@@ -290,6 +484,15 @@ func (a *SecretsAPIService) GetSecretMetadataExecute(r ApiGetSecretMetadataReque
 	localVarQueryParams := url.Values{}
 	localVarFormParams := url.Values{}
 
+	if r.environment != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "environment", r.environment, "form", "")
+	}
+	if r.scope != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "scope", r.scope, "form", "")
+	}
+	if r.reveal != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "reveal", r.reveal, "form", "")
+	}
 	// to determine the Content-Type header
 	localVarHTTPContentTypes := []string{}
 
@@ -347,6 +550,20 @@ func (a *SecretsAPIService) GetSecretMetadataExecute(r ApiGetSecretMetadataReque
 type ApiListSecretsRequest struct {
 	ctx context.Context
 	ApiService *SecretsAPIService
+	environment *string
+	scope *string
+}
+
+// Environment id
+func (r ApiListSecretsRequest) Environment(environment string) ApiListSecretsRequest {
+	r.environment = &environment
+	return r
+}
+
+// Explicit scope
+func (r ApiListSecretsRequest) Scope(scope string) ApiListSecretsRequest {
+	r.scope = &scope
+	return r
 }
 
 func (r ApiListSecretsRequest) Execute() ([]SecretMetadataResponse, *http.Response, error) {
@@ -354,10 +571,9 @@ func (r ApiListSecretsRequest) Execute() ([]SecretMetadataResponse, *http.Respon
 }
 
 /*
-ListSecrets List all secrets for the authenticated user.
+ListSecrets List secrets in a scope.
 
-Returns metadata for all secrets in the user's scope. Secret values are
-never exposed through this endpoint.
+Scope resolution: see [`resolve_scope`].
 
 # Errors
 
@@ -394,6 +610,12 @@ func (a *SecretsAPIService) ListSecretsExecute(r ApiListSecretsRequest) ([]Secre
 	localVarQueryParams := url.Values{}
 	localVarFormParams := url.Values{}
 
+	if r.environment != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "environment", r.environment, "form", "")
+	}
+	if r.scope != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "scope", r.scope, "form", "")
+	}
 	// to determine the Content-Type header
 	localVarHTTPContentTypes := []string{}
 
@@ -411,6 +633,262 @@ func (a *SecretsAPIService) ListSecretsExecute(r ApiListSecretsRequest) ([]Secre
 	if localVarHTTPHeaderAccept != "" {
 		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
 	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiRevealAllSecretsRequest struct {
+	ctx context.Context
+	ApiService *SecretsAPIService
+	environment *string
+}
+
+// Environment id (required)
+func (r ApiRevealAllSecretsRequest) Environment(environment string) ApiRevealAllSecretsRequest {
+	r.environment = &environment
+	return r
+}
+
+func (r ApiRevealAllSecretsRequest) Execute() (*RevealAllSecretsResponse, *http.Response, error) {
+	return r.ApiService.RevealAllSecretsExecute(r)
+}
+
+/*
+RevealAllSecrets Reveal every secret in an environment at once (admin only).
+
+Used by `zlayer run` to build the child-process env in a single round-trip.
+
+# Errors
+
+Returns `ApiError::Forbidden` if the caller is not admin, `ApiError::NotFound`
+if the environment is unknown, and `ApiError::Internal` for storage failures.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @return ApiRevealAllSecretsRequest
+*/
+func (a *SecretsAPIService) RevealAllSecrets(ctx context.Context) ApiRevealAllSecretsRequest {
+	return ApiRevealAllSecretsRequest{
+		ApiService: a,
+		ctx: ctx,
+	}
+}
+
+// Execute executes the request
+//  @return RevealAllSecretsResponse
+func (a *SecretsAPIService) RevealAllSecretsExecute(r ApiRevealAllSecretsRequest) (*RevealAllSecretsResponse, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodGet
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *RevealAllSecretsResponse
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "SecretsAPIService.RevealAllSecrets")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/secrets/reveal-all"
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if r.environment == nil {
+		return localVarReturnValue, nil, reportError("environment is required and must be specified")
+	}
+
+	parameterAddToHeaderOrQuery(localVarQueryParams, "environment", r.environment, "form", "")
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return localVarReturnValue, nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarReturnValue, localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	err = a.client.decode(&localVarReturnValue, localVarBody, localVarHTTPResponse.Header.Get("Content-Type"))
+	if err != nil {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: err.Error(),
+		}
+		return localVarReturnValue, localVarHTTPResponse, newErr
+	}
+
+	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiRotateSecretRequest struct {
+	ctx context.Context
+	ApiService *SecretsAPIService
+	name string
+	rotateSecretRequest *RotateSecretRequest
+	environment *string
+	scope *string
+}
+
+func (r ApiRotateSecretRequest) RotateSecretRequest(rotateSecretRequest RotateSecretRequest) ApiRotateSecretRequest {
+	r.rotateSecretRequest = &rotateSecretRequest
+	return r
+}
+
+// Environment id
+func (r ApiRotateSecretRequest) Environment(environment string) ApiRotateSecretRequest {
+	r.environment = &environment
+	return r
+}
+
+// Explicit scope (legacy)
+func (r ApiRotateSecretRequest) Scope(scope string) ApiRotateSecretRequest {
+	r.scope = &scope
+	return r
+}
+
+func (r ApiRotateSecretRequest) Execute() (*RotateSecretResponse, *http.Response, error) {
+	return r.ApiService.RotateSecretExecute(r)
+}
+
+/*
+RotateSecret Rotate a secret — overwrite with a new value and return the version before+after.
+
+Admin-only in v1. Mutually exclusive scope query like the other endpoints.
+
+# Errors
+
+Returns `ApiError::BadRequest` for empty names or conflicting scope params,
+`ApiError::Forbidden` for non-admin callers, `ApiError::NotFound` when the
+secret or environment is unknown, and `ApiError::Internal` for storage
+failures.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @param name Secret name
+ @return ApiRotateSecretRequest
+*/
+func (a *SecretsAPIService) RotateSecret(ctx context.Context, name string) ApiRotateSecretRequest {
+	return ApiRotateSecretRequest{
+		ApiService: a,
+		ctx: ctx,
+		name: name,
+	}
+}
+
+// Execute executes the request
+//  @return RotateSecretResponse
+func (a *SecretsAPIService) RotateSecretExecute(r ApiRotateSecretRequest) (*RotateSecretResponse, *http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+		localVarReturnValue  *RotateSecretResponse
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "SecretsAPIService.RotateSecret")
+	if err != nil {
+		return localVarReturnValue, nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/secrets/{name}/rotate"
+	localVarPath = strings.Replace(localVarPath, "{"+"name"+"}", url.PathEscape(parameterValueToString(r.name, "name")), -1)
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if r.rotateSecretRequest == nil {
+		return localVarReturnValue, nil, reportError("rotateSecretRequest is required and must be specified")
+	}
+
+	if r.environment != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "environment", r.environment, "form", "")
+	}
+	if r.scope != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "scope", r.scope, "form", "")
+	}
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{"application/json"}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{"application/json"}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	// body params
+	localVarPostBody = r.rotateSecretRequest
 	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
 	if err != nil {
 		return localVarReturnValue, nil, err

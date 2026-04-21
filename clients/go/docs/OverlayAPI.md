@@ -1,0 +1,256 @@
+# \OverlayAPI
+
+All URIs are relative to *http://localhost*
+
+Method | HTTP request | Description
+------------- | ------------- | -------------
+[**GetDnsStatus**](OverlayAPI.md#GetDnsStatus) | **Get** /api/v1/overlay/dns | Get DNS service status.
+[**GetIpAllocation**](OverlayAPI.md#GetIpAllocation) | **Get** /api/v1/overlay/ip-alloc | Get IP allocation status.
+[**GetOverlayPeers**](OverlayAPI.md#GetOverlayPeers) | **Get** /api/v1/overlay/peers | Get list of overlay peers.
+[**GetOverlayStatus**](OverlayAPI.md#GetOverlayStatus) | **Get** /api/v1/overlay/status | Get overlay network status.
+
+
+
+## GetDnsStatus
+
+> DnsStatusResponse GetDnsStatus(ctx).Execute()
+
+Get DNS service status.
+
+
+
+### Example
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID"
+)
+
+func main() {
+
+	configuration := openapiclient.NewConfiguration()
+	apiClient := openapiclient.NewAPIClient(configuration)
+	resp, r, err := apiClient.OverlayAPI.GetDnsStatus(context.Background()).Execute()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error when calling `OverlayAPI.GetDnsStatus``: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Full HTTP response: %v\n", r)
+	}
+	// response from `GetDnsStatus`: DnsStatusResponse
+	fmt.Fprintf(os.Stdout, "Response from `OverlayAPI.GetDnsStatus`: %v\n", resp)
+}
+```
+
+### Path Parameters
+
+This endpoint does not need any parameter.
+
+### Other Parameters
+
+Other parameters are passed through a pointer to a apiGetDnsStatusRequest struct via the builder pattern
+
+
+### Return type
+
+[**DnsStatusResponse**](DnsStatusResponse.md)
+
+### Authorization
+
+No authorization required
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints)
+[[Back to Model list]](../README.md#documentation-for-models)
+[[Back to README]](../README.md)
+
+
+## GetIpAllocation
+
+> IpAllocationResponse GetIpAllocation(ctx).Execute()
+
+Get IP allocation status.
+
+
+
+### Example
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID"
+)
+
+func main() {
+
+	configuration := openapiclient.NewConfiguration()
+	apiClient := openapiclient.NewAPIClient(configuration)
+	resp, r, err := apiClient.OverlayAPI.GetIpAllocation(context.Background()).Execute()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error when calling `OverlayAPI.GetIpAllocation``: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Full HTTP response: %v\n", r)
+	}
+	// response from `GetIpAllocation`: IpAllocationResponse
+	fmt.Fprintf(os.Stdout, "Response from `OverlayAPI.GetIpAllocation`: %v\n", resp)
+}
+```
+
+### Path Parameters
+
+This endpoint does not need any parameter.
+
+### Other Parameters
+
+Other parameters are passed through a pointer to a apiGetIpAllocationRequest struct via the builder pattern
+
+
+### Return type
+
+[**IpAllocationResponse**](IpAllocationResponse.md)
+
+### Authorization
+
+No authorization required
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints)
+[[Back to Model list]](../README.md#documentation-for-models)
+[[Back to README]](../README.md)
+
+
+## GetOverlayPeers
+
+> PeerListResponse GetOverlayPeers(ctx).Execute()
+
+Get list of overlay peers.
+
+
+
+### Example
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID"
+)
+
+func main() {
+
+	configuration := openapiclient.NewConfiguration()
+	apiClient := openapiclient.NewAPIClient(configuration)
+	resp, r, err := apiClient.OverlayAPI.GetOverlayPeers(context.Background()).Execute()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error when calling `OverlayAPI.GetOverlayPeers``: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Full HTTP response: %v\n", r)
+	}
+	// response from `GetOverlayPeers`: PeerListResponse
+	fmt.Fprintf(os.Stdout, "Response from `OverlayAPI.GetOverlayPeers`: %v\n", resp)
+}
+```
+
+### Path Parameters
+
+This endpoint does not need any parameter.
+
+### Other Parameters
+
+Other parameters are passed through a pointer to a apiGetOverlayPeersRequest struct via the builder pattern
+
+
+### Return type
+
+[**PeerListResponse**](PeerListResponse.md)
+
+### Authorization
+
+No authorization required
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints)
+[[Back to Model list]](../README.md#documentation-for-models)
+[[Back to README]](../README.md)
+
+
+## GetOverlayStatus
+
+> OverlayStatusResponse GetOverlayStatus(ctx).Execute()
+
+Get overlay network status.
+
+
+
+### Example
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"os"
+	openapiclient "github.com/GIT_USER_ID/GIT_REPO_ID"
+)
+
+func main() {
+
+	configuration := openapiclient.NewConfiguration()
+	apiClient := openapiclient.NewAPIClient(configuration)
+	resp, r, err := apiClient.OverlayAPI.GetOverlayStatus(context.Background()).Execute()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error when calling `OverlayAPI.GetOverlayStatus``: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Full HTTP response: %v\n", r)
+	}
+	// response from `GetOverlayStatus`: OverlayStatusResponse
+	fmt.Fprintf(os.Stdout, "Response from `OverlayAPI.GetOverlayStatus`: %v\n", resp)
+}
+```
+
+### Path Parameters
+
+This endpoint does not need any parameter.
+
+### Other Parameters
+
+Other parameters are passed through a pointer to a apiGetOverlayStatusRequest struct via the builder pattern
+
+
+### Return type
+
+[**OverlayStatusResponse**](OverlayStatusResponse.md)
+
+### Authorization
+
+No authorization required
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints)
+[[Back to Model list]](../README.md#documentation-for-models)
+[[Back to README]](../README.md)
+

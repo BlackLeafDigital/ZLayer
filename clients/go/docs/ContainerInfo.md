@@ -5,11 +5,16 @@
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **CreatedAt** | **string** | Creation timestamp (ISO 8601) | 
+**ExitCode** | Pointer to **NullableInt32** | Most-recent exit code. &#x60;None&#x60; for containers still running and for containers that have never exited. | [optional] 
+**Health** | Pointer to [**NullableContainerHealthInfo**](ContainerHealthInfo.md) | Runtime-native health status, when the container image declares a &#x60;HEALTHCHECK&#x60; (or equivalent). &#x60;None&#x60; when the runtime doesn&#39;t track health for this container. | [optional] 
 **Id** | **string** | Container identifier | 
 **Image** | **string** | OCI image reference | 
+**Ipv4** | Pointer to **NullableString** | Primary IPv4 address (first non-empty IP across attached networks). Docker&#39;s &#x60;bridge&#x60; network is preferred when present. | [optional] 
 **Labels** | **map[string]string** | Labels | 
 **Name** | Pointer to **NullableString** | Human-readable name (if set) | [optional] 
+**Networks** | Pointer to [**[]NetworkAttachmentInfo**](NetworkAttachmentInfo.md) | Networks this container is attached to, with per-network aliases and IPv4. Empty when the runtime doesn&#39;t surface network detail. | [optional] 
 **Pid** | Pointer to **NullableInt32** | Process ID (if running) | [optional] 
+**Ports** | Pointer to [**[]PortMapping**](PortMapping.md) | Published port mappings (container → host). Populated from the runtime&#39;s inspect response; empty when the runtime doesn&#39;t expose port-level detail or the container has no published ports. | [optional] 
 **State** | **string** | Container state (pending, running, exited, failed) | 
 
 ## Methods
@@ -51,6 +56,76 @@ and a boolean to check if the value has been set.
 SetCreatedAt sets CreatedAt field to given value.
 
 
+### GetExitCode
+
+`func (o *ContainerInfo) GetExitCode() int32`
+
+GetExitCode returns the ExitCode field if non-nil, zero value otherwise.
+
+### GetExitCodeOk
+
+`func (o *ContainerInfo) GetExitCodeOk() (*int32, bool)`
+
+GetExitCodeOk returns a tuple with the ExitCode field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetExitCode
+
+`func (o *ContainerInfo) SetExitCode(v int32)`
+
+SetExitCode sets ExitCode field to given value.
+
+### HasExitCode
+
+`func (o *ContainerInfo) HasExitCode() bool`
+
+HasExitCode returns a boolean if a field has been set.
+
+### SetExitCodeNil
+
+`func (o *ContainerInfo) SetExitCodeNil(b bool)`
+
+ SetExitCodeNil sets the value for ExitCode to be an explicit nil
+
+### UnsetExitCode
+`func (o *ContainerInfo) UnsetExitCode()`
+
+UnsetExitCode ensures that no value is present for ExitCode, not even an explicit nil
+### GetHealth
+
+`func (o *ContainerInfo) GetHealth() ContainerHealthInfo`
+
+GetHealth returns the Health field if non-nil, zero value otherwise.
+
+### GetHealthOk
+
+`func (o *ContainerInfo) GetHealthOk() (*ContainerHealthInfo, bool)`
+
+GetHealthOk returns a tuple with the Health field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetHealth
+
+`func (o *ContainerInfo) SetHealth(v ContainerHealthInfo)`
+
+SetHealth sets Health field to given value.
+
+### HasHealth
+
+`func (o *ContainerInfo) HasHealth() bool`
+
+HasHealth returns a boolean if a field has been set.
+
+### SetHealthNil
+
+`func (o *ContainerInfo) SetHealthNil(b bool)`
+
+ SetHealthNil sets the value for Health to be an explicit nil
+
+### UnsetHealth
+`func (o *ContainerInfo) UnsetHealth()`
+
+UnsetHealth ensures that no value is present for Health, not even an explicit nil
 ### GetId
 
 `func (o *ContainerInfo) GetId() string`
@@ -91,6 +166,41 @@ and a boolean to check if the value has been set.
 SetImage sets Image field to given value.
 
 
+### GetIpv4
+
+`func (o *ContainerInfo) GetIpv4() string`
+
+GetIpv4 returns the Ipv4 field if non-nil, zero value otherwise.
+
+### GetIpv4Ok
+
+`func (o *ContainerInfo) GetIpv4Ok() (*string, bool)`
+
+GetIpv4Ok returns a tuple with the Ipv4 field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetIpv4
+
+`func (o *ContainerInfo) SetIpv4(v string)`
+
+SetIpv4 sets Ipv4 field to given value.
+
+### HasIpv4
+
+`func (o *ContainerInfo) HasIpv4() bool`
+
+HasIpv4 returns a boolean if a field has been set.
+
+### SetIpv4Nil
+
+`func (o *ContainerInfo) SetIpv4Nil(b bool)`
+
+ SetIpv4Nil sets the value for Ipv4 to be an explicit nil
+
+### UnsetIpv4
+`func (o *ContainerInfo) UnsetIpv4()`
+
+UnsetIpv4 ensures that no value is present for Ipv4, not even an explicit nil
 ### GetLabels
 
 `func (o *ContainerInfo) GetLabels() map[string]string`
@@ -146,6 +256,31 @@ HasName returns a boolean if a field has been set.
 `func (o *ContainerInfo) UnsetName()`
 
 UnsetName ensures that no value is present for Name, not even an explicit nil
+### GetNetworks
+
+`func (o *ContainerInfo) GetNetworks() []NetworkAttachmentInfo`
+
+GetNetworks returns the Networks field if non-nil, zero value otherwise.
+
+### GetNetworksOk
+
+`func (o *ContainerInfo) GetNetworksOk() (*[]NetworkAttachmentInfo, bool)`
+
+GetNetworksOk returns a tuple with the Networks field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetNetworks
+
+`func (o *ContainerInfo) SetNetworks(v []NetworkAttachmentInfo)`
+
+SetNetworks sets Networks field to given value.
+
+### HasNetworks
+
+`func (o *ContainerInfo) HasNetworks() bool`
+
+HasNetworks returns a boolean if a field has been set.
+
 ### GetPid
 
 `func (o *ContainerInfo) GetPid() int32`
@@ -181,6 +316,31 @@ HasPid returns a boolean if a field has been set.
 `func (o *ContainerInfo) UnsetPid()`
 
 UnsetPid ensures that no value is present for Pid, not even an explicit nil
+### GetPorts
+
+`func (o *ContainerInfo) GetPorts() []PortMapping`
+
+GetPorts returns the Ports field if non-nil, zero value otherwise.
+
+### GetPortsOk
+
+`func (o *ContainerInfo) GetPortsOk() (*[]PortMapping, bool)`
+
+GetPortsOk returns a tuple with the Ports field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetPorts
+
+`func (o *ContainerInfo) SetPorts(v []PortMapping)`
+
+SetPorts sets Ports field to given value.
+
+### HasPorts
+
+`func (o *ContainerInfo) HasPorts() bool`
+
+HasPorts returns a boolean if a field has been set.
+
 ### GetState
 
 `func (o *ContainerInfo) GetState() string`

@@ -4,11 +4,15 @@ pub mod audit;
 pub mod auth;
 pub mod build;
 pub mod cluster;
+pub mod container_networks;
+#[cfg(feature = "docker")]
+pub mod container_networks_docker;
 pub mod containers;
 pub mod credentials;
 pub mod cron;
 pub mod deployments;
 pub mod environments;
+pub mod events;
 pub mod groups;
 pub mod health;
 pub mod images;

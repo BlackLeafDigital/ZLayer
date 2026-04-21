@@ -14,7 +14,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { GitCredentialResponse } from '@zlayer/client'
+import type { GitCredentialResponse } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

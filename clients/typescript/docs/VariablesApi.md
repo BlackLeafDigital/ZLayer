@@ -26,11 +26,11 @@ Create a new variable. Admin only.
 import {
   Configuration,
   VariablesApi,
-} from '@zlayer/client';
-import type { CreateVariableOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateVariableOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -100,11 +100,11 @@ Delete a variable. Admin only.
 import {
   Configuration,
   VariablesApi,
-} from '@zlayer/client';
-import type { DeleteVariableRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteVariableRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -173,11 +173,11 @@ Fetch a single variable by id.
 import {
   Configuration,
   VariablesApi,
-} from '@zlayer/client';
-import type { GetVariableRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetVariableRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -245,11 +245,11 @@ Filter rules (see [&#x60;ListVariablesQuery&#x60;]):  - &#x60;?scope&#x3D;{id}&#
 import {
   Configuration,
   VariablesApi,
-} from '@zlayer/client';
-import type { ListVariablesRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListVariablesRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -317,11 +317,11 @@ Update a variable\&#39;s name and/or value. Admin only.
 import {
   Configuration,
   VariablesApi,
-} from '@zlayer/client';
-import type { UpdateVariableOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { UpdateVariableOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

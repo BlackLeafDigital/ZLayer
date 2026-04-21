@@ -19,12 +19,18 @@ import (
 // checks if the ContainerWaitResponse type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &ContainerWaitResponse{}
 
-// ContainerWaitResponse Wait response with container exit code
+// ContainerWaitResponse Wait response with container exit code plus optional classification fields (added in §3.12 of the SDK-fixes spec).  The three optional fields (`reason`, `signal`, `finished_at`) are additive — clients that only read `exit_code` keep working unchanged.
 type ContainerWaitResponse struct {
-	// Exit code (0 = success)
+	// Exit code (0 = success). When the container was killed by signal `N`, this is typically `128 + N`.
 	ExitCode int32 `json:"exit_code"`
+	// RFC3339 timestamp of when the container exited, if reported by the runtime.
+	FinishedAt NullableString `json:"finished_at,omitempty"`
 	// Container identifier
 	Id string `json:"id"`
+	// Classification of the exit. One of `\"exited\"`, `\"signal\"`, `\"oom_killed\"`, or `\"runtime_error\"`. Absent when the runtime didn't classify the exit.
+	Reason NullableString `json:"reason,omitempty"`
+	// Signal name when `reason == \"signal\"`, e.g. `\"SIGKILL\"`. Absent when the runtime couldn't determine it (or the exit wasn't a signal death).
+	Signal NullableString `json:"signal,omitempty"`
 }
 
 type _ContainerWaitResponse ContainerWaitResponse
@@ -72,6 +78,48 @@ func (o *ContainerWaitResponse) SetExitCode(v int32) {
 	o.ExitCode = v
 }
 
+// GetFinishedAt returns the FinishedAt field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ContainerWaitResponse) GetFinishedAt() string {
+	if o == nil || IsNil(o.FinishedAt.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.FinishedAt.Get()
+}
+
+// GetFinishedAtOk returns a tuple with the FinishedAt field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ContainerWaitResponse) GetFinishedAtOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.FinishedAt.Get(), o.FinishedAt.IsSet()
+}
+
+// HasFinishedAt returns a boolean if a field has been set.
+func (o *ContainerWaitResponse) HasFinishedAt() bool {
+	if o != nil && o.FinishedAt.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetFinishedAt gets a reference to the given NullableString and assigns it to the FinishedAt field.
+func (o *ContainerWaitResponse) SetFinishedAt(v string) {
+	o.FinishedAt.Set(&v)
+}
+// SetFinishedAtNil sets the value for FinishedAt to be an explicit nil
+func (o *ContainerWaitResponse) SetFinishedAtNil() {
+	o.FinishedAt.Set(nil)
+}
+
+// UnsetFinishedAt ensures that no value is present for FinishedAt, not even an explicit nil
+func (o *ContainerWaitResponse) UnsetFinishedAt() {
+	o.FinishedAt.Unset()
+}
+
 // GetId returns the Id field value
 func (o *ContainerWaitResponse) GetId() string {
 	if o == nil {
@@ -96,6 +144,90 @@ func (o *ContainerWaitResponse) SetId(v string) {
 	o.Id = v
 }
 
+// GetReason returns the Reason field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ContainerWaitResponse) GetReason() string {
+	if o == nil || IsNil(o.Reason.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.Reason.Get()
+}
+
+// GetReasonOk returns a tuple with the Reason field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ContainerWaitResponse) GetReasonOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Reason.Get(), o.Reason.IsSet()
+}
+
+// HasReason returns a boolean if a field has been set.
+func (o *ContainerWaitResponse) HasReason() bool {
+	if o != nil && o.Reason.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetReason gets a reference to the given NullableString and assigns it to the Reason field.
+func (o *ContainerWaitResponse) SetReason(v string) {
+	o.Reason.Set(&v)
+}
+// SetReasonNil sets the value for Reason to be an explicit nil
+func (o *ContainerWaitResponse) SetReasonNil() {
+	o.Reason.Set(nil)
+}
+
+// UnsetReason ensures that no value is present for Reason, not even an explicit nil
+func (o *ContainerWaitResponse) UnsetReason() {
+	o.Reason.Unset()
+}
+
+// GetSignal returns the Signal field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ContainerWaitResponse) GetSignal() string {
+	if o == nil || IsNil(o.Signal.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.Signal.Get()
+}
+
+// GetSignalOk returns a tuple with the Signal field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ContainerWaitResponse) GetSignalOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Signal.Get(), o.Signal.IsSet()
+}
+
+// HasSignal returns a boolean if a field has been set.
+func (o *ContainerWaitResponse) HasSignal() bool {
+	if o != nil && o.Signal.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetSignal gets a reference to the given NullableString and assigns it to the Signal field.
+func (o *ContainerWaitResponse) SetSignal(v string) {
+	o.Signal.Set(&v)
+}
+// SetSignalNil sets the value for Signal to be an explicit nil
+func (o *ContainerWaitResponse) SetSignalNil() {
+	o.Signal.Set(nil)
+}
+
+// UnsetSignal ensures that no value is present for Signal, not even an explicit nil
+func (o *ContainerWaitResponse) UnsetSignal() {
+	o.Signal.Unset()
+}
+
 func (o ContainerWaitResponse) MarshalJSON() ([]byte, error) {
 	toSerialize,err := o.ToMap()
 	if err != nil {
@@ -107,7 +239,16 @@ func (o ContainerWaitResponse) MarshalJSON() ([]byte, error) {
 func (o ContainerWaitResponse) ToMap() (map[string]interface{}, error) {
 	toSerialize := map[string]interface{}{}
 	toSerialize["exit_code"] = o.ExitCode
+	if o.FinishedAt.IsSet() {
+		toSerialize["finished_at"] = o.FinishedAt.Get()
+	}
 	toSerialize["id"] = o.Id
+	if o.Reason.IsSet() {
+		toSerialize["reason"] = o.Reason.Get()
+	}
+	if o.Signal.IsSet() {
+		toSerialize["signal"] = o.Signal.Get()
+	}
 	return toSerialize, nil
 }
 

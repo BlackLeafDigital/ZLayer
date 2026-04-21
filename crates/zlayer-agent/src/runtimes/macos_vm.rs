@@ -68,7 +68,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
-use zlayer_spec::ServiceSpec;
+use zlayer_spec::{RegistryAuth, ServiceSpec};
 
 // ---------------------------------------------------------------------------
 // libkrun FFI types (loaded via dlopen)
@@ -536,7 +536,7 @@ fn build_env_array(env: &HashMap<String, String>) -> Result<(Vec<CString>, Vec<*
 impl Runtime for VmRuntime {
     /// Pull an image to local storage with default policy (`IfNotPresent`).
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent)
+        self.pull_image_with_policy(image, zlayer_spec::PullPolicy::IfNotPresent, None)
             .await
     }
 
@@ -545,10 +545,16 @@ impl Runtime for VmRuntime {
     /// Uses `zlayer_registry` to pull OCI image layers and extract them.
     /// Unlike the `SandboxRuntime`, VM containers run real Linux -- so standard
     /// Linux OCI images work directly.
+    ///
+    /// The `_auth` parameter is accepted for trait conformance (§3.10) but
+    /// currently ignored: credentials flow through the existing
+    /// `AuthResolver` hostname lookup. Callers that need inline auth should
+    /// use the Docker runtime.
     async fn pull_image_with_policy(
         &self,
         image: &str,
         policy: zlayer_spec::PullPolicy,
+        _auth: Option<&RegistryAuth>,
     ) -> Result<()> {
         let safe_name = sanitize_image_name(image);
         let image_dir = self.images_dir().join(&safe_name);

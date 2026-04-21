@@ -604,13 +604,16 @@ async fn run(mut cli: Cli) -> Result<()> {
             service,
             replicas,
         } => {
-            commands::join::join(
+            // Box::pin to keep this large match arm off the stack — the
+            // future here is sizeable (spawns daemon state) and clippy's
+            // `large_futures` lint flags anything above ~16kB.
+            Box::pin(commands::join::join(
                 &cli,
                 token,
                 spec_dir.as_deref(),
                 service.as_deref(),
                 *replicas,
-            )
+            ))
             .await
         }
         #[cfg(unix)]

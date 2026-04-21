@@ -1010,6 +1010,7 @@ mod tests {
             errors: zlayer_spec::ErrorsSpec::default(),
             devices: vec![],
             storage: vec![],
+            port_mappings: vec![],
             capabilities: vec![],
             privileged: false,
             node_mode,
@@ -1018,6 +1019,10 @@ mod tests {
             wasm: None,
             logs: None,
             host_network: false,
+            hostname: None,
+            dns: Vec::new(),
+            extra_hosts: Vec::new(),
+            restart_policy: None,
         }
     }
 

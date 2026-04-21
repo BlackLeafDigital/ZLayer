@@ -16,7 +16,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { ContainerStatsResponse } from '@zlayer/client'
+import type { ContainerStatsResponse } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

@@ -16,7 +16,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { CronJobResponse } from '@zlayer/client'
+import type { CronJobResponse } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

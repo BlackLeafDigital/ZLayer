@@ -22,6 +22,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod event_bus;
 pub mod handlers;
 pub mod identity;
 pub mod middleware;
@@ -40,6 +41,7 @@ pub use auth::{
 };
 pub use config::ApiConfig;
 pub use error::{ApiError, Result};
+pub use event_bus::{ContainerEvent, ContainerEventBus, ContainerEventKind, EVENT_BUS_CAPACITY};
 pub use identity::{IdentityError, IdentityManager};
 pub use openapi::ApiDoc;
 pub use poller::GitPoller;
@@ -48,12 +50,13 @@ pub use ratelimit::{
     IpRateLimiter, RateLimitState,
 };
 pub use router::{
-    build_audit_routes, build_cluster_routes, build_container_routes, build_credential_routes,
-    build_cron_routes, build_environment_routes, build_group_routes, build_image_routes,
-    build_internal_routes, build_job_routes, build_network_routes, build_notifier_routes,
-    build_permission_routes, build_project_routes, build_project_webhook_routes,
-    build_proxy_routes, build_router, build_router_full, build_router_with_builds,
-    build_router_with_containers, build_router_with_deployment_state, build_router_with_internal,
+    build_audit_routes, build_cluster_routes, build_container_network_routes,
+    build_container_routes, build_credential_routes, build_cron_routes, build_environment_routes,
+    build_event_routes, build_group_routes, build_image_routes, build_internal_routes,
+    build_job_routes, build_network_routes, build_notifier_routes, build_permission_routes,
+    build_project_routes, build_project_webhook_routes, build_proxy_routes, build_router,
+    build_router_full, build_router_with_builds, build_router_with_containers,
+    build_router_with_deployment_state, build_router_with_internal,
     build_router_with_internal_and_secrets, build_router_with_jobs, build_router_with_secrets,
     build_router_with_services, build_router_with_services_and_secrets, build_router_with_storage,
     build_router_with_tunnels, build_secrets_routes, build_storage_routes, build_sync_routes,
@@ -71,6 +74,13 @@ pub use handlers::cluster::{
     ClusterApiState, ClusterJoinRequest, ClusterJoinResponse, ClusterNodeSummary, ClusterPeer,
     ForceLeaderRequest, ForceLeaderResponse,
 };
+pub use handlers::container_networks::{
+    BridgeNetworkApiState, BridgeNetworkDetails, BridgeNetworkRuntime, ConnectBridgeNetworkRequest,
+    CreateBridgeNetworkRequest, DisconnectBridgeNetworkRequest,
+    RuntimeError as BridgeNetworkRuntimeError,
+};
+#[cfg(feature = "docker")]
+pub use handlers::container_networks_docker::DockerBridgeNetworkRuntime;
 pub use handlers::containers::ContainerApiState;
 pub use handlers::credentials::{
     CreateGitCredentialRequest, CreateRegistryCredentialRequest, CredentialState,
@@ -115,7 +125,10 @@ pub use handlers::tunnels::{
     TunnelApiState, TunnelStatus, TunnelSummary,
 };
 pub use handlers::variables::{CreateVariableRequest, UpdateVariableRequest, VariableState};
-pub use handlers::volumes::{DeleteVolumeQuery, VolumeApiState, VolumeSummary};
+pub use handlers::volumes::{
+    CreateVolumeRequest, DeleteVolumeQuery, VolumeApiState, VolumeInfo, VolumeSummary,
+    VolumeUsageSource,
+};
 pub use handlers::webhooks::{WebhookInfoResponse, WebhookResponse, WebhookState};
 pub use handlers::workflows::{CreateWorkflowRequest, WorkflowsState};
 

@@ -25,11 +25,11 @@ Attempts to cancel a running or pending job execution.  # Errors  Returns an err
 import {
   Configuration,
   JobsApi,
-} from '@zlayer/client';
-import type { CancelExecutionRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CancelExecutionRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -99,11 +99,11 @@ Returns the current status of a job execution, including logs if available.  # E
 import {
   Configuration,
   JobsApi,
-} from '@zlayer/client';
-import type { GetExecutionStatusRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetExecutionStatusRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -172,11 +172,11 @@ Returns a list of recent executions for the specified job.  # Errors  Returns an
 import {
   Configuration,
   JobsApi,
-} from '@zlayer/client';
-import type { ListJobExecutionsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListJobExecutionsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -250,11 +250,11 @@ Starts a new execution of the specified job. Returns immediately with an executi
 import {
   Configuration,
   JobsApi,
-} from '@zlayer/client';
-import type { TriggerJobRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { TriggerJobRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

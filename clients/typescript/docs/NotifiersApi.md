@@ -27,11 +27,11 @@ Create a new notifier. Admin only.
 import {
   Configuration,
   NotifiersApi,
-} from '@zlayer/client';
-import type { CreateNotifierOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateNotifierOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -100,11 +100,11 @@ Delete a notifier. Admin only.
 import {
   Configuration,
   NotifiersApi,
-} from '@zlayer/client';
-import type { DeleteNotifierRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteNotifierRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -173,11 +173,11 @@ Fetch a single notifier by id.
 import {
   Configuration,
   NotifiersApi,
-} from '@zlayer/client';
-import type { GetNotifierRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetNotifierRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -245,11 +245,11 @@ List notifiers.
 import {
   Configuration,
   NotifiersApi,
-} from '@zlayer/client';
-import type { ListNotifiersRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListNotifiersRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -309,11 +309,11 @@ For Slack and Discord, sends a test message via the configured webhook URL. For 
 import {
   Configuration,
   NotifiersApi,
-} from '@zlayer/client';
-import type { TestNotifierRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { TestNotifierRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -382,11 +382,11 @@ Supports partial updates: only fields present in the request body are changed.  
 import {
   Configuration,
   NotifiersApi,
-} from '@zlayer/client';
-import type { UpdateNotifierOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { UpdateNotifierOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

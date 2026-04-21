@@ -25,11 +25,11 @@ Returns each service\&#39;s backend group with its strategy, health status, and 
 import {
   Configuration,
   ProxyApi,
-} from '@zlayer/client';
-import type { ListBackendsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListBackendsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -89,11 +89,11 @@ Returns the full list of L7 routes with their host patterns, path prefixes, back
 import {
   Configuration,
   ProxyApi,
-} from '@zlayer/client';
-import type { ListRoutesRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListRoutesRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -153,11 +153,11 @@ Returns all TCP and UDP stream proxies with their listen ports, service names, a
 import {
   Configuration,
   ProxyApi,
-} from '@zlayer/client';
-import type { ListStreamsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListStreamsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -217,11 +217,11 @@ Returns cached certificate domains with metadata (expiry, fingerprint) when avai
 import {
   Configuration,
   ProxyApi,
-} from '@zlayer/client';
-import type { ListTlsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListTlsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

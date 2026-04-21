@@ -1,4 +1,4 @@
-# @zlayer/client@0.1.0
+# @zlayer/api-client@0.10.104
 
 A TypeScript SDK client for the localhost API.
 
@@ -7,7 +7,7 @@ A TypeScript SDK client for the localhost API.
 First, install the SDK from npm.
 
 ```bash
-npm install @zlayer/client --save
+npm install @zlayer/api-client --save
 ```
 
 Next, try it out.
@@ -17,11 +17,11 @@ Next, try it out.
 import {
   Configuration,
   AuditApi,
-} from '@zlayer/client';
-import type { ListAuditRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListAuditRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new AuditApi();
 
   const body = {
@@ -60,11 +60,14 @@ All URIs are relative to *http://localhost*
 | ----- | ------ | ------------ | -------------
 *AuditApi* | [**listAudit**](docs/AuditApi.md#listaudit) | **GET** /api/v1/audit | List audit log entries. Admin only.
 *AuthenticationApi* | [**bootstrap**](docs/AuthenticationApi.md#bootstrapoperation) | **POST** /auth/bootstrap | Bootstrap the very first admin user. Returns 409 if any user exists.
+*AuthenticationApi* | [**callback**](docs/AuthenticationApi.md#callback) | **GET** /auth/oidc/{provider}/callback | &#x60;GET /auth/oidc/:provider/callback&#x60;.
 *AuthenticationApi* | [**csrf**](docs/AuthenticationApi.md#csrf) | **GET** /auth/csrf | Rotate the CSRF double-submit token for the current session.
 *AuthenticationApi* | [**getToken**](docs/AuthenticationApi.md#gettoken) | **POST** /auth/token | Get an access token.
+*AuthenticationApi* | [**listProviders**](docs/AuthenticationApi.md#listproviders) | **GET** /auth/oidc/providers | &#x60;GET /auth/oidc/providers&#x60;.
 *AuthenticationApi* | [**login**](docs/AuthenticationApi.md#loginoperation) | **POST** /auth/login | Sign in an existing user.
 *AuthenticationApi* | [**logout**](docs/AuthenticationApi.md#logout) | **POST** /auth/logout | Clear the session + CSRF cookies.
 *AuthenticationApi* | [**me**](docs/AuthenticationApi.md#me) | **GET** /auth/me | Return the currently signed-in user.
+*AuthenticationApi* | [**start**](docs/AuthenticationApi.md#start) | **GET** /auth/oidc/{provider}/start | &#x60;GET /auth/oidc/:provider/start&#x60; — 302 to the provider\&#39;s authorize URL.
 *BuildApi* | [**getBuildLogs**](docs/BuildApi.md#getbuildlogs) | **GET** /api/v1/build/{id}/logs | GET /api/v1/build/{id}/logs Get build logs.
 *BuildApi* | [**getBuildStatus**](docs/BuildApi.md#getbuildstatus) | **GET** /api/v1/build/{id} | GET /api/v1/build/{id} Get build status.
 *BuildApi* | [**listBuilds**](docs/BuildApi.md#listbuilds) | **GET** /api/v1/builds | GET /api/v1/builds List all builds.
@@ -76,6 +79,12 @@ All URIs are relative to *http://localhost*
 *ClusterApi* | [**clusterHeartbeat**](docs/ClusterApi.md#clusterheartbeat) | **POST** /api/v1/cluster/heartbeat | Handle node heartbeat.
 *ClusterApi* | [**clusterJoin**](docs/ClusterApi.md#clusterjoinoperation) | **POST** /api/v1/cluster/join | Handle a cluster join request.
 *ClusterApi* | [**clusterListNodes**](docs/ClusterApi.md#clusterlistnodes) | **GET** /api/v1/cluster/nodes | List all nodes visible in the Raft cluster state.
+*ContainerNetworksApi* | [**connectContainerNetwork**](docs/ContainerNetworksApi.md#connectcontainernetwork) | **POST** /api/v1/container-networks/{id_or_name}/connect | Attach a container to a network.
+*ContainerNetworksApi* | [**createContainerNetwork**](docs/ContainerNetworksApi.md#createcontainernetwork) | **POST** /api/v1/container-networks | Create a new bridge or overlay network.
+*ContainerNetworksApi* | [**deleteContainerNetwork**](docs/ContainerNetworksApi.md#deletecontainernetwork) | **DELETE** /api/v1/container-networks/{id_or_name} | Delete a bridge network. Refuses if the network still has attachments unless &#x60;?force&#x3D;true&#x60; is set.
+*ContainerNetworksApi* | [**disconnectContainerNetwork**](docs/ContainerNetworksApi.md#disconnectcontainernetwork) | **POST** /api/v1/container-networks/{id_or_name}/disconnect | Detach a container from a network.
+*ContainerNetworksApi* | [**getContainerNetwork**](docs/ContainerNetworksApi.md#getcontainernetwork) | **GET** /api/v1/container-networks/{id_or_name} | Inspect a single bridge network by id or by name.
+*ContainerNetworksApi* | [**listContainerNetworks**](docs/ContainerNetworksApi.md#listcontainernetworks) | **GET** /api/v1/container-networks | List all bridge networks, optionally filtered by label.
 *ContainersApi* | [**createContainer**](docs/ContainersApi.md#createcontaineroperation) | **POST** /api/v1/containers | Create and start a container.
 *ContainersApi* | [**deleteContainer**](docs/ContainersApi.md#deletecontainer) | **DELETE** /api/v1/containers/{id} | Stop and remove a container.
 *ContainersApi* | [**execInContainer**](docs/ContainersApi.md#execincontainer) | **POST** /api/v1/containers/{id}/exec | Execute a command in a running container.
@@ -108,6 +117,7 @@ All URIs are relative to *http://localhost*
 *EnvironmentsApi* | [**getEnvironment**](docs/EnvironmentsApi.md#getenvironment) | **GET** /api/v1/environments/{id} | Fetch a single environment by id.
 *EnvironmentsApi* | [**listEnvironments**](docs/EnvironmentsApi.md#listenvironments) | **GET** /api/v1/environments | List environments.
 *EnvironmentsApi* | [**updateEnvironment**](docs/EnvironmentsApi.md#updateenvironmentoperation) | **PATCH** /api/v1/environments/{id} | Rename / re-describe an environment. Admin only.
+*EventsApi* | [**streamEvents**](docs/EventsApi.md#streamevents) | **GET** /api/v1/events | Stream container lifecycle events as Server-Sent Events.
 *GroupsApi* | [**addMember**](docs/GroupsApi.md#addmemberoperation) | **POST** /api/v1/groups/{id}/members | Add a member to a group. Admin only.
 *GroupsApi* | [**createGroup**](docs/GroupsApi.md#creategroupoperation) | **POST** /api/v1/groups | Create a new group. Admin only.
 *GroupsApi* | [**deleteGroup**](docs/GroupsApi.md#deletegroup) | **DELETE** /api/v1/groups/{id} | Delete a group. Admin only.
@@ -149,6 +159,7 @@ All URIs are relative to *http://localhost*
 *OverlayApi* | [**getOverlayStatus**](docs/OverlayApi.md#getoverlaystatus) | **GET** /api/v1/overlay/status | Get overlay network status.
 *PermissionsApi* | [**grantPermission**](docs/PermissionsApi.md#grantpermissionoperation) | **POST** /api/v1/permissions | Grant a permission. Admin only.
 *PermissionsApi* | [**listPermissions**](docs/PermissionsApi.md#listpermissions) | **GET** /api/v1/permissions | List permissions for a subject (user or group).
+*PermissionsApi* | [**listPermissionsByResource**](docs/PermissionsApi.md#listpermissionsbyresource) | **GET** /api/v1/permissions/by-resource | List permissions granted on a specific resource.
 *PermissionsApi* | [**revokePermission**](docs/PermissionsApi.md#revokepermission) | **DELETE** /api/v1/permissions/{id} | Revoke a permission by id. Admin only.
 *ProjectsApi* | [**createProject**](docs/ProjectsApi.md#createprojectoperation) | **POST** /api/v1/projects | Create a new project. Admin only.
 *ProjectsApi* | [**deleteProject**](docs/ProjectsApi.md#deleteproject) | **DELETE** /api/v1/projects/{id} | Delete a project. Admin only. Cascade-removes deployment links.
@@ -168,6 +179,8 @@ All URIs are relative to *http://localhost*
 *SecretsApi* | [**deleteSecret**](docs/SecretsApi.md#deletesecret) | **DELETE** /api/v1/secrets/{name} | Delete a secret.
 *SecretsApi* | [**getSecretMetadata**](docs/SecretsApi.md#getsecretmetadata) | **GET** /api/v1/secrets/{name} | Get metadata for a specific secret. With &#x60;?reveal&#x3D;true&#x60; (admin only), the response also includes the plaintext &#x60;value&#x60;.
 *SecretsApi* | [**listSecrets**](docs/SecretsApi.md#listsecrets) | **GET** /api/v1/secrets | List secrets in a scope.
+*SecretsApi* | [**revealAllSecrets**](docs/SecretsApi.md#revealallsecrets) | **GET** /api/v1/secrets/reveal-all | Reveal every secret in an environment at once (admin only).
+*SecretsApi* | [**rotateSecret**](docs/SecretsApi.md#rotatesecretoperation) | **POST** /api/v1/secrets/{name}/rotate | Rotate a secret — overwrite with a new value and return the version before+after.
 *ServicesApi* | [**getService**](docs/ServicesApi.md#getservice) | **GET** /api/v1/deployments/{deployment}/services/{service} | Get service details.
 *ServicesApi* | [**getServiceLogs**](docs/ServicesApi.md#getservicelogs) | **GET** /api/v1/deployments/{deployment}/services/{service}/logs | Get service logs.
 *ServicesApi* | [**listServices**](docs/ServicesApi.md#listservices) | **GET** /api/v1/deployments/{deployment}/services | List services in a deployment.
@@ -201,7 +214,9 @@ All URIs are relative to *http://localhost*
 *VariablesApi* | [**getVariable**](docs/VariablesApi.md#getvariable) | **GET** /api/v1/variables/{id} | Fetch a single variable by id.
 *VariablesApi* | [**listVariables**](docs/VariablesApi.md#listvariables) | **GET** /api/v1/variables | List variables.
 *VariablesApi* | [**updateVariable**](docs/VariablesApi.md#updatevariableoperation) | **PATCH** /api/v1/variables/{id} | Update a variable\&#39;s name and/or value. Admin only.
+*VolumesApi* | [**createVolume**](docs/VolumesApi.md#createvolumeoperation) | **POST** /api/v1/volumes | Create a new named volume.
 *VolumesApi* | [**deleteVolume**](docs/VolumesApi.md#deletevolume) | **DELETE** /api/v1/volumes/{name} | Delete a volume by name.
+*VolumesApi* | [**getVolume**](docs/VolumesApi.md#getvolume) | **GET** /api/v1/volumes/{name} | Inspect a single volume by name.
 *VolumesApi* | [**listVolumes**](docs/VolumesApi.md#listvolumes) | **GET** /api/v1/volumes | List all volumes on disk.
 *WebhooksApi* | [**getWebhookInfo**](docs/WebhooksApi.md#getwebhookinfo) | **GET** /api/v1/projects/{id}/webhook | Get webhook configuration for a project.
 *WebhooksApi* | [**receiveWebhook**](docs/WebhooksApi.md#receivewebhook) | **POST** /webhooks/{provider}/{project_id} | Receive a webhook push event and trigger a project pull.
@@ -222,6 +237,10 @@ All URIs are relative to *http://localhost*
 - [BackendInfo](docs/BackendInfo.md)
 - [BackendsResponse](docs/BackendsResponse.md)
 - [BootstrapRequest](docs/BootstrapRequest.md)
+- [BridgeNetwork](docs/BridgeNetwork.md)
+- [BridgeNetworkAttachment](docs/BridgeNetworkAttachment.md)
+- [BridgeNetworkDetails](docs/BridgeNetworkDetails.md)
+- [BridgeNetworkDriver](docs/BridgeNetworkDriver.md)
 - [BuildKind](docs/BuildKind.md)
 - [BuildRequest](docs/BuildRequest.md)
 - [BuildRequestWithContext](docs/BuildRequestWithContext.md)
@@ -233,12 +252,19 @@ All URIs are relative to *http://localhost*
 - [ClusterJoinResponse](docs/ClusterJoinResponse.md)
 - [ClusterNodeSummary](docs/ClusterNodeSummary.md)
 - [ClusterPeer](docs/ClusterPeer.md)
+- [ConnectBridgeNetworkRequest](docs/ConnectBridgeNetworkRequest.md)
+- [ContainerEvent](docs/ContainerEvent.md)
+- [ContainerEventKind](docs/ContainerEventKind.md)
 - [ContainerExecRequest](docs/ContainerExecRequest.md)
 - [ContainerExecResponse](docs/ContainerExecResponse.md)
+- [ContainerHealthInfo](docs/ContainerHealthInfo.md)
 - [ContainerInfo](docs/ContainerInfo.md)
 - [ContainerResourceLimits](docs/ContainerResourceLimits.md)
+- [ContainerRestartKind](docs/ContainerRestartKind.md)
+- [ContainerRestartPolicy](docs/ContainerRestartPolicy.md)
 - [ContainerStatsResponse](docs/ContainerStatsResponse.md)
 - [ContainerWaitResponse](docs/ContainerWaitResponse.md)
+- [CreateBridgeNetworkRequest](docs/CreateBridgeNetworkRequest.md)
 - [CreateContainerRequest](docs/CreateContainerRequest.md)
 - [CreateDeploymentRequest](docs/CreateDeploymentRequest.md)
 - [CreateEnvironmentRequest](docs/CreateEnvironmentRequest.md)
@@ -256,12 +282,14 @@ All URIs are relative to *http://localhost*
 - [CreateTunnelResponse](docs/CreateTunnelResponse.md)
 - [CreateUserRequest](docs/CreateUserRequest.md)
 - [CreateVariableRequest](docs/CreateVariableRequest.md)
+- [CreateVolumeRequest](docs/CreateVolumeRequest.md)
 - [CreateWorkflowRequest](docs/CreateWorkflowRequest.md)
 - [CronJobResponse](docs/CronJobResponse.md)
 - [CronStatusResponse](docs/CronStatusResponse.md)
 - [CsrfResponse](docs/CsrfResponse.md)
 - [DeploymentDetails](docs/DeploymentDetails.md)
 - [DeploymentSummary](docs/DeploymentSummary.md)
+- [DisconnectBridgeNetworkRequest](docs/DisconnectBridgeNetworkRequest.md)
 - [DnsStatusResponse](docs/DnsStatusResponse.md)
 - [ForceLeaderRequest](docs/ForceLeaderRequest.md)
 - [ForceLeaderResponse](docs/ForceLeaderResponse.md)
@@ -271,6 +299,7 @@ All URIs are relative to *http://localhost*
 - [GpuUtilizationReport](docs/GpuUtilizationReport.md)
 - [GrantPermissionRequest](docs/GrantPermissionRequest.md)
 - [GroupMembersResponse](docs/GroupMembersResponse.md)
+- [HealthCheckRequest](docs/HealthCheckRequest.md)
 - [HealthResponse](docs/HealthResponse.md)
 - [HeartbeatRequest](docs/HeartbeatRequest.md)
 - [ImageInfoDto](docs/ImageInfoDto.md)
@@ -283,6 +312,8 @@ All URIs are relative to *http://localhost*
 - [LinkDeploymentRequest](docs/LinkDeploymentRequest.md)
 - [LoginRequest](docs/LoginRequest.md)
 - [LoginResponse](docs/LoginResponse.md)
+- [NetworkAttachmentInfo](docs/NetworkAttachmentInfo.md)
+- [NetworkAttachmentRequest](docs/NetworkAttachmentRequest.md)
 - [NetworkSummary](docs/NetworkSummary.md)
 - [NodeDetails](docs/NodeDetails.md)
 - [NodeResourceInfo](docs/NodeResourceInfo.md)
@@ -293,19 +324,28 @@ All URIs are relative to *http://localhost*
 - [NotifierConfigOneOf2](docs/NotifierConfigOneOf2.md)
 - [NotifierConfigOneOf3](docs/NotifierConfigOneOf3.md)
 - [NotifierKind](docs/NotifierKind.md)
+- [OidcCallbackResponse](docs/OidcCallbackResponse.md)
+- [OidcProviderPublic](docs/OidcProviderPublic.md)
 - [OverlayStatusResponse](docs/OverlayStatusResponse.md)
 - [PeerInfo](docs/PeerInfo.md)
 - [PeerListResponse](docs/PeerListResponse.md)
 - [PermissionLevel](docs/PermissionLevel.md)
+- [PortMapping](docs/PortMapping.md)
+- [PortProtocol](docs/PortProtocol.md)
 - [ProjectPullResponse](docs/ProjectPullResponse.md)
 - [PruneResultDto](docs/PruneResultDto.md)
 - [PullImageRequest](docs/PullImageRequest.md)
 - [PullImageResponse](docs/PullImageResponse.md)
 - [RegisteredServiceInfo](docs/RegisteredServiceInfo.md)
+- [RegistryAuth](docs/RegistryAuth.md)
+- [RegistryAuthType](docs/RegistryAuthType.md)
 - [RegistryAuthTypeSchema](docs/RegistryAuthTypeSchema.md)
 - [RegistryCredentialResponse](docs/RegistryCredentialResponse.md)
 - [ReplicationInfo](docs/ReplicationInfo.md)
 - [RestartContainerRequest](docs/RestartContainerRequest.md)
+- [RevealAllSecretsResponse](docs/RevealAllSecretsResponse.md)
+- [RotateSecretRequest](docs/RotateSecretRequest.md)
+- [RotateSecretResponse](docs/RotateSecretResponse.md)
 - [RouteInfo](docs/RouteInfo.md)
 - [RoutesResponse](docs/RoutesResponse.md)
 - [ScaleRequest](docs/ScaleRequest.md)
@@ -360,7 +400,9 @@ All URIs are relative to *http://localhost*
 - [UpdateVariableRequest](docs/UpdateVariableRequest.md)
 - [UserRole](docs/UserRole.md)
 - [UserView](docs/UserView.md)
+- [VolumeInfo](docs/VolumeInfo.md)
 - [VolumeMount](docs/VolumeMount.md)
+- [VolumeMountType](docs/VolumeMountType.md)
 - [VolumeSummary](docs/VolumeSummary.md)
 - [WebhookInfoResponse](docs/WebhookInfoResponse.md)
 - [WebhookResponse](docs/WebhookResponse.md)
@@ -390,7 +432,7 @@ and is automatically generated by the
 [OpenAPI Generator](https://openapi-generator.tech) project:
 
 - API version: `0.1.0`
-- Package version: `0.1.0`
+- Package version: `0.10.104`
 - Generator version: `7.21.0`
 - Build package: `org.openapitools.codegen.languages.TypeScriptFetchClientCodegen`
 

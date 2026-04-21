@@ -17,6 +17,7 @@ use crate::config::ApiConfig;
 use crate::handlers;
 use crate::handlers::audit::AuditState;
 use crate::handlers::cluster::ClusterApiState;
+use crate::handlers::container_networks::BridgeNetworkApiState;
 use crate::handlers::containers::ContainerApiState;
 use crate::handlers::credentials::CredentialState;
 use crate::handlers::cron::CronState;
@@ -1245,6 +1246,8 @@ pub fn build_storage_routes(storage_state: StorageState) -> Router<()> {
 pub fn build_volume_routes(volume_state: VolumeApiState) -> Router<()> {
     Router::new()
         .route("/", get(handlers::volumes::list_volumes))
+        .route("/", post(handlers::volumes::create_volume))
+        .route("/{name}", get(handlers::volumes::get_volume))
         .route("/{name}", delete(handlers::volumes::delete_volume))
         .with_state(volume_state)
 }
@@ -1281,6 +1284,63 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
         )
         .route("/{id}/kill", post(handlers::containers::kill_container))
         .with_state(container_state)
+}
+
+/// Build the daemon-wide container event stream route.
+///
+/// Mounts `GET /` (to be nested at `/api/v1/events`) as an SSE stream of
+/// container lifecycle events. The event bus lives on `ContainerApiState`,
+/// so lifecycle handlers and the event stream share the same broadcast
+/// channel when both are constructed from the same state instance.
+///
+/// # Arguments
+/// * `container_state` - Same state used by `/api/v1/containers`, so
+///   start/die/etc. events published by lifecycle handlers are visible on
+///   the event stream.
+pub fn build_event_routes(container_state: ContainerApiState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::events::stream_events))
+        .with_state(container_state)
+}
+
+/// Build routes for container bridge/overlay network management.
+///
+/// Creates the routes for CRUD operations on user-defined bridge or overlay
+/// networks plus connect/disconnect of containers. These routes require
+/// authentication; mutating endpoints require the `operator` role.
+///
+/// # Arguments
+/// * `state` - [`BridgeNetworkApiState`] (registry + optional runtime).
+///
+/// # Returns
+/// A Router with the container-network endpoints
+pub fn build_container_network_routes(state: BridgeNetworkApiState) -> Router<()> {
+    Router::new()
+        .route(
+            "/",
+            post(handlers::container_networks::create_container_network),
+        )
+        .route(
+            "/",
+            get(handlers::container_networks::list_container_networks),
+        )
+        .route(
+            "/{id_or_name}",
+            get(handlers::container_networks::get_container_network),
+        )
+        .route(
+            "/{id_or_name}",
+            delete(handlers::container_networks::delete_container_network),
+        )
+        .route(
+            "/{id_or_name}/connect",
+            post(handlers::container_networks::connect_container_network),
+        )
+        .route(
+            "/{id_or_name}/disconnect",
+            post(handlers::container_networks::disconnect_container_network),
+        )
+        .with_state(state)
 }
 
 pub fn build_job_routes(job_state: JobState) -> Router<()> {
@@ -1330,14 +1390,17 @@ pub fn build_router_with_containers(
     // Start with the services router
     let base_router = build_router_with_services(config, storage, service_manager);
 
-    // Create container state
+    // Create container state (carries the shared event bus)
     let container_state = ContainerApiState::new(runtime);
 
-    // Build container routes
-    let container_routes = build_container_routes(container_state);
+    // Build container + event routes from the same state so both sides see
+    // the same event bus. The state type is `Clone`, so this is cheap.
+    let container_routes = build_container_routes(container_state.clone());
+    let event_routes = build_event_routes(container_state);
 
-    // Merge container routes into API v1
-    base_router.nest("/api/v1/containers", container_routes)
+    base_router
+        .nest("/api/v1/containers", container_routes)
+        .nest("/api/v1/events", event_routes)
 }
 
 /// Build the sync routes sub-router.

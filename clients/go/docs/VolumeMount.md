@@ -5,14 +5,15 @@
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **Readonly** | Pointer to **bool** | Mount as read-only | [optional] 
-**Source** | **string** | Host path or volume name | 
+**Source** | Pointer to **NullableString** | Host path (bind), volume name (volume), or unused (tmpfs). | [optional] 
 **Target** | **string** | Container mount path | 
+**Type** | Pointer to [**NullableVolumeMountType**](VolumeMountType.md) | Mount kind. Omit (or &#x60;\&quot;bind\&quot;&#x60;) for legacy host-path binds. | [optional] 
 
 ## Methods
 
 ### NewVolumeMount
 
-`func NewVolumeMount(source string, target string, ) *VolumeMount`
+`func NewVolumeMount(target string, ) *VolumeMount`
 
 NewVolumeMount instantiates a new VolumeMount object
 This constructor will assign default values to properties that have it defined,
@@ -71,7 +72,22 @@ and a boolean to check if the value has been set.
 
 SetSource sets Source field to given value.
 
+### HasSource
 
+`func (o *VolumeMount) HasSource() bool`
+
+HasSource returns a boolean if a field has been set.
+
+### SetSourceNil
+
+`func (o *VolumeMount) SetSourceNil(b bool)`
+
+ SetSourceNil sets the value for Source to be an explicit nil
+
+### UnsetSource
+`func (o *VolumeMount) UnsetSource()`
+
+UnsetSource ensures that no value is present for Source, not even an explicit nil
 ### GetTarget
 
 `func (o *VolumeMount) GetTarget() string`
@@ -92,6 +108,41 @@ and a boolean to check if the value has been set.
 SetTarget sets Target field to given value.
 
 
+### GetType
+
+`func (o *VolumeMount) GetType() VolumeMountType`
+
+GetType returns the Type field if non-nil, zero value otherwise.
+
+### GetTypeOk
+
+`func (o *VolumeMount) GetTypeOk() (*VolumeMountType, bool)`
+
+GetTypeOk returns a tuple with the Type field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetType
+
+`func (o *VolumeMount) SetType(v VolumeMountType)`
+
+SetType sets Type field to given value.
+
+### HasType
+
+`func (o *VolumeMount) HasType() bool`
+
+HasType returns a boolean if a field has been set.
+
+### SetTypeNil
+
+`func (o *VolumeMount) SetTypeNil(b bool)`
+
+ SetTypeNil sets the value for Type to be an explicit nil
+
+### UnsetType
+`func (o *VolumeMount) UnsetType()`
+
+UnsetType ensures that no value is present for Type, not even an explicit nil
 
 [[Back to Model list]](../README.md#documentation-for-models) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to README]](../README.md)
 

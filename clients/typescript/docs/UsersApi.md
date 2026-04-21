@@ -27,11 +27,11 @@ Create a new user. Admin only.
 import {
   Configuration,
   UsersApi,
-} from '@zlayer/client';
-import type { CreateUserOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateUserOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new UsersApi();
 
   const body = {
@@ -97,11 +97,11 @@ Delete a user. Admin only. Callers cannot delete their own account.
 import {
   Configuration,
   UsersApi,
-} from '@zlayer/client';
-import type { DeleteUserRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteUserRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new UsersApi();
 
   const body = {
@@ -166,11 +166,11 @@ Fetch a single user. Admins can read any record; regular users can read only the
 import {
   Configuration,
   UsersApi,
-} from '@zlayer/client';
-import type { GetUserRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetUserRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new UsersApi();
 
   const body = {
@@ -234,11 +234,11 @@ List all users. Admin only.
 import {
   Configuration,
   UsersApi,
-} from '@zlayer/client';
-import type { ListUsersRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListUsersRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new UsersApi();
 
   try {
@@ -294,11 +294,11 @@ Set a user\&#39;s password. Admins may change any user\&#39;s password; regular 
 import {
   Configuration,
   UsersApi,
-} from '@zlayer/client';
-import type { SetPasswordOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { SetPasswordOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new UsersApi();
 
   const body = {
@@ -368,11 +368,11 @@ Update a user\&#39;s mutable fields. Admin only.
 import {
   Configuration,
   UsersApi,
-} from '@zlayer/client';
-import type { UpdateUserOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { UpdateUserOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new UsersApi();
 
   const body = {

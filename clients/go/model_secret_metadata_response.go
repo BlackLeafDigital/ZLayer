@@ -19,15 +19,17 @@ import (
 // checks if the SecretMetadataResponse type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &SecretMetadataResponse{}
 
-// SecretMetadataResponse Response containing secret metadata (never the value)
+// SecretMetadataResponse Response containing secret metadata. Never includes the value unless the caller is on the explicit `?reveal=true` admin path, in which case `value` is populated.
 type SecretMetadataResponse struct {
-	// Unix timestamp when the secret was created
+	// Unix timestamp when the secret was created.
 	CreatedAt int64 `json:"created_at"`
-	// The name/identifier of the secret
+	// The name/identifier of the secret.
 	Name string `json:"name"`
-	// Unix timestamp when the secret was last updated
+	// Unix timestamp when the secret was last updated.
 	UpdatedAt int64 `json:"updated_at"`
-	// Version number of the secret (incremented on each update)
+	// Plaintext value — populated only on `?reveal=true` admin reads.
+	Value NullableString `json:"value,omitempty"`
+	// Version number of the secret (incremented on each update).
 	Version int32 `json:"version"`
 }
 
@@ -126,6 +128,48 @@ func (o *SecretMetadataResponse) SetUpdatedAt(v int64) {
 	o.UpdatedAt = v
 }
 
+// GetValue returns the Value field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *SecretMetadataResponse) GetValue() string {
+	if o == nil || IsNil(o.Value.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.Value.Get()
+}
+
+// GetValueOk returns a tuple with the Value field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *SecretMetadataResponse) GetValueOk() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Value.Get(), o.Value.IsSet()
+}
+
+// HasValue returns a boolean if a field has been set.
+func (o *SecretMetadataResponse) HasValue() bool {
+	if o != nil && o.Value.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetValue gets a reference to the given NullableString and assigns it to the Value field.
+func (o *SecretMetadataResponse) SetValue(v string) {
+	o.Value.Set(&v)
+}
+// SetValueNil sets the value for Value to be an explicit nil
+func (o *SecretMetadataResponse) SetValueNil() {
+	o.Value.Set(nil)
+}
+
+// UnsetValue ensures that no value is present for Value, not even an explicit nil
+func (o *SecretMetadataResponse) UnsetValue() {
+	o.Value.Unset()
+}
+
 // GetVersion returns the Version field value
 func (o *SecretMetadataResponse) GetVersion() int32 {
 	if o == nil {
@@ -163,6 +207,9 @@ func (o SecretMetadataResponse) ToMap() (map[string]interface{}, error) {
 	toSerialize["created_at"] = o.CreatedAt
 	toSerialize["name"] = o.Name
 	toSerialize["updated_at"] = o.UpdatedAt
+	if o.Value.IsSet() {
+		toSerialize["value"] = o.Value.Get()
+	}
 	toSerialize["version"] = o.Version
 	return toSerialize, nil
 }

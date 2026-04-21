@@ -20,10 +20,10 @@ type BuildStateEnum string
 
 // List of BuildStateEnum
 const (
-	PENDING BuildStateEnum = "pending"
-	RUNNING BuildStateEnum = "running"
-	COMPLETE BuildStateEnum = "complete"
-	FAILED BuildStateEnum = "failed"
+	BUILDSTATEENUM_PENDING BuildStateEnum = "pending"
+	BUILDSTATEENUM_RUNNING BuildStateEnum = "running"
+	BUILDSTATEENUM_COMPLETE BuildStateEnum = "complete"
+	BUILDSTATEENUM_FAILED BuildStateEnum = "failed"
 )
 
 // All allowed values of BuildStateEnum enum

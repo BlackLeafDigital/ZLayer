@@ -68,6 +68,9 @@ tracing.workspace = true
 # Time
 time.workspace = true
 chrono.workspace = true
+# humantime parses duration strings like "10s", "30s", "1m" for
+# `HealthCheckRequest` interval/timeout/start_period fields.
+humantime = "2"
 
 # UUID
 uuid.workspace = true
@@ -99,6 +102,9 @@ lettre.workspace = true
 parking_lot.workspace = true
 dashmap.workspace = true
 
+# CIDR / IP parsing (bridge-network subnet validation)
+ipnetwork = "0.21.1"
+
 # Streaming
 tokio-stream.workspace = true
 futures-util.workspace = true
@@ -109,6 +115,17 @@ flate2.workspace = true
 
 # Embedded database
 sqlx.workspace = true
+
+# Docker bridge-network runtime (optional — only when `docker` feature is
+# enabled by the binary). Kept default-features-off + minimal features to
+# mirror the settings in `zlayer-agent`.
+bollard = { version = "0.20", default-features = false, features = ["ssl", "time", "pipe", "http"], optional = true }
+
+[features]
+default = []
+# Enables the Docker-backed `BridgeNetworkRuntime` implementation used by
+# `bin/zlayer` when the daemon runs on a host with Docker available.
+docker = ["dep:bollard"]
 
 # Temp directories for tests
 [dev-dependencies]

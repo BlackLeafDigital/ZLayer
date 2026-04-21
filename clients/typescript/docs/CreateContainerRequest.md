@@ -8,29 +8,47 @@ Request to create and start a container
 Name | Type
 ------------ | -------------
 `command` | Array&lt;string&gt;
+`dns` | Array&lt;string&gt;
 `env` | { [key: string]: string; }
+`extraHosts` | Array&lt;string&gt;
+`healthCheck` | [HealthCheckRequest](HealthCheckRequest.md)
+`hostname` | string
 `image` | string
 `labels` | { [key: string]: string; }
 `name` | string
+`networks` | [Array&lt;NetworkAttachmentRequest&gt;](NetworkAttachmentRequest.md)
+`ports` | [Array&lt;PortMapping&gt;](PortMapping.md)
 `pullPolicy` | string
+`registryAuth` | [RegistryAuth](RegistryAuth.md)
+`registryCredentialId` | string
 `resources` | [ContainerResourceLimits](ContainerResourceLimits.md)
+`restartPolicy` | [ContainerRestartPolicy](ContainerRestartPolicy.md)
 `volumes` | [Array&lt;VolumeMount&gt;](VolumeMount.md)
 `workDir` | string
 
 ## Example
 
 ```typescript
-import type { CreateContainerRequest } from '@zlayer/client'
+import type { CreateContainerRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {
   "command": null,
+  "dns": null,
   "env": null,
+  "extraHosts": null,
+  "healthCheck": null,
+  "hostname": null,
   "image": null,
   "labels": null,
   "name": null,
+  "networks": null,
+  "ports": null,
   "pullPolicy": null,
+  "registryAuth": null,
+  "registryCredentialId": null,
   "resources": null,
+  "restartPolicy": null,
   "volumes": null,
   "workDir": null,
 } satisfies CreateContainerRequest
