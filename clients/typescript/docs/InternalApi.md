@@ -23,11 +23,11 @@ This endpoint allows the scheduler to query the current state of a service.  # E
 import {
   Configuration,
   InternalApi,
-} from '@zlayer/client';
-import type { GetReplicasInternalRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetReplicasInternalRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new InternalApi();
 
   const body = {
@@ -92,11 +92,11 @@ This endpoint is called by the distributed scheduler leader to trigger scaling o
 import {
   Configuration,
   InternalApi,
-} from '@zlayer/client';
-import type { ScaleServiceInternalRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ScaleServiceInternalRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new InternalApi();
 
   const body = {

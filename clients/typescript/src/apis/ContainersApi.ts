@@ -57,6 +57,7 @@ export interface DeleteContainerRequest {
 export interface ExecInContainerRequest {
     id: string;
     containerExecRequest: ContainerExecRequest;
+    stream?: boolean;
 }
 
 export interface GetContainerRequest {
@@ -71,6 +72,8 @@ export interface GetContainerLogsRequest {
 
 export interface GetContainerStatsRequest {
     id: string;
+    stream?: boolean;
+    interval?: number | null;
 }
 
 export interface KillContainerOperationRequest {
@@ -236,6 +239,10 @@ export class ContainersApi extends runtime.BaseAPI {
 
         const queryParameters: any = {};
 
+        if (requestParameters['stream'] != null) {
+            queryParameters['stream'] = requestParameters['stream'];
+        }
+
         const headerParameters: runtime.HTTPHeaders = {};
 
         headerParameters['Content-Type'] = 'application/json';
@@ -262,7 +269,7 @@ export class ContainersApi extends runtime.BaseAPI {
     }
 
     /**
-     * # Errors  Returns an error if the container is not found, the command is invalid, execution fails, or the user lacks the operator role.
+     * When `stream=true` is passed as a query parameter, this endpoint upgrades to a Server-Sent Events stream emitting: - `event: stdout\\ndata: <line>\\n\\n` for each stdout line - `event: stderr\\ndata: <line>\\n\\n` for each stderr line - `event: exit\\ndata: {\"exit_code\": N}\\n\\n` as the final event  # Errors  Returns an error if the container is not found, the command is invalid, execution fails, or the user lacks the operator role.
      * Execute a command in a running container.
      */
     async execInContainerRaw(requestParameters: ExecInContainerRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<ContainerExecResponse>> {
@@ -273,7 +280,7 @@ export class ContainersApi extends runtime.BaseAPI {
     }
 
     /**
-     * # Errors  Returns an error if the container is not found, the command is invalid, execution fails, or the user lacks the operator role.
+     * When `stream=true` is passed as a query parameter, this endpoint upgrades to a Server-Sent Events stream emitting: - `event: stdout\\ndata: <line>\\n\\n` for each stdout line - `event: stderr\\ndata: <line>\\n\\n` for each stderr line - `event: exit\\ndata: {\"exit_code\": N}\\n\\n` as the final event  # Errors  Returns an error if the container is not found, the command is invalid, execution fails, or the user lacks the operator role.
      * Execute a command in a running container.
      */
     async execInContainer(requestParameters: ExecInContainerRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<ContainerExecResponse> {
@@ -416,6 +423,14 @@ export class ContainersApi extends runtime.BaseAPI {
 
         const queryParameters: any = {};
 
+        if (requestParameters['stream'] != null) {
+            queryParameters['stream'] = requestParameters['stream'];
+        }
+
+        if (requestParameters['interval'] != null) {
+            queryParameters['interval'] = requestParameters['interval'];
+        }
+
         const headerParameters: runtime.HTTPHeaders = {};
 
         if (this.configuration && this.configuration.accessToken) {
@@ -439,7 +454,7 @@ export class ContainersApi extends runtime.BaseAPI {
     }
 
     /**
-     * Returns CPU and memory usage statistics for the specified container.  # Errors  Returns an error if the container is not found or stats retrieval fails.
+     * Returns CPU and memory usage statistics for the specified container. By default this is a one-shot JSON response. When the query string contains `stream=true`, the handler switches to Server-Sent Events and emits one `ContainerStatsResponse` sample every `interval` seconds (default 2, clamped to `[1, 60]`). The stream ends with a final `event: close` when the container exits or the runtime reports an unrecoverable error.  # Errors  Returns an error if the container is not found or stats retrieval fails.
      * Get container resource statistics.
      */
     async getContainerStatsRaw(requestParameters: GetContainerStatsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<ContainerStatsResponse>> {
@@ -450,7 +465,7 @@ export class ContainersApi extends runtime.BaseAPI {
     }
 
     /**
-     * Returns CPU and memory usage statistics for the specified container.  # Errors  Returns an error if the container is not found or stats retrieval fails.
+     * Returns CPU and memory usage statistics for the specified container. By default this is a one-shot JSON response. When the query string contains `stream=true`, the handler switches to Server-Sent Events and emits one `ContainerStatsResponse` sample every `interval` seconds (default 2, clamped to `[1, 60]`). The stream ends with a final `event: close` when the container exits or the runtime reports an unrecoverable error.  # Errors  Returns an error if the container is not found or stats retrieval fails.
      * Get container resource statistics.
      */
     async getContainerStats(requestParameters: GetContainerStatsRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<ContainerStatsResponse> {

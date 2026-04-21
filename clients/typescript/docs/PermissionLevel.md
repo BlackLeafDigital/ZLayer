@@ -11,7 +11,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { PermissionLevel } from '@zlayer/client'
+import type { PermissionLevel } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

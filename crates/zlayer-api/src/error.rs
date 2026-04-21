@@ -106,4 +106,19 @@ impl From<crate::storage::StorageError> for ApiError {
     }
 }
 
+impl From<crate::identity::IdentityError> for ApiError {
+    fn from(err: crate::identity::IdentityError) -> Self {
+        use crate::identity::IdentityError;
+        match err {
+            IdentityError::UserStore(e) => ApiError::from(e),
+            IdentityError::Credentials(e) => ApiError::Internal(format!("credential store: {e}")),
+            IdentityError::NotFound(msg) => ApiError::NotFound(msg),
+            IdentityError::EmailExists(msg) => {
+                ApiError::Conflict(format!("Email '{msg}' is already registered"))
+            }
+            IdentityError::Invalid(msg) => ApiError::BadRequest(msg),
+        }
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ApiError>;

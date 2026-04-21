@@ -9,6 +9,10 @@ pub mod spec;
 pub mod tunnel;
 pub mod wasm;
 
+// Windows-only maintenance commands (WSL2 distro management)
+#[cfg(all(target_os = "windows", feature = "wsl"))]
+pub mod windows;
+
 // Unix-only commands (depend on zlayer-agent, zlayer-overlay, zlayer-api, etc.)
 #[cfg(unix)]
 pub mod audit_cmd;
@@ -48,6 +52,8 @@ pub mod project;
 pub mod ps;
 #[cfg(unix)]
 pub mod resolver;
+#[cfg(unix)]
+pub mod run;
 #[cfg(unix)]
 pub mod secret;
 #[cfg(unix)]

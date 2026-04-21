@@ -25,11 +25,11 @@ Get service details.
 import {
   Configuration,
   ServicesApi,
-} from '@zlayer/client';
-import type { GetServiceRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetServiceRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -101,11 +101,11 @@ Returns service logs as plain text when &#x60;follow&#x3D;false&#x60;, or as a S
 import {
   Configuration,
   ServicesApi,
-} from '@zlayer/client';
-import type { GetServiceLogsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetServiceLogsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -186,11 +186,11 @@ List services in a deployment.
 import {
   Configuration,
   ServicesApi,
-} from '@zlayer/client';
-import type { ListServicesRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListServicesRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -259,11 +259,11 @@ Scale a service.
 import {
   Configuration,
   ServicesApi,
-} from '@zlayer/client';
-import type { ScaleServiceRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ScaleServiceRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

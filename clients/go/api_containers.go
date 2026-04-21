@@ -241,10 +241,17 @@ type ApiExecInContainerRequest struct {
 	ApiService *ContainersAPIService
 	id string
 	containerExecRequest *ContainerExecRequest
+	stream *bool
 }
 
 func (r ApiExecInContainerRequest) ContainerExecRequest(containerExecRequest ContainerExecRequest) ApiExecInContainerRequest {
 	r.containerExecRequest = &containerExecRequest
+	return r
+}
+
+// Stream exec events as SSE instead of returning a buffered JSON body.
+func (r ApiExecInContainerRequest) Stream(stream bool) ApiExecInContainerRequest {
+	r.stream = &stream
 	return r
 }
 
@@ -254,6 +261,12 @@ func (r ApiExecInContainerRequest) Execute() (*ContainerExecResponse, *http.Resp
 
 /*
 ExecInContainer Execute a command in a running container.
+
+When `stream=true` is passed as a query parameter, this endpoint upgrades
+to a Server-Sent Events stream emitting:
+- `event: stdout\ndata: <line>\n\n` for each stdout line
+- `event: stderr\ndata: <line>\n\n` for each stderr line
+- `event: exit\ndata: {"exit_code": N}\n\n` as the final event
 
 # Errors
 
@@ -297,6 +310,9 @@ func (a *ContainersAPIService) ExecInContainerExecute(r ApiExecInContainerReques
 		return localVarReturnValue, nil, reportError("containerExecRequest is required and must be specified")
 	}
 
+	if r.stream != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "stream", r.stream, "form", "")
+	}
 	// to determine the Content-Type header
 	localVarHTTPContentTypes := []string{"application/json"}
 
@@ -590,6 +606,20 @@ type ApiGetContainerStatsRequest struct {
 	ctx context.Context
 	ApiService *ContainersAPIService
 	id string
+	stream *bool
+	interval *int32
+}
+
+// Stream periodic samples as SSE events instead of a one-shot JSON response.
+func (r ApiGetContainerStatsRequest) Stream(stream bool) ApiGetContainerStatsRequest {
+	r.stream = &stream
+	return r
+}
+
+// Sample cadence in seconds (only used when &#x60;stream&#x3D;true&#x60;). Clamped to &#x60;[1, 60]&#x60;. Defaults to &#x60;2&#x60; seconds.
+func (r ApiGetContainerStatsRequest) Interval(interval int32) ApiGetContainerStatsRequest {
+	r.interval = &interval
+	return r
 }
 
 func (r ApiGetContainerStatsRequest) Execute() (*ContainerStatsResponse, *http.Response, error) {
@@ -600,6 +630,12 @@ func (r ApiGetContainerStatsRequest) Execute() (*ContainerStatsResponse, *http.R
 GetContainerStats Get container resource statistics.
 
 Returns CPU and memory usage statistics for the specified container.
+By default this is a one-shot JSON response. When the query string
+contains `stream=true`, the handler switches to Server-Sent Events and
+emits one `ContainerStatsResponse` sample every `interval` seconds
+(default 2, clamped to `[1, 60]`). The stream ends with a final
+`event: close` when the container exits or the runtime reports an
+unrecoverable error.
 
 # Errors
 
@@ -639,6 +675,12 @@ func (a *ContainersAPIService) GetContainerStatsExecute(r ApiGetContainerStatsRe
 	localVarQueryParams := url.Values{}
 	localVarFormParams := url.Values{}
 
+	if r.stream != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "stream", r.stream, "form", "")
+	}
+	if r.interval != nil {
+		parameterAddToHeaderOrQuery(localVarQueryParams, "interval", r.interval, "form", "")
+	}
 	// to determine the Content-Type header
 	localVarHTTPContentTypes := []string{}
 
@@ -691,6 +733,118 @@ func (a *ContainersAPIService) GetContainerStatsExecute(r ApiGetContainerStatsRe
 	}
 
 	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiKillContainerRequest struct {
+	ctx context.Context
+	ApiService *ContainersAPIService
+	id string
+	killContainerRequest *KillContainerRequest
+}
+
+func (r ApiKillContainerRequest) KillContainerRequest(killContainerRequest KillContainerRequest) ApiKillContainerRequest {
+	r.killContainerRequest = &killContainerRequest
+	return r
+}
+
+func (r ApiKillContainerRequest) Execute() (*http.Response, error) {
+	return r.ApiService.KillContainerExecute(r)
+}
+
+/*
+KillContainer Send a signal to a running container.
+
+Mirrors Docker-compat `POST /containers/{id}/kill`. When the request body's
+`signal` field is omitted, the runtime sends `SIGKILL`. Accepted signals
+are `SIGKILL`, `SIGTERM`, `SIGINT`, `SIGHUP`, `SIGUSR1`, `SIGUSR2` (with
+or without the `SIG` prefix); any other value is rejected with `400`.
+
+# Errors
+
+Returns `400` for unknown signals, `404` if the container is not found,
+`403` if the caller lacks the `operator` role, `501` if the runtime does
+not support `kill_container`, and `500` for other runtime errors.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @param id Container identifier
+ @return ApiKillContainerRequest
+*/
+func (a *ContainersAPIService) KillContainer(ctx context.Context, id string) ApiKillContainerRequest {
+	return ApiKillContainerRequest{
+		ApiService: a,
+		ctx: ctx,
+		id: id,
+	}
+}
+
+// Execute executes the request
+func (a *ContainersAPIService) KillContainerExecute(r ApiKillContainerRequest) (*http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "ContainersAPIService.KillContainer")
+	if err != nil {
+		return nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/containers/{id}/kill"
+	localVarPath = strings.Replace(localVarPath, "{"+"id"+"}", url.PathEscape(parameterValueToString(r.id, "id")), -1)
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if r.killContainerRequest == nil {
+		return nil, reportError("killContainerRequest is required and must be specified")
+	}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{"application/json"}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	// body params
+	localVarPostBody = r.killContainerRequest
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarHTTPResponse, newErr
+	}
+
+	return localVarHTTPResponse, nil
 }
 
 type ApiListContainersRequest struct {
@@ -805,6 +959,325 @@ func (a *ContainersAPIService) ListContainersExecute(r ApiListContainersRequest)
 	}
 
 	return localVarReturnValue, localVarHTTPResponse, nil
+}
+
+type ApiRestartContainerRequest struct {
+	ctx context.Context
+	ApiService *ContainersAPIService
+	id string
+	restartContainerRequest *RestartContainerRequest
+}
+
+func (r ApiRestartContainerRequest) RestartContainerRequest(restartContainerRequest RestartContainerRequest) ApiRestartContainerRequest {
+	r.restartContainerRequest = &restartContainerRequest
+	return r
+}
+
+func (r ApiRestartContainerRequest) Execute() (*http.Response, error) {
+	return r.ApiService.RestartContainerExecute(r)
+}
+
+/*
+RestartContainer Restart a container: stop then start.
+
+Composes `stop_container(timeout)` followed by `start_container`. Errors
+during the stop phase are ignored (the container may already be stopped);
+errors during the start phase are surfaced.
+
+# Errors
+
+Returns an error if the container is not found, the start phase fails, or
+the user lacks the operator role.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @param id Container identifier
+ @return ApiRestartContainerRequest
+*/
+func (a *ContainersAPIService) RestartContainer(ctx context.Context, id string) ApiRestartContainerRequest {
+	return ApiRestartContainerRequest{
+		ApiService: a,
+		ctx: ctx,
+		id: id,
+	}
+}
+
+// Execute executes the request
+func (a *ContainersAPIService) RestartContainerExecute(r ApiRestartContainerRequest) (*http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "ContainersAPIService.RestartContainer")
+	if err != nil {
+		return nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/containers/{id}/restart"
+	localVarPath = strings.Replace(localVarPath, "{"+"id"+"}", url.PathEscape(parameterValueToString(r.id, "id")), -1)
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if r.restartContainerRequest == nil {
+		return nil, reportError("restartContainerRequest is required and must be specified")
+	}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{"application/json"}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	// body params
+	localVarPostBody = r.restartContainerRequest
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarHTTPResponse, newErr
+	}
+
+	return localVarHTTPResponse, nil
+}
+
+type ApiStartContainerRequest struct {
+	ctx context.Context
+	ApiService *ContainersAPIService
+	id string
+}
+
+func (r ApiStartContainerRequest) Execute() (*http.Response, error) {
+	return r.ApiService.StartContainerExecute(r)
+}
+
+/*
+StartContainer Start a previously-created container.
+
+Useful for re-starting a container that was stopped via
+`POST /api/v1/containers/{id}/stop` without being removed.
+
+# Errors
+
+Returns an error if the container is not found, start fails, or the user
+lacks the operator role.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @param id Container identifier
+ @return ApiStartContainerRequest
+*/
+func (a *ContainersAPIService) StartContainer(ctx context.Context, id string) ApiStartContainerRequest {
+	return ApiStartContainerRequest{
+		ApiService: a,
+		ctx: ctx,
+		id: id,
+	}
+}
+
+// Execute executes the request
+func (a *ContainersAPIService) StartContainerExecute(r ApiStartContainerRequest) (*http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "ContainersAPIService.StartContainer")
+	if err != nil {
+		return nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/containers/{id}/start"
+	localVarPath = strings.Replace(localVarPath, "{"+"id"+"}", url.PathEscape(parameterValueToString(r.id, "id")), -1)
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarHTTPResponse, newErr
+	}
+
+	return localVarHTTPResponse, nil
+}
+
+type ApiStopContainerRequest struct {
+	ctx context.Context
+	ApiService *ContainersAPIService
+	id string
+	stopContainerRequest *StopContainerRequest
+}
+
+func (r ApiStopContainerRequest) StopContainerRequest(stopContainerRequest StopContainerRequest) ApiStopContainerRequest {
+	r.stopContainerRequest = &stopContainerRequest
+	return r
+}
+
+func (r ApiStopContainerRequest) Execute() (*http.Response, error) {
+	return r.ApiService.StopContainerExecute(r)
+}
+
+/*
+StopContainer Stop a running container.
+
+Sends the runtime's graceful stop signal and waits up to `timeout` seconds
+before force-killing. The container is **not** removed; use
+`DELETE /api/v1/containers/{id}` to stop-and-remove. Idempotent: calling
+stop on an already-stopped container is not an error.
+
+# Errors
+
+Returns an error if the container is not found, stop fails, or the user
+lacks the operator role.
+
+ @param ctx context.Context - for authentication, logging, cancellation, deadlines, tracing, etc. Passed from http.Request or context.Background().
+ @param id Container identifier
+ @return ApiStopContainerRequest
+*/
+func (a *ContainersAPIService) StopContainer(ctx context.Context, id string) ApiStopContainerRequest {
+	return ApiStopContainerRequest{
+		ApiService: a,
+		ctx: ctx,
+		id: id,
+	}
+}
+
+// Execute executes the request
+func (a *ContainersAPIService) StopContainerExecute(r ApiStopContainerRequest) (*http.Response, error) {
+	var (
+		localVarHTTPMethod   = http.MethodPost
+		localVarPostBody     interface{}
+		formFiles            []formFile
+	)
+
+	localBasePath, err := a.client.cfg.ServerURLWithContext(r.ctx, "ContainersAPIService.StopContainer")
+	if err != nil {
+		return nil, &GenericOpenAPIError{error: err.Error()}
+	}
+
+	localVarPath := localBasePath + "/api/v1/containers/{id}/stop"
+	localVarPath = strings.Replace(localVarPath, "{"+"id"+"}", url.PathEscape(parameterValueToString(r.id, "id")), -1)
+
+	localVarHeaderParams := make(map[string]string)
+	localVarQueryParams := url.Values{}
+	localVarFormParams := url.Values{}
+	if r.stopContainerRequest == nil {
+		return nil, reportError("stopContainerRequest is required and must be specified")
+	}
+
+	// to determine the Content-Type header
+	localVarHTTPContentTypes := []string{"application/json"}
+
+	// set Content-Type header
+	localVarHTTPContentType := selectHeaderContentType(localVarHTTPContentTypes)
+	if localVarHTTPContentType != "" {
+		localVarHeaderParams["Content-Type"] = localVarHTTPContentType
+	}
+
+	// to determine the Accept header
+	localVarHTTPHeaderAccepts := []string{}
+
+	// set Accept header
+	localVarHTTPHeaderAccept := selectHeaderAccept(localVarHTTPHeaderAccepts)
+	if localVarHTTPHeaderAccept != "" {
+		localVarHeaderParams["Accept"] = localVarHTTPHeaderAccept
+	}
+	// body params
+	localVarPostBody = r.stopContainerRequest
+	req, err := a.client.prepareRequest(r.ctx, localVarPath, localVarHTTPMethod, localVarPostBody, localVarHeaderParams, localVarQueryParams, localVarFormParams, formFiles)
+	if err != nil {
+		return nil, err
+	}
+
+	localVarHTTPResponse, err := a.client.callAPI(req)
+	if err != nil || localVarHTTPResponse == nil {
+		return localVarHTTPResponse, err
+	}
+
+	localVarBody, err := io.ReadAll(localVarHTTPResponse.Body)
+	localVarHTTPResponse.Body.Close()
+	localVarHTTPResponse.Body = io.NopCloser(bytes.NewBuffer(localVarBody))
+	if err != nil {
+		return localVarHTTPResponse, err
+	}
+
+	if localVarHTTPResponse.StatusCode >= 300 {
+		newErr := &GenericOpenAPIError{
+			body:  localVarBody,
+			error: localVarHTTPResponse.Status,
+		}
+		return localVarHTTPResponse, newErr
+	}
+
+	return localVarHTTPResponse, nil
 }
 
 type ApiWaitContainerRequest struct {

@@ -16,10 +16,15 @@ use crate::handlers::cluster::{
     ClusterJoinRequest, ClusterJoinResponse, ClusterNodeSummary, ClusterPeer, ForceLeaderRequest,
     ForceLeaderResponse, HeartbeatRequest,
 };
+use crate::handlers::container_networks::{
+    BridgeNetworkDetails, ConnectBridgeNetworkRequest, CreateBridgeNetworkRequest,
+    DisconnectBridgeNetworkRequest,
+};
 use crate::handlers::containers::{
-    ContainerExecRequest, ContainerExecResponse, ContainerInfo, ContainerResourceLimits,
-    ContainerStatsResponse, ContainerWaitResponse, CreateContainerRequest, KillContainerRequest,
-    RestartContainerRequest, StopContainerRequest, VolumeMount,
+    ContainerExecRequest, ContainerExecResponse, ContainerHealthInfo, ContainerInfo,
+    ContainerResourceLimits, ContainerStatsResponse, ContainerWaitResponse, CreateContainerRequest,
+    HealthCheckRequest, KillContainerRequest, NetworkAttachmentInfo, NetworkAttachmentRequest,
+    RestartContainerRequest, StopContainerRequest, VolumeMount, VolumeMountType,
 };
 use crate::handlers::credentials::{
     CreateGitCredentialRequest, CreateRegistryCredentialRequest, GitCredentialKindSchema,
@@ -28,6 +33,8 @@ use crate::handlers::credentials::{
 use crate::handlers::cron::{CronJobResponse, CronStatusResponse, TriggerCronResponse};
 use crate::handlers::deployments::{CreateDeploymentRequest, DeploymentDetails, DeploymentSummary};
 use crate::handlers::environments::{CreateEnvironmentRequest, UpdateEnvironmentRequest};
+
+use crate::event_bus::{ContainerEvent, ContainerEventKind};
 use crate::handlers::groups::{
     AddMemberRequest, CreateGroupRequest, GroupMembersResponse, UpdateGroupRequest,
 };
@@ -54,7 +61,10 @@ use crate::handlers::proxy::{
     BackendGroupInfo, BackendInfo, BackendsResponse, CertInfo, RouteInfo, RoutesResponse,
     StreamBackendInfo, StreamInfo, StreamsResponse, TlsResponse,
 };
-use crate::handlers::secrets::{BulkImportResponse, CreateSecretRequest, SecretMetadataResponse};
+use crate::handlers::secrets::{
+    BulkImportResponse, CreateSecretRequest, RevealAllSecretsResponse, RotateSecretRequest,
+    RotateSecretResponse, SecretMetadataResponse,
+};
 use crate::handlers::services::{
     ScaleRequest, ServiceDetails, ServiceEndpoint, ServiceMetrics, ServiceSummary,
 };
@@ -70,7 +80,7 @@ use crate::handlers::tunnels::{
 };
 use crate::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
 use crate::handlers::variables::{CreateVariableRequest, UpdateVariableRequest};
-use crate::handlers::volumes::VolumeSummary;
+use crate::handlers::volumes::{CreateVolumeRequest, VolumeInfo, VolumeSummary};
 use crate::handlers::webhooks::{WebhookInfoResponse, WebhookResponse};
 use crate::handlers::workflows::CreateWorkflowRequest;
 
@@ -92,6 +102,11 @@ use crate::handlers::build::{
 use crate::handlers::cluster::{
     __path_cluster_force_leader, __path_cluster_heartbeat, __path_cluster_join,
     __path_cluster_list_nodes,
+};
+use crate::handlers::container_networks::{
+    __path_connect_container_network, __path_create_container_network,
+    __path_delete_container_network, __path_disconnect_container_network,
+    __path_get_container_network, __path_list_container_networks,
 };
 use crate::handlers::containers::{
     __path_create_container, __path_delete_container, __path_exec_in_container,
@@ -116,6 +131,7 @@ use crate::handlers::environments::{
     __path_create_environment, __path_delete_environment, __path_get_environment,
     __path_list_environments, __path_update_environment,
 };
+use crate::handlers::events::__path_stream_events;
 use crate::handlers::groups::{
     __path_add_member, __path_create_group, __path_delete_group, __path_get_group,
     __path_list_groups, __path_remove_member, __path_update_group,
@@ -141,12 +157,14 @@ use crate::handlers::notifiers::{
     __path_create_notifier, __path_delete_notifier, __path_get_notifier, __path_list_notifiers,
     __path_test_notifier, __path_update_notifier,
 };
+use crate::handlers::oidc::{__path_callback, __path_list_providers, __path_start};
 use crate::handlers::overlay::{
     __path_get_dns_status, __path_get_ip_allocation, __path_get_overlay_peers,
     __path_get_overlay_status,
 };
 use crate::handlers::permissions::{
-    __path_grant_permission, __path_list_permissions, __path_revoke_permission,
+    __path_grant_permission, __path_list_permissions, __path_list_permissions_by_resource,
+    __path_revoke_permission,
 };
 use crate::handlers::projects::{
     __path_create_project, __path_delete_project, __path_get_project,
@@ -158,7 +176,8 @@ use crate::handlers::proxy::{
 };
 use crate::handlers::secrets::{
     __path_bulk_import_secrets, __path_create_secret, __path_delete_secret,
-    __path_get_secret_metadata, __path_list_secrets,
+    __path_get_secret_metadata, __path_list_secrets, __path_reveal_all_secrets,
+    __path_rotate_secret,
 };
 use crate::handlers::services::{
     __path_get_service, __path_get_service_logs, __path_list_services, __path_scale_service,
@@ -183,7 +202,9 @@ use crate::handlers::variables::{
     __path_create_variable, __path_delete_variable, __path_get_variable, __path_list_variables,
     __path_update_variable,
 };
-use crate::handlers::volumes::{__path_delete_volume, __path_list_volumes};
+use crate::handlers::volumes::{
+    __path_create_volume, __path_delete_volume, __path_get_volume, __path_list_volumes,
+};
 use crate::handlers::webhooks::{
     __path_get_webhook_info, __path_receive_webhook, __path_rotate_webhook_secret,
 };
@@ -235,6 +256,10 @@ impl Modify for SecurityAddon {
         logout,
         me,
         csrf,
+        // OIDC / SSO
+        list_providers,
+        start,
+        callback,
         // Users
         list_users,
         create_user,
@@ -284,16 +309,20 @@ impl Modify for SecurityAddon {
         get_replicas_internal,
         // Secrets
         create_secret,
+        rotate_secret,
         list_secrets,
         get_secret_metadata,
         delete_secret,
         bulk_import_secrets,
+        reveal_all_secrets,
         // Environments
         list_environments,
         create_environment,
         get_environment,
         update_environment,
         delete_environment,
+        // Events (daemon-wide container lifecycle stream)
+        stream_events,
         // Projects
         list_projects,
         create_project,
@@ -358,6 +387,7 @@ impl Modify for SecurityAddon {
         remove_member,
         // Permissions
         list_permissions,
+        list_permissions_by_resource,
         grant_permission,
         revoke_permission,
         // Audit
@@ -385,6 +415,13 @@ impl Modify for SecurityAddon {
         create_network,
         update_network,
         delete_network,
+        // Container bridge / overlay networks
+        create_container_network,
+        list_container_networks,
+        get_container_network,
+        delete_container_network,
+        connect_container_network,
+        disconnect_container_network,
         // Proxy
         list_routes,
         list_backends,
@@ -397,6 +434,8 @@ impl Modify for SecurityAddon {
         cluster_force_leader,
         // Volumes
         list_volumes,
+        create_volume,
+        get_volume,
         delete_volume,
         // Storage
         get_storage_status,
@@ -450,6 +489,13 @@ impl Modify for SecurityAddon {
             ContainerInfo,
             ContainerResourceLimits,
             VolumeMount,
+            VolumeMountType,
+            zlayer_spec::PortMapping,
+            zlayer_spec::PortProtocol,
+            HealthCheckRequest,
+            // §3.15: rich inspect fields on ContainerInfo
+            NetworkAttachmentInfo,
+            ContainerHealthInfo,
             ContainerExecRequest,
             ContainerExecResponse,
             ContainerWaitResponse,
@@ -457,6 +503,10 @@ impl Modify for SecurityAddon {
             StopContainerRequest,
             RestartContainerRequest,
             KillContainerRequest,
+            NetworkAttachmentRequest,
+            // §3.10: inline registry auth on CreateContainerRequest / PullImageRequest
+            zlayer_spec::RegistryAuth,
+            zlayer_spec::RegistryAuthType,
             // Image schemas
             ImageInfoDto,
             PruneResultDto,
@@ -466,11 +516,17 @@ impl Modify for SecurityAddon {
             // Secrets schemas
             CreateSecretRequest,
             SecretMetadataResponse,
+            RotateSecretRequest,
+            RotateSecretResponse,
             BulkImportResponse,
+            RevealAllSecretsResponse,
             // Environments schemas
             crate::storage::StoredEnvironment,
             CreateEnvironmentRequest,
             UpdateEnvironmentRequest,
+            // Events schemas (daemon-wide container lifecycle)
+            ContainerEvent,
+            ContainerEventKind,
             // Projects schemas
             crate::storage::StoredProject,
             crate::storage::BuildKind,
@@ -556,6 +612,17 @@ impl Modify for SecurityAddon {
             SuccessResponse,
             // Network schemas
             NetworkSummary,
+            // Container bridge / overlay network schemas
+            zlayer_spec::BridgeNetwork,
+            zlayer_spec::BridgeNetworkDriver,
+            zlayer_spec::BridgeNetworkAttachment,
+            // Container restart policy (§3.4)
+            zlayer_spec::ContainerRestartPolicy,
+            zlayer_spec::ContainerRestartKind,
+            BridgeNetworkDetails,
+            CreateBridgeNetworkRequest,
+            ConnectBridgeNetworkRequest,
+            DisconnectBridgeNetworkRequest,
             // Proxy schemas
             RouteInfo,
             RoutesResponse,
@@ -577,6 +644,8 @@ impl Modify for SecurityAddon {
             ForceLeaderResponse,
             // Volume schemas
             VolumeSummary,
+            VolumeInfo,
+            CreateVolumeRequest,
             // Storage schemas
             ReplicationInfo,
             StorageStatusResponse,
@@ -602,6 +671,7 @@ impl Modify for SecurityAddon {
         (name = "Internal", description = "Internal scheduler-to-agent communication"),
         (name = "Secrets", description = "Secrets management"),
         (name = "Environments", description = "Environment CRUD"),
+        (name = "Events", description = "Daemon-wide container lifecycle event stream (SSE)"),
         (name = "Projects", description = "Project CRUD and deployment linking"),
         (name = "Webhooks", description = "Git push webhook receiver and configuration"),
         (name = "Credentials", description = "Registry and git credential management"),
@@ -617,6 +687,7 @@ impl Modify for SecurityAddon {
         (name = "Overlay", description = "Overlay network status and diagnostics"),
         (name = "Tunnels", description = "Tunnel token and node-to-node tunnel management"),
         (name = "Networks", description = "Network access-control group management"),
+        (name = "ContainerNetworks", description = "User-defined bridge / overlay networks for standalone containers"),
         (name = "Proxy", description = "Reverse proxy status (routes, backends, TLS, L4 streams)"),
         (name = "Cluster", description = "Cluster membership, heartbeats, and disaster recovery"),
         (name = "Volumes", description = "Named volume listing and deletion"),

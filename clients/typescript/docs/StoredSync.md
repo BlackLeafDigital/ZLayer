@@ -20,7 +20,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { StoredSync } from '@zlayer/client'
+import type { StoredSync } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

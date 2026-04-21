@@ -22,11 +22,11 @@ Returns the current state of SQLite-to-S3 replication including whether it is en
 import {
   Configuration,
   StorageApi,
-} from '@zlayer/client';
-import type { GetStorageStatusRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetStorageStatusRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

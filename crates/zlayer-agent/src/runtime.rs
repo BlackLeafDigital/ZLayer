@@ -5,11 +5,13 @@
 
 use crate::cgroups_stats::ContainerStats;
 use crate::error::{AgentError, Result};
+use futures_util::Stream;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::time::Duration;
 use tokio::task::JoinHandle;
 use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
-use zlayer_spec::{PullPolicy, ServiceSpec};
+use zlayer_spec::{PullPolicy, RegistryAuth, ServiceSpec};
 
 /// Container state
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +81,178 @@ pub struct PruneResult {
     pub space_reclaimed: u64,
 }
 
+/// Reason a container stopped running, as reported by [`Runtime::wait_outcome`].
+///
+/// Serialized as `snake_case` strings on the wire (`exited`, `signal`,
+/// `oom_killed`, `runtime_error`) so the API DTO can emit the reason as-is
+/// without a second translation layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitReason {
+    /// Container exited normally.
+    Exited,
+    /// Container was killed by a signal (e.g. `SIGKILL`, `SIGTERM`).
+    Signal,
+    /// Container was killed by the OOM killer.
+    OomKilled,
+    /// Runtime-side failure (pre-start error, runtime crash, etc.).
+    RuntimeError,
+}
+
+/// Richer wait result returned by [`Runtime::wait_outcome`].
+///
+/// Backwards-compatible with [`Runtime::wait_container`] (which returns just
+/// `exit_code`). The API handler uses this to populate the extended
+/// `ContainerWaitResponse` fields (`reason`, `signal`, `finished_at`) while
+/// existing callers that only need the exit code can keep using
+/// `wait_container`.
+#[derive(Debug, Clone)]
+pub struct WaitOutcome {
+    /// Process exit code (0 = success). When the container was killed by
+    /// signal `N`, this is typically `128 + N`.
+    pub exit_code: i32,
+    /// Classification of the exit.
+    pub reason: WaitReason,
+    /// Signal name when `reason == WaitReason::Signal`, e.g. `"SIGKILL"`.
+    /// Derived from `exit_code - 128` on a best-effort basis.
+    pub signal: Option<String>,
+    /// Time the container exited, if the runtime reports it.
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl WaitOutcome {
+    /// Build a plain `Exited` outcome with no signal/timestamp metadata — the
+    /// default that matches the pre-§3.12 behaviour.
+    #[must_use]
+    pub fn exited(exit_code: i32) -> Self {
+        Self {
+            exit_code,
+            reason: WaitReason::Exited,
+            signal: None,
+            finished_at: None,
+        }
+    }
+}
+
+/// Map a signal-style exit code (`128 + N`) to a canonical signal name.
+///
+/// Recognises common POSIX signals and falls back to `signal_<n>` for
+/// unknown numbers so the caller always gets *something* readable.
+#[must_use]
+pub fn signal_name_from_exit_code(exit_code: i32) -> Option<String> {
+    if exit_code <= 128 {
+        return None;
+    }
+    let n = exit_code - 128;
+    let name = match n {
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        6 => "SIGABRT",
+        7 => "SIGBUS",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 => "SIGUSR1",
+        11 => "SIGSEGV",
+        12 => "SIGUSR2",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        17 => "SIGSTOP",
+        18 => "SIGCONT",
+        _ => return Some(format!("signal_{n}")),
+    };
+    Some(name.to_string())
+}
+
+/// One streaming event emitted by [`Runtime::exec_stream`].
+///
+/// Runtimes push these events as the exec'd command produces output. The final
+/// event for any successful stream is always an [`ExecEvent::Exit`] carrying
+/// the process's exit code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecEvent {
+    /// A chunk of stdout from the running command. Emitted line-by-line by
+    /// Docker; other runtimes may emit the full buffered output in one event.
+    Stdout(String),
+    /// A chunk of stderr from the running command.
+    Stderr(String),
+    /// The command has exited with this exit code. Always the final event.
+    Exit(i32),
+}
+
+/// Boxed async stream of [`ExecEvent`]s returned by [`Runtime::exec_stream`].
+pub type ExecEventStream = Pin<Box<dyn Stream<Item = ExecEvent> + Send>>;
+
+/// Per-network attachment reported by [`Runtime::inspect_detailed`].
+///
+/// Mirrors the subset of bollard's `EndpointSettings` that the API needs to
+/// populate `ContainerInfo.networks` for standalone containers. Kept in
+/// `zlayer-agent` (rather than `zlayer-spec`) because it's a runtime-level
+/// inspect result, not a deployment specification.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NetworkAttachmentDetail {
+    /// Network name as reported by the runtime (Docker's key in
+    /// `NetworkSettings.Networks`, e.g. `"bridge"` or a user-defined network
+    /// name).
+    pub network: String,
+    /// DNS aliases the container answers to on this network. Empty when the
+    /// runtime doesn't surface aliases.
+    pub aliases: Vec<String>,
+    /// Assigned IPv4 address on this network, if any. Empty strings are
+    /// normalised to `None`.
+    pub ipv4: Option<String>,
+}
+
+/// Per-container health detail reported by [`Runtime::inspect_detailed`].
+///
+/// Sourced directly from bollard's `ContainerState.health` (Docker's native
+/// healthcheck tracking). Our internal `HealthMonitor` in
+/// `crates/zlayer-agent/src/health.rs` drives service-level health events; for
+/// standalone containers the API reports the runtime-native status instead so
+/// that images with a baked-in `HEALTHCHECK` show up correctly.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HealthDetail {
+    /// One of `"none"`, `"starting"`, `"healthy"`, `"unhealthy"` (Docker's
+    /// `HealthStatusEnum`). Empty string is normalised to `"none"` upstream.
+    pub status: String,
+    /// Consecutive failing probe count, if the runtime reports it.
+    pub failing_streak: Option<u32>,
+    /// Output from the most recent failing probe, when available.
+    pub last_output: Option<String>,
+}
+
+/// Rich inspect details for a single container, returned by
+/// [`Runtime::inspect_detailed`].
+///
+/// Carries the fields `ContainerInfo` needs on top of the bare
+/// [`ContainerState`] reported by [`Runtime::container_state`]:
+/// published ports, attached networks, first IPv4, health, and `exit_code`.
+///
+/// Default is an all-empty record — that's what the default trait method
+/// returns for runtimes that don't (yet) implement rich inspect, and the API
+/// layer treats all fields as purely additive, so a default record still
+/// produces a backwards-compatible `ContainerInfo`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContainerInspectDetails {
+    /// Published port mappings (container → host), translated back from the
+    /// runtime's internal port-binding map.
+    pub ports: Vec<zlayer_spec::PortMapping>,
+    /// Networks the container is attached to, plus the aliases + IPv4 for each.
+    pub networks: Vec<NetworkAttachmentDetail>,
+    /// First non-empty IPv4 address found across the container's networks,
+    /// useful as a "primary" IP for simple clients that don't want to iterate
+    /// `networks`. `None` when the container isn't on any network with an IP.
+    pub ipv4: Option<String>,
+    /// Health status when the container has a Docker-native `HEALTHCHECK` or
+    /// the runtime otherwise reports a health state.
+    pub health: Option<HealthDetail>,
+    /// Most recent exit code, when the runtime reports one. `None` for
+    /// containers that are still running and have never exited.
+    pub exit_code: Option<i32>,
+}
+
 /// Abstract container runtime trait
 ///
 /// This trait abstracts over different container runtimes (containerd, CRI-O, etc.)
@@ -87,8 +261,24 @@ pub trait Runtime: Send + Sync {
     /// Pull an image to local storage
     async fn pull_image(&self, image: &str) -> Result<()>;
 
-    /// Pull an image to local storage with a specific policy
-    async fn pull_image_with_policy(&self, image: &str, policy: PullPolicy) -> Result<()>;
+    /// Pull an image to local storage with a specific policy.
+    ///
+    /// When `auth` is `Some`, the runtime uses those inline credentials for
+    /// the pull (§3.10 of `ZLAYER_SDK_FIXES.md`). When `auth` is `None`, the
+    /// runtime falls back to its existing credential-store lookup keyed by
+    /// registry hostname (or anonymous access when no match exists).
+    ///
+    /// Non-Docker runtimes may accept but ignore the `auth` argument — their
+    /// OCI puller (`zlayer-registry`) already resolves credentials from the
+    /// store by hostname, and inline auth is primarily a Docker-backend
+    /// concern. Ignoring it is safe: callers that need inline auth should use
+    /// the Docker runtime.
+    async fn pull_image_with_policy(
+        &self,
+        image: &str,
+        policy: PullPolicy,
+        auth: Option<&RegistryAuth>,
+    ) -> Result<()>;
 
     /// Create a container
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()>;
@@ -111,6 +301,33 @@ pub trait Runtime: Send + Sync {
     /// Execute command in container
     async fn exec(&self, id: &ContainerId, cmd: &[String]) -> Result<(i32, String, String)>;
 
+    /// Execute a command in a container and stream stdout / stderr / exit
+    /// events as they are produced.
+    ///
+    /// The default implementation calls the buffered [`Runtime::exec`] and
+    /// emits everything as a single `Stdout` event, a single `Stderr` event,
+    /// and a final `Exit` event. Runtimes that support true streaming (e.g.
+    /// Docker via bollard) override this to produce line-by-line events as
+    /// the command runs.
+    ///
+    /// The returned stream always terminates with exactly one
+    /// [`ExecEvent::Exit`] as the final item on success. Errors that occur
+    /// before the stream is returned (e.g. container not found, failure to
+    /// create the exec) are surfaced via the outer `Result`; errors that
+    /// occur mid-stream are logged by the runtime and the stream closes.
+    async fn exec_stream(&self, id: &ContainerId, cmd: &[String]) -> Result<ExecEventStream> {
+        let (exit, stdout, stderr) = self.exec(id, cmd).await?;
+        let mut events: Vec<ExecEvent> = Vec::with_capacity(3);
+        if !stdout.is_empty() {
+            events.push(ExecEvent::Stdout(stdout));
+        }
+        if !stderr.is_empty() {
+            events.push(ExecEvent::Stderr(stderr));
+        }
+        events.push(ExecEvent::Exit(exit));
+        Ok(Box::pin(futures_util::stream::iter(events)))
+    }
+
     /// Get container resource statistics from cgroups
     ///
     /// Returns CPU and memory statistics for the specified container.
@@ -122,6 +339,20 @@ pub trait Runtime: Send + Sync {
     /// This method blocks until the container exits or an error occurs.
     /// Used primarily for job execution to implement run-to-completion semantics.
     async fn wait_container(&self, id: &ContainerId) -> Result<i32>;
+
+    /// Wait for a container to exit and return a [`WaitOutcome`] with richer
+    /// classification (exit code + reason + signal + `finished_at` timestamp).
+    ///
+    /// The default implementation delegates to [`Runtime::wait_container`] and
+    /// synthesizes a [`WaitReason::Exited`] result with no signal/timestamp.
+    /// Runtimes that can distinguish OOM kills, signal deaths, or report a
+    /// finished-at time (e.g. the Docker runtime, which has
+    /// `ContainerInspectResponse.state.oom_killed` / `.finished_at`) should
+    /// override this.
+    async fn wait_outcome(&self, id: &ContainerId) -> Result<WaitOutcome> {
+        let exit_code = self.wait_container(id).await?;
+        Ok(WaitOutcome::exited(exit_code))
+    }
 
     /// Get container logs (stdout/stderr combined)
     ///
@@ -237,6 +468,24 @@ pub trait Runtime: Send + Sync {
             "tag_image is not supported by this runtime".into(),
         ))
     }
+
+    /// Return rich inspect details for a container: published ports, attached
+    /// networks, first IPv4, health, and most-recent exit code.
+    ///
+    /// Runtimes implement this by translating the backend's native inspect
+    /// response (bollard's `ContainerInspectResponse` for Docker) into the
+    /// runtime-level [`ContainerInspectDetails`] struct. The API layer merges
+    /// these fields into `ContainerInfo` on `GET /api/v1/containers` and
+    /// `GET /api/v1/containers/{id}` (§3.15 of `ZLAYER_SDK_FIXES.md`).
+    ///
+    /// The default implementation returns [`ContainerInspectDetails::default`]
+    /// — an all-empty record, which the API layer treats as "this runtime
+    /// doesn't support rich inspect; skip all the extra fields". This keeps
+    /// non-Docker runtimes (Youki, WASM, Mock) backwards compatible; they can
+    /// override this later if they gain equivalent inspect capability.
+    async fn inspect_detailed(&self, _id: &ContainerId) -> Result<ContainerInspectDetails> {
+        Ok(ContainerInspectDetails::default())
+    }
 }
 
 /// Validate a signal name for [`Runtime::kill_container`].
@@ -306,11 +555,16 @@ impl Default for MockRuntime {
 #[async_trait::async_trait]
 impl Runtime for MockRuntime {
     async fn pull_image(&self, _image: &str) -> Result<()> {
-        self.pull_image_with_policy(_image, PullPolicy::IfNotPresent)
+        self.pull_image_with_policy(_image, PullPolicy::IfNotPresent, None)
             .await
     }
 
-    async fn pull_image_with_policy(&self, _image: &str, _policy: PullPolicy) -> Result<()> {
+    async fn pull_image_with_policy(
+        &self,
+        _image: &str,
+        _policy: PullPolicy,
+        _auth: Option<&RegistryAuth>,
+    ) -> Result<()> {
         // Mock: always succeeds
         tokio::time::sleep(Duration::from_millis(100)).await;
         Ok(())
@@ -613,6 +867,81 @@ mod tests {
             matches!(state, ContainerState::Exited { code: 137 }),
             "expected Exited(137), got {state:?}"
         );
+    }
+
+    #[test]
+    fn wait_reason_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&WaitReason::Exited).unwrap(),
+            "\"exited\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WaitReason::Signal).unwrap(),
+            "\"signal\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WaitReason::OomKilled).unwrap(),
+            "\"oom_killed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WaitReason::RuntimeError).unwrap(),
+            "\"runtime_error\""
+        );
+    }
+
+    #[test]
+    fn wait_reason_deserialize_roundtrip() {
+        for variant in [
+            WaitReason::Exited,
+            WaitReason::Signal,
+            WaitReason::OomKilled,
+            WaitReason::RuntimeError,
+        ] {
+            let s = serde_json::to_string(&variant).unwrap();
+            let back: WaitReason = serde_json::from_str(&s).unwrap();
+            assert_eq!(variant, back, "roundtrip failed for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn signal_name_from_exit_code_known_signals() {
+        assert_eq!(signal_name_from_exit_code(137).as_deref(), Some("SIGKILL"));
+        assert_eq!(signal_name_from_exit_code(143).as_deref(), Some("SIGTERM"));
+        assert_eq!(signal_name_from_exit_code(130).as_deref(), Some("SIGINT"));
+        assert_eq!(signal_name_from_exit_code(129).as_deref(), Some("SIGHUP"));
+        assert_eq!(signal_name_from_exit_code(139).as_deref(), Some("SIGSEGV"));
+    }
+
+    #[test]
+    fn signal_name_from_exit_code_handles_unknown_and_normal() {
+        // Normal exits (<= 128) return None.
+        assert_eq!(signal_name_from_exit_code(0), None);
+        assert_eq!(signal_name_from_exit_code(1), None);
+        assert_eq!(signal_name_from_exit_code(128), None);
+
+        // Unknown signals produce a stable string form.
+        assert_eq!(
+            signal_name_from_exit_code(128 + 99).as_deref(),
+            Some("signal_99")
+        );
+    }
+
+    #[tokio::test]
+    async fn default_wait_outcome_delegates_to_wait_container() {
+        let runtime = MockRuntime::new();
+        let id = ContainerId {
+            service: "wait-test".to_string(),
+            replica: 0,
+        };
+        runtime.create_container(&id, &mock_spec()).await.unwrap();
+        runtime.start_container(&id).await.unwrap();
+
+        let outcome = runtime.wait_outcome(&id).await.unwrap();
+        // MockRuntime::wait_container returns 0 for running containers.
+        assert_eq!(outcome.exit_code, 0);
+        assert_eq!(outcome.reason, WaitReason::Exited);
+        assert!(outcome.signal.is_none());
+        assert!(outcome.finished_at.is_none());
     }
 
     #[tokio::test]

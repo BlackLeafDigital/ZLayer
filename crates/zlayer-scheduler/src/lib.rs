@@ -449,6 +449,7 @@ impl Scheduler {
             errors: zlayer_spec::ErrorsSpec::default(),
             devices: vec![],
             storage: vec![],
+            port_mappings: vec![],
             capabilities: vec![],
             privileged: false,
             node_mode: zlayer_spec::NodeMode::Shared,
@@ -457,6 +458,10 @@ impl Scheduler {
             wasm: None,
             logs: None,
             host_network: false,
+            hostname: None,
+            dns: Vec::new(),
+            extra_hosts: Vec::new(),
+            restart_policy: None,
         };
 
         let effective_spec = spec.unwrap_or(&default_spec);

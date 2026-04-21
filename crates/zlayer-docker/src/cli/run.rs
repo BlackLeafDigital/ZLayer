@@ -98,6 +98,15 @@ pub struct RunArgs {
     #[clap(short = 'H', long)]
     pub hostname: Option<String>,
 
+    /// Set custom DNS servers (repeatable)
+    #[clap(long)]
+    pub dns: Vec<String>,
+
+    /// Add a custom `host:ip` mapping to `/etc/hosts` (repeatable).
+    /// Accepts the literal `host-gateway` as the ip half.
+    #[clap(long = "add-host")]
+    pub add_host: Vec<String>,
+
     /// Set meta data on a container
     #[clap(short, long = "label")]
     pub labels: Vec<String>,
@@ -151,9 +160,6 @@ pub async fn handle_run(args: RunArgs) -> Result<()> {
     if args.user.is_some() {
         eprintln!("warning: --user is not yet supported; ignoring");
     }
-    if args.hostname.is_some() {
-        eprintln!("warning: --hostname is not yet supported; ignoring");
-    }
     if !args.labels.is_empty() {
         eprintln!("warning: --label is not yet supported; ignoring");
     }
@@ -196,6 +202,16 @@ pub async fn handle_run(args: RunArgs) -> Result<()> {
 
     // Volumes from -v flags.
     let storage = parse_volumes(&args.volumes).context("Failed to parse --volume argument")?;
+
+    // --dns entries must each be a plausible IPv4 or IPv6 address.
+    for entry in &args.dns {
+        validate_dns_server(entry).context("Failed to parse --dns argument")?;
+    }
+    // --add-host entries must be of the form `hostname:ip` (ip can be the
+    // literal `host-gateway`).
+    for entry in &args.add_host {
+        validate_extra_host(entry).context("Failed to parse --add-host argument")?;
+    }
 
     // Resources.
     let mut resources = zlayer_spec::ResourcesSpec::default();
@@ -273,6 +289,7 @@ pub async fn handle_run(args: RunArgs) -> Result<()> {
         errors: zlayer_spec::ErrorsSpec::default(),
         devices: Vec::new(),
         storage,
+        port_mappings: Vec::new(),
         capabilities: Vec::new(),
         privileged: args.privileged,
         node_mode: zlayer_spec::NodeMode::default(),
@@ -281,6 +298,10 @@ pub async fn handle_run(args: RunArgs) -> Result<()> {
         wasm: None,
         logs: None,
         host_network: false,
+        hostname: args.hostname.clone(),
+        dns: args.dns.clone(),
+        extra_hosts: args.add_host.clone(),
+        restart_policy: None,
     };
 
     let mut services = HashMap::new();
@@ -462,6 +483,43 @@ fn parse_volumes(specs: &[String]) -> Result<Vec<StorageSpec>> {
     Ok(out)
 }
 
+/// Validate a `--dns` value. Accepts IPv4 dotted-quad and IPv6 colon-hex.
+fn validate_dns_server(raw: &str) -> Result<()> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--dns value cannot be empty");
+    }
+    if trimmed.parse::<std::net::IpAddr>().is_err() {
+        anyhow::bail!("--dns value is not a valid IP address: '{raw}'");
+    }
+    Ok(())
+}
+
+/// Validate a `--add-host` value of the form `hostname:ip`.
+///
+/// The ip half may be the literal `host-gateway`, which bollard/Docker
+/// resolve to the host-visible gateway address (see
+/// `host.docker.internal:host-gateway`). Splits on the *first* colon so
+/// IPv6 addresses (which themselves contain colons) can be used as-is.
+fn validate_extra_host(raw: &str) -> Result<()> {
+    let (host, ip) = raw.split_once(':').ok_or_else(|| {
+        anyhow::anyhow!("--add-host value must be in the form 'hostname:ip': '{raw}'")
+    })?;
+    if host.trim().is_empty() {
+        anyhow::bail!("--add-host hostname cannot be empty: '{raw}'");
+    }
+    if ip.trim().is_empty() {
+        anyhow::bail!("--add-host ip cannot be empty: '{raw}'");
+    }
+    if ip == "host-gateway" {
+        return Ok(());
+    }
+    if ip.parse::<std::net::IpAddr>().is_err() {
+        anyhow::bail!("--add-host ip is not a valid address: '{raw}' (got '{ip}')");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,6 +641,7 @@ mod tests {
             errors: zlayer_spec::ErrorsSpec::default(),
             devices: Vec::new(),
             storage: Vec::new(),
+            port_mappings: Vec::new(),
             capabilities: Vec::new(),
             privileged: false,
             node_mode: zlayer_spec::NodeMode::default(),
@@ -591,6 +650,10 @@ mod tests {
             wasm: None,
             logs: None,
             host_network: false,
+            hostname: None,
+            dns: Vec::new(),
+            extra_hosts: Vec::new(),
+            restart_policy: None,
         };
         let mut services = HashMap::new();
         services.insert("nginx".to_string(), service);
@@ -604,5 +667,33 @@ mod tests {
         };
         let yaml = serde_yaml::to_string(&spec).expect("serialize");
         zlayer_spec::from_yaml_str(&yaml).expect("generated spec should validate");
+    }
+
+    #[test]
+    fn validate_dns_server_accepts_v4_and_v6() {
+        validate_dns_server("8.8.8.8").expect("v4 is valid");
+        validate_dns_server("2001:4860:4860::8888").expect("v6 is valid");
+    }
+
+    #[test]
+    fn validate_dns_server_rejects_garbage() {
+        assert!(validate_dns_server("").is_err());
+        assert!(validate_dns_server("not-an-ip").is_err());
+        assert!(validate_dns_server("999.999.999.999").is_err());
+    }
+
+    #[test]
+    fn validate_extra_host_accepts_plain_ip_and_host_gateway() {
+        validate_extra_host("host.docker.internal:host-gateway").expect("host-gateway literal");
+        validate_extra_host("myhost:10.0.0.1").expect("ipv4");
+        validate_extra_host("ipv6host:fe80::1").expect("ipv6");
+    }
+
+    #[test]
+    fn validate_extra_host_rejects_malformed() {
+        assert!(validate_extra_host("no-colon").is_err());
+        assert!(validate_extra_host(":10.0.0.1").is_err()); // empty host
+        assert!(validate_extra_host("host:").is_err()); // empty ip
+        assert!(validate_extra_host("host:not-an-ip").is_err());
     }
 }

@@ -13,6 +13,20 @@
  */
 
 import { mapValues } from '../runtime';
+import type { ContainerRestartPolicy } from './ContainerRestartPolicy';
+import {
+    ContainerRestartPolicyFromJSON,
+    ContainerRestartPolicyFromJSONTyped,
+    ContainerRestartPolicyToJSON,
+    ContainerRestartPolicyToJSONTyped,
+} from './ContainerRestartPolicy';
+import type { NetworkAttachmentRequest } from './NetworkAttachmentRequest';
+import {
+    NetworkAttachmentRequestFromJSON,
+    NetworkAttachmentRequestFromJSONTyped,
+    NetworkAttachmentRequestToJSON,
+    NetworkAttachmentRequestToJSONTyped,
+} from './NetworkAttachmentRequest';
 import type { VolumeMount } from './VolumeMount';
 import {
     VolumeMountFromJSON,
@@ -20,6 +34,20 @@ import {
     VolumeMountToJSON,
     VolumeMountToJSONTyped,
 } from './VolumeMount';
+import type { HealthCheckRequest } from './HealthCheckRequest';
+import {
+    HealthCheckRequestFromJSON,
+    HealthCheckRequestFromJSONTyped,
+    HealthCheckRequestToJSON,
+    HealthCheckRequestToJSONTyped,
+} from './HealthCheckRequest';
+import type { PortMapping } from './PortMapping';
+import {
+    PortMappingFromJSON,
+    PortMappingFromJSONTyped,
+    PortMappingToJSON,
+    PortMappingToJSONTyped,
+} from './PortMapping';
 import type { ContainerResourceLimits } from './ContainerResourceLimits';
 import {
     ContainerResourceLimitsFromJSON,
@@ -27,6 +55,13 @@ import {
     ContainerResourceLimitsToJSON,
     ContainerResourceLimitsToJSONTyped,
 } from './ContainerResourceLimits';
+import type { RegistryAuth } from './RegistryAuth';
+import {
+    RegistryAuthFromJSON,
+    RegistryAuthFromJSONTyped,
+    RegistryAuthToJSON,
+    RegistryAuthToJSONTyped,
+} from './RegistryAuth';
 
 /**
  * Request to create and start a container
@@ -41,11 +76,40 @@ export interface CreateContainerRequest {
      */
     command?: Array<string> | null;
     /**
+     * Additional DNS servers (maps to Docker's `--dns`). Each entry must be
+     * a plausible IPv4 or IPv6 address.
+     * @type {Array<string>}
+     * @memberof CreateContainerRequest
+     */
+    dns?: Array<string>;
+    /**
      * Environment variables
      * @type {{ [key: string]: string; }}
      * @memberof CreateContainerRequest
      */
     env?: { [key: string]: string; };
+    /**
+     * Extra `hostname:ip` entries appended to `/etc/hosts` (maps to Docker's
+     * `--add-host`). The special literal `host-gateway` is accepted as the
+     * `ip` half.
+     * @type {Array<string>}
+     * @memberof CreateContainerRequest
+     */
+    extraHosts?: Array<string>;
+    /**
+     * Optional health check. When omitted, the daemon installs a no-op
+     * placeholder (`HealthCheck::Tcp { port: 0 }`) matching the current
+     * default; the health monitor treats `port == 0` as "skip".
+     * @type {HealthCheckRequest}
+     * @memberof CreateContainerRequest
+     */
+    healthCheck?: HealthCheckRequest | null;
+    /**
+     * Optional container hostname (maps to Docker's `--hostname`).
+     * @type {string}
+     * @memberof CreateContainerRequest
+     */
+    hostname?: string | null;
     /**
      * OCI image reference (e.g., "nginx:latest", "ubuntu:22.04")
      * @type {string}
@@ -65,17 +129,60 @@ export interface CreateContainerRequest {
      */
     name?: string | null;
     /**
+     * User-defined bridge/overlay networks to attach the newly-created
+     * container to. Each entry references a network by id or name and is
+     * attached after the container is successfully started. If any
+     * attachment fails, the partially-started container is rolled back
+     * (stopped + removed) and the request is failed.
+     * @type {Array<NetworkAttachmentRequest>}
+     * @memberof CreateContainerRequest
+     */
+    networks?: Array<NetworkAttachmentRequest>;
+    /**
+     * Published ports (Docker's `-p host:container/proto`). When omitted,
+     * the container is created without any host port publishing.
+     * @type {Array<PortMapping>}
+     * @memberof CreateContainerRequest
+     */
+    ports?: Array<PortMapping>;
+    /**
      * Image pull policy: "always", "`if_not_present`", or "never"
      * @type {string}
      * @memberof CreateContainerRequest
      */
     pullPolicy?: string | null;
     /**
+     * Inline Docker/OCI registry credentials used for this pull only. Not
+     * persisted, never logged, never echoed back on a response. When both
+     * `registry_credential_id` and `registry_auth` are set, this field
+     * takes precedence.
+     * @type {RegistryAuth}
+     * @memberof CreateContainerRequest
+     */
+    registryAuth?: RegistryAuth | null;
+    /**
+     * Id of a persisted registry credential (from
+     * `POST /api/v1/credentials/registry`) to use when pulling the image.
+     * Ignored when [`Self::registry_auth`] is also supplied (inline auth
+     * wins). Requires the daemon to be configured with a credential store
+     * — otherwise the request is rejected with `400`.
+     * @type {string}
+     * @memberof CreateContainerRequest
+     */
+    registryCredentialId?: string | null;
+    /**
      * Resource limits (CPU, memory)
      * @type {ContainerResourceLimits}
      * @memberof CreateContainerRequest
      */
     resources?: ContainerResourceLimits | null;
+    /**
+     * Container restart policy (Docker-style). When omitted, the runtime
+     * applies no explicit restart policy (Docker default: `"no"`).
+     * @type {ContainerRestartPolicy}
+     * @memberof CreateContainerRequest
+     */
+    restartPolicy?: ContainerRestartPolicy | null;
     /**
      * Volume mounts
      * @type {Array<VolumeMount>}
@@ -109,12 +216,21 @@ export function CreateContainerRequestFromJSONTyped(json: any, ignoreDiscriminat
     return {
         
         'command': json['command'] == null ? undefined : json['command'],
+        'dns': json['dns'] == null ? undefined : json['dns'],
         'env': json['env'] == null ? undefined : json['env'],
+        'extraHosts': json['extra_hosts'] == null ? undefined : json['extra_hosts'],
+        'healthCheck': json['health_check'] == null ? undefined : HealthCheckRequestFromJSON(json['health_check']),
+        'hostname': json['hostname'] == null ? undefined : json['hostname'],
         'image': json['image'],
         'labels': json['labels'] == null ? undefined : json['labels'],
         'name': json['name'] == null ? undefined : json['name'],
+        'networks': json['networks'] == null ? undefined : ((json['networks'] as Array<any>).map(NetworkAttachmentRequestFromJSON)),
+        'ports': json['ports'] == null ? undefined : ((json['ports'] as Array<any>).map(PortMappingFromJSON)),
         'pullPolicy': json['pull_policy'] == null ? undefined : json['pull_policy'],
+        'registryAuth': json['registry_auth'] == null ? undefined : RegistryAuthFromJSON(json['registry_auth']),
+        'registryCredentialId': json['registry_credential_id'] == null ? undefined : json['registry_credential_id'],
         'resources': json['resources'] == null ? undefined : ContainerResourceLimitsFromJSON(json['resources']),
+        'restartPolicy': json['restart_policy'] == null ? undefined : ContainerRestartPolicyFromJSON(json['restart_policy']),
         'volumes': json['volumes'] == null ? undefined : ((json['volumes'] as Array<any>).map(VolumeMountFromJSON)),
         'workDir': json['work_dir'] == null ? undefined : json['work_dir'],
     };
@@ -132,12 +248,21 @@ export function CreateContainerRequestToJSONTyped(value?: CreateContainerRequest
     return {
         
         'command': value['command'],
+        'dns': value['dns'],
         'env': value['env'],
+        'extra_hosts': value['extraHosts'],
+        'health_check': HealthCheckRequestToJSON(value['healthCheck']),
+        'hostname': value['hostname'],
         'image': value['image'],
         'labels': value['labels'],
         'name': value['name'],
+        'networks': value['networks'] == null ? undefined : ((value['networks'] as Array<any>).map(NetworkAttachmentRequestToJSON)),
+        'ports': value['ports'] == null ? undefined : ((value['ports'] as Array<any>).map(PortMappingToJSON)),
         'pull_policy': value['pullPolicy'],
+        'registry_auth': RegistryAuthToJSON(value['registryAuth']),
+        'registry_credential_id': value['registryCredentialId'],
         'resources': ContainerResourceLimitsToJSON(value['resources']),
+        'restart_policy': ContainerRestartPolicyToJSON(value['restartPolicy']),
         'volumes': value['volumes'] == null ? undefined : ((value['volumes'] as Array<any>).map(VolumeMountToJSON)),
         'work_dir': value['workDir'],
     };

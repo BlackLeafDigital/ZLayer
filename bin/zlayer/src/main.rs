@@ -14,6 +14,10 @@
 //! - `observability`: Axum metrics and trace propagation
 
 mod app;
+#[cfg(unix)]
+mod bootstrap_admin;
+#[cfg(unix)]
+mod bootstrap_admin_env_grants;
 mod cli;
 mod commands;
 #[cfg(unix)]
@@ -89,11 +93,17 @@ fn main() -> ExitCode {
 
         #[cfg(all(target_os = "windows", feature = "wsl"))]
         {
+            let vhd_gb_override = match &cli.command {
+                Some(Commands::Serve { vhd_gb, .. }) => *vhd_gb,
+                _ => None,
+            };
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("Failed to create tokio runtime");
-            match rt.block_on(zlayer_wsl::setup::ensure_wsl_backend_ready()) {
+            match rt.block_on(zlayer_wsl::setup::ensure_wsl_backend_ready_with_vhd_gb(
+                vhd_gb_override,
+            )) {
                 Ok(config) => match rt.block_on(zlayer_wsl::daemon::start_daemon(&config)) {
                     Ok(()) => {
                         println!("zlayer daemon started inside WSL2 on {}", config.api_addr);
@@ -507,7 +517,7 @@ async fn run(mut cli: Cli) -> Result<()> {
         }
         Commands::Wasm(wasm_cmd) => commands::wasm::handle_wasm(&cli, wasm_cmd).await,
         Commands::Tunnel(tunnel_cmd) => commands::tunnel::handle_tunnel(&cli, tunnel_cmd).await,
-        Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd),
+        Commands::Manager(manager_cmd) => commands::manager::handle_manager(manager_cmd).await,
         #[cfg(feature = "docker-compat")]
         Commands::Docker(_) => unreachable!("Docker handled before borrow"),
         Commands::Export {
@@ -530,6 +540,8 @@ async fn run(mut cli: Cli) -> Result<()> {
             jwt_secret,
             no_swagger,
             daemon: _, // Already handled in main() before tokio runtime
+            #[cfg(all(target_os = "windows", feature = "wsl"))]
+            vhd_gb,
             #[cfg(feature = "docker-compat")]
             docker_socket,
             #[cfg(feature = "docker-compat")]
@@ -539,7 +551,7 @@ async fn run(mut cli: Cli) -> Result<()> {
             #[cfg(all(target_os = "windows", feature = "wsl"))]
             {
                 let _ = (bind, jwt_secret, no_swagger);
-                let config = zlayer_wsl::setup::ensure_wsl_backend_ready()
+                let config = zlayer_wsl::setup::ensure_wsl_backend_ready_with_vhd_gb(*vhd_gb)
                     .await
                     .context("Failed to set up WSL2 backend")?;
                 zlayer_wsl::daemon::start_daemon(&config)
@@ -600,13 +612,16 @@ async fn run(mut cli: Cli) -> Result<()> {
             service,
             replicas,
         } => {
-            commands::join::join(
+            // Box::pin to keep this large match arm off the stack — the
+            // future here is sizeable (spawns daemon state) and clippy's
+            // `large_futures` lint flags anything above ~16kB.
+            Box::pin(commands::join::join(
                 &cli,
                 token,
                 spec_dir.as_deref(),
                 service.as_deref(),
                 *replicas,
-            )
+            ))
             .await
         }
         #[cfg(unix)]
@@ -674,6 +689,8 @@ async fn run(mut cli: Cli) -> Result<()> {
         Commands::Daemon(action) => {
             commands::daemon::handle_daemon(action, &cli.effective_data_dir()).await
         }
+        #[cfg(all(target_os = "windows", feature = "wsl"))]
+        Commands::Windows(cmd) => commands::windows::handle(cmd).await,
         #[cfg(unix)]
         Commands::Image(image_cmd) => commands::image::handle_image(&cli, image_cmd).await,
         #[cfg(unix)]
@@ -684,6 +701,27 @@ async fn run(mut cli: Cli) -> Result<()> {
         Commands::System(system_cmd) => commands::system::handle_system(&cli, system_cmd).await,
         #[cfg(unix)]
         Commands::Secret(secret_cmd) => commands::secret::handle_secret(&cli, secret_cmd).await,
+        #[cfg(unix)]
+        Commands::Run {
+            env,
+            no_global,
+            merge,
+            project,
+            dry_run,
+            unmask,
+            command,
+        } => {
+            commands::run::handle_run(
+                env,
+                *no_global,
+                merge,
+                project.as_deref(),
+                *dry_run,
+                *unmask,
+                command,
+            )
+            .await
+        }
         #[cfg(unix)]
         Commands::Network(network_cmd) => {
             commands::network::handle_network(&cli, network_cmd).await
@@ -954,7 +992,24 @@ async fn run(mut cli: Cli) -> Result<()> {
             cli::UserCommands::SetRole { id, role } => {
                 commands::user::set_role(id.clone(), (*role).into()).await
             }
-            cli::UserCommands::SetPassword { id } => commands::user::set_password(id.clone()).await,
+            cli::UserCommands::SetPassword {
+                id,
+                email,
+                password,
+                password_file,
+                random,
+                no_confirm,
+            } => {
+                commands::user::set_password(
+                    id.clone(),
+                    email.clone(),
+                    password.clone(),
+                    password_file.clone(),
+                    *random,
+                    *no_confirm,
+                )
+                .await
+            }
             cli::UserCommands::Delete { id, yes } => commands::user::delete(id.clone(), *yes).await,
         },
         #[cfg(unix)]

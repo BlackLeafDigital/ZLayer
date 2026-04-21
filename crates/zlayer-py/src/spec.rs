@@ -570,6 +570,7 @@ pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResu
         errors: zlayer_spec::ErrorsSpec::default(),
         devices: Vec::new(),
         storage: Vec::new(),
+        port_mappings: Vec::new(),
         capabilities: Vec::new(),
         privileged: false,
         node_mode: zlayer_spec::NodeMode::default(),
@@ -578,6 +579,10 @@ pub fn create_service_spec(name: &str, image: &str, port: Option<u16>) -> PyResu
         wasm: None,
         logs: None,
         host_network: false,
+        hostname: None,
+        dns: Vec::new(),
+        extra_hosts: Vec::new(),
+        restart_policy: None,
     };
 
     Ok(ServiceSpec {

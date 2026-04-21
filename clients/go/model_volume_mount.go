@@ -19,14 +19,16 @@ import (
 // checks if the VolumeMount type satisfies the MappedNullable interface at compile time
 var _ MappedNullable = &VolumeMount{}
 
-// VolumeMount Volume mount specification
+// VolumeMount Volume mount specification.  The `type` field (a Docker-compatible discriminator) selects how `source` is interpreted: - `\"bind\"` (default): `source` is an absolute host path. - `\"volume\"`: `source` is a named-volume identifier. - `\"tmpfs\"`: no `source`; a memory-backed mount is provisioned.
 type VolumeMount struct {
 	// Mount as read-only
 	Readonly *bool `json:"readonly,omitempty"`
-	// Host path or volume name
-	Source string `json:"source"`
+	// Host path (bind), volume name (volume), or unused (tmpfs).
+	Source NullableString `json:"source,omitempty"`
 	// Container mount path
 	Target string `json:"target"`
+	// Mount kind. Omit (or `\"bind\"`) for legacy host-path binds.
+	Type NullableVolumeMountType `json:"type,omitempty"`
 }
 
 type _VolumeMount VolumeMount
@@ -35,9 +37,8 @@ type _VolumeMount VolumeMount
 // This constructor will assign default values to properties that have it defined,
 // and makes sure properties required by API are set, but the set of arguments
 // will change when the set of required properties is changed
-func NewVolumeMount(source string, target string) *VolumeMount {
+func NewVolumeMount(target string) *VolumeMount {
 	this := VolumeMount{}
-	this.Source = source
 	this.Target = target
 	return &this
 }
@@ -82,28 +83,46 @@ func (o *VolumeMount) SetReadonly(v bool) {
 	o.Readonly = &v
 }
 
-// GetSource returns the Source field value
+// GetSource returns the Source field value if set, zero value otherwise (both if not set or set to explicit null).
 func (o *VolumeMount) GetSource() string {
-	if o == nil {
+	if o == nil || IsNil(o.Source.Get()) {
 		var ret string
 		return ret
 	}
-
-	return o.Source
+	return *o.Source.Get()
 }
 
-// GetSourceOk returns a tuple with the Source field value
+// GetSourceOk returns a tuple with the Source field value if set, nil otherwise
 // and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
 func (o *VolumeMount) GetSourceOk() (*string, bool) {
 	if o == nil {
 		return nil, false
 	}
-	return &o.Source, true
+	return o.Source.Get(), o.Source.IsSet()
 }
 
-// SetSource sets field value
+// HasSource returns a boolean if a field has been set.
+func (o *VolumeMount) HasSource() bool {
+	if o != nil && o.Source.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetSource gets a reference to the given NullableString and assigns it to the Source field.
 func (o *VolumeMount) SetSource(v string) {
-	o.Source = v
+	o.Source.Set(&v)
+}
+// SetSourceNil sets the value for Source to be an explicit nil
+func (o *VolumeMount) SetSourceNil() {
+	o.Source.Set(nil)
+}
+
+// UnsetSource ensures that no value is present for Source, not even an explicit nil
+func (o *VolumeMount) UnsetSource() {
+	o.Source.Unset()
 }
 
 // GetTarget returns the Target field value
@@ -130,6 +149,48 @@ func (o *VolumeMount) SetTarget(v string) {
 	o.Target = v
 }
 
+// GetType returns the Type field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *VolumeMount) GetType() VolumeMountType {
+	if o == nil || IsNil(o.Type.Get()) {
+		var ret VolumeMountType
+		return ret
+	}
+	return *o.Type.Get()
+}
+
+// GetTypeOk returns a tuple with the Type field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *VolumeMount) GetTypeOk() (*VolumeMountType, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Type.Get(), o.Type.IsSet()
+}
+
+// HasType returns a boolean if a field has been set.
+func (o *VolumeMount) HasType() bool {
+	if o != nil && o.Type.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetType gets a reference to the given NullableVolumeMountType and assigns it to the Type field.
+func (o *VolumeMount) SetType(v VolumeMountType) {
+	o.Type.Set(&v)
+}
+// SetTypeNil sets the value for Type to be an explicit nil
+func (o *VolumeMount) SetTypeNil() {
+	o.Type.Set(nil)
+}
+
+// UnsetType ensures that no value is present for Type, not even an explicit nil
+func (o *VolumeMount) UnsetType() {
+	o.Type.Unset()
+}
+
 func (o VolumeMount) MarshalJSON() ([]byte, error) {
 	toSerialize,err := o.ToMap()
 	if err != nil {
@@ -143,8 +204,13 @@ func (o VolumeMount) ToMap() (map[string]interface{}, error) {
 	if !IsNil(o.Readonly) {
 		toSerialize["readonly"] = o.Readonly
 	}
-	toSerialize["source"] = o.Source
+	if o.Source.IsSet() {
+		toSerialize["source"] = o.Source.Get()
+	}
 	toSerialize["target"] = o.Target
+	if o.Type.IsSet() {
+		toSerialize["type"] = o.Type.Get()
+	}
 	return toSerialize, nil
 }
 
@@ -153,7 +219,6 @@ func (o *VolumeMount) UnmarshalJSON(data []byte) (err error) {
 	// by unmarshalling the object into a generic map with string keys and checking
 	// that every required field exists as a key in the generic map.
 	requiredProperties := []string{
-		"source",
 		"target",
 	}
 

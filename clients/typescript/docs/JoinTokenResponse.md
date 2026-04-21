@@ -17,7 +17,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { JoinTokenResponse } from '@zlayer/client'
+import type { JoinTokenResponse } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

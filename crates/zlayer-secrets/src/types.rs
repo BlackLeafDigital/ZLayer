@@ -120,6 +120,15 @@ impl SecretMetadata {
     }
 }
 
+/// Result of a secret rotation — records the version before and after the rotate call.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RotationResult {
+    /// Version number prior to rotation. `None` if the secret did not exist before.
+    pub previous_version: Option<u32>,
+    /// Version number after rotation (always set — it's a fresh write).
+    pub new_version: u32,
+}
+
 /// The scope of a secret - determines visibility and access.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SecretScope {

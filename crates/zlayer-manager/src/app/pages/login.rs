@@ -5,14 +5,26 @@ use leptos::task::spawn_local;
 use leptos_router::hooks::use_navigate;
 use leptos_router::NavigateOptions;
 
-use crate::app::server_fns::{manager_login, ManagerLoginRequest};
+use crate::app::server_fns::{
+    manager_list_oidc_providers, manager_login, ManagerLoginRequest, ManagerOidcProvider,
+};
 
 #[component]
+#[allow(clippy::too_many_lines)]
 pub fn Login() -> impl IntoView {
     let (email, set_email) = signal(String::new());
     let (password, set_password) = signal(String::new());
     let (error, set_error) = signal(None::<String>);
     let (submitting, set_submitting) = signal(false);
+
+    let (oidc_providers, set_oidc_providers) = signal(Vec::<ManagerOidcProvider>::new());
+    Effect::new(move |_| {
+        spawn_local(async move {
+            if let Ok(ps) = manager_list_oidc_providers().await {
+                set_oidc_providers.set(ps);
+            }
+        });
+    });
 
     let on_submit = move |ev: leptos::ev::SubmitEvent| {
         ev.prevent_default();
@@ -103,6 +115,25 @@ pub fn Login() -> impl IntoView {
                             {move || if submitting.get() { "Signing in…" } else { "Sign in" }}
                         </button>
                     </form>
+
+                    {move || {
+                        let providers = oidc_providers.get();
+                        (!providers.is_empty()).then(|| {
+                            view! {
+                                <div class="divider text-xs opacity-60 mt-4">"or"</div>
+                                <div class="space-y-2">
+                                    {providers.into_iter().map(|p| view! {
+                                        <a
+                                            href=format!("/auth/oidc/{}/start", p.name)
+                                            class="btn btn-outline w-full"
+                                        >
+                                            {format!("Sign in with {}", p.display_name)}
+                                        </a>
+                                    }).collect_view()}
+                                </div>
+                            }
+                        })
+                    }}
                 </div>
             </div>
         </div>

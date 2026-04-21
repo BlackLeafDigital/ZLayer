@@ -13,7 +13,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { WebhookResponse } from '@zlayer/client'
+import type { WebhookResponse } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

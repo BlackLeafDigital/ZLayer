@@ -28,11 +28,11 @@ GET /api/v1/build/{id}/logs Get build logs.
 import {
   Configuration,
   BuildApi,
-} from '@zlayer/client';
-import type { GetBuildLogsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetBuildLogsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -101,11 +101,11 @@ GET /api/v1/build/{id} Get build status.
 import {
   Configuration,
   BuildApi,
-} from '@zlayer/client';
-import type { GetBuildStatusRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetBuildStatusRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -174,11 +174,11 @@ GET /api/v1/builds List all builds.
 import {
   Configuration,
   BuildApi,
-} from '@zlayer/client';
-import type { ListBuildsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListBuildsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -236,11 +236,11 @@ GET /api/v1/templates List available runtime templates
 import {
   Configuration,
   BuildApi,
-} from '@zlayer/client';
-import type { ListRuntimeTemplatesRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListRuntimeTemplatesRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new BuildApi();
 
   try {
@@ -295,11 +295,11 @@ Accepts a multipart form with: - &#x60;dockerfile&#x60;: The Dockerfile content 
 import {
   Configuration,
   BuildApi,
-} from '@zlayer/client';
-import type { StartBuildRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { StartBuildRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -361,11 +361,11 @@ POST /api/v1/build/json Start a new build from JSON request with a context path 
 import {
   Configuration,
   BuildApi,
-} from '@zlayer/client';
-import type { StartBuildJsonRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { StartBuildJsonRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -435,11 +435,11 @@ GET /api/v1/build/{id}/stream Stream build progress via Server-Sent Events.
 import {
   Configuration,
   BuildApi,
-} from '@zlayer/client';
-import type { StreamBuildRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { StreamBuildRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

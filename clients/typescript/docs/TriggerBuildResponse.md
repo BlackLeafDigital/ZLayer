@@ -13,7 +13,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { TriggerBuildResponse } from '@zlayer/client'
+import type { TriggerBuildResponse } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

@@ -27,11 +27,11 @@ Create a node-to-node tunnel.
 import {
   Configuration,
   TunnelsApi,
-} from '@zlayer/client';
-import type { CreateNodeTunnelOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateNodeTunnelOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -101,11 +101,11 @@ Create a new tunnel token.
 import {
   Configuration,
   TunnelsApi,
-} from '@zlayer/client';
-import type { CreateTunnelOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateTunnelOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -174,11 +174,11 @@ Get tunnel status.
 import {
   Configuration,
   TunnelsApi,
-} from '@zlayer/client';
-import type { GetTunnelStatusRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetTunnelStatusRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -247,11 +247,11 @@ List all tunnels.
 import {
   Configuration,
   TunnelsApi,
-} from '@zlayer/client';
-import type { ListTunnelsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListTunnelsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -311,11 +311,11 @@ Remove a node-to-node tunnel.
 import {
   Configuration,
   TunnelsApi,
-} from '@zlayer/client';
-import type { RemoveNodeTunnelRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { RemoveNodeTunnelRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -385,11 +385,11 @@ Revoke (delete) a tunnel.
 import {
   Configuration,
   TunnelsApi,
-} from '@zlayer/client';
-import type { RevokeTunnelRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { RevokeTunnelRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

@@ -19,13 +19,95 @@
 //! gates this file to Unix, so no inner `#![cfg(unix)]` is needed here.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use zlayer_api::handlers::secrets::SecretMetadataResponse;
+use zlayer_api::storage::{PermissionLevel, SubjectKind};
+use zlayer_api::GrantPermissionRequest;
 
 use crate::cli::{Cli, SecretCommands};
 use zlayer_client::DaemonClient;
+
+/// Source of a secret's value provided on the CLI.
+#[derive(Debug, Clone)]
+pub(crate) struct ValueInput {
+    pub value: Option<String>,
+    pub from_stdin: bool,
+    pub from_file: Option<PathBuf>,
+    pub random: bool,
+    pub random_length: usize,
+}
+
+/// Resolve the secret value from whichever input the user supplied.
+///
+/// Exactly one of `value` / `from_stdin` / `from_file` / `random` must be set;
+/// returns an error otherwise. When `random`, also returns `true` so the
+/// caller can print the generated value once.
+pub(crate) fn read_secret_value(input: ValueInput) -> Result<(String, bool /* was_random */)> {
+    let modes_on = [
+        input.value.is_some(),
+        input.from_stdin,
+        input.from_file.is_some(),
+        input.random,
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
+    if modes_on == 0 {
+        bail!("Provide exactly one of --value / --from-stdin / --from-file / --random");
+    }
+    if modes_on > 1 {
+        bail!("--value, --from-stdin, --from-file, --random are mutually exclusive");
+    }
+
+    if let Some(v) = input.value {
+        tracing::warn!(
+            "--value exposes the secret on the process argv; prefer --from-file or --from-stdin for sensitive data"
+        );
+        return Ok((v, false));
+    }
+    if input.from_stdin {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| anyhow::anyhow!("Failed to read stdin: {e}"))?;
+        // Trim only a SINGLE trailing newline (users may paste secrets with
+        // leading/trailing whitespace they actually want preserved).
+        if buf.ends_with('\n') {
+            buf.pop();
+            if buf.ends_with('\r') {
+                buf.pop();
+            }
+        }
+        return Ok((buf, false));
+    }
+    if let Some(path) = input.from_file {
+        let mut s = std::fs::read_to_string(&path)
+            .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+        // Strip a single trailing `\n` (and the `\r` preceding it on CRLF),
+        // matching the stdin behaviour above.
+        if s.ends_with('\n') {
+            s.pop();
+            if s.ends_with('\r') {
+                s.pop();
+            }
+        }
+        return Ok((s, false));
+    }
+    if input.random {
+        use rand::distr::Alphanumeric;
+        use rand::Rng;
+        let v: String = rand::rng()
+            .sample_iter(Alphanumeric)
+            .take(input.random_length)
+            .map(char::from)
+            .collect();
+        return Ok((v, true));
+    }
+    unreachable!("one of the branches must have fired")
+}
 
 /// Entry point for `zlayer secret <subcommand>`.
 pub(crate) async fn handle_secret(_cli: &Cli, cmd: &SecretCommands) -> Result<()> {
@@ -38,9 +120,22 @@ pub(crate) async fn handle_secret(_cli: &Cli, cmd: &SecretCommands) -> Result<()
         SecretCommands::Create {
             name,
             value,
+            from_stdin,
+            from_file,
+            random,
+            random_length,
             env,
             project,
-        } => create_secret(name, value, env.as_deref(), project.as_deref()).await,
+        } => {
+            let input = ValueInput {
+                value: value.clone(),
+                from_stdin: *from_stdin,
+                from_file: from_file.clone(),
+                random: *random,
+                random_length: *random_length,
+            };
+            create_secret(name, input, env.as_deref(), project.as_deref()).await
+        }
         SecretCommands::Get {
             name,
             env,
@@ -51,10 +146,43 @@ pub(crate) async fn handle_secret(_cli: &Cli, cmd: &SecretCommands) -> Result<()
             remove_secret(name, env.as_deref(), project.as_deref()).await
         }
         SecretCommands::Set {
-            assignment,
+            name,
+            value,
+            from_stdin,
+            from_file,
+            random,
+            random_length,
             env,
             project,
-        } => set_secret(assignment, env, project.as_deref()).await,
+        } => {
+            let input = ValueInput {
+                value: value.clone(),
+                from_stdin: *from_stdin,
+                from_file: from_file.clone(),
+                random: *random,
+                random_length: *random_length,
+            };
+            set_secret(name, input, env, project.as_deref()).await
+        }
+        SecretCommands::Rotate {
+            name,
+            value,
+            from_stdin,
+            from_file,
+            random,
+            random_length,
+            env,
+            project,
+        } => {
+            let input = ValueInput {
+                value: value.clone(),
+                from_stdin: *from_stdin,
+                from_file: from_file.clone(),
+                random: *random,
+                random_length: *random_length,
+            };
+            rotate_secret(name, input, env, project.as_deref()).await
+        }
         SecretCommands::Unset { name, env, project } => {
             unset_secret(name, env, project.as_deref()).await
         }
@@ -66,6 +194,20 @@ pub(crate) async fn handle_secret(_cli: &Cli, cmd: &SecretCommands) -> Result<()
             format,
             project,
         } => export_secrets(env, format, project.as_deref()).await,
+        SecretCommands::Grant {
+            user,
+            env,
+            level,
+            project,
+        } => grant_env_access(user, env, level, project.as_deref()).await,
+        SecretCommands::Revoke { user, env, project } => {
+            revoke_env_access(user, env, project.as_deref()).await
+        }
+        SecretCommands::Permissions {
+            env,
+            project,
+            output,
+        } => list_env_permissions(env, project.as_deref(), output).await,
     }
 }
 
@@ -125,31 +267,46 @@ async fn list_secrets(output: &str, env: Option<&str>, project: Option<&str>) ->
 
 async fn create_secret(
     name: &str,
-    value: &str,
+    input: ValueInput,
     env: Option<&str>,
     project: Option<&str>,
 ) -> Result<()> {
+    let (value, was_random) = read_secret_value(input)?;
     let client = DaemonClient::connect().await?;
 
     if let Some(env_ref) = env {
         let env_id = resolve_env_id(&client, env_ref, project).await?;
         let meta = client
-            .set_secret_in_env(&env_id, name, value)
+            .set_secret_in_env(&env_id, name, &value)
             .await
             .context("Failed to store secret")?;
         println!(
             "Secret '{}' stored in environment {} (version {})",
             meta.name, env_id, meta.version
         );
+        if was_random {
+            println!();
+            println!("Generated value for '{}':", meta.name);
+            println!("  {value}");
+            println!();
+            println!("This is the only time it will be shown. Store it now.");
+        }
         return Ok(());
     }
 
-    let result = client.create_secret(name, value).await?;
+    let result = client.create_secret(name, &value).await?;
     let version = result
         .get("version")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(1);
     println!("Secret '{name}' stored (version {version})");
+    if was_random {
+        println!();
+        println!("Generated value for '{name}':");
+        println!("  {value}");
+        println!();
+        println!("This is the only time it will be shown. Store it now.");
+    }
     Ok(())
 }
 
@@ -232,25 +389,68 @@ async fn remove_secret(name: &str, env: Option<&str>, project: Option<&str>) -> 
     Ok(())
 }
 
-async fn set_secret(assignment: &str, env: &str, project: Option<&str>) -> Result<()> {
-    let (name, value) = assignment
-        .split_once('=')
-        .ok_or_else(|| anyhow::anyhow!("Expected NAME=VALUE, got '{assignment}'"))?;
-    let name = name.trim();
-    if name.is_empty() {
+async fn set_secret(name: &str, input: ValueInput, env: &str, project: Option<&str>) -> Result<()> {
+    if name.trim().is_empty() {
         bail!("Secret name cannot be empty");
     }
+    let (value, was_random) = read_secret_value(input)?;
 
     let client = DaemonClient::connect().await?;
     let env_id = resolve_env_id(&client, env, project).await?;
     let meta = client
-        .set_secret_in_env(&env_id, name, value)
+        .set_secret_in_env(&env_id, name, &value)
         .await
         .context("Failed to set secret")?;
     println!(
         "Secret '{}' set in environment {} (version {})",
         meta.name, env_id, meta.version
     );
+    if was_random {
+        println!();
+        println!("Generated value for '{}':", meta.name);
+        println!("  {value}");
+        println!();
+        println!("This is the only time it will be shown. Store it now.");
+    }
+    Ok(())
+}
+
+async fn rotate_secret(
+    name: &str,
+    input: ValueInput,
+    env: &str,
+    project: Option<&str>,
+) -> Result<()> {
+    if name.trim().is_empty() {
+        bail!("Secret name cannot be empty");
+    }
+    let (value, was_random) = read_secret_value(input)?;
+
+    let client = DaemonClient::connect().await?;
+    let env_id = resolve_env_id(&client, env, project).await?;
+    let resp = client
+        .rotate_secret_in_env(&env_id, name, &value)
+        .await
+        .context("Failed to rotate secret")?;
+
+    match resp.previous_version {
+        Some(prev) => println!(
+            "Rotated '{}' in env '{}' (v{} → v{})",
+            resp.name, env_id, prev, resp.new_version
+        ),
+        None => println!(
+            "Rotated '{}' in env '{}' (→ v{})",
+            resp.name, env_id, resp.new_version
+        ),
+    }
+
+    if was_random {
+        println!();
+        println!("Generated value for '{}':", resp.name);
+        println!("  {value}");
+        println!();
+        println!("This is the only time it will be shown. Store it now.");
+    }
     Ok(())
 }
 
@@ -342,6 +542,160 @@ async fn export_secrets(env: &str, format: &str, project: Option<&str>) -> Resul
 }
 
 // ---------------------------------------------------------------------------
+// Permission management for environment secrets
+// ---------------------------------------------------------------------------
+
+async fn grant_env_access(
+    user_ref: &str,
+    env_ref: &str,
+    level_raw: &str,
+    project: Option<&str>,
+) -> Result<()> {
+    let level = parse_permission_level(level_raw)?;
+
+    let client = DaemonClient::connect().await?;
+    let env_id = resolve_env_id(&client, env_ref, project).await?;
+    let user_id = resolve_user_id(&client, user_ref).await?;
+
+    let req = GrantPermissionRequest {
+        subject_kind: SubjectKind::User,
+        subject_id: user_id.clone(),
+        resource_kind: "environment".to_string(),
+        resource_id: Some(env_id.clone()),
+        level,
+    };
+
+    let perm = client
+        .grant_permission(&req)
+        .await
+        .context("Failed to grant environment permission")?;
+
+    println!(
+        "Granted {} on environment {} to user {} (permission id {})",
+        perm.level, env_id, user_id, perm.id
+    );
+    Ok(())
+}
+
+async fn revoke_env_access(user_ref: &str, env_ref: &str, project: Option<&str>) -> Result<()> {
+    let client = DaemonClient::connect().await?;
+    let env_id = resolve_env_id(&client, env_ref, project).await?;
+    let user_id = resolve_user_id(&client, user_ref).await?;
+
+    let perms = client
+        .list_permissions(Some(&user_id), None)
+        .await
+        .context("Failed to list user permissions")?;
+
+    let target = perms.into_iter().find(|p| {
+        p.resource_kind == "environment" && p.resource_id.as_deref() == Some(env_id.as_str())
+    });
+
+    match target {
+        Some(perm) => {
+            client
+                .revoke_permission(&perm.id)
+                .await
+                .context("Failed to revoke environment permission")?;
+            println!(
+                "Revoked {} on environment {} from user {} (permission id {})",
+                perm.level, env_id, user_id, perm.id
+            );
+        }
+        None => {
+            println!(
+                "No grant to revoke: user {user_id} has no permission on environment {env_id}"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn list_env_permissions(env_ref: &str, project: Option<&str>, output: &str) -> Result<()> {
+    let client = DaemonClient::connect().await?;
+    let env_id = resolve_env_id(&client, env_ref, project).await?;
+
+    let perms = client
+        .list_permissions_for_resource("environment", Some(&env_id))
+        .await
+        .context("Failed to list environment permissions")?;
+
+    if output == "json" {
+        println!("{}", serde_json::to_string_pretty(&perms)?);
+        return Ok(());
+    }
+
+    if output != "table" {
+        bail!("Unsupported --output '{output}' (expected 'table' or 'json')");
+    }
+
+    if perms.is_empty() {
+        println!("(no grants on environment {env_id})");
+        return Ok(());
+    }
+
+    println!(
+        "{:<38} {:<6} {:<38} {:<8}",
+        "PERMISSION_ID", "KIND", "SUBJECT_ID", "LEVEL"
+    );
+    for p in &perms {
+        println!(
+            "{:<38} {:<6} {:<38} {:<8}",
+            p.id,
+            p.subject_kind.to_string(),
+            p.subject_id,
+            p.level.to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Parse a user-supplied permission level string.
+///
+/// Accepts `read`, `execute`, `write` (case-insensitive). `none` is rejected
+/// so an accidental typo cannot silently grant nothing.
+fn parse_permission_level(raw: &str) -> Result<PermissionLevel> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "read" => Ok(PermissionLevel::Read),
+        "execute" => Ok(PermissionLevel::Execute),
+        "write" => Ok(PermissionLevel::Write),
+        other => {
+            bail!("Invalid permission level '{other}' (expected 'read', 'execute', or 'write')")
+        }
+    }
+}
+
+/// Resolve a user reference (email or id) into a concrete user id.
+///
+/// If `user_ref` matches an existing user's email (case-insensitive), returns
+/// that user's id. Otherwise, it is passed through verbatim — the daemon will
+/// 4xx if the id is bogus.
+async fn resolve_user_id(client: &DaemonClient, user_ref: &str) -> Result<String> {
+    let trimmed = user_ref.trim();
+    if trimmed.is_empty() {
+        bail!("User reference cannot be empty");
+    }
+
+    // Only fall through to a listing lookup when the reference looks like an
+    // email. Anything else is assumed to be a user id and passed through
+    // verbatim to keep this path working without admin list_users access.
+    if !trimmed.contains('@') {
+        return Ok(trimmed.to_string());
+    }
+
+    let users = client
+        .list_users()
+        .await
+        .context("Failed to list users while resolving user reference")?;
+    let needle = trimmed.to_ascii_lowercase();
+    users
+        .into_iter()
+        .find(|u| u.email.eq_ignore_ascii_case(&needle))
+        .map(|u| u.id)
+        .ok_or_else(|| anyhow::anyhow!("No user with email {trimmed}"))
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -352,7 +706,11 @@ async fn export_secrets(env: &str, format: &str, project: Option<&str>) -> Resul
 /// `project` scope (or globals when `project` is `None`) and filtering by
 /// name. An unknown name produces an error with the list of names that were
 /// found in the scope so the user can pick one.
-async fn resolve_env_id(client: &DaemonClient, env: &str, project: Option<&str>) -> Result<String> {
+pub(crate) async fn resolve_env_id(
+    client: &DaemonClient,
+    env: &str,
+    project: Option<&str>,
+) -> Result<String> {
     if looks_like_uuid(env) {
         return Ok(env.to_string());
     }

@@ -18,7 +18,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { StoredTask } from '@zlayer/client'
+import type { StoredTask } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

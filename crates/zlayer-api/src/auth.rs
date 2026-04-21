@@ -197,6 +197,14 @@ pub struct AuthState {
     /// Optional so legacy instances without the store still boot; endpoints
     /// that require it return 503 when `None`.
     pub user_store: Option<std::sync::Arc<dyn crate::storage::UserStorage>>,
+    /// Identity facade for combined user-store + credential-store writes.
+    /// Handlers touching both stores MUST go through this; `None` only in
+    /// legacy tests that build a router without persistent stores.
+    pub identity: Option<std::sync::Arc<crate::identity::IdentityManager>>,
+    /// Configured OIDC providers. Empty when SSO is disabled.
+    pub oidc_clients: std::collections::HashMap<String, crate::oidc::OidcClient>,
+    /// In-flight OIDC CSRF / PKCE state.
+    pub oidc_state: std::sync::Arc<crate::oidc::StateTokenStore>,
     /// Whether to set cookies with `Secure=true`. Production: `true`.
     /// Dev/local-http: `false` so the browser doesn't drop the cookie.
     pub cookie_secure: bool,

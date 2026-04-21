@@ -25,7 +25,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { ClusterNodeSummary } from '@zlayer/client'
+import type { ClusterNodeSummary } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

@@ -76,6 +76,12 @@ fn convert_service(svc_name: &str, svc: &ComposeService) -> crate::Result<Servic
 
     warn_unsupported_fields(svc_name, svc);
 
+    let dns = svc
+        .dns
+        .clone()
+        .map(super::types::StringOrList::into_list)
+        .unwrap_or_default();
+
     Ok(ServiceSpec {
         rtype: ResourceType::Service,
         schedule: None,
@@ -92,6 +98,7 @@ fn convert_service(svc_name: &str, svc: &ComposeService) -> crate::Result<Servic
         errors: ErrorsSpec::default(),
         devices: Vec::new(),
         storage,
+        port_mappings: Vec::new(),
         capabilities: svc.cap_add.clone(),
         privileged: svc.privileged,
         node_mode: NodeMode::default(),
@@ -100,6 +107,10 @@ fn convert_service(svc_name: &str, svc: &ComposeService) -> crate::Result<Servic
         wasm: None,
         logs: None,
         host_network: false,
+        hostname: svc.hostname.clone(),
+        dns,
+        extra_hosts: svc.extra_hosts.clone(),
+        restart_policy: None,
     })
 }
 
@@ -135,18 +146,6 @@ fn warn_unsupported_fields(svc_name: &str, svc: &ComposeService) {
         info!(
             service = svc_name,
             "ZLayer handles networking automatically; network_mode ignored"
-        );
-    }
-    if !svc.extra_hosts.is_empty() {
-        warn!(
-            service = svc_name,
-            "extra_hosts is not supported in ZLayer; skipping"
-        );
-    }
-    if svc.dns.is_some() {
-        warn!(
-            service = svc_name,
-            "custom DNS is not supported in ZLayer; skipping"
         );
     }
     if !svc.sysctls.is_empty() {

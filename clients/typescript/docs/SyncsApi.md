@@ -26,11 +26,11 @@ For each resource in the manifest directory: - &#x60;deployment&#x60; YAMLs are 
 import {
   Configuration,
   SyncsApi,
-} from '@zlayer/client';
-import type { ApplySyncRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ApplySyncRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -98,11 +98,11 @@ Create a new sync.
 import {
   Configuration,
   SyncsApi,
-} from '@zlayer/client';
-import type { CreateSyncOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateSyncOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -171,11 +171,11 @@ Delete a sync.
 import {
   Configuration,
   SyncsApi,
-} from '@zlayer/client';
-import type { DeleteSyncRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteSyncRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -243,11 +243,11 @@ Compute a diff for a sync (scan git path vs. remote resources).
 import {
   Configuration,
   SyncsApi,
-} from '@zlayer/client';
-import type { DiffSyncRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DiffSyncRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -315,11 +315,11 @@ List all syncs.
 import {
   Configuration,
   SyncsApi,
-} from '@zlayer/client';
-import type { ListSyncsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListSyncsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

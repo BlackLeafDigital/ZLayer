@@ -13,7 +13,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { TagImageRequest } from '@zlayer/client'
+import type { TagImageRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

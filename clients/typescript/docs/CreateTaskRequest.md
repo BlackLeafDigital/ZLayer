@@ -15,7 +15,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { CreateTaskRequest } from '@zlayer/client'
+import type { CreateTaskRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

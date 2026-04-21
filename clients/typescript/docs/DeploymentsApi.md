@@ -25,11 +25,11 @@ When the daemon has orchestration wired (service manager, proxy, overlay), this 
 import {
   Configuration,
   DeploymentsApi,
-} from '@zlayer/client';
-import type { CreateDeploymentOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateDeploymentOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -98,11 +98,11 @@ Delete a deployment.
 import {
   Configuration,
   DeploymentsApi,
-} from '@zlayer/client';
-import type { DeleteDeploymentRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteDeploymentRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -171,11 +171,11 @@ Get deployment details (with live per-service health when available).
 import {
   Configuration,
   DeploymentsApi,
-} from '@zlayer/client';
-import type { GetDeploymentRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetDeploymentRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -244,11 +244,11 @@ List all deployments.
 import {
   Configuration,
   DeploymentsApi,
-} from '@zlayer/client';
-import type { ListDeploymentsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListDeploymentsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

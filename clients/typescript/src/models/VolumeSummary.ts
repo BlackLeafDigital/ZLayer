@@ -14,25 +14,28 @@
 
 import { mapValues } from '../runtime';
 /**
- * Summary of a single volume returned by the list endpoint.
+ * Legacy response shape kept for backwards compatibility with older SDK
+ * consumers that deserialize strictly. New consumers should use
+ * [`VolumeInfo`]. `list_volumes` now returns [`VolumeInfo`] which is a
+ * strict superset of the fields in `VolumeSummary`.
  * @export
  * @interface VolumeSummary
  */
 export interface VolumeSummary {
     /**
-     * Volume name (directory name)
+     * Volume name (directory name).
      * @type {string}
      * @memberof VolumeSummary
      */
     name: string;
     /**
-     * Host filesystem path
+     * Host filesystem path.
      * @type {string}
      * @memberof VolumeSummary
      */
     path: string;
     /**
-     * Approximate size in bytes (sum of files in the volume directory)
+     * Approximate size in bytes.
      * @type {number}
      * @memberof VolumeSummary
      */

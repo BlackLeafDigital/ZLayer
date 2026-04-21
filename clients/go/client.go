@@ -49,21 +49,73 @@ type APIClient struct {
 
 	// API Services
 
+	AuditAPI *AuditAPIService
+
 	AuthenticationAPI *AuthenticationAPIService
 
 	BuildAPI *BuildAPIService
 
+	ClusterAPI *ClusterAPIService
+
+	ContainerNetworksAPI *ContainerNetworksAPIService
+
 	ContainersAPI *ContainersAPIService
+
+	CredentialsAPI *CredentialsAPIService
+
+	CronAPI *CronAPIService
 
 	DeploymentsAPI *DeploymentsAPIService
 
+	EnvironmentsAPI *EnvironmentsAPIService
+
+	EventsAPI *EventsAPIService
+
+	GroupsAPI *GroupsAPIService
+
 	HealthAPI *HealthAPIService
 
+	ImagesAPI *ImagesAPIService
+
 	InternalAPI *InternalAPIService
+
+	JobsAPI *JobsAPIService
+
+	NetworksAPI *NetworksAPIService
+
+	NodesAPI *NodesAPIService
+
+	NotifiersAPI *NotifiersAPIService
+
+	OverlayAPI *OverlayAPIService
+
+	PermissionsAPI *PermissionsAPIService
+
+	ProjectsAPI *ProjectsAPIService
+
+	ProxyAPI *ProxyAPIService
 
 	SecretsAPI *SecretsAPIService
 
 	ServicesAPI *ServicesAPIService
+
+	StorageAPI *StorageAPIService
+
+	SyncsAPI *SyncsAPIService
+
+	TasksAPI *TasksAPIService
+
+	TunnelsAPI *TunnelsAPIService
+
+	UsersAPI *UsersAPIService
+
+	VariablesAPI *VariablesAPIService
+
+	VolumesAPI *VolumesAPIService
+
+	WebhooksAPI *WebhooksAPIService
+
+	WorkflowsAPI *WorkflowsAPIService
 }
 
 type service struct {
@@ -82,14 +134,40 @@ func NewAPIClient(cfg *Configuration) *APIClient {
 	c.common.client = c
 
 	// API Services
+	c.AuditAPI = (*AuditAPIService)(&c.common)
 	c.AuthenticationAPI = (*AuthenticationAPIService)(&c.common)
 	c.BuildAPI = (*BuildAPIService)(&c.common)
+	c.ClusterAPI = (*ClusterAPIService)(&c.common)
+	c.ContainerNetworksAPI = (*ContainerNetworksAPIService)(&c.common)
 	c.ContainersAPI = (*ContainersAPIService)(&c.common)
+	c.CredentialsAPI = (*CredentialsAPIService)(&c.common)
+	c.CronAPI = (*CronAPIService)(&c.common)
 	c.DeploymentsAPI = (*DeploymentsAPIService)(&c.common)
+	c.EnvironmentsAPI = (*EnvironmentsAPIService)(&c.common)
+	c.EventsAPI = (*EventsAPIService)(&c.common)
+	c.GroupsAPI = (*GroupsAPIService)(&c.common)
 	c.HealthAPI = (*HealthAPIService)(&c.common)
+	c.ImagesAPI = (*ImagesAPIService)(&c.common)
 	c.InternalAPI = (*InternalAPIService)(&c.common)
+	c.JobsAPI = (*JobsAPIService)(&c.common)
+	c.NetworksAPI = (*NetworksAPIService)(&c.common)
+	c.NodesAPI = (*NodesAPIService)(&c.common)
+	c.NotifiersAPI = (*NotifiersAPIService)(&c.common)
+	c.OverlayAPI = (*OverlayAPIService)(&c.common)
+	c.PermissionsAPI = (*PermissionsAPIService)(&c.common)
+	c.ProjectsAPI = (*ProjectsAPIService)(&c.common)
+	c.ProxyAPI = (*ProxyAPIService)(&c.common)
 	c.SecretsAPI = (*SecretsAPIService)(&c.common)
 	c.ServicesAPI = (*ServicesAPIService)(&c.common)
+	c.StorageAPI = (*StorageAPIService)(&c.common)
+	c.SyncsAPI = (*SyncsAPIService)(&c.common)
+	c.TasksAPI = (*TasksAPIService)(&c.common)
+	c.TunnelsAPI = (*TunnelsAPIService)(&c.common)
+	c.UsersAPI = (*UsersAPIService)(&c.common)
+	c.VariablesAPI = (*VariablesAPIService)(&c.common)
+	c.VolumesAPI = (*VolumesAPIService)(&c.common)
+	c.WebhooksAPI = (*WebhooksAPIService)(&c.common)
+	c.WorkflowsAPI = (*WorkflowsAPIService)(&c.common)
 
 	return c
 }

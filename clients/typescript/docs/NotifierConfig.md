@@ -22,7 +22,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { NotifierConfig } from '@zlayer/client'
+import type { NotifierConfig } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

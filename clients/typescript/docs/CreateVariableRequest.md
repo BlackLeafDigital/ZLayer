@@ -14,7 +14,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { CreateVariableRequest } from '@zlayer/client'
+import type { CreateVariableRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

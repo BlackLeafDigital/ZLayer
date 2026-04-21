@@ -17,7 +17,6 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["process", "time", "net", "io-util"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
+toml_edit = "0.22"
+fs4 = "0.9"
 zlayer-paths.workspace = true
-
-[target.'cfg(windows)'.dependencies]
-winreg = "0.55"

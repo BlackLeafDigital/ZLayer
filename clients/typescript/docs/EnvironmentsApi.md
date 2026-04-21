@@ -26,11 +26,11 @@ Create a new environment. Admin only.
 import {
   Configuration,
   EnvironmentsApi,
-} from '@zlayer/client';
-import type { CreateEnvironmentOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateEnvironmentOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -100,11 +100,11 @@ Non-cascading: the operator must purge any secrets attached to the environment b
 import {
   Configuration,
   EnvironmentsApi,
-} from '@zlayer/client';
-import type { DeleteEnvironmentRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteEnvironmentRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -174,11 +174,11 @@ Fetch a single environment by id.
 import {
   Configuration,
   EnvironmentsApi,
-} from '@zlayer/client';
-import type { GetEnvironmentRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetEnvironmentRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -246,11 +246,11 @@ Filter rules (see [&#x60;ListEnvironmentsQuery&#x60;]):  - &#x60;?project&#x3D;{
 import {
   Configuration,
   EnvironmentsApi,
-} from '@zlayer/client';
-import type { ListEnvironmentsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListEnvironmentsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -318,11 +318,11 @@ Rename / re-describe an environment. Admin only.
 import {
   Configuration,
   EnvironmentsApi,
-} from '@zlayer/client';
-import type { UpdateEnvironmentOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { UpdateEnvironmentOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

@@ -4,8 +4,9 @@
 
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
-**Name** | **string** | The name of the secret | 
-**Value** | **string** | The secret value (will be encrypted at rest) | 
+**Name** | **string** | The name of the secret. | 
+**Scope** | Pointer to **NullableString** | Optional explicit scope (legacy form). Mutually exclusive with the &#x60;?environment&#x3D;&#x60; query parameter. | [optional] 
+**Value** | **string** | The secret value (will be encrypted at rest). | 
 
 ## Methods
 
@@ -46,6 +47,41 @@ and a boolean to check if the value has been set.
 SetName sets Name field to given value.
 
 
+### GetScope
+
+`func (o *CreateSecretRequest) GetScope() string`
+
+GetScope returns the Scope field if non-nil, zero value otherwise.
+
+### GetScopeOk
+
+`func (o *CreateSecretRequest) GetScopeOk() (*string, bool)`
+
+GetScopeOk returns a tuple with the Scope field if it's non-nil, zero value otherwise
+and a boolean to check if the value has been set.
+
+### SetScope
+
+`func (o *CreateSecretRequest) SetScope(v string)`
+
+SetScope sets Scope field to given value.
+
+### HasScope
+
+`func (o *CreateSecretRequest) HasScope() bool`
+
+HasScope returns a boolean if a field has been set.
+
+### SetScopeNil
+
+`func (o *CreateSecretRequest) SetScopeNil(b bool)`
+
+ SetScopeNil sets the value for Scope to be an explicit nil
+
+### UnsetScope
+`func (o *CreateSecretRequest) UnsetScope()`
+
+UnsetScope ensures that no value is present for Scope, not even an explicit nil
 ### GetValue
 
 `func (o *CreateSecretRequest) GetValue() string`

@@ -20,7 +20,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { RouteInfo } from '@zlayer/client'
+import type { RouteInfo } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

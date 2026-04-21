@@ -180,6 +180,36 @@ impl<S: SecretsStore> CredentialStore<S> {
         self.store.exists(CREDENTIALS_SCOPE, api_key).await
     }
 
+    /// Overwrite the roles array on an existing credential, preserving the
+    /// password hash. Use this to keep credential roles in sync with the
+    /// authoritative user-store role when an admin changes a user's role.
+    ///
+    /// # Arguments
+    /// * `api_key` - The API key whose roles should be updated
+    /// * `roles` - The new role list (replaces existing)
+    ///
+    /// # Errors
+    /// Returns `SecretsError::NotFound` if the credential doesn't exist, or a
+    /// `SecretsError` if the storage or (de)serialisation fails.
+    pub async fn set_roles(&self, api_key: &str, roles: &[&str]) -> Result<()> {
+        let secret = self.store.get_secret(CREDENTIALS_SCOPE, api_key).await?;
+        let mut stored: StoredCredential = serde_json::from_str(secret.expose()).map_err(|e| {
+            SecretsError::Storage(format!("corrupt credential record for '{api_key}': {e}"))
+        })?;
+
+        stored.roles = roles.iter().map(|r| (*r).to_string()).collect();
+
+        let json = serde_json::to_string(&stored)
+            .map_err(|e| SecretsError::Storage(format!("failed to serialise credential: {e}")))?;
+
+        self.store
+            .set_secret(CREDENTIALS_SCOPE, api_key, &Secret::new(json))
+            .await?;
+
+        info!(api_key = %api_key, roles = ?roles, "Updated credential roles");
+        Ok(())
+    }
+
     /// Ensure a default admin credential exists.
     ///
     /// If no credential with the given `api_key` exists, one is created with
@@ -297,6 +327,45 @@ mod tests {
 
         cred_store.delete_api_key("delete-me").await.unwrap();
         assert!(!cred_store.exists("delete-me").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_set_roles_preserves_hash() {
+        let (store, _temp) = create_test_store().await;
+        let cred_store = CredentialStore::new(store);
+
+        cred_store
+            .create_api_key("alice@example.com", "hunter2hunter2", &["user"])
+            .await
+            .unwrap();
+
+        cred_store
+            .set_roles("alice@example.com", &["admin"])
+            .await
+            .unwrap();
+
+        // Old password still works (hash preserved)
+        let roles = cred_store
+            .validate("alice@example.com", "hunter2hunter2")
+            .await
+            .unwrap()
+            .expect("should validate");
+        assert_eq!(roles, vec!["admin".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_set_roles_missing_errors() {
+        let (store, _temp) = create_test_store().await;
+        let cred_store = CredentialStore::new(store);
+
+        let err = cred_store
+            .set_roles("nonexistent", &["admin"])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, SecretsError::NotFound { .. }),
+            "unexpected: {err}"
+        );
     }
 
     #[tokio::test]

@@ -15,22 +15,90 @@
 
 import * as runtime from '../runtime';
 import type {
-  VolumeSummary,
+  CreateVolumeRequest,
+  VolumeInfo,
 } from '../models/index';
 import {
-    VolumeSummaryFromJSON,
-    VolumeSummaryToJSON,
+    CreateVolumeRequestFromJSON,
+    CreateVolumeRequestToJSON,
+    VolumeInfoFromJSON,
+    VolumeInfoToJSON,
 } from '../models/index';
+
+export interface CreateVolumeOperationRequest {
+    createVolumeRequest: CreateVolumeRequest;
+}
 
 export interface DeleteVolumeRequest {
     name: string;
     force: boolean;
 }
 
+export interface GetVolumeRequest {
+    name: string;
+}
+
 /**
  * 
  */
 export class VolumesApi extends runtime.BaseAPI {
+
+    /**
+     * Creates request options for createVolume without sending the request
+     */
+    async createVolumeRequestOpts(requestParameters: CreateVolumeOperationRequest): Promise<runtime.RequestOpts> {
+        if (requestParameters['createVolumeRequest'] == null) {
+            throw new runtime.RequiredError(
+                'createVolumeRequest',
+                'Required parameter "createVolumeRequest" was null or undefined when calling createVolume().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        headerParameters['Content-Type'] = 'application/json';
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearer_auth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/api/v1/volumes`;
+
+        return {
+            path: urlPath,
+            method: 'POST',
+            headers: headerParameters,
+            query: queryParameters,
+            body: CreateVolumeRequestToJSON(requestParameters['createVolumeRequest']),
+        };
+    }
+
+    /**
+     * Creates `state.volume_dir/{name}` on disk and writes a `.metadata.json` sidecar capturing labels, size, tier, and the creation timestamp.  # Errors  - 400 Bad Request — invalid name, size, or tier. - 403 Forbidden — caller lacks the `operator` role. - 409 Conflict — a volume with this name already exists. - 500 Internal — filesystem errors.
+     * Create a new named volume.
+     */
+    async createVolumeRaw(requestParameters: CreateVolumeOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<VolumeInfo>> {
+        const requestOptions = await this.createVolumeRequestOpts(requestParameters);
+        const response = await this.request(requestOptions, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => VolumeInfoFromJSON(jsonValue));
+    }
+
+    /**
+     * Creates `state.volume_dir/{name}` on disk and writes a `.metadata.json` sidecar capturing labels, size, tier, and the creation timestamp.  # Errors  - 400 Bad Request — invalid name, size, or tier. - 403 Forbidden — caller lacks the `operator` role. - 409 Conflict — a volume with this name already exists. - 500 Internal — filesystem errors.
+     * Create a new named volume.
+     */
+    async createVolume(requestParameters: CreateVolumeOperationRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<VolumeInfo> {
+        const response = await this.createVolumeRaw(requestParameters, initOverrides);
+        return await response.value();
+    }
 
     /**
      * Creates request options for deleteVolume without sending the request
@@ -79,7 +147,7 @@ export class VolumesApi extends runtime.BaseAPI {
     }
 
     /**
-     * Removes a volume directory from disk. By default, only empty volumes can be deleted. Use `?force=true` to remove non-empty volumes.  # Errors  Returns an error if the volume is not found or cannot be removed.
+     * By default, refuses to remove a volume that is non-empty OR that any container currently reports mounting. `?force=true` overrides both checks.  # Errors  - 404 Not Found — no such volume. - 409 Conflict — non-empty or in-use without `?force=true`. - 403 Forbidden — caller lacks the `operator` role.
      * Delete a volume by name.
      */
     async deleteVolumeRaw(requestParameters: DeleteVolumeRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<void>> {
@@ -90,11 +158,66 @@ export class VolumesApi extends runtime.BaseAPI {
     }
 
     /**
-     * Removes a volume directory from disk. By default, only empty volumes can be deleted. Use `?force=true` to remove non-empty volumes.  # Errors  Returns an error if the volume is not found or cannot be removed.
+     * By default, refuses to remove a volume that is non-empty OR that any container currently reports mounting. `?force=true` overrides both checks.  # Errors  - 404 Not Found — no such volume. - 409 Conflict — non-empty or in-use without `?force=true`. - 403 Forbidden — caller lacks the `operator` role.
      * Delete a volume by name.
      */
     async deleteVolume(requestParameters: DeleteVolumeRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<void> {
         await this.deleteVolumeRaw(requestParameters, initOverrides);
+    }
+
+    /**
+     * Creates request options for getVolume without sending the request
+     */
+    async getVolumeRequestOpts(requestParameters: GetVolumeRequest): Promise<runtime.RequestOpts> {
+        if (requestParameters['name'] == null) {
+            throw new runtime.RequiredError(
+                'name',
+                'Required parameter "name" was null or undefined when calling getVolume().'
+            );
+        }
+
+        const queryParameters: any = {};
+
+        const headerParameters: runtime.HTTPHeaders = {};
+
+        if (this.configuration && this.configuration.accessToken) {
+            const token = this.configuration.accessToken;
+            const tokenString = await token("bearer_auth", []);
+
+            if (tokenString) {
+                headerParameters["Authorization"] = `Bearer ${tokenString}`;
+            }
+        }
+
+        let urlPath = `/api/v1/volumes/{name}`;
+        urlPath = urlPath.replace(`{${"name"}}`, encodeURIComponent(String(requestParameters['name'])));
+
+        return {
+            path: urlPath,
+            method: 'GET',
+            headers: headerParameters,
+            query: queryParameters,
+        };
+    }
+
+    /**
+     * Reads the sidecar when present, synthesizes defaults for legacy volumes, and populates `in_use_by` when a [`VolumeUsageSource`] is wired.  # Errors  - 404 Not Found — no such volume. - 500 Internal — filesystem or parse errors.
+     * Inspect a single volume by name.
+     */
+    async getVolumeRaw(requestParameters: GetVolumeRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<VolumeInfo>> {
+        const requestOptions = await this.getVolumeRequestOpts(requestParameters);
+        const response = await this.request(requestOptions, initOverrides);
+
+        return new runtime.JSONApiResponse(response, (jsonValue) => VolumeInfoFromJSON(jsonValue));
+    }
+
+    /**
+     * Reads the sidecar when present, synthesizes defaults for legacy volumes, and populates `in_use_by` when a [`VolumeUsageSource`] is wired.  # Errors  - 404 Not Found — no such volume. - 500 Internal — filesystem or parse errors.
+     * Inspect a single volume by name.
+     */
+    async getVolume(requestParameters: GetVolumeRequest, initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<VolumeInfo> {
+        const response = await this.getVolumeRaw(requestParameters, initOverrides);
+        return await response.value();
     }
 
     /**
@@ -125,21 +248,21 @@ export class VolumesApi extends runtime.BaseAPI {
     }
 
     /**
-     * Enumerates subdirectories under the volume base directory and returns metadata for each one.  # Errors  Returns an error if the volume directory cannot be read.
+     * Enumerates subdirectories under the volume base directory, reads each sidecar when present, and returns a [`VolumeInfo`] for each entry (including `in_use_by` when a [`VolumeUsageSource`] is wired).  # Errors  Returns an error if the volume directory cannot be read.
      * List all volumes on disk.
      */
-    async listVolumesRaw(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Array<VolumeSummary>>> {
+    async listVolumesRaw(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<runtime.ApiResponse<Array<VolumeInfo>>> {
         const requestOptions = await this.listVolumesRequestOpts();
         const response = await this.request(requestOptions, initOverrides);
 
-        return new runtime.JSONApiResponse(response, (jsonValue) => jsonValue.map(VolumeSummaryFromJSON));
+        return new runtime.JSONApiResponse(response, (jsonValue) => jsonValue.map(VolumeInfoFromJSON));
     }
 
     /**
-     * Enumerates subdirectories under the volume base directory and returns metadata for each one.  # Errors  Returns an error if the volume directory cannot be read.
+     * Enumerates subdirectories under the volume base directory, reads each sidecar when present, and returns a [`VolumeInfo`] for each entry (including `in_use_by` when a [`VolumeUsageSource`] is wired).  # Errors  Returns an error if the volume directory cannot be read.
      * List all volumes on disk.
      */
-    async listVolumes(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Array<VolumeSummary>> {
+    async listVolumes(initOverrides?: RequestInit | runtime.InitOverrideFunction): Promise<Array<VolumeInfo>> {
         const response = await this.listVolumesRaw(initOverrides);
         return await response.value();
     }

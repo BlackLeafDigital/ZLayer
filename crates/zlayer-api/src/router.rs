@@ -17,6 +17,7 @@ use crate::config::ApiConfig;
 use crate::handlers;
 use crate::handlers::audit::AuditState;
 use crate::handlers::cluster::ClusterApiState;
+use crate::handlers::container_networks::BridgeNetworkApiState;
 use crate::handlers::containers::ContainerApiState;
 use crate::handlers::credentials::CredentialState;
 use crate::handlers::cron::CronState;
@@ -84,6 +85,9 @@ fn build_auth_routes(auth_state: AuthState) -> Router {
         .route("/logout", post(logout_adapter))
         .route("/me", get(handlers::auth::me))
         .route("/csrf", get(csrf_adapter))
+        .route("/oidc/providers", get(handlers::oidc::list_providers))
+        .route("/oidc/{provider}/start", get(handlers::oidc::start))
+        .route("/oidc/{provider}/callback", get(handlers::oidc::callback))
         .with_state(auth_state)
 }
 
@@ -121,6 +125,9 @@ pub fn build_router_with_storage(
         jwt_secret: config.jwt_secret.clone(),
         credential_store: config.credential_store.clone(),
         user_store: config.user_store.clone(),
+        identity: config.identity.clone(),
+        oidc_clients: config.oidc_clients.clone(),
+        oidc_state: config.oidc_state.clone(),
         cookie_secure: false,
     };
 
@@ -356,6 +363,9 @@ pub fn build_router_with_services(
         jwt_secret: config.jwt_secret.clone(),
         credential_store: config.credential_store.clone(),
         user_store: config.user_store.clone(),
+        identity: config.identity.clone(),
+        oidc_clients: config.oidc_clients.clone(),
+        oidc_state: config.oidc_state.clone(),
         cookie_secure: false,
     };
 
@@ -471,6 +481,9 @@ pub fn build_router_with_deployment_state(
         jwt_secret: config.jwt_secret.clone(),
         credential_store: config.credential_store.clone(),
         user_store: config.user_store.clone(),
+        identity: config.identity.clone(),
+        oidc_clients: config.oidc_clients.clone(),
+        oidc_state: config.oidc_state.clone(),
         cookie_secure: false,
     };
 
@@ -680,6 +693,8 @@ pub fn build_secrets_routes(secrets_state: SecretsState) -> Router<()> {
         .route("/", post(handlers::secrets::create_secret))
         .route("/", get(handlers::secrets::list_secrets))
         .route("/bulk-import", post(handlers::secrets::bulk_import_secrets))
+        .route("/reveal-all", get(handlers::secrets::reveal_all_secrets))
+        .route("/{name}/rotate", post(handlers::secrets::rotate_secret))
         .route("/{name}", get(handlers::secrets::get_secret_metadata))
         .route("/{name}", delete(handlers::secrets::delete_secret))
         .with_state(secrets_state)
@@ -1231,6 +1246,8 @@ pub fn build_storage_routes(storage_state: StorageState) -> Router<()> {
 pub fn build_volume_routes(volume_state: VolumeApiState) -> Router<()> {
     Router::new()
         .route("/", get(handlers::volumes::list_volumes))
+        .route("/", post(handlers::volumes::create_volume))
+        .route("/{name}", get(handlers::volumes::get_volume))
         .route("/{name}", delete(handlers::volumes::delete_volume))
         .with_state(volume_state)
 }
@@ -1267,6 +1284,63 @@ pub fn build_container_routes(container_state: ContainerApiState) -> Router<()> 
         )
         .route("/{id}/kill", post(handlers::containers::kill_container))
         .with_state(container_state)
+}
+
+/// Build the daemon-wide container event stream route.
+///
+/// Mounts `GET /` (to be nested at `/api/v1/events`) as an SSE stream of
+/// container lifecycle events. The event bus lives on `ContainerApiState`,
+/// so lifecycle handlers and the event stream share the same broadcast
+/// channel when both are constructed from the same state instance.
+///
+/// # Arguments
+/// * `container_state` - Same state used by `/api/v1/containers`, so
+///   start/die/etc. events published by lifecycle handlers are visible on
+///   the event stream.
+pub fn build_event_routes(container_state: ContainerApiState) -> Router<()> {
+    Router::new()
+        .route("/", get(handlers::events::stream_events))
+        .with_state(container_state)
+}
+
+/// Build routes for container bridge/overlay network management.
+///
+/// Creates the routes for CRUD operations on user-defined bridge or overlay
+/// networks plus connect/disconnect of containers. These routes require
+/// authentication; mutating endpoints require the `operator` role.
+///
+/// # Arguments
+/// * `state` - [`BridgeNetworkApiState`] (registry + optional runtime).
+///
+/// # Returns
+/// A Router with the container-network endpoints
+pub fn build_container_network_routes(state: BridgeNetworkApiState) -> Router<()> {
+    Router::new()
+        .route(
+            "/",
+            post(handlers::container_networks::create_container_network),
+        )
+        .route(
+            "/",
+            get(handlers::container_networks::list_container_networks),
+        )
+        .route(
+            "/{id_or_name}",
+            get(handlers::container_networks::get_container_network),
+        )
+        .route(
+            "/{id_or_name}",
+            delete(handlers::container_networks::delete_container_network),
+        )
+        .route(
+            "/{id_or_name}/connect",
+            post(handlers::container_networks::connect_container_network),
+        )
+        .route(
+            "/{id_or_name}/disconnect",
+            post(handlers::container_networks::disconnect_container_network),
+        )
+        .with_state(state)
 }
 
 pub fn build_job_routes(job_state: JobState) -> Router<()> {
@@ -1316,14 +1390,17 @@ pub fn build_router_with_containers(
     // Start with the services router
     let base_router = build_router_with_services(config, storage, service_manager);
 
-    // Create container state
+    // Create container state (carries the shared event bus)
     let container_state = ContainerApiState::new(runtime);
 
-    // Build container routes
-    let container_routes = build_container_routes(container_state);
+    // Build container + event routes from the same state so both sides see
+    // the same event bus. The state type is `Clone`, so this is cheap.
+    let container_routes = build_container_routes(container_state.clone());
+    let event_routes = build_event_routes(container_state);
 
-    // Merge container routes into API v1
-    base_router.nest("/api/v1/containers", container_routes)
+    base_router
+        .nest("/api/v1/containers", container_routes)
+        .nest("/api/v1/events", event_routes)
 }
 
 /// Build the sync routes sub-router.
@@ -1444,9 +1521,10 @@ pub fn build_group_routes(groups_state: GroupsState) -> Router<()> {
 /// Build routes for permission grant/revoke/listing.
 ///
 /// Routes:
-/// - `GET    /`       -- list permissions for a subject (user or group)
-/// - `POST   /`       -- grant (admin-only)
-/// - `DELETE /{id}`   -- revoke (admin-only)
+/// - `GET    /`              -- list permissions for a subject (user or group)
+/// - `GET    /by-resource`   -- list permissions granted on a specific resource
+/// - `POST   /`              -- grant (admin-only)
+/// - `DELETE /{id}`          -- revoke (admin-only)
 ///
 /// All routes require authentication via the `AuthActor` extractor; admin
 /// enforcement happens in the handlers.
@@ -1460,6 +1538,10 @@ pub fn build_group_routes(groups_state: GroupsState) -> Router<()> {
 pub fn build_permission_routes(permissions_state: PermissionsState) -> Router<()> {
     Router::new()
         .route("/", get(handlers::permissions::list_permissions))
+        .route(
+            "/by-resource",
+            get(handlers::permissions::list_permissions_by_resource),
+        )
         .route("/", post(handlers::permissions::grant_permission))
         .route("/{id}", delete(handlers::permissions::revoke_permission))
         .with_state(permissions_state)

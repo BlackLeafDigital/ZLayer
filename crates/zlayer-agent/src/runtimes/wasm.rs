@@ -47,7 +47,7 @@ use wasmtime_wasi::p2::pipe::{MemoryInputPipe, MemoryOutputPipe};
 use wasmtime_wasi::{DirPerms, FilePerms, WasiCtx, WasiCtxBuilder, WasiCtxView, WasiView};
 use zlayer_observability::logs::{LogEntry, LogSource, LogStream};
 use zlayer_registry::{detect_wasm_version_from_binary, WasiVersion};
-use zlayer_spec::{PullPolicy, ServiceSpec, StorageSpec, WasmCapabilities};
+use zlayer_spec::{PullPolicy, RegistryAuth, ServiceSpec, StorageSpec, WasmCapabilities};
 
 /// Default capacity for stdout/stderr capture pipes (1MB)
 /// TODO: Phase 6 (stdout/stderr capture) will use this constant
@@ -949,20 +949,30 @@ impl Runtime for WasmRuntime {
         )
     )]
     async fn pull_image(&self, image: &str) -> Result<()> {
-        self.pull_image_with_policy(image, PullPolicy::IfNotPresent)
+        self.pull_image_with_policy(image, PullPolicy::IfNotPresent, None)
             .await
     }
 
-    /// Pull a WASM image with a specific policy
+    /// Pull a WASM image with a specific policy.
+    ///
+    /// The `_auth` parameter is accepted for trait conformance (§3.10) but
+    /// currently ignored: the WASM runtime resolves credentials through the
+    /// existing `AuthResolver` (hostname-based lookup in the secret store).
+    /// Callers that need inline auth should use the Docker runtime.
     #[instrument(
-        skip(self),
+        skip(self, _auth),
         fields(
             otel.name = "wasm.pull",
             container.image.name = %image,
             pull_policy = ?policy,
         )
     )]
-    async fn pull_image_with_policy(&self, image: &str, policy: PullPolicy) -> Result<()> {
+    async fn pull_image_with_policy(
+        &self,
+        image: &str,
+        policy: PullPolicy,
+        _auth: Option<&RegistryAuth>,
+    ) -> Result<()> {
         // Handle Never policy
         if matches!(policy, PullPolicy::Never) {
             tracing::debug!(image = %image, "pull policy is Never, skipping pull");

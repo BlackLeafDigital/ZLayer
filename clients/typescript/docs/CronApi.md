@@ -26,11 +26,11 @@ Disables a cron job, preventing it from running on schedule. The job can still b
 import {
   Configuration,
   CronApi,
-} from '@zlayer/client';
-import type { DisableCronJobRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DisableCronJobRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -99,11 +99,11 @@ Enables a disabled cron job, allowing it to run on schedule.  # Errors  Returns 
 import {
   Configuration,
   CronApi,
-} from '@zlayer/client';
-import type { EnableCronJobRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { EnableCronJobRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -172,11 +172,11 @@ Returns detailed information about a specific cron job.  # Errors  Returns an er
 import {
   Configuration,
   CronApi,
-} from '@zlayer/client';
-import type { GetCronJobRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetCronJobRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -245,11 +245,11 @@ Returns a list of all registered cron jobs with their schedule information.  # E
 import {
   Configuration,
   CronApi,
-} from '@zlayer/client';
-import type { ListCronJobsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListCronJobsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -309,11 +309,11 @@ Triggers an immediate execution of the cron job, regardless of its schedule.  # 
 import {
   Configuration,
   CronApi,
-} from '@zlayer/client';
-import type { TriggerCronJobRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { TriggerCronJobRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

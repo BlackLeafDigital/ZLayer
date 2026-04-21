@@ -39,6 +39,28 @@ pub async fn ensure_wsl_backend_ready() -> anyhow::Result<WslBackendConfig> {
         );
     }
 
+    // Ensure .wslconfig has a generous vhdSize cap + sparseVhd=true so the backing
+    // ext4.vhdx can grow and reclaim space. Idempotent — no-ops if already correct.
+    let install_dir = super::paths::install_dir();
+    let min_gb = super::wslconfig::compute_default_gb(&install_dir);
+    match super::wslconfig::ensure_wslconfig(min_gb).await {
+        Ok(outcome) => {
+            if outcome.changed {
+                tracing::info!(
+                    path = %outcome.path.display(),
+                    previous_cap_gb = ?outcome.previous_cap_gb,
+                    new_cap_gb = outcome.new_cap_gb,
+                    "wrote .wslconfig with vhdSize cap"
+                );
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                "failed to ensure .wslconfig; WSL2 will use its default vhdSize: {err:#}"
+            );
+        }
+    }
+
     if !status.zlayer_distro_exists {
         tracing::info!("ZLayer WSL2 distro not found, creating...");
         setup_distro().await?;
@@ -65,17 +87,46 @@ pub async fn ensure_wsl_backend_ready() -> anyhow::Result<WslBackendConfig> {
     anyhow::bail!("WSL2 setup is only available on Windows")
 }
 
+/// Same as [`ensure_wsl_backend_ready`] but lets the caller override the VHD cap.
+///
+/// Passing `Some(gb)` forces that cap (still floored at 64 GiB inside
+/// `ensure_wslconfig`). Passing `None` uses [`crate::wslconfig::compute_default_gb`].
+///
+/// # Errors
+///
+/// Same failure modes as [`ensure_wsl_backend_ready`].
+#[cfg(target_os = "windows")]
+pub async fn ensure_wsl_backend_ready_with_vhd_gb(
+    override_gb: Option<u64>,
+) -> anyhow::Result<WslBackendConfig> {
+    // Temporary env override so compute_default_gb picks it up without
+    // restructuring the existing function.
+    if let Some(gb) = override_gb {
+        // SAFETY: env mutation is single-threaded during startup init.
+        std::env::set_var("ZLAYER_WSL_VHD_GB", gb.to_string());
+    }
+    ensure_wsl_backend_ready().await
+}
+
+/// Non-Windows stub for [`ensure_wsl_backend_ready_with_vhd_gb`].
+///
+/// # Errors
+///
+/// Always returns an error on non-Windows platforms.
+#[cfg(not(target_os = "windows"))]
+#[allow(clippy::unused_async)]
+pub async fn ensure_wsl_backend_ready_with_vhd_gb(
+    _override_gb: Option<u64>,
+) -> anyhow::Result<WslBackendConfig> {
+    anyhow::bail!("WSL2 setup is only available on Windows")
+}
+
 /// Create the ZLayer WSL2 distro with a minimal Alpine rootfs.
 #[cfg(target_os = "windows")]
 async fn setup_distro() -> anyhow::Result<()> {
     use std::path::{Path, PathBuf};
 
-    // Determine install directory
-    let install_dir = if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        PathBuf::from(local_app_data).join("ZLayer").join("wsl")
-    } else {
-        PathBuf::from(r"C:\ProgramData\ZLayer\wsl")
-    };
+    let install_dir = super::paths::install_dir();
 
     // Look for bundled rootfs alongside the executable
     let exe_dir = std::env::current_exe()?

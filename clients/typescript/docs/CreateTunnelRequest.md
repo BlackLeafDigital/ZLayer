@@ -14,7 +14,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { CreateTunnelRequest } from '@zlayer/client'
+import type { CreateTunnelRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

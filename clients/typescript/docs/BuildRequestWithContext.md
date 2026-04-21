@@ -18,7 +18,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { BuildRequestWithContext } from '@zlayer/client'
+import type { BuildRequestWithContext } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

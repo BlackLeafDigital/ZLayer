@@ -1,24 +1,30 @@
 
 # ContainerWaitResponse
 
-Wait response with container exit code
+Wait response with container exit code plus optional classification fields (added in §3.12 of the SDK-fixes spec).  The three optional fields (`reason`, `signal`, `finished_at`) are additive — clients that only read `exit_code` keep working unchanged.
 
 ## Properties
 
 Name | Type
 ------------ | -------------
 `exitCode` | number
+`finishedAt` | string
 `id` | string
+`reason` | string
+`signal` | string
 
 ## Example
 
 ```typescript
-import type { ContainerWaitResponse } from '@zlayer/client'
+import type { ContainerWaitResponse } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {
   "exitCode": null,
+  "finishedAt": null,
   "id": null,
+  "reason": null,
+  "signal": null,
 } satisfies ContainerWaitResponse
 
 console.log(example)

@@ -30,11 +30,11 @@ Create a new project. Admin only.
 import {
   Configuration,
   ProjectsApi,
-} from '@zlayer/client';
-import type { CreateProjectOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { CreateProjectOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -104,11 +104,11 @@ Delete a project. Admin only. Cascade-removes deployment links.
 import {
   Configuration,
   ProjectsApi,
-} from '@zlayer/client';
-import type { DeleteProjectRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { DeleteProjectRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -177,11 +177,11 @@ Fetch a single project by id.
 import {
   Configuration,
   ProjectsApi,
-} from '@zlayer/client';
-import type { GetProjectRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetProjectRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -249,11 +249,11 @@ Link a deployment to a project.
 import {
   Configuration,
   ProjectsApi,
-} from '@zlayer/client';
-import type { LinkProjectDeploymentRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { LinkProjectDeploymentRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -325,11 +325,11 @@ List deployment names linked to a project.
 import {
   Configuration,
   ProjectsApi,
-} from '@zlayer/client';
-import type { ListProjectDeploymentsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListProjectDeploymentsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -397,11 +397,11 @@ Any authenticated user can list projects.  # Errors  Returns [&#x60;ApiError::In
 import {
   Configuration,
   ProjectsApi,
-} from '@zlayer/client';
-import type { ListProjectsRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ListProjectsRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -461,11 +461,11 @@ Authentication is resolved from &#x60;git_credential_id&#x60;: when set, the mat
 import {
   Configuration,
   ProjectsApi,
-} from '@zlayer/client';
-import type { PullProjectRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { PullProjectRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -536,11 +536,11 @@ Unlink a deployment from a project.
 import {
   Configuration,
   ProjectsApi,
-} from '@zlayer/client';
-import type { UnlinkProjectDeploymentRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { UnlinkProjectDeploymentRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -611,11 +611,11 @@ Update a project. Admin only.
 import {
   Configuration,
   ProjectsApi,
-} from '@zlayer/client';
-import type { UpdateProjectOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { UpdateProjectOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

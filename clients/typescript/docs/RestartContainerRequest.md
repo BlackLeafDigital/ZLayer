@@ -12,7 +12,7 @@ Name | Type
 ## Example
 
 ```typescript
-import type { RestartContainerRequest } from '@zlayer/client'
+import type { RestartContainerRequest } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {

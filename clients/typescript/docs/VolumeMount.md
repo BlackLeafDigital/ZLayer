@@ -1,7 +1,7 @@
 
 # VolumeMount
 
-Volume mount specification
+Volume mount specification.  The `type` field (a Docker-compatible discriminator) selects how `source` is interpreted: - `\"bind\"` (default): `source` is an absolute host path. - `\"volume\"`: `source` is a named-volume identifier. - `\"tmpfs\"`: no `source`; a memory-backed mount is provisioned.
 
 ## Properties
 
@@ -10,17 +10,19 @@ Name | Type
 `readonly` | boolean
 `source` | string
 `target` | string
+`type` | [VolumeMountType](VolumeMountType.md)
 
 ## Example
 
 ```typescript
-import type { VolumeMount } from '@zlayer/client'
+import type { VolumeMount } from '@zlayer/api-client'
 
 // TODO: Update the object below with actual values
 const example = {
   "readonly": null,
   "source": null,
   "target": null,
+  "type": null,
 } satisfies VolumeMount
 
 console.log(example)

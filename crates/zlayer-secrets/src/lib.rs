@@ -10,6 +10,9 @@
 //! ## Syntax
 //! - `$S:secret-name` - Deployment-level secret
 //! - `$S:@service/secret-name` - Service-specific secret
+//! - `$secret://<env>/<KEY>` - Environment-scoped secret (requires an
+//!   [`EnvScopeProvider`] wired via [`SecretsResolver::with_env_resolver`])
+//! - `$secret://<env>/<KEY>/<field>` - With JSON field extraction
 
 mod encryption;
 mod error;
@@ -35,8 +38,8 @@ mod vault;
 pub use encryption::EncryptionKey;
 pub use error::{Result, SecretsError};
 pub use key_manager::KeyManager;
-pub use provider::{SecretsProvider, SecretsResolver, SecretsStore};
-pub use types::{Secret, SecretMetadata, SecretRef, SecretScope};
+pub use provider::{EnvScopeProvider, SecretsProvider, SecretsResolver, SecretsStore};
+pub use types::{RotationResult, Secret, SecretMetadata, SecretRef, SecretScope};
 
 #[cfg(feature = "persistent")]
 pub use persistent::PersistentSecretsStore;

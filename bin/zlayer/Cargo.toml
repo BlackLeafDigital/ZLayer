@@ -21,7 +21,10 @@ full = ["docker", "docker-compat", "wasm", "s3", "persistent", "observability", 
 wsl = ["dep:zlayer-wsl"]
 
 # Runtime capabilities (forwarded to deps)
-docker = ["zlayer-agent/docker"]
+# The `zlayer-api/docker` forwarding enables the Docker-backed
+# `BridgeNetworkRuntime` implementation used by the daemon's
+# `/api/v1/container-networks` endpoints.
+docker = ["zlayer-agent/docker", "zlayer-api/docker"]
 wasm = ["zlayer-agent/wasm"]
 s3 = ["zlayer-agent/s3", "zlayer-registry/s3"]
 persistent = ["zlayer-scheduler/persistent", "zlayer-registry/persistent"]
@@ -115,6 +118,7 @@ zlayer-wsl = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+serial_test = "3"
 
 [lints]
 workspace = true

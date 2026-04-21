@@ -4,6 +4,10 @@ name: Publish SDKs
 # registry checks to skip SDKs that are already published at the target version.
 # Covers the Python binding (zlayer-py), TypeScript API clients, and the
 # WASM plugin SDKs (rust, python, typescript, go, c).
+#
+# Build strategy for zlayer-py: ONE abi3 wheel per platform. The crate uses
+# pyo3's `abi3-py38` feature, so a single wheel per platform installs on
+# every CPython >= 3.8. No Python-version matrix needed.
 
 on:
   workflow_dispatch:
@@ -15,7 +19,6 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  PYO3_USE_ABI3_FORWARD_COMPATIBILITY: "1"
 
 jobs:
   # ===========================================
@@ -25,6 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       services-to-release: ${{ steps.detect.outputs.services-to-release }}
+      services-to-release-flat: ${{ steps.detect.outputs.services-to-release-flat }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -36,22 +40,43 @@ jobs:
           config-path: .forgejo/build-config.yaml
           check-registry: 'true'
           version: ${{ inputs.version }}
+      - name: Purge stale ci-status markers
+        if: steps.detect.outputs.services-to-release-flat != '[]'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: purge-version
+          version: ${{ inputs.version }}
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          keep-markers: ''
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
   # zlayer-py (Python binding) -> PyPI as `zlayer`
+  # One abi3 wheel per platform (works on CPython >= 3.8).
   # ===========================================
   publish-py-binding-build-linux-x86_64:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (linux-x86_64)
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
         with:
           python-version: '3.12'
+
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-zig@main
+
+      - name: Install system deps
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf-compiler libseccomp-dev pkg-config libssl-dev clang'
+          cross-platform: 'true'
 
       - name: Set pyproject version
         shell: bash
@@ -65,16 +90,15 @@ jobs:
           fi
           grep -E '^(version|dynamic) = ' pyproject.toml || true
 
-      - name: Build wheel (manylinux_2_28 x86_64)
-        uses: https://github.com/PyO3/maturin-action@v1
-        with:
-          working-directory: crates/zlayer-py
-          target: x86_64-unknown-linux-gnu
-          manylinux: '2_28'
-          args: --release --out dist --find-interpreter
+      - name: Install maturin via uv
+        run: uv tool install maturin
 
-      - name: Upload artifact
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - name: Build wheel
+        working-directory: crates/zlayer-py
+        # --zig links against zig's bundled glibc to produce manylinux_2_28-compatible wheels.
+        run: maturin build --release --zig --target x86_64-unknown-linux-gnu --out dist
+
+      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: wheels-linux-x86_64
           path: crates/zlayer-py/dist/*.whl
@@ -82,16 +106,40 @@ jobs:
 
   publish-py-binding-build-linux-aarch64:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (linux-aarch64)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
         with:
           python-version: '3.12'
+
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-zig@main
+
+      - name: Enable arm64 apt architecture + install cross libs
+        shell: bash
+        run: |
+          # Keep the host (amd64) sources intact; add arm64 as a second arch.
+          sudo dpkg --add-architecture arm64
+          # Most Ubuntu mirrors serve amd64/i386 only — the arm64 archive lives on
+          # ports.ubuntu.com. Restrict existing sources to amd64/i386 first so apt
+          # doesn't 404 every arm64 package against them.
+          sudo sed -i 's|^deb \(http\)|deb [arch=amd64,i386] \1|' /etc/apt/sources.list
+          codename=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename} main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-updates main restricted universe multiverse
+          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-security main restricted universe multiverse" \
+            | sudo tee /etc/apt/sources.list.d/arm64.list
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler clang \
+            libseccomp-dev:arm64 libssl-dev:arm64
 
       - name: Set pyproject version
         shell: bash
@@ -103,18 +151,18 @@ jobs:
           else
             sed -i "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
           fi
-          grep -E '^(version|dynamic) = ' pyproject.toml || true
 
-      - name: Build wheel (manylinux_2_28 aarch64)
-        uses: https://github.com/PyO3/maturin-action@v1
-        with:
-          working-directory: crates/zlayer-py
-          target: aarch64-unknown-linux-gnu
-          manylinux: '2_28'
-          args: --release --out dist --find-interpreter
+      - name: Install maturin via uv
+        run: uv tool install maturin
 
-      - name: Upload artifact
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - name: Build wheel
+        working-directory: crates/zlayer-py
+        env:
+          PKG_CONFIG_ALLOW_CROSS: '1'
+          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
+        run: maturin build --release --zig --target aarch64-unknown-linux-gnu --out dist
+
+      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: wheels-linux-aarch64
           path: crates/zlayer-py/dist/*.whl
@@ -122,14 +170,18 @@ jobs:
 
   publish-py-binding-build-macos-x86_64:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (macos-x86_64)
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          targets: x86_64-apple-darwin
+
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
         with:
           python-version: '3.12'
 
@@ -149,17 +201,17 @@ jobs:
           else
             sed -i '' "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
           fi
-          grep -E '^(version|dynamic) = ' pyproject.toml || true
 
-      - name: Build wheel (macOS x86_64)
-        uses: https://github.com/PyO3/maturin-action@v1
-        with:
-          working-directory: crates/zlayer-py
-          target: x86_64-apple-darwin
-          args: --release --out dist --find-interpreter
+      - name: Install maturin via uv
+        run: uv tool install maturin
 
-      - name: Upload artifact
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - name: Build wheel
+        working-directory: crates/zlayer-py
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '10.13'
+        run: maturin build --release --target x86_64-apple-darwin --out dist
+
+      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: wheels-macos-x86_64
           path: crates/zlayer-py/dist/*.whl
@@ -167,14 +219,16 @@ jobs:
 
   publish-py-binding-build-macos-aarch64:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (macos-aarch64)
     runs-on: macos-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
         with:
           python-version: '3.12'
 
@@ -194,17 +248,17 @@ jobs:
           else
             sed -i '' "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
           fi
-          grep -E '^(version|dynamic) = ' pyproject.toml || true
 
-      - name: Build wheel (macOS aarch64)
-        uses: https://github.com/PyO3/maturin-action@v1
-        with:
-          working-directory: crates/zlayer-py
-          target: aarch64-apple-darwin
-          args: --release --out dist --find-interpreter
+      - name: Install maturin via uv
+        run: uv tool install maturin
 
-      - name: Upload artifact
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - name: Build wheel
+        working-directory: crates/zlayer-py
+        env:
+          MACOSX_DEPLOYMENT_TARGET: '11.0'
+        run: maturin build --release --target aarch64-apple-darwin --out dist
+
+      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: wheels-macos-aarch64
           path: crates/zlayer-py/dist/*.whl
@@ -212,14 +266,16 @@ jobs:
 
   publish-py-binding-build-windows-x86_64:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (windows-x86_64)
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
         with:
           python-version: '3.12'
 
@@ -243,17 +299,17 @@ jobs:
           else
             sed -i "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
           fi
-          grep -E '^(version|dynamic) = ' pyproject.toml || true
 
-      - name: Build wheel (Windows x86_64)
-        uses: https://github.com/PyO3/maturin-action@v1
-        with:
-          working-directory: crates/zlayer-py
-          target: x86_64-pc-windows-msvc
-          args: --release --out dist --find-interpreter
+      - name: Install maturin via uv
+        shell: bash
+        run: uv tool install maturin
 
-      - name: Upload artifact
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - name: Build wheel
+        shell: bash
+        working-directory: crates/zlayer-py
+        run: maturin build --release --out dist
+
+      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: wheels-windows-x86_64
           path: crates/zlayer-py/dist/*.whl
@@ -261,16 +317,14 @@ jobs:
 
   publish-py-binding-build-sdist:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build sdist
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
 
       - name: Set pyproject version
         shell: bash
@@ -283,15 +337,14 @@ jobs:
             sed -i "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
           fi
 
-      - name: Build sdist
-        uses: https://github.com/PyO3/maturin-action@v1
-        with:
-          working-directory: crates/zlayer-py
-          command: sdist
-          args: --out dist
+      - name: Install maturin via uv
+        run: uv tool install maturin
 
-      - name: Upload artifact
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+      - name: Build sdist
+        working-directory: crates/zlayer-py
+        run: maturin sdist --out dist
+
+      - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: sdist
           path: crates/zlayer-py/dist/*.tar.gz
@@ -306,7 +359,7 @@ jobs:
       - publish-py-binding-build-macos-aarch64
       - publish-py-binding-build-windows-x86_64
       - publish-py-binding-build-sdist
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"py-binding"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Publish to PyPI
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -324,10 +377,8 @@ jobs:
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
-      - uses: actions/setup-python@v5
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
         if: steps.check.outputs.completed != 'true'
-        with:
-          python-version: '3.12'
 
       - name: Download all wheel artifacts
         if: steps.check.outputs.completed != 'true'
@@ -341,7 +392,7 @@ jobs:
         shell: bash
         run: |
           echo "=== dist/ ==="
-          find dist -type f -name '*.whl' -o -name '*.tar.gz' | sort
+          find dist -type f \( -name '*.whl' -o -name '*.tar.gz' \) | sort
 
       - name: Publish to PyPI
         if: steps.check.outputs.completed != 'true'
@@ -351,7 +402,7 @@ jobs:
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
           TWINE_NON_INTERACTIVE: '1'
         run: |
-          pip install --upgrade twine
+          uv tool install twine
           twine upload --skip-existing dist/*.whl dist/*.tar.gz
 
       - name: Mark step complete
@@ -370,7 +421,7 @@ jobs:
   # ===========================================
   publish-ts-client:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"ts-client"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/ts-client')
     name: Publish to npm
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -388,11 +439,10 @@ jobs:
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
-      - uses: actions/setup-node@v4
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-node@main
         if: steps.check.outputs.completed != 'true'
         with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org/'
+          node-version: '22'
 
       - name: Publish @zlayer/api-client (raw generated client)
         if: steps.check.outputs.completed != 'true'
@@ -468,7 +518,7 @@ jobs:
   # ===========================================
   publish-plugin-sdk-rust:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-rust"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/plugin-sdk-rust')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -516,7 +566,7 @@ jobs:
 
   publish-plugin-sdk-python:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-python"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/plugin-sdk-python')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -532,10 +582,8 @@ jobs:
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-      - uses: actions/setup-python@v5
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
         if: steps.check.outputs.completed != 'true'
-        with:
-          python-version: '3.12'
       - name: Check and publish
         if: steps.check.outputs.completed != 'true'
         working-directory: clients/zlayer-sdk/python
@@ -549,8 +597,9 @@ jobs:
             echo "Publishing python-sdk..."
             sed -i "s/^version = .*/version = \"$INPUT_VERSION\"/" pyproject.toml
             sed -i "s/__version__ = .*/__version__ = \"$INPUT_VERSION\"/" zlayer/__init__.py
-            pip install build twine
-            python -m build
+            uv tool install build
+            uv tool install twine
+            pyproject-build
             twine upload dist/* || echo "May already exist"
           else
             echo "Skipping python-sdk (already at or above $INPUT_VERSION)"
@@ -568,7 +617,7 @@ jobs:
 
   publish-plugin-sdk-typescript:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-typescript"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/plugin-sdk-typescript')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -584,11 +633,10 @@ jobs:
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-      - uses: actions/setup-node@v4
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-node@main
         if: steps.check.outputs.completed != 'true'
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
       - name: Check and publish
         if: steps.check.outputs.completed != 'true'
         working-directory: clients/zlayer-sdk/typescript
@@ -622,7 +670,7 @@ jobs:
   # `github.com/BlackLeafDigital/ZLayer/clients/zlayer-sdk/go@v<VERSION>`.
   publish-plugin-sdk-go:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-go"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/plugin-sdk-go')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -639,7 +687,7 @@ jobs:
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-      - uses: actions/setup-go@v5
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-go@main
         if: steps.check.outputs.completed != 'true'
         with:
           go-version: '1.24'
@@ -675,7 +723,7 @@ jobs:
   # packages. Consumers download, extract, and build with cmake themselves.
   publish-plugin-sdk-c:
     needs: [detect]
-    if: contains(fromJson(needs.detect.outputs.services-to-release), fromJson('{"group":"sdks","service":"plugin-sdk-c"}'))
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/plugin-sdk-c')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -691,7 +739,9 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Install build dependencies
         if: steps.check.outputs.completed != 'true'
-        run: sudo apt-get update && sudo apt-get install -y cmake build-essential
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'cmake build-essential'
       - name: Verify C SDK builds
         if: steps.check.outputs.completed != 'true'
         working-directory: clients/zlayer-sdk/c

@@ -22,6 +22,18 @@ func Test_zlayer_SecretsAPIService(t *testing.T) {
 	configuration := openapiclient.NewConfiguration()
 	apiClient := openapiclient.NewAPIClient(configuration)
 
+	t.Run("Test SecretsAPIService BulkImportSecrets", func(t *testing.T) {
+
+		t.Skip("skip test")  // remove to run test
+
+		resp, httpRes, err := apiClient.SecretsAPI.BulkImportSecrets(context.Background()).Execute()
+
+		require.Nil(t, err)
+		require.NotNil(t, resp)
+		assert.Equal(t, 200, httpRes.StatusCode)
+
+	})
+
 	t.Run("Test SecretsAPIService CreateSecret", func(t *testing.T) {
 
 		t.Skip("skip test")  // remove to run test

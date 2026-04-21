@@ -1,9 +1,34 @@
-//! Windows <-> WSL2 path translation.
+//! Windows <-> WSL2 path translation, plus install-location helpers.
 //!
 //! Converts Windows paths (e.g., `C:\Users\zach\project`) to their
-//! WSL2 equivalents (`/mnt/c/Users/zach/project`) and vice versa.
+//! WSL2 equivalents (`/mnt/c/Users/zach/project`) and vice versa, and
+//! resolves the canonical `ZLayer` WSL2 install directory / vhdx location.
 
 use std::path::{Path, PathBuf};
+
+/// The directory where `wsl --import` places the `zlayer` distro's files
+/// (including `ext4.vhdx`).
+///
+/// Resolves to `%LOCALAPPDATA%\ZLayer\wsl` when `LOCALAPPDATA` is set
+/// (standard user install), falling back to `C:\ProgramData\ZLayer\wsl`
+/// for service-mode / missing-env cases.
+#[must_use]
+pub fn install_dir() -> PathBuf {
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        PathBuf::from(local_app_data).join("ZLayer").join("wsl")
+    } else {
+        PathBuf::from(r"C:\ProgramData\ZLayer\wsl")
+    }
+}
+
+/// Filesystem path to the `zlayer` distro's backing VHDX on the Windows host.
+///
+/// `wsl --import` always creates the backing file as `ext4.vhdx` inside the
+/// install directory, so this is deterministic.
+#[must_use]
+pub fn vhdx_path() -> PathBuf {
+    install_dir().join("ext4.vhdx")
+}
 
 /// Convert a Windows path to its WSL2 equivalent.
 ///

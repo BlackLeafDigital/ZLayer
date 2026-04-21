@@ -25,11 +25,11 @@ Returns DNS server configuration and registered service count. When DNS is not c
 import {
   Configuration,
   OverlayApi,
-} from '@zlayer/client';
-import type { GetDnsStatusRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetDnsStatusRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new OverlayApi();
 
   try {
@@ -84,11 +84,11 @@ Returns the overlay network\&#39;s IP allocation statistics including CIDR, tota
 import {
   Configuration,
   OverlayApi,
-} from '@zlayer/client';
-import type { GetIpAllocationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetIpAllocationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new OverlayApi();
 
   try {
@@ -144,11 +144,11 @@ Returns peer information from the overlay transport\&#39;s UAPI state. When the 
 import {
   Configuration,
   OverlayApi,
-} from '@zlayer/client';
-import type { GetOverlayPeersRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetOverlayPeersRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new OverlayApi();
 
   try {
@@ -204,11 +204,11 @@ Returns the current overlay network status including interface name, node IP, CI
 import {
   Configuration,
   OverlayApi,
-} from '@zlayer/client';
-import type { GetOverlayStatusRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { GetOverlayStatusRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new OverlayApi();
 
   try {

@@ -12,13 +12,13 @@ use zlayer_api::handlers::cluster::ClusterApiState;
 use zlayer_api::handlers::nodes::NodeApiState;
 use zlayer_api::handlers::overlay::OverlayApiState;
 use zlayer_api::router::{
-    build_cluster_routes, build_container_routes, build_cron_routes, build_job_routes,
-    build_network_routes, build_node_routes, build_overlay_routes, build_tunnel_routes,
-    build_volume_routes,
+    build_cluster_routes, build_container_network_routes, build_container_routes,
+    build_cron_routes, build_event_routes, build_job_routes, build_network_routes,
+    build_node_routes, build_overlay_routes, build_tunnel_routes, build_volume_routes,
 };
 use zlayer_api::{
-    ApiConfig, BuildState, ContainerApiState, CronState, JobState, NetworkApiState, TunnelApiState,
-    VolumeApiState,
+    ApiConfig, BridgeNetworkApiState, BuildState, ContainerApiState, CronState, JobState,
+    NetworkApiState, TunnelApiState, VolumeApiState,
 };
 use zlayer_overlay::IpAllocator;
 
@@ -698,6 +698,49 @@ pub(crate) async fn serve(
     // -----------------------------------------------------------------------
     let bundle = StorageBundle::open(Some(config.data_dir.as_path())).await?;
 
+    let identity = Arc::new(
+        zlayer_api::IdentityManager::new(bundle.users.clone(), credential_store.clone())
+            .with_oidc(bundle.oidc_identities.clone()),
+    );
+
+    // Non-interactive admin bootstrap: if the users table is empty and
+    // ZLAYER_BOOTSTRAP_EMAIL + password source envs are set, seed the
+    // initial admin before the listener accepts. Idempotent.
+    crate::bootstrap_admin::maybe_bootstrap_admin(&identity).await?;
+
+    // One-shot migration: give every existing admin an explicit
+    // `environment:write` grant for every existing environment. Admins
+    // short-circuit permission checks so this isn't required for correctness,
+    // but the `GET /permissions/by-resource?kind=environment` endpoint and the
+    // manager UI's permission listings want the grants to be visible rather
+    // than implicit. Idempotent — gated on an audit-log marker row.
+    crate::bootstrap_admin_env_grants::run(
+        bundle.users.clone(),
+        bundle.environments.clone(),
+        bundle.projects.clone(),
+        bundle.permissions.clone(),
+        bundle.audit.clone(),
+    )
+    .await
+    .context("Failed to run admin env-grants migration")?;
+
+    // Load OIDC providers from env (ZLAYER_OIDC_<NAME>_*). Empty map when
+    // SSO is disabled — callers get 404 on /auth/oidc/* endpoints.
+    let oidc_providers =
+        zlayer_api::oidc::OidcProviderConfig::load_all().context("loading OIDC provider config")?;
+    let oidc_clients: std::collections::HashMap<String, zlayer_api::oidc::OidcClient> =
+        oidc_providers
+            .into_iter()
+            .map(|cfg| (cfg.name.clone(), zlayer_api::oidc::OidcClient::new(cfg)))
+            .collect();
+    if !oidc_clients.is_empty() {
+        info!(
+            providers = ?oidc_clients.keys().collect::<Vec<_>>(),
+            "OIDC / SSO enabled",
+        );
+    }
+    let oidc_state = Arc::new(zlayer_api::oidc::StateTokenStore::new());
+
     // -----------------------------------------------------------------------
     // 4. Build the full API router
     // -----------------------------------------------------------------------
@@ -707,6 +750,9 @@ pub(crate) async fn serve(
         swagger_enabled: !no_swagger,
         credential_store: Some(credential_store),
         user_store: Some(bundle.users.clone()),
+        identity: Some(identity),
+        oidc_clients,
+        oidc_state,
         ..Default::default()
     };
 
@@ -765,8 +811,13 @@ pub(crate) async fn serve(
 
     // Add secrets routes — env-aware so secrets handlers can resolve the
     // environment scope from the bundle's persistent environments store.
-    let secrets_state =
-        zlayer_api::SecretsState::with_environments(secrets, bundle.environments.clone());
+    // Wired with the permission store so env-scoped endpoints can enforce
+    // per-env RBAC instead of blanket admin.
+    let secrets_state = zlayer_api::SecretsState::with_rbac(
+        secrets,
+        bundle.environments.clone(),
+        bundle.permissions.clone(),
+    );
     let environments_state = zlayer_api::EnvironmentsState::new(bundle.environments.clone());
     let secrets_routes = zlayer_api::build_secrets_routes(secrets_state.clone());
     let mut router = base_router.nest("/api/v1/secrets", secrets_routes);
@@ -967,10 +1018,28 @@ pub(crate) async fn serve(
     let build_api_routes = build_routes().with_state(build_state);
     router = router.nest("/api/v1", build_api_routes);
 
-    // Merge container lifecycle routes
-    let container_state = ContainerApiState::new(runtime);
-    let container_routes = build_container_routes(container_state);
+    // Build the bridge-network (Docker-style `docker network create`) state.
+    // When the `docker` feature is enabled AND the daemon can connect to a
+    // Docker socket, we wire a `DockerBridgeNetworkRuntime` into the state so
+    // `POST /api/v1/container-networks` actually creates real Docker
+    // networks; otherwise the state stays in metadata-only mode and a
+    // warning is logged the first time a handler would need the runtime.
+    let bridge_network_state = build_bridge_network_state().await;
+    let container_network_routes = build_container_network_routes(bridge_network_state.clone());
+    router = router.nest("/api/v1/container-networks", container_network_routes);
+
+    // Merge container lifecycle routes. The same `container_state` is used
+    // for the daemon-wide event stream at `/api/v1/events` so lifecycle
+    // handlers and event subscribers share the broadcast bus. The
+    // bridge-network state is threaded in so `CreateContainerRequest.networks`
+    // can attach freshly-created containers to user-defined networks.
+    let container_state =
+        ContainerApiState::new(runtime).with_bridge_networks(bridge_network_state);
+    let container_routes = build_container_routes(container_state.clone());
     router = router.nest("/api/v1/containers", container_routes);
+
+    let event_routes = build_event_routes(container_state);
+    router = router.nest("/api/v1/events", event_routes);
 
     // Merge volume management routes
     let volume_dir = config.data_dir.join("volumes");
@@ -996,6 +1065,9 @@ pub(crate) async fn serve(
         jwt_secret: api_config.jwt_secret.clone(),
         credential_store: api_config.credential_store.clone(),
         user_store: api_config.user_store.clone(),
+        identity: api_config.identity.clone(),
+        oidc_clients: api_config.oidc_clients.clone(),
+        oidc_state: api_config.oidc_state.clone(),
         cookie_secure: false,
     };
     router = router.layer(zlayer_api::Extension(auth_state));
@@ -1172,6 +1244,7 @@ pub(crate) struct StorageBundle {
     pub permissions: std::sync::Arc<dyn zlayer_api::PermissionStorage>,
     pub audit: std::sync::Arc<dyn zlayer_api::AuditStorage>,
     pub syncs: std::sync::Arc<dyn zlayer_api::SyncStorage>,
+    pub oidc_identities: std::sync::Arc<dyn zlayer_api::OidcIdentityStorage>,
 }
 
 impl StorageBundle {
@@ -1223,10 +1296,14 @@ impl StorageBundle {
             let syncs = zlayer_api::SqlxSyncStore::open(dir.join("syncs.db"))
                 .await
                 .context("Failed to open syncs.db")?;
+            let oidc_identities =
+                zlayer_api::SqlxOidcIdentityStore::open(dir.join("oidc_identities.db"))
+                    .await
+                    .context("Failed to open oidc_identities.db")?;
 
             info!(
                 dir = %dir.display(),
-                "Opened persistent API stores (11 databases)"
+                "Opened persistent API stores (12 databases)"
             );
 
             Ok(Self {
@@ -1241,6 +1318,7 @@ impl StorageBundle {
                 permissions: std::sync::Arc::new(permissions),
                 audit: std::sync::Arc::new(audit),
                 syncs: std::sync::Arc::new(syncs),
+                oidc_identities: std::sync::Arc::new(oidc_identities),
             })
         } else {
             let users = zlayer_api::SqlxUserStore::in_memory()
@@ -1276,6 +1354,9 @@ impl StorageBundle {
             let syncs = zlayer_api::SqlxSyncStore::in_memory()
                 .await
                 .context("Failed to create in-memory syncs store")?;
+            let oidc_identities = zlayer_api::SqlxOidcIdentityStore::in_memory()
+                .await
+                .context("Failed to create in-memory oidc_identities store")?;
 
             info!("Opened in-memory API stores (ephemeral / test mode)");
 
@@ -1291,9 +1372,46 @@ impl StorageBundle {
                 permissions: std::sync::Arc::new(permissions),
                 audit: std::sync::Arc::new(audit),
                 syncs: std::sync::Arc::new(syncs),
+                oidc_identities: std::sync::Arc::new(oidc_identities),
             })
         }
     }
+}
+
+/// Build the bridge-network ([`BridgeNetworkApiState`]) with a Docker-backed
+/// runtime attached when possible.
+///
+/// When the `docker` feature is enabled and `bollard` can reach the local
+/// Docker daemon, we wrap a [`DockerBridgeNetworkRuntime`] into the state so
+/// `POST /api/v1/container-networks` and the `networks` field on
+/// `CreateContainerRequest` actually create / attach real Docker networks.
+///
+/// When the feature is disabled, or Docker is unavailable at startup, the
+/// state falls back to metadata-only mode (the in-memory registry still
+/// tracks network specs and attachments, but nothing happens on the
+/// container-runtime side). The `BridgeNetworkApiState` logs a single
+/// warning on the first handler call in that mode.
+async fn build_bridge_network_state() -> BridgeNetworkApiState {
+    let state = BridgeNetworkApiState::new();
+
+    #[cfg(feature = "docker")]
+    {
+        match zlayer_api::DockerBridgeNetworkRuntime::connect_local().await {
+            Ok(rt) => {
+                info!("Docker bridge-network runtime attached");
+                return state.with_runtime(std::sync::Arc::new(rt));
+            }
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Docker not reachable; /api/v1/container-networks runs in \
+                     metadata-only mode"
+                );
+            }
+        }
+    }
+
+    state
 }
 
 #[cfg(test)]

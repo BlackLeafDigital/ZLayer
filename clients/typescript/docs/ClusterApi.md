@@ -25,11 +25,11 @@ Force this node to become the cluster leader (disaster recovery).
 import {
   Configuration,
   ClusterApi,
-} from '@zlayer/client';
-import type { ClusterForceLeaderRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ClusterForceLeaderRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",
@@ -99,11 +99,11 @@ Handle node heartbeat.
 import {
   Configuration,
   ClusterApi,
-} from '@zlayer/client';
-import type { ClusterHeartbeatRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ClusterHeartbeatRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new ClusterApi();
 
   const body = {
@@ -168,11 +168,11 @@ Handle a cluster join request.
 import {
   Configuration,
   ClusterApi,
-} from '@zlayer/client';
-import type { ClusterJoinOperationRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ClusterJoinOperationRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const api = new ClusterApi();
 
   const body = {
@@ -238,11 +238,11 @@ List all nodes visible in the Raft cluster state.
 import {
   Configuration,
   ClusterApi,
-} from '@zlayer/client';
-import type { ClusterListNodesRequest } from '@zlayer/client';
+} from '@zlayer/api-client';
+import type { ClusterListNodesRequest } from '@zlayer/api-client';
 
 async function example() {
-  console.log("🚀 Testing @zlayer/client SDK...");
+  console.log("🚀 Testing @zlayer/api-client SDK...");
   const config = new Configuration({ 
     // Configure HTTP bearer authorization: bearer_auth
     accessToken: "YOUR BEARER TOKEN",

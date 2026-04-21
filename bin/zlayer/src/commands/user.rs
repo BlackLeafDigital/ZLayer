@@ -5,8 +5,12 @@
 //! work out of the box on a fresh install. Non-admin users hitting a remote
 //! daemon receive a 403.
 
+use std::path::Path;
+
 use anyhow::{bail, Context, Result};
 use dialoguer::Password;
+use rand::distr::Alphanumeric;
+use rand::Rng;
 use zlayer_api::handlers::auth::UserView;
 use zlayer_api::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
 use zlayer_api::storage::UserRole;
@@ -82,32 +86,121 @@ pub async fn set_role(id: String, role: UserRole) -> Result<()> {
     Ok(())
 }
 
-/// `zlayer user set-password <id>` -- admin resets another user's password
-/// (or self-service when id matches the caller's session).
-pub async fn set_password(id: String) -> Result<()> {
-    let new_password = Password::new()
-        .with_prompt("New password")
-        .with_confirmation("Confirm new password", "Passwords don't match")
-        .interact()
-        .context("Failed to read password")?;
+/// `zlayer user set-password` -- admin resets a user's password (or
+/// self-service when the target matches the caller's session). The target is
+/// selected either by the positional `id` or `--email`. The new password
+/// source is one of `--password`, `--password-file`, `--random`, or an
+/// interactive prompt when none is supplied.
+#[allow(clippy::too_many_arguments)]
+pub async fn set_password(
+    id: Option<String>,
+    email: Option<String>,
+    password: Option<String>,
+    password_file: Option<std::path::PathBuf>,
+    random: bool,
+    no_confirm: bool,
+) -> Result<()> {
+    if id.is_some() && email.is_some() {
+        bail!("--email and a positional id are mutually exclusive");
+    }
 
     let client = DaemonClient::connect().await?;
+
+    let resolved_id = match (id, email) {
+        (Some(i), None) => i,
+        (None, Some(email)) => resolve_email_to_id(&client, &email).await?,
+        (None, None) => bail!("either a positional id or --email is required"),
+        (Some(_), Some(_)) => unreachable!(),
+    };
+
+    let (new_password, generated) =
+        resolve_new_password(password, password_file.as_deref(), random)?;
+
+    if !no_confirm {
+        use dialoguer::Confirm;
+        let prompt = format!("Rotate password for user {resolved_id}?");
+        let ok = Confirm::new()
+            .with_prompt(prompt)
+            .default(false)
+            .interact()
+            .context("Failed to read confirmation")?;
+        if !ok {
+            bail!("Aborted");
+        }
+    }
+
     let req = SetPasswordRequest {
-        new_password,
-        // Admin resetting someone else's password: current_password not required.
-        // If the daemon decides this is a self-service request it will return
-        // 400 asking for current_password; we can add an interactive prompt for
-        // that path in a follow-up if the need arises.
+        new_password: new_password.clone(),
         current_password: None,
     };
 
     client
-        .set_user_password(&id, &req)
+        .set_user_password(&resolved_id, &req)
         .await
         .context("Failed to set password")?;
 
-    println!("Password updated for user {id}");
+    if generated {
+        println!();
+        println!("Generated password for {resolved_id}:");
+        println!("  {new_password}");
+        println!();
+        println!("This is the only time it will be shown. Store it now.");
+    } else {
+        println!("Password updated for user {resolved_id}");
+    }
     Ok(())
+}
+
+async fn resolve_email_to_id(client: &DaemonClient, email: &str) -> Result<String> {
+    let email_lc = email.trim().to_lowercase();
+    let users = client.list_users().await.context("Failed to list users")?;
+    users
+        .into_iter()
+        .find(|u| u.email.eq_ignore_ascii_case(&email_lc))
+        .map(|u| u.id)
+        .ok_or_else(|| anyhow::anyhow!("No user with email {email_lc}"))
+}
+
+fn resolve_new_password(
+    inline: Option<String>,
+    file: Option<&Path>,
+    random: bool,
+) -> Result<(String, bool)> {
+    let sources = [inline.is_some(), file.is_some(), random]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if sources > 1 {
+        bail!("at most one of --password, --password-file, --random may be supplied");
+    }
+
+    if let Some(p) = inline {
+        return Ok((p, false));
+    }
+    if let Some(path) = file {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("reading --password-file {}", path.display()))?;
+        let trimmed = raw.trim_end_matches(['\n', '\r']).to_string();
+        if trimmed.is_empty() {
+            bail!("--password-file {} is empty", path.display());
+        }
+        return Ok((trimmed, false));
+    }
+    if random {
+        let pw: String = rand::rng()
+            .sample_iter(Alphanumeric)
+            .take(32)
+            .map(char::from)
+            .collect();
+        return Ok((pw, true));
+    }
+
+    let pw = Password::new()
+        .with_prompt("New password")
+        .with_confirmation("Confirm new password", "Passwords don't match")
+        .interact()
+        .context("Failed to read password")?;
+    Ok((pw, false))
 }
 
 /// `zlayer user delete <id>` -- admin deletes a user account.
@@ -151,5 +244,57 @@ fn print_users_table(users: &[UserView]) {
             "{:<38} {:<30} {:<20} {:<6} {:<8}",
             u.id, u.email, u.display_name, u.role, active
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_new_password;
+    use std::io::Write;
+
+    #[test]
+    fn inline_password_returned_as_is() {
+        let (pw, generated) =
+            resolve_new_password(Some("hunter2hunter2".to_string()), None, false).unwrap();
+        assert_eq!(pw, "hunter2hunter2");
+        assert!(!generated);
+    }
+
+    #[test]
+    fn password_file_is_read_and_trimmed() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp.as_file(), "filesecret123").unwrap();
+        let (pw, generated) = resolve_new_password(None, Some(tmp.path()), false).unwrap();
+        assert_eq!(pw, "filesecret123");
+        assert!(!generated);
+    }
+
+    #[test]
+    fn password_file_empty_errors() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let err = resolve_new_password(None, Some(tmp.path()), false).unwrap_err();
+        assert!(err.to_string().contains("empty"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn password_file_missing_errors() {
+        let path = std::path::Path::new("/nonexistent/zlayer/set_password/pw");
+        let err = resolve_new_password(None, Some(path), false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("reading --password-file"), "unexpected: {msg}");
+    }
+
+    #[test]
+    fn random_generates_32_char_alphanumeric() {
+        let (pw, generated) = resolve_new_password(None, None, true).unwrap();
+        assert_eq!(pw.len(), 32);
+        assert!(pw.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(generated);
+    }
+
+    #[test]
+    fn multiple_sources_rejected() {
+        let err = resolve_new_password(Some("a".to_string()), None, true).unwrap_err();
+        assert!(err.to_string().contains("at most one"), "unexpected: {err}");
     }
 }

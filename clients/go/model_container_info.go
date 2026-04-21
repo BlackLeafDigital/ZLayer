@@ -23,16 +23,26 @@ var _ MappedNullable = &ContainerInfo{}
 type ContainerInfo struct {
 	// Creation timestamp (ISO 8601)
 	CreatedAt string `json:"created_at"`
+	// Most-recent exit code. `None` for containers still running and for containers that have never exited.
+	ExitCode NullableInt32 `json:"exit_code,omitempty"`
+	// Runtime-native health status, when the container image declares a `HEALTHCHECK` (or equivalent). `None` when the runtime doesn't track health for this container.
+	Health NullableContainerHealthInfo `json:"health,omitempty"`
 	// Container identifier
 	Id string `json:"id"`
 	// OCI image reference
 	Image string `json:"image"`
+	// Primary IPv4 address (first non-empty IP across attached networks). Docker's `bridge` network is preferred when present.
+	Ipv4 NullableString `json:"ipv4,omitempty"`
 	// Labels
 	Labels map[string]string `json:"labels"`
 	// Human-readable name (if set)
 	Name NullableString `json:"name,omitempty"`
+	// Networks this container is attached to, with per-network aliases and IPv4. Empty when the runtime doesn't surface network detail.
+	Networks []NetworkAttachmentInfo `json:"networks,omitempty"`
 	// Process ID (if running)
 	Pid NullableInt32 `json:"pid,omitempty"`
+	// Published port mappings (container → host). Populated from the runtime's inspect response; empty when the runtime doesn't expose port-level detail or the container has no published ports.
+	Ports []PortMapping `json:"ports,omitempty"`
 	// Container state (pending, running, exited, failed)
 	State string `json:"state"`
 }
@@ -85,6 +95,90 @@ func (o *ContainerInfo) SetCreatedAt(v string) {
 	o.CreatedAt = v
 }
 
+// GetExitCode returns the ExitCode field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ContainerInfo) GetExitCode() int32 {
+	if o == nil || IsNil(o.ExitCode.Get()) {
+		var ret int32
+		return ret
+	}
+	return *o.ExitCode.Get()
+}
+
+// GetExitCodeOk returns a tuple with the ExitCode field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ContainerInfo) GetExitCodeOk() (*int32, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.ExitCode.Get(), o.ExitCode.IsSet()
+}
+
+// HasExitCode returns a boolean if a field has been set.
+func (o *ContainerInfo) HasExitCode() bool {
+	if o != nil && o.ExitCode.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetExitCode gets a reference to the given NullableInt32 and assigns it to the ExitCode field.
+func (o *ContainerInfo) SetExitCode(v int32) {
+	o.ExitCode.Set(&v)
+}
+// SetExitCodeNil sets the value for ExitCode to be an explicit nil
+func (o *ContainerInfo) SetExitCodeNil() {
+	o.ExitCode.Set(nil)
+}
+
+// UnsetExitCode ensures that no value is present for ExitCode, not even an explicit nil
+func (o *ContainerInfo) UnsetExitCode() {
+	o.ExitCode.Unset()
+}
+
+// GetHealth returns the Health field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ContainerInfo) GetHealth() ContainerHealthInfo {
+	if o == nil || IsNil(o.Health.Get()) {
+		var ret ContainerHealthInfo
+		return ret
+	}
+	return *o.Health.Get()
+}
+
+// GetHealthOk returns a tuple with the Health field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ContainerInfo) GetHealthOk() (*ContainerHealthInfo, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Health.Get(), o.Health.IsSet()
+}
+
+// HasHealth returns a boolean if a field has been set.
+func (o *ContainerInfo) HasHealth() bool {
+	if o != nil && o.Health.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetHealth gets a reference to the given NullableContainerHealthInfo and assigns it to the Health field.
+func (o *ContainerInfo) SetHealth(v ContainerHealthInfo) {
+	o.Health.Set(&v)
+}
+// SetHealthNil sets the value for Health to be an explicit nil
+func (o *ContainerInfo) SetHealthNil() {
+	o.Health.Set(nil)
+}
+
+// UnsetHealth ensures that no value is present for Health, not even an explicit nil
+func (o *ContainerInfo) UnsetHealth() {
+	o.Health.Unset()
+}
+
 // GetId returns the Id field value
 func (o *ContainerInfo) GetId() string {
 	if o == nil {
@@ -131,6 +225,48 @@ func (o *ContainerInfo) GetImageOk() (*string, bool) {
 // SetImage sets field value
 func (o *ContainerInfo) SetImage(v string) {
 	o.Image = v
+}
+
+// GetIpv4 returns the Ipv4 field value if set, zero value otherwise (both if not set or set to explicit null).
+func (o *ContainerInfo) GetIpv4() string {
+	if o == nil || IsNil(o.Ipv4.Get()) {
+		var ret string
+		return ret
+	}
+	return *o.Ipv4.Get()
+}
+
+// GetIpv4Ok returns a tuple with the Ipv4 field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+// NOTE: If the value is an explicit nil, `nil, true` will be returned
+func (o *ContainerInfo) GetIpv4Ok() (*string, bool) {
+	if o == nil {
+		return nil, false
+	}
+	return o.Ipv4.Get(), o.Ipv4.IsSet()
+}
+
+// HasIpv4 returns a boolean if a field has been set.
+func (o *ContainerInfo) HasIpv4() bool {
+	if o != nil && o.Ipv4.IsSet() {
+		return true
+	}
+
+	return false
+}
+
+// SetIpv4 gets a reference to the given NullableString and assigns it to the Ipv4 field.
+func (o *ContainerInfo) SetIpv4(v string) {
+	o.Ipv4.Set(&v)
+}
+// SetIpv4Nil sets the value for Ipv4 to be an explicit nil
+func (o *ContainerInfo) SetIpv4Nil() {
+	o.Ipv4.Set(nil)
+}
+
+// UnsetIpv4 ensures that no value is present for Ipv4, not even an explicit nil
+func (o *ContainerInfo) UnsetIpv4() {
+	o.Ipv4.Unset()
 }
 
 // GetLabels returns the Labels field value
@@ -199,6 +335,38 @@ func (o *ContainerInfo) UnsetName() {
 	o.Name.Unset()
 }
 
+// GetNetworks returns the Networks field value if set, zero value otherwise.
+func (o *ContainerInfo) GetNetworks() []NetworkAttachmentInfo {
+	if o == nil || IsNil(o.Networks) {
+		var ret []NetworkAttachmentInfo
+		return ret
+	}
+	return o.Networks
+}
+
+// GetNetworksOk returns a tuple with the Networks field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *ContainerInfo) GetNetworksOk() ([]NetworkAttachmentInfo, bool) {
+	if o == nil || IsNil(o.Networks) {
+		return nil, false
+	}
+	return o.Networks, true
+}
+
+// HasNetworks returns a boolean if a field has been set.
+func (o *ContainerInfo) HasNetworks() bool {
+	if o != nil && !IsNil(o.Networks) {
+		return true
+	}
+
+	return false
+}
+
+// SetNetworks gets a reference to the given []NetworkAttachmentInfo and assigns it to the Networks field.
+func (o *ContainerInfo) SetNetworks(v []NetworkAttachmentInfo) {
+	o.Networks = v
+}
+
 // GetPid returns the Pid field value if set, zero value otherwise (both if not set or set to explicit null).
 func (o *ContainerInfo) GetPid() int32 {
 	if o == nil || IsNil(o.Pid.Get()) {
@@ -241,6 +409,38 @@ func (o *ContainerInfo) UnsetPid() {
 	o.Pid.Unset()
 }
 
+// GetPorts returns the Ports field value if set, zero value otherwise.
+func (o *ContainerInfo) GetPorts() []PortMapping {
+	if o == nil || IsNil(o.Ports) {
+		var ret []PortMapping
+		return ret
+	}
+	return o.Ports
+}
+
+// GetPortsOk returns a tuple with the Ports field value if set, nil otherwise
+// and a boolean to check if the value has been set.
+func (o *ContainerInfo) GetPortsOk() ([]PortMapping, bool) {
+	if o == nil || IsNil(o.Ports) {
+		return nil, false
+	}
+	return o.Ports, true
+}
+
+// HasPorts returns a boolean if a field has been set.
+func (o *ContainerInfo) HasPorts() bool {
+	if o != nil && !IsNil(o.Ports) {
+		return true
+	}
+
+	return false
+}
+
+// SetPorts gets a reference to the given []PortMapping and assigns it to the Ports field.
+func (o *ContainerInfo) SetPorts(v []PortMapping) {
+	o.Ports = v
+}
+
 // GetState returns the State field value
 func (o *ContainerInfo) GetState() string {
 	if o == nil {
@@ -276,14 +476,29 @@ func (o ContainerInfo) MarshalJSON() ([]byte, error) {
 func (o ContainerInfo) ToMap() (map[string]interface{}, error) {
 	toSerialize := map[string]interface{}{}
 	toSerialize["created_at"] = o.CreatedAt
+	if o.ExitCode.IsSet() {
+		toSerialize["exit_code"] = o.ExitCode.Get()
+	}
+	if o.Health.IsSet() {
+		toSerialize["health"] = o.Health.Get()
+	}
 	toSerialize["id"] = o.Id
 	toSerialize["image"] = o.Image
+	if o.Ipv4.IsSet() {
+		toSerialize["ipv4"] = o.Ipv4.Get()
+	}
 	toSerialize["labels"] = o.Labels
 	if o.Name.IsSet() {
 		toSerialize["name"] = o.Name.Get()
 	}
+	if !IsNil(o.Networks) {
+		toSerialize["networks"] = o.Networks
+	}
 	if o.Pid.IsSet() {
 		toSerialize["pid"] = o.Pid.Get()
+	}
+	if !IsNil(o.Ports) {
+		toSerialize["ports"] = o.Ports
 	}
 	toSerialize["state"] = o.State
 	return toSerialize, nil

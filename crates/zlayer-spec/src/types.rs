@@ -702,6 +702,13 @@ pub struct ServiceSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub storage: Vec<StorageSpec>,
 
+    /// Host-to-container port mappings (Docker's `-p host:container/proto`).
+    ///
+    /// Each entry publishes a container port on the host. When `host_port` is
+    /// `None` (or zero), the daemon assigns an ephemeral host port.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub port_mappings: Vec<PortMapping>,
+
     /// Linux capabilities to add (e.g., `SYS_ADMIN`, `NET_ADMIN`)
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -737,6 +744,42 @@ pub struct ServiceSpec {
     /// This is set programmatically via the `--host-network` CLI flag, not in YAML specs.
     #[serde(skip)]
     pub host_network: bool,
+
+    /// Container hostname (maps to Docker's `--hostname`).
+    ///
+    /// When set, the container's `/etc/hostname` and initial kernel hostname
+    /// are configured to this value. Ignored when `host_network` is true
+    /// (the container inherits the host's hostname).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+
+    /// Additional DNS servers for the container (maps to Docker's `--dns`).
+    ///
+    /// Each entry must be a plausible IPv4 or IPv6 address. Forwarded to the
+    /// container runtime as resolver addresses ahead of the platform defaults.
+    /// Ignored when `host_network` is true.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<String>,
+
+    /// Extra `hostname:ip` entries appended to `/etc/hosts` (maps to Docker's
+    /// `--add-host`).
+    ///
+    /// Each entry must be in the form `"<hostname>:<ip>"`. The special literal
+    /// `host-gateway` is accepted as the `<ip>` half (resolved by Docker /
+    /// bollard to the host-visible gateway address, commonly used with
+    /// `host.docker.internal:host-gateway`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_hosts: Vec<String>,
+
+    /// Container restart policy (Docker-style).
+    ///
+    /// Controls when the runtime should automatically restart the container
+    /// after it exits. Maps to Docker's `HostConfig.RestartPolicy`. Named
+    /// `ContainerRestartPolicy` to avoid colliding with `ZLayer`'s existing
+    /// `PanicPolicy` (which controls post-panic behavior, not runtime-level
+    /// restarts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_policy: Option<ContainerRestartPolicy>,
 }
 
 /// Command override specification (Section 5.5)
@@ -1684,9 +1727,270 @@ pub enum AccessAction {
     Deny,
 }
 
+// ==========================================================================
+// Container bridge / overlay network types (Docker-compatible)
+// ==========================================================================
+//
+// These types model user-defined bridge or overlay networks that standalone
+// containers can attach to — the Docker-style "docker network create" model.
+// They are intentionally named `BridgeNetwork*` to avoid colliding with the
+// CIDR-ACL `NetworkPolicySpec` types above, which model a completely
+// different concept (access-control groups).
+
+/// A user-defined bridge or overlay network that containers can attach to.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct BridgeNetwork {
+    /// Opaque server-generated identifier (UUID v4).
+    pub id: String,
+
+    /// Human-readable, unique name (must match `^[a-z0-9][a-z0-9_-]{0,63}$`).
+    pub name: String,
+
+    /// Driver backing the network (bridge vs. overlay).
+    #[serde(default)]
+    pub driver: BridgeNetworkDriver,
+
+    /// IPv4/IPv6 subnet in CIDR notation (e.g. `"10.240.0.0/24"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subnet: Option<String>,
+
+    /// Arbitrary key/value labels for filtering and grouping.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub labels: HashMap<String, String>,
+
+    /// If true, containers attached to this network cannot reach the outside
+    /// world — only other containers on the same network.
+    #[serde(default)]
+    pub internal: bool,
+
+    /// Creation timestamp (UTC, RFC 3339).
+    #[schema(value_type = String, format = "date-time")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Backing driver for a [`BridgeNetwork`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeNetworkDriver {
+    /// Linux bridge on the local host (single-host, default).
+    #[default]
+    Bridge,
+    /// Overlay network spanning multiple hosts.
+    Overlay,
+}
+
+/// A container attached to a [`BridgeNetwork`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct BridgeNetworkAttachment {
+    /// Runtime-provided container id.
+    pub container_id: String,
+
+    /// Container name, if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container_name: Option<String>,
+
+    /// DNS aliases the container can be reached by on this network.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
+
+    /// Assigned IPv4 address on the network (if any).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4: Option<String>,
+}
+
+// ==========================================================================
+// Registry auth (inline, not persisted) — §3.10 of ZLAYER_SDK_FIXES.md
+// ==========================================================================
+//
+// Inline credentials a client can attach to a single pull or container-create
+// request without first POSTing them to `/api/v1/credentials/registry`. The
+// daemon uses them exactly once — they are never logged, never persisted, and
+// never echoed back on a response.
+//
+// For requests that instead want to reuse an already-stored credential, the
+// `CreateContainerRequest` / `PullImageRequest` DTOs also accept a
+// `registry_credential_id` pointing at the `RegistryCredentialStore`. Inline
+// `RegistryAuth` takes precedence when both are provided.
+
+/// Inline Docker/OCI registry credentials attached to a single pull request.
+///
+/// Prefer persistent credentials via `/api/v1/credentials/registry` for
+/// long-lived services. Use this inline form for one-off pulls (e.g. CI
+/// runners fetching a private image for a single job) where persisting a
+/// credential is undesirable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct RegistryAuth {
+    /// Username for the registry (for basic auth) or a placeholder
+    /// identifier when `auth_type == Token`.
+    pub username: String,
+    /// Password or bearer token. **Never** logged or returned on any
+    /// response — consumed once and dropped.
+    pub password: String,
+    /// Which authentication scheme to use against the registry.
+    #[serde(default = "default_registry_auth_type")]
+    pub auth_type: RegistryAuthType,
+}
+
+/// Authentication scheme for a [`RegistryAuth`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RegistryAuthType {
+    /// HTTP Basic authentication (username + password). Default.
+    #[default]
+    Basic,
+    /// Bearer token authentication. `password` carries the token; `username`
+    /// is typically a placeholder such as `"oauth2accesstoken"` or `"<token>"`.
+    Token,
+}
+
+/// Serde default for [`RegistryAuth::auth_type`]. Kept as a free function so
+/// `#[serde(default = "...")]` can reference it.
+#[must_use]
+pub fn default_registry_auth_type() -> RegistryAuthType {
+    RegistryAuthType::Basic
+}
+
+// ==========================================================================
+// Container restart policy (Docker-style) — §3.4 of ZLAYER_SDK_FIXES.md
+// ==========================================================================
+//
+// Named `ContainerRestartPolicy` / `ContainerRestartKind` rather than
+// `RestartPolicy` / `RestartKind` to avoid colliding with ZLayer's existing
+// `PanicPolicy`/`PanicAction` types and to make the runtime-level (as opposed
+// to panic-driven) nature of this policy explicit.
+
+/// Container-runtime-level restart policy.
+///
+/// Maps onto Docker's `HostConfig.RestartPolicy`. Distinct from
+/// [`PanicPolicy`], which governs what `ZLayer` does in response to an
+/// application panic (it does not set a Docker restart policy).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ContainerRestartPolicy {
+    /// Which restart policy to apply.
+    pub kind: ContainerRestartKind,
+
+    /// For `on_failure` only: maximum number of restart attempts before
+    /// giving up. Ignored by other kinds. `None` means "retry forever".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+
+    /// Humantime-formatted delay between restarts (e.g. `"500ms"`,
+    /// `"2s"`). Accepted for forward-compatibility but currently ignored
+    /// by the Docker backend: bollard's `RestartPolicy` has no per-kind
+    /// delay field. When set, the runtime emits a warning.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay: Option<String>,
+}
+
+/// Which flavor of container restart policy to apply.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerRestartKind {
+    /// Never restart (Docker's `"no"`).
+    No,
+    /// Always restart (Docker's `"always"`).
+    Always,
+    /// Restart unless the user explicitly stopped the container
+    /// (Docker's `"unless-stopped"`).
+    UnlessStopped,
+    /// Restart only when the container exits with a non-zero code
+    /// (Docker's `"on-failure"`). Respects `max_attempts`.
+    OnFailure,
+}
+
+// ==========================================================================
+// Port mappings (Docker-style container port publishing)
+// ==========================================================================
+
+/// Transport protocol for a published container port.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PortProtocol {
+    /// TCP (default).
+    Tcp,
+    /// UDP.
+    Udp,
+}
+
+impl Default for PortProtocol {
+    fn default() -> Self {
+        default_port_protocol()
+    }
+}
+
+impl PortProtocol {
+    /// Return the lowercase string form Docker uses in port-binding keys
+    /// (e.g. `"tcp"` or `"udp"`).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            PortProtocol::Tcp => "tcp",
+            PortProtocol::Udp => "udp",
+        }
+    }
+}
+
+fn default_port_protocol() -> PortProtocol {
+    PortProtocol::Tcp
+}
+
+fn default_host_ip() -> String {
+    "0.0.0.0".to_string()
+}
+
+/// A single host-to-container port publish rule (Docker's `-p`).
+///
+/// When `host_port` is `None` (or explicitly `Some(0)`), the container runtime
+/// assigns an ephemeral host port. `host_ip` defaults to `"0.0.0.0"` to bind
+/// on all interfaces.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub struct PortMapping {
+    /// Host port. `None` (or zero) means "assign an ephemeral port".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<u16>,
+    /// Container-side port.
+    pub container_port: u16,
+    /// Transport protocol (defaults to TCP).
+    #[serde(default = "default_port_protocol")]
+    pub protocol: PortProtocol,
+    /// Host interface to bind on. Defaults to `"0.0.0.0"` (all interfaces).
+    #[serde(default = "default_host_ip", skip_serializing_if = "String::is_empty")]
+    pub host_ip: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_mapping_defaults_via_serde() {
+        // Minimal JSON: only container_port. host_port omitted, protocol defaults
+        // to "tcp", host_ip defaults to "0.0.0.0".
+        let json = r#"{"container_port": 8080}"#;
+        let m: PortMapping = serde_json::from_str(json).expect("parse minimal PortMapping");
+        assert_eq!(m.container_port, 8080);
+        assert_eq!(m.host_port, None);
+        assert_eq!(m.protocol, PortProtocol::Tcp);
+        assert_eq!(m.host_ip, "0.0.0.0");
+    }
+
+    #[test]
+    fn port_mapping_skips_none_host_port_and_empty_host_ip() {
+        let m = PortMapping {
+            host_port: None,
+            container_port: 443,
+            protocol: PortProtocol::Tcp,
+            host_ip: String::new(),
+        };
+        let s = serde_json::to_string(&m).expect("serialize");
+        // host_port = None should be skipped, host_ip = "" should be skipped.
+        assert!(!s.contains("host_port"), "host_port should be skipped: {s}");
+        assert!(!s.contains("host_ip"), "host_ip should be skipped: {s}");
+        assert!(s.contains("\"container_port\":443"));
+        assert!(s.contains("\"protocol\":\"tcp\""));
+    }
 
     #[test]
     fn test_parse_simple_spec() {
@@ -2483,5 +2787,100 @@ name: bob
         assert!(spec.cidrs.is_empty());
         assert!(spec.members.is_empty());
         assert!(spec.access_rules.is_empty());
+    }
+
+    #[test]
+    fn container_restart_policy_serde_roundtrip_all_kinds() {
+        // Exercise every `ContainerRestartKind` variant via a JSON roundtrip.
+        // Covers the `snake_case` rename (`unless_stopped`, `on_failure`) and
+        // the optional `max_attempts` / `delay` fields. Validates the wire
+        // format the API will expose under `/v1/containers`.
+        let cases = [
+            (
+                ContainerRestartPolicy {
+                    kind: ContainerRestartKind::No,
+                    max_attempts: None,
+                    delay: None,
+                },
+                r#"{"kind":"no"}"#,
+            ),
+            (
+                ContainerRestartPolicy {
+                    kind: ContainerRestartKind::Always,
+                    max_attempts: None,
+                    delay: Some("500ms".to_string()),
+                },
+                r#"{"kind":"always","delay":"500ms"}"#,
+            ),
+            (
+                ContainerRestartPolicy {
+                    kind: ContainerRestartKind::UnlessStopped,
+                    max_attempts: None,
+                    delay: None,
+                },
+                r#"{"kind":"unless_stopped"}"#,
+            ),
+            (
+                ContainerRestartPolicy {
+                    kind: ContainerRestartKind::OnFailure,
+                    max_attempts: Some(5),
+                    delay: None,
+                },
+                r#"{"kind":"on_failure","max_attempts":5}"#,
+            ),
+        ];
+
+        for (value, expected_json) in &cases {
+            let serialized = serde_json::to_string(value).expect("serialize");
+            assert_eq!(&serialized, expected_json, "serialize mismatch");
+            let round: ContainerRestartPolicy =
+                serde_json::from_str(&serialized).expect("deserialize");
+            assert_eq!(&round, value, "roundtrip mismatch");
+        }
+    }
+
+    // -- §3.10: RegistryAuth ------------------------------------------------
+
+    #[test]
+    fn registry_auth_type_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&RegistryAuthType::Basic).unwrap(),
+            "\"basic\""
+        );
+        assert_eq!(
+            serde_json::to_string(&RegistryAuthType::Token).unwrap(),
+            "\"token\""
+        );
+    }
+
+    #[test]
+    fn registry_auth_default_auth_type_is_basic() {
+        // When `auth_type` is omitted on the wire, the serde default kicks in.
+        let json = r#"{"username":"u","password":"p"}"#;
+        let parsed: RegistryAuth = serde_json::from_str(json).expect("parse");
+        assert_eq!(parsed.auth_type, RegistryAuthType::Basic);
+        assert_eq!(parsed.username, "u");
+        assert_eq!(parsed.password, "p");
+    }
+
+    #[test]
+    fn registry_auth_serde_roundtrip_both_variants() {
+        for variant in [RegistryAuthType::Basic, RegistryAuthType::Token] {
+            let cred = RegistryAuth {
+                username: "ci-bot".to_string(),
+                password: "s3cret".to_string(),
+                auth_type: variant,
+            };
+            let serialized = serde_json::to_string(&cred).expect("serialize");
+            let back: RegistryAuth = serde_json::from_str(&serialized).expect("deserialize");
+            assert_eq!(back, cred, "roundtrip mismatch for {variant:?}");
+        }
+    }
+
+    #[test]
+    fn registry_auth_explicit_token_type_parses() {
+        let json = r#"{"username":"oauth2accesstoken","password":"ghp_abc","auth_type":"token"}"#;
+        let parsed: RegistryAuth = serde_json::from_str(json).expect("parse");
+        assert_eq!(parsed.auth_type, RegistryAuthType::Token);
     }
 }
