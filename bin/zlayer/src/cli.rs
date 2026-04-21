@@ -523,6 +523,12 @@ pub(crate) enum Commands {
         #[arg(long)]
         socket: Option<String>,
 
+        /// Override the WSL2 vhdSize cap (GiB). Defaults to ~80% of free host disk.
+        /// Only meaningful on Windows.
+        #[cfg(all(target_os = "windows", feature = "wsl"))]
+        #[arg(long, value_name = "GB")]
+        vhd_gb: Option<u64>,
+
         /// Enable Docker API socket emulation
         #[cfg(feature = "docker-compat")]
         #[arg(long)]
@@ -538,6 +544,11 @@ pub(crate) enum Commands {
     #[cfg(unix)]
     #[command(subcommand, display_order = 32)]
     Daemon(DaemonAction),
+
+    /// Windows-only maintenance commands (WSL2 distro management)
+    #[cfg(all(target_os = "windows", feature = "wsl"))]
+    #[command(subcommand, display_order = 32)]
+    Windows(WindowsCommands),
 
     /// Tunnel management commands
     ///
@@ -810,6 +821,19 @@ pub(crate) enum Commands {
         /// Target shell (bash, zsh, fish, powershell, elvish)
         #[arg(value_enum)]
         shell: clap_complete::Shell,
+    },
+}
+
+/// Windows-only maintenance commands. Currently exposes VHDX compaction;
+/// future subcommands will cover `.wslconfig` management and distro ops.
+#[cfg(all(target_os = "windows", feature = "wsl"))]
+#[derive(Debug, clap::Subcommand)]
+pub enum WindowsCommands {
+    /// Compact the ZLayer WSL2 distro's `ext4.vhdx` to reclaim freed space to the host.
+    Compact {
+        /// Skip the graceful daemon-stop wait; go straight to `wsl --shutdown`.
+        #[arg(long)]
+        force: bool,
     },
 }
 

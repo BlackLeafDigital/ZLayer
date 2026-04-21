@@ -7,9 +7,12 @@
 //!
 //! On non-Windows platforms, all functions return errors or no-op values.
 
+pub mod compact;
 pub mod daemon;
 pub mod detect;
 pub mod distro;
 pub mod errors;
 pub mod paths;
 pub mod setup;
+pub mod shell;
+pub mod wslconfig;

@@ -93,11 +93,17 @@ fn main() -> ExitCode {
 
         #[cfg(all(target_os = "windows", feature = "wsl"))]
         {
+            let vhd_gb_override = match &cli.command {
+                Some(Commands::Serve { vhd_gb, .. }) => *vhd_gb,
+                _ => None,
+            };
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("Failed to create tokio runtime");
-            match rt.block_on(zlayer_wsl::setup::ensure_wsl_backend_ready()) {
+            match rt.block_on(zlayer_wsl::setup::ensure_wsl_backend_ready_with_vhd_gb(
+                vhd_gb_override,
+            )) {
                 Ok(config) => match rt.block_on(zlayer_wsl::daemon::start_daemon(&config)) {
                     Ok(()) => {
                         println!("zlayer daemon started inside WSL2 on {}", config.api_addr);
@@ -534,6 +540,8 @@ async fn run(mut cli: Cli) -> Result<()> {
             jwt_secret,
             no_swagger,
             daemon: _, // Already handled in main() before tokio runtime
+            #[cfg(all(target_os = "windows", feature = "wsl"))]
+            vhd_gb,
             #[cfg(feature = "docker-compat")]
             docker_socket,
             #[cfg(feature = "docker-compat")]
@@ -543,7 +551,7 @@ async fn run(mut cli: Cli) -> Result<()> {
             #[cfg(all(target_os = "windows", feature = "wsl"))]
             {
                 let _ = (bind, jwt_secret, no_swagger);
-                let config = zlayer_wsl::setup::ensure_wsl_backend_ready()
+                let config = zlayer_wsl::setup::ensure_wsl_backend_ready_with_vhd_gb(*vhd_gb)
                     .await
                     .context("Failed to set up WSL2 backend")?;
                 zlayer_wsl::daemon::start_daemon(&config)
@@ -681,6 +689,8 @@ async fn run(mut cli: Cli) -> Result<()> {
         Commands::Daemon(action) => {
             commands::daemon::handle_daemon(action, &cli.effective_data_dir()).await
         }
+        #[cfg(all(target_os = "windows", feature = "wsl"))]
+        Commands::Windows(cmd) => commands::windows::handle(cmd).await,
         #[cfg(unix)]
         Commands::Image(image_cmd) => commands::image::handle_image(&cli, image_cmd).await,
         #[cfg(unix)]
