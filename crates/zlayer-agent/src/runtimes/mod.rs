@@ -95,6 +95,12 @@
 //! # }
 //! ```
 
+// Cross-platform composite runtime that dispatches per-container between a
+// primary runtime and an optional delegate (e.g. a WSL2 Linux delegate on a
+// Windows host). Compiled unconditionally — the delegate is optional at
+// runtime, so the abstraction is useful on every target.
+pub mod composite;
+
 // Youki runtime is Linux-only as it depends on libcontainer which uses
 // Linux-specific APIs (cgroups, namespaces, procfs). Gated behind the
 // `youki-runtime` feature so the crate publishes without pulling libcontainer.
@@ -133,6 +139,13 @@ pub mod macos_vm;
 // submodule, both of which are Windows-only.
 #[cfg(target_os = "windows")]
 pub mod hcs;
+
+// WSL2 delegate runtime. Compiled only on Windows with the `wsl` feature
+// enabled; shells out to `youki` inside the dedicated `zlayer` WSL2 distro
+// so Linux containers can run alongside HCS-managed Windows containers via
+// [`composite::CompositeRuntime`].
+#[cfg(all(target_os = "windows", feature = "wsl"))]
+pub mod wsl2_delegate;
 
 #[cfg(target_os = "windows")]
 pub use hcs::{HcsConfig, HcsRuntime, IsolationMode};

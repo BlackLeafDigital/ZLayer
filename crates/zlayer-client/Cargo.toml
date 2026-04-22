@@ -1,6 +1,6 @@
 [package]
 name = "zlayer-client"
-description = "HTTP-over-Unix-socket client for the ZLayer daemon, shared between the zlayer CLI, zlayer-docker, zlayer-py, and language SDKs."
+description = "HTTP client for the ZLayer daemon (Unix-domain socket on Unix, TCP loopback on Windows), shared between the zlayer CLI, zlayer-docker, zlayer-py, and language SDKs."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -25,8 +25,7 @@ chrono = { workspace = true }
 # Central filesystem path resolution (sockets, data/log dirs).
 zlayer-paths.workspace = true
 
-[target.'cfg(unix)'.dependencies]
-# HTTP-over-Unix-socket client
+# HTTP transport (Unix-domain socket on Unix, TCP loopback on Windows).
 tokio = { workspace = true, features = ["full"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }

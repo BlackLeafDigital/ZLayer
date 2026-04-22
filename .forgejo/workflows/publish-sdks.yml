@@ -60,23 +60,25 @@ jobs:
     if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (linux-x86_64)
     runs-on: ubuntu-latest
+    # Build inside the stock upstream manylinux image so the wheel picks up
+    # the right glibc and a yum-provided libseccomp that the native linker
+    # can resolve. No zigbuild, no cross-compilation.
+    container: quay.io/pypa/manylinux_2_28_x86_64
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install system deps (yum, inside manylinux)
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: 'protobuf-compiler pkg-config openssl-devel libseccomp-devel clang-devel'
+          cross-platform: 'true'
 
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
 
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
         with:
           python-version: '3.12'
-
-      - uses: https://forge.blackleafdigital.com/Public/actions/setup-zig@main
-
-      - name: Install system deps
-        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
-        with:
-          packages: 'protobuf-compiler libseccomp-dev pkg-config libssl-dev clang'
-          cross-platform: 'true'
 
       - name: Set pyproject version
         shell: bash
@@ -90,13 +92,9 @@ jobs:
           fi
           grep -E '^(version|dynamic) = ' pyproject.toml || true
 
-      - name: Install maturin via uv
-        run: uv tool install maturin
-
       - name: Build wheel
         working-directory: crates/zlayer-py
-        # --zig links against zig's bundled glibc to produce manylinux_2_28-compatible wheels.
-        run: maturin build --release --zig --target x86_64-unknown-linux-gnu --out dist
+        run: uvx maturin build --release --target x86_64-unknown-linux-gnu --manylinux 2_28 --out dist
 
       - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
@@ -108,38 +106,24 @@ jobs:
     needs: [detect]
     if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/py-binding')
     name: Build wheel (linux-aarch64)
-    runs-on: ubuntu-latest
+    # Native aarch64 self-hosted runner. No cross-compilation.
+    runs-on: arm64
+    container: quay.io/pypa/manylinux_2_28_aarch64
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
-      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+      - name: Install system deps (yum, inside manylinux)
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
         with:
-          targets: aarch64-unknown-linux-gnu
+          packages: 'protobuf-compiler pkg-config openssl-devel libseccomp-devel clang-devel'
+          cross-platform: 'true'
+
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
 
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
         with:
           python-version: '3.12'
-
-      - uses: https://forge.blackleafdigital.com/Public/actions/setup-zig@main
-
-      - name: Enable arm64 apt architecture + install cross libs
-        shell: bash
-        run: |
-          # Keep the host (amd64) sources intact; add arm64 as a second arch.
-          sudo dpkg --add-architecture arm64
-          # Most Ubuntu mirrors serve amd64/i386 only — the arm64 archive lives on
-          # ports.ubuntu.com. Restrict existing sources to amd64/i386 first so apt
-          # doesn't 404 every arm64 package against them.
-          sudo sed -i 's|^deb \(http\)|deb [arch=amd64,i386] \1|' /etc/apt/sources.list
-          codename=$(. /etc/os-release && echo "$UBUNTU_CODENAME")
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename} main restricted universe multiverse
-          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-updates main restricted universe multiverse
-          deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports ${codename}-security main restricted universe multiverse" \
-            | sudo tee /etc/apt/sources.list.d/arm64.list
-          sudo apt-get update
-          sudo apt-get install -y protobuf-compiler clang \
-            libseccomp-dev:arm64 libssl-dev:arm64
 
       - name: Set pyproject version
         shell: bash
@@ -152,15 +136,9 @@ jobs:
             sed -i "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
           fi
 
-      - name: Install maturin via uv
-        run: uv tool install maturin
-
       - name: Build wheel
         working-directory: crates/zlayer-py
-        env:
-          PKG_CONFIG_ALLOW_CROSS: '1'
-          PKG_CONFIG_PATH: /usr/lib/aarch64-linux-gnu/pkgconfig
-        run: maturin build --release --zig --target aarch64-unknown-linux-gnu --out dist
+        run: uvx maturin build --release --target aarch64-unknown-linux-gnu --manylinux 2_28 --out dist
 
       - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
@@ -202,14 +180,11 @@ jobs:
             sed -i '' "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
           fi
 
-      - name: Install maturin via uv
-        run: uv tool install maturin
-
       - name: Build wheel
         working-directory: crates/zlayer-py
         env:
           MACOSX_DEPLOYMENT_TARGET: '10.13'
-        run: maturin build --release --target x86_64-apple-darwin --out dist
+        run: uvx maturin build --release --target x86_64-apple-darwin --out dist
 
       - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
@@ -249,14 +224,11 @@ jobs:
             sed -i '' "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
           fi
 
-      - name: Install maturin via uv
-        run: uv tool install maturin
-
       - name: Build wheel
         working-directory: crates/zlayer-py
         env:
           MACOSX_DEPLOYMENT_TARGET: '11.0'
-        run: maturin build --release --target aarch64-apple-darwin --out dist
+        run: uvx maturin build --release --target aarch64-apple-darwin --out dist
 
       - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
@@ -337,12 +309,9 @@ jobs:
             sed -i "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
           fi
 
-      - name: Install maturin via uv
-        run: uv tool install maturin
-
       - name: Build sdist
         working-directory: crates/zlayer-py
-        run: maturin sdist --out dist
+        run: uvx maturin sdist --out dist
 
       - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
@@ -401,9 +370,7 @@ jobs:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_TOKEN }}
           TWINE_NON_INTERACTIVE: '1'
-        run: |
-          uv tool install twine
-          twine upload --skip-existing dist/*.whl dist/*.tar.gz
+        run: uvx twine upload --skip-existing dist/*.whl dist/*.tar.gz
 
       - name: Mark step complete
         if: steps.check.outputs.completed != 'true'
@@ -597,10 +564,8 @@ jobs:
             echo "Publishing python-sdk..."
             sed -i "s/^version = .*/version = \"$INPUT_VERSION\"/" pyproject.toml
             sed -i "s/__version__ = .*/__version__ = \"$INPUT_VERSION\"/" zlayer/__init__.py
-            uv tool install build
-            uv tool install twine
-            pyproject-build
-            twine upload dist/* || echo "May already exist"
+            uvx --from build pyproject-build
+            uvx twine upload --skip-existing dist/* || echo "May already exist"
           else
             echo "Skipping python-sdk (already at or above $INPUT_VERSION)"
           fi
@@ -708,6 +673,21 @@ jobs:
           git config user.email "ci@forge.blackleafdigital.com"
           git tag -a "${TAG}" -m "zlayer-sdk-go ${{ inputs.version }}"
           git push origin "${TAG}"
+
+      # Forgejo→GitHub mirror is disabled; push the subpath tag explicitly
+      # with a narrow refspec so `go get github.com/BlackLeafDigital/ZLayer/...`
+      # resolves. NEVER use --mirror / --all / refs/*:refs/*.
+      - name: Push go-sdk tag to GitHub
+        if: steps.check.outputs.completed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="clients/zlayer-sdk/go/v${{ inputs.version }}"
+          case "$TAG" in *zdb*|*ZDB*) echo "refusing: tag matches zdb"; exit 1 ;; esac
+          git remote remove github 2>/dev/null || true
+          git remote add github "https://x-access-token:${GH_TOKEN}@github.com/BlackLeafDigital/ZLayer.git"
+          git push github "refs/tags/${TAG}:refs/tags/${TAG}"
       - name: Mark step complete
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
@@ -742,11 +722,17 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
         with:
           packages: 'cmake build-essential'
+      - name: Install WASI SDK
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-wasi-sdk@main
       - name: Verify C SDK builds
         if: steps.check.outputs.completed != 'true'
         working-directory: clients/zlayer-sdk/c
+        # The SDK targets wasm32-wasip2; use the WASI-SDK toolchain file so
+        # cmake configures clang with the right sysroot instead of the host
+        # compiler.
         run: |
-          cmake -B build
+          cmake -B build -DCMAKE_TOOLCHAIN_FILE="${WASI_SDK_PREFIX}/share/cmake/wasi-sdk.cmake"
           cmake --build build
       - name: Package C SDK tarball
         if: steps.check.outputs.completed != 'true'

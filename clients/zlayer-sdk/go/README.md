@@ -53,7 +53,7 @@ Create a new Go file for your plugin (e.g., `examples/hello/main.go`):
 package main
 
 import (
-    "github.com/zlayer/zlayer-sdk-go/gen/zlayer/plugin/types"
+    "github.com/BlackLeafDigital/ZLayer/clients/zlayer-sdk/go/gen/zlayer/plugin/types"
 )
 
 //go:generate wit-bindgen-go generate --world zlayer-plugin --out ../../gen ../../../wit/zlayer
@@ -131,14 +131,14 @@ Once bindings are generated, you'll have access to these ZLayer host capabilitie
 
 ### Configuration
 ```go
-import "github.com/zlayer/zlayer-sdk-go/gen/zlayer/plugin/config"
+import "github.com/BlackLeafDigital/ZLayer/clients/zlayer-sdk/go/gen/zlayer/plugin/config"
 
 value := config.Get("my-key")
 ```
 
 ### Key-Value Storage
 ```go
-import "github.com/zlayer/zlayer-sdk-go/gen/zlayer/plugin/kv"
+import "github.com/BlackLeafDigital/ZLayer/clients/zlayer-sdk/go/gen/zlayer/plugin/kv"
 
 kv.Set("key", []byte("value"))
 data := kv.Get("key")
@@ -146,14 +146,14 @@ data := kv.Get("key")
 
 ### Logging
 ```go
-import "github.com/zlayer/zlayer-sdk-go/gen/zlayer/plugin/logging"
+import "github.com/BlackLeafDigital/ZLayer/clients/zlayer-sdk/go/gen/zlayer/plugin/logging"
 
 logging.Log(logging.LevelInfo, "Processing request")
 ```
 
 ### Secrets
 ```go
-import "github.com/zlayer/zlayer-sdk-go/gen/zlayer/plugin/secrets"
+import "github.com/BlackLeafDigital/ZLayer/clients/zlayer-sdk/go/gen/zlayer/plugin/secrets"
 
 apiKey := secrets.Get("api-key")
 ```

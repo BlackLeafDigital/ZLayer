@@ -26,6 +26,12 @@ youki-runtime = ["dep:libcontainer"]
 # opt-in marker for CI / bin/zlayer configuration. Enabling it on non-Windows
 # targets is a no-op.
 hcs-runtime = []
+# WSL2 delegate runtime. When enabled on Windows targets, pulls in the
+# `zlayer-wsl` crate so `Wsl2DelegateRuntime` can shell out to `youki` inside
+# the dedicated `zlayer` WSL2 distro. Off by default; enabled explicitly by
+# `bin/zlayer` when the native Windows daemon wants Linux-container support
+# alongside HCS.
+wsl = ["dep:zlayer-wsl"]
 docker = ["dep:bollard"]
 wasm = [
     "dep:wasmtime",
@@ -134,6 +140,9 @@ windows = { version = "0.62", features = [
 ] }
 zlayer-hcs = { path = "../zlayer-hcs" }
 zlayer-hns = { path = "../zlayer-hns" }
+# Gated behind the `wsl` feature — only pulled in when the Wsl2DelegateRuntime
+# is actually compiled. Keeps the default Windows build lean.
+zlayer-wsl = { workspace = true, optional = true }
 # Windows OCI layer unpacker deps (crates/.../windows/unpacker.rs).
 # `uuid` is already in the main [dependencies] section but listing it again
 # here would be redundant; same for `sha2` (only pulled in via the `wasm`

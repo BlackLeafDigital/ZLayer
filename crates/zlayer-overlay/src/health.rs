@@ -395,6 +395,12 @@ fn current_timestamp() -> u64 {
 }
 
 /// Send a UAPI `get=1` query to the boringtun socket and return the raw response.
+///
+/// On Unix platforms, connects to the boringtun UAPI Unix domain socket. On
+/// Windows, returns a "not found" error (handled gracefully by `get_wg_stats`
+/// which treats it as "no peers"). The Windows overlay transport does not
+/// currently expose a UAPI socket — health is tracked via other mechanisms.
+#[cfg(unix)]
 async fn uapi_get_raw(sock_path: &str) -> std::result::Result<String, Box<dyn std::error::Error>> {
     let mut stream = tokio::net::UnixStream::connect(sock_path).await?;
     stream.write_all(b"get=1\n\n").await?;
@@ -402,6 +408,17 @@ async fn uapi_get_raw(sock_path: &str) -> std::result::Result<String, Box<dyn st
     let mut response = String::new();
     stream.read_to_string(&mut response).await?;
     Ok(response)
+}
+
+/// Windows stub: UAPI Unix-socket probe is unavailable. Returns a "not found"
+/// error which [`OverlayHealthChecker::get_wg_stats`] treats as "no peers",
+/// keeping health checks non-fatal on platforms without a UAPI socket.
+#[cfg(not(unix))]
+async fn uapi_get_raw(_sock_path: &str) -> std::result::Result<String, Box<dyn std::error::Error>> {
+    Err(Box::new(std::io::Error::new(
+        std::io::ErrorKind::NotFound,
+        "UAPI Unix socket not supported on this platform",
+    )))
 }
 
 /// Convert a hex-encoded key (from UAPI) to base64 (standard `WireGuard` format).

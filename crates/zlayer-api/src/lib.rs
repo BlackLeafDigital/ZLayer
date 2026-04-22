@@ -64,7 +64,6 @@ pub use router::{
     build_webhook_receiver_routes, build_workflow_routes,
 };
 pub use server::ApiServer;
-#[cfg(unix)]
 pub use server::{bind_dual_with_local_auth, serve_bound, BoundListeners};
 
 // Re-export state types for job/cron/build/deployment/service/internal/container endpoints

@@ -14,15 +14,11 @@
 //! - `observability`: Axum metrics and trace propagation
 
 mod app;
-#[cfg(unix)]
 mod bootstrap_admin;
-#[cfg(unix)]
 mod bootstrap_admin_env_grants;
 mod cli;
 mod commands;
-#[cfg(unix)]
 mod config;
-#[cfg(unix)]
 pub mod daemon;
 #[allow(dead_code)]
 mod deploy_tui;
@@ -91,41 +87,19 @@ fn main() -> ExitCode {
             }
         }
 
-        #[cfg(all(target_os = "windows", feature = "wsl"))]
+        #[cfg(target_os = "windows")]
         {
-            let vhd_gb_override = match &cli.command {
-                Some(Commands::Serve { vhd_gb, .. }) => *vhd_gb,
-                _ => None,
-            };
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime");
-            match rt.block_on(zlayer_wsl::setup::ensure_wsl_backend_ready_with_vhd_gb(
-                vhd_gb_override,
-            )) {
-                Ok(config) => match rt.block_on(zlayer_wsl::daemon::start_daemon(&config)) {
-                    Ok(()) => {
-                        println!("zlayer daemon started inside WSL2 on {}", config.api_addr);
-                        return ExitCode::SUCCESS;
-                    }
-                    Err(e) => {
-                        eprintln!("Error starting WSL2 daemon: {e:#}");
-                        return ExitCode::FAILURE;
-                    }
-                },
-                Err(e) => {
-                    eprintln!("Error setting up WSL2 backend: {e:#}");
-                    return ExitCode::FAILURE;
-                }
-            }
-        }
-
-        #[cfg(all(target_os = "windows", not(feature = "wsl")))]
-        {
-            eprintln!("On Windows, use 'zlayer serve' to start the daemon inside WSL2.");
-            eprintln!("The daemon runs automatically inside WSL2 when needed.");
-            return ExitCode::SUCCESS;
+            // No fork on Windows; the daemon runs in the foreground. Operators
+            // who want a background service can use a Windows service wrapper,
+            // scheduled task, or `Start-Process -WindowStyle Hidden`.
+            //
+            // The `wsl` feature only enables a Linux delegate runtime inside
+            // the native HCS-backed daemon — it is NOT required to serve.
+            eprintln!(
+                "Note: zlayer serve runs in the foreground on Windows. \
+                 To run in the background, wrap it in a Windows service or scheduled task."
+            );
+            // Fall through into the normal serve path below.
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -533,7 +507,13 @@ async fn run(mut cli: Cli) -> Result<()> {
         }
 
         // =================================================================
-        // Serve -- special handling: WSL on Windows, direct on Unix
+        // Serve -- native HCS daemon on Windows, direct on Unix.
+        //
+        // Windows previously routed through a daemon running inside WSL2.
+        // After Phase F-6, `create_runtime(RuntimeConfig::Hcs(..))` builds a
+        // native CompositeRuntime with an optional WSL2 delegate, so the
+        // Windows daemon path is now identical to Linux conceptually — it
+        // just binds TCP loopback instead of a Unix socket.
         // =================================================================
         Commands::Serve {
             bind,
@@ -541,71 +521,50 @@ async fn run(mut cli: Cli) -> Result<()> {
             no_swagger,
             daemon: _, // Already handled in main() before tokio runtime
             #[cfg(all(target_os = "windows", feature = "wsl"))]
-            vhd_gb,
+                vhd_gb: _,
             #[cfg(feature = "docker-compat")]
             docker_socket,
             #[cfg(feature = "docker-compat")]
             docker_socket_path,
             ..
         } => {
-            #[cfg(all(target_os = "windows", feature = "wsl"))]
-            {
-                let _ = (bind, jwt_secret, no_swagger);
-                let config = zlayer_wsl::setup::ensure_wsl_backend_ready_with_vhd_gb(*vhd_gb)
-                    .await
-                    .context("Failed to set up WSL2 backend")?;
-                zlayer_wsl::daemon::start_daemon(&config)
-                    .await
-                    .context("Failed to start daemon in WSL2")?;
-                println!("zlayer daemon running inside WSL2 on {}", config.api_addr);
-                Ok(())
+            // Spawn Docker API socket server if enabled (Unix only — the
+            // socket is a Unix domain socket).
+            #[cfg(all(unix, feature = "docker-compat"))]
+            if *docker_socket {
+                let path = docker_socket_path.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = zlayer_docker::socket::serve(std::path::Path::new(&path)).await
+                    {
+                        tracing::error!("Docker API socket server failed: {e}");
+                    }
+                });
             }
-            #[cfg(all(target_os = "windows", not(feature = "wsl")))]
+            #[cfg(all(not(unix), feature = "docker-compat"))]
             {
-                let _ = (bind, jwt_secret, no_swagger);
-                anyhow::bail!(
-                    "The 'serve' command requires the WSL feature on Windows.\n\
-                     Rebuild with: cargo build --features wsl"
-                );
+                let _ = (docker_socket, docker_socket_path);
             }
-            #[cfg(unix)]
-            {
-                // Spawn Docker API socket server if enabled
-                #[cfg(feature = "docker-compat")]
-                if *docker_socket {
-                    let path = docker_socket_path.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) =
-                            zlayer_docker::socket::serve(std::path::Path::new(&path)).await
-                        {
-                            tracing::error!("Docker API socket server failed: {e}");
-                        }
-                    });
-                }
 
-                let socket_path = cli.effective_socket_path();
-                let data_dir = cli.effective_data_dir();
-                Box::pin(commands::serve::serve(
-                    bind,
-                    jwt_secret.clone(),
-                    *no_swagger,
-                    &socket_path,
-                    cli.host_network,
-                    data_dir,
-                ))
-                .await
-            }
+            let socket_path = cli.effective_socket_path();
+            let data_dir = cli.effective_data_dir();
+            Box::pin(commands::serve::serve(
+                bind,
+                jwt_secret.clone(),
+                *no_swagger,
+                &socket_path,
+                cli.host_network,
+                data_dir,
+            ))
+            .await
         }
 
         // =================================================================
         // Runtime commands -- Unix only
         // =================================================================
-        #[cfg(unix)]
         Commands::Deploy { spec_path, dry_run } => {
             let path = util::discover_spec_path(spec_path.as_deref())?;
             commands::deploy::deploy(&cli, &path, *dry_run).await
         }
-        #[cfg(unix)]
         Commands::Join {
             token,
             spec_dir,
@@ -624,9 +583,7 @@ async fn run(mut cli: Cli) -> Result<()> {
             ))
             .await
         }
-        #[cfg(unix)]
         Commands::Status => commands::lifecycle::status(&cli).await,
-        #[cfg(unix)]
         Commands::Logs {
             deployment,
             service,
@@ -643,7 +600,6 @@ async fn run(mut cli: Cli) -> Result<()> {
             )
             .await
         }
-        #[cfg(unix)]
         Commands::Stop {
             deployment,
             service,
@@ -659,49 +615,37 @@ async fn run(mut cli: Cli) -> Result<()> {
             )
             .await
         }
-        #[cfg(unix)]
         Commands::Up { spec_path } => {
             let path = util::discover_spec_path(spec_path.as_deref())?;
             commands::deploy::up(&cli, &path).await
         }
-        #[cfg(unix)]
         Commands::Down { deployment } => commands::deploy::down(deployment.clone()).await,
-        #[cfg(unix)]
         Commands::Token(token_cmd) => commands::token::handle_token(token_cmd),
-        #[cfg(unix)]
         Commands::Exec {
             service,
             deployment,
             replica,
             cmd,
         } => commands::exec::exec(deployment.clone(), service, *replica, cmd).await,
-        #[cfg(unix)]
         Commands::Ps {
             deployment,
             containers,
             format,
         } => commands::ps::ps(deployment.clone(), *containers, format).await,
-        #[cfg(unix)]
         Commands::Node(node_cmd) => {
             commands::node::handle_node(node_cmd, &cli.effective_data_dir()).await
         }
-        #[cfg(unix)]
         Commands::Daemon(action) => {
             commands::daemon::handle_daemon(action, &cli.effective_data_dir()).await
         }
         #[cfg(all(target_os = "windows", feature = "wsl"))]
         Commands::Windows(cmd) => commands::windows::handle(cmd).await,
-        #[cfg(unix)]
         Commands::Image(image_cmd) => commands::image::handle_image(&cli, image_cmd).await,
-        #[cfg(unix)]
         Commands::Container(container_cmd) => {
             commands::container::handle_container(&cli, container_cmd).await
         }
-        #[cfg(unix)]
         Commands::System(system_cmd) => commands::system::handle_system(&cli, system_cmd).await,
-        #[cfg(unix)]
         Commands::Secret(secret_cmd) => commands::secret::handle_secret(&cli, secret_cmd).await,
-        #[cfg(unix)]
         Commands::Run {
             env,
             no_global,
@@ -722,15 +666,11 @@ async fn run(mut cli: Cli) -> Result<()> {
             )
             .await
         }
-        #[cfg(unix)]
         Commands::Network(network_cmd) => {
             commands::network::handle_network(&cli, network_cmd).await
         }
-        #[cfg(unix)]
         Commands::Job(job_cmd) => commands::job::handle_job(&cli, job_cmd).await,
-        #[cfg(unix)]
         Commands::Volume(volume_cmd) => commands::volume::handle_volume(&cli, volume_cmd).await,
-        #[cfg(unix)]
         Commands::Auth(auth_cmd) => match auth_cmd {
             cli::AuthCommands::Bootstrap {
                 email,
@@ -746,7 +686,6 @@ async fn run(mut cli: Cli) -> Result<()> {
             cli::AuthCommands::Logout => commands::auth::logout().await,
             cli::AuthCommands::Whoami => commands::auth::whoami().await,
         },
-        #[cfg(unix)]
         Commands::Env(env_cmd) => match env_cmd {
             cli::EnvCommands::Ls { project, output } => {
                 commands::env::list(project.clone(), output).await
@@ -764,7 +703,6 @@ async fn run(mut cli: Cli) -> Result<()> {
             } => commands::env::update(id.clone(), name.clone(), description.clone()).await,
             cli::EnvCommands::Delete { id, yes } => commands::env::delete(id.clone(), *yes).await,
         },
-        #[cfg(unix)]
         Commands::Task(task_cmd) => match task_cmd {
             cli::TaskCommands::List { project, output } => {
                 commands::task::list(project.clone(), output).await
@@ -782,7 +720,6 @@ async fn run(mut cli: Cli) -> Result<()> {
             cli::TaskCommands::Logs { id } => commands::task::logs(id.clone()).await,
             cli::TaskCommands::Delete { id, yes } => commands::task::delete(id.clone(), *yes).await,
         },
-        #[cfg(unix)]
         Commands::Workflow(wf_cmd) => match wf_cmd {
             cli::WorkflowCommands::List { output } => commands::workflow::list(output).await,
             cli::WorkflowCommands::Create {
@@ -796,7 +733,6 @@ async fn run(mut cli: Cli) -> Result<()> {
                 commands::workflow::delete(id.clone(), *yes).await
             }
         },
-        #[cfg(unix)]
         Commands::Notifier(n_cmd) => match n_cmd {
             cli::NotifierCommands::List { output } => commands::notifier::list(output).await,
             cli::NotifierCommands::Create {
@@ -818,7 +754,6 @@ async fn run(mut cli: Cli) -> Result<()> {
                 commands::notifier::delete(id.clone(), *yes).await
             }
         },
-        #[cfg(unix)]
         Commands::Variable(var_cmd) => match var_cmd {
             cli::VariableCommands::List { scope, output } => {
                 commands::variable::list(scope.clone(), output).await
@@ -833,7 +768,6 @@ async fn run(mut cli: Cli) -> Result<()> {
                 commands::variable::unset(name.clone(), scope.clone()).await
             }
         },
-        #[cfg(unix)]
         Commands::Project(project_cmd) => match project_cmd {
             cli::ProjectCommands::Ls { output } => commands::project::list(output).await,
             cli::ProjectCommands::Create {
@@ -917,7 +851,6 @@ async fn run(mut cli: Cli) -> Result<()> {
                 }
             },
         },
-        #[cfg(unix)]
         Commands::Credential(cred_cmd) => match cred_cmd {
             cli::CredentialCommands::Registry(reg_cmd) => match reg_cmd {
                 cli::RegistryCredentialCommands::Ls { output } => {
@@ -954,7 +887,6 @@ async fn run(mut cli: Cli) -> Result<()> {
                 }
             },
         },
-        #[cfg(unix)]
         Commands::Sync(sync_cmd) => match sync_cmd {
             cli::SyncCommands::Ls { output } => commands::sync_cmd::list(output).await,
             cli::SyncCommands::Create {
@@ -972,7 +904,6 @@ async fn run(mut cli: Cli) -> Result<()> {
                 commands::sync_cmd::delete(id.clone(), *yes).await
             }
         },
-        #[cfg(unix)]
         Commands::User(user_cmd) => match user_cmd {
             cli::UserCommands::Ls { output } => commands::user::list(output).await,
             cli::UserCommands::Create {
@@ -1012,7 +943,6 @@ async fn run(mut cli: Cli) -> Result<()> {
             }
             cli::UserCommands::Delete { id, yes } => commands::user::delete(id.clone(), *yes).await,
         },
-        #[cfg(unix)]
         Commands::Group(group_cmd) => match group_cmd {
             cli::GroupCommands::List { output } => commands::group::list(output).await,
             cli::GroupCommands::Create { name } => commands::group::create(name.clone()).await,
@@ -1028,7 +958,6 @@ async fn run(mut cli: Cli) -> Result<()> {
                 }
             },
         },
-        #[cfg(unix)]
         Commands::Permission(perm_cmd) => match perm_cmd {
             cli::PermissionCommands::List {
                 user,
@@ -1055,7 +984,6 @@ async fn run(mut cli: Cli) -> Result<()> {
                 commands::permission::revoke(id.clone()).await
             }
         },
-        #[cfg(unix)]
         Commands::Audit(audit_cmd) => match audit_cmd {
             cli::AuditCommands::Tail {
                 user,
@@ -1067,13 +995,6 @@ async fn run(mut cli: Cli) -> Result<()> {
                     .await
             }
         },
-
-        // On non-Unix platforms, runtime commands are not available
-        #[cfg(not(unix))]
-        _ => anyhow::bail!(
-            "This command requires the ZLayer runtime which is not available on Windows.\n\
-             Start the WSL2 daemon with 'zlayer serve' and use the daemon API."
-        ),
     }
 }
 

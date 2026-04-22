@@ -54,6 +54,7 @@ struct StaleDaemonMeta {
 )]
 async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind: &str) {
     let metadata_path = config.data_dir.join("daemon.json");
+    #[cfg(unix)]
     let my_pid = std::process::id();
 
     // Track whether the PID-based kill was conclusive (i.e. daemon.json existed
@@ -67,6 +68,12 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 
     // -----------------------------------------------------------------------
     // 1. Read the old daemon PID and terminate it if still alive
+    //
+    // Process termination is Unix-only: the stale-daemon kill path uses
+    // `libc::kill()` with SIGTERM/SIGKILL. On Windows we still read the old
+    // api_bind to pick the right port for the port-free check below, but
+    // skip the kill — subsequent bind attempts will surface
+    // "address in use" errors if a stale daemon is still running.
     // -----------------------------------------------------------------------
     if let Ok(contents) = tokio::fs::read_to_string(&metadata_path).await {
         match serde_json::from_str::<StaleDaemonMeta>(&contents) {
@@ -80,56 +87,71 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                     }
                 }
 
-                let old_pid = meta.pid as i32;
-                // Do not kill ourselves (pid file left over from a clean restart).
-                if old_pid as u32 == my_pid {
-                    info!(
-                        pid = old_pid,
-                        "Stale daemon PID matches current process, skipping kill"
-                    );
-                    pid_kill_conclusive = true;
-                } else if process_alive(old_pid) {
-                    warn!(
-                        pid = old_pid,
-                        "Stale daemon process detected, sending SIGTERM"
-                    );
-                    // SAFETY: we validated the PID is alive and is not us.
-                    unsafe { libc::kill(old_pid, libc::SIGTERM) };
-
-                    // Poll for up to 5 seconds waiting for graceful exit.
-                    let mut terminated = false;
-                    for _ in 0..50 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        if !process_alive(old_pid) {
-                            terminated = true;
-                            break;
-                        }
-                    }
-
-                    if terminated {
-                        info!(pid = old_pid, "Stale daemon exited after SIGTERM");
+                #[cfg(unix)]
+                {
+                    let old_pid = meta.pid as i32;
+                    // Do not kill ourselves (pid file left over from a clean restart).
+                    if old_pid as u32 == my_pid {
+                        info!(
+                            pid = old_pid,
+                            "Stale daemon PID matches current process, skipping kill"
+                        );
                         pid_kill_conclusive = true;
-                    } else {
+                    } else if process_alive(old_pid) {
                         warn!(
                             pid = old_pid,
-                            "Stale daemon did not exit in time, sending SIGKILL"
+                            "Stale daemon process detected, sending SIGTERM"
                         );
-                        unsafe { libc::kill(old_pid, libc::SIGKILL) };
-                        // Brief wait for the kernel to reap.
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        if process_alive(old_pid) {
-                            warn!(pid = old_pid, "Stale daemon still alive after SIGKILL");
-                        } else {
-                            info!(pid = old_pid, "Stale daemon killed with SIGKILL");
-                            pid_kill_conclusive = true;
+                        // SAFETY: we validated the PID is alive and is not us.
+                        unsafe { libc::kill(old_pid, libc::SIGTERM) };
+
+                        // Poll for up to 5 seconds waiting for graceful exit.
+                        let mut terminated = false;
+                        for _ in 0..50 {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            if !process_alive(old_pid) {
+                                terminated = true;
+                                break;
+                            }
                         }
+
+                        if terminated {
+                            info!(pid = old_pid, "Stale daemon exited after SIGTERM");
+                            pid_kill_conclusive = true;
+                        } else {
+                            warn!(
+                                pid = old_pid,
+                                "Stale daemon did not exit in time, sending SIGKILL"
+                            );
+                            unsafe { libc::kill(old_pid, libc::SIGKILL) };
+                            // Brief wait for the kernel to reap.
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            if process_alive(old_pid) {
+                                warn!(pid = old_pid, "Stale daemon still alive after SIGKILL");
+                            } else {
+                                info!(pid = old_pid, "Stale daemon killed with SIGKILL");
+                                pid_kill_conclusive = true;
+                            }
+                        }
+                    } else {
+                        info!(
+                            pid = old_pid,
+                            "Previous daemon is not running, cleaning up stale files"
+                        );
+                        pid_kill_conclusive = true;
                     }
-                } else {
+                }
+                #[cfg(not(unix))]
+                {
+                    // No process-kill on Windows in this phase. If the old
+                    // daemon is still running, the TCP bind below will fail
+                    // with a clear "address already in use" error.
                     info!(
-                        pid = old_pid,
-                        "Previous daemon is not running, cleaning up stale files"
+                        pid = meta.pid,
+                        "Found stale daemon.json on Windows; skipping process kill \
+                         (not yet implemented). TCP bind will fail if the old daemon \
+                         is still running."
                     );
-                    pid_kill_conclusive = true;
                 }
             }
             Err(e) => {
@@ -152,14 +174,25 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     }
 
     // -----------------------------------------------------------------------
-    // 1c. Remove stale unix socket
+    // 1c. Remove stale unix socket (Unix only; Windows uses TCP loopback).
     // -----------------------------------------------------------------------
-    let socket = std::path::Path::new(socket_path);
-    if socket.exists() {
-        match tokio::fs::remove_file(socket).await {
-            Ok(()) => info!(path = %socket_path, "Removed stale unix socket"),
-            Err(e) => warn!(path = %socket_path, error = %e, "Failed to remove stale unix socket"),
+    #[cfg(unix)]
+    {
+        let socket = std::path::Path::new(socket_path);
+        if socket.exists() {
+            match tokio::fs::remove_file(socket).await {
+                Ok(()) => info!(path = %socket_path, "Removed stale unix socket"),
+                Err(e) => {
+                    warn!(path = %socket_path, error = %e, "Failed to remove stale unix socket");
+                }
+            }
         }
+    }
+    #[cfg(not(unix))]
+    {
+        // `socket_path` is a TCP URI on Windows (e.g. "tcp://127.0.0.1:3669"),
+        // not a filesystem path — nothing to unlink.
+        let _ = socket_path;
     }
 
     // -----------------------------------------------------------------------
@@ -280,7 +313,12 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 
     // -----------------------------------------------------------------------
     // 4b. Wait for WireGuard UDP port to be free (DEFAULT_WG_PORT in bootstrap.rs)
+    //
+    // This block kills stale boringtun holders on Unix via libc::kill.
+    // On Windows we only do a passive poll — killing arbitrary processes
+    // that happen to hold the WG UDP port is F-7b territory.
     // -----------------------------------------------------------------------
+    #[cfg(unix)]
     {
         let wg_port = load_overlay_port(&config.data_dir);
         let wg_addr: std::net::SocketAddr = ([0, 0, 0, 0], wg_port).into();
@@ -365,6 +403,35 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
             }
         }
     }
+    #[cfg(not(unix))]
+    {
+        let wg_port = load_overlay_port(&config.data_dir);
+        let wg_addr: std::net::SocketAddr = ([0, 0, 0, 0], wg_port).into();
+        if std::net::UdpSocket::bind(wg_addr).is_err() {
+            // Passive wait — do not kill arbitrary processes on Windows in F-7a.
+            let mut wg_free = false;
+            for attempt in 1..=5 {
+                if std::net::UdpSocket::bind(wg_addr).is_ok() {
+                    if attempt > 1 {
+                        info!(
+                            port = wg_port,
+                            attempts = attempt,
+                            "WireGuard UDP port is now free"
+                        );
+                    }
+                    wg_free = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if !wg_free {
+                warn!(
+                    port = wg_port,
+                    "WireGuard UDP port still in use after passive wait — overlay may fail"
+                );
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // 5. Remove stale daemon metadata and PID files
@@ -384,6 +451,9 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 /// Check whether a process with the given PID is still alive.
 ///
 /// Uses `kill(pid, 0)` which checks for existence without sending a signal.
+/// Unix-only: Windows process lifecycle management will arrive with the
+/// `DaemonClient` work (Phase F-7b).
+#[cfg(unix)]
 #[allow(unsafe_code)]
 fn process_alive(pid: i32) -> bool {
     // SAFETY: signal 0 is a null signal used purely for existence checking.

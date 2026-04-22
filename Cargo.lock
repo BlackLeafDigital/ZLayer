@@ -12116,6 +12116,7 @@ dependencies = [
  "zlayer-secrets",
  "zlayer-spec",
  "zlayer-storage",
+ "zlayer-wsl",
  "zstd",
 ]
 
@@ -12176,6 +12177,7 @@ dependencies = [
  "zlayer-git",
  "zlayer-observability",
  "zlayer-overlay",
+ "zlayer-paths",
  "zlayer-proxy",
  "zlayer-scheduler",
  "zlayer-secrets",

@@ -277,9 +277,32 @@ pub async fn create_runtime(
             Ok(Arc::new(runtime))
         }
         #[cfg(target_os = "macos")]
-        RuntimeConfig::MacSandbox(config) => Ok(Arc::new(
-            runtimes::macos_sandbox::SandboxRuntime::new(config, auth_ctx)?,
-        )),
+        RuntimeConfig::MacSandbox(config) => {
+            let primary: Arc<dyn Runtime> = Arc::new(runtimes::macos_sandbox::SandboxRuntime::new(
+                config,
+                auth_ctx.clone(),
+            )?);
+            let delegate: Option<Arc<dyn Runtime>> = match runtimes::macos_vm::VmRuntime::new(
+                auth_ctx,
+            ) {
+                Ok(rt) => {
+                    tracing::info!(
+                            "macOS VM (libkrun) delegate available — Linux containers will execute in a micro-VM"
+                        );
+                    Some(Arc::new(rt))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "macOS VM delegate unavailable; node will only run mac-native containers"
+                    );
+                    None
+                }
+            };
+            Ok(Arc::new(runtimes::composite::CompositeRuntime::new(
+                primary, delegate,
+            )))
+        }
         #[cfg(target_os = "macos")]
         RuntimeConfig::MacVm => Ok(Arc::new(runtimes::macos_vm::VmRuntime::new(auth_ctx)?)),
         #[cfg(target_os = "windows")]
@@ -288,15 +311,46 @@ pub async fn create_runtime(
             tracing::warn!(
                 "RuntimeConfig::Wsl2 is deprecated; treating as RuntimeConfig::Hcs with default config"
             );
-            let runtime =
-                crate::runtimes::hcs::HcsRuntime::new(crate::runtimes::hcs::HcsConfig::default())
-                    .await?;
-            Ok(Arc::new(runtime))
+            Box::pin(create_runtime(
+                RuntimeConfig::Hcs(crate::runtimes::hcs::HcsConfig::default()),
+                auth_ctx,
+            ))
+            .await
         }
         #[cfg(target_os = "windows")]
         RuntimeConfig::Hcs(hcs_config) => {
-            let runtime = crate::runtimes::hcs::HcsRuntime::new(hcs_config).await?;
-            Ok(Arc::new(runtime))
+            let primary: Arc<dyn Runtime> =
+                Arc::new(crate::runtimes::hcs::HcsRuntime::new(hcs_config).await?);
+
+            #[cfg(feature = "wsl")]
+            let delegate: Option<Arc<dyn Runtime>> =
+                match runtimes::wsl2_delegate::Wsl2DelegateRuntime::try_new().await {
+                    Ok(Some(rt)) => {
+                        tracing::info!(
+                            "WSL2 delegate runtime available — Linux containers will execute inside the zlayer distro"
+                        );
+                        Some(Arc::new(rt))
+                    }
+                    Ok(None) => {
+                        tracing::info!(
+                            "WSL2 not available; node will only run Windows-image containers"
+                        );
+                        None
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "WSL2 delegate setup failed; node will only run Windows-image containers"
+                        );
+                        None
+                    }
+                };
+            #[cfg(not(feature = "wsl"))]
+            let delegate: Option<Arc<dyn Runtime>> = None;
+
+            Ok(Arc::new(runtimes::composite::CompositeRuntime::new(
+                primary, delegate,
+            )))
         }
     }
 }
@@ -320,6 +374,7 @@ pub async fn create_runtime(
     )),
     allow(unused_variables)
 )]
+#[allow(clippy::too_many_lines)]
 async fn create_auto_runtime(
     auth_ctx: Option<ContainerAuthContext>,
 ) -> Result<Arc<dyn Runtime + Send + Sync>> {
@@ -339,37 +394,104 @@ async fn create_auto_runtime(
         }
     }
 
-    // On macOS, try sandbox → VM → Docker
+    // On macOS, build a composite runtime:
+    //   primary  = SandboxRuntime (native Metal/MPS), when available
+    //   delegate = VmRuntime (libkrun Linux compat), when available
+    // If at least the primary is available, return the composite. Otherwise
+    // (e.g. sandbox init failed), fall through to Docker.
     #[cfg(target_os = "macos")]
     {
-        // Try sandbox first (native Metal/MPS performance)
-        match runtimes::macos_sandbox::SandboxRuntime::new(
+        let primary: Option<Arc<dyn Runtime>> = match runtimes::macos_sandbox::SandboxRuntime::new(
             MacSandboxConfig::default(),
             auth_ctx.clone(),
         ) {
-            Ok(rt) => return Ok(Arc::new(rt)),
-            Err(e) => tracing::warn!("macOS sandbox runtime unavailable: {e}"),
+            Ok(rt) => Some(Arc::new(rt)),
+            Err(e) => {
+                tracing::warn!("macOS sandbox runtime unavailable: {e}");
+                None
+            }
+        };
+        let delegate: Option<Arc<dyn Runtime>> = match runtimes::macos_vm::VmRuntime::new(
+            auth_ctx.clone(),
+        ) {
+            Ok(rt) => {
+                tracing::info!(
+                        "macOS VM (libkrun) delegate available — Linux containers will execute in a micro-VM"
+                    );
+                Some(Arc::new(rt))
+            }
+            Err(e) => {
+                tracing::warn!("macOS VM runtime (libkrun) unavailable: {e}");
+                None
+            }
+        };
+
+        if let Some(p) = primary {
+            return Ok(Arc::new(runtimes::composite::CompositeRuntime::new(
+                p, delegate,
+            )));
         }
-        // Fall back to VM runtime (Linux container compat with GPU forwarding)
-        match runtimes::macos_vm::VmRuntime::new(auth_ctx.clone()) {
-            Ok(rt) => return Ok(Arc::new(rt)),
-            Err(e) => tracing::warn!("macOS VM runtime (libkrun) unavailable: {e}"),
+        // If sandbox failed but VM succeeded, use the VM runtime on its own —
+        // it's still the best available native macOS path before falling back
+        // to Docker.
+        if let Some(d) = delegate {
+            return Ok(d);
         }
     }
 
-    // On Windows, try the native HCS runtime first, then fall back to Docker.
+    // On Windows, build a composite runtime:
+    //   primary  = HcsRuntime (native Windows containers), when available
+    //   delegate = Wsl2DelegateRuntime (Linux containers via WSL2), when available
+    // If the primary is available, return the composite. Otherwise fall
+    // through to Docker.
     #[cfg(target_os = "windows")]
     {
-        match crate::runtimes::hcs::HcsRuntime::new(crate::runtimes::hcs::HcsConfig::default())
-            .await
-        {
-            Ok(rt) => {
-                tracing::info!(
-                    "Using native Windows HCS runtime (no Docker Desktop / WSL2 required)"
-                );
-                return Ok(Arc::new(rt));
-            }
-            Err(e) => tracing::warn!(error = %e, "HCS runtime unavailable, falling back to Docker"),
+        let primary: Option<Arc<dyn Runtime>> =
+            match crate::runtimes::hcs::HcsRuntime::new(crate::runtimes::hcs::HcsConfig::default())
+                .await
+            {
+                Ok(rt) => {
+                    tracing::info!(
+                        "Using native Windows HCS runtime (no Docker Desktop / WSL2 required)"
+                    );
+                    Some(Arc::new(rt))
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "HCS runtime unavailable, falling back to Docker");
+                    None
+                }
+            };
+
+        #[cfg(feature = "wsl")]
+        let delegate: Option<Arc<dyn Runtime>> =
+            match runtimes::wsl2_delegate::Wsl2DelegateRuntime::try_new().await {
+                Ok(Some(rt)) => {
+                    tracing::info!(
+                        "WSL2 delegate runtime available — Linux containers will execute inside the zlayer distro"
+                    );
+                    Some(Arc::new(rt))
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        "WSL2 not available; node will only run Windows-image containers"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "WSL2 delegate setup failed; node will only run Windows-image containers"
+                    );
+                    None
+                }
+            };
+        #[cfg(not(feature = "wsl"))]
+        let delegate: Option<Arc<dyn Runtime>> = None;
+
+        if let Some(p) = primary {
+            return Ok(Arc::new(runtimes::composite::CompositeRuntime::new(
+                p, delegate,
+            )));
         }
     }
 

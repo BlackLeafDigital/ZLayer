@@ -899,6 +899,54 @@ impl ImagePuller {
         self.pull_image_config(image, auth).await
     }
 
+    /// Fetch the operating system targeted by `image` from its OCI config blob.
+    ///
+    /// Reads the top-level `os` field (OCI-canonical lowercase, e.g.
+    /// `"linux"` / `"windows"` / `"darwin"`) from the image config and
+    /// converts it via [`zlayer_spec::OsKind::from_oci_str`]. Multi-platform
+    /// indexes are resolved by the puller's configured `platform_resolver`
+    /// (set at construction time), so the answer reflects the manifest that
+    /// would actually be pulled for this host.
+    ///
+    /// Returns:
+    /// * `Ok(Some(os))` when the config blob carries a recognized OS.
+    /// * `Ok(None)` when the `os` field is absent or holds an unknown value —
+    ///   the caller should treat this as "fall through to a platform-agnostic
+    ///   default" rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest or config blob cannot be fetched, or
+    /// if the config blob cannot be parsed as valid JSON.
+    pub async fn image_os(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+    ) -> Result<Option<zlayer_spec::OsKind>> {
+        let (manifest, _digest) = self.pull_manifest(image, auth).await?;
+
+        let config_digest = &manifest.config.digest;
+        let config_blob = self.pull_blob(image, config_digest, auth).await?;
+
+        let config_root: OciImageConfigRoot =
+            serde_json::from_slice(&config_blob).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    image = %image,
+                    config_digest = %config_digest,
+                    "failed to parse image config JSON for OS inspection"
+                );
+                RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
+                    "failed to parse image config for {image}: {e}"
+                )))
+            })?;
+
+        Ok(config_root
+            .os
+            .as_deref()
+            .and_then(zlayer_spec::OsKind::from_oci_str))
+    }
+
     /// Detect the artifact type of an image from its manifest
     ///
     /// This method pulls the manifest and determines whether the image is a
@@ -1658,6 +1706,59 @@ async fn fetch_blob_from_url(
     }
 
     Ok(bytes.to_vec())
+}
+
+/// Convert a [`zlayer_spec::RegistryAuth`] into the [`RegistryAuth`] shape
+/// that the OCI client speaks. Anonymous is returned when `auth` is `None`.
+///
+/// Basic and Token map onto the same `(username, password)` shape today —
+/// the client's bearer-token path is a parsing detail handled by
+/// `oci-client` itself. The explicit match keeps us honest when a future
+/// [`zlayer_spec::RegistryAuthType`] variant lands with different semantics.
+fn spec_auth_to_oci(auth: Option<&zlayer_spec::RegistryAuth>) -> RegistryAuth {
+    let Some(a) = auth else {
+        return RegistryAuth::Anonymous;
+    };
+    match a.auth_type {
+        zlayer_spec::RegistryAuthType::Basic | zlayer_spec::RegistryAuthType::Token => {
+            RegistryAuth::Basic(a.username.clone(), a.password.clone())
+        }
+    }
+}
+
+/// Fetch the OCI operating system of `image` without pulling any layers.
+///
+/// Convenience wrapper that constructs an ephemeral [`ImagePuller`] backed by
+/// an in-memory [`BlobCache`] and calls [`ImagePuller::image_os`]. Intended
+/// for callers that need a one-shot OS inspection and don't otherwise own a
+/// long-lived puller — e.g. the agent's `CompositeRuntime` deciding which
+/// child runtime should run a freshly-pulled image. The caller's own
+/// long-lived puller has already pulled the blobs to its persistent cache;
+/// this helper only touches the ~1–5 KB config blob, so the redundant fetch
+/// is negligible.
+///
+/// Auth is the same [`zlayer_spec::RegistryAuth`] carried on the
+/// [`Runtime::pull_image_with_policy`](crate) trait; `None` maps to
+/// anonymous. The manifest is resolved for the process's runtime platform
+/// (with the historical macOS `darwin → linux` fallback) — matching the
+/// behavior of [`ImagePuller::new`].
+///
+/// # Errors
+///
+/// Returns an error if the in-memory cache cannot be initialized, or if the
+/// manifest or config blob cannot be fetched or parsed. Callers in the hot
+/// path (e.g. `CompositeRuntime::pull_image_with_policy`) should treat any
+/// error as non-fatal: the safe fall-through is "dispatch to the primary
+/// runtime" rather than failing the pull.
+pub async fn fetch_image_os(
+    image: &str,
+    auth: Option<&zlayer_spec::RegistryAuth>,
+) -> Result<Option<zlayer_spec::OsKind>> {
+    let cache = crate::cache::BlobCache::new()?;
+    let puller = ImagePuller::new(cache);
+
+    let oci_auth = spec_auth_to_oci(auth);
+    puller.image_os(image, &oci_auth).await
 }
 
 #[cfg(test)]

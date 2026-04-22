@@ -223,6 +223,24 @@ impl ZLayerDirs {
         self.data_dir.join("admin_password")
     }
 
+    /// Path to the persisted local-admin bearer token file.
+    ///
+    /// On Linux/macOS this file is informational — the daemon's UDS middleware
+    /// already injects the bearer into UDS-originated requests. On Windows the
+    /// `DaemonClient` reads this file on connect to authenticate against the
+    /// loopback TCP listener (which has no socket-path-based local-admin
+    /// bypass).
+    ///
+    /// Default: `<data_dir>/admin_bearer.token`
+    ///
+    /// On Windows this resolves under `%ProgramData%\ZLayer` so the file
+    /// inherits the parent ACL (SYSTEM + Administrators write, Users read),
+    /// which is adequate for the local-admin bearer.
+    #[must_use]
+    pub fn admin_bearer_path(&self) -> PathBuf {
+        self.data_dir.join("admin_bearer.token")
+    }
+
     /// Daemon metadata file path (`{data}/daemon.json`).
     pub fn daemon_json(&self) -> PathBuf {
         self.data_dir.join("daemon.json")
@@ -265,6 +283,12 @@ impl ZLayerDirs {
     pub fn tmp(&self) -> PathBuf {
         self.data_dir.join("tmp")
     }
+}
+
+/// Convenience: `ZLayerDirs::system_default().admin_bearer_path()`.
+#[must_use]
+pub fn default_admin_bearer_path() -> PathBuf {
+    ZLayerDirs::system_default().admin_bearer_path()
 }
 
 // -- Internal helpers --------------------------------------------------------
@@ -344,6 +368,23 @@ mod tests {
     fn system_default_uses_default_data_dir() {
         let dirs = ZLayerDirs::system_default();
         assert_eq!(dirs.data_dir(), ZLayerDirs::default_data_dir().as_path());
+    }
+
+    #[test]
+    fn admin_bearer_path_is_under_data_dir() {
+        let dirs = ZLayerDirs::new(PathBuf::from("/tmp/zlayer-test"));
+        assert_eq!(
+            dirs.admin_bearer_path(),
+            PathBuf::from("/tmp/zlayer-test/admin_bearer.token")
+        );
+    }
+
+    #[test]
+    fn default_admin_bearer_path_matches_system_default() {
+        assert_eq!(
+            default_admin_bearer_path(),
+            ZLayerDirs::system_default().admin_bearer_path()
+        );
     }
 
     #[cfg(target_os = "windows")]

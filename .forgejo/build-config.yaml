@@ -22,7 +22,7 @@ services:
         registry:
           type: cargo
           name: zlayer-sdk
-          url: https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/cargo/
+          url: https://crates.io
       plugin-sdk-python:
         paths:
           - clients/zlayer-sdk/python/**

@@ -980,6 +980,172 @@ async fn status(data_dir: &Path) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
+// Windows (no system service integration yet — direct spawn)
+// ---------------------------------------------------------------------------
+//
+// Windows does not yet have a launchd/systemd-equivalent integration.  For
+// v1 we manage the daemon as a foreground-spawned background process:
+//
+//   - `install`   — pre-create log dir, optionally spawn the daemon.
+//   - `uninstall` — best-effort stop; no service registration to remove.
+//   - `start`     — spawn `zlayer serve --daemon --bind <addr>` and poll
+//                   the TCP endpoint until reachable (same pattern as
+//                   `DaemonClient::auto_start_daemon_windows`).
+//   - `stop`      — graceful shutdown over the network is not implemented
+//                   yet; print a pointer to Task Manager / Stop-Process.
+//   - `restart`   — `stop` then `start`.
+//   - `status`    — probe the TCP endpoint via `DaemonClient::try_connect`;
+//                   "running" if reachable, "stopped" otherwise.
+//
+// TODO(windows): full Windows Service integration (sc.exe create / SCM APIs)
+// with a proper graceful-shutdown control code so `stop` doesn't need the
+// user to reach for Task Manager.
+
+#[cfg(target_os = "windows")]
+async fn install(
+    data_dir: &Path,
+    no_start: bool,
+    bind: &str,
+    jwt_secret: Option<&str>,
+    no_swagger: bool,
+    #[cfg(feature = "docker-compat")] _docker_socket: bool,
+) -> Result<()> {
+    let log_dir = crate::cli::default_log_dir(data_dir);
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("Warning: could not create {}: {e}", log_dir.display());
+    }
+
+    println!("Daemon configured (Windows has no system service integration yet).");
+    println!("  Data dir: {}", data_dir.display());
+    println!("  Bind:     {bind}");
+    if no_swagger {
+        println!("  Swagger:  disabled");
+    }
+
+    if !no_start {
+        spawn_daemon_windows(data_dir, bind, jwt_secret, no_swagger).await?;
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn uninstall() -> Result<()> {
+    // No system service registration on Windows yet, so there's nothing to
+    // remove.  Best-effort stop so a leftover daemon doesn't survive an
+    // uninstall — but don't fail if it's already gone.
+    let _ = stop().await;
+    println!("Daemon uninstalled (no system service to remove on Windows).");
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn start(data_dir: &Path) -> Result<()> {
+    // Default bind matches the Windows auto-start path (see
+    // `DaemonClient::auto_start_daemon_windows`).  `daemon install` callers
+    // that want a different bind should re-run install with `--bind`.
+    let bind = "127.0.0.1:3669";
+    spawn_daemon_windows(data_dir, bind, None, false).await
+}
+
+#[cfg(target_os = "windows")]
+async fn stop() -> Result<()> {
+    // Graceful remote shutdown of a native Windows daemon is not yet
+    // implemented — doing it cleanly wants either a Windows Service control
+    // code or a dedicated shutdown endpoint on the API.  Surface that
+    // clearly so the user knows this is expected, not a bug.
+    println!(
+        "Graceful daemon shutdown is not yet implemented on Windows.\n\
+         Use Task Manager or PowerShell to stop the process:\n\
+         \n  Get-Process zlayer | Stop-Process\n"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn restart(data_dir: &Path) -> Result<()> {
+    stop().await.ok();
+    start(data_dir).await
+}
+
+#[cfg(target_os = "windows")]
+async fn status(_data_dir: &Path) -> Result<()> {
+    // The daemon's readiness signal is the API socket, same as on Unix.
+    // Probe via the shared `DaemonClient::try_connect` helper, which on
+    // Windows speaks TCP + bearer auth.
+    match zlayer_client::DaemonClient::try_connect().await {
+        Ok(Some(_)) => {
+            println!("Daemon: running");
+        }
+        _ => {
+            println!("Daemon: stopped");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn spawn_daemon_windows(
+    data_dir: &Path,
+    bind: &str,
+    jwt_secret: Option<&str>,
+    no_swagger: bool,
+) -> Result<()> {
+    use tokio::process::Command;
+
+    let exe = std::env::current_exe().context("Failed to resolve current executable path")?;
+
+    let log_dir = crate::cli::default_log_dir(data_dir);
+    truncate_daemon_logs(&log_dir);
+
+    // Write spawner PID so the new daemon's cleanup_stale_daemon() won't
+    // kill this CLI process while we wait for readiness. Mirrors the Unix
+    // behavior in `install`/`start`.
+    let spawner_pid_path = data_dir.join("spawner.pid");
+    std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
+
+    // --data-dir is a top-level Cli arg, so it must come BEFORE the
+    // subcommand — matches the Linux systemd unit.
+    let mut cmd = Command::new(&exe);
+    cmd.arg("--data-dir").arg(data_dir);
+    cmd.arg("serve").arg("--daemon").arg("--bind").arg(bind);
+    if no_swagger {
+        cmd.arg("--no-swagger");
+    }
+    if let Some(secret) = jwt_secret {
+        cmd.env("ZLAYER_JWT_SECRET", secret);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    // Spawn detached — `zlayer serve` on Windows stays in the foreground
+    // of its own process (no fork/daemonize), so we must not `.status()`
+    // here or we'd block forever waiting for the daemon to exit.
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to spawn daemon process: {}", exe.display()))?;
+    // Dropping the Child handle without awaiting it leaves the daemon
+    // running independently of this CLI process.
+    drop(child);
+
+    print!("Daemon starting...");
+    match wait_for_daemon_ready(45).await {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&spawner_pid_path);
+            println!(" started");
+            println!("  Stop: see `zlayer daemon stop`");
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&spawner_pid_path);
+            println!(" failed");
+            return Err(e);
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Log helpers (shared across platforms)
 // ---------------------------------------------------------------------------
 

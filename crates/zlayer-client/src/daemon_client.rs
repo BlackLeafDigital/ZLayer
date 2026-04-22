@@ -1,15 +1,23 @@
-//! HTTP-over-Unix-socket client for CLI-to-daemon communication.
+//! HTTP client for CLI-to-daemon communication.
 //!
 //! Provides a typed [`DaemonClient`] that communicates with the `zlayer serve`
-//! daemon via its Unix domain socket (platform-dependent path; see
-//! [`default_socket_path()`]).  If the daemon is not running,
-//! [`DaemonClient::connect`] will auto-start it and wait with exponential backoff
-//! until the socket becomes available.
+//! daemon. On Unix platforms the transport is HTTP-over-Unix-domain-socket
+//! (platform-dependent path; see [`default_socket_path()`]). On Windows it is
+//! HTTP-over-TCP-loopback at `127.0.0.1:3669`.
+//!
+//! If the daemon is not running, [`DaemonClient::connect`] will auto-start it
+//! and wait with exponential backoff until the socket / TCP port becomes
+//! available.
 
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::future::Future;
+#[cfg(windows)]
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::pin::Pin;
+#[cfg(unix)]
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -17,9 +25,12 @@ use anyhow::{bail, Context as _, Result};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::Uri;
+#[cfg(windows)]
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
+#[cfg(unix)]
 use tokio::net::UnixStream;
 use tracing::{debug, info};
 use zlayer_api::handlers::auth::{BootstrapRequest, LoginRequest, LoginResponse, UserView};
@@ -31,10 +42,11 @@ use zlayer_api::handlers::secrets::{
 use zlayer_api::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
 use zlayer_api::storage::{StoredEnvironment, StoredVariable};
 
-/// Default path for the daemon Unix socket.
+/// Default daemon endpoint.
 ///
-/// On macOS: `~/.zlayer/run/zlayer.sock`.
-/// On Linux: `/var/run/zlayer.sock`.
+/// On macOS: `~/.zlayer/run/zlayer.sock` (Unix-domain socket path).
+/// On Linux: `/var/run/zlayer.sock` (Unix-domain socket path).
+/// On Windows: `tcp://127.0.0.1:3669` (TCP loopback URL).
 #[must_use]
 pub fn default_socket_path() -> String {
     zlayer_paths::ZLayerDirs::default_socket_path()
@@ -47,11 +59,13 @@ pub fn default_socket_path() -> String {
 /// A [`tower::Service`] connector that routes every request to a fixed Unix
 /// domain socket, regardless of the URI's host/port.  This lets us reuse the
 /// standard `hyper_util::client::legacy::Client` for HTTP-over-UDS.
+#[cfg(unix)]
 #[derive(Clone)]
 struct UnixConnector {
     socket_path: PathBuf,
 }
 
+#[cfg(unix)]
 impl UnixConnector {
     fn new(socket_path: impl Into<PathBuf>) -> Self {
         Self {
@@ -60,6 +74,7 @@ impl UnixConnector {
     }
 }
 
+#[cfg(unix)]
 impl tower::Service<Uri> for UnixConnector {
     type Response = hyper_util::rt::TokioIo<UnixStream>;
     type Error = std::io::Error;
@@ -79,19 +94,82 @@ impl tower::Service<Uri> for UnixConnector {
 }
 
 // ---------------------------------------------------------------------------
+// Platform-specific connector type alias
+// ---------------------------------------------------------------------------
+
+/// Transport connector used by [`DaemonClient`]. On Unix this is the custom
+/// [`UnixConnector`] (HTTP-over-UDS). On Windows it is `hyper_util`'s standard
+/// [`HttpConnector`] (HTTP-over-TCP loopback).
+#[cfg(unix)]
+type DaemonConnector = UnixConnector;
+#[cfg(windows)]
+type DaemonConnector = HttpConnector;
+
+// ---------------------------------------------------------------------------
+// Windows endpoint helpers
+// ---------------------------------------------------------------------------
+
+/// Parse a daemon endpoint string into a [`SocketAddr`].
+///
+/// Accepts either `tcp://127.0.0.1:3669` (the shape returned by
+/// [`default_socket_path()`] on Windows) or a bare `127.0.0.1:3669`.
+#[cfg(windows)]
+fn parse_tcp_url(raw: &str) -> Result<SocketAddr> {
+    let trimmed = raw.strip_prefix("tcp://").unwrap_or(raw);
+    trimmed
+        .parse::<SocketAddr>()
+        .map_err(|e| anyhow::anyhow!("invalid daemon endpoint {raw:?}: {e}"))
+}
+
+/// Read the locally-persisted admin bearer token, if any.
+///
+/// Windows has no Unix-socket peer-credential check, so the daemon
+/// authenticates local admin clients via a file-backed bearer token.
+///
+/// The server persists the raw JWT to
+/// [`zlayer_paths::default_admin_bearer_path()`] on startup (see
+/// `zlayer-api::server::persist_admin_bearer`). This reads that file and
+/// returns the trimmed contents, or `None` if the file is missing, empty, or
+/// unreadable (e.g. permission denied). Callers then fall back to whatever
+/// the daemon's default auth path permits.
+#[cfg(windows)]
+fn read_local_bearer() -> Option<String> {
+    let path = zlayer_paths::default_admin_bearer_path();
+    let raw = std::fs::read_to_string(&path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DaemonClient
 // ---------------------------------------------------------------------------
 
-/// HTTP client that communicates with the zlayer daemon over a Unix socket.
+/// HTTP client that communicates with the zlayer daemon.
 ///
-/// All API methods send HTTP requests to the daemon's REST API.  The URI host
-/// component is set to `localhost` (ignored by the connector) and the path
-/// matches the route definitions in `zlayer-api`.
+/// All API methods send HTTP requests to the daemon's REST API. On Unix the
+/// URI host component is set to `localhost` (ignored by the connector, which
+/// always dials the configured Unix-domain socket). On Windows the host
+/// component is the TCP endpoint (`127.0.0.1:3669`).
 pub struct DaemonClient {
-    /// Inner hyper client wired to the Unix connector.
-    client: Client<UnixConnector, Full<Bytes>>,
-    /// Path to the Unix socket file.
+    /// Inner hyper client wired to the platform-specific connector.
+    client: Client<DaemonConnector, Full<Bytes>>,
+    /// Path to the Unix socket file (Unix only).
+    #[cfg(unix)]
     socket_path: PathBuf,
+    /// TCP loopback endpoint (Windows only).
+    #[cfg(windows)]
+    endpoint: SocketAddr,
+    /// Bearer token read from the local admin-token file (Windows only).
+    ///
+    /// Windows has no Unix-socket peer-credential check, so the daemon
+    /// authenticates local admin clients via a file-backed bearer token.
+    /// Batch B of F-7b will persist this token; for now this is always `None`.
+    #[cfg(windows)]
+    bearer: Option<String>,
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -102,23 +180,55 @@ impl DaemonClient {
 
     /// Connect to the daemon, auto-starting it if it is not already running.
     ///
-    /// Checks for the Unix socket at [`default_socket_path()`].  If the socket
-    /// does not exist and no daemon PID is found, `zlayer serve --daemon`
+    /// On Unix: checks for the Unix socket at [`default_socket_path()`]. If the
+    /// socket does not exist and no daemon PID is found, `zlayer serve --daemon`
     /// is spawned and the function polls the socket with exponential backoff
     /// (100 ms -> 200 ms -> 400 ms -> ... -> 1 s, max 20 attempts, ~10 s total).
+    ///
+    /// On Windows: connects to `tcp://127.0.0.1:3669` (or whatever
+    /// [`default_socket_path()`] returns). Auto-start uses the same spawn
+    /// logic, but polls the TCP port rather than a socket file.
+    #[cfg(unix)]
     pub async fn connect() -> Result<Self> {
         Self::connect_to(&default_socket_path()).await
+    }
+
+    /// Connect to the daemon, auto-starting it if it is not already running.
+    ///
+    /// See Unix variant above for semantics.
+    #[cfg(windows)]
+    pub async fn connect() -> Result<Self> {
+        let raw = default_socket_path();
+        Self::connect_to(raw).await
     }
 
     /// Try to connect to a running daemon without auto-starting.
     ///
     /// Returns `Ok(Some(client))` if the daemon is running and healthy,
     /// `Ok(None)` if the daemon is not running, or `Err` on unexpected errors.
+    #[cfg(unix)]
     pub async fn try_connect() -> Result<Option<Self>> {
         Self::try_connect_to(&default_socket_path()).await
     }
 
+    /// Try to connect to a running daemon without auto-starting.
+    #[cfg(windows)]
+    pub async fn try_connect() -> Result<Option<Self>> {
+        let raw = default_socket_path();
+        match parse_tcp_url(&raw) {
+            Ok(endpoint) => {
+                let bearer = read_local_bearer();
+                match Self::try_build_windows(endpoint, bearer).await {
+                    Ok(client) => Ok(Some(client)),
+                    Err(_) => Ok(None),
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Like [`try_connect`](Self::try_connect) but with a custom socket path.
+    #[cfg(unix)]
     pub async fn try_connect_to(socket_path: impl AsRef<Path>) -> Result<Option<Self>> {
         let socket_path = socket_path.as_ref().to_path_buf();
 
@@ -132,7 +242,26 @@ impl DaemonClient {
         }
     }
 
+    /// Like [`try_connect`](Self::try_connect) but with a custom TCP endpoint.
+    ///
+    /// Accepts either `tcp://127.0.0.1:3669` or bare `127.0.0.1:3669`.
+    #[cfg(windows)]
+    pub async fn try_connect_to(endpoint: impl Into<String>) -> Result<Option<Self>> {
+        let raw = endpoint.into();
+        match parse_tcp_url(&raw) {
+            Ok(parsed) => {
+                let bearer = read_local_bearer();
+                match Self::try_build_windows(parsed, bearer).await {
+                    Ok(client) => Ok(Some(client)),
+                    Err(_) => Ok(None),
+                }
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
     /// Like [`connect`](Self::connect) but with a custom socket path.
+    #[cfg(unix)]
     pub async fn connect_to(socket_path: impl AsRef<Path>) -> Result<Self> {
         let socket_path = socket_path.as_ref().to_path_buf();
 
@@ -155,8 +284,33 @@ impl DaemonClient {
             .context("Cannot connect to ZLayer daemon. Run 'zlayer status' for details.")
     }
 
+    /// Like [`connect`](Self::connect) but with a custom TCP endpoint.
+    ///
+    /// Accepts either `tcp://127.0.0.1:3669` or bare `127.0.0.1:3669`.
+    #[cfg(windows)]
+    pub async fn connect_to(endpoint: impl Into<String>) -> Result<Self> {
+        let raw = endpoint.into();
+        let parsed = parse_tcp_url(&raw)?;
+        let bearer = read_local_bearer();
+
+        // Fast path: try to talk to an already-running daemon.
+        if let Ok(client) = Self::try_build_windows(parsed, bearer.clone()).await {
+            return Ok(client);
+        }
+
+        // No running daemon detected -- start one.
+        info!("Daemon not running, auto-starting...");
+        eprintln!("ZLayer daemon not running. Starting...");
+        Self::auto_start_daemon_windows(parsed).await?;
+
+        Self::try_build_windows(parsed, bearer)
+            .await
+            .context("Cannot connect to ZLayer daemon. Run 'zlayer status' for details.")
+    }
+
     /// Build the client and verify that the daemon is reachable via a health
     /// check.  Returns `Err` if the health probe fails.
+    #[cfg(unix)]
     async fn try_build(socket_path: &Path) -> Result<Self> {
         let connector = UnixConnector::new(socket_path);
         let client = Client::builder(TokioExecutor::new()).build(connector);
@@ -167,6 +321,25 @@ impl DaemonClient {
         };
 
         // Quick health probe -- if this fails the daemon is not (yet) ready.
+        if dc.health_check().await? {
+            Ok(dc)
+        } else {
+            bail!("Daemon health check returned unhealthy")
+        }
+    }
+
+    /// Build the Windows client and verify reachability via a health check.
+    #[cfg(windows)]
+    async fn try_build_windows(endpoint: SocketAddr, bearer: Option<String>) -> Result<Self> {
+        let connector = HttpConnector::new();
+        let client = Client::builder(TokioExecutor::new()).build(connector);
+
+        let dc = Self {
+            client,
+            endpoint,
+            bearer,
+        };
+
         if dc.health_check().await? {
             Ok(dc)
         } else {
@@ -186,6 +359,7 @@ impl DaemonClient {
 
     /// Spawn `zlayer serve --daemon` and poll the socket with
     /// exponential backoff until the daemon is reachable or we give up.
+    #[cfg(unix)]
     async fn auto_start_daemon(socket_path: &Path) -> Result<()> {
         let runtime_bin = Self::find_self_binary()?;
 
@@ -276,23 +450,130 @@ impl DaemonClient {
         )
     }
 
+    /// Windows auto-start: spawn `zlayer serve --daemon --bind <addr>` and
+    /// poll the TCP endpoint with exponential backoff.
+    #[cfg(windows)]
+    async fn auto_start_daemon_windows(endpoint: SocketAddr) -> Result<()> {
+        let runtime_bin = Self::find_self_binary()?;
+
+        debug!(binary = %runtime_bin.display(), "Spawning daemon");
+
+        let mut cmd = std::process::Command::new(&runtime_bin);
+
+        // Propagate data-dir in the same way as the Unix path.
+        if std::env::var_os("ZLAYER_DATA_DIR").is_none() {
+            let data_dir = zlayer_paths::ZLayerDirs::detect_data_dir();
+            cmd.arg("--data-dir").arg(&data_dir);
+        }
+
+        cmd.env("ZLAYER_SPAWNER_PID", std::process::id().to_string());
+
+        cmd.arg("serve")
+            .arg("--daemon")
+            .arg("--bind")
+            .arg(endpoint.to_string());
+
+        let status = cmd
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .with_context(|| {
+                format!("Failed to spawn daemon process: {}", runtime_bin.display())
+            })?;
+
+        if !status.success() {
+            bail!(
+                "Daemon process exited with status {} (binary: {})",
+                status,
+                runtime_bin.display()
+            );
+        }
+
+        // Poll endpoint with exponential backoff: 100ms, 200ms, 400ms, 800ms,
+        // then 1s for the remaining attempts.  Max 20 attempts (~10 s).
+        let mut delay = Duration::from_millis(100);
+        let max_delay = Duration::from_secs(1);
+        let max_attempts = 20u32;
+
+        for attempt in 1..=max_attempts {
+            tokio::time::sleep(delay).await;
+
+            match tokio::net::TcpStream::connect(endpoint).await {
+                Ok(_) => {
+                    info!(
+                        attempts = attempt,
+                        "Daemon endpoint is accepting connections"
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    debug!(
+                        attempt,
+                        error = %e,
+                        "Endpoint not yet accepting connections"
+                    );
+                }
+            }
+
+            delay = std::cmp::min(delay * 2, max_delay);
+        }
+
+        let log_dir = zlayer_paths::ZLayerDirs::default_log_dir();
+        let log_path = log_dir.join("daemon.log");
+        let timeout_secs = 10;
+        eprintln!("Failed to start ZLayer daemon after {timeout_secs}s.");
+        eprintln!("  Check logs: {}", log_path.display());
+        eprintln!("  Start manually: zlayer serve");
+        bail!(
+            "Timed out waiting for daemon to start after {} attempts (~{} s). \
+             Endpoint: {}",
+            max_attempts,
+            timeout_secs,
+            endpoint
+        )
+    }
+
     // ------------------------------------------------------------------
     // Low-level HTTP helpers
     // ------------------------------------------------------------------
 
+    /// Build the request URI for a given API path.
+    ///
+    /// On Unix the host is the literal `localhost` (ignored by
+    /// [`UnixConnector`], which always dials the configured socket). On
+    /// Windows the host is the configured TCP endpoint so the stock
+    /// [`HttpConnector`] can resolve and dial it.
+    #[cfg_attr(unix, allow(clippy::unused_self))]
+    fn uri(&self, path: &str) -> Result<Uri> {
+        #[cfg(unix)]
+        let url = format!("http://localhost{path}");
+        #[cfg(windows)]
+        let url = format!("http://{}{path}", self.endpoint);
+
+        url.parse::<Uri>()
+            .map_err(|e| anyhow::anyhow!("invalid uri {url:?}: {e}"))
+    }
+
     /// If the user has a saved session (`~/.zlayer/session.json`) with an
-    /// unexpired token, attach it as an `Authorization: Bearer <token>` header.
-    /// When the file is absent or the token has expired, this is a no-op -- the
-    /// daemon's Unix-socket middleware will inject the local-admin token.
+    /// unexpired token, attach it as an `Authorization: Bearer <token>`
+    /// header. When the file is absent or the token has expired, this falls
+    /// back on Windows to the locally-persisted admin bearer (if any); on
+    /// Unix it is a no-op because the daemon's Unix-socket middleware injects
+    /// the local-admin token via peer-credential check.
+    #[cfg_attr(unix, allow(clippy::unused_self))]
     fn apply_session_auth(
+        &self,
         mut builder: hyper::http::request::Builder,
     ) -> hyper::http::request::Builder {
+        let mut session_attached = false;
         match crate::session::read_session() {
             Ok(Some(session)) if !session.is_expired() => {
                 builder = builder.header(
                     hyper::header::AUTHORIZATION,
                     format!("Bearer {}", session.token),
                 );
+                session_attached = true;
             }
             Ok(Some(expired)) => {
                 tracing::debug!(
@@ -308,20 +589,36 @@ impl DaemonClient {
                 );
             }
         }
+
+        // On Windows: if no session was attached, fall back to the
+        // locally-persisted admin bearer. Batch B populates this; Batch A
+        // leaves it as `None`, making this a no-op for now.
+        #[cfg(windows)]
+        {
+            if !session_attached {
+                if let Some(bearer) = self.bearer.as_deref() {
+                    builder =
+                        builder.header(hyper::header::AUTHORIZATION, format!("Bearer {bearer}"));
+                }
+            }
+        }
+        #[cfg(unix)]
+        {
+            let _ = session_attached;
+        }
+
         builder
     }
 
     /// Send a GET request and return the response body as bytes.
     async fn get(&self, path: &str) -> Result<(hyper::StatusCode, Bytes)> {
-        let uri: Uri = format!("http://localhost{path}")
-            .parse()
-            .with_context(|| format!("Invalid request path: {path}"))?;
+        let uri = self.uri(path)?;
 
         let builder = hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri(uri)
             .header("Host", "localhost");
-        let builder = Self::apply_session_auth(builder);
+        let builder = self.apply_session_auth(builder);
         let req = builder
             .body(Full::new(Bytes::new()))
             .context("Failed to build GET request")?;
@@ -345,16 +642,14 @@ impl DaemonClient {
 
     /// Send a POST request with a JSON body and return the response.
     async fn post_json(&self, path: &str, body: &str) -> Result<(hyper::StatusCode, Bytes)> {
-        let uri: Uri = format!("http://localhost{path}")
-            .parse()
-            .with_context(|| format!("Invalid request path: {path}"))?;
+        let uri = self.uri(path)?;
 
         let builder = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(uri)
             .header("Host", "localhost")
             .header("Content-Type", "application/json");
-        let builder = Self::apply_session_auth(builder);
+        let builder = self.apply_session_auth(builder);
         let req = builder
             .body(Full::new(Bytes::from(body.to_owned())))
             .context("Failed to build POST request")?;
@@ -378,15 +673,13 @@ impl DaemonClient {
 
     /// Send a DELETE request and return the response.
     async fn delete(&self, path: &str) -> Result<(hyper::StatusCode, Bytes)> {
-        let uri: Uri = format!("http://localhost{path}")
-            .parse()
-            .with_context(|| format!("Invalid request path: {path}"))?;
+        let uri = self.uri(path)?;
 
         let builder = hyper::Request::builder()
             .method(hyper::Method::DELETE)
             .uri(uri)
             .header("Host", "localhost");
-        let builder = Self::apply_session_auth(builder);
+        let builder = self.apply_session_auth(builder);
         let req = builder
             .body(Full::new(Bytes::new()))
             .context("Failed to build DELETE request")?;
@@ -412,16 +705,14 @@ impl DaemonClient {
     ///
     /// Used for endpoints whose body is not JSON (e.g. dotenv bulk imports).
     async fn post_text(&self, path: &str, body: &str) -> Result<(hyper::StatusCode, Bytes)> {
-        let uri: Uri = format!("http://localhost{path}")
-            .parse()
-            .with_context(|| format!("Invalid request path: {path}"))?;
+        let uri = self.uri(path)?;
 
         let builder = hyper::Request::builder()
             .method(hyper::Method::POST)
             .uri(uri)
             .header("Host", "localhost")
             .header("Content-Type", "text/plain; charset=utf-8");
-        let builder = Self::apply_session_auth(builder);
+        let builder = self.apply_session_auth(builder);
         let req = builder
             .body(Full::new(Bytes::from(body.to_owned())))
             .context("Failed to build POST request")?;
@@ -445,16 +736,14 @@ impl DaemonClient {
 
     /// Send a PATCH request with a JSON body and return the response.
     async fn patch_json(&self, path: &str, body: &str) -> Result<(hyper::StatusCode, Bytes)> {
-        let uri: Uri = format!("http://localhost{path}")
-            .parse()
-            .with_context(|| format!("Invalid request path: {path}"))?;
+        let uri = self.uri(path)?;
 
         let builder = hyper::Request::builder()
             .method(hyper::Method::PATCH)
             .uri(uri)
             .header("Host", "localhost")
             .header("Content-Type", "application/json");
-        let builder = Self::apply_session_auth(builder);
+        let builder = self.apply_session_auth(builder);
         let req = builder
             .body(Full::new(Bytes::from(body.to_owned())))
             .context("Failed to build PATCH request")?;
@@ -581,9 +870,7 @@ impl DaemonClient {
     ) -> Result<tokio::sync::mpsc::Receiver<(String, String)>> {
         let path = format!("/api/v1/deployments/{}/events", urlencoding(name));
 
-        let uri: Uri = format!("http://localhost{path}")
-            .parse()
-            .with_context(|| format!("Invalid request path: {path}"))?;
+        let uri = self.uri(&path)?;
 
         let req = hyper::Request::builder()
             .method(hyper::Method::GET)
@@ -811,9 +1098,7 @@ impl DaemonClient {
             let _ = write!(path, "&instance={}", urlencoding(inst));
         }
 
-        let uri: Uri = format!("http://localhost{path}")
-            .parse()
-            .with_context(|| format!("Invalid request path: {path}"))?;
+        let uri = self.uri(&path)?;
 
         let req = hyper::Request::builder()
             .method(hyper::Method::GET)
@@ -966,10 +1251,18 @@ impl DaemonClient {
         Self::parse_json(&resp)
     }
 
-    /// Get the socket path this client is connected to.
+    /// Get the socket path this client is connected to (Unix only).
+    #[cfg(unix)]
     #[must_use]
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// Get the TCP endpoint this client is connected to (Windows only).
+    #[cfg(windows)]
+    #[must_use]
+    pub fn endpoint(&self) -> &SocketAddr {
+        &self.endpoint
     }
 
     // ------------------------------------------------------------------

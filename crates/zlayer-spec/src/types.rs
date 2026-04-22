@@ -164,6 +164,22 @@ impl OsKind {
             _ => None,
         }
     }
+
+    /// Parse the OCI-canonical OS string as written in an image manifest's
+    /// `config.os` field (lowercase: `"linux"` / `"windows"` / `"darwin"`).
+    /// Unknown or empty values return `None`.
+    ///
+    /// This is the inverse of [`Self::as_oci_str`] and is used by the
+    /// registry's manifest-OS inspection (see `fetch_image_os`).
+    #[must_use]
+    pub fn from_oci_str(s: &str) -> Option<Self> {
+        match s {
+            "linux" => Some(Self::Linux),
+            "windows" => Some(Self::Windows),
+            "darwin" => Some(Self::Macos),
+            _ => None,
+        }
+    }
 }
 
 /// CPU architecture a service needs. Mirrors the arch half of an OCI platform.

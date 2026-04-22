@@ -47,6 +47,21 @@ zlayer-core.workspace = true
 zlayer-tunnel.workspace = true
 zlayer-registry = { workspace = true, features = ["local"] }
 
+# Daemon / serve dependencies shared by Linux, macOS, and Windows.
+#
+# These were previously `cfg(unix)`-only (the Windows build historically
+# routed `zlayer serve` through a daemon inside WSL2). After F-7a the
+# Windows build runs the native HCS-backed daemon directly, so all of the
+# orchestration crates the serve path depends on need to be available on
+# every platform.
+zlayer-api.workspace = true
+zlayer-overlay.workspace = true
+zlayer-proxy.workspace = true
+zlayer-scheduler.workspace = true
+zlayer-secrets.workspace = true
+zlayer-storage.workspace = true
+secrecy = { workspace = true }
+
 # TUI
 ratatui = "0.29"
 crossterm = "0.28"
@@ -103,14 +118,7 @@ zlayer-client.workspace = true
 # Linux runtime. The feature is a no-op on macOS (libcontainer dep is target-
 # gated to Linux) but keeps the manifest declaration uniform across Unix.
 zlayer-agent = { workspace = true, features = ["youki-runtime"] }
-zlayer-overlay.workspace = true
-zlayer-api.workspace = true
-zlayer-proxy.workspace = true
-zlayer-scheduler.workspace = true
-zlayer-secrets.workspace = true
-zlayer-storage.workspace = true
 zlayer-init-actions.workspace = true
-secrecy = { workspace = true }
 # Docker compatibility layer (optional)
 zlayer-docker = { workspace = true, optional = true }
 # Daemonization (fork, setsid) and signal handling (kill) -- Unix only

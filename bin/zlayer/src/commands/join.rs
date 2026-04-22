@@ -4,14 +4,20 @@
 //! with the API, fetching the deployment spec, and starting local replicas.
 
 use anyhow::{Context, Result};
+#[cfg(unix)]
 use std::sync::Arc;
+#[cfg(unix)]
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::sync::RwLock;
+#[cfg(unix)]
 use tracing::{info, warn};
 
+#[cfg(unix)]
 use zlayer_spec::DeploymentSpec;
 
 use crate::cli::Cli;
+#[cfg(unix)]
 use crate::config::build_runtime_config;
 
 /// Join token information
@@ -46,6 +52,22 @@ pub(crate) fn parse_join_token(token: &str) -> Result<JoinToken> {
 }
 
 /// Join an existing deployment
+#[cfg(not(unix))]
+pub(crate) async fn join(
+    _cli: &Cli,
+    _token: &str,
+    _spec_dir: Option<&str>,
+    _service: Option<&str>,
+    _replicas: u32,
+) -> Result<()> {
+    anyhow::bail!(
+        "'zlayer join' requires the overlay + agent runtime, which is not yet supported on Windows. \
+         Run the join from a Linux peer, or wait for native Windows overlay support."
+    )
+}
+
+/// Join an existing deployment
+#[cfg(unix)]
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn join(
     cli: &Cli,

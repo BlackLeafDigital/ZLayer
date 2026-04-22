@@ -212,6 +212,45 @@ jobs:
           git merge origin/dev --no-ff -X theirs -m "Merge dev into main for release ${{ github.ref_name }}"
           git push origin main
 
+      # Forgejo→GitHub push mirror is disabled so proprietary refs can't leak.
+      # The workflow now owns every byte that lands on github.com. Each push
+      # below uses a FULL literal refspec — never --mirror, never --all, never
+      # refs/*:refs/*. Any change here needs review.
+      - name: Push main to GitHub
+        if: steps.check.outputs.completed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Defense in depth: refuse if the tree contains anything zdb-shaped.
+          if git ls-tree -r --name-only HEAD | grep -Eq '(^|/)(zdb|z-db)($|/)'; then
+            echo "refusing to push: tree contains zdb paths"
+            exit 1
+          fi
+          git remote remove github 2>/dev/null || true
+          git remote add github "https://x-access-token:${GH_TOKEN}@github.com/BlackLeafDigital/ZLayer.git"
+          git push github "refs/heads/main:refs/heads/main"
+
+      - name: Push release tag to GitHub
+        if: steps.check.outputs.completed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+          TRIGGERING_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Hard allowlist — only the tag prefixes release.yml already dispatches on.
+          case "$TRIGGERING_TAG" in
+            v[0-9]*|major-v[0-9]*|docker-v[0-9]*|\
+            spec-v[0-9]*|core-v[0-9]*|registry-v[0-9]*|obs-v[0-9]*|builder-v[0-9]*|\
+            overlay-v[0-9]*|init-v[0-9]*|scheduler-v[0-9]*|storage-v[0-9]*|\
+            tunnel-v[0-9]*|tui-v[0-9]*|consensus-v[0-9]*|build-v[0-9]*|\
+            rust-sdk-v[0-9]*|py-sdk-v[0-9]*|ts-sdk-v[0-9]*|go-sdk-v[0-9]*|c-sdk-v[0-9]*) ;;
+            *) echo "tag '$TRIGGERING_TAG' not on allowlist — skipping GitHub tag push"; exit 0 ;;
+          esac
+          case "$TRIGGERING_TAG" in *zdb*|*ZDB*) echo "refusing: zdb tag"; exit 1 ;; esac
+          # `github` remote was added by the previous step.
+          git push github "refs/tags/${TRIGGERING_TAG}:refs/tags/${TRIGGERING_TAG}"
+
       - name: Mark step complete
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main

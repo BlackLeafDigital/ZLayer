@@ -108,6 +108,89 @@ pub async fn ensure_wslconfig(_min_gb: u64) -> anyhow::Result<WslconfigOutcome> 
     anyhow::bail!("WSL2 configuration is only available on Windows")
 }
 
+/// Idempotently set `[wsl2] networkingMode = "mirrored"` in `%UserProfile%\.wslconfig`.
+///
+/// Merge semantics: preserve every key the caller has already set in every section.
+/// Only `[wsl2] networkingMode` is touched. If the `[wsl2]` section is absent, it is
+/// created. If the key is present but set to a different value (e.g. `"nat"`), it is
+/// overwritten with `"mirrored"`. If the key is already `"mirrored"`, nothing changes.
+///
+/// Effective only on WSL2 >= 2.0.0 and Windows 11 22H2+. Older hosts silently ignore
+/// the setting, so writing it unconditionally is safe.
+///
+/// The write is atomic: bytes go to `.wslconfig.tmp` next to the target and are then
+/// renamed into place.
+///
+/// The returned [`WslconfigOutcome`] reuses the same fields as [`ensure_wslconfig`];
+/// `previous_cap_gb` and `new_cap_gb` reflect the `vhdSize` values present in the
+/// file before/after this call (this function does not modify `vhdSize`). `changed`
+/// indicates whether this call wrote bytes to disk.
+///
+/// # Errors
+///
+/// Returns an error when the `USERPROFILE` environment variable is missing, when the
+/// existing `.wslconfig` cannot be read or parsed, or when the atomic write fails.
+#[cfg(target_os = "windows")]
+pub async fn ensure_mirrored_networking() -> anyhow::Result<WslconfigOutcome> {
+    let profile = std::env::var_os("USERPROFILE").ok_or_else(|| {
+        anyhow::anyhow!("cannot determine user profile path; %USERPROFILE% is not set")
+    })?;
+    let path = PathBuf::from(profile).join(".wslconfig");
+
+    let existing = match tokio::fs::read_to_string(&path).await {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            return Err(
+                anyhow::Error::from(e).context(format!("failed to read {}", path.display()))
+            );
+        }
+    };
+
+    let previous_cap_gb = parse_vhd_size_gb(&existing);
+    let (merged, changed) = merge_networking_mode(&existing);
+    let new_cap_gb = parse_vhd_size_gb(&merged).unwrap_or(0);
+
+    if changed {
+        let tmp = path.with_extension("wslconfig.tmp");
+        tokio::fs::write(&tmp, merged.as_bytes())
+            .await
+            .map_err(|e| {
+                anyhow::Error::from(e).context(format!("failed to write {}", tmp.display()))
+            })?;
+        tokio::fs::rename(&tmp, &path).await.map_err(|e| {
+            anyhow::Error::from(e).context(format!("failed to rename into {}", path.display()))
+        })?;
+        tracing::info!(
+            path = %path.display(),
+            "updated .wslconfig: set networkingMode = \"mirrored\""
+        );
+    } else {
+        tracing::debug!(
+            path = %path.display(),
+            "no changes to .wslconfig (networkingMode already mirrored)"
+        );
+    }
+
+    Ok(WslconfigOutcome {
+        path,
+        previous_cap_gb,
+        new_cap_gb,
+        changed,
+    })
+}
+
+/// Non-Windows stub — `.wslconfig` has no meaning off Windows.
+///
+/// # Errors
+///
+/// Always returns an error on non-Windows platforms.
+#[cfg(not(target_os = "windows"))]
+#[allow(clippy::unused_async)]
+pub async fn ensure_mirrored_networking() -> anyhow::Result<WslconfigOutcome> {
+    anyhow::bail!("WSL2 configuration is only available on Windows")
+}
+
 /// Compute the default cap in GiB: approximately 80% of free space on the install drive,
 /// floored at 64 GiB. Honors `ZLAYER_WSL_VHD_GB` as a hard override (parsed as u64 GiB).
 #[cfg(target_os = "windows")]
@@ -229,6 +312,41 @@ fn apply_sparse_vhd(wsl2: &mut toml_edit::Table) {
     let current = wsl2.get("sparseVhd").and_then(toml_edit::Item::as_bool);
     if current != Some(true) {
         wsl2["sparseVhd"] = toml_edit::value(true);
+    }
+}
+
+/// Merge `[wsl2] networkingMode = "mirrored"` into an existing `.wslconfig` body.
+/// Returns the new body and whether it differs from the original. Pure / no I/O,
+/// so it is exercised by cross-platform unit tests.
+fn merge_networking_mode(existing: &str) -> (String, bool) {
+    let mut doc = match existing.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "failed to parse existing .wslconfig; starting from empty document"
+            );
+            toml_edit::DocumentMut::new()
+        }
+    };
+
+    ensure_wsl2_table(&mut doc);
+
+    let wsl2 = doc["wsl2"]
+        .as_table_mut()
+        .expect("wsl2 table ensured above");
+
+    apply_networking_mode(wsl2);
+
+    let rendered = doc.to_string();
+    let changed = rendered != existing;
+    (rendered, changed)
+}
+
+fn apply_networking_mode(wsl2: &mut toml_edit::Table) {
+    let current = wsl2.get("networkingMode").and_then(toml_edit::Item::as_str);
+    if current != Some("mirrored") {
+        wsl2["networkingMode"] = toml_edit::value("mirrored");
     }
 }
 
@@ -386,5 +504,63 @@ mod tests {
         assert_eq!(parse_vhd_size_gb(body), Some(500));
         assert_eq!(parse_vhd_size_gb(""), None);
         assert_eq!(parse_vhd_size_gb("[wsl2]\nmemory = \"4GB\"\n"), None);
+    }
+
+    #[test]
+    fn mirrored_networking_added_when_section_absent() {
+        let (out, changed) = merge_networking_mode("");
+        assert!(changed);
+        assert!(out.contains("[wsl2]"));
+        assert!(out.contains(r#"networkingMode = "mirrored""#));
+    }
+
+    #[test]
+    fn mirrored_networking_added_when_section_present_no_key() {
+        let input = "[wsl2]\nvhdSize = \"64GB\"\n";
+        let (out, changed) = merge_networking_mode(input);
+        assert!(changed);
+        assert!(out.contains(r#"vhdSize = "64GB""#));
+        assert!(out.contains(r#"networkingMode = "mirrored""#));
+    }
+
+    #[test]
+    fn mirrored_networking_idempotent() {
+        let (first, first_changed) = merge_networking_mode("");
+        assert!(first_changed);
+        let (second, second_changed) = merge_networking_mode(&first);
+        assert!(
+            !second_changed,
+            "second merge must be a no-op when the key is already set"
+        );
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn mirrored_networking_preserves_existing_keys() {
+        let input = "[wsl2]\nkernelCommandLine = \"vsyscall=emulate\"\n";
+        let (out, changed) = merge_networking_mode(input);
+        assert!(changed);
+        assert!(out.contains(r#"kernelCommandLine = "vsyscall=emulate""#));
+        assert!(out.contains(r#"networkingMode = "mirrored""#));
+    }
+
+    #[test]
+    fn mirrored_networking_overwrites_other_value() {
+        let input = "[wsl2]\nnetworkingMode = \"nat\"\n";
+        let (out, changed) = merge_networking_mode(input);
+        assert!(changed);
+        assert!(out.contains(r#"networkingMode = "mirrored""#));
+        assert!(!out.contains(r#"networkingMode = "nat""#));
+    }
+
+    #[test]
+    fn mirrored_networking_preserves_other_sections() {
+        let input = "[experimental]\nsparseVhd = true\n";
+        let (out, changed) = merge_networking_mode(input);
+        assert!(changed);
+        assert!(out.contains("[experimental]"));
+        assert!(out.contains("sparseVhd = true"));
+        assert!(out.contains("[wsl2]"));
+        assert!(out.contains(r#"networkingMode = "mirrored""#));
     }
 }
