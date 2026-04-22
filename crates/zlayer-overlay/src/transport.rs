@@ -5,20 +5,54 @@
 //!
 //! On Linux, creates TUN interfaces via `/dev/net/tun`.
 //! On macOS, creates utun interfaces via the kernel control socket.
+//! On Windows, creates a Wintun adapter (see [`crate::tun::windows`]),
+//! configures it via IP Helper (see [`crate::interface::windows`]), and
+//! drives the `WireGuard` noise pipeline directly via
+//! `boringtun::noise::Tunn` paired with a userspace UDP socket. Three
+//! async tasks shuttle packets: `ingress` (UDP → decap → TUN), `egress`
+//! (TUN → encap → UDP), and `timers` (per-peer `update_timers` tick to
+//! emit keepalives / re-initiate handshakes).
 
+use crate::interface::platform_ops;
 use crate::{config::OverlayConfig, PeerInfo};
+#[cfg(not(windows))]
 use boringtun::device::{DeviceConfig, DeviceHandle};
 use std::fmt::Write;
+#[cfg(not(windows))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(not(windows))]
 use tokio::net::UnixStream;
-#[cfg(target_os = "macos")]
-use tokio::process::Command;
+
+#[cfg(windows)]
+use crate::tun::WindowsTun;
+#[cfg(windows)]
+use boringtun::noise::{Tunn, TunnResult};
+#[cfg(windows)]
+use dashmap::DashMap;
+#[cfg(windows)]
+use parking_lot::RwLock;
+#[cfg(windows)]
+use std::net::{IpAddr, SocketAddr};
+#[cfg(windows)]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(windows)]
+use std::sync::Arc;
+#[cfg(windows)]
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(windows)]
+use tokio::net::UdpSocket;
+#[cfg(windows)]
+use tokio::sync::Mutex as AsyncMutex;
+#[cfg(windows)]
+use tokio::task::JoinHandle;
 
 // ---------------------------------------------------------------------------
-// UAPI helpers
+// UAPI helpers (Linux/macOS only — Windows drives boringtun::noise::Tunn
+// directly without going through a Unix socket)
 // ---------------------------------------------------------------------------
 
 /// Convert a base64-encoded `WireGuard` key to hex (UAPI requires hex-encoded keys).
+#[cfg(not(windows))]
 fn key_to_hex(base64_key: &str) -> Result<String, Box<dyn std::error::Error>> {
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     let bytes = STANDARD.decode(base64_key)?;
@@ -32,6 +66,7 @@ fn key_to_hex(base64_key: &str) -> Result<String, Box<dyn std::error::Error>> {
 ///
 /// The body should contain newline-delimited `key=value` pairs (without the
 /// leading `set=1\n` — that is prepended automatically).
+#[cfg(not(windows))]
 async fn uapi_set(sock_path: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(sock_path).await?;
     let msg = format!("set=1\n{body}\n");
@@ -47,6 +82,7 @@ async fn uapi_set(sock_path: &str, body: &str) -> Result<(), Box<dyn std::error:
 }
 
 /// Send a UAPI `get` command and return the raw response.
+#[cfg(not(windows))]
 async fn uapi_get(sock_path: &str) -> Result<String, Box<dyn std::error::Error>> {
     let mut stream = UnixStream::connect(sock_path).await?;
     stream.write_all(b"get=1\n\n").await?;
@@ -54,6 +90,98 @@ async fn uapi_get(sock_path: &str) -> Result<String, Box<dyn std::error::Error>>
     let mut response = String::new();
     stream.read_to_string(&mut response).await?;
     Ok(response)
+}
+
+// ---------------------------------------------------------------------------
+// Windows-only helpers (packet parsing, key decoding, Tunn construction)
+// ---------------------------------------------------------------------------
+
+/// Per-peer state held by the Windows packet loop.
+///
+/// `tunn` is behind an async Mutex because ingress / egress / timers
+/// tasks all need `&mut Tunn` for encapsulate / decapsulate /
+/// update_timers. `endpoint` uses `parking_lot::RwLock` since reads
+/// dominate (egress path + timers) and writes are rare (NAT endpoint
+/// switch). `last_handshake_sec` is a monotonic-ish unix-seconds
+/// counter updated from the ingress path; `allowed_ips` is immutable
+/// after `add_peer`.
+#[cfg(windows)]
+#[derive(Clone)]
+struct WindowsPeerState {
+    tunn: Arc<AsyncMutex<Tunn>>,
+    endpoint: Arc<RwLock<Option<SocketAddr>>>,
+    last_handshake_sec: Arc<AtomicU64>,
+    allowed_ips: Arc<Vec<ipnet::IpNet>>,
+    persistent_keepalive: Option<u16>,
+}
+
+/// Decode a base64-encoded `WireGuard` key into a 32-byte array.
+///
+/// Used on Windows where we drive `Tunn` directly and therefore need
+/// raw key bytes rather than the hex encoding UAPI uses.
+#[cfg(windows)]
+fn decode_key_b64(b64: &str) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    let bytes = STANDARD.decode(b64)?;
+    if bytes.len() != 32 {
+        return Err(format!(
+            "invalid WireGuard key length: expected 32 bytes, got {}",
+            bytes.len()
+        )
+        .into());
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
+/// Extract the destination IP from a raw IPv4 or IPv6 packet.
+///
+/// IPv4: version in the top 4 bits of byte 0, dst in bytes 16..20.
+/// IPv6: version in the top 4 bits of byte 0, dst in bytes 24..40.
+/// Returns `None` for non-IP (version mismatch) or truncated packets.
+#[cfg(windows)]
+fn parse_dst_ip(packet: &[u8]) -> Option<IpAddr> {
+    if packet.is_empty() {
+        return None;
+    }
+    match packet[0] >> 4 {
+        4 if packet.len() >= 20 => {
+            let b: [u8; 4] = packet[16..20].try_into().ok()?;
+            Some(IpAddr::from(b))
+        }
+        6 if packet.len() >= 40 => {
+            let b: [u8; 16] = packet[24..40].try_into().ok()?;
+            Some(IpAddr::from(b))
+        }
+        _ => None,
+    }
+}
+
+/// Build a new `Tunn` from raw key material.
+///
+/// Any boringtun construction error is surfaced as
+/// `OverlayError::NetworkConfig` via the caller's error mapping.
+/// `index=0` lets boringtun assign its own internal session indices;
+/// `rate_limiter=None` uses the per-tunnel default.
+#[cfg(windows)]
+fn build_tunn(
+    our_priv: &[u8; 32],
+    peer_pub: &[u8; 32],
+    preshared: Option<[u8; 32]>,
+    persistent_keepalive: Option<u16>,
+) -> Tunn {
+    let priv_secret = boringtun::x25519::StaticSecret::from(*our_priv);
+    let peer_pub_key = boringtun::x25519::PublicKey::from(*peer_pub);
+    // `Tunn::new` returns `Self` directly in boringtun 0.7 — no Result.
+    Tunn::new(
+        priv_secret,
+        peer_pub_key,
+        preshared,
+        persistent_keepalive,
+        0,
+        None,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -65,13 +193,47 @@ async fn uapi_get(sock_path: &str) -> Result<String, Box<dyn std::error::Error>>
 /// Uses boringtun (userspace `WireGuard`) to create TUN-based encrypted tunnels.
 /// No kernel `WireGuard` module required.
 ///
-/// **Important:** This struct holds the boringtun [`DeviceHandle`]. The TUN
-/// device is destroyed when the handle is dropped. Callers **must** keep this
-/// struct alive for the entire overlay network lifetime.
+/// **Important:** This struct holds the boringtun [`DeviceHandle`] (or, on
+/// Windows, the Wintun adapter + spawned loop tasks). Dropping the struct
+/// tears down the TUN device. Callers **must** keep this struct alive for
+/// the entire overlay network lifetime.
 pub struct OverlayTransport {
     config: OverlayConfig,
     interface_name: String,
+    /// boringtun-managed TUN device handle (Linux/macOS).
+    /// On Windows we own the adapter via `wintun` instead — see `wintun_dev`.
+    #[cfg(not(windows))]
     device: Option<DeviceHandle>,
+    /// Wintun adapter + session handle (Windows only).
+    ///
+    /// Wrapped in `Arc` so ingress / egress tasks can hold references
+    /// while the transport itself remains owned by the caller. Dropping
+    /// the last Arc tears down the Wintun session and removes the
+    /// adapter, mirroring the `DeviceHandle::drop` semantics on Unix.
+    #[cfg(windows)]
+    wintun_dev: Option<Arc<WindowsTun>>,
+    /// UDP socket servicing the `WireGuard` protocol for this overlay
+    /// (Windows only). Bound to `OverlayConfig::local_endpoint` in
+    /// `configure`; shared across ingress / egress / timers tasks.
+    #[cfg(windows)]
+    udp: Option<Arc<UdpSocket>>,
+    /// Per-peer Noise state + metadata, keyed by raw 32-byte public key.
+    /// `DashMap` lets the ingress task (write to endpoint / handshake
+    /// timestamp), the egress task (read endpoint), and the timers task
+    /// (encapsulate keepalives) all mutate independent shards without
+    /// contending on a global lock.
+    #[cfg(windows)]
+    peers: Arc<DashMap<[u8; 32], WindowsPeerState>>,
+    /// Ingress task: UDP → Tunn::decapsulate → Wintun send.
+    #[cfg(windows)]
+    ingress_task: Option<JoinHandle<()>>,
+    /// Egress task: Wintun recv → Tunn::encapsulate → UDP send.
+    #[cfg(windows)]
+    egress_task: Option<JoinHandle<()>>,
+    /// Timers task: ~250 ms tick driving `Tunn::update_timers` per peer
+    /// to fire keepalives and handshake re-initiations.
+    #[cfg(windows)]
+    timers_task: Option<JoinHandle<()>>,
 }
 
 impl OverlayTransport {
@@ -81,7 +243,20 @@ impl OverlayTransport {
         Self {
             config,
             interface_name,
+            #[cfg(not(windows))]
             device: None,
+            #[cfg(windows)]
+            wintun_dev: None,
+            #[cfg(windows)]
+            udp: None,
+            #[cfg(windows)]
+            peers: Arc::new(DashMap::new()),
+            #[cfg(windows)]
+            ingress_task: None,
+            #[cfg(windows)]
+            egress_task: None,
+            #[cfg(windows)]
+            timers_task: None,
         }
     }
 
@@ -96,6 +271,9 @@ impl OverlayTransport {
     }
 
     /// Path to the UAPI Unix socket for this interface.
+    ///
+    /// Linux/macOS only — Windows does not use UAPI.
+    #[cfg(not(windows))]
     fn uapi_sock_path(&self) -> String {
         format!("/var/run/wireguard/{}.sock", self.interface_name)
     }
@@ -106,7 +284,7 @@ impl OverlayTransport {
     /// If the process was `SIGKILLed` (or crashed without running Drop),
     /// the TUN device persists in the kernel and boringtun's
     /// `DeviceHandle::new()` will fail on re-create with EEXIST. We probe
-    /// for the interface via RTNETLINK and delete it if present.
+    /// for the interface via [`InterfaceOps`] and delete it if present.
     ///
     /// Any error from either the probe or the delete is logged at WARN
     /// level and swallowed — this is a cleanup path, not the primary
@@ -114,13 +292,14 @@ impl OverlayTransport {
     /// with creation and the next step surfaces any real problem).
     #[cfg(target_os = "linux")]
     async fn cleanup_stale_linux_interface(iface_name: &str) {
-        match crate::netlink::link_exists(iface_name).await {
+        let iface_ops = platform_ops();
+        match iface_ops.link_exists(iface_name).await {
             Ok(true) => {
                 tracing::warn!(
                     interface = %iface_name,
                     "stale network interface found, cleaning up before re-create"
                 );
-                if let Err(e) = crate::netlink::delete_link_by_name(iface_name).await {
+                if let Err(e) = iface_ops.delete_link(iface_name).await {
                     tracing::warn!(
                         interface = %iface_name,
                         error = %e,
@@ -139,20 +318,40 @@ impl OverlayTransport {
         }
     }
 
-    /// Create the TUN interface via boringtun.
+    /// Create the TUN interface.
     ///
-    /// This spawns boringtun worker threads that manage the TUN device.  The
-    /// device is torn down when this struct is dropped (or [`shutdown`] is
-    /// called).
+    /// On Linux/macOS this spawns boringtun worker threads that manage
+    /// the TUN device. On Windows it instantiates a Wintun adapter (no
+    /// boringtun threads — the Windows packet loop is driven directly
+    /// via `boringtun::noise::Tunn` in a follow-up task; today this
+    /// only stands the adapter up so IP configuration can run).
+    ///
+    /// The device is torn down when this struct is dropped (or
+    /// [`shutdown`] is called).
     ///
     /// On Linux, creates a named TUN interface (requires `CAP_NET_ADMIN`).
     /// On macOS, creates a kernel-assigned `utunN` interface (requires `sudo`).
+    /// On Windows, creates a Wintun adapter (requires Administrator and
+    /// `wintun.dll` on disk — see [`crate::tun::windows`]).
     ///
     /// # Errors
     ///
     /// Returns an error if the TUN device cannot be created or required
     /// privileges are unavailable.
     pub async fn create_interface(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(windows)]
+        {
+            self.create_interface_windows().await
+        }
+        #[cfg(not(windows))]
+        {
+            self.create_interface_unix().await
+        }
+    }
+
+    /// Linux / macOS implementation of [`Self::create_interface`].
+    #[cfg(not(windows))]
+    async fn create_interface_unix(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         // On Linux, validate interface name length (IFNAMSIZ = 15).
         // On macOS, the kernel auto-assigns utunN names so validation is skipped.
         #[cfg(not(target_os = "macos"))]
@@ -256,152 +455,519 @@ impl OverlayTransport {
         Ok(())
     }
 
+    /// Windows implementation of [`Self::create_interface`].
+    ///
+    /// Stands up a Wintun adapter named `self.interface_name`. The
+    /// packet-forwarding loop (UDP ↔ Tunn ↔ Wintun) is started later
+    /// from [`Self::configure`] once the peer set + listen port are
+    /// known.
+    #[cfg(windows)]
+    async fn create_interface_windows(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Wintun has no IFNAMSIZ-style limit, but very long names are
+        // a sign of a misconfigured caller and look terrible in the UI.
+        if self.interface_name.len() > 64 {
+            return Err(format!(
+                "Wintun adapter name '{}' exceeds 64 character limit",
+                self.interface_name
+            )
+            .into());
+        }
+
+        let iface_name = self.interface_name.clone();
+        let mtu = 1420; // Standard WireGuard MTU. IP Helper can override later.
+
+        // WindowsTun::new is synchronous — wrap in spawn_blocking so we
+        // don't stall the runtime if Wintun's load_from_path / adapter
+        // creation is slow on a busy host.
+        let dev = tokio::task::spawn_blocking(move || WindowsTun::new(&iface_name, mtu))
+            .await
+            .map_err(|e| format!("spawn_blocking join error: {e}"))??;
+
+        tracing::info!(
+            interface = %self.interface_name,
+            luid = dev.luid_value(),
+            "Created Wintun overlay adapter"
+        );
+
+        self.wintun_dev = Some(Arc::new(dev));
+        Ok(())
+    }
+
     /// Configure the transport with private key, listen port, and peers.
     ///
-    /// After setting the `WireGuard` parameters via UAPI, this also assigns the
-    /// overlay IP address and brings the interface up using platform-appropriate
-    /// commands (`ifconfig`/`route` on macOS, `ip` on Linux).
+    /// On Linux/macOS this writes the `WireGuard` configuration via UAPI
+    /// to boringtun's per-interface socket, then assigns the overlay IP
+    /// and brings the interface up via [`InterfaceOps`].
+    ///
+    /// On Windows this binds the UDP listener, creates a
+    /// `boringtun::noise::Tunn` instance for each configured peer,
+    /// spawns the ingress / egress / timers tasks that drive the noise
+    /// protocol against the Wintun adapter, and configures the IP layer.
     ///
     /// # Errors
     ///
-    /// Returns an error if UAPI configuration fails or IP assignment commands fail.
-    pub async fn configure(&self, peers: &[PeerInfo]) -> Result<(), Box<dyn std::error::Error>> {
-        let sock = self.uapi_sock_path();
+    /// On Linux/macOS, returns an error if UAPI configuration or IP
+    /// assignment fails. On Windows, returns an error if the Wintun
+    /// adapter is missing, the UDP socket cannot be bound, key decoding
+    /// fails, or the IP layer cannot be configured.
+    pub async fn configure(
+        &mut self,
+        peers: &[PeerInfo],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        #[cfg(not(windows))]
+        {
+            let sock = self.uapi_sock_path();
 
-        // Build the UAPI set body
-        let private_key_hex = key_to_hex(&self.config.private_key)?;
-        let mut body = format!(
-            "private_key={}\nlisten_port={}\n",
-            private_key_hex,
-            self.config.local_endpoint.port(),
-        );
+            // Build the UAPI set body
+            let private_key_hex = key_to_hex(&self.config.private_key)?;
+            let mut body = format!(
+                "private_key={}\nlisten_port={}\n",
+                private_key_hex,
+                self.config.local_endpoint.port(),
+            );
 
-        for peer in peers {
-            let pub_hex = key_to_hex(&peer.public_key)?;
-            let _ = writeln!(body, "public_key={pub_hex}");
-            let _ = writeln!(body, "endpoint={}", peer.endpoint);
-            let _ = writeln!(body, "allowed_ip={}", peer.allowed_ips);
-            let _ = writeln!(
-                body,
-                "persistent_keepalive_interval={}",
-                peer.persistent_keepalive_interval.as_secs()
+            for peer in peers {
+                let pub_hex = key_to_hex(&peer.public_key)?;
+                let _ = writeln!(body, "public_key={pub_hex}");
+                let _ = writeln!(body, "endpoint={}", peer.endpoint);
+                let _ = writeln!(body, "allowed_ip={}", peer.allowed_ips);
+                let _ = writeln!(
+                    body,
+                    "persistent_keepalive_interval={}",
+                    peer.persistent_keepalive_interval.as_secs()
+                );
+            }
+
+            uapi_set(&sock, &body).await?;
+            tracing::debug!(interface = %self.interface_name, "Applied UAPI configuration");
+
+            // Assign overlay IP address and bring interface up
+            self.configure_interface().await?;
+
+            tracing::info!(interface = %self.interface_name, "Overlay transport configured and up");
+            Ok(())
+        }
+
+        #[cfg(windows)]
+        {
+            self.configure_windows(peers).await
+        }
+    }
+
+    /// Windows implementation of [`Self::configure`].
+    ///
+    /// Responsibilities (in order):
+    /// 1. Configure the IP/route layer so host state is consistent.
+    /// 2. Bind the `WireGuard` UDP socket on `local_endpoint`.
+    /// 3. Build a `Tunn` per peer and seed `self.peers`.
+    /// 4. Spawn the three loop tasks (ingress, egress, timers).
+    #[cfg(windows)]
+    async fn configure_windows(
+        &mut self,
+        peers: &[PeerInfo],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // IP layer first.
+        self.configure_interface().await?;
+
+        // Install a catch-all host route for the full cluster CIDR via the
+        // Wintun adapter. HCN auto-installs the more specific per-node /28 →
+        // vSwitch route, so longest-prefix-match sends local-slice traffic to
+        // the vSwitch and remote-slice traffic to Wintun (where boringtun's
+        // egress loop picks it up, encapsulates, and forwards to the owning
+        // peer). Without this route, packets destined for remote container
+        // IPs leak out of the default gateway instead of the overlay.
+        //
+        // Failure is logged as a warning but not fatal — the route may
+        // already exist from a previous run, and we want adapter bringup to
+        // remain idempotent.
+        if let Some(ref cluster_cidr_str) = self.config.cluster_cidr {
+            match cluster_cidr_str.parse::<ipnet::IpNet>() {
+                Ok(net) => {
+                    use crate::interface::windows::WindowsIpHelperOps;
+                    use crate::interface::InterfaceOps;
+                    let ops = WindowsIpHelperOps::new();
+                    let adapter_name = self.interface_name.clone();
+                    match ops
+                        .add_route_via_dev(net.network(), net.prefix_len(), &adapter_name)
+                        .await
+                    {
+                        Ok(()) => {
+                            tracing::info!(
+                                cidr = %net,
+                                adapter = %adapter_name,
+                                "Installed cluster-CIDR host route via Wintun adapter"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                cidr = %net,
+                                adapter = %adapter_name,
+                                "Failed to install cluster-CIDR host route via Wintun (overlay traffic may not route across nodes); route may already exist"
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        cidr = %cluster_cidr_str,
+                        "cluster_cidr unparseable; skipping Wintun route install"
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                "cluster_cidr not set in OverlayConfig; skipping Wintun route install (cross-node overlay traffic may not route)"
             );
         }
 
-        uapi_set(&sock, &body).await?;
-        tracing::debug!(interface = %self.interface_name, "Applied UAPI configuration");
+        // Wintun adapter must already be up via `create_interface`.
+        let tun = self
+            .wintun_dev
+            .as_ref()
+            .ok_or("Wintun adapter not initialized — call create_interface first")?
+            .clone();
 
-        // Assign overlay IP address and bring interface up
-        self.configure_interface().await?;
+        // Bind the WireGuard UDP socket. Use the configured local
+        // endpoint so IPv4 / IPv6 family matches the overlay.
+        let listen = self.config.local_endpoint;
+        let udp = Arc::new(
+            UdpSocket::bind(listen)
+                .await
+                .map_err(|e| format!("failed to bind WireGuard UDP socket on {listen}: {e}"))?,
+        );
+        self.udp = Some(udp.clone());
 
-        tracing::info!(interface = %self.interface_name, "Overlay transport configured and up");
+        // Seed peers from the initial config.
+        let priv_bytes = decode_key_b64(&self.config.private_key)?;
+        for peer in peers {
+            self.add_peer_windows(&priv_bytes, peer)?;
+        }
+
+        // Spawn the three driver tasks. They hold Arc clones of the
+        // shared state so they outlive individual peer inserts /
+        // removes; aborted during `shutdown`.
+        let peers_ingress = self.peers.clone();
+        let udp_ingress = udp.clone();
+        let tun_ingress = tun.clone();
+        self.ingress_task = Some(tokio::spawn(async move {
+            Self::ingress_loop(udp_ingress, tun_ingress, peers_ingress).await;
+        }));
+
+        let peers_egress = self.peers.clone();
+        let udp_egress = udp.clone();
+        let tun_egress = tun.clone();
+        self.egress_task = Some(tokio::spawn(async move {
+            Self::egress_loop(tun_egress, udp_egress, peers_egress).await;
+        }));
+
+        let peers_timers = self.peers.clone();
+        let udp_timers = udp.clone();
+        self.timers_task = Some(tokio::spawn(async move {
+            Self::timers_loop(udp_timers, peers_timers).await;
+        }));
+
+        tracing::info!(
+            interface = %self.interface_name,
+            peer_count = peers.len(),
+            listen = %listen,
+            "Windows overlay transport configured (Tunn pipeline online)"
+        );
         Ok(())
     }
 
-    /// Platform-specific interface IP assignment and bring-up.
+    /// Insert (or replace) a peer in the Windows peer map.
     ///
-    /// Supports both IPv4 and IPv6 overlay CIDRs. For IPv4, uses `ifconfig inet`
-    /// with a netmask. For IPv6, uses `ifconfig inet6` with prefix length notation.
-    /// Routes are added with `-inet6` for IPv6 destinations.
-    #[cfg(target_os = "macos")]
-    async fn configure_interface(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let cidr: ipnet::IpNet = self.config.overlay_cidr.parse().map_err(|e| {
-            format!(
-                "Failed to parse overlay CIDR '{}': {e}",
-                self.config.overlay_cidr
-            )
-        })?;
-        let overlay_ip = cidr.addr().to_string();
-
-        // Configure point-to-point utun interface (IPv4 vs IPv6 syntax differs)
-        let output = match &cidr {
-            ipnet::IpNet::V4(v4) => {
-                let netmask = v4.netmask().to_string();
-                Command::new("ifconfig")
-                    .args([
-                        &self.interface_name,
-                        "inet",
-                        &overlay_ip,
-                        &overlay_ip,
-                        "netmask",
-                        &netmask,
-                        "up",
-                    ])
-                    .output()
-                    .await?
-            }
-            ipnet::IpNet::V6(_v6) => {
-                // macOS ifconfig for IPv6: ifconfig <iface> inet6 <addr> prefixlen <len>
-                let prefixlen = cidr.prefix_len().to_string();
-                Command::new("ifconfig")
-                    .args([
-                        &self.interface_name,
-                        "inet6",
-                        &overlay_ip,
-                        "prefixlen",
-                        &prefixlen,
-                        "up",
-                    ])
-                    .output()
-                    .await?
+    /// Used both by `configure_windows` at bootstrap time and by the
+    /// public `add_peer` entry point. Assumes `self.config.private_key`
+    /// has already been decoded (the caller passes the raw bytes to
+    /// avoid re-decoding per peer during bulk seeding).
+    #[cfg(windows)]
+    fn add_peer_windows(
+        &self,
+        our_priv: &[u8; 32],
+        peer: &PeerInfo,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let peer_pub = decode_key_b64(&peer.public_key)?;
+        let allowed: ipnet::IpNet = peer
+            .allowed_ips
+            .parse()
+            .map_err(|e| format!("invalid allowed_ips '{}': {e}", peer.allowed_ips))?;
+        // WireGuard persistent_keepalive_interval of 0 means "disabled",
+        // which boringtun models as `None`.
+        let keepalive = {
+            let secs = peer.persistent_keepalive_interval.as_secs();
+            if secs == 0 {
+                None
+            } else {
+                u16::try_from(secs).ok()
             }
         };
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!("Failed to configure interface: {stderr}").into());
-        }
-
-        // Add route for the overlay subnet
-        let network_cidr = format!("{}/{}", cidr.network(), cidr.prefix_len());
-        let output = match &cidr {
-            ipnet::IpNet::V4(_) => {
-                Command::new("route")
-                    .args([
-                        "-n",
-                        "add",
-                        "-net",
-                        &network_cidr,
-                        "-interface",
-                        &self.interface_name,
-                    ])
-                    .output()
-                    .await?
-            }
-            ipnet::IpNet::V6(_) => {
-                // macOS route for IPv6: route -n add -inet6 <dest> -interface <iface>
-                Command::new("route")
-                    .args([
-                        "-n",
-                        "add",
-                        "-inet6",
-                        &network_cidr,
-                        "-interface",
-                        &self.interface_name,
-                    ])
-                    .output()
-                    .await?
-            }
+        let tunn = build_tunn(our_priv, &peer_pub, None, keepalive);
+        let state = WindowsPeerState {
+            tunn: Arc::new(AsyncMutex::new(tunn)),
+            endpoint: Arc::new(RwLock::new(Some(peer.endpoint))),
+            last_handshake_sec: Arc::new(AtomicU64::new(0)),
+            allowed_ips: Arc::new(vec![allowed]),
+            persistent_keepalive: keepalive,
         };
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // Ignore "already in table" — idempotent
-            if !stderr.contains("already in table") {
-                return Err(format!("Failed to add route: {stderr}").into());
-            }
-        }
-
+        self.peers.insert(peer_pub, state);
+        tracing::debug!(
+            peer_key = %peer.public_key,
+            endpoint = %peer.endpoint,
+            allowed = %peer.allowed_ips,
+            "Added peer to Windows overlay peer map"
+        );
         Ok(())
     }
 
-    /// Platform-specific interface IP assignment and bring-up.
+    /// UDP → decapsulate → Wintun loop.
     ///
-    /// Supports both IPv4 and IPv6 overlay CIDRs. Uses RTNETLINK directly
-    /// via the [`crate::netlink`] helpers — no shell-outs to `ip`. The
-    /// address add handles both address families natively; the route add
-    /// dispatches on the destination's address family inside the helper.
-    #[cfg(not(target_os = "macos"))]
+    /// For each inbound datagram we linear-scan the peer map and hand
+    /// the packet to each `Tunn::decapsulate` until one returns a
+    /// non-error result. This is O(N peers) per packet; for the
+    /// small-cluster overlays ZLayer targets it is fine. A future
+    /// optimization can cache `src_addr → pubkey` once sessions are
+    /// established.
+    ///
+    /// `decapsulate` returns:
+    /// - `WriteToTunnelV4` / `WriteToTunnelV6` — cleartext IP packet to
+    ///   inject into Wintun.
+    /// - `WriteToNetwork` — an auto-generated WG reply (cookie / 2nd
+    ///   handshake message) to echo back to the remote.
+    /// - `Done` / `Err` — not our peer, keep scanning.
+    ///
+    /// After a successful decap, we loop on an empty-datagram call
+    /// to drain any queued packets boringtun buffered during the
+    /// handshake (documented behavior of `decapsulate`).
+    #[cfg(windows)]
+    async fn ingress_loop(
+        udp: Arc<UdpSocket>,
+        tun: Arc<WindowsTun>,
+        peers: Arc<DashMap<[u8; 32], WindowsPeerState>>,
+    ) {
+        // 65536 covers the largest possible IPv4/IPv6 datagram.
+        let mut inbuf = vec![0u8; 65536];
+        loop {
+            let (n, src) = match udp.recv_from(&mut inbuf).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(error = %e, "UDP recv failed; ingress loop exiting");
+                    break;
+                }
+            };
+
+            // Snapshot (pubkey, state) pairs so we release the DashMap
+            // shard lock before awaiting on the async per-peer Mutex.
+            let snapshot: Vec<([u8; 32], WindowsPeerState)> = peers
+                .iter()
+                .map(|e| (*e.key(), e.value().clone()))
+                .collect();
+
+            for (pk, state) in snapshot {
+                let mut out = vec![0u8; 65536];
+                let mut handled = false;
+                {
+                    let mut tunn = state.tunn.lock().await;
+                    match tunn.decapsulate(Some(src.ip()), &inbuf[..n], &mut out) {
+                        TunnResult::WriteToTunnelV4(pkt, _)
+                        | TunnResult::WriteToTunnelV6(pkt, _) => {
+                            let pkt_owned = pkt.to_vec();
+                            drop(tunn);
+                            if let Err(e) = tun.send(&pkt_owned).await {
+                                tracing::warn!(error = %e, "Wintun send failed");
+                            }
+                            *state.endpoint.write() = Some(src);
+                            state.last_handshake_sec.store(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                Ordering::Relaxed,
+                            );
+                            handled = true;
+                        }
+                        TunnResult::WriteToNetwork(resp) => {
+                            let resp_owned = resp.to_vec();
+                            drop(tunn);
+                            if let Err(e) = udp.send_to(&resp_owned, src).await {
+                                tracing::warn!(error = %e, "UDP reply send failed");
+                            }
+                            *state.endpoint.write() = Some(src);
+                            handled = true;
+                        }
+                        TunnResult::Done | TunnResult::Err(_) => {
+                            // Not this peer — try the next.
+                        }
+                    }
+                }
+                if handled {
+                    // Drain queued packets: boringtun buffers data
+                    // packets that arrived before the handshake
+                    // completed; passing an empty datagram releases
+                    // them one at a time until `Done`.
+                    loop {
+                        let mut drain = vec![0u8; 65536];
+                        let mut tunn = state.tunn.lock().await;
+                        match tunn.decapsulate(None, &[], &mut drain) {
+                            TunnResult::WriteToNetwork(resp) => {
+                                let resp_owned = resp.to_vec();
+                                drop(tunn);
+                                if let Err(e) = udp.send_to(&resp_owned, src).await {
+                                    tracing::warn!(error = %e, "UDP drain send failed");
+                                }
+                            }
+                            TunnResult::WriteToTunnelV4(pkt, _)
+                            | TunnResult::WriteToTunnelV6(pkt, _) => {
+                                let pkt_owned = pkt.to_vec();
+                                drop(tunn);
+                                if let Err(e) = tun.send(&pkt_owned).await {
+                                    tracing::warn!(error = %e, "Wintun drain send failed");
+                                }
+                            }
+                            TunnResult::Done | TunnResult::Err(_) => break,
+                        }
+                    }
+                    let _ = pk; // peer matched; stop scanning.
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Wintun → encapsulate → UDP loop.
+    ///
+    /// Parses the destination IP from the outbound clear packet,
+    /// matches it against each peer's allowed_ips, encapsulates with
+    /// that peer's `Tunn`, and writes the ciphertext to UDP. If no
+    /// endpoint is known yet the packet is dropped silently — callers
+    /// typically retry at a higher layer, and `update_timers` will be
+    /// firing handshake initiations independently.
+    #[cfg(windows)]
+    async fn egress_loop(
+        tun: Arc<WindowsTun>,
+        udp: Arc<UdpSocket>,
+        peers: Arc<DashMap<[u8; 32], WindowsPeerState>>,
+    ) {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            let n = match tun.recv(&mut buf).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!(error = %e, "Wintun recv failed; egress loop exiting");
+                    break;
+                }
+            };
+
+            let Some(dst_ip) = parse_dst_ip(&buf[..n]) else {
+                continue;
+            };
+
+            // Find the first peer whose allowed_ips contains dst_ip.
+            let state = peers.iter().find_map(|entry| {
+                if entry
+                    .value()
+                    .allowed_ips
+                    .iter()
+                    .any(|net| net.contains(&dst_ip))
+                {
+                    Some(entry.value().clone())
+                } else {
+                    None
+                }
+            });
+            let Some(state) = state else {
+                tracing::trace!(%dst_ip, "no matching overlay peer");
+                continue;
+            };
+
+            let endpoint = *state.endpoint.read();
+            let Some(endpoint) = endpoint else {
+                tracing::trace!(%dst_ip, "peer has no endpoint yet; dropping");
+                continue;
+            };
+
+            // `encapsulate` requires dst ≥ src.len() + 32 and ≥ 148.
+            // We size to 64 KiB + 32 to cover any legal IP packet plus
+            // the WG overhead.
+            let mut out = vec![0u8; 65536 + 32];
+            let mut tunn = state.tunn.lock().await;
+            match tunn.encapsulate(&buf[..n], &mut out) {
+                TunnResult::WriteToNetwork(pkt) => {
+                    let pkt_owned = pkt.to_vec();
+                    drop(tunn);
+                    if let Err(e) = udp.send_to(&pkt_owned, endpoint).await {
+                        tracing::warn!(error = %e, "UDP send failed");
+                    }
+                }
+                TunnResult::Done => {
+                    // Packet queued inside boringtun pending handshake;
+                    // nothing to emit right now.
+                }
+                TunnResult::Err(e) => {
+                    tracing::warn!(?e, "encapsulate error");
+                }
+                TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
+                    // encapsulate never produces TUN-ward results.
+                }
+            }
+        }
+    }
+
+    /// Per-peer periodic `update_timers` tick.
+    ///
+    /// Fires every 250 ms (the cadence boringtun's reference
+    /// implementation uses) to emit keepalives and re-initiate stale
+    /// handshakes. `update_timers` writes at most 148 bytes (max WG
+    /// handshake init length), so the scratch buffer is sized
+    /// accordingly.
+    #[cfg(windows)]
+    async fn timers_loop(udp: Arc<UdpSocket>, peers: Arc<DashMap<[u8; 32], WindowsPeerState>>) {
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let snapshot: Vec<WindowsPeerState> = peers.iter().map(|e| e.value().clone()).collect();
+            for state in snapshot {
+                let endpoint = *state.endpoint.read();
+                let mut out = vec![0u8; 148];
+                let mut tunn = state.tunn.lock().await;
+                match tunn.update_timers(&mut out) {
+                    TunnResult::WriteToNetwork(pkt) => {
+                        let pkt_owned = pkt.to_vec();
+                        drop(tunn);
+                        if let Some(ep) = endpoint {
+                            if let Err(e) = udp.send_to(&pkt_owned, ep).await {
+                                tracing::debug!(error = %e, "timers UDP send failed");
+                            }
+                        }
+                    }
+                    TunnResult::Done => {}
+                    TunnResult::Err(e) => {
+                        tracing::debug!(?e, "update_timers error");
+                    }
+                    TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {}
+                }
+            }
+        }
+    }
+
+    /// Platform-agnostic interface IP assignment and bring-up.
+    ///
+    /// Supports both IPv4 and IPv6 overlay CIDRs. The per-OS details
+    /// (RTNETLINK on Linux, `ifconfig` / `route` shell-outs on macOS)
+    /// are hidden behind the [`InterfaceOps`] trait.
+    ///
+    /// Idempotency behavior is preserved byte-for-byte:
+    /// - `add_address` failures whose message contains `"File exists"`
+    ///   or `"EEXIST"` (Linux RTNETLINK EEXIST on re-add) are swallowed.
+    /// - `add_route_via_dev` failures whose message contains
+    ///   `"File exists"` / `"EEXIST"` (Linux) or `"already in table"`
+    ///   (BSD route) are swallowed inside the macOS implementation; the
+    ///   Linux implementation returns the error, and we swallow it here
+    ///   via the same text-match gate used by the original code.
     async fn configure_interface(&self) -> Result<(), Box<dyn std::error::Error>> {
         let cidr: ipnet::IpNet = self.config.overlay_cidr.parse().map_err(|e| {
             format!(
@@ -411,14 +977,17 @@ impl OverlayTransport {
         })?;
         let overlay_addr = cidr.addr();
         let prefix_len = cidr.prefix_len();
+        let net_addr = cidr.network();
 
-        // Assign overlay IP address — rtnetlink handles both IPv4 and IPv6.
-        // Preserve the original shell-out's idempotency: swallow EEXIST /
-        // "File exists" since a previous run may have left the address
-        // configured on a still-live TUN device.
-        if let Err(e) =
-            crate::netlink::add_address_to_link(&self.interface_name, overlay_addr, prefix_len)
-                .await
+        let iface_ops = platform_ops();
+
+        // Assign overlay IP address — handles both IPv4 and IPv6.
+        // Preserve original idempotency: swallow EEXIST / "File exists"
+        // since a previous run may have left the address configured on
+        // a still-live TUN device.
+        if let Err(e) = iface_ops
+            .add_address(&self.interface_name, overlay_addr, prefix_len)
+            .await
         {
             let msg = e.to_string();
             if !msg.contains("File exists") && !msg.contains("EEXIST") {
@@ -426,21 +995,26 @@ impl OverlayTransport {
             }
         }
 
-        // Bring interface up.
-        crate::netlink::set_link_up_by_name(&self.interface_name)
+        // Bring interface up. On macOS this is redundant with the
+        // `up` token passed into ifconfig during `add_address`, but
+        // harmless.
+        iface_ops
+            .set_link_up(&self.interface_name)
             .await
             .map_err(|e| format!("Failed to bring up interface: {e}"))?;
 
-        // Add explicit route for the overlay subnet. rtnetlink dispatches
-        // internally on v4/v6. Preserve the original shell-out's
-        // idempotency: swallow EEXIST since the kernel may auto-install a
-        // connected route when the address is assigned.
-        let net_addr = cidr.network();
-        if let Err(e) =
-            crate::netlink::add_route_via_dev(net_addr, prefix_len, &self.interface_name).await
+        // Add explicit route for the overlay subnet. Preserve original
+        // idempotency: swallow EEXIST since the kernel may auto-install
+        // a connected route when the address is assigned.
+        if let Err(e) = iface_ops
+            .add_route_via_dev(net_addr, prefix_len, &self.interface_name)
+            .await
         {
             let msg = e.to_string();
-            if !msg.contains("File exists") && !msg.contains("EEXIST") {
+            if !msg.contains("File exists")
+                && !msg.contains("EEXIST")
+                && !msg.contains("already in table")
+            {
                 return Err(format!("Failed to add route: {msg}").into());
             }
         }
@@ -448,61 +1022,130 @@ impl OverlayTransport {
         Ok(())
     }
 
-    /// Add a peer dynamically via UAPI.
+    /// Add a peer dynamically.
+    ///
+    /// On Linux/macOS this writes to boringtun's UAPI socket. On
+    /// Windows it returns an error until the per-peer
+    /// `boringtun::noise::Tunn` map is wired (Phase D3.x).
     ///
     /// # Errors
     ///
-    /// Returns an error if the key conversion or UAPI command fails.
+    /// Returns an error if the key conversion or UAPI command fails on
+    /// Linux/macOS, or always on Windows (until the packet loop lands).
     pub async fn add_peer(&self, peer: &PeerInfo) -> Result<(), Box<dyn std::error::Error>> {
-        let sock = self.uapi_sock_path();
-        let pub_hex = key_to_hex(&peer.public_key)?;
+        #[cfg(not(windows))]
+        {
+            let sock = self.uapi_sock_path();
+            let pub_hex = key_to_hex(&peer.public_key)?;
 
-        let body = format!(
-            "public_key={}\nendpoint={}\nallowed_ip={}\npersistent_keepalive_interval={}\n",
-            pub_hex,
-            peer.endpoint,
-            peer.allowed_ips,
-            peer.persistent_keepalive_interval.as_secs(),
-        );
+            let body = format!(
+                "public_key={}\nendpoint={}\nallowed_ip={}\npersistent_keepalive_interval={}\n",
+                pub_hex,
+                peer.endpoint,
+                peer.allowed_ips,
+                peer.persistent_keepalive_interval.as_secs(),
+            );
 
-        uapi_set(&sock, &body).await?;
-        tracing::debug!(
-            peer_key = %peer.public_key,
-            interface = %self.interface_name,
-            "Added peer via UAPI"
-        );
-        Ok(())
+            uapi_set(&sock, &body).await?;
+            tracing::debug!(
+                peer_key = %peer.public_key,
+                interface = %self.interface_name,
+                "Added peer via UAPI"
+            );
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            let priv_bytes = decode_key_b64(&self.config.private_key)?;
+            self.add_peer_windows(&priv_bytes, peer)?;
+            Ok(())
+        }
     }
 
-    /// Remove a peer via UAPI.
+    /// Remove a peer.
+    ///
+    /// On Linux/macOS this writes to boringtun's UAPI socket. On
+    /// Windows it returns an error until the per-peer
+    /// `boringtun::noise::Tunn` map is wired (Phase D3.x).
     ///
     /// # Errors
     ///
-    /// Returns an error if the key conversion or UAPI command fails.
+    /// Returns an error if the key conversion or UAPI command fails on
+    /// Linux/macOS, or always on Windows (until the packet loop lands).
     pub async fn remove_peer(&self, public_key: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let sock = self.uapi_sock_path();
-        let pub_hex = key_to_hex(public_key)?;
+        #[cfg(not(windows))]
+        {
+            let sock = self.uapi_sock_path();
+            let pub_hex = key_to_hex(public_key)?;
 
-        let body = format!("public_key={pub_hex}\nremove=true\n");
+            let body = format!("public_key={pub_hex}\nremove=true\n");
 
-        uapi_set(&sock, &body).await?;
-        tracing::debug!(
-            peer_key = %public_key,
-            interface = %self.interface_name,
-            "Removed peer via UAPI"
-        );
-        Ok(())
+            uapi_set(&sock, &body).await?;
+            tracing::debug!(
+                peer_key = %public_key,
+                interface = %self.interface_name,
+                "Removed peer via UAPI"
+            );
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            let pk = decode_key_b64(public_key)?;
+            self.peers.remove(&pk);
+            tracing::debug!(
+                peer_key = %public_key,
+                interface = %self.interface_name,
+                "Removed peer from Windows overlay"
+            );
+            Ok(())
+        }
     }
 
-    /// Query interface status via UAPI.
+    /// Query interface status.
+    ///
+    /// On Linux/macOS this reads boringtun's UAPI socket. On Windows it
+    /// returns an error until the packet loop lands (since there is no
+    /// running `WireGuard` stack to query yet).
     ///
     /// # Errors
     ///
-    /// Returns an error if the UAPI query fails.
+    /// Returns an error if the UAPI query fails on Linux/macOS, or
+    /// always on Windows.
     pub async fn status(&self) -> Result<String, Box<dyn std::error::Error>> {
-        let sock = self.uapi_sock_path();
-        let response = uapi_get(&sock).await?;
-        Ok(response)
+        #[cfg(not(windows))]
+        {
+            let sock = self.uapi_sock_path();
+            let response = uapi_get(&sock).await?;
+            Ok(response)
+        }
+        #[cfg(windows)]
+        {
+            // Mimic the `wg show`-style key=value newline-delimited
+            // dump that the Linux/macOS UAPI surface produces.
+            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            let mut out = String::new();
+            let priv_bytes = decode_key_b64(&self.config.private_key).unwrap_or([0u8; 32]);
+            let _ = writeln!(out, "private_key={}", hex::encode(priv_bytes));
+            let _ = writeln!(out, "listen_port={}", self.config.local_endpoint.port());
+            for entry in self.peers.iter() {
+                let pk_b64 = STANDARD.encode(entry.key());
+                let _ = writeln!(out, "public_key={}", hex::encode(entry.key()));
+                let _ = writeln!(out, "public_key_b64={pk_b64}");
+                if let Some(ep) = *entry.value().endpoint.read() {
+                    let _ = writeln!(out, "endpoint={ep}");
+                }
+                for net in entry.value().allowed_ips.iter() {
+                    let _ = writeln!(out, "allowed_ip={net}");
+                }
+                if let Some(k) = entry.value().persistent_keepalive {
+                    let _ = writeln!(out, "persistent_keepalive_interval={k}");
+                }
+                let last = entry.value().last_handshake_sec.load(Ordering::Relaxed);
+                let _ = writeln!(out, "last_handshake_time_sec={last}");
+            }
+            let _ = writeln!(out, "errno=0");
+            Ok(out)
+        }
     }
 
     /// Generate an overlay keypair using native Rust crypto (x25519-dalek).
@@ -541,16 +1184,34 @@ impl OverlayTransport {
         public_key: &str,
         new_endpoint: std::net::SocketAddr,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let sock = self.uapi_sock_path();
-        let pub_hex = key_to_hex(public_key)?;
-        let body = format!("public_key={pub_hex}\nendpoint={new_endpoint}\n");
-        uapi_set(&sock, &body).await?;
-        tracing::debug!(
-            peer_key = %public_key,
-            endpoint = %new_endpoint,
-            "Updated peer endpoint"
-        );
-        Ok(())
+        #[cfg(not(windows))]
+        {
+            let sock = self.uapi_sock_path();
+            let pub_hex = key_to_hex(public_key)?;
+            let body = format!("public_key={pub_hex}\nendpoint={new_endpoint}\n");
+            uapi_set(&sock, &body).await?;
+            tracing::debug!(
+                peer_key = %public_key,
+                endpoint = %new_endpoint,
+                "Updated peer endpoint"
+            );
+            Ok(())
+        }
+        #[cfg(windows)]
+        {
+            let pk = decode_key_b64(public_key)?;
+            let entry = self
+                .peers
+                .get(&pk)
+                .ok_or_else(|| format!("peer not found: {public_key}"))?;
+            *entry.value().endpoint.write() = Some(new_endpoint);
+            tracing::debug!(
+                peer_key = %public_key,
+                endpoint = %new_endpoint,
+                "Updated peer endpoint (Windows)"
+            );
+            Ok(())
+        }
     }
 
     /// Check if a peer has completed a `WireGuard` handshake since a given timestamp.
@@ -567,39 +1228,58 @@ impl OverlayTransport {
         public_key: &str,
         since: u64,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let sock = self.uapi_sock_path();
-        let response = uapi_get(&sock).await?;
-        let target_hex = key_to_hex(public_key)?;
+        #[cfg(not(windows))]
+        {
+            let sock = self.uapi_sock_path();
+            let response = uapi_get(&sock).await?;
+            let target_hex = key_to_hex(public_key)?;
 
-        let mut in_target = false;
-        for line in response.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with("errno=") {
-                continue;
-            }
-            let Some((key, value)) = line.split_once('=') else {
-                continue;
-            };
-            match key {
-                "public_key" => {
-                    in_target = value == target_hex;
+            let mut in_target = false;
+            for line in response.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with("errno=") {
+                    continue;
                 }
-                "last_handshake_time_sec" if in_target => {
-                    if let Ok(t) = value.parse::<u64>() {
-                        return Ok(t > 0 && t >= since);
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                match key {
+                    "public_key" => {
+                        in_target = value == target_hex;
                     }
+                    "last_handshake_time_sec" if in_target => {
+                        if let Ok(t) = value.parse::<u64>() {
+                            return Ok(t > 0 && t >= since);
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
+            Ok(false)
         }
-        Ok(false)
+        #[cfg(windows)]
+        {
+            let pk = decode_key_b64(public_key)?;
+            let entry = self
+                .peers
+                .get(&pk)
+                .ok_or_else(|| format!("peer not found: {public_key}"))?;
+            let last = entry.value().last_handshake_sec.load(Ordering::Relaxed);
+            Ok(last > 0 && last >= since)
+        }
     }
 
     /// Shut down the overlay transport, destroying the TUN device.
     ///
-    /// This takes the [`DeviceHandle`] and drops it, which triggers boringtun's
-    /// cleanup logic (signal exit + join worker threads + remove socket).
+    /// On Linux/macOS this takes the boringtun [`DeviceHandle`] and
+    /// drops it, which triggers boringtun's cleanup logic (signal exit +
+    /// join worker threads + remove socket).
+    ///
+    /// On Windows it takes the Wintun adapter handle and drops it, which
+    /// ends the session and removes the adapter from the Windows device
+    /// tree.
     pub fn shutdown(&mut self) {
+        #[cfg(not(windows))]
         if let Some(device) = self.device.take() {
             tracing::info!(
                 interface = %self.interface_name,
@@ -607,6 +1287,30 @@ impl OverlayTransport {
             );
             // DeviceHandle::drop triggers exit + cleanup
             drop(device);
+        }
+        #[cfg(windows)]
+        {
+            if let Some(h) = self.ingress_task.take() {
+                h.abort();
+            }
+            if let Some(h) = self.egress_task.take() {
+                h.abort();
+            }
+            if let Some(h) = self.timers_task.take() {
+                h.abort();
+            }
+            // Drop the UDP socket — any in-flight recv on the ingress
+            // task will already have been aborted above, but the Arc
+            // count must drop to zero for the kernel handle to close.
+            self.udp.take();
+            self.peers.clear();
+            if let Some(dev) = self.wintun_dev.take() {
+                tracing::info!(
+                    interface = %self.interface_name,
+                    "Shutting down Wintun overlay transport"
+                );
+                drop(dev);
+            }
         }
     }
 }
@@ -639,6 +1343,70 @@ mod tests {
         let config = peer.to_peer_config();
         assert!(config.contains("PublicKey = test_public_key"));
         assert!(config.contains("Endpoint = 10.0.0.1:51820"));
+    }
+
+    // -----------------------------------------------------------------
+    // Windows-only helper tests
+    // -----------------------------------------------------------------
+
+    #[cfg(windows)]
+    #[test]
+    fn test_parse_dst_ip_v4() {
+        // Minimal IPv4 header: version=4 (top nibble), header length=5,
+        // dst IP = 10.0.0.7 in bytes 16..20.
+        let mut pkt = vec![0u8; 20];
+        pkt[0] = 0x45;
+        pkt[16..20].copy_from_slice(&[10, 0, 0, 7]);
+        assert_eq!(
+            super::parse_dst_ip(&pkt),
+            Some(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7)))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_parse_dst_ip_v6() {
+        // IPv6: version=6 (top nibble), dst IP = fd00::1 in bytes 24..40.
+        let mut pkt = vec![0u8; 40];
+        pkt[0] = 0x60;
+        pkt[24] = 0xfd;
+        pkt[25] = 0x00;
+        pkt[39] = 0x01;
+        let expected = IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1));
+        assert_eq!(super::parse_dst_ip(&pkt), Some(expected));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_parse_dst_ip_truncated_returns_none() {
+        let pkt = vec![0x45u8; 10];
+        assert_eq!(super::parse_dst_ip(&pkt), None);
+        assert_eq!(super::parse_dst_ip(&[]), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_parse_dst_ip_unknown_version_returns_none() {
+        let pkt = vec![0x70u8; 64];
+        assert_eq!(super::parse_dst_ip(&pkt), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_decode_key_b64_roundtrip() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let raw = [0x42u8; 32];
+        let b64 = STANDARD.encode(raw);
+        let decoded = super::decode_key_b64(&b64).expect("decode");
+        assert_eq!(decoded, raw);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_decode_key_b64_wrong_length_errors() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let short = STANDARD.encode([0u8; 16]);
+        assert!(super::decode_key_b64(&short).is_err());
     }
 
     #[test]
@@ -789,6 +1557,7 @@ mod tests {
     async fn test_create_interface_boringtun() {
         let config = OverlayConfig {
             overlay_cidr: "10.42.0.1/24".to_string(),
+            cluster_cidr: None,
             private_key: "test_key".to_string(),
             public_key: "test_pub".to_string(),
             local_endpoint: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 51820),
@@ -838,6 +1607,7 @@ mod tests {
     async fn test_create_interface_boringtun_ipv6() {
         let config = OverlayConfig {
             overlay_cidr: "fd00::1/48".to_string(),
+            cluster_cidr: None,
             private_key: "test_key".to_string(),
             public_key: "test_pub".to_string(),
             local_endpoint: SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 51820),

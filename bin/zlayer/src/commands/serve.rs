@@ -1002,11 +1002,86 @@ pub(crate) async fn serve(
     }
 
     let ip_allocator = Arc::new(RwLock::new(ip_allocator));
+
+    // Initialize leader-side slice allocator. Carves the cluster CIDR into
+    // `/28` slices assigned to each joining node. Persists snapshots to
+    // `slice_allocator.json` next to the IP allocator state.
+    let slice_allocator_path = config.data_dir.join("slice_allocator.json");
+    let slice_allocator = {
+        let cluster_cidr: zlayer_overlay::ipnet::IpNet = node_config
+            .overlay_cidr
+            .parse()
+            .context("Invalid overlay CIDR in node config (slice allocator)")?;
+        if slice_allocator_path.exists() {
+            match tokio::fs::read_to_string(&slice_allocator_path).await {
+                Ok(contents) => match serde_json::from_str::<
+                    zlayer_overlay::NodeSliceAllocatorSnapshot,
+                >(&contents)
+                {
+                    Ok(snapshot) => match zlayer_overlay::NodeSliceAllocator::restore(snapshot) {
+                        Ok(alloc) => {
+                            info!(
+                                path = %slice_allocator_path.display(),
+                                "Loaded persisted slice allocator state"
+                            );
+                            alloc
+                        }
+                        Err(e) => {
+                            warn!(
+                                path = %slice_allocator_path.display(),
+                                error = %e,
+                                "Failed to restore slice allocator state, creating fresh"
+                            );
+                            zlayer_overlay::NodeSliceAllocator::new(
+                                cluster_cidr,
+                                zlayer_overlay::DEFAULT_SLICE_PREFIX,
+                            )
+                            .context("Failed to create slice allocator")?
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            path = %slice_allocator_path.display(),
+                            error = %e,
+                            "Failed to parse slice allocator snapshot, creating fresh"
+                        );
+                        zlayer_overlay::NodeSliceAllocator::new(
+                            cluster_cidr,
+                            zlayer_overlay::DEFAULT_SLICE_PREFIX,
+                        )
+                        .context("Failed to create slice allocator")?
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        path = %slice_allocator_path.display(),
+                        error = %e,
+                        "Failed to read slice allocator state, creating fresh"
+                    );
+                    zlayer_overlay::NodeSliceAllocator::new(
+                        cluster_cidr,
+                        zlayer_overlay::DEFAULT_SLICE_PREFIX,
+                    )
+                    .context("Failed to create slice allocator")?
+                }
+            }
+        } else {
+            zlayer_overlay::NodeSliceAllocator::new(
+                cluster_cidr,
+                zlayer_overlay::DEFAULT_SLICE_PREFIX,
+            )
+            .context("Failed to create slice allocator")?
+        }
+    };
+    let slice_allocator = Arc::new(RwLock::new(slice_allocator));
+
     let cluster_state = ClusterApiState::with_internal_token(
         _raft.clone(),
         Some(join_secret),
         ip_allocator,
         Some(ip_allocator_path),
+        slice_allocator,
+        Some(slice_allocator_path),
         internal_token,
         Some(config.data_dir.clone()),
     );

@@ -133,6 +133,7 @@ windows = { version = "0.62", features = [
     "Win32_System_HostComputeSystem",
 ] }
 zlayer-hcs = { path = "../zlayer-hcs" }
+zlayer-hns = { path = "../zlayer-hns" }
 # Windows OCI layer unpacker deps (crates/.../windows/unpacker.rs).
 # `uuid` is already in the main [dependencies] section but listing it again
 # here would be redundant; same for `sha2` (only pulled in via the `wasm`

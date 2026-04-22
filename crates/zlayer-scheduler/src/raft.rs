@@ -79,6 +79,10 @@ pub enum Request {
         os: Option<zlayer_spec::OsKind>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         arch: Option<zlayer_spec::ArchKind>,
+        /// Per-node slice of the cluster CIDR assigned by the leader (e.g. "10.200.42.0/28").
+        /// Empty string for pre-slice-aware registrations — treated as "no slice".
+        #[serde(default)]
+        slice_cidr: String,
     },
     /// Update node heartbeat with current resource usage
     UpdateNodeHeartbeat {
@@ -240,6 +244,10 @@ pub struct NodeInfo {
     /// CPU architecture of the agent. Same legacy semantics as `os`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<zlayer_spec::ArchKind>,
+    /// Per-node slice of the cluster CIDR assigned by the leader (e.g. "10.200.42.0/28").
+    /// Empty string for pre-slice-aware registrations — treated as "no slice".
+    #[serde(default)]
+    pub slice_cidr: String,
 }
 
 fn default_node_status() -> String {
@@ -313,6 +321,9 @@ pub struct AddMemberParams {
     pub os: Option<zlayer_spec::OsKind>,
     /// CPU architecture of the joining agent. Same legacy semantics as `os`.
     pub arch: Option<zlayer_spec::ArchKind>,
+    /// Per-node slice of the cluster CIDR assigned by the leader (e.g. "10.200.42.0/28").
+    /// Empty string for pre-slice-aware registrations — treated as "no slice".
+    pub slice_cidr: String,
 }
 
 impl ClusterState {
@@ -365,6 +376,7 @@ impl ClusterState {
                 mode,
                 os,
                 arch,
+                slice_cidr,
             } => self.apply_register_node(
                 *node_id,
                 address,
@@ -380,6 +392,7 @@ impl ClusterState {
                 mode,
                 *os,
                 *arch,
+                slice_cidr,
             ),
             Request::UpdateNodeHeartbeat {
                 node_id,
@@ -480,6 +493,7 @@ impl ClusterState {
         mode: &str,
         os: Option<zlayer_spec::OsKind>,
         arch: Option<zlayer_spec::ArchKind>,
+        slice_cidr: &str,
     ) -> Response {
         let now = u64::try_from(
             std::time::SystemTime::now()
@@ -513,6 +527,7 @@ impl ClusterState {
                 mode: mode.to_owned(),
                 os,
                 arch,
+                slice_cidr: slice_cidr.to_owned(),
             },
         );
 
@@ -849,6 +864,7 @@ impl RaftCoordinator {
             mode: params.mode.clone(),
             os: params.os,
             arch: params.arch,
+            slice_cidr: params.slice_cidr,
         })
         .await?;
 
@@ -1196,6 +1212,7 @@ mod tests {
             mode: "full".to_string(),
             os: None,
             arch: None,
+            slice_cidr: String::new(),
         });
 
         let node = state.get_node(1).unwrap();
@@ -1246,6 +1263,7 @@ mod tests {
             mode: "full".to_string(),
             os: None,
             arch: None,
+            slice_cidr: String::new(),
         });
 
         // Save
@@ -1291,6 +1309,7 @@ mod tests {
             mode: "full".to_string(),
             os: None,
             arch: None,
+            slice_cidr: String::new(),
         });
 
         // Save
@@ -1335,6 +1354,7 @@ mod tests {
             mode: "full".to_string(),
             os: None,
             arch: None,
+            slice_cidr: String::new(),
         });
 
         let node = state.get_node(3).unwrap();

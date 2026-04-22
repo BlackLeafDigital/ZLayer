@@ -27,7 +27,9 @@ impl ZLayerDirs {
     /// - macOS: `~/.zlayer`
     /// - Linux (root): `/var/lib/zlayer`
     /// - Linux (user): `~/.zlayer`
-    /// - Windows: `%LOCALAPPDATA%\ZLayer` or `C:\ProgramData\ZLayer`
+    /// - Windows: `%ProgramData%\ZLayer` (system) or `C:\ProgramData\ZLayer`
+    ///   fallback. HCS-backed nodes run as SYSTEM so the system-wide
+    ///   `ProgramData` location is the right default.
     pub fn default_data_dir() -> PathBuf {
         #[cfg(target_os = "macos")]
         {
@@ -35,11 +37,7 @@ impl ZLayerDirs {
         }
         #[cfg(target_os = "windows")]
         {
-            if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-                PathBuf::from(local_app_data).join("ZLayer")
-            } else {
-                PathBuf::from(r"C:\ProgramData\ZLayer")
-            }
+            windows_program_data_root()
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -55,7 +53,10 @@ impl ZLayerDirs {
     ///
     /// On Linux, if not root, checks whether `/var/lib/zlayer/daemon.json`
     /// exists (indicating a system-level install) and returns
-    /// `/var/lib/zlayer` if so. Otherwise falls back to [`default_data_dir`].
+    /// `/var/lib/zlayer` if so. On Windows, probes `%ProgramData%\ZLayer`
+    /// for a `daemon.json` marker in case the caller lacks the env var but
+    /// a prior system install is present. Otherwise falls back to
+    /// [`default_data_dir`].
     pub fn detect_data_dir() -> PathBuf {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -66,6 +67,13 @@ impl ZLayerDirs {
                 }
             }
         }
+        #[cfg(target_os = "windows")]
+        {
+            let system_data = windows_program_data_root();
+            if system_data.join("daemon.json").exists() {
+                return system_data;
+            }
+        }
         Self::default_data_dir()
     }
 
@@ -73,7 +81,7 @@ impl ZLayerDirs {
     ///
     /// - Linux: `/var/run/zlayer`
     /// - macOS: `{default_data_dir}/run`
-    /// - Windows: `{default_data_dir}\run`
+    /// - Windows: `{default_data_dir}\run` (i.e. `%ProgramData%\ZLayer\run`)
     pub fn default_run_dir() -> PathBuf {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -89,7 +97,7 @@ impl ZLayerDirs {
     ///
     /// - Linux: `/var/log/zlayer`
     /// - macOS: `{default_data_dir}/logs`
-    /// - Windows: `{default_data_dir}\logs`
+    /// - Windows: `{default_data_dir}\logs` (i.e. `%ProgramData%\ZLayer\logs`)
     pub fn default_log_dir() -> PathBuf {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -220,6 +228,11 @@ impl ZLayerDirs {
         self.data_dir.join("daemon.json")
     }
 
+    /// Path to the agent's local IPAM (per-node slice allocator) state file.
+    pub fn agent_ipam_state(&self) -> PathBuf {
+        self.data_dir.join("agent_ipam.json")
+    }
+
     /// Logs subdirectory under data_dir (`{data}/logs`).
     /// Used on macOS where logs live under the user data dir.
     pub fn logs(&self) -> PathBuf {
@@ -256,10 +269,27 @@ impl ZLayerDirs {
 
 // -- Internal helpers --------------------------------------------------------
 
+#[cfg(not(target_os = "windows"))]
 fn home_dir_or_tmp() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
+}
+
+/// Resolve the Windows system-wide ZLayer data root.
+///
+/// Uses `%ProgramData%` (typically `C:\ProgramData`) when present, falling
+/// back to the literal `C:\ProgramData\ZLayer` path when the env var is
+/// missing (as can happen under a stripped-down service account).
+#[cfg(target_os = "windows")]
+fn windows_program_data_root() -> PathBuf {
+    if let Some(program_data) = std::env::var_os("PROGRAMDATA") {
+        let mut p = PathBuf::from(program_data);
+        p.push("ZLayer");
+        p
+    } else {
+        PathBuf::from(r"C:\ProgramData\ZLayer")
+    }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -314,5 +344,48 @@ mod tests {
     fn system_default_uses_default_data_dir() {
         let dirs = ZLayerDirs::system_default();
         assert_eq!(dirs.data_dir(), ZLayerDirs::default_data_dir().as_path());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_default_data_dir_uses_program_data() {
+        let prev = std::env::var_os("PROGRAMDATA");
+        std::env::set_var("PROGRAMDATA", r"C:\TestProgramData");
+
+        let data = ZLayerDirs::default_data_dir();
+        assert_eq!(data, PathBuf::from(r"C:\TestProgramData\ZLayer"));
+
+        // Sub-paths should live under the ProgramData root.
+        let dirs = ZLayerDirs::system_default();
+        assert_eq!(dirs.certs(), data.join("certs"));
+        assert_eq!(dirs.secrets(), data.join("secrets"));
+        assert_eq!(dirs.logs(), data.join("logs"));
+
+        // Run/log helpers should also honour the ProgramData root.
+        assert_eq!(ZLayerDirs::default_run_dir(), data.join("run"));
+        assert_eq!(ZLayerDirs::default_log_dir(), data.join("logs"));
+
+        // Socket path on Windows is a TCP loopback endpoint, not a filesystem
+        // path.
+        assert_eq!(ZLayerDirs::default_socket_path(), "tcp://127.0.0.1:3669");
+
+        match prev {
+            Some(v) => std::env::set_var("PROGRAMDATA", v),
+            None => std::env::remove_var("PROGRAMDATA"),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_default_data_dir_fallback_when_env_missing() {
+        let prev = std::env::var_os("PROGRAMDATA");
+        std::env::remove_var("PROGRAMDATA");
+
+        let data = ZLayerDirs::default_data_dir();
+        assert_eq!(data, PathBuf::from(r"C:\ProgramData\ZLayer"));
+
+        if let Some(v) = prev {
+            std::env::set_var("PROGRAMDATA", v);
+        }
     }
 }

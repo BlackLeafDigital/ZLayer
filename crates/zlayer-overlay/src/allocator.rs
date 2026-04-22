@@ -4,10 +4,10 @@
 //! Supports both IPv4 and IPv6 (dual-stack) networks.
 
 use crate::error::{OverlayError, Result};
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use std::net::{IpAddr, Ipv6Addr};
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 
 /// IP allocator for overlay network addresses
@@ -350,6 +350,233 @@ impl IpAllocator {
     #[must_use]
     pub fn allocated_ips(&self) -> Vec<IpAddr> {
         self.allocated.iter().copied().collect()
+    }
+}
+
+/// Leader-side allocator that carves per-node slices out of a cluster CIDR.
+///
+/// Used to fix the latent IP-collision bug where every agent independently
+/// allocated container IPs from the full cluster `/16`. With a `NodeSliceAllocator`
+/// the leader hands each joining node its own non-overlapping slice, and the
+/// agent-local `IpAllocator` is bounded to that slice.
+///
+/// Slice assignment is deterministic within a leader process: the node ID hashes
+/// to a candidate slice index; collisions are resolved by linear probing forward
+/// until a free slot is found. Existing assignments are preserved across leader
+/// restart via `snapshot()` / `restore()`.
+#[derive(Debug, Clone)]
+pub struct NodeSliceAllocator {
+    cluster_cidr: IpNet,
+    slice_prefix: u8,
+    assigned: HashMap<String, IpNet>,
+}
+
+/// Persistent snapshot of a `NodeSliceAllocator` for raft/disk persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeSliceAllocatorSnapshot {
+    pub cluster_cidr: String,
+    pub slice_prefix: u8,
+    pub assigned: Vec<(String, String)>,
+}
+
+/// Deterministic FNV-1a 64-bit hash for a node ID string.
+///
+/// Chosen over `DefaultHasher` because `DefaultHasher` is seeded per-process
+/// and slice assignments should be reproducible from a snapshot.
+fn hash_node_id(node_id: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for &b in node_id.as_bytes() {
+        hash ^= u64::from(b);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+impl NodeSliceAllocator {
+    /// Create a new slice allocator that carves `/slice_prefix`-sized slices
+    /// out of `cluster_cidr`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OverlayError::InvalidCidr` if `slice_prefix` is not strictly
+    /// more specific than `cluster_cidr.prefix_len()`, or if it exceeds the
+    /// address family's maximum prefix length.
+    pub fn new(cluster_cidr: IpNet, slice_prefix: u8) -> Result<Self> {
+        if slice_prefix <= cluster_cidr.prefix_len() {
+            return Err(OverlayError::InvalidCidr(format!(
+                "slice prefix /{} must be more specific than cluster prefix /{}",
+                slice_prefix,
+                cluster_cidr.prefix_len()
+            )));
+        }
+        if slice_prefix > cluster_cidr.max_prefix_len() {
+            return Err(OverlayError::InvalidCidr(format!(
+                "slice prefix /{} exceeds address family max /{}",
+                slice_prefix,
+                cluster_cidr.max_prefix_len()
+            )));
+        }
+        Ok(Self {
+            cluster_cidr,
+            slice_prefix,
+            assigned: HashMap::new(),
+        })
+    }
+
+    /// Assign (or return an existing) slice for `node_id`.
+    ///
+    /// Idempotent: calling `assign` with a node ID that already has a slice
+    /// returns the existing slice without re-assigning.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OverlayError::NoAvailableIps` if every slice in the cluster
+    /// CIDR is already assigned.
+    pub fn assign(&mut self, node_id: &str) -> Result<IpNet> {
+        if let Some(existing) = self.assigned.get(node_id) {
+            return Ok(*existing);
+        }
+
+        let num_slices = self.num_slices();
+        if num_slices == 0 {
+            return Err(OverlayError::NoAvailableIps);
+        }
+
+        let taken: HashSet<IpNet> = self.assigned.values().copied().collect();
+        let start = hash_node_id(node_id) % num_slices;
+
+        for i in 0..num_slices {
+            let idx = (start + i) % num_slices;
+            let slice = self.slice_at_index(idx);
+            if !taken.contains(&slice) {
+                self.assigned.insert(node_id.to_string(), slice);
+                return Ok(slice);
+            }
+        }
+
+        Err(OverlayError::NoAvailableIps)
+    }
+
+    /// Release `node_id`'s slice back to the free pool.
+    ///
+    /// Returns `true` if a slice was released, `false` if the node was not assigned.
+    pub fn release(&mut self, node_id: &str) -> bool {
+        self.assigned.remove(node_id).is_some()
+    }
+
+    /// Look up a node's assigned slice without mutating state.
+    #[must_use]
+    pub fn slice_for(&self, node_id: &str) -> Option<IpNet> {
+        self.assigned.get(node_id).copied()
+    }
+
+    /// Number of currently-assigned slices.
+    #[must_use]
+    pub fn assigned_count(&self) -> usize {
+        self.assigned.len()
+    }
+
+    /// Total number of slices the cluster CIDR can hold at the configured slice prefix.
+    #[must_use]
+    pub fn capacity(&self) -> u64 {
+        self.num_slices()
+    }
+
+    /// Cluster CIDR the allocator operates over.
+    #[must_use]
+    pub fn cluster_cidr(&self) -> IpNet {
+        self.cluster_cidr
+    }
+
+    /// Slice prefix length (e.g. `28` for `/28` slices).
+    #[must_use]
+    pub fn slice_prefix(&self) -> u8 {
+        self.slice_prefix
+    }
+
+    /// Build a persistable snapshot for durable leader state.
+    #[must_use]
+    pub fn snapshot(&self) -> NodeSliceAllocatorSnapshot {
+        NodeSliceAllocatorSnapshot {
+            cluster_cidr: self.cluster_cidr.to_string(),
+            slice_prefix: self.slice_prefix,
+            assigned: self
+                .assigned
+                .iter()
+                .map(|(k, v)| (k.clone(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    /// Rebuild an allocator from a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns `OverlayError::InvalidCidr` if the snapshot's CIDR or any
+    /// assigned slice fails to parse, or if the slice prefix is inconsistent.
+    pub fn restore(snapshot: NodeSliceAllocatorSnapshot) -> Result<Self> {
+        let cluster_cidr: IpNet = snapshot
+            .cluster_cidr
+            .parse()
+            .map_err(|e| OverlayError::InvalidCidr(format!("{}: {e}", snapshot.cluster_cidr)))?;
+        let mut allocator = Self::new(cluster_cidr, snapshot.slice_prefix)?;
+        for (node_id, slice_str) in snapshot.assigned {
+            let slice: IpNet = slice_str
+                .parse()
+                .map_err(|e| OverlayError::InvalidCidr(format!("{slice_str}: {e}")))?;
+            if slice.prefix_len() != snapshot.slice_prefix {
+                return Err(OverlayError::InvalidCidr(format!(
+                    "assigned slice {slice} does not match configured prefix /{}",
+                    snapshot.slice_prefix
+                )));
+            }
+            if !cluster_cidr.contains(&slice.network()) {
+                return Err(OverlayError::InvalidCidr(format!(
+                    "assigned slice {slice} is not contained in cluster CIDR {cluster_cidr}"
+                )));
+            }
+            allocator.assigned.insert(node_id, slice);
+        }
+        Ok(allocator)
+    }
+
+    fn num_slices(&self) -> u64 {
+        let bits = self.slice_prefix - self.cluster_cidr.prefix_len();
+        // bits is in 1..=32 for v4 or 1..=128 for v6. For a /16 cluster with /28
+        // slices, bits = 12 → 4096 slices, safely inside u64 range.
+        if bits >= 64 {
+            u64::MAX
+        } else {
+            1u64 << bits
+        }
+    }
+
+    fn slice_at_index(&self, idx: u64) -> IpNet {
+        let shift = u32::from(self.cluster_cidr.max_prefix_len() - self.slice_prefix);
+        match self.cluster_cidr {
+            IpNet::V4(v4) => {
+                let base = u32::from(v4.network());
+                // idx fits in 32 bits whenever slice_prefix − cluster_prefix ≤ 32.
+                #[allow(clippy::cast_possible_truncation)]
+                let offset = (idx as u32).wrapping_shl(shift);
+                let slice_addr = Ipv4Addr::from(base.wrapping_add(offset));
+                IpNet::V4(
+                    Ipv4Net::new(slice_addr, self.slice_prefix)
+                        .expect("slice_prefix validated in constructor"),
+                )
+            }
+            IpNet::V6(v6) => {
+                let base = u128::from(v6.network());
+                let offset = u128::from(idx).wrapping_shl(shift);
+                let slice_addr = Ipv6Addr::from(base.wrapping_add(offset));
+                IpNet::V6(
+                    Ipv6Net::new(slice_addr, self.slice_prefix)
+                        .expect("slice_prefix validated in constructor"),
+                )
+            }
+        }
     }
 }
 
@@ -819,5 +1046,193 @@ mod tests {
         assert_eq!(host_count(true, 127), 1); // 2^1 - 1
         assert_eq!(host_count(true, 128), 0); // /128 — single address (is network addr)
         assert_eq!(host_count(true, 64), (1u128 << 64) - 1); // 2^64 - 1
+    }
+
+    // ========================
+    // NodeSliceAllocator tests
+    // ========================
+
+    fn cluster() -> IpNet {
+        "10.200.0.0/16".parse().unwrap()
+    }
+
+    #[test]
+    fn test_slice_new_rejects_equal_prefix() {
+        let err = NodeSliceAllocator::new(cluster(), 16).unwrap_err();
+        assert!(matches!(err, OverlayError::InvalidCidr(_)));
+    }
+
+    #[test]
+    fn test_slice_new_rejects_smaller_prefix() {
+        let err = NodeSliceAllocator::new(cluster(), 8).unwrap_err();
+        assert!(matches!(err, OverlayError::InvalidCidr(_)));
+    }
+
+    #[test]
+    fn test_slice_new_rejects_over_max() {
+        let err = NodeSliceAllocator::new(cluster(), 33).unwrap_err();
+        assert!(matches!(err, OverlayError::InvalidCidr(_)));
+    }
+
+    #[test]
+    fn test_slice_capacity_28_in_16() {
+        let allocator = NodeSliceAllocator::new(cluster(), 28).unwrap();
+        // /16 → /28 ⇒ 2^12 = 4096 slices
+        assert_eq!(allocator.capacity(), 4096);
+    }
+
+    #[test]
+    fn test_slice_capacity_24_in_16() {
+        let allocator = NodeSliceAllocator::new(cluster(), 24).unwrap();
+        // /16 → /24 ⇒ 2^8 = 256 slices
+        assert_eq!(allocator.capacity(), 256);
+    }
+
+    #[test]
+    fn test_slice_assign_is_within_cluster() {
+        let mut allocator = NodeSliceAllocator::new(cluster(), 28).unwrap();
+        let slice = allocator.assign("node-a").unwrap();
+        assert_eq!(slice.prefix_len(), 28);
+        assert!(cluster().contains(&slice.network()));
+    }
+
+    #[test]
+    fn test_slice_assign_is_idempotent() {
+        let mut allocator = NodeSliceAllocator::new(cluster(), 28).unwrap();
+        let first = allocator.assign("node-a").unwrap();
+        let second = allocator.assign("node-a").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(allocator.assigned_count(), 1);
+    }
+
+    #[test]
+    fn test_slice_assign_different_nodes_get_different_slices() {
+        let mut allocator = NodeSliceAllocator::new(cluster(), 28).unwrap();
+        let a = allocator.assign("node-a").unwrap();
+        let b = allocator.assign("node-b").unwrap();
+        let c = allocator.assign("node-c").unwrap();
+        assert_ne!(a, b);
+        assert_ne!(b, c);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn test_slice_release() {
+        let mut allocator = NodeSliceAllocator::new(cluster(), 28).unwrap();
+        let slice = allocator.assign("node-a").unwrap();
+        assert_eq!(allocator.slice_for("node-a"), Some(slice));
+
+        assert!(allocator.release("node-a"));
+        assert_eq!(allocator.slice_for("node-a"), None);
+
+        // Release of unknown node returns false.
+        assert!(!allocator.release("node-a"));
+    }
+
+    #[test]
+    fn test_slice_collision_probes_forward() {
+        // Use a very small cluster → few slices → high probability that two
+        // arbitrary IDs hash to the same candidate index. Force a true collision
+        // by manually occupying the slot a second node's hash maps to.
+        let small: IpNet = "10.200.0.0/28".parse().unwrap();
+        let mut allocator = NodeSliceAllocator::new(small, 30).unwrap();
+        // /28 → /30 ⇒ 2^2 = 4 slices
+        assert_eq!(allocator.capacity(), 4);
+
+        // Assign 4 nodes — all must succeed and all must land on distinct slices.
+        let ids = ["a", "b", "c", "d"];
+        let mut slices: Vec<IpNet> = Vec::new();
+        for id in ids {
+            let slice = allocator.assign(id).unwrap();
+            assert!(
+                !slices.contains(&slice),
+                "slice {slice} re-assigned; all slices must be distinct"
+            );
+            slices.push(slice);
+        }
+        assert_eq!(allocator.assigned_count(), 4);
+    }
+
+    #[test]
+    fn test_slice_exhaustion_4096() {
+        let mut allocator = NodeSliceAllocator::new(cluster(), 28).unwrap();
+        // Fill every one of the 4096 slices.
+        for i in 0..4096u32 {
+            let id = format!("node-{i}");
+            allocator.assign(&id).unwrap();
+        }
+        assert_eq!(allocator.assigned_count(), 4096);
+
+        // The next assignment must fail with NoAvailableIps.
+        let err = allocator.assign("node-4096").unwrap_err();
+        assert!(matches!(err, OverlayError::NoAvailableIps));
+    }
+
+    #[test]
+    fn test_slice_snapshot_roundtrip() {
+        let mut allocator = NodeSliceAllocator::new(cluster(), 28).unwrap();
+        let slice_a = allocator.assign("node-a").unwrap();
+        let slice_b = allocator.assign("node-b").unwrap();
+        let slice_c = allocator.assign("node-c").unwrap();
+
+        let snapshot = allocator.snapshot();
+
+        // Round-trip through JSON serialization too.
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let snapshot_restored: NodeSliceAllocatorSnapshot = serde_json::from_str(&json).unwrap();
+
+        let restored = NodeSliceAllocator::restore(snapshot_restored).unwrap();
+        assert_eq!(restored.slice_for("node-a"), Some(slice_a));
+        assert_eq!(restored.slice_for("node-b"), Some(slice_b));
+        assert_eq!(restored.slice_for("node-c"), Some(slice_c));
+        assert_eq!(restored.capacity(), 4096);
+        assert_eq!(restored.slice_prefix(), 28);
+        assert_eq!(restored.cluster_cidr(), cluster());
+    }
+
+    #[test]
+    fn test_slice_restore_rejects_mismatched_prefix() {
+        let snapshot = NodeSliceAllocatorSnapshot {
+            cluster_cidr: "10.200.0.0/16".to_string(),
+            slice_prefix: 28,
+            assigned: vec![("node-a".to_string(), "10.200.0.0/24".to_string())],
+        };
+        let err = NodeSliceAllocator::restore(snapshot).unwrap_err();
+        assert!(matches!(err, OverlayError::InvalidCidr(_)));
+    }
+
+    #[test]
+    fn test_slice_restore_rejects_out_of_cluster() {
+        let snapshot = NodeSliceAllocatorSnapshot {
+            cluster_cidr: "10.200.0.0/16".to_string(),
+            slice_prefix: 28,
+            assigned: vec![("node-a".to_string(), "10.201.0.0/28".to_string())],
+        };
+        let err = NodeSliceAllocator::restore(snapshot).unwrap_err();
+        assert!(matches!(err, OverlayError::InvalidCidr(_)));
+    }
+
+    #[test]
+    fn test_slice_hash_is_deterministic() {
+        // Two allocators built fresh should produce the same first-assignment
+        // index for the same node ID — critical for consistency across leader
+        // restart on a fresh cluster (before any snapshot exists).
+        let mut a = NodeSliceAllocator::new(cluster(), 28).unwrap();
+        let mut b = NodeSliceAllocator::new(cluster(), 28).unwrap();
+        let slice_a = a.assign("my-node-id").unwrap();
+        let slice_b = b.assign("my-node-id").unwrap();
+        assert_eq!(slice_a, slice_b);
+    }
+
+    #[test]
+    fn test_slice_allocator_v6() {
+        let cluster_v6: IpNet = "fd00:200::/48".parse().unwrap();
+        let mut allocator = NodeSliceAllocator::new(cluster_v6, 64).unwrap();
+        // /48 → /64 ⇒ 2^16 = 65536 slices
+        assert_eq!(allocator.capacity(), 65536);
+
+        let slice = allocator.assign("node-a").unwrap();
+        assert_eq!(slice.prefix_len(), 64);
+        assert!(cluster_v6.contains(&slice.network()));
     }
 }

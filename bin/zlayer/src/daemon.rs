@@ -682,7 +682,25 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
 
                     // Register the leader node in the Raft state machine so it
                     // appears in cluster state with its overlay networking metadata.
-                    let leader_overlay_ip = "10.200.0.1".to_string();
+                    //
+                    // Read the leader's own overlay IP and slice CIDR from the
+                    // live `OverlayManager` when one is available. This replaces
+                    // the legacy hardcoded `10.200.0.1` and supports slice-aware
+                    // deployments (T8). Falls back to the hardcode when the
+                    // overlay is not configured (e.g. host-networking mode).
+                    let (leader_overlay_ip, leader_slice_cidr) = if let Some(om) = &overlay {
+                        let om_guard = om.read().await;
+                        let ip = om_guard
+                            .node_ip()
+                            .map_or_else(|| "10.200.0.1".to_string(), |ip| ip.to_string());
+                        let slice = om_guard
+                            .slice_cidr()
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        (ip, slice)
+                    } else {
+                        ("10.200.0.1".to_string(), String::new())
+                    };
                     let leader_raft_addr =
                         format!("{}:{}", node_config.advertise_addr, node_config.raft_port);
                     let sys_res = crate::resources::detect_system_resources(&config.data_dir);
@@ -702,6 +720,7 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                             mode: "full".to_string(),
                             os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
                             arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
+                            slice_cidr: leader_slice_cidr,
                         })
                         .await
                     {

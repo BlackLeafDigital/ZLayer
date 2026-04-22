@@ -3,7 +3,7 @@
 //! Provides the `/api/v1/cluster/join` endpoint for new nodes joining
 //! the cluster, and `/api/v1/cluster/nodes` for listing cluster members.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
-use zlayer_overlay::IpAllocator;
+use zlayer_overlay::{IpAllocator, NodeSliceAllocator};
 
 use crate::error::{ApiError, Result};
 use crate::handlers::internal::{InternalAddPeerRequest, INTERNAL_AUTH_HEADER};
@@ -81,6 +81,10 @@ pub struct ClusterJoinResponse {
     pub raft_node_id: u64,
     /// Assigned overlay IP for the new node
     pub overlay_ip: String,
+    /// Per-node slice CIDR assigned by the leader (e.g. "10.200.42.0/28").
+    /// Empty string if the leader is not slice-aware yet.
+    #[serde(default)]
+    pub slice_cidr: String,
     /// Existing peers in the cluster
     pub peers: Vec<ClusterPeer>,
     /// Role assigned to this node: "voter" or "learner"
@@ -164,6 +168,12 @@ pub struct ClusterApiState {
     pub internal_token: Option<String>,
     /// Data directory for Raft storage and recovery markers.
     pub data_dir: Option<std::path::PathBuf>,
+    /// Leader-side slice allocator. Carves the cluster CIDR into `/28` slices
+    /// and hands one to each joining node. Wrapped in `RwLock` for concurrent
+    /// access from multiple join handlers.
+    pub slice_allocator: Arc<RwLock<NodeSliceAllocator>>,
+    /// Persisted path for `slice_allocator` snapshots (None = in-memory only).
+    pub slice_allocator_path: Option<PathBuf>,
 }
 
 impl ClusterApiState {
@@ -173,12 +183,17 @@ impl ClusterApiState {
     /// `join_secret` is the `auth_secret` that must appear in the join token.
     /// `ip_allocator` is a CIDR-aware allocator for overlay IPs.
     /// `ip_allocator_path` is the file path used to persist allocator state.
+    /// `slice_allocator` is the leader-side per-node `/28` slice allocator.
+    /// `slice_allocator_path` is the file path used to persist slice allocator state.
     /// `data_dir` is the Raft data directory for recovery markers.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         raft: Option<Arc<RaftCoordinator>>,
         join_secret: Option<String>,
         ip_allocator: Arc<RwLock<IpAllocator>>,
         ip_allocator_path: Option<std::path::PathBuf>,
+        slice_allocator: Arc<RwLock<NodeSliceAllocator>>,
+        slice_allocator_path: Option<PathBuf>,
         data_dir: Option<std::path::PathBuf>,
     ) -> Self {
         Self {
@@ -189,15 +204,20 @@ impl ClusterApiState {
             ip_allocator_path,
             internal_token: None,
             data_dir,
+            slice_allocator,
+            slice_allocator_path,
         }
     }
 
     /// Create a new cluster API state with an internal token for peer broadcasting.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_internal_token(
         raft: Option<Arc<RaftCoordinator>>,
         join_secret: Option<String>,
         ip_allocator: Arc<RwLock<IpAllocator>>,
         ip_allocator_path: Option<std::path::PathBuf>,
+        slice_allocator: Arc<RwLock<NodeSliceAllocator>>,
+        slice_allocator_path: Option<PathBuf>,
         internal_token: String,
         data_dir: Option<std::path::PathBuf>,
     ) -> Self {
@@ -209,6 +229,8 @@ impl ClusterApiState {
             ip_allocator_path,
             internal_token: Some(internal_token),
             data_dir,
+            slice_allocator,
+            slice_allocator_path,
         }
     }
 
@@ -223,6 +245,13 @@ impl ClusterApiState {
     pub fn placeholder() -> Self {
         let allocator = IpAllocator::new(zlayer_overlay::DEFAULT_OVERLAY_CIDR)
             .expect("default overlay CIDR must be valid");
+        let slice_allocator = NodeSliceAllocator::new(
+            zlayer_overlay::DEFAULT_OVERLAY_CIDR
+                .parse()
+                .expect("default overlay CIDR must parse as IpNet"),
+            zlayer_overlay::DEFAULT_SLICE_PREFIX,
+        )
+        .expect("default slice prefix must be valid for default cluster CIDR");
         Self {
             raft: None,
             next_raft_id: Arc::new(AtomicU64::new(2)),
@@ -231,6 +260,8 @@ impl ClusterApiState {
             ip_allocator_path: None,
             internal_token: None,
             data_dir: None,
+            slice_allocator: Arc::new(RwLock::new(slice_allocator)),
+            slice_allocator_path: None,
         }
     }
 
@@ -313,6 +344,32 @@ pub async fn cluster_join(
         ip.to_string()
     };
 
+    // 5b. Assign a per-node `/28` slice of the cluster CIDR. This gives the
+    //     joining node its own non-overlapping pool of container IPs, fixing
+    //     the latent IP-collision bug where every agent allocated from the
+    //     full cluster `/16`.
+    let slice_cidr = {
+        let mut slice_allocator = state.slice_allocator.write().await;
+        let assigned = slice_allocator
+            .assign(&raft_node_id.to_string())
+            .map_err(|e| ApiError::Internal(format!("slice allocation failed: {e}")))?;
+        // Persist the slice allocator snapshot if a path is configured.
+        if let Some(ref p) = state.slice_allocator_path {
+            let snapshot = slice_allocator.snapshot();
+            match serde_json::to_string_pretty(&snapshot) {
+                Ok(json) => {
+                    if let Err(e) = tokio::fs::write(p, json).await {
+                        warn!(error = %e, "failed to persist slice allocator state");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to serialize slice allocator snapshot");
+                }
+            }
+        }
+        assigned.to_string()
+    };
+
     // 6. Add the member to the Raft cluster (with overlay networking metadata)
     let role = raft
         .add_member(AddMemberParams {
@@ -330,6 +387,7 @@ pub async fn cluster_join(
             mode: req.mode.clone(),
             os: req.os,
             arch: req.arch,
+            slice_cidr: slice_cidr.clone(),
         })
         .await
         .map_err(|e| ApiError::Internal(format!("Failed to add member to Raft: {e}")))?;
@@ -438,6 +496,7 @@ pub async fn cluster_join(
         node_id: node_uuid,
         raft_node_id,
         overlay_ip,
+        slice_cidr,
         peers,
         role: match role {
             zlayer_scheduler::raft::MemberRole::Voter => "voter".to_string(),
@@ -861,11 +920,13 @@ mod tests {
             node_id: "uuid-123".into(),
             raft_node_id: 2,
             overlay_ip: "10.200.0.2".into(),
+            slice_cidr: "10.200.16.0/28".into(),
             peers: vec![],
             role: "voter".into(),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("uuid-123"));
         assert!(json.contains("10.200.0.2"));
+        assert!(json.contains("10.200.16.0/28"));
     }
 }

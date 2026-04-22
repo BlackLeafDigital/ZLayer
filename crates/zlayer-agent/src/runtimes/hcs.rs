@@ -38,10 +38,13 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use oci_client::manifest::OciImageManifest;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::time::timeout as tokio_timeout;
 use tracing::instrument;
+use windows::core::GUID;
+use zlayer_hns::attach::{self as hns_attach, EndpointAttachment};
 use zlayer_observability::logs::LogEntry;
+use zlayer_overlay::ipnet;
 use zlayer_spec::{PullPolicy, RegistryAuth as SpecRegistryAuth, ServiceSpec};
 
 use crate::cgroups_stats::ContainerStats;
@@ -64,6 +67,12 @@ use zlayer_hcs::system::ComputeSystem;
 /// startup to discover zombie systems from a previous agent run, and as the
 /// filter for [`enumerate::list_by_owner`].
 pub const OWNER_TAG: &str = "zlayer";
+
+/// Name used for the per-daemon HCN Transparent overlay network on the host.
+/// Every ZLayer container on this node attaches an endpoint into this
+/// network; the network's IPAM subnet is the node's per-node `/28` slice of
+/// the cluster CIDR (no longer a constant — see [`HcsConfig::slice_cidr`]).
+const OVERLAY_NETWORK_NAME: &str = "zlayer-overlay";
 
 /// Isolation mode for the compute systems this runtime creates.
 ///
@@ -91,6 +100,14 @@ pub struct HcsConfig {
     pub default_isolation: IsolationMode,
     /// Default scratch layer size in GiB. `0` requests the HCS default.
     pub default_scratch_size_gb: u64,
+    /// Cluster CIDR (e.g. "10.200.0.0/16") used for per-endpoint policy
+    /// configuration: OutBoundNAT exceptions, SDNRoute destination,
+    /// ACL remote-addresses.
+    pub cluster_cidr: String,
+    /// This node's per-node /28 slice of the cluster CIDR. `None` until
+    /// the node joins the cluster and the leader hands out a slice. When
+    /// `None`, [`HcsRuntime::ensure_overlay_network`] cannot proceed.
+    pub slice_cidr: Option<ipnet::IpNet>,
 }
 
 impl Default for HcsConfig {
@@ -101,6 +118,8 @@ impl Default for HcsConfig {
                 .map_or_else(|_| dirs.containers().join("hcs"), PathBuf::from),
             default_isolation: IsolationMode::default(),
             default_scratch_size_gb: 20,
+            cluster_cidr: "10.200.0.0/16".to_string(),
+            slice_cidr: None,
         }
     }
 }
@@ -128,6 +147,30 @@ struct ContainerEntry {
     /// Last observed exit code, set when a `SystemExited` event is received
     /// via the HCS event stream. `None` while the container is still running.
     last_exit_code: Arc<RwLock<Option<i32>>>,
+    /// HCN namespace + endpoint pair that wires this container into the
+    /// daemon's Transparent overlay network. `None` if HCN was unavailable
+    /// at [`HcsRuntime::create_container`] time — we still let the container
+    /// start, but it won't have networking.
+    network_attachment: Option<EndpointAttachment>,
+}
+
+/// Per-daemon HCN Transparent overlay network created lazily on first
+/// [`HcsRuntime::create_container`] call. We never tear this down during the
+/// daemon's lifetime — containers share it by attaching HCN endpoints to
+/// fresh per-container namespaces.
+#[derive(Debug)]
+struct OverlayNetwork {
+    /// HCN-addressable GUID of the network.
+    id: GUID,
+    /// CIDR the network was created with (this node's per-node slice).
+    /// Informational — kept for logging and diagnostics.
+    #[allow(dead_code)]
+    subnet: String,
+    /// Keep the `Network` handle alive so the handle's `Drop` does not close
+    /// out from under concurrent endpoint creates. `HcnCloseNetwork` only
+    /// releases the caller's handle; the network itself lives until we call
+    /// `HcnDeleteNetwork` (we never do, for the daemon's lifetime).
+    _network: zlayer_hns::network::Network,
 }
 
 /// HCS-backed implementation of [`Runtime`].
@@ -144,6 +187,18 @@ pub struct HcsRuntime {
     /// Auth resolver used to pick up persisted credentials when no inline
     /// auth is supplied on the pull.
     auth_resolver: zlayer_core::AuthResolver,
+    /// Lazily-created HCN Transparent overlay network all containers attach
+    /// to. Guarded by a `tokio::sync::Mutex` so the first `create_container`
+    /// call wins the race and every subsequent call returns the cached GUID
+    /// without a double-create.
+    overlay_network: Arc<Mutex<Option<OverlayNetwork>>>,
+    /// Per-container IP address stashed here by
+    /// [`HcsRuntime::set_next_container_ip`] just before the matching
+    /// [`Runtime::create_container`] call. Consumed by `create_container` so
+    /// the next allocation doesn't leak into a subsequent create. This is a
+    /// stopgap until the overlay manager plumbs the IP through a dedicated
+    /// attach path (T11).
+    next_container_ip: Arc<Mutex<Option<IpAddr>>>,
 }
 
 impl std::fmt::Debug for HcsRuntime {
@@ -205,6 +260,8 @@ impl HcsRuntime {
             images: RwLock::new(HashMap::new()),
             registry,
             auth_resolver: zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()),
+            overlay_network: Arc::new(Mutex::new(None)),
+            next_container_ip: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -227,6 +284,178 @@ impl HcsRuntime {
     /// Scratch-layer directory for a specific container.
     fn scratch_dir(&self, hcs_id: &str) -> PathBuf {
         self.config.storage_root.join("scratch").join(hcs_id)
+    }
+
+    /// Lazy-create the per-daemon HCN Transparent overlay network on first
+    /// use and cache its GUID.
+    ///
+    /// The network's IPAM subnet is this node's per-node `/28` slice of the
+    /// cluster CIDR (supplied by the caller). HCN installs a connected route
+    /// for that slice on the uplink vSwitch so traffic within the slice is
+    /// routed without NAT — callers are responsible for ensuring the
+    /// overlay tunnel is set up so cross-node traffic works.
+    ///
+    /// Idempotent: subsequent calls return the cached GUID without touching
+    /// HCN. All `HcnCreateNetwork` traffic runs on a `spawn_blocking` thread
+    /// because the underlying syscall is synchronous and can block for tens
+    /// of milliseconds on a cold host.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying [`zlayer_hns::error::HnsError`] when HCN
+    /// refuses the create (e.g. `AccessDenied` when the daemon is not
+    /// running as Administrator, or `SubnetConflict` if another network
+    /// already owns the slice).
+    async fn ensure_overlay_network(&self, slice_cidr: ipnet::IpNet) -> Result<GUID> {
+        let mut guard = self.overlay_network.lock().await;
+        if let Some(net) = guard.as_ref() {
+            return Ok(net.id);
+        }
+
+        let net_id = GUID::new().map_err(|e| {
+            AgentError::Internal(format!("GUID::new for overlay network failed: {e}"))
+        })?;
+        let uplink = zlayer_hns::adapter::find_primary_adapter()
+            .map_err(|e| AgentError::Internal(format!("find_primary_adapter: {e}")))?;
+        let subnet_str = slice_cidr.to_string();
+        let subnet_for_create = subnet_str.clone();
+        let uplink_for_create = uplink.clone();
+
+        let network = tokio::task::spawn_blocking(move || {
+            zlayer_hns::network::Network::create_transparent(
+                net_id,
+                OVERLAY_NETWORK_NAME,
+                &subnet_for_create,
+                &uplink_for_create,
+            )
+        })
+        .await
+        .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?
+        .map_err(|e| AgentError::Internal(format!("HcnCreateNetwork(zlayer-overlay): {e}")))?;
+
+        *guard = Some(OverlayNetwork {
+            id: net_id,
+            subnet: subnet_str.clone(),
+            _network: network,
+        });
+        tracing::info!(
+            network_id = %format!("{net_id:?}"),
+            subnet = %subnet_str,
+            uplink = %uplink,
+            "created HCN Transparent overlay network"
+        );
+        Ok(net_id)
+    }
+
+    /// Stash the IP the next [`Runtime::create_container`] call should assign
+    /// to its HCN endpoint. Callers must invoke this once per container
+    /// immediately before `create_container` — the IP is consumed on the
+    /// next create. If no IP has been stashed, `create_container` aborts
+    /// with a clear error.
+    ///
+    /// This is a stopgap; once `OverlayManager::attach_container_hcn` is in
+    /// place (T11) the allocation will flow through a dedicated call path
+    /// and this setter will be removed.
+    pub async fn set_next_container_ip(&self, ip: IpAddr) {
+        *self.next_container_ip.lock().await = Some(ip);
+    }
+
+    /// Scan the host for HCN endpoints owned by this runtime (name prefix
+    /// matches [`OWNER_TAG`]) and delete them.
+    ///
+    /// Intended for agent startup: the in-memory container map is empty at
+    /// that moment so every owned endpoint is by definition an orphan from a
+    /// previous crashed run. Call sites must supply a `live` set of HCS ids
+    /// already known to the runtime so we don't reap endpoints still in use;
+    /// an empty set means "reap everything we own".
+    ///
+    /// Individual delete failures are logged and swallowed so one stuck
+    /// endpoint cannot block the rest of reconciliation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the initial HCN enumeration fails. Per-
+    /// endpoint delete failures are logged.
+    #[allow(dead_code)]
+    pub async fn reconcile_orphans(&self) -> Result<()> {
+        let live: std::collections::HashSet<String> =
+            self.containers.read().await.keys().cloned().collect();
+
+        let owned = tokio::task::spawn_blocking(|| hns_attach::list_owned_endpoints(OWNER_TAG))
+            .await
+            .map_err(|e| AgentError::Internal(format!("spawn_blocking join failed: {e}")))?
+            .map_err(|e| AgentError::Internal(format!("list_owned_endpoints: {e}")))?;
+
+        for (endpoint_id, name) in owned {
+            // Endpoint name is `{OWNER_TAG}-{container_id}`. Strip the prefix
+            // + dash to recover the container id and skip live containers.
+            let prefix = format!("{OWNER_TAG}-");
+            let container_id = name.strip_prefix(&prefix).unwrap_or(name.as_str());
+            if live.contains(container_id) {
+                continue;
+            }
+
+            // We only stored the endpoint id in HCN; the matched namespace is
+            // discovered via the endpoint's properties. Best-effort: query,
+            // then delete both. On failure we log and continue.
+            let ep_id = endpoint_id;
+            let namespace_id = match tokio::task::spawn_blocking(move || {
+                zlayer_hns::endpoint::Endpoint::open(ep_id).and_then(|ep| ep.query_properties("{}"))
+            })
+            .await
+            {
+                Ok(Ok(props)) => props
+                    .host_compute_namespace
+                    .as_deref()
+                    .and_then(parse_guid_loose),
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        endpoint_id = %format!("{ep_id:?}"),
+                        error = %e,
+                        "reconcile: failed to query orphan endpoint properties"
+                    );
+                    None
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        endpoint_id = %format!("{ep_id:?}"),
+                        error = %e,
+                        "reconcile: spawn_blocking join failed"
+                    );
+                    None
+                }
+            };
+
+            let res = tokio::task::spawn_blocking(move || match namespace_id {
+                Some(ns) => hns_attach::delete_endpoint_and_namespace(ep_id, ns),
+                None => zlayer_hns::endpoint::Endpoint::delete(ep_id),
+            })
+            .await;
+            match res {
+                Ok(Ok(())) => {
+                    tracing::info!(
+                        endpoint_id = %format!("{ep_id:?}"),
+                        container_id = %container_id,
+                        "reconcile: reaped orphan HCN endpoint"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        endpoint_id = %format!("{ep_id:?}"),
+                        error = %e,
+                        "reconcile: failed to delete orphan endpoint"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        endpoint_id = %format!("{ep_id:?}"),
+                        error = %e,
+                        "reconcile: spawn_blocking join failed during delete"
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Pick the layer descriptor list from an OCI manifest. The manifest
@@ -303,12 +532,19 @@ impl HcsRuntime {
     ///
     /// The caller supplies the previously-built scratch layer so its mount
     /// path and directory can be wired into the `Storage` block.
+    ///
+    /// `namespace_ids` carries the HCN namespace GUID strings (brace-wrapped,
+    /// as produced by `format!("{:?}", guid)`) this container should be
+    /// attached to. Empty means no network attachment — the resulting
+    /// compute-system doc will omit the `Networking` field entirely so HCS
+    /// treats the container as isolated.
     fn build_compute_system_doc(
         &self,
         hcs_id: &str,
         spec: &ServiceSpec,
         scratch_layer: &scratch::WritableLayer,
         parent_layers: Vec<zlayer_hcs::schema::Layer>,
+        namespace_ids: Vec<String>,
     ) -> HcsDoc {
         let processor = spec.resources.cpu.and_then(|cpu| {
             // `count` must be at least 1 vCPU; we round up fractional requests.
@@ -343,9 +579,20 @@ impl HcsRuntime {
             path: Some(scratch_layer.layer_path().to_string_lossy().into_owned()),
         };
 
+        let networking = if namespace_ids.is_empty() {
+            None
+        } else {
+            Some(zlayer_hcs::schema::ContainerNetworking {
+                allow_unqualified_dns_query: None,
+                dns_search_list: Vec::new(),
+                namespace: namespace_ids,
+                network_shared_container_name: None,
+            })
+        };
+
         let container = HcsContainer {
             storage: Some(storage),
-            networking: None, // Phase C will populate HNS namespace here.
+            networking,
             mapped_directories: Vec::new(),
             mapped_pipes: Vec::new(),
             hostname: spec.hostname.clone(),
@@ -414,6 +661,14 @@ impl HcsRuntime {
             }
         });
     }
+}
+
+/// Parse a GUID that may or may not be brace-wrapped, as HCN emits them on
+/// the wire (`"{aabbccdd-...}"` or bare `"aabbccdd-..."`). Returns `None` for
+/// any malformed input so callers can fall back gracefully.
+fn parse_guid_loose(s: &str) -> Option<GUID> {
+    let bare = s.trim_matches(|c: char| c == '{' || c == '}');
+    GUID::try_from(bare).ok()
 }
 
 /// Extract an exit code from the JSON payload HCS emits on
@@ -534,14 +789,104 @@ impl Runtime for HcsRuntime {
             reason: format!("scratch layer create: {e}"),
         })?;
 
-        // 3. Build the compute-system JSON document.
-        let doc = self.build_compute_system_doc(&hcs_id, spec, &scratch_layer, parent_layers);
+        // 3. Attach the container to the daemon's HCN Transparent overlay
+        //    network. If HCN is unavailable (e.g. non-admin daemon on a dev
+        //    box), log and proceed with `None` — the container still starts,
+        //    just without network connectivity. This keeps the happy path of
+        //    `zlayer deploy` green for local smoke tests even without admin.
+        //
+        //    The per-container IP is stashed via
+        //    [`HcsRuntime::set_next_container_ip`] immediately before this
+        //    call by the overlay manager. The prefix length comes from the
+        //    slice, and the cluster CIDR drives the OutBoundNAT / SDNRoute /
+        //    ACL policies on the endpoint.
+        let slice_cidr = self.config.slice_cidr;
+        let allocated_ip = self.next_container_ip.lock().await.take();
+        let cluster_cidr = self.config.cluster_cidr.clone();
+        let network_attachment = match (slice_cidr, allocated_ip) {
+            (Some(slice), Some(ip)) => match self.ensure_overlay_network(slice).await {
+                Ok(net_id) => {
+                    let cid_for_attach = hcs_id.clone();
+                    let prefix_length = slice.prefix_len();
+                    let cluster_cidr_owned = cluster_cidr;
+                    match tokio::task::spawn_blocking(move || {
+                        EndpointAttachment::create_overlay(
+                            net_id,
+                            OWNER_TAG,
+                            cid_for_attach.as_str(),
+                            ip,
+                            prefix_length,
+                            &cluster_cidr_owned,
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(att)) => Some(att),
+                        Ok(Err(e)) => {
+                            tracing::warn!(
+                                hcs_id = %hcs_id,
+                                error = %e,
+                                "HCN overlay endpoint attach failed; starting container without network"
+                            );
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                hcs_id = %hcs_id,
+                                error = %e,
+                                "spawn_blocking join for overlay endpoint attach failed; starting container without network"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        hcs_id = %hcs_id,
+                        error = %e,
+                        "HCN Transparent overlay network unavailable; starting container without network"
+                    );
+                    None
+                }
+            },
+            (None, _) => {
+                tracing::warn!(
+                    hcs_id = %hcs_id,
+                    "HcsConfig.slice_cidr is None (node has no assigned slice yet); starting container without network"
+                );
+                None
+            }
+            (Some(_), None) => {
+                tracing::warn!(
+                    hcs_id = %hcs_id,
+                    "no container IP stashed via set_next_container_ip; starting container without network"
+                );
+                None
+            }
+        };
+
+        // 4. Build the compute-system JSON document, populating
+        //    `Container.Networking.Namespace` with the namespace GUID we just
+        //    created. HCS expects the namespace GUID as a brace-wrapped
+        //    string (matching the `{:?}` debug formatter for
+        //    `windows::core::GUID`).
+        let namespace_strs: Vec<String> = network_attachment
+            .as_ref()
+            .map(|att| vec![format!("{:?}", att.namespace_id())])
+            .unwrap_or_default();
+        let doc = self.build_compute_system_doc(
+            &hcs_id,
+            spec,
+            &scratch_layer,
+            parent_layers,
+            namespace_strs,
+        );
         let doc_json = serde_json::to_string(&doc).map_err(|e| AgentError::CreateFailed {
             id: hcs_id.clone(),
             reason: format!("serialize ComputeSystem doc: {e}"),
         })?;
 
-        // 4. Create the compute system.
+        // 5. Create the compute system.
         let system = ComputeSystem::create(&hcs_id, &doc_json)
             .await
             .map_err(|e| AgentError::CreateFailed {
@@ -549,17 +894,18 @@ impl Runtime for HcsRuntime {
                 reason: format!("HcsCreateComputeSystem: {e}"),
             })?;
 
-        // 5. Subscribe to exit events before returning so we don't miss a
+        // 6. Subscribe to exit events before returning so we don't miss a
         //    fast-exiting container.
         let sink: Arc<RwLock<Option<i32>>> = Arc::new(RwLock::new(None));
         self.spawn_exit_watcher(hcs_id.clone(), system.raw(), sink.clone());
 
-        // 6. Register the entry.
+        // 7. Register the entry.
         let entry = ContainerEntry {
             system,
             scratch_layer: Some(scratch_layer),
             hcs_id: hcs_id.clone(),
             last_exit_code: sink,
+            network_attachment,
         };
         self.containers.write().await.insert(hcs_id, entry);
         Ok(())
@@ -655,6 +1001,33 @@ impl Runtime for HcsRuntime {
             scratch_layer
                 .detach_and_destroy()
                 .map_err(|e| AgentError::Internal(format!("scratch teardown: {e}")))?;
+        }
+
+        // Tear down the HCN endpoint + namespace, if we attached one. Best-
+        // effort: log on failure (the container is already gone so leaving a
+        // dangling endpoint is recoverable via startup reconcile) and do
+        // **not** propagate — scratch teardown already succeeded and the
+        // caller expects success once we reach this point.
+        if let Some(attachment) = entry.network_attachment.take() {
+            let hcs_id_for_log = entry.hcs_id.clone();
+            let res = tokio::task::spawn_blocking(move || attachment.teardown()).await;
+            match res {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        hcs_id = %hcs_id_for_log,
+                        error = %e,
+                        "HCN attachment teardown failed; endpoint may leak until next reconcile"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        hcs_id = %hcs_id_for_log,
+                        error = %e,
+                        "spawn_blocking join failed during HCN teardown"
+                    );
+                }
+            }
         }
         drop(entry);
         Ok(())
@@ -819,14 +1192,52 @@ impl Runtime for HcsRuntime {
     async fn get_container_pid(&self, _id: &ContainerId) -> Result<Option<u32>> {
         // HCS containers do not expose the PID of the root process via the
         // compute-system surface; the init process is managed by vmcompute.
-        // We return `None` so callers that need a PID for overlay attach
-        // know to fall back to the HNS endpoint path (Phase C).
+        // `service.rs` falls back to the HCN namespace GUID path (see
+        // `get_container_namespace_id`) for Windows overlay attach.
         Ok(None)
     }
 
-    async fn get_container_ip(&self, _id: &ContainerId) -> Result<Option<IpAddr>> {
-        // Phase C will wire this up via HNS endpoint enumeration.
-        Ok(None)
+    async fn get_container_namespace_id(
+        &self,
+        id: &ContainerId,
+    ) -> Result<Option<windows::core::GUID>> {
+        let hcs_id = Self::hcs_id(id);
+        let entries = self.containers.read().await;
+        Ok(entries.get(&hcs_id).and_then(|e| {
+            e.network_attachment
+                .as_ref()
+                .map(EndpointAttachment::namespace_id)
+        }))
+    }
+
+    async fn get_container_ip(&self, id: &ContainerId) -> Result<Option<IpAddr>> {
+        let hcs_id = Self::hcs_id(id);
+        let containers = self.containers.read().await;
+        let Some(entry) = containers.get(&hcs_id) else {
+            return Err(AgentError::NotFound {
+                container: hcs_id,
+                reason: "no HCS entry for container".to_string(),
+            });
+        };
+        let Some(ip_str) = entry
+            .network_attachment
+            .as_ref()
+            .and_then(|a| a.ip().map(str::to_string))
+        else {
+            return Ok(None);
+        };
+        match ip_str.parse::<IpAddr>() {
+            Ok(ip) => Ok(Some(ip)),
+            Err(e) => {
+                tracing::warn!(
+                    hcs_id = %hcs_id,
+                    ip = %ip_str,
+                    error = %e,
+                    "HCN endpoint returned unparseable IP"
+                );
+                Ok(None)
+            }
+        }
     }
 
     async fn list_images(&self) -> Result<Vec<ImageInfo>> {
@@ -1052,5 +1463,15 @@ mod tests {
         );
         assert_eq!(extract_process_exit_code(r#"{"ExitCode":9}"#), Some(9));
         assert_eq!(extract_process_exit_code(r#"{}"#), None);
+    }
+
+    #[test]
+    fn hcs_config_default_sets_overlay_networking_fields() {
+        let cfg = HcsConfig::default();
+        assert_eq!(cfg.cluster_cidr, "10.200.0.0/16");
+        assert!(
+            cfg.slice_cidr.is_none(),
+            "slice_cidr must be None until the node joins the cluster and the leader hands out a slice"
+        );
     }
 }

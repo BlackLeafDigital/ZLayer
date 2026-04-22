@@ -108,22 +108,26 @@ pub mod error;
 pub mod health;
 pub mod transport;
 
-#[cfg(target_os = "linux")]
+pub(crate) mod interface;
 pub(crate) mod netlink;
+pub(crate) mod tun;
 
 #[cfg(feature = "nat")]
 pub mod nat;
 
 // Re-export commonly used types
-pub use allocator::IpAllocator;
+pub use allocator::{IpAllocator, NodeSliceAllocator, NodeSliceAllocatorSnapshot};
 pub use bootstrap::{
     BootstrapConfig, BootstrapState, OverlayBootstrap, PeerConfig, DEFAULT_INTERFACE_NAME,
-    DEFAULT_KEEPALIVE_SECS, DEFAULT_OVERLAY_CIDR, DEFAULT_WG_PORT,
+    DEFAULT_KEEPALIVE_SECS, DEFAULT_OVERLAY_CIDR, DEFAULT_SLICE_PREFIX, DEFAULT_WG_PORT,
 };
+// Re-export `ipnet` so consumers can parse CIDRs for the slice allocator
+// without needing their own direct dependency.
 pub use config::*;
 pub use dns::*;
 pub use error::{OverlayError, Result};
 pub use health::{OverlayHealth, OverlayHealthChecker, PeerStatus};
+pub use ipnet;
 pub use transport::*;
 
 #[cfg(feature = "nat")]

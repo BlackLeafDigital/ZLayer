@@ -85,6 +85,10 @@ struct NodeJoinResponse {
     raft_node_id: u64,
     /// Assigned overlay IP
     overlay_ip: String,
+    /// Per-node slice CIDR assigned by the leader (e.g. "10.200.42.0/28").
+    /// Empty string if the leader is not slice-aware yet.
+    #[serde(default)]
+    slice_cidr: String,
     /// Existing peers in the cluster
     peers: Vec<PeerNode>,
 }
@@ -420,8 +424,16 @@ pub(crate) async fn handle_node_init(
         .context("Failed to bootstrap Raft cluster")?;
     info!("Raft cluster bootstrapped");
 
-    // Register the leader node in the Raft state machine with overlay metadata
+    // Register the leader node in the Raft state machine with overlay metadata.
+    // `handle_node_init` runs before the overlay bootstrap is persisted — the
+    // daemon is responsible for computing the leader's `/28` slice on first
+    // start (via `OverlayBootstrap::init_leader`), after which the daemon
+    // re-registers the leader with the correct `slice_cidr`. Here we register
+    // with the legacy hardcoded `10.200.0.1` overlay IP and an empty
+    // `slice_cidr`; the daemon overwrites both once the bootstrap state
+    // exists on disk.
     let leader_overlay_ip = "10.200.0.1".to_string();
+    let leader_slice_cidr = String::new();
     raft.propose(zlayer_scheduler::Request::RegisterNode {
         node_id: raft_node_id,
         address: format!("{advertise_addr}:{raft_port}"),
@@ -437,6 +449,7 @@ pub(crate) async fn handle_node_init(
         mode: "full".to_string(),
         os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
         arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
+        slice_cidr: leader_slice_cidr,
     })
     .await
     .context("Failed to register leader in Raft state")?;
@@ -606,6 +619,23 @@ pub(crate) async fn handle_node_join(
         .parse()
         .context("Invalid overlay IP in join response")?;
 
+    // Parse the per-node slice CIDR assigned by the leader. Empty string
+    // preserves pre-slice-aware behavior (allocator ranges over the full
+    // cluster CIDR). Non-empty strings are required to parse; a malformed
+    // slice from the leader is a hard error because the daemon would later
+    // misconfigure overlay routing.
+    let our_slice_cidr: Option<zlayer_overlay::ipnet::IpNet> =
+        if join_response.slice_cidr.is_empty() {
+            None
+        } else {
+            Some(
+                join_response
+                    .slice_cidr
+                    .parse()
+                    .context("Invalid slice CIDR in join response")?,
+            )
+        };
+
     // Extract the prefix length from the overlay CIDR (e.g. "10.200.0.0/16" -> 16)
     let overlay_prefix_len = token_data
         .overlay_cidr
@@ -670,9 +700,15 @@ pub(crate) async fn handle_node_join(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            // Slice CIDR advertised by the leader (T8). Populated when the
+            // leader is slice-aware; `None` for back-compat with pre-slice
+            // leaders, in which case the agent allocator ranges over the
+            // full cluster CIDR (legacy behavior).
+            slice_cidr: our_slice_cidr,
         },
         peers: overlay_peers.clone(),
         allocator_state: None,
+        slice_allocator_state: None,
     };
     let bootstrap_path = data_dir.join("overlay_bootstrap.json");
     let bootstrap_json = serde_json::to_string_pretty(&bootstrap_state)
@@ -799,6 +835,9 @@ pub(crate) async fn handle_node_join(
     println!("Node ID:        {}", join_response.node_id);
     println!("Raft Node ID:   {}", join_response.raft_node_id);
     println!("Overlay IP:     {}", join_response.overlay_ip);
+    if !join_response.slice_cidr.is_empty() {
+        println!("Slice CIDR:     {}", join_response.slice_cidr);
+    }
     println!("Mode:           {mode}");
     if let Some(svcs) = services {
         println!("Services:       {}", svcs.join(", "));
