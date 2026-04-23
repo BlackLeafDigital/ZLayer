@@ -21,13 +21,17 @@ use crate::OverlayError;
 /// Compute the IPv4 netmask (dotted-quad) for a given prefix length.
 fn v4_netmask(prefix_len: u8) -> String {
     // Saturate at 32 — callers should already pass a valid v4 prefix.
-    let p = std::cmp::min(prefix_len, 32);
-    let mask: u32 = if p == 0 { 0 } else { u32::MAX << (32 - p) };
-    let a = (mask >> 24) & 0xff;
-    let b = (mask >> 16) & 0xff;
-    let c = (mask >> 8) & 0xff;
-    let d = mask & 0xff;
-    format!("{a}.{b}.{c}.{d}")
+    let bits = std::cmp::min(prefix_len, 32);
+    let mask: u32 = if bits == 0 {
+        0
+    } else {
+        u32::MAX << (32 - bits)
+    };
+    let octet0 = (mask >> 24) & 0xff;
+    let octet1 = (mask >> 16) & 0xff;
+    let octet2 = (mask >> 8) & 0xff;
+    let octet3 = mask & 0xff;
+    format!("{octet0}.{octet1}.{octet2}.{octet3}")
 }
 
 pub(crate) struct MacIfconfigOps;
@@ -107,9 +111,9 @@ impl InterfaceOps for MacIfconfigOps {
                     .map_err(OverlayError::Io)?
             }
             IpAddr::V6(_) => {
-                let prefixlen = prefix_len.to_string();
+                let prefix_str = prefix_len.to_string();
                 Command::new("ifconfig")
-                    .args([name, "inet6", &ip_str, "prefixlen", &prefixlen, "up"])
+                    .args([name, "inet6", &ip_str, "prefixlen", &prefix_str, "up"])
                     .output()
                     .await
                     .map_err(OverlayError::Io)?

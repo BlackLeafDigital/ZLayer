@@ -7,10 +7,10 @@
 //!   registry.
 //! - Creates a scratch layer.
 //! - Applies a minimal Dockerfile (`COPY hello.txt C:\\hello.txt`).
-//! - Captures the NTFS diff via BackupRead.
+//! - Captures the NTFS diff via `BackupRead`.
 //! - Writes an OCI image layout.
 //! - Asserts the manifest is valid (`os: windows`, `architecture: amd64`,
-//!   non-zero layer size, valid diff_id).
+//!   non-zero layer size, valid `diff_id`).
 //!
 //! Ignored by default — requires a Windows 11 22H2+ / Server 2022 host
 //! with Hyper-V + HCS + internet access to mcr.microsoft.com.
