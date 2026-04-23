@@ -455,6 +455,27 @@ impl BundleBuilder {
         Ok(self.bundle_dir.clone())
     }
 
+    /// Render the OCI runtime spec without creating a bundle directory
+    /// or writing `config.json`.
+    ///
+    /// Used by the WSL2 delegate runtime (`runtimes/wsl2_delegate.rs`):
+    /// the Windows host renders the spec, then streams the JSON into the
+    /// WSL distro filesystem where `youki` will consume it. The bundle
+    /// path passed to `BundleBuilder::new` is purely informational in
+    /// that flow; this method never touches the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::InvalidSpec`] if the spec generation fails.
+    pub async fn build_spec_only(
+        &self,
+        container_id: &ContainerId,
+        spec: &ServiceSpec,
+        volume_paths: &std::collections::HashMap<String, PathBuf>,
+    ) -> Result<oci_spec::runtime::Spec> {
+        self.build_oci_spec(container_id, spec, volume_paths).await
+    }
+
     /// Build the OCI runtime spec from `ServiceSpec`
     #[allow(clippy::too_many_lines)]
     async fn build_oci_spec(

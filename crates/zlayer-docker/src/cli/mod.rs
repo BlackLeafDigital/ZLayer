@@ -5,9 +5,15 @@
 
 pub mod compose_cmd;
 pub mod container;
+pub mod daemon_reconfig;
+pub mod env_profile;
+#[cfg(windows)]
+pub mod env_profile_windows;
 pub mod image;
+pub mod install;
 pub mod network;
 pub mod run;
+pub mod sock_symlink;
 pub mod system;
 pub mod volume;
 
@@ -91,6 +97,15 @@ pub enum DockerCommands {
     /// Manage Docker
     #[clap(subcommand)]
     System(system::SystemSubcommand),
+
+    /// Install the Docker compatibility shim: configures the daemon to
+    /// expose the Docker Engine API socket, installs `docker` and
+    /// `docker-compose` shims on PATH, and optionally symlinks
+    /// `/var/run/docker.sock`.
+    Install(install::InstallArgs),
+
+    /// Remove the Docker compatibility shim installed by `install`.
+    Uninstall(install::UninstallArgs),
 }
 
 /// Dispatch a parsed [`DockerCommands`] to the appropriate handler.
@@ -130,5 +145,7 @@ pub async fn handle_docker_command(cmd: DockerCommands) -> anyhow::Result<()> {
         DockerCommands::System(sub) => {
             system::handle_system(system::SystemCommands { command: sub }).await
         }
+        DockerCommands::Install(args) => install::handle_install(args).await,
+        DockerCommands::Uninstall(args) => install::handle_uninstall(args).await,
     }
 }

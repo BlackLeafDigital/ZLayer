@@ -27,5 +27,8 @@ clients/typescript/dist/
 clients/typescript-client/node_modules/
 clients/typescript-client/dist/
 
+# Windows remote-check logs (scripts/windows-remote-check.sh)
+/logs/
+
 # Agent iteration logs (scripts/iterate-fix.sh)
 .iter/

@@ -84,7 +84,7 @@ async fn install(
     bind: &str,
     jwt_secret: Option<&str>,
     no_swagger: bool,
-    #[cfg(feature = "docker-compat")] _docker_socket: bool,
+    #[cfg(feature = "docker-compat")] docker_socket: bool,
 ) -> Result<()> {
     use tokio::process::Command;
 
@@ -114,6 +114,13 @@ async fn install(
     }
     if no_swagger {
         args.push("        <string>--no-swagger</string>".to_string());
+    }
+    #[cfg(feature = "docker-compat")]
+    if docker_socket {
+        args.push("        <string>--docker-socket</string>".to_string());
+        let default_path = zlayer_paths::ZLayerDirs::default_docker_socket_path();
+        args.push("        <string>--docker-socket-path</string>".to_string());
+        args.push(format!("        <string>{default_path}</string>"));
     }
 
     let args_xml = args.join("\n");
@@ -230,6 +237,40 @@ async fn install(
         }
     }
 
+    #[cfg(feature = "docker-compat")]
+    if docker_socket {
+        let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
+        if !shim_dir.exists() {
+            let _ = std::fs::create_dir_all(&shim_dir);
+        }
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::install_shim(&shim_dir, name, target) {
+                Ok(zlayer_docker::shim::ShimInstalled::Fresh(p)) => {
+                    println!("Installed shim: {} -> {target}", p.display());
+                }
+                Ok(zlayer_docker::shim::ShimInstalled::ReplacedExisting { shim, backup }) => {
+                    println!(
+                        "Installed shim: {} -> {target} (backed up existing file to {})",
+                        shim.display(),
+                        backup.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimInstalled::AlreadyOurs(p)) => {
+                    println!("Shim already installed: {}", p.display());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not install {name} shim in {}: {e}",
+                        shim_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -256,6 +297,39 @@ async fn uninstall() -> Result<()> {
     } else {
         println!("No launchd plist found (checked {})", path.display());
     }
+
+    #[cfg(feature = "docker-compat")]
+    {
+        let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::uninstall_shim(&shim_dir, name, target, true) {
+                Ok(zlayer_docker::shim::ShimUninstalled::Removed(p)) => {
+                    println!("Removed shim: {}", p.display());
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::RemovedAndRestored {
+                    shim,
+                    restored_from,
+                }) => {
+                    println!(
+                        "Removed shim {} (restored backup from {})",
+                        shim.display(),
+                        restored_from.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::NotPresent) => {}
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not remove {name} shim from {}: {e}",
+                        shim_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -772,33 +846,37 @@ WantedBy=multi-user.target
         eprintln!("Warning: could not create {}: {e}", log_dir.display());
     }
 
-    // Install Docker CLI shim when docker-compat is enabled
+    // Install Docker + Docker Compose CLI shims when docker-compat is enabled
     #[cfg(feature = "docker-compat")]
     if docker_socket {
         let shim_dir = pick_system_binary_path()
             .parent()
             .unwrap_or(std::path::Path::new("/usr/local/bin"))
             .to_path_buf();
-        let shim_path = shim_dir.join("docker");
-        let shim_content = "#!/bin/sh\nexec zlayer docker \"$@\"\n";
-        match std::fs::write(&shim_path, shim_content) {
-            Ok(()) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755))
-                        .ok();
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::install_shim(&shim_dir, name, target) {
+                Ok(zlayer_docker::shim::ShimInstalled::Fresh(p)) => {
+                    println!("Installed shim: {} -> {target}", p.display());
                 }
-                println!(
-                    "Installed Docker CLI shim: {} -> zlayer docker",
-                    shim_path.display()
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: could not install Docker shim at {}: {e}",
-                    shim_path.display()
-                );
+                Ok(zlayer_docker::shim::ShimInstalled::ReplacedExisting { shim, backup }) => {
+                    println!(
+                        "Installed shim: {} -> {target} (backed up existing file to {})",
+                        shim.display(),
+                        backup.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimInstalled::AlreadyOurs(p)) => {
+                    println!("Shim already installed: {}", p.display());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not install {name} shim in {}: {e}",
+                        shim_dir.display()
+                    );
+                }
             }
         }
     }
@@ -862,6 +940,46 @@ async fn uninstall() -> Result<()> {
     } else {
         println!("No systemd unit found at {}", path.display());
     }
+
+    // Remove Docker + Docker Compose CLI shims that may have been
+    // installed by `daemon install --docker-socket`.
+    #[cfg(feature = "docker-compat")]
+    {
+        let shim_dir = pick_system_binary_path()
+            .parent()
+            .unwrap_or(std::path::Path::new("/usr/local/bin"))
+            .to_path_buf();
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::uninstall_shim(&shim_dir, name, target, true) {
+                Ok(zlayer_docker::shim::ShimUninstalled::Removed(p)) => {
+                    println!("Removed shim: {}", p.display());
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::RemovedAndRestored {
+                    shim,
+                    restored_from,
+                }) => {
+                    println!(
+                        "Removed shim {} (restored backup from {})",
+                        shim.display(),
+                        restored_from.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::NotPresent) => {
+                    // nothing to do
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not remove {name} shim from {}: {e}",
+                        shim_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1074,6 +1192,7 @@ fn build_service_launch_arguments(
 }
 
 #[cfg(target_os = "windows")]
+#[allow(clippy::too_many_lines)]
 async fn install(
     data_dir: &Path,
     no_start: bool,
@@ -1179,6 +1298,40 @@ async fn install(
         }
     }
 
+    #[cfg(feature = "docker-compat")]
+    if docker_socket {
+        let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
+        if !shim_dir.exists() {
+            let _ = std::fs::create_dir_all(&shim_dir);
+        }
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::install_shim(&shim_dir, name, target) {
+                Ok(zlayer_docker::shim::ShimInstalled::Fresh(p)) => {
+                    println!("Installed shim: {} -> {target}", p.display());
+                }
+                Ok(zlayer_docker::shim::ShimInstalled::ReplacedExisting { shim, backup }) => {
+                    println!(
+                        "Installed shim: {} -> {target} (backed up existing file to {})",
+                        shim.display(),
+                        backup.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimInstalled::AlreadyOurs(p)) => {
+                    println!("Shim already installed: {}", p.display());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not install {name} shim in {}: {e}",
+                        shim_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -1237,6 +1390,39 @@ async fn uninstall() -> Result<()> {
         "Unregistered Windows Service '{}'.",
         crate::daemon_service::SERVICE_NAME
     );
+
+    #[cfg(feature = "docker-compat")]
+    {
+        let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::uninstall_shim(&shim_dir, name, target, true) {
+                Ok(zlayer_docker::shim::ShimUninstalled::Removed(p)) => {
+                    println!("Removed shim: {}", p.display());
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::RemovedAndRestored {
+                    shim,
+                    restored_from,
+                }) => {
+                    println!(
+                        "Removed shim {} (restored backup from {})",
+                        shim.display(),
+                        restored_from.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::NotPresent) => {}
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not remove {name} shim from {}: {e}",
+                        shim_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

@@ -600,7 +600,7 @@ pub(crate) enum Commands {
 
         /// Docker API socket path
         #[cfg(feature = "docker-compat")]
-        #[arg(long, default_value = "/var/run/docker.sock")]
+        #[arg(long, default_value_t = zlayer_paths::ZLayerDirs::default_docker_socket_path())]
         docker_socket_path: String,
     },
 

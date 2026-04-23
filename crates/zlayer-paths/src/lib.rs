@@ -136,6 +136,48 @@ impl ZLayerDirs {
         }
     }
 
+    /// Default Docker-compatible API socket path.
+    ///
+    /// - Linux (root): `/var/run/zlayer/docker.sock`
+    /// - Linux (user, `XDG_RUNTIME_DIR` set): `{XDG_RUNTIME_DIR}/zlayer/docker.sock`
+    /// - Linux (user, no `XDG_RUNTIME_DIR`): `{default_data_dir}/run/docker.sock`
+    /// - macOS: `{default_data_dir}/run/docker.sock`
+    /// - Windows: `\\.\pipe\zlayer-docker`
+    pub fn default_docker_socket_path() -> String {
+        #[cfg(target_os = "windows")]
+        {
+            r"\\.\pipe\zlayer-docker".to_string()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            #[cfg(target_os = "macos")]
+            {
+                Self::default_data_dir()
+                    .join("run")
+                    .join("docker.sock")
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if is_root() {
+                    "/var/run/zlayer/docker.sock".to_string()
+                } else if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+                    let mut p = PathBuf::from(xdg);
+                    p.push("zlayer");
+                    p.push("docker.sock");
+                    p.to_string_lossy().into_owned()
+                } else {
+                    Self::default_data_dir()
+                        .join("run")
+                        .join("docker.sock")
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            }
+        }
+    }
+
     /// Preferred system directory for the `zlayer` binary.
     ///
     /// Tries `/usr/local/bin` first (standard FHS, writable on most systems).
@@ -447,5 +489,32 @@ mod tests {
         if let Some(v) = prev {
             std::env::set_var("PROGRAMDATA", v);
         }
+    }
+
+    #[test]
+    fn default_docker_socket_path_not_empty() {
+        let result = ZLayerDirs::default_docker_socket_path();
+        assert!(!result.is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn default_docker_socket_path_platform_shape() {
+        let result = ZLayerDirs::default_docker_socket_path();
+        assert!(result.starts_with(r"\\.\pipe"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_docker_socket_path_platform_shape() {
+        let result = ZLayerDirs::default_docker_socket_path();
+        assert!(result.ends_with("/docker.sock"));
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    #[test]
+    fn default_docker_socket_path_platform_shape() {
+        let result = ZLayerDirs::default_docker_socket_path();
+        assert!(result.ends_with("/docker.sock"));
     }
 }

@@ -635,25 +635,39 @@ mod tests {
     fn write_oci_artifacts_round_trip_reparses() {
         // Write an artifact set to a tempdir, then re-parse the manifest
         // and config back via the canonical types to confirm a valid layout.
+        //
+        // The base layer's `media_type` ends in `.tar.gzip`, so
+        // `compute_base_diff_ids` will gzip-decode `base.bytes` to derive
+        // the diff_id. Its bytes must therefore be a valid gzip stream.
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write as _;
+
+        fn gzip_bytes(uncompressed: &[u8]) -> Vec<u8> {
+            let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+            enc.write_all(uncompressed).unwrap();
+            enc.finish().unwrap()
+        }
+
         let tmp = tempfile::tempdir().unwrap();
         let cfg = demo_config();
+
+        let base_uncompressed = b"fake base bytes";
+        let base_compressed = gzip_bytes(base_uncompressed);
         let base = BaseLayerBlob {
             media_type: "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip".to_string(),
-            digest: format!("sha256:{}", hex::encode(Sha256::digest(b"fake base bytes"))),
-            bytes: b"fake base bytes".to_vec(),
+            digest: format!("sha256:{}", hex::encode(Sha256::digest(&base_compressed))),
+            bytes: base_compressed,
             urls: vec!["https://mcr.microsoft.com/foo".to_string()],
         };
+
+        let new_uncompressed = b"new layer uncompressed";
+        let new_compressed = gzip_bytes(new_uncompressed);
         let new_layer = super::super::layer::CapturedLayer {
-            bytes: b"new layer compressed".to_vec(),
-            digest: format!(
-                "sha256:{}",
-                hex::encode(Sha256::digest(b"new layer compressed"))
-            ),
-            size: 20,
-            diff_id: format!(
-                "sha256:{}",
-                hex::encode(Sha256::digest(b"new layer uncompressed"))
-            ),
+            size: new_compressed.len() as u64,
+            digest: format!("sha256:{}", hex::encode(Sha256::digest(&new_compressed))),
+            diff_id: format!("sha256:{}", hex::encode(Sha256::digest(new_uncompressed))),
+            bytes: new_compressed,
         };
 
         let artifacts =

@@ -174,7 +174,7 @@ pub struct ContainerProcessor {
 #[serde(rename_all = "PascalCase")]
 pub struct ContainerMemory {
     /// Memory limit in MiB.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "SizeInMB", default, skip_serializing_if = "Option::is_none")]
     pub size_in_mb: Option<u64>,
 }
 
@@ -252,6 +252,7 @@ pub struct Topology {
 #[serde(rename_all = "PascalCase")]
 pub struct TopologyMemory {
     /// RAM assigned to the VM, in MiB.
+    #[serde(rename = "SizeInMB")]
     pub size_in_mb: u64,
 }
 

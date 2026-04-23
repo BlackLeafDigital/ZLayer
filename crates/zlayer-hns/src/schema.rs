@@ -309,6 +309,7 @@ pub struct SdnRoutePolicySetting {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub struct AclPolicySetting {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub protocols: String,
     pub action: AclAction,
     pub direction: AclDirection,

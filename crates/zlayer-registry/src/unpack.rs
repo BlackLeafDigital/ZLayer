@@ -350,14 +350,27 @@ impl LayerUnpacker {
     /// Validate that a path doesn't escape the rootfs directory
     #[allow(clippy::unused_self)]
     fn is_safe_path(&self, path: &Path) -> bool {
-        // Reject absolute paths
+        use std::path::Component;
+
+        // Reject platform-absolute paths (drive-letter on Windows, `/` on Unix).
         if path.is_absolute() {
             return false;
         }
 
-        // Reject paths with .. components
+        // Reject POSIX root-prefixed paths even on Windows — container tar
+        // layers carry `/etc/passwd`-style paths, and those must still be
+        // treated as root-escaping regardless of the host path semantics.
+        let mut components = path.components();
+        if matches!(
+            components.next(),
+            Some(Component::RootDir | Component::Prefix(_))
+        ) {
+            return false;
+        }
+
+        // Reject paths with .. components anywhere.
         for component in path.components() {
-            if let std::path::Component::ParentDir = component {
+            if matches!(component, Component::ParentDir) {
                 return false;
             }
         }

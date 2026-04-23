@@ -492,16 +492,19 @@ fn test_env_file_single_path() {
     writeln!(f, "SINGLE_QUOTED='foo'").unwrap();
     drop(f);
 
+    // Normalize backslashes to forward slashes so the interpolated path
+    // does not trigger YAML unicode-escape parsing (`\U…` in double-quoted
+    // strings) on Windows.
+    let env_path_yaml = env_path.display().to_string().replace('\\', "/");
     let yaml = format!(
         r#"
 services:
   app:
     image: myapp:latest
-    env_file: "{}"
+    env_file: "{env_path_yaml}"
     environment:
       DB_PORT: "9999"
-"#,
-        env_path.display()
+"#
     );
     let compose = parse_compose(&yaml).unwrap();
     let spec = compose_to_deployment(&compose, "envfile-test").unwrap();
@@ -556,17 +559,19 @@ fn test_env_file_list_mixed() {
     writeln!(f, "REAL_VAR=yes").unwrap();
     drop(f);
 
+    // Normalize backslashes to forward slashes so the interpolated path
+    // does not trigger YAML unicode-escape parsing on Windows.
+    let env_path_yaml = env_path.display().to_string().replace('\\', "/");
     let yaml = format!(
         r#"
 services:
   app:
     image: myapp:latest
     env_file:
-      - "{}"
+      - "{env_path_yaml}"
       - path: /nonexistent/optional.env
         required: false
-"#,
-        env_path.display()
+"#
     );
     let compose = parse_compose(&yaml).unwrap();
     let spec = compose_to_deployment(&compose, "envfile-mixed-test").unwrap();

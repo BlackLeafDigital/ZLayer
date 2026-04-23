@@ -391,8 +391,33 @@ fn get_search_paths(install_dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// Find a binary in PATH using the `which` command
+/// Find a binary on PATH. Uses platform-native lookup:
+/// - Windows: `where.exe` (always available in System32).
+/// - Unix: `which`, then `sh -c "command -v"` as a fallback.
 async fn find_in_path(binary: &str) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Ok(output) = Command::new("where")
+            .arg(binary)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .await
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // `where.exe` prints one path per line — first hit is the
+                // one that would run.
+                if let Some(first) = stdout.lines().next() {
+                    let path = first.trim().to_string();
+                    if !path.is_empty() {
+                        return Some(PathBuf::from(path));
+                    }
+                }
+            }
+        }
+    }
+
     let output = Command::new("which")
         .arg(binary)
         .stdout(Stdio::piped())
@@ -660,9 +685,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_in_path_exists() {
-        // 'sh' should exist on any Unix system
-        let result = find_in_path("sh").await;
-        assert!(result.is_some());
+        // Probe for a binary guaranteed to exist on each platform.
+        #[cfg(unix)]
+        let probe = "sh";
+        #[cfg(windows)]
+        let probe = "cmd.exe";
+        let result = find_in_path(probe).await;
+        assert!(
+            result.is_some(),
+            "find_in_path({probe:?}) should find a system binary"
+        );
     }
 
     // Integration test - only runs if buildah is installed

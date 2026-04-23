@@ -628,9 +628,10 @@ async fn run(
             docker_socket_path,
             ..
         } => {
-            // Spawn Docker API socket server if enabled (Unix only — the
-            // socket is a Unix domain socket).
-            #[cfg(all(unix, feature = "docker-compat"))]
+            // Spawn Docker API socket server if enabled. On Unix this is a
+            // Unix domain socket; on Windows it is a named pipe. The transport
+            // is selected inside `zlayer_docker::socket::serve`.
+            #[cfg(feature = "docker-compat")]
             if *docker_socket {
                 let path = docker_socket_path.clone();
                 tokio::spawn(async move {
@@ -639,10 +640,6 @@ async fn run(
                         tracing::error!("Docker API socket server failed: {e}");
                     }
                 });
-            }
-            #[cfg(all(not(unix), feature = "docker-compat"))]
-            {
-                let _ = (docker_socket, docker_socket_path);
             }
 
             let socket_path = cli.effective_socket_path();
