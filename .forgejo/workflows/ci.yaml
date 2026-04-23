@@ -129,6 +129,9 @@ jobs:
         with:
           components: clippy
 
+      - name: Install Git Bash
+        uses: https://forge.blackleafdigital.com/Public/actions/install-git-bash@main
+
       - name: Install protoc
         uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
         with:
