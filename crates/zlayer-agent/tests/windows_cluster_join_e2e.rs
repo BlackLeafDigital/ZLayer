@@ -103,12 +103,12 @@ fn deployment_yaml() -> String {
     format!(
         r"
 version: v1
-deployment: {deployment}
+deployment: {DEPLOYMENT_NAME}
 services:
-  {linux_svc}:
+  {LINUX_SVC}:
     rtype: service
     image:
-      name: {linux_image}
+      name: {LINUX_IMAGE}
     platform:
       os: linux
       arch: amd64
@@ -120,10 +120,10 @@ services:
         - sh
         - -c
         - 'while true; do sleep 3600; done'
-  {win_svc}:
+  {WIN_SVC}:
     rtype: service
     image:
-      name: {win_image}
+      name: {WINDOWS_IMAGE}
     platform:
       os: windows
       arch: amd64
@@ -136,11 +136,6 @@ services:
         - /c
         - 'ping -n 999999 127.0.0.1 >nul'
 ",
-        deployment = DEPLOYMENT_NAME,
-        linux_svc = LINUX_SVC,
-        linux_image = LINUX_IMAGE,
-        win_svc = WIN_SVC,
-        win_image = WINDOWS_IMAGE,
     )
 }
 
@@ -289,8 +284,7 @@ async fn wait_for_running(client: &reqwest::Client, base: &str, name: &str) -> R
     }
 
     Err(format!(
-        "deployment {name} did not reach Running within {:?}; last status: {last_status}",
-        RUNNING_TIMEOUT
+        "deployment {name} did not reach Running within {RUNNING_TIMEOUT:?}; last status: {last_status}"
     ))
 }
 
