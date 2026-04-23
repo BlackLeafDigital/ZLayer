@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, Instant};
+#[cfg(unix)]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -413,7 +414,11 @@ async fn uapi_get_raw(sock_path: &str) -> std::result::Result<String, Box<dyn st
 /// Windows stub: UAPI Unix-socket probe is unavailable. Returns a "not found"
 /// error which [`OverlayHealthChecker::get_wg_stats`] treats as "no peers",
 /// keeping health checks non-fatal on platforms without a UAPI socket.
+///
+/// The signature keeps `async` to match the Unix variant so the caller's
+/// `.await` continues to type-check on both targets.
 #[cfg(not(unix))]
+#[allow(clippy::unused_async)]
 async fn uapi_get_raw(_sock_path: &str) -> std::result::Result<String, Box<dyn std::error::Error>> {
     Err(Box::new(std::io::Error::new(
         std::io::ErrorKind::NotFound,

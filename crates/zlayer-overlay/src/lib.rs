@@ -105,6 +105,7 @@ pub mod bootstrap;
 pub mod config;
 pub mod dns;
 pub mod error;
+pub mod firewall;
 pub mod health;
 pub mod transport;
 

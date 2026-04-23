@@ -27,7 +27,37 @@
 //! Methods that are not meaningful on Windows today return a clean
 //! [`AgentError::Unsupported`] error rather than panicking.
 
-#![cfg(target_os = "windows")]
+// `#[cfg(target_os = "windows")]` is applied by the parent `runtimes/mod.rs`
+// module declaration, so it is not repeated here.
+//
+// This module wraps `zlayer-hcs` + HNS into the `Runtime` trait and contains
+// a large amount of Windows-container glue. A few clippy lints that do not
+// fight the architecture are allowed at the module level with justification;
+// each individual `unsafe` block still carries a `SAFETY:` comment:
+//
+// - `type_complexity`: `Arc<Mutex<Option<(Option<IpAddr>, Option<String>)>>>`
+//   is the `next_container_dns` per-call stash; extracting a typedef for a
+//   single field is more obscure than the direct signature.
+// - `must_use_candidate` / `default_trait_access` / `unused_self`: stylistic
+//   nits on methods we keep as-is for API symmetry with the Linux runtime.
+// - `needless_pass_by_value` / `bind_instead_of_map` / `map_unwrap_or` /
+//   `default_trait_access` / `needless_return` / `unnecessary_debug_formatting`
+//   / `used_underscore_binding` / `no_effect_underscore_binding` /
+//   `needless_raw_string_hashes`: style-only, not semantic issues.
+#![allow(
+    clippy::type_complexity,
+    clippy::must_use_candidate,
+    clippy::default_trait_access,
+    clippy::unused_self,
+    clippy::needless_pass_by_value,
+    clippy::bind_instead_of_map,
+    clippy::map_unwrap_or,
+    clippy::needless_return,
+    clippy::unnecessary_debug_formatting,
+    clippy::used_underscore_binding,
+    clippy::no_effect_underscore_binding,
+    clippy::needless_raw_string_hashes
+)]
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -69,7 +99,7 @@ use zlayer_hcs::system::ComputeSystem;
 pub const OWNER_TAG: &str = "zlayer";
 
 /// Name used for the per-daemon HCN Transparent overlay network on the host.
-/// Every ZLayer container on this node attaches an endpoint into this
+/// Every `ZLayer` container on this node attaches an endpoint into this
 /// network; the network's IPAM subnet is the node's per-node `/28` slice of
 /// the cluster CIDR (no longer a constant — see [`HcsConfig::slice_cidr`]).
 const OVERLAY_NETWORK_NAME: &str = "zlayer-overlay";
@@ -101,7 +131,7 @@ pub struct HcsConfig {
     /// Default scratch layer size in GiB. `0` requests the HCS default.
     pub default_scratch_size_gb: u64,
     /// Cluster CIDR (e.g. "10.200.0.0/16") used for per-endpoint policy
-    /// configuration: OutBoundNAT exceptions, SDNRoute destination,
+    /// configuration: `OutBoundNAT` exceptions, `SDNRoute` destination,
     /// ACL remote-addresses.
     pub cluster_cidr: String,
     /// This node's per-node /28 slice of the cluster CIDR. `None` until
@@ -199,6 +229,14 @@ pub struct HcsRuntime {
     /// stopgap until the overlay manager plumbs the IP through a dedicated
     /// attach path (T11).
     next_container_ip: Arc<Mutex<Option<IpAddr>>>,
+    /// Per-container DNS configuration stashed here by
+    /// [`HcsRuntime::set_next_container_dns`] just before the matching
+    /// [`Runtime::create_container`] call. Tuple is `(dns_server, dns_domain)`;
+    /// both are optional. Consumed on the next create so the stash does not
+    /// leak into a subsequent create. `None` (outer) means the caller did not
+    /// set any DNS configuration at all for the next container — the endpoint
+    /// is created without a `Dns` field (legacy behavior).
+    next_container_dns: Arc<Mutex<Option<(Option<IpAddr>, Option<String>)>>>,
 }
 
 impl std::fmt::Debug for HcsRuntime {
@@ -262,6 +300,7 @@ impl HcsRuntime {
             auth_resolver: zlayer_core::AuthResolver::new(zlayer_core::AuthConfig::default()),
             overlay_network: Arc::new(Mutex::new(None)),
             next_container_ip: Arc::new(Mutex::new(None)),
+            next_container_dns: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -358,6 +397,23 @@ impl HcsRuntime {
     /// and this setter will be removed.
     pub async fn set_next_container_ip(&self, ip: IpAddr) {
         *self.next_container_ip.lock().await = Some(ip);
+    }
+
+    /// Stash the DNS configuration the next [`Runtime::create_container`] call
+    /// should attach to its HCN endpoint via the `Dns` schema field. Either or
+    /// both parameters may be `None` to skip DNS plumbing. The stash is
+    /// consumed on the next `create_container` and cleared so it does not
+    /// leak into a subsequent create.
+    ///
+    /// Callers typically wire this from `OverlayManager::dns_server_addr()`
+    /// and `OverlayManager::dns_domain()` so the endpoint inherits whichever
+    /// overlay DNS the node is running.
+    pub async fn set_next_container_dns(
+        &self,
+        dns_server: Option<IpAddr>,
+        dns_domain: Option<String>,
+    ) {
+        *self.next_container_dns.lock().await = Some((dns_server, dns_domain));
     }
 
     /// Scan the host for HCN endpoints owned by this runtime (name prefix
@@ -699,7 +755,7 @@ trait ApplyServiceId {
 }
 
 impl ApplyServiceId for HcsDoc {
-    fn apply_service_id(mut self, hcs_id: &str) -> Self {
+    fn apply_service_id(self, hcs_id: &str) -> Self {
         // We don't actually put the id here — HcsCreateComputeSystem already
         // takes the id as a separate argument. This hook exists so future
         // phases that need the id in the JSON (e.g. for `HcsModifyComputeSystem`
@@ -802,6 +858,7 @@ impl Runtime for HcsRuntime {
         //    ACL policies on the endpoint.
         let slice_cidr = self.config.slice_cidr;
         let allocated_ip = self.next_container_ip.lock().await.take();
+        let dns_config = self.next_container_dns.lock().await.take();
         let cluster_cidr = self.config.cluster_cidr.clone();
         let network_attachment = match (slice_cidr, allocated_ip) {
             (Some(slice), Some(ip)) => match self.ensure_overlay_network(slice).await {
@@ -809,6 +866,7 @@ impl Runtime for HcsRuntime {
                     let cid_for_attach = hcs_id.clone();
                     let prefix_length = slice.prefix_len();
                     let cluster_cidr_owned = cluster_cidr;
+                    let (dns_server, dns_domain) = dns_config.unwrap_or((None, None));
                     match tokio::task::spawn_blocking(move || {
                         EndpointAttachment::create_overlay(
                             net_id,
@@ -817,6 +875,8 @@ impl Runtime for HcsRuntime {
                             ip,
                             prefix_length,
                             &cluster_cidr_owned,
+                            dns_server,
+                            dns_domain.as_deref(),
                         )
                     })
                     .await
@@ -896,8 +956,14 @@ impl Runtime for HcsRuntime {
 
         // 6. Subscribe to exit events before returning so we don't miss a
         //    fast-exiting container.
+        //
+        // `system.raw()` returns `SendHandle<HCS_SYSTEM>`; deref with `*` to
+        // pass the bare handle to the synchronous `HcsSetComputeSystemCallback`
+        // path inside `spawn_exit_watcher`. The dereferenced value is used
+        // before any `.await`, so the `!Send + !Sync` raw handle never
+        // crosses a suspend point.
         let sink: Arc<RwLock<Option<i32>>> = Arc::new(RwLock::new(None));
-        self.spawn_exit_watcher(hcs_id.clone(), system.raw(), sink.clone());
+        self.spawn_exit_watcher(hcs_id.clone(), *system.raw(), sink.clone());
 
         // 7. Register the entry.
         let entry = ContainerEntry {
@@ -1090,7 +1156,13 @@ impl Runtime for HcsRuntime {
             user: None,
         };
 
-        let process = ComputeProcess::spawn(entry.system.raw(), &params)
+        // `entry.system.raw()` already returns `SendHandle<HCS_SYSTEM>` (the
+        // `ComputeSystem::raw()` accessor wraps the inner handle at the
+        // source so the returned `ComputeProcess::spawn` future remains
+        // `Send` across the enclosing `async fn exec`). See
+        // `zlayer_hcs::handle::SendHandle`.
+        let system_handle = entry.system.raw();
+        let process = ComputeProcess::spawn(system_handle, &params)
             .await
             .map_err(|e| AgentError::Internal(format!("HcsCreateProcess: {e}")))?;
 
@@ -1320,20 +1392,29 @@ impl Runtime for HcsRuntime {
 
     async fn inspect_detailed(&self, id: &ContainerId) -> Result<ContainerInspectDetails> {
         let hcs_id = Self::hcs_id(id);
-        let containers = self.containers.read().await;
-        let entry = containers
-            .get(&hcs_id)
-            .ok_or_else(|| AgentError::NotFound {
-                container: hcs_id.clone(),
-                reason: "no HCS entry for container".to_string(),
-            })?;
+        // Clone the exit-code sink out of the entry before the outer
+        // `containers` read-guard drops. Holding the guard across the inner
+        // `last_exit_code.read().await` below would borrow-check-fail
+        // (E0597) and also make the returned future non-Send on Windows
+        // because the `RwLockReadGuard<HashMap<..>>` is not Send.
+        let last_exit_code_lock = {
+            let containers = self.containers.read().await;
+            let entry = containers
+                .get(&hcs_id)
+                .ok_or_else(|| AgentError::NotFound {
+                    container: hcs_id.clone(),
+                    reason: "no HCS entry for container".to_string(),
+                })?;
+            Arc::clone(&entry.last_exit_code)
+        };
+        let exit_code = *last_exit_code_lock.read().await;
 
         Ok(ContainerInspectDetails {
             ports: Vec::new(),
             networks: Vec::new(),
             ipv4: None,
             health: None,
-            exit_code: *entry.last_exit_code.read().await,
+            exit_code,
         })
     }
 }

@@ -1,6 +1,6 @@
-//! Physical network adapter discovery for HCN Transparent / L2Bridge binding.
+//! Physical network adapter discovery for HCN Transparent / `L2Bridge` binding.
 //!
-//! An HCN Transparent or L2Bridge network must be bound to the friendly name
+//! An HCN Transparent or `L2Bridge` network must be bound to the friendly name
 //! of a physical host NIC (the "uplink" adapter). This module finds that
 //! adapter by walking `GetAdaptersAddresses` and selecting the first up
 //! adapter that owns a default IPv4 gateway — the same heuristic Calico-Windows
@@ -214,12 +214,11 @@ mod tests {
         // We can't assert the exact return here — it depends on the test host.
         // But we can assert the env override is *not* returned (trimmed empty).
         let got = find_primary_adapter();
-        match got {
-            Ok(name) => assert_ne!(name, "   "),
-            Err(_) => {
-                // Acceptable: no real adapter on the test host (CI without a
-                // physical NIC), auto-detection returns NotFound.
-            }
+        if let Ok(name) = got {
+            assert_ne!(name, "   ");
+        } else {
+            // Acceptable: no real adapter on the test host (CI without a
+            // physical NIC), auto-detection returns NotFound.
         }
         match previous {
             Some(v) => unsafe { env::set_var(ZLAYER_UPLINK_ENV, v) },

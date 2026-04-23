@@ -1,7 +1,7 @@
 //! Typed errors for HCN operations.
 //!
 //! HCN returns HRESULT codes for every call. This module classifies the
-//! failures ZLayer cares about and preserves the raw HRESULT + message for
+//! failures `ZLayer` cares about and preserves the raw HRESULT + message for
 //! unclassified errors. When HCN supplies a JSON error record (`ErrorRecord`),
 //! the structured fields are decoded and surfaced in [`HnsError::Other`] as
 //! a concatenated message for now — callers that need structured access can
@@ -32,7 +32,7 @@ pub enum HnsError {
     },
 
     /// The JSON document passed to HCN was rejected as invalid.
-    /// Usually caused by a missing `SchemaVersion`, a PascalCase quirk
+    /// Usually caused by a missing `SchemaVersion`, a `PascalCase` quirk
     /// (e.g. `IPConfigurations` vs `IpConfigurations`), or UTF-16 null
     /// terminator handling issues.
     #[error("HCN rejected JSON document: {message} (HRESULT 0x{hresult:08x})")]
@@ -89,12 +89,10 @@ impl HnsError {
         // Magic numbers come from the HCN headers. See hcsshim's
         // internal/hns/error.go + learn.microsoft.com HCN reference.
         match hr.0 {
-            // HCN_E_NETWORK_NOT_FOUND (0x803B0001)
-            -0x7FC4_FFFF => Self::NotFound { id: message.into() },
-            // HCN_E_ENDPOINT_NOT_FOUND (0x803B0004)
-            -0x7FC4_FFFC => Self::NotFound { id: message.into() },
+            // HCN_E_NETWORK_NOT_FOUND (0x803B0001),
+            // HCN_E_ENDPOINT_NOT_FOUND (0x803B0004),
             // HCN_E_NAMESPACE_NOT_FOUND (0x803B000C)
-            -0x7FC4_FFF4 => Self::NotFound { id: message.into() },
+            -0x7FC4_FFFF | -0x7FC4_FFFC | -0x7FC4_FFF4 => Self::NotFound { id: message.into() },
 
             // E_ACCESSDENIED (0x80070005)
             -0x7FFF_FFFB => Self::AccessDenied { hresult: hr.0 },

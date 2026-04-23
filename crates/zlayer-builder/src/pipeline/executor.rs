@@ -37,14 +37,16 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 use serde::Deserialize;
 
-use crate::backend::BuildBackend;
+use crate::backend::{detect_backend, BuildBackend, ImageOs};
 
 /// Minimal struct to read `source_hash` from a cached image's `config.json`.
 /// Separate from `SandboxImageConfig` which is macOS-only.
@@ -102,8 +104,18 @@ pub struct PipelineExecutor {
     /// Pluggable build backend (buildah, sandbox, etc.).
     ///
     /// When set, builds delegate to this backend instead of using the
-    /// `executor` field directly.
+    /// `executor` field directly. This is an *explicit* override: when
+    /// present, the executor uses the same backend for every image in the
+    /// pipeline regardless of the image's target OS.
     backend: Option<Arc<dyn BuildBackend>>,
+    /// Per-target-OS backend cache used when `backend` is `None`.
+    ///
+    /// Each wave may contain images targeting different OSes (e.g. one Linux
+    /// image + one Windows image). Rather than re-run `detect_backend()` for
+    /// every image, we memoize the backend selected for each [`ImageOs`] the
+    /// first time we see it in the pipeline. Shared via `Arc<Mutex<_>>` so
+    /// spawned build tasks can resolve their backend concurrently.
+    backend_cache: Arc<Mutex<HashMap<ImageOs, Arc<dyn BuildBackend>>>>,
     /// Whether to abort on first failure
     fail_fast: bool,
     /// Whether to push images after building
@@ -131,6 +143,7 @@ impl PipelineExecutor {
             base_dir,
             executor,
             backend: None,
+            backend_cache: Arc::new(Mutex::new(HashMap::new())),
             fail_fast: true,
             push_enabled,
             #[cfg(feature = "local-registry")]
@@ -162,6 +175,7 @@ impl PipelineExecutor {
             base_dir,
             executor: BuildahExecutor::default(),
             backend: Some(backend),
+            backend_cache: Arc::new(Mutex::new(HashMap::new())),
             fail_fast: true,
             push_enabled,
             #[cfg(feature = "local-registry")]
@@ -378,13 +392,24 @@ impl PipelineExecutor {
     /// set, and images with no platforms use the native platform (existing
     /// behavior).
     ///
+    /// # Per-image backend selection
+    ///
+    /// When the executor was built via [`PipelineExecutor::with_backend`]
+    /// (i.e. `self.backend.is_some()`), that explicit backend is used for
+    /// every image. Otherwise the target OS is parsed from each image's
+    /// `platforms` field and a backend is resolved via [`detect_backend`],
+    /// cached in `self.backend_cache` to avoid re-detection. An image that
+    /// cannot resolve a backend (e.g. Windows image on a Linux host) fails
+    /// only that image — other images in the wave continue.
+    ///
     /// Returns a vector of (name, result) tuples for each image in the wave.
     async fn build_wave(&self, wave: &[String]) -> Vec<(String, Result<BuiltImage>)> {
         // Create shared data for spawned tasks
         let pipeline = Arc::new(self.pipeline.clone());
         let base_dir = Arc::new(self.base_dir.clone());
         let executor = self.executor.clone();
-        let backend = self.backend.clone();
+        let explicit_backend = self.backend.clone();
+        let backend_cache = Arc::clone(&self.backend_cache);
 
         // Extract local registry root path (if configured) so spawned tasks
         // can create their own LocalRegistry handles pointing at the same store.
@@ -401,58 +426,21 @@ impl PipelineExecutor {
             let pipeline = Arc::clone(&pipeline);
             let base_dir = Arc::clone(&base_dir);
             let executor = executor.clone();
-            let backend = backend.clone();
+            let explicit_backend = explicit_backend.clone();
+            let backend_cache = Arc::clone(&backend_cache);
             let registry_root = registry_root.clone();
 
             set.spawn(async move {
-                let platforms = {
-                    let image_config = &pipeline.images[&name];
-                    effective_platforms(image_config, &pipeline.defaults)
-                };
-
-                let result = match platforms.len() {
-                    // No platforms specified — native build (existing behavior)
-                    0 => {
-                        build_single_image(
-                            &name,
-                            &pipeline,
-                            &base_dir,
-                            executor,
-                            backend.as_ref().map(Arc::clone),
-                            None,
-                            registry_root.as_deref(),
-                        )
-                        .await
-                    }
-                    // Single platform — use build_single_image with platform set
-                    1 => {
-                        let platform = platforms[0].clone();
-                        build_single_image(
-                            &name,
-                            &pipeline,
-                            &base_dir,
-                            executor,
-                            backend.as_ref().map(Arc::clone),
-                            Some(&platform),
-                            registry_root.as_deref(),
-                        )
-                        .await
-                    }
-                    // Multiple platforms — build each, then create manifest list
-                    _ => {
-                        build_multiplatform_image(
-                            &name,
-                            &pipeline,
-                            &base_dir,
-                            executor,
-                            backend.as_ref().map(Arc::clone),
-                            &platforms,
-                            registry_root.as_deref(),
-                        )
-                        .await
-                    }
-                };
-
+                let result = build_one_image(
+                    &name,
+                    &pipeline,
+                    &base_dir,
+                    executor,
+                    explicit_backend,
+                    &backend_cache,
+                    registry_root.as_deref(),
+                )
+                .await;
                 (name, result)
             });
         }
@@ -514,6 +502,172 @@ fn effective_platforms(image: &PipelineImage, defaults: &PipelineDefaults) -> Ve
         defaults.platforms.clone()
     } else {
         image.platforms.clone()
+    }
+}
+
+/// Parse the target OS from an image's effective `platforms` list.
+///
+/// Rules:
+/// - `explicit_os` (e.g. `PipelineImage.os:`) takes precedence — when
+///   `Some(os)`, we also verify each `platforms` entry parses to the same
+///   OS so a misconfigured platform list surfaces loudly rather than being
+///   silently overridden.
+/// - Empty list with no explicit OS → [`ImageOs::Linux`] (the historical default).
+/// - All entries parse to the same OS → that OS.
+/// - Any entry fails to parse → an error naming the bad entry.
+/// - Entries parse to *different* OSes → an error, because buildah cannot
+///   assemble a single manifest list across OSes and the user should split
+///   the image into separate `PipelineImage` entries.
+fn target_os_for_image(platforms: &[String], explicit_os: Option<ImageOs>) -> Result<ImageOs> {
+    // Parse every entry so we still catch malformed strings even when an
+    // explicit OS is supplied; the L-7 validation semantics stay intact.
+    let mut selected: Option<ImageOs> = None;
+    for platform in platforms {
+        let os = ImageOs::from_str(platform).map_err(|e| {
+            BuildError::invalid_instruction(
+                "pipeline",
+                format!("unrecognized platform '{platform}': {e}"),
+            )
+        })?;
+        match selected {
+            None => selected = Some(os),
+            Some(existing) if existing == os => {}
+            Some(existing) => {
+                return Err(BuildError::invalid_instruction(
+                    "pipeline",
+                    format!(
+                        "multi-platform images cannot mix OSes in a single entry \
+                         (found {existing:?} and {os:?} in platforms={platforms:?}); \
+                         split into separate PipelineImage entries"
+                    ),
+                ));
+            }
+        }
+    }
+
+    if let Some(explicit) = explicit_os {
+        if let Some(from_platforms) = selected {
+            if from_platforms != explicit {
+                return Err(BuildError::invalid_instruction(
+                    "pipeline",
+                    format!(
+                        "explicit os={explicit:?} conflicts with OS inferred from \
+                         platforms={platforms:?} (got {from_platforms:?}); remove one \
+                         or make them agree"
+                    ),
+                ));
+            }
+        }
+        return Ok(explicit);
+    }
+
+    Ok(selected.unwrap_or(ImageOs::Linux))
+}
+
+/// Resolve a build backend for `target_os`, using `cache` to memoize prior
+/// detections.
+///
+/// If `explicit` is `Some`, it is returned unconditionally — callers that
+/// constructed the executor via [`PipelineExecutor::with_backend`] have opted
+/// into a single backend and we do not second-guess them. Otherwise we check
+/// the cache and fall back to [`detect_backend`] on a miss, storing the
+/// result before returning.
+async fn backend_for(
+    target_os: ImageOs,
+    cache: &Mutex<HashMap<ImageOs, Arc<dyn BuildBackend>>>,
+    explicit: Option<Arc<dyn BuildBackend>>,
+) -> Result<Arc<dyn BuildBackend>> {
+    if let Some(backend) = explicit {
+        return Ok(backend);
+    }
+
+    // Fast path: already detected.
+    {
+        let guard = cache.lock().await;
+        if let Some(backend) = guard.get(&target_os) {
+            return Ok(Arc::clone(backend));
+        }
+    }
+
+    // Slow path: detect + memoize. Hold the lock across detection so two
+    // concurrent images targeting the same OS share one detection call.
+    let mut guard = cache.lock().await;
+    if let Some(backend) = guard.get(&target_os) {
+        return Ok(Arc::clone(backend));
+    }
+    let backend = detect_backend(target_os).await?;
+    guard.insert(target_os, Arc::clone(&backend));
+    Ok(backend)
+}
+
+/// Build a single pipeline image end-to-end.
+///
+/// Parses the target OS, resolves a backend (with caching), logs the build
+/// intent, then dispatches to the single-platform or multi-platform path
+/// based on the effective platform list.
+#[allow(clippy::too_many_arguments)]
+async fn build_one_image(
+    name: &str,
+    pipeline: &ZPipeline,
+    base_dir: &Path,
+    executor: BuildahExecutor,
+    explicit_backend: Option<Arc<dyn BuildBackend>>,
+    backend_cache: &Mutex<HashMap<ImageOs, Arc<dyn BuildBackend>>>,
+    registry_root: Option<&Path>,
+) -> Result<BuiltImage> {
+    let image_config = &pipeline.images[name];
+    let platforms = effective_platforms(image_config, &pipeline.defaults);
+
+    // L-2: `PipelineImage.os:` takes precedence over OS parsed from platforms.
+    let target_os = target_os_for_image(&platforms, image_config.os)?;
+    info!(
+        "Building image '{}' (target_os={:?}, platforms={:?}, explicit_os={:?})",
+        name, target_os, platforms, image_config.os
+    );
+
+    let backend = backend_for(target_os, backend_cache, explicit_backend).await?;
+
+    match platforms.len() {
+        // No platforms specified — native build (existing behavior)
+        0 => {
+            build_single_image(
+                name,
+                pipeline,
+                base_dir,
+                executor,
+                Some(backend),
+                None,
+                registry_root,
+            )
+            .await
+        }
+        // Single platform — use build_single_image with platform set
+        1 => {
+            let platform = platforms[0].clone();
+            build_single_image(
+                name,
+                pipeline,
+                base_dir,
+                executor,
+                Some(backend),
+                Some(&platform),
+                registry_root,
+            )
+            .await
+        }
+        // Multiple platforms — build each, then create manifest list
+        _ => {
+            build_multiplatform_image(
+                name,
+                pipeline,
+                base_dir,
+                executor,
+                Some(backend),
+                &platforms,
+                registry_root,
+            )
+            .await
+        }
     }
 }
 
@@ -1142,6 +1296,7 @@ push:
             cache_mounts: vec![],
             retries: None,
             platforms: vec![],
+            os: None,
         }
     }
 
@@ -1218,5 +1373,265 @@ push:
         };
         // Image platforms completely replace defaults, not merge
         assert_eq!(effective_platforms(&image, &defaults), vec!["linux/s390x"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // L-7: per-image backend selection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_target_os_for_image_empty_defaults_to_linux() {
+        assert_eq!(target_os_for_image(&[], None).unwrap(), ImageOs::Linux);
+    }
+
+    #[test]
+    fn test_target_os_for_image_single_linux() {
+        assert_eq!(
+            target_os_for_image(&["linux/amd64".to_string()], None).unwrap(),
+            ImageOs::Linux
+        );
+    }
+
+    #[test]
+    fn test_target_os_for_image_single_windows() {
+        assert_eq!(
+            target_os_for_image(&["windows/amd64".to_string()], None).unwrap(),
+            ImageOs::Windows
+        );
+    }
+
+    #[test]
+    fn test_target_os_for_image_multi_same_os() {
+        // All-Linux entries should collapse to a single Linux backend.
+        let plats = vec!["linux/amd64".to_string(), "linux/arm64".to_string()];
+        assert_eq!(target_os_for_image(&plats, None).unwrap(), ImageOs::Linux);
+    }
+
+    #[test]
+    fn test_target_os_for_image_mixed_os_is_rejected() {
+        // Mixed OSes in a single entry must fail — there is no single backend
+        // (or buildah manifest list) that can straddle Linux + Windows.
+        let plats = vec!["linux/amd64".to_string(), "windows/amd64".to_string()];
+        let err = target_os_for_image(&plats, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot mix OSes"),
+            "expected mix-of-OSes error, got: {msg}"
+        );
+        assert!(
+            msg.contains("split into separate PipelineImage entries"),
+            "expected remediation hint, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_target_os_for_image_unrecognized_platform() {
+        let plats = vec!["plan9/amd64".to_string()];
+        let err = target_os_for_image(&plats, None).unwrap_err();
+        assert!(err.to_string().contains("unrecognized platform"));
+    }
+
+    #[test]
+    fn test_target_os_for_image_explicit_os_wins_empty_platforms() {
+        // L-2: explicit os: on PipelineImage overrides the default Linux
+        // inference when no platforms are set.
+        assert_eq!(
+            target_os_for_image(&[], Some(ImageOs::Windows)).unwrap(),
+            ImageOs::Windows
+        );
+    }
+
+    #[test]
+    fn test_target_os_for_image_explicit_os_matches_platforms() {
+        // Explicit os: agrees with the OS portion of platforms — totally fine.
+        let plats = vec!["windows/amd64".to_string()];
+        assert_eq!(
+            target_os_for_image(&plats, Some(ImageOs::Windows)).unwrap(),
+            ImageOs::Windows
+        );
+    }
+
+    #[test]
+    fn test_target_os_for_image_explicit_os_conflicts_with_platforms() {
+        // Explicit os: disagrees with platforms — must fail loudly so we don't
+        // silently override user intent.
+        let plats = vec!["linux/amd64".to_string()];
+        let err = target_os_for_image(&plats, Some(ImageOs::Windows)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("explicit os=")
+                && msg.contains("conflicts with OS inferred from platforms"),
+            "expected conflict error, got: {msg}"
+        );
+    }
+
+    /// A fake [`BuildBackend`] that records which tags it was asked to build
+    /// and returns synthetic [`BuiltImage`] values. Used to exercise the
+    /// per-image routing without invoking the real buildah CLI.
+    struct FakeBackend {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl BuildBackend for FakeBackend {
+        async fn build_image(
+            &self,
+            _context: &Path,
+            _dockerfile: &crate::dockerfile::Dockerfile,
+            options: &crate::builder::BuildOptions,
+            _event_tx: Option<std::sync::mpsc::Sender<crate::tui::BuildEvent>>,
+        ) -> Result<BuiltImage> {
+            Ok(BuiltImage {
+                image_id: format!("{}:fake-id", self.name),
+                tags: options.tags.clone(),
+                layer_count: 1,
+                size: 0,
+                build_time_ms: 1,
+                is_manifest: false,
+            })
+        }
+
+        async fn push_image(
+            &self,
+            _tag: &str,
+            _auth: Option<&crate::builder::RegistryAuth>,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn tag_image(&self, _image: &str, _new_tag: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn manifest_create(&self, _name: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn manifest_add(&self, _manifest: &str, _image: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn manifest_push(&self, _name: &str, _destination: &str) -> Result<()> {
+            Ok(())
+        }
+
+        async fn is_available(&self) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            self.name
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backend_for_uses_explicit_override() {
+        // When `explicit` is supplied, `backend_for` must return that backend
+        // regardless of target_os and must not touch the cache.
+        let explicit: Arc<dyn BuildBackend> = Arc::new(FakeBackend { name: "explicit" });
+        let cache: Mutex<HashMap<ImageOs, Arc<dyn BuildBackend>>> = Mutex::new(HashMap::new());
+        let resolved = backend_for(ImageOs::Linux, &cache, Some(Arc::clone(&explicit)))
+            .await
+            .unwrap();
+        assert_eq!(resolved.name(), "explicit");
+        assert!(
+            cache.lock().await.is_empty(),
+            "explicit override should not populate cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backend_for_cache_hit_returns_cached() {
+        // If the cache already has an entry for the target_os, `backend_for`
+        // must return it verbatim without calling detect_backend.
+        let fake: Arc<dyn BuildBackend> = Arc::new(FakeBackend { name: "cached" });
+        let cache: Mutex<HashMap<ImageOs, Arc<dyn BuildBackend>>> = Mutex::new(HashMap::new());
+        cache.lock().await.insert(ImageOs::Linux, Arc::clone(&fake));
+        let resolved = backend_for(ImageOs::Linux, &cache, None).await.unwrap();
+        assert_eq!(resolved.name(), "cached");
+    }
+
+    /// Mixed-OS wave: one Linux image (served by a seeded fake backend) and
+    /// one Windows image. On a non-Windows host, `detect_backend(Windows)`
+    /// returns an error from L-6; the Linux build should still succeed via
+    /// the cached fake backend. This verifies per-image backend selection
+    /// and per-image error isolation within a single wave.
+    #[cfg(not(target_os = "windows"))]
+    #[tokio::test]
+    async fn test_build_one_image_isolates_windows_failure_on_linux_host() {
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        let ctx = tmp.path();
+        // A minimal Dockerfile is enough — the fake backend ignores its
+        // contents, but the Dockerfile parser needs *something* to read.
+        tokio::fs::write(ctx.join("Dockerfile"), "FROM scratch\n")
+            .await
+            .unwrap();
+
+        let yaml = r#"
+images:
+  linux-app:
+    file: Dockerfile
+    platforms: ["linux/amd64"]
+    tags: ["example/linux:dev"]
+  win-app:
+    file: Dockerfile
+    platforms: ["windows/amd64"]
+    tags: ["example/windows:dev"]
+"#;
+        let pipeline = parse_pipeline(yaml).unwrap();
+
+        // Pre-seed the cache with a fake Linux backend so the Linux build
+        // does not try to invoke real buildah.
+        let cache: Arc<Mutex<HashMap<ImageOs, Arc<dyn BuildBackend>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let fake_linux: Arc<dyn BuildBackend> = Arc::new(FakeBackend { name: "fake-linux" });
+        cache
+            .lock()
+            .await
+            .insert(ImageOs::Linux, Arc::clone(&fake_linux));
+
+        // Linux image should succeed via the seeded fake backend.
+        let linux_res = build_one_image(
+            "linux-app",
+            &pipeline,
+            ctx,
+            BuildahExecutor::with_path("/usr/bin/buildah"),
+            None, // no explicit override — exercise per-target_os routing
+            &cache,
+            None,
+        )
+        .await;
+        assert!(
+            linux_res.is_ok(),
+            "Linux image should succeed, got: {linux_res:?}"
+        );
+        assert_eq!(linux_res.unwrap().image_id, "fake-linux:fake-id");
+
+        // Windows image should fail with the L-6 message — a Windows image
+        // cannot be built on a non-Windows host.
+        let win_res = build_one_image(
+            "win-app",
+            &pipeline,
+            ctx,
+            BuildahExecutor::with_path("/usr/bin/buildah"),
+            None,
+            &cache,
+            None,
+        )
+        .await;
+        let err = win_res.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Windows host") || msg.contains("windows host"),
+            "expected Windows-host error from detect_backend, got: {msg}"
+        );
+
+        // The Windows detection failure must not pollute the cache for
+        // ImageOs::Windows, and the Linux backend must remain cached.
+        let guard = cache.lock().await;
+        assert!(guard.contains_key(&ImageOs::Linux));
+        assert!(!guard.contains_key(&ImageOs::Windows));
     }
 }

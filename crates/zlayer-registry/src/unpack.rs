@@ -573,8 +573,12 @@ impl LayerUnpacker {
         Ok(())
     }
 
-    /// Set file permissions from tar entry
-    #[allow(clippy::unused_self)]
+    /// Set file permissions from tar entry.
+    ///
+    /// The `Result<()>` return is load-bearing on Unix (where we can fail to
+    /// apply the mode from the tar header); the Windows branch is a no-op
+    /// and cannot fail, so clippy's `unnecessary_wraps` is allowed here.
+    #[allow(clippy::unused_self, clippy::unnecessary_wraps)]
     fn set_permissions<R: Read>(&self, entry: &tar::Entry<'_, R>, full_path: &Path) -> Result<()> {
         #[cfg(unix)]
         {

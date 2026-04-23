@@ -39,9 +39,17 @@ pub(crate) mod stub;
 #[async_trait]
 pub(crate) trait InterfaceOps: Send + Sync {
     /// Return true iff a network interface with this name exists on the host.
+    ///
+    /// Only wired to callers on Linux today; on Windows the Wintun adapter
+    /// lifecycle is owned by the `tun::WindowsTun` session and callers do
+    /// not currently probe for interface existence.
+    #[allow(dead_code)]
     async fn link_exists(&self, name: &str) -> Result<bool, OverlayError>;
 
     /// Delete a network interface. Idempotent — `Ok(())` if absent.
+    ///
+    /// Only wired to callers on Linux today (see [`link_exists`]).
+    #[allow(dead_code)]
     async fn delete_link(&self, name: &str) -> Result<(), OverlayError>;
 
     /// Bring a network interface administratively up.

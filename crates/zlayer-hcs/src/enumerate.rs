@@ -34,7 +34,7 @@ pub struct EnumeratedSystem {
 
 /// Query filter for [`list`].
 ///
-/// Each optional field narrows the result set; multiple fields are ANDed.
+/// Each optional field narrows the result set; multiple fields are `ANDed`.
 /// HCS accepts a JSON `PropertyQuery` document — we serialize this struct into
 /// it. Defaults match "return all compute systems".
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -80,7 +80,7 @@ pub async fn list(query: &EnumerateQuery) -> HcsResult<Vec<EnumeratedSystem>> {
     Ok(systems)
 }
 
-/// Convenience: list compute systems owned by a specific tag. ZLayer tags
+/// Convenience: list compute systems owned by a specific tag. `ZLayer` tags
 /// every compute system it creates with `owner = "zlayer"` so this finds
 /// our zombies on startup.
 pub async fn list_by_owner(owner: &str) -> HcsResult<Vec<EnumeratedSystem>> {

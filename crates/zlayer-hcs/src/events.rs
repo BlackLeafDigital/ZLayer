@@ -55,7 +55,7 @@ pub struct HcsEvent {
     pub detail_json: String,
 }
 
-/// Classification of `HCS_EVENT_TYPE` values ZLayer cares about.
+/// Classification of `HCS_EVENT_TYPE` values `ZLayer` cares about.
 ///
 /// The numeric discriminants come from `windows::Win32::System::HostComputeSystem`
 /// constants (`HcsEventSystemExited = 1`, `HcsEventSystemCrashInitiated = 2`,

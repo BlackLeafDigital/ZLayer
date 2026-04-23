@@ -277,7 +277,7 @@ pub struct BoundListeners {
 /// Bind a TCP listener and mint the local admin JWT token (Windows).
 ///
 /// This is the Windows counterpart of the Unix `bind_dual_with_local_auth`.
-/// It binds only the TCP listener — the ZLayer daemon does not yet expose a
+/// It binds only the TCP listener — the `ZLayer` daemon does not yet expose a
 /// named-pipe transport on Windows (tracked as Phase F-7b). The `unix_path`
 /// argument is accepted to keep the call-site signature identical, but
 /// treated as opaque: if it looks like a `tcp://host:port` URL the parsed

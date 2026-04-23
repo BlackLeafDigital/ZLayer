@@ -236,6 +236,8 @@ zlayer-secrets = { version = "0.0.0-dev", path = "crates/zlayer-secrets" }
 zlayer-wsl = { version = "0.0.0-dev", path = "crates/zlayer-wsl" }
 zlayer-git = { version = "0.0.0-dev", path = "crates/zlayer-git" }
 zlayer-client = { version = "0.0.0-dev", path = "crates/zlayer-client" }
+zlayer-hcs = { version = "0.0.0-dev", path = "crates/zlayer-hcs" }
+zlayer-hns = { version = "0.0.0-dev", path = "crates/zlayer-hns" }
 
 # Git (gitoxide) — pure-Rust git implementation used by `zlayer-git`.
 # Features chosen to cover the operations we perform: blocking HTTPS transport

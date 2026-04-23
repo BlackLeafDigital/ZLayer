@@ -131,12 +131,21 @@ impl ServiceInstance {
                 };
 
                 // Create container (no lock needed - I/O operation)
+                //
+                // RouteToPeer must propagate unchanged: the scheduler uses it
+                // to re-place the workload on a capable peer, and wrapping it
+                // in `CreateFailed` would hide the signal and mark the service
+                // dead instead of rescheduling it. All other errors are
+                // normalised to `CreateFailed` for upstream handling.
                 self.runtime
                     .create_container(&id, &self.spec)
                     .await
-                    .map_err(|e| AgentError::CreateFailed {
-                        id: id.to_string(),
-                        reason: e.to_string(),
+                    .map_err(|e| match e {
+                        AgentError::RouteToPeer { .. } => e,
+                        other => AgentError::CreateFailed {
+                            id: id.to_string(),
+                            reason: other.to_string(),
+                        },
                     })?;
 
                 // Run init actions with error policy enforcement (no lock needed)
@@ -253,12 +262,17 @@ impl ServiceInstance {
                             Ok(Some(ns_id)) => {
                                 let ip_override =
                                     self.runtime.get_container_ip(&id).await.ok().flatten();
+                                let dns_server = overlay_guard.dns_server_addr().map(|sa| sa.ip());
+                                let dns_domain =
+                                    overlay_guard.dns_domain().map(ToString::to_string);
                                 match overlay_guard
                                     .attach_container_hcn(
                                         ns_id,
                                         &self.service_name,
                                         ip_override,
                                         true,
+                                        dns_server,
+                                        dns_domain,
                                     )
                                     .await
                                 {

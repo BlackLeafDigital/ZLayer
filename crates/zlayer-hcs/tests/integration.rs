@@ -10,6 +10,11 @@
 //! suite stays green on developer machines and unprivileged CI runners.
 
 #![cfg(windows)]
+// Mirrors the `src/lib.rs` policy: this is an HCS FFI integration test that
+// calls `OpenProcessToken` / `GetTokenInformation` directly to drive the
+// elevation probe, so `unsafe` + the pointer-family lints are allowed here
+// for the same reason they're allowed at the crate root.
+#![allow(unsafe_code, clippy::borrow_as_ptr, clippy::items_after_statements)]
 
 use zlayer_hcs::enumerate::{list as enum_list, list_by_owner, EnumerateQuery};
 use zlayer_hcs::error::HcsError;

@@ -31,7 +31,7 @@ hcs-runtime = []
 # the dedicated `zlayer` WSL2 distro. Off by default; enabled explicitly by
 # `bin/zlayer` when the native Windows daemon wants Linux-container support
 # alongside HCS.
-wsl = ["dep:zlayer-wsl"]
+wsl = ["dep:zlayer-wsl", "dep:anyhow"]
 docker = ["dep:bollard"]
 wasm = [
     "dep:wasmtime",
@@ -138,8 +138,8 @@ windows = { version = "0.62", features = [
     "Win32_System_IO",
     "Win32_System_HostComputeSystem",
 ] }
-zlayer-hcs = { path = "../zlayer-hcs" }
-zlayer-hns = { path = "../zlayer-hns" }
+zlayer-hcs = { workspace = true }
+zlayer-hns = { workspace = true }
 # Gated behind the `wsl` feature — only pulled in when the Wsl2DelegateRuntime
 # is actually compiled. Keeps the default Windows build lean.
 zlayer-wsl = { workspace = true, optional = true }

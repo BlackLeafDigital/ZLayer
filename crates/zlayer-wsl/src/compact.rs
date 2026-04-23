@@ -40,7 +40,7 @@ pub enum CompactMethod {
     OptimizeVhd,
 }
 
-/// Compact the ZLayer WSL2 distro's `ext4.vhdx`, reclaiming freed space to the host.
+/// Compact the `ZLayer` WSL2 distro's `ext4.vhdx`, reclaiming freed space to the host.
 ///
 /// Flow:
 ///
@@ -176,7 +176,7 @@ async fn stat_len(path: &std::path::Path) -> Option<u64> {
     }
 }
 
-/// Returns `true` if PowerShell has the `Optimize-VHD` cmdlet registered
+/// Returns `true` if `PowerShell` has the `Optimize-VHD` cmdlet registered
 /// (i.e. the Hyper-V module is installed — typically Pro/Enterprise).
 #[cfg(target_os = "windows")]
 async fn has_optimize_vhd() -> bool {

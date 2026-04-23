@@ -12,7 +12,7 @@
 //! - Layers are buffered fully in memory. A production-grade pipeline would
 //!   stream each blob to disk to cap RAM at large-image boundaries.
 //! - Digest verification re-hashes the raw (compressed) blob bytes; we don't
-//!   independently verify DiffIDs on the decompressed tar.
+//!   independently verify `DiffIDs` on the decompressed tar.
 //! - Tombstones and `Hives/` entries are written as raw byte copies. The
 //!   `Files/` subtree is fed through [`BackupStreamWriter`] because its
 //!   entries are already BackupRead-framed in the wclayer tar.

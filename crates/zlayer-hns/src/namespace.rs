@@ -201,7 +201,7 @@ impl Namespace {
             )
             .map_err(|e| classify_error(e.code(), err_record, "HcnQueryNamespaceProperties"))?;
         }
-        let json = decode_pwstr(out_properties)?;
+        let json = decode_pwstr(out_properties);
         let parsed: HostComputeNamespace = serde_json::from_str(&json)?;
         Ok(parsed)
     }
@@ -248,7 +248,7 @@ pub fn list(query_json: &str) -> HnsResult<Vec<GUID>> {
         HcnEnumerateNamespaces(&query_hstring, &mut out_namespaces, Some(&mut err_record))
             .map_err(|e| classify_error(e.code(), err_record, "HcnEnumerateNamespaces"))?;
     }
-    let json = decode_pwstr(out_namespaces)?;
+    let json = decode_pwstr(out_namespaces);
     if json.is_empty() {
         return Ok(Vec::new());
     }
@@ -275,10 +275,10 @@ pub fn list(query_json: &str) -> HnsResult<Vec<GUID>> {
 
 /// Convert an HCN-returned PWSTR to an owned `String` and free its backing
 /// `LocalAlloc` buffer. Safe to call with a null pointer (returns empty).
-fn decode_pwstr(p: PWSTR) -> HnsResult<String> {
+fn decode_pwstr(p: PWSTR) -> String {
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     if p.is_null() {
-        return Ok(String::new());
+        return String::new();
     }
     // SAFETY: HCN handed us a null-terminated UTF-16 buffer allocated via
     // LocalAlloc. We read it, then free it via LocalFree. The PWSTR is
@@ -288,21 +288,21 @@ fn decode_pwstr(p: PWSTR) -> HnsResult<String> {
     unsafe {
         let _ = LocalFree(Some(HLOCAL(p.0.cast())));
     }
-    Ok(s)
+    s
 }
 
 /// Classify a windows-rs `HRESULT` into an [`HnsError`], folding in the
 /// decoded `ErrorRecord` PWSTR and a caller-supplied context string.
 ///
 /// Consumes the `PWSTR` (freeing the underlying buffer) so callers never
-/// leak the ErrorRecord.
+/// leak the `ErrorRecord`.
 fn classify_error<S: Into<String>>(
     hr: windows::core::HRESULT,
     err_record: PWSTR,
     context: S,
 ) -> HnsError {
     let ctx: String = context.into();
-    let decoded = decode_pwstr(err_record).unwrap_or_default();
+    let decoded = decode_pwstr(err_record);
     let msg = if decoded.is_empty() {
         ctx
     } else {
@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn decode_pwstr_null_returns_empty() {
-        let s = decode_pwstr(PWSTR::null()).unwrap();
+        let s = decode_pwstr(PWSTR::null());
         assert!(s.is_empty());
     }
 

@@ -27,7 +27,7 @@ impl Default for WslBackendConfig {
     }
 }
 
-/// Start the ZLayer daemon inside WSL2.
+/// Start the `ZLayer` daemon inside WSL2.
 ///
 /// # Errors
 ///
@@ -81,7 +81,7 @@ pub async fn start_daemon(_config: &WslBackendConfig) -> anyhow::Result<()> {
     anyhow::bail!("WSL2 daemon management is only available on Windows")
 }
 
-/// Stop the ZLayer daemon inside WSL2.
+/// Stop the `ZLayer` daemon inside WSL2.
 ///
 /// # Errors
 ///

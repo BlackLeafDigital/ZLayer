@@ -8,7 +8,7 @@
 //! # DLL distribution
 //!
 //! We intentionally do **not** embed `wintun.dll` in the binary. Wintun is
-//! WireGuard LLC's property, it is signed with their certificate, and the
+//! `WireGuard` LLC's property, it is signed with their certificate, and the
 //! recommended deployment model is to ship it as a sibling file (or to
 //! install it under `%ProgramData%`). On first use [`WindowsTun::new`]
 //! looks for the DLL at the paths below, in order:
@@ -33,7 +33,12 @@
 //! [`WindowsTun`] for adapter creation + IP configuration — the packet
 //! loop itself is deliberately stubbed.
 
-#![cfg(windows)]
+// This module is the Wintun FFI boundary. Every `unsafe` block below
+// has a `SAFETY:` comment explaining why the required invariants hold;
+// the workspace-wide `-W unsafe-code` policy remains in force everywhere
+// else. (`#[cfg(windows)]` is applied by the parent `tun/mod.rs` module
+// declaration, so it is not repeated here.)
+#![allow(unsafe_code)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -47,7 +52,7 @@ use crate::OverlayError;
 /// Device Manager tree under *Network adapters*.
 const WINTUN_POOL: &str = "ZLayer";
 
-/// Size of the per-session ring buffer. 4 MiB mirrors the WireGuard
+/// Size of the per-session ring buffer. 4 MiB mirrors the `WireGuard`
 /// reference default and comfortably holds bursty overlay traffic at
 /// 1500-byte MTU.
 const WINTUN_RING_BYTES: u32 = 4 * 1024 * 1024;

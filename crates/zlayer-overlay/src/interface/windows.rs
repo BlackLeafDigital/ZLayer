@@ -1,7 +1,7 @@
 //! Windows implementation of [`InterfaceOps`] via the IP Helper API.
 //!
 //! Uses `windows-rs 0.62`'s `Win32::NetworkManagement::IpHelper` module
-//! to program the Wintun adapter — no shell-outs, no PowerShell. The
+//! to program the Wintun adapter — no shell-outs, no `PowerShell`. The
 //! three calls that matter:
 //!
 //! | [`InterfaceOps`] method | IP Helper call |
@@ -14,7 +14,15 @@
 //! name-based, so every call starts with a
 //! [`ConvertInterfaceAliasToLuid`] lookup.
 
-#![cfg(windows)]
+// This module is the Windows IP Helper API FFI boundary. Every `unsafe`
+// block below has a `SAFETY:` comment explaining why the required
+// invariants hold; the workspace-wide `-W unsafe-code` policy remains in
+// force everywhere else. (`#[cfg(windows)]` is applied by the parent
+// `interface.rs` module declaration, so it is not repeated here.)
+// `borrow_as_ptr` is allowed because the IP Helper entry points take
+// `*mut T` / `*const T` and we hand them `&mut row` / `&row` at the call
+// sites — each inside an `unsafe` block with a `SAFETY:` comment.
+#![allow(unsafe_code, clippy::borrow_as_ptr)]
 
 use std::net::IpAddr;
 

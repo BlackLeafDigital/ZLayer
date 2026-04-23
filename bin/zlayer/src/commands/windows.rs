@@ -57,6 +57,7 @@ fn print_report(report: &zlayer_wsl::compact::CompactReport) {
     }
 }
 
+#[allow(clippy::cast_precision_loss)]
 fn fmt_bytes(n: u64) -> String {
     const UNITS: &[&str] = &["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;

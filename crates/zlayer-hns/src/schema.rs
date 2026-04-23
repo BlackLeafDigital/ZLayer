@@ -229,7 +229,7 @@ pub struct EndpointPolicy {
 /// Enumerates every `EndpointPolicyType` hcsshim recognises (April 2026).
 ///
 /// The on-wire string uses the hcsshim Go constant's literal spelling, not a
-/// normalized PascalCase — hence the explicit `#[serde(rename = ...)]` on each
+/// normalized `PascalCase` — hence the explicit `#[serde(rename = ...)]` on each
 /// variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EndpointPolicyType {
@@ -292,7 +292,7 @@ pub struct OutBoundNatPolicySetting {
 /// `SDNRoute` policy settings: adds a route inside the container's routing
 /// table. Use with `need_encap: false` to tell HCN that traffic to
 /// `destination_prefix` must *not* be VXLAN-encapsulated (we do encap via
-/// WireGuard on the host).
+/// `WireGuard` on the host).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub struct SdnRoutePolicySetting {
@@ -341,9 +341,14 @@ pub enum AclDirection {
     Out,
 }
 
+// serde's `skip_serializing_if` requires `fn(&T) -> bool`, so these
+// helpers must take their argument by reference even though u16/u32 fit
+// in a register.
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn u16_is_zero(v: &u16) -> bool {
     *v == 0
 }
+#[allow(clippy::trivially_copy_pass_by_ref)]
 fn u32_is_zero(v: &u32) -> bool {
     *v == 0
 }
@@ -351,6 +356,12 @@ fn u32_is_zero(v: &u32) -> bool {
 impl EndpointPolicy {
     /// Build an `OutBoundNAT` policy with a single exceptions list (typically
     /// the cluster CIDR).
+    ///
+    /// # Panics
+    ///
+    /// Never panics in practice: `OutBoundNatPolicySetting` is plain data
+    /// (`Vec<String>` + `String`) so `serde_json::to_value` cannot fail for
+    /// it. The `.expect()` below is defensive.
     #[must_use]
     pub fn out_bound_nat(exceptions: Vec<String>) -> Self {
         let settings = OutBoundNatPolicySetting {
@@ -366,6 +377,12 @@ impl EndpointPolicy {
 
     /// Build an `SDNRoute` policy declaring that the given destination prefix
     /// does (or does not) need HCN-managed encapsulation.
+    ///
+    /// # Panics
+    ///
+    /// Never panics in practice: `SdnRoutePolicySetting` is plain data
+    /// (`String` + `bool` + `u16`) so `serde_json::to_value` cannot fail
+    /// for it. The `.expect()` below is defensive.
     #[must_use]
     pub fn sdn_route(destination_prefix: impl Into<String>, need_encap: bool) -> Self {
         let settings = SdnRoutePolicySetting {
@@ -382,6 +399,12 @@ impl EndpointPolicy {
 
     /// Build an inbound `Allow` ACL for a remote address range, typically the
     /// cluster CIDR to allow overlay-sourced traffic into the endpoint.
+    ///
+    /// # Panics
+    ///
+    /// Never panics in practice: `AclPolicySetting` is plain data (all
+    /// `String`s + two unit enums + `u16`) so `serde_json::to_value` cannot
+    /// fail for it. The `.expect()` below is defensive.
     #[must_use]
     pub fn acl_in_allow(remote_addresses: impl Into<String>) -> Self {
         let settings = AclPolicySetting {

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use tracing::info;
 
-use zlayer_builder::{detect_backend, parse_pipeline, PipelineExecutor};
+use zlayer_builder::{detect_backend, parse_pipeline, ImageOs, PipelineExecutor};
 
 /// Discover pipeline file from explicit path or well-known defaults.
 fn discover_pipeline_file(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -77,7 +77,7 @@ pub async fn cmd_pipeline(
     }
 
     // 4. Detect build backend
-    let backend = detect_backend()
+    let backend = detect_backend(ImageOs::Linux)
         .await
         .context("Failed to initialize build backend")?;
 

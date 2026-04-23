@@ -27,9 +27,23 @@ pub(crate) async fn handle_build(
     push: bool,
     no_tui: bool,
     verbose_build: bool,
+    platform: Option<String>,
 ) -> Result<()> {
+    use std::str::FromStr;
     use zlayer_builder::{
-        detect_runtime, BuildEvent, ImageBuilder, PlainLogger, PullBaseMode, Runtime,
+        detect_runtime, BuildEvent, ImageBuilder, ImageOs, PlainLogger, PullBaseMode, Runtime,
+    };
+
+    // L-2: Parse the CLI `--platform` flag into an `ImageOs` pin. When set,
+    // this takes precedence over any OS inferred from the ZImagefile. When
+    // unset, `ImageBuilder` will peek at the ZImagefile's `os:`/`platform:`
+    // fields during `build()` and fall back to Linux if nothing hints
+    // otherwise.
+    let cli_target_os = match platform.as_deref() {
+        Some(p) => Some(ImageOs::from_str(p).with_context(|| {
+            format!("invalid --platform value '{p}' (expected linux[/arch] or windows[/arch])")
+        })?),
+        None => None,
     };
 
     // Resolve pull mode: --no-pull wins as an explicit override
@@ -90,8 +104,10 @@ pub(crate) async fn handle_build(
     // Create event channel for progress updates
     let (event_tx, event_rx) = mpsc::channel::<BuildEvent>();
 
-    // Build the ImageBuilder
-    let mut builder = ImageBuilder::new(&context)
+    // Build the ImageBuilder. Pass the CLI-supplied target OS (if any) so the
+    // backend is detected for the correct OS up front — avoids a throw-away
+    // Linux-backend probe when the user asked for Windows.
+    let mut builder = ImageBuilder::new_with_os(&context, cli_target_os)
         .await
         .context("Failed to create image builder")?
         .with_events(event_tx);

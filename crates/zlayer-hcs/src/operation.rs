@@ -30,7 +30,7 @@ use windows::Win32::System::HostComputeSystem::{
 };
 
 use crate::error::{HcsError, HcsResult};
-use crate::handle::OwnedOperation;
+use crate::handle::{OwnedOperation, SendHandle};
 
 /// The boxed half of the oneshot we hand to HCS as the callback context.
 ///
@@ -62,15 +62,14 @@ unsafe fn pwstr_to_string(pwstr: PWSTR) -> String {
     }
     // SAFETY: caller-provided PWSTR is null-terminated and live for the
     // duration of this call per the function contract.
-    match unsafe { pwstr.to_string() } {
-        Ok(s) => s,
-        Err(_) => {
-            // SAFETY: `as_wide` requires the same invariants as `to_string`,
-            // which the caller upheld; we only reach this branch when the
-            // strict UTF-16 decode failed, so fall back to lossy.
-            let wide = unsafe { pwstr.as_wide() };
-            String::from_utf16_lossy(wide)
-        }
+    if let Ok(s) = unsafe { pwstr.to_string() } {
+        s
+    } else {
+        // SAFETY: `as_wide` requires the same invariants as `to_string`,
+        // which the caller upheld; we only reach this branch when the
+        // strict UTF-16 decode failed, so fall back to lossy.
+        let wide = unsafe { pwstr.as_wide() };
+        String::from_utf16_lossy(wide)
     }
 }
 
@@ -105,7 +104,7 @@ unsafe extern "system" fn completion_trampoline(operation: HCS_OPERATION, contex
         // operation is closed (after we send below, the awaiting future
         // resumes and `OwnedOperation::drop` closes it).
         let mut result_doc: PWSTR = PWSTR::null();
-        let hr_result = unsafe { HcsGetOperationResult(operation, Some(&mut result_doc)) };
+        let hr_result = unsafe { HcsGetOperationResult(operation, Some(&raw mut result_doc)) };
         // Decode the document up front so we have a message either way.
         // SAFETY: `result_doc` is either null or a valid wide string per
         // the HCS contract; `pwstr_to_string` handles both.
@@ -195,14 +194,19 @@ where
     // SAFETY: the context pointer is a valid `Box<CompletionSender>` raw
     // pointer; on success the trampoline re-owns it; on the error paths
     // below we reclaim it ourselves before returning.
-    let op_raw = unsafe {
+    //
+    // Wrap the raw `HCS_OPERATION` in `SendHandle` so this local can cross
+    // the `rx.await` below while the generated future is `Send` — the raw
+    // `HCS_OPERATION` is `!Send + !Sync` because it is transparent over
+    // `*mut c_void`.
+    let op_raw = SendHandle(unsafe {
         HcsCreateOperation(
             Some(tx_ptr.cast::<c_void>().cast_const()),
             Some(completion_trampoline),
         )
-    };
+    });
 
-    if op_raw.is_invalid() {
+    if op_raw.0.is_invalid() {
         // No operation was created, so the trampoline will never fire and
         // we must reclaim the sender box ourselves.
         // SAFETY: `tx_ptr` was just produced by `Box::into_raw` and has
@@ -215,12 +219,18 @@ where
     }
 
     // Take ownership of the operation so it is closed on every exit path.
-    // SAFETY: `op_raw` was just produced by `HcsCreateOperation` and has
+    // SAFETY: `op_raw.0` was just produced by `HcsCreateOperation` and has
     // not been handed to any other owner.
-    let op = unsafe { OwnedOperation::from_raw(op_raw) };
+    let op = unsafe { OwnedOperation::from_raw(op_raw.0) };
 
     // Kick off the caller's HCS call.
-    let kickoff_hr = f(op.as_raw());
+    //
+    // `op.as_raw()` returns `SendHandle<HCS_OPERATION>`; deref with `*` to
+    // produce the bare `HCS_OPERATION` the closure parameter expects. The
+    // dereferenced value is consumed synchronously by the closure (no
+    // `.await` before or after the call), so the raw `HCS_OPERATION` is
+    // never held across a suspend point.
+    let kickoff_hr = f(*op.as_raw());
     if kickoff_hr.is_err() {
         // The HCS call failed synchronously, so the trampoline will never
         // fire — reclaim the sender box and surface the classified error.

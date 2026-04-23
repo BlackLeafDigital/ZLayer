@@ -59,7 +59,12 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 
     // Track whether the PID-based kill was conclusive (i.e. daemon.json existed
     // and the named PID was either dead or successfully killed).
+    // Only mutated inside the Unix branch below; the Windows branch never
+    // reaches `libc::kill`, so the `mut` is Unix-only.
+    #[cfg(unix)]
     let mut pid_kill_conclusive = false;
+    #[cfg(not(unix))]
+    let pid_kill_conclusive = false;
 
     // The port we need to verify is free before returning.  Default to the
     // port extracted from the *current* bind address; override with the port
@@ -566,7 +571,10 @@ async fn find_udp_port_holder(port: u16) -> Option<(u32, String)> {
 }
 
 /// Start the daemon API server with full infrastructure.
-#[allow(clippy::too_many_lines)]
+///
+/// Foreground variant — uses Ctrl+C / SIGTERM for shutdown. For the
+/// Windows Service variant that also honours SCM Stop/Shutdown control
+/// codes, see [`serve_with_external_shutdown`].
 pub(crate) async fn serve(
     bind: &str,
     jwt_secret: Option<String>,
@@ -574,6 +582,43 @@ pub(crate) async fn serve(
     socket_path: &str,
     host_network: bool,
     data_dir: std::path::PathBuf,
+) -> Result<()> {
+    // Box::pin keeps the top-level future below clippy's `large_futures`
+    // threshold — `serve_with_external_shutdown` materialises the whole
+    // daemon state on the stack and its future is sizeable.
+    Box::pin(serve_with_external_shutdown(
+        bind,
+        jwt_secret,
+        no_swagger,
+        socket_path,
+        host_network,
+        data_dir,
+        None,
+    ))
+    .await
+}
+
+/// Entry point equivalent to [`serve`] but with an additional external
+/// shutdown trigger. Used by the Windows Service event loop (I-1) so the SCM
+/// control handler can signal the daemon to shut down gracefully.
+///
+/// When `external_shutdown` is `Some(rx)`, the server shuts down on *any* of:
+///
+///   * `Ctrl+C`
+///   * `SIGTERM` (Unix only)
+///   * `rx` transitioning to `true`
+///
+/// When `None`, behaves exactly like [`serve`] — foreground signal handling
+/// only.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn serve_with_external_shutdown(
+    bind: &str,
+    jwt_secret: Option<String>,
+    no_swagger: bool,
+    socket_path: &str,
+    host_network: bool,
+    data_dir: std::path::PathBuf,
+    external_shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
     let jwt_secret_raw = jwt_secret.unwrap_or_else(|| {
         warn!("Using default JWT secret - NOT SAFE FOR PRODUCTION");
@@ -1226,8 +1271,12 @@ pub(crate) async fn serve(
 
     // -----------------------------------------------------------------------
     // 5. Setup graceful shutdown signal handler
+    //
+    // Awaits any of: Ctrl+C, SIGTERM (Unix), or the optional
+    // `external_shutdown` watch receiver transitioning to `true` (set by the
+    // Windows Service SCM handler — see `daemon_service::my_service_main`).
     // -----------------------------------------------------------------------
-    let shutdown = async {
+    let shutdown = async move {
         let ctrl_c = async {
             tokio::signal::ctrl_c()
                 .await
@@ -1245,9 +1294,22 @@ pub(crate) async fn serve(
         #[cfg(not(unix))]
         let terminate = std::future::pending::<()>();
 
+        let external = async move {
+            match external_shutdown {
+                Some(mut rx) => {
+                    // Returns once the watched value flips to `true`. If the
+                    // sender is dropped, the receiver yields Err(_) which we
+                    // treat as a shutdown (the supervisor is gone).
+                    let _ = rx.wait_for(|&v| v).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         tokio::select! {
-            () = ctrl_c => {},
-            () = terminate => {},
+            () = ctrl_c => info!("Shutdown: Ctrl+C received"),
+            () = terminate => info!("Shutdown: SIGTERM received"),
+            () = external => info!("Shutdown: external trigger (SCM)"),
         }
 
         info!("Shutdown signal received, starting graceful shutdown");

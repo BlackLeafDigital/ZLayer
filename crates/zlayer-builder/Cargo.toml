@@ -68,6 +68,26 @@ zip.workspace = true
 nix.workspace = true
 zlayer-paths.workspace = true
 
+# Spec types (OsKind / ArchKind / TargetPlatform) used by the HCS backend when
+# routing manifest pulls through `ImagePuller::with_platform`.
+zlayer-spec.workspace = true
+
+# Windows-only dependencies for the HCS (Host Compute Service) build backend.
+# The HCS backend in `src/backend/hcs/` wraps `zlayer-agent`'s NTFS layer
+# primitives (scratch layer creation, BackupRead-based diff capture) with a
+# `BuildBackend` impl. Both deps are already gated behind
+# `cfg(target_os = "windows")` at their source so non-Windows builds never pull
+# them in — listing them under a target-specific block keeps the Linux /
+# macOS dependency graph lean.
+[target.'cfg(target_os = "windows")'.dependencies]
+zlayer-agent = { workspace = true }
+zlayer-hcs = { workspace = true }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_HostComputeSystem",
+] }
+uuid = { workspace = true }
+
 [dev-dependencies]
 tempfile = "3"
 tokio = { workspace = true, features = ["full", "macros", "rt-multi-thread"] }

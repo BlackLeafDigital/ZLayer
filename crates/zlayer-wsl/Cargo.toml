@@ -20,3 +20,16 @@ serde_json = { workspace = true }
 toml_edit = "0.22"
 fs4 = "0.9"
 zlayer-paths.workspace = true
+
+# Windows-only deps for the elevated `wsl --install` consent path. Uses
+# `ShellExecuteExW` with `runas` to invoke the UAC prompt, then
+# `WaitForSingleObject` / `GetExitCodeProcess` on the resulting process handle
+# to detect the ERROR_SUCCESS_REBOOT_REQUIRED (3010) exit code.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_UI_Shell",
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }

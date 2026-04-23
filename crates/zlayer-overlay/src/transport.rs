@@ -100,7 +100,7 @@ async fn uapi_get(sock_path: &str) -> Result<String, Box<dyn std::error::Error>>
 ///
 /// `tunn` is behind an async Mutex because ingress / egress / timers
 /// tasks all need `&mut Tunn` for encapsulate / decapsulate /
-/// update_timers. `endpoint` uses `parking_lot::RwLock` since reads
+/// `update_timers`. `endpoint` uses `parking_lot::RwLock` since reads
 /// dominate (egress path + timers) and writes are rare (NAT endpoint
 /// switch). `last_handshake_sec` is a monotonic-ish unix-seconds
 /// counter updated from the ingress path; `allowed_ips` is immutable
@@ -224,10 +224,10 @@ pub struct OverlayTransport {
     /// contending on a global lock.
     #[cfg(windows)]
     peers: Arc<DashMap<[u8; 32], WindowsPeerState>>,
-    /// Ingress task: UDP → Tunn::decapsulate → Wintun send.
+    /// Ingress task: UDP → `Tunn::decapsulate` → Wintun send.
     #[cfg(windows)]
     ingress_task: Option<JoinHandle<()>>,
-    /// Egress task: Wintun recv → Tunn::encapsulate → UDP send.
+    /// Egress task: Wintun recv → `Tunn::encapsulate` → UDP send.
     #[cfg(windows)]
     egress_task: Option<JoinHandle<()>>,
     /// Timers task: ~250 ms tick driving `Tunn::update_timers` per peer
@@ -728,7 +728,7 @@ impl OverlayTransport {
     /// For each inbound datagram we linear-scan the peer map and hand
     /// the packet to each `Tunn::decapsulate` until one returns a
     /// non-error result. This is O(N peers) per packet; for the
-    /// small-cluster overlays ZLayer targets it is fine. A future
+    /// small-cluster overlays `ZLayer` targets it is fine. A future
     /// optimization can cache `src_addr → pubkey` once sessions are
     /// established.
     ///
@@ -840,7 +840,7 @@ impl OverlayTransport {
     /// Wintun → encapsulate → UDP loop.
     ///
     /// Parses the destination IP from the outbound clear packet,
-    /// matches it against each peer's allowed_ips, encapsulates with
+    /// matches it against each peer's `allowed_ips`, encapsulates with
     /// that peer's `Tunn`, and writes the ciphertext to UDP. If no
     /// endpoint is known yet the packet is dropped silently — callers
     /// typically retry at a higher layer, and `update_timers` will be
@@ -902,15 +902,17 @@ impl OverlayTransport {
                         tracing::warn!(error = %e, "UDP send failed");
                     }
                 }
-                TunnResult::Done => {
-                    // Packet queued inside boringtun pending handshake;
-                    // nothing to emit right now.
+                TunnResult::Done
+                | TunnResult::WriteToTunnelV4(_, _)
+                | TunnResult::WriteToTunnelV6(_, _) => {
+                    // `Done`: packet queued inside boringtun pending
+                    // handshake; nothing to emit right now.
+                    // `WriteToTunnel*`: encapsulate never produces
+                    // TUN-ward results, but we treat them as no-ops for
+                    // exhaustiveness.
                 }
                 TunnResult::Err(e) => {
                     tracing::warn!(?e, "encapsulate error");
-                }
-                TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {
-                    // encapsulate never produces TUN-ward results.
                 }
             }
         }
@@ -944,11 +946,12 @@ impl OverlayTransport {
                             }
                         }
                     }
-                    TunnResult::Done => {}
+                    TunnResult::Done
+                    | TunnResult::WriteToTunnelV4(_, _)
+                    | TunnResult::WriteToTunnelV6(_, _) => {}
                     TunnResult::Err(e) => {
                         tracing::debug!(?e, "update_timers error");
                     }
-                    TunnResult::WriteToTunnelV4(_, _) | TunnResult::WriteToTunnelV6(_, _) => {}
                 }
             }
         }
@@ -1032,6 +1035,7 @@ impl OverlayTransport {
     ///
     /// Returns an error if the key conversion or UAPI command fails on
     /// Linux/macOS, or always on Windows (until the packet loop lands).
+    #[cfg_attr(windows, allow(clippy::unused_async))]
     pub async fn add_peer(&self, peer: &PeerInfo) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(windows))]
         {
@@ -1072,6 +1076,7 @@ impl OverlayTransport {
     ///
     /// Returns an error if the key conversion or UAPI command fails on
     /// Linux/macOS, or always on Windows (until the packet loop lands).
+    #[cfg_attr(windows, allow(clippy::unused_async))]
     pub async fn remove_peer(&self, public_key: &str) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(not(windows))]
         {
@@ -1111,6 +1116,7 @@ impl OverlayTransport {
     ///
     /// Returns an error if the UAPI query fails on Linux/macOS, or
     /// always on Windows.
+    #[cfg_attr(windows, allow(clippy::unused_async))]
     pub async fn status(&self) -> Result<String, Box<dyn std::error::Error>> {
         #[cfg(not(windows))]
         {
@@ -1179,6 +1185,7 @@ impl OverlayTransport {
     ///
     /// Returns an error if key conversion or UAPI command fails.
     #[cfg(feature = "nat")]
+    #[cfg_attr(windows, allow(clippy::unused_async))]
     pub async fn update_peer_endpoint(
         &self,
         public_key: &str,
@@ -1223,6 +1230,7 @@ impl OverlayTransport {
     ///
     /// Returns an error if the UAPI query fails.
     #[cfg(feature = "nat")]
+    #[cfg_attr(windows, allow(clippy::unused_async))]
     pub async fn check_peer_handshake(
         &self,
         public_key: &str,
@@ -1525,6 +1533,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn test_key_to_hex() {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -1538,6 +1547,7 @@ mod tests {
         assert_eq!(hex_key.len(), 64, "Hex key should be 64 chars");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn test_key_to_hex_invalid_length() {
         use base64::{engine::general_purpose::STANDARD, Engine as _};

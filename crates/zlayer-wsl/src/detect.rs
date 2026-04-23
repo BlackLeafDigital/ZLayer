@@ -31,6 +31,13 @@ pub async fn detect_wsl() -> anyhow::Result<WslStatus> {
     })
 }
 
+/// Detect the current WSL2 status on this system.
+///
+/// # Errors
+///
+/// Returns an error if `wsl.exe --list --verbose` fails unexpectedly (e.g.
+/// the WSL feature is installed but the service is broken). An absent
+/// `wsl.exe` is not an error — it surfaces as `wsl_installed: false`.
 #[cfg(target_os = "windows")]
 pub async fn detect_wsl() -> anyhow::Result<WslStatus> {
     use tokio::process::Command;
@@ -77,11 +84,7 @@ pub async fn detect_wsl() -> anyhow::Result<WslStatus> {
             continue;
         }
         let is_default = line.starts_with('*');
-        let parts: Vec<&str> = line
-            .trim_start_matches('*')
-            .trim()
-            .split_whitespace()
-            .collect();
+        let parts: Vec<&str> = line.trim_start_matches('*').split_whitespace().collect();
         if let Some(name) = parts.first() {
             if is_default {
                 default_distro = Some((*name).to_string());

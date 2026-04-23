@@ -14,7 +14,9 @@ use std::collections::HashMap;
 use std::future::Future;
 #[cfg(windows)]
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 #[cfg(unix)]
 use std::pin::Pin;
 #[cfg(unix)]
@@ -526,11 +528,8 @@ impl DaemonClient {
         eprintln!("  Check logs: {}", log_path.display());
         eprintln!("  Start manually: zlayer serve");
         bail!(
-            "Timed out waiting for daemon to start after {} attempts (~{} s). \
-             Endpoint: {}",
-            max_attempts,
-            timeout_secs,
-            endpoint
+            "Timed out waiting for daemon to start after {max_attempts} attempts (~{timeout_secs} s). \
+             Endpoint: {endpoint}"
         )
     }
 

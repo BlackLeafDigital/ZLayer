@@ -25,7 +25,7 @@ use windows::Win32::System::HostComputeSystem::{
 };
 
 use crate::error::{HcsError, HcsResult};
-use crate::handle::OwnedSystem;
+use crate::handle::{OwnedSystem, SendHandle};
 use crate::operation::run_operation;
 
 /// A single HRESULT success value used to turn `windows_core::Result<()>`
@@ -71,7 +71,12 @@ impl ComputeSystem {
         // system has finished transitioning to `Created`. We therefore
         // capture the handle in the closure via a mutable slot and then
         // await the operation for the state transition.
-        let mut handle_slot: Option<HCS_SYSTEM> = None;
+        //
+        // The slot is wrapped in `SendHandle` so this local may cross the
+        // `run_operation` `.await` below while keeping the enclosing
+        // future `Send` — raw `HCS_SYSTEM` is `!Send + !Sync` because it
+        // is transparent over `*mut c_void`.
+        let mut handle_slot: Option<SendHandle<HCS_SYSTEM>> = None;
 
         let result = {
             let handle_slot = &mut handle_slot;
@@ -83,7 +88,7 @@ impl ComputeSystem {
                 let res = unsafe { HcsCreateComputeSystem(&id_w, &cfg_w, op, None) };
                 match res {
                     Ok(sys) => {
-                        *handle_slot = Some(sys);
+                        *handle_slot = Some(SendHandle(sys));
                         HR_OK
                     }
                     Err(e) => e.code(),
@@ -102,17 +107,17 @@ impl ComputeSystem {
                 message: "HcsCreateComputeSystem returned success without a handle".to_string(),
             });
         };
-        if raw.is_invalid() {
+        if raw.0.is_invalid() {
             return Err(HcsError::Other {
                 hresult: 0,
                 message: "HcsCreateComputeSystem returned an invalid handle".to_string(),
             });
         }
 
-        // SAFETY: `raw` was just produced by a successful
+        // SAFETY: `raw.0` was just produced by a successful
         // `HcsCreateComputeSystem` call and has not been handed to any
         // other owner.
-        let inner = unsafe { OwnedSystem::from_raw(raw) };
+        let inner = unsafe { OwnedSystem::from_raw(raw.0) };
         Ok(Self { inner })
     }
 
@@ -143,8 +148,15 @@ impl ComputeSystem {
     /// (e.g. event-callback registration) that need the bare pointer; the
     /// handle remains owned by this [`ComputeSystem`] and must not be
     /// closed by the caller.
+    ///
+    /// Returns a [`SendHandle<HCS_SYSTEM>`] rather than the bare raw
+    /// handle so the wrapper's `Send + Sync` guarantees propagate to
+    /// callers that hold the value across an `.await` — raw `HCS_SYSTEM`
+    /// is transparent over `*mut c_void` and is therefore `!Send + !Sync`.
+    /// FFI call sites dereference with `*handle` (via [`std::ops::Deref`])
+    /// when passing the value to a C entry point.
     #[must_use]
-    pub fn raw(&self) -> HCS_SYSTEM {
+    pub fn raw(&self) -> SendHandle<HCS_SYSTEM> {
         self.inner.as_raw()
     }
 
@@ -152,12 +164,21 @@ impl ComputeSystem {
     /// options document; pass `""` to use defaults.
     pub async fn start(&self, options_json: &str) -> HcsResult<()> {
         let opts_w = HSTRING::from(options_json);
+        // Wrap the raw handle so the enclosing future stays `Send` across
+        // the `.await` below. See `handle::SendHandle` for the rationale.
+        //
+        // NOTE: Inside the closure we MUST dereference through `*handle`
+        // (not `handle.0`). Rust 2021's disjoint-field capture rules cause
+        // `handle.0` in a `move` closure to capture ONLY the inner
+        // `HCS_SYSTEM` field (which is `!Send + !Sync`), defeating the
+        // `SendHandle` wrapper. `*handle` goes through `Deref`, which
+        // requires `&handle` and therefore captures the whole wrapper.
         let handle = self.inner.as_raw();
         run_operation(move |op| {
-            // SAFETY: `handle` is live for the duration of `self`, which
+            // SAFETY: `*handle` is live for the duration of `self`, which
             // outlives this await (borrow check); `opts_w` lives for the
             // closure invocation; `op` is owned by `run_operation`.
-            to_hresult(unsafe { HcsStartComputeSystem(handle, op, &opts_w) })
+            to_hresult(unsafe { HcsStartComputeSystem(*handle, op, &opts_w) })
         })
         .await?;
         Ok(())
@@ -170,7 +191,7 @@ impl ComputeSystem {
         let handle = self.inner.as_raw();
         run_operation(move |op| {
             // SAFETY: see `start` — identical lifetime argument.
-            to_hresult(unsafe { HcsShutDownComputeSystem(handle, op, &opts_w) })
+            to_hresult(unsafe { HcsShutDownComputeSystem(*handle, op, &opts_w) })
         })
         .await?;
         Ok(())
@@ -182,7 +203,7 @@ impl ComputeSystem {
         let handle = self.inner.as_raw();
         run_operation(move |op| {
             // SAFETY: see `start`.
-            to_hresult(unsafe { HcsTerminateComputeSystem(handle, op, &opts_w) })
+            to_hresult(unsafe { HcsTerminateComputeSystem(*handle, op, &opts_w) })
         })
         .await?;
         Ok(())
@@ -196,7 +217,7 @@ impl ComputeSystem {
         let handle = self.inner.as_raw();
         run_operation(move |op| {
             // SAFETY: see `start`.
-            to_hresult(unsafe { HcsPauseComputeSystem(handle, op, &opts_w) })
+            to_hresult(unsafe { HcsPauseComputeSystem(*handle, op, &opts_w) })
         })
         .await?;
         Ok(())
@@ -208,7 +229,7 @@ impl ComputeSystem {
         let handle = self.inner.as_raw();
         run_operation(move |op| {
             // SAFETY: see `start`.
-            to_hresult(unsafe { HcsResumeComputeSystem(handle, op, &opts_w) })
+            to_hresult(unsafe { HcsResumeComputeSystem(*handle, op, &opts_w) })
         })
         .await?;
         Ok(())
@@ -220,7 +241,7 @@ impl ComputeSystem {
         let handle = self.inner.as_raw();
         run_operation(move |op| {
             // SAFETY: see `start`.
-            to_hresult(unsafe { HcsSaveComputeSystem(handle, op, &opts_w) })
+            to_hresult(unsafe { HcsSaveComputeSystem(*handle, op, &opts_w) })
         })
         .await?;
         Ok(())
@@ -236,7 +257,7 @@ impl ComputeSystem {
         let handle = self.inner.as_raw();
         run_operation(move |op| {
             // SAFETY: see `start`.
-            to_hresult(unsafe { HcsGetComputeSystemProperties(handle, op, &query_w) })
+            to_hresult(unsafe { HcsGetComputeSystemProperties(*handle, op, &query_w) })
         })
         .await
     }
@@ -250,7 +271,7 @@ impl ComputeSystem {
         run_operation(move |op| {
             // SAFETY: see `start`; the fourth argument (optional identity
             // handle) is `None` — we do not attach a token to the request.
-            to_hresult(unsafe { HcsModifyComputeSystem(handle, op, &mod_w, None) })
+            to_hresult(unsafe { HcsModifyComputeSystem(*handle, op, &mod_w, None) })
         })
         .await?;
         Ok(())

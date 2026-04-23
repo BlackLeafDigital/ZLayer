@@ -123,14 +123,21 @@ pub fn move_link_into_netns_fd_and_rename(
     Ok(())
 }
 
-/// Stub for non-Linux platforms and for Linux builds without the
-/// `youki-runtime` feature (which provides the libcontainer-backed impl).
+/// Stub for non-Linux Unix platforms (macOS/BSD) and for Linux builds without
+/// the `youki-runtime` feature (which provides the libcontainer-backed impl).
+///
+/// Not emitted on Windows: `attach_to_interface` (the sole caller) is itself
+/// gated `#[cfg(target_os = "linux")]` in `overlay_manager.rs`, so there are
+/// no Windows callers, and the `BorrowedFd` parameter type is Unix-only.
 ///
 /// # Errors
 ///
 /// Always returns [`NetlinkError::Netlink`] — this function is unsupported on
 /// the current target/feature combination.
-#[cfg(any(not(target_os = "linux"), not(feature = "youki-runtime")))]
+#[cfg(any(
+    all(not(target_os = "linux"), unix),
+    all(target_os = "linux", not(feature = "youki-runtime")),
+))]
 pub fn move_link_into_netns_fd_and_rename(
     _link_name: &str,
     _ns_fd: std::os::fd::BorrowedFd<'_>,
@@ -807,8 +814,10 @@ where
         .map_err(|_| NetlinkError::Netlink("with_netns_fd thread panicked".to_string()))?
 }
 
-/// Non-Linux stub.
-#[cfg(not(target_os = "linux"))]
+/// Non-Linux Unix (macOS/BSD) stub. Not emitted on Windows — the sole caller
+/// chain (`attach_to_interface` in `overlay_manager.rs`) is
+/// `#[cfg(target_os = "linux")]`-gated, and `OwnedFd` is Unix-only.
+#[cfg(all(not(target_os = "linux"), unix))]
 pub fn with_netns_fd<F, T>(_ns_fd: std::os::fd::OwnedFd, _f: F) -> Result<T, NetlinkError>
 where
     F: FnOnce() -> Result<T, NetlinkError> + Send + 'static,
@@ -904,8 +913,10 @@ where
     })
 }
 
-/// Non-Linux stub.
-#[cfg(not(target_os = "linux"))]
+/// Non-Linux Unix (macOS/BSD) stub. Not emitted on Windows — the sole caller
+/// chain (`attach_to_interface` in `overlay_manager.rs`) is
+/// `#[cfg(target_os = "linux")]`-gated, and `OwnedFd` is Unix-only.
+#[cfg(all(not(target_os = "linux"), unix))]
 pub fn with_netns_fd_async<F, Fut, T>(
     _ns_fd: std::os::fd::OwnedFd,
     _f: F,

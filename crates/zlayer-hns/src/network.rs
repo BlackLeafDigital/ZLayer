@@ -150,7 +150,7 @@ impl Network {
     ///
     /// Transparent HCN networks put each endpoint directly on the uplink's L2
     /// segment with a caller-chosen IP. Combined with the endpoint policies
-    /// from [`crate::schema::EndpointPolicy`], this is how ZLayer replaces the
+    /// from [`crate::schema::EndpointPolicy`], this is how `ZLayer` replaces the
     /// older HNS NAT model so Windows containers have real overlay IPs.
     ///
     /// The `subnet` CIDR becomes the Transparent network's IPAM subnet — HCN
@@ -205,7 +205,7 @@ impl Network {
 }
 
 /// Build the `NetAdapterName` network policy that binds a Transparent or
-/// L2Bridge HCN network to a specific physical uplink adapter.
+/// `L2Bridge` HCN network to a specific physical uplink adapter.
 fn net_adapter_name_policy(adapter_name: &str) -> serde_json::Value {
     serde_json::json!({
         "Type": "NetAdapterName",
@@ -239,61 +239,6 @@ pub(crate) fn transparent_settings(
         }],
         flags: 0,
         schema_version: SchemaVersion::default(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{net_adapter_name_policy, transparent_settings};
-    use serde_json::json;
-
-    #[test]
-    fn net_adapter_name_policy_shape_matches_hcsshim() {
-        let v = net_adapter_name_policy("Ethernet 2");
-        assert_eq!(
-            v,
-            json!({
-                "Type": "NetAdapterName",
-                "Settings": { "NetworkAdapterName": "Ethernet 2" }
-            })
-        );
-    }
-
-    #[test]
-    fn transparent_settings_wire_format() {
-        let settings = transparent_settings("zlayer-overlay", "10.200.42.0/28", "Ethernet");
-        let v = serde_json::to_value(&settings).unwrap();
-
-        assert_eq!(v["Name"], json!("zlayer-overlay"));
-        assert_eq!(v["Type"], json!("Transparent"));
-        assert_eq!(v["Ipams"][0]["Type"], json!("Static"));
-        assert_eq!(
-            v["Ipams"][0]["Subnets"][0]["IpAddressPrefix"],
-            json!("10.200.42.0/28")
-        );
-        assert_eq!(v["Policies"][0]["Type"], json!("NetAdapterName"));
-        assert_eq!(
-            v["Policies"][0]["Settings"]["NetworkAdapterName"],
-            json!("Ethernet")
-        );
-        assert_eq!(v["SchemaVersion"]["Major"], json!(2));
-        assert_eq!(v["SchemaVersion"]["Minor"], json!(0));
-    }
-
-    #[test]
-    fn transparent_settings_round_trip_preserves_shape() {
-        let settings = transparent_settings("zlayer-overlay", "10.200.0.0/28", "Ethernet 2");
-        let json_str = serde_json::to_string(&settings).unwrap();
-        let parsed: crate::schema::HostComputeNetwork = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(parsed.name, "zlayer-overlay");
-        assert!(matches!(parsed.ty, crate::schema::NetworkType::Transparent));
-        assert_eq!(parsed.ipams.len(), 1);
-        assert_eq!(
-            parsed.ipams[0].subnets[0].ip_address_prefix,
-            "10.200.0.0/28"
-        );
-        assert_eq!(parsed.policies.len(), 1);
-        assert_eq!(parsed.policies[0]["Type"], "NetAdapterName");
     }
 }
 
@@ -366,4 +311,59 @@ fn classify_error<S: Into<String>>(
         format!("{ctx}: {decoded}")
     };
     HnsError::from_hresult(hr, msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{net_adapter_name_policy, transparent_settings};
+    use serde_json::json;
+
+    #[test]
+    fn net_adapter_name_policy_shape_matches_hcsshim() {
+        let v = net_adapter_name_policy("Ethernet 2");
+        assert_eq!(
+            v,
+            json!({
+                "Type": "NetAdapterName",
+                "Settings": { "NetworkAdapterName": "Ethernet 2" }
+            })
+        );
+    }
+
+    #[test]
+    fn transparent_settings_wire_format() {
+        let settings = transparent_settings("zlayer-overlay", "10.200.42.0/28", "Ethernet");
+        let v = serde_json::to_value(&settings).unwrap();
+
+        assert_eq!(v["Name"], json!("zlayer-overlay"));
+        assert_eq!(v["Type"], json!("Transparent"));
+        assert_eq!(v["Ipams"][0]["Type"], json!("Static"));
+        assert_eq!(
+            v["Ipams"][0]["Subnets"][0]["IpAddressPrefix"],
+            json!("10.200.42.0/28")
+        );
+        assert_eq!(v["Policies"][0]["Type"], json!("NetAdapterName"));
+        assert_eq!(
+            v["Policies"][0]["Settings"]["NetworkAdapterName"],
+            json!("Ethernet")
+        );
+        assert_eq!(v["SchemaVersion"]["Major"], json!(2));
+        assert_eq!(v["SchemaVersion"]["Minor"], json!(0));
+    }
+
+    #[test]
+    fn transparent_settings_round_trip_preserves_shape() {
+        let settings = transparent_settings("zlayer-overlay", "10.200.0.0/28", "Ethernet 2");
+        let json_str = serde_json::to_string(&settings).unwrap();
+        let parsed: crate::schema::HostComputeNetwork = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(parsed.name, "zlayer-overlay");
+        assert!(matches!(parsed.ty, crate::schema::NetworkType::Transparent));
+        assert_eq!(parsed.ipams.len(), 1);
+        assert_eq!(
+            parsed.ipams[0].subnets[0].ip_address_prefix,
+            "10.200.0.0/28"
+        );
+        assert_eq!(parsed.policies.len(), 1);
+        assert_eq!(parsed.policies[0]["Type"], "NetAdapterName");
+    }
 }

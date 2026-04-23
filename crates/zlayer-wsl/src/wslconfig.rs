@@ -201,20 +201,17 @@ pub fn compute_default_gb(install_dir: &Path) -> u64 {
     }
 
     let probe = walk_up_to_existing(install_dir);
-    match probe.and_then(|p| fs4::available_space(p).ok()) {
-        Some(bytes) => {
-            let gib = bytes / (1024 * 1024 * 1024);
-            let capped = gib.saturating_mul(DEFAULT_FREE_SPACE_PERCENT) / 100;
-            capped.max(MIN_FLOOR_GB)
-        }
-        None => {
-            tracing::warn!(
-                install_dir = %install_dir.display(),
-                "could not read free disk space; falling back to {}GB cap",
-                MIN_FLOOR_GB
-            );
+    if let Some(bytes) = probe.and_then(|p| fs4::available_space(p).ok()) {
+        let gib = bytes / (1024 * 1024 * 1024);
+        let capped = gib.saturating_mul(DEFAULT_FREE_SPACE_PERCENT) / 100;
+        capped.max(MIN_FLOOR_GB)
+    } else {
+        tracing::warn!(
+            install_dir = %install_dir.display(),
+            "could not read free disk space; falling back to {}GB cap",
             MIN_FLOOR_GB
-        }
+        );
+        MIN_FLOOR_GB
     }
 }
 

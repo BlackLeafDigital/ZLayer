@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::backend::ImageOs;
+
 // ---------------------------------------------------------------------------
 // Top-level ZPipeline
 // ---------------------------------------------------------------------------
@@ -190,6 +192,10 @@ pub struct PipelineImage {
     /// If empty, inherits from defaults.platforms.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub platforms: Vec<String>,
+
+    /// Target OS for this image. Overrides any OS inferred from `platforms`. Default: inferred or Linux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<ImageOs>,
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +296,27 @@ file: Dockerfile
         assert!(img.cache_mounts.is_empty());
         assert!(img.retries.is_none());
         assert!(img.platforms.is_empty());
+        assert!(img.os.is_none());
+    }
+
+    #[test]
+    fn test_pipeline_image_os_linux() {
+        let yaml = r"
+file: Dockerfile
+os: linux
+";
+        let img: PipelineImage = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(img.os, Some(ImageOs::Linux));
+    }
+
+    #[test]
+    fn test_pipeline_image_os_windows() {
+        let yaml = r"
+file: Dockerfile
+os: windows
+";
+        let img: PipelineImage = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(img.os, Some(ImageOs::Windows));
     }
 
     #[test]
@@ -436,6 +463,7 @@ extra: "bad"
             cache_mounts: vec![],
             retries: None,
             platforms: vec![],
+            os: None,
         };
         let serialized = serde_yaml::to_string(&img).unwrap();
         // Should only contain "file" since everything else is default/empty
@@ -449,6 +477,7 @@ extra: "bad"
         assert!(!serialized.contains("cache_mounts:"));
         assert!(!serialized.contains("retries:"));
         assert!(!serialized.contains("platforms:"));
+        assert!(!serialized.contains("os:"));
     }
 
     #[test]
@@ -469,6 +498,7 @@ extra: "bad"
             }],
             retries: Some(3),
             platforms: vec!["linux/amd64".to_string(), "linux/arm64".to_string()],
+            os: Some(ImageOs::Linux),
         };
         let serialized = serde_yaml::to_string(&img).unwrap();
         assert!(serialized.contains("context:"));
@@ -480,5 +510,6 @@ extra: "bad"
         assert!(serialized.contains("cache_mounts:"));
         assert!(serialized.contains("retries:"));
         assert!(serialized.contains("platforms:"));
+        assert!(serialized.contains("os:"));
     }
 }

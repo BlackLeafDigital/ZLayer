@@ -316,16 +316,35 @@ fn windows_program_data_root() -> PathBuf {
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn is_root() -> bool {
-    #[cfg(unix)]
-    {
-        nix::unistd::geteuid().is_root()
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+/// Returns `true` when the current process is running with superuser /
+/// Administrator privileges.
+///
+/// - Unix: true when the effective UID is `0`.
+/// - Windows: true when the current process token is a member of the
+///   built-in Administrators group (checked via `IsUserAnAdmin`).
+/// - Other targets: always returns `false`.
+#[cfg(unix)]
+#[must_use]
+pub fn is_root() -> bool {
+    // SAFETY: `geteuid` is always safe to call and is thread-safe.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Returns `true` when the current process is running with superuser /
+/// Administrator privileges.
+#[cfg(windows)]
+#[must_use]
+pub fn is_root() -> bool {
+    use windows::Win32::UI::Shell::IsUserAnAdmin;
+    // SAFETY: `IsUserAnAdmin` has no preconditions and returns a BOOL.
+    unsafe { IsUserAnAdmin().as_bool() }
+}
+
+/// Fallback for non-unix, non-windows targets.
+#[cfg(not(any(unix, windows)))]
+#[must_use]
+pub fn is_root() -> bool {
+    false
 }
 
 #[cfg(test)]

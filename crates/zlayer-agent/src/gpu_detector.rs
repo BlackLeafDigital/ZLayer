@@ -259,6 +259,7 @@ fn detect_unified_memory_mb() -> u64 {
 
 /// Returns an empty GPU list on unsupported platforms
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[must_use]
 pub fn detect_gpus() -> Vec<GpuInfo> {
     Vec::new()
 }

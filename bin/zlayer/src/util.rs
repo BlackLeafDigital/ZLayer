@@ -124,6 +124,10 @@ pub(crate) fn parse_image_reference(image: &str) -> (String, String) {
 }
 
 /// Parse a duration string like "1h", "30m", "3600s"
+///
+/// Only called from Unix-gated CLI paths today; exposed here so the Windows
+/// build keeps the helper available for planned `ServiceSpec` wiring.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn parse_duration(s: &str) -> Result<u64> {
     let s = s.trim();
 

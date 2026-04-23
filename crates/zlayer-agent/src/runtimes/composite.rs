@@ -12,7 +12,11 @@
 //!   `platform` is `None`, a secondary **image-OS cache** (populated by
 //!   [`CompositeRuntime::record_image_os`] from OCI manifest inspection at
 //!   pull time) is consulted. If both are unknown we fall through to the
-//!   primary.
+//!   primary. **Strict policy (H-7):** if either source identifies the
+//!   workload as Linux and this node has no delegate configured, dispatch
+//!   returns [`AgentError::RouteToPeer`] so the scheduler can re-place the
+//!   workload on a Linux peer — the old permissive "fall through to primary"
+//!   behavior is gone.
 //! * All subsequent per-container operations (start/stop/remove/logs/exec/…)
 //!   look up the container in an internal **dispatch cache** that records
 //!   which runtime created it. This guarantees the same runtime sees the
@@ -148,37 +152,61 @@ impl CompositeRuntime {
     }
 
     /// Decide which runtime should handle a `create_container` call for `spec`.
-    async fn select_for(&self, spec: &ServiceSpec) -> Result<DispatchTarget> {
+    ///
+    /// The `service` argument is the originating service name, used to build an
+    /// actionable [`AgentError::RouteToPeer`] when a Linux workload lands on
+    /// this node without a local delegate so the scheduler can re-place it on
+    /// a capable peer.
+    ///
+    /// Policy (H-7): Linux workloads are never silently routed to the primary
+    /// on nodes without a delegate. The old "permissive" fall-through (primary
+    /// handles everything) returned an `Unsupported` error only when
+    /// `spec.platform` was explicitly set, but fell through to primary for
+    /// specs without a platform — producing cryptic downstream errors when the
+    /// image-OS cache said `Linux`. We now return `RouteToPeer` in both cases.
+    async fn select_for(&self, service: &str, spec: &ServiceSpec) -> Result<DispatchTarget> {
         if let Some(platform) = &spec.platform {
             let target = match platform.os {
                 OsKind::Windows | OsKind::Macos => DispatchTarget::Primary,
                 OsKind::Linux => DispatchTarget::Delegate,
             };
             if matches!(target, DispatchTarget::Delegate) && self.delegate.is_none() {
-                return Err(AgentError::Unsupported(
-                    "service requests Linux runtime (spec.platform.os = linux) but no delegate \
-                     runtime is configured on this node"
+                return Err(AgentError::RouteToPeer {
+                    service: service.to_string(),
+                    required_os: OsKind::Linux.as_oci_str().to_string(),
+                    reason: "spec.platform.os = linux but this node has no WSL2 delegate \
+                            configured; enable `--install-wsl yes` on this node or add a Linux \
+                            peer to the cluster"
                         .to_string(),
-                ));
+                });
             }
             return Ok(target);
         }
 
         if let Some(os) = self.image_os.read().await.get(&spec.image.name).copied() {
-            return Ok(match os {
+            return match os {
                 OsKind::Linux => {
                     if self.delegate.is_some() {
-                        DispatchTarget::Delegate
+                        Ok(DispatchTarget::Delegate)
                     } else {
-                        // No delegate: the primary is our only option. F-4 /
-                        // F-6 wire the error path when this actually fails to
-                        // run; at the composite layer we stay permissive so
-                        // single-runtime deployments don't regress.
-                        DispatchTarget::Primary
+                        // No delegate and the image manifest says Linux —
+                        // refuse at the composite layer so the scheduler can
+                        // re-place on a Linux peer instead of the primary
+                        // failing with a cryptic HCS error.
+                        Err(AgentError::RouteToPeer {
+                            service: service.to_string(),
+                            required_os: OsKind::Linux.as_oci_str().to_string(),
+                            reason: format!(
+                                "image '{}' manifest reports os=linux but this node has no WSL2 \
+                                 delegate configured; enable `--install-wsl yes` on this node or \
+                                 add a Linux peer to the cluster",
+                                spec.image.name
+                            ),
+                        })
                     }
                 }
-                OsKind::Windows | OsKind::Macos => DispatchTarget::Primary,
-            });
+                OsKind::Windows | OsKind::Macos => Ok(DispatchTarget::Primary),
+            };
         }
 
         Ok(DispatchTarget::Primary)
@@ -269,7 +297,7 @@ impl Runtime for CompositeRuntime {
     }
 
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
-        let target = self.select_for(spec).await?;
+        let target = self.select_for(&id.service, spec).await?;
         {
             let mut dispatch = self.dispatch.write().await;
             dispatch.insert(id.clone(), target);
@@ -712,6 +740,9 @@ services:
 
     #[tokio::test]
     async fn dispatch_linux_without_delegate_errors() {
+        // H-7 policy: a Linux spec on a node without a delegate must return
+        // `RouteToPeer` (not `Unsupported`, not a silent primary fall-through)
+        // so the scheduler can re-place the workload on a capable peer.
         let (rt, _calls) = make_composite(false);
         let id = cid("lin-svc", 0);
         let spec = make_spec(
@@ -720,10 +751,55 @@ services:
         );
 
         let err = rt.create_container(&id, &spec).await.unwrap_err();
-        assert!(
-            matches!(err, AgentError::Unsupported(_)),
-            "expected Unsupported, got {err:?}",
-        );
+        match err {
+            AgentError::RouteToPeer {
+                service,
+                required_os,
+                reason,
+            } => {
+                assert_eq!(service, "lin-svc");
+                assert_eq!(required_os, "linux");
+                assert!(
+                    reason.contains("--install-wsl") && reason.contains("Linux peer"),
+                    "reason must name both remediations, got: {reason}"
+                );
+            }
+            other => panic!("expected RouteToPeer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_linux_image_cache_without_delegate_routes_to_peer() {
+        // H-7 policy: even when `spec.platform` is unset, a Linux image in the
+        // OS cache must route to a peer instead of falling through to primary.
+        // This is the old permissive-fallthrough path the comment at lines
+        // 172-178 used to describe; the behavior is now strict.
+        let (rt, _calls) = make_composite(false);
+        let id = cid("svc", 0);
+        let image = "docker.io/library/nginx:1.25";
+        rt.record_image_os(image, OsKind::Linux).await;
+
+        let spec = make_spec(image, None);
+        let err = rt.create_container(&id, &spec).await.unwrap_err();
+        match err {
+            AgentError::RouteToPeer {
+                service,
+                required_os,
+                reason,
+            } => {
+                assert_eq!(service, "svc");
+                assert_eq!(required_os, "linux");
+                assert!(
+                    reason.contains(image),
+                    "reason should mention the image name, got: {reason}"
+                );
+                assert!(
+                    reason.contains("--install-wsl") && reason.contains("Linux peer"),
+                    "reason must name both remediations, got: {reason}"
+                );
+            }
+            other => panic!("expected RouteToPeer, got {other:?}"),
+        }
     }
 
     #[tokio::test]

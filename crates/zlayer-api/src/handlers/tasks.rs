@@ -314,6 +314,10 @@ pub async fn list_task_runs(
 /// Execute a task body via `sh -c` on Unix, capturing output.
 ///
 /// On non-Unix platforms, returns 501 Not Implemented.
+// The Unix branch is `async` (awaits the subprocess) and consumes `task`;
+// the non-Unix branch does neither. Allow both lints for the branch clippy
+// does not see when it type-checks this target.
+#[cfg_attr(not(unix), allow(clippy::unused_async, unused_variables))]
 async fn execute_task(task: &StoredTask) -> Result<TaskRun> {
     let run_id = uuid::Uuid::new_v4().to_string();
     let started_at = Utc::now();

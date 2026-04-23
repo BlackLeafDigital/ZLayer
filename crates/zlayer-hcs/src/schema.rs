@@ -1,7 +1,7 @@
 //! HCS document schema types (subset of `hcsshim/internal/hcs/schema2`).
 //!
 //! These `serde` types model the JSON documents HCS accepts on creation and
-//! emits on `GetProperties` calls. Only the fields ZLayer uses today are
+//! emits on `GetProperties` calls. Only the fields `ZLayer` uses today are
 //! modeled — extend as new features are added. All structs default to
 //! schema v2.1 which is supported on every Windows host since Server 2019.
 
@@ -192,7 +192,7 @@ pub struct VirtualMachine {
     /// VM compute topology (vCPUs, memory).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compute_topology: Option<Topology>,
-    /// Attached devices (SCSI, VirtualSMB, ...).
+    /// Attached devices (SCSI, `VirtualSMB`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub devices: Option<Devices>,
     /// Guest-state (VHDX) configuration.
@@ -270,7 +270,7 @@ pub struct Devices {
     /// SCSI controllers keyed by their controller id (string-encoded index).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub scsi: BTreeMap<String, ScsiController>,
-    /// VirtualSMB shares keyed by share name.
+    /// `VirtualSMB` shares keyed by share name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub virtual_smb: BTreeMap<String, VirtualSmbShare>,
 }
@@ -298,7 +298,7 @@ pub struct ScsiAttachment {
     pub read_only: Option<bool>,
 }
 
-/// VirtualSMB share projected into the VM.
+/// `VirtualSMB` share projected into the VM.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub struct VirtualSmbShare {

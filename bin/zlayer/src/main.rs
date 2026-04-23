@@ -20,9 +20,11 @@ mod cli;
 mod commands;
 mod config;
 pub mod daemon;
+mod daemon_service;
 #[allow(dead_code)]
 mod deploy_tui;
 pub mod resources;
+pub mod ui;
 mod util;
 mod views;
 mod widgets;
@@ -57,6 +59,25 @@ fn main() -> ExitCode {
     }
 
     // --- Daemon / CLI path below ---
+
+    // `zlayer serve --service` hands the whole process to the Windows SCM
+    // dispatcher (I-1). The dispatcher blocks the thread it's called on and
+    // spawns its own thread for `ffi_service_main`, which builds a tokio
+    // runtime internally — so we must NOT construct a runtime here, and we
+    // also skip the normal observability init, daemonization, and CLI
+    // dispatch paths.
+    //
+    // On non-Windows this returns an error ("not supported on this
+    // platform") surfaced via the stub in `daemon_service::stub`.
+    if let Some(Commands::Serve { service: true, .. }) = &cli.command {
+        return match run_service_entry(&cli) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("Error: {e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
 
     // Daemonize BEFORE any threads exist (before tokio runtime or observability init).
     // This is critical: daemon() calls fork(), which is unsafe after threads are spawned.
@@ -404,9 +425,86 @@ fn install_launchd_service(cli: &Cli, log_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Entry point for `zlayer serve --service`.
+///
+/// Handed control before the tokio runtime is built because the Windows SCM
+/// dispatcher blocks the calling thread and spawns its own thread for the
+/// service main. The dispatched entry point builds its own runtime internally
+/// (see `daemon_service::imp::run_service`).
+///
+/// On non-Windows targets this bails immediately — the `--service` flag is
+/// only meaningful when the Windows SCM spawns the binary.
+#[allow(unused_variables)]
+fn run_service_entry(cli: &Cli) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("--service is not supported on this platform (Windows only)");
+    }
+
+    #[cfg(windows)]
+    {
+        let Some(Commands::Serve {
+            bind,
+            jwt_secret,
+            no_swagger,
+            ..
+        }) = cli.command.as_ref()
+        else {
+            anyhow::bail!("run_service_entry called without Serve command");
+        };
+
+        let socket_path = cli.effective_socket_path();
+        let data_dir = cli.effective_data_dir();
+
+        // Observability init: the dispatched thread logs extensively but we
+        // can't hold the guard across the sync dispatcher boundary the way
+        // we do in `main()`'s tokio path. Fall back to file-based rolling
+        // logs under the daemon log dir — the same directory the foreground
+        // daemon uses via the FileLoggingConfig branch below.
+        let log_dir = cli.effective_log_dir();
+        if let Err(e) = std::fs::create_dir_all(&log_dir) {
+            eprintln!(
+                "Warning: failed to create log dir {}: {e}",
+                log_dir.display()
+            );
+        }
+        let obs_config = ObservabilityConfig {
+            logging: LoggingConfig {
+                level: LogLevel::Info,
+                format: LogFormat::Json,
+                filter_directives: None,
+                file: Some(zlayer_observability::config::FileLoggingConfig {
+                    directory: log_dir,
+                    prefix: "daemon-service.log".to_string(),
+                    rotation: zlayer_observability::config::RotationStrategy::Daily,
+                    max_files: Some(7),
+                }),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // Guards drop at end of function, which is fine — service_dispatcher
+        // blocks for the entire lifetime of the service, so the guards stay
+        // alive until SCM stops us.
+        let _guards = init_observability(&obs_config)
+            .context("Failed to initialize observability for Windows Service")?;
+
+        daemon_service::run_as_windows_service(
+            bind.clone(),
+            jwt_secret.clone(),
+            *no_swagger,
+            socket_path,
+            cli.host_network,
+            data_dir,
+        )
+    }
+}
+
 /// Dispatch CLI commands to their handlers.
 #[allow(clippy::too_many_lines)]
-async fn run(mut cli: Cli) -> Result<()> {
+async fn run(
+    #[cfg_attr(not(feature = "docker-compat"), allow(unused_mut))] mut cli: Cli,
+) -> Result<()> {
     // Docker compat: handle before borrowing since it takes ownership of args
     #[cfg(feature = "docker-compat")]
     if matches!(&cli.command, Some(Commands::Docker(_))) {
@@ -444,6 +542,7 @@ async fn run(mut cli: Cli) -> Result<()> {
             push,
             no_tui,
             verbose_build,
+            platform,
         } => {
             commands::build::handle_build(
                 context.clone(),
@@ -460,6 +559,7 @@ async fn run(mut cli: Cli) -> Result<()> {
                 *push,
                 *no_tui,
                 *verbose_build,
+                platform.clone(),
             )
             .await
         }
@@ -570,7 +670,17 @@ async fn run(mut cli: Cli) -> Result<()> {
             spec_dir,
             service,
             replicas,
+            install_wsl,
         } => {
+            // The Windows branch of `commands::join::join` takes an extra
+            // `ConsentMode` argument for the WSL2 auto-install consent flow
+            // (H-3). Unix ignores the flag entirely, so the field is only
+            // threaded through on non-Unix targets.
+            #[cfg(not(unix))]
+            let consent = install_wsl.mode();
+            #[cfg(unix)]
+            let _ = install_wsl; // silence unused-field warning on Unix.
+
             // Box::pin to keep this large match arm off the stack — the
             // future here is sizeable (spawns daemon state) and clippy's
             // `large_futures` lint flags anything above ~16kB.
@@ -580,6 +690,8 @@ async fn run(mut cli: Cli) -> Result<()> {
                 spec_dir.as_deref(),
                 service.as_deref(),
                 *replicas,
+                #[cfg(not(unix))]
+                consent,
             ))
             .await
         }

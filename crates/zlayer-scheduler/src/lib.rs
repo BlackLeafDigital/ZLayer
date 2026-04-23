@@ -510,6 +510,14 @@ impl Scheduler {
     /// The leader dispatches scale requests to each node that has been assigned
     /// containers for this service. Uses the same internal API endpoint and
     /// authentication as local scaling.
+    ///
+    /// **H-7 reroute:** when a node answers with `reroute_to_os` set in the
+    /// scale response body, the composite runtime on that node could not run
+    /// the workload (e.g. Linux on a Windows node without a WSL2 delegate).
+    /// We mark the node as unwilling for this service, recompute placement
+    /// across the remaining capable peers, and re-dispatch. If no capable peer
+    /// exists in the cluster, the service is marked `Unhealthy` in Raft with
+    /// an actionable message naming both remediations.
     #[allow(clippy::too_many_lines)]
     async fn execute_distributed_scaling(
         &self,
@@ -520,6 +528,11 @@ impl Scheduler {
             Some(raft) => raft.read_state().await,
             None => return Err(SchedulerError::NotLeader),
         };
+
+        // H-7: collect nodes that refused the scale because they can't run the
+        // workload's OS. After the first-pass loop we try to re-place on peers
+        // the placement algorithm will filter by `NodeState.os` automatically.
+        let mut rerouted_nodes: Vec<(NodeId, String, String)> = Vec::new();
 
         for (node_id, containers) in node_assignments {
             let Some(node_info) = cluster.nodes.get(node_id) else {
@@ -578,12 +591,51 @@ impl Scheduler {
                     .await
                 {
                     Ok(resp) if resp.status().is_success() => {
-                        info!(
-                            node_id,
-                            service = service_name,
-                            replicas,
-                            "Scale dispatch succeeded"
-                        );
+                        // Success status alone doesn't mean the agent ran the
+                        // workload — H-7 lets the agent return 200 with
+                        // `reroute_to_os` set to signal "I can't, try a peer".
+                        let body_text = resp.text().await.unwrap_or_default();
+                        match serde_json::from_str::<serde_json::Value>(&body_text) {
+                            Ok(body) => {
+                                if let Some(required_os) = body
+                                    .get("reroute_to_os")
+                                    .and_then(serde_json::Value::as_str)
+                                {
+                                    let reason = body
+                                        .get("message")
+                                        .and_then(serde_json::Value::as_str)
+                                        .unwrap_or("agent refused workload")
+                                        .to_string();
+                                    warn!(
+                                        node_id,
+                                        service = service_name,
+                                        required_os,
+                                        reason = %reason,
+                                        "Agent refused workload — will attempt reroute to peer"
+                                    );
+                                    rerouted_nodes.push((
+                                        *node_id,
+                                        required_os.to_string(),
+                                        reason,
+                                    ));
+                                } else {
+                                    info!(
+                                        node_id,
+                                        service = service_name,
+                                        replicas,
+                                        "Scale dispatch succeeded"
+                                    );
+                                }
+                            }
+                            Err(_) => {
+                                info!(
+                                    node_id,
+                                    service = service_name,
+                                    replicas,
+                                    "Scale dispatch succeeded (opaque response body)"
+                                );
+                            }
+                        }
                     }
                     Ok(resp) => {
                         let status = resp.status();
@@ -609,6 +661,7 @@ impl Scheduler {
 
             #[cfg(feature = "test-skip-http")]
             {
+                let _ = &mut rerouted_nodes;
                 debug!(
                     node_id,
                     service = service_name,
@@ -619,9 +672,16 @@ impl Scheduler {
         }
 
         // Update service assignments in Raft so cluster state tracks which
-        // nodes are running this service
+        // nodes are running this service. Filter out nodes that rerouted —
+        // they did NOT run the workload.
         if let Some(ref raft) = self.raft {
-            let assigned_nodes: Vec<NodeId> = node_assignments.keys().copied().collect();
+            let rerouted_ids: std::collections::HashSet<NodeId> =
+                rerouted_nodes.iter().map(|(id, _, _)| *id).collect();
+            let assigned_nodes: Vec<NodeId> = node_assignments
+                .keys()
+                .copied()
+                .filter(|id| !rerouted_ids.contains(id))
+                .collect();
             let _ = raft
                 .propose(Request::UpdateServiceAssignment {
                     service_name: service_name.to_string(),
@@ -630,7 +690,186 @@ impl Scheduler {
                 .await;
         }
 
+        // H-7: handle reroutes. Recompute placement with the refusing nodes
+        // excluded, and redispatch to the surviving capable peers.
+        #[cfg(not(feature = "test-skip-http"))]
+        if !rerouted_nodes.is_empty() {
+            self.handle_reroutes(service_name, &rerouted_nodes).await;
+        }
+
         Ok(())
+    }
+
+    /// Handle a batch of `reroute_to_os` signals for a single scaling pass.
+    ///
+    /// Called after [`Self::execute_distributed_scaling`] collects nodes that
+    /// answered with `RouteToPeer`. Recomputes placement with those nodes
+    /// excluded and redispatches. When no capable peer exists in the cluster,
+    /// marks the service `Unhealthy` in Raft with an actionable error naming
+    /// both remediations ("`--install-wsl yes`" or "add a Linux peer").
+    #[cfg(not(feature = "test-skip-http"))]
+    async fn handle_reroutes(&self, service_name: &str, rerouted: &[(NodeId, String, String)]) {
+        use std::collections::HashSet;
+
+        // Collect the IDs of the nodes that refused; the placement algorithm
+        // already filters by `NodeState.os` so the normal re-run will only
+        // land containers on capable peers, but we also drop the refusers
+        // outright in case their OS metadata lies (e.g. a Windows node that
+        // reports `os = Linux` because its delegate probe was flaky).
+        let refused: HashSet<NodeId> = rerouted.iter().map(|(id, _, _)| *id).collect();
+        let required_os = rerouted
+            .first()
+            .map_or_else(|| "linux".to_string(), |(_, os, _)| os.clone());
+        let first_reason = rerouted
+            .first()
+            .map_or_else(String::new, |(_, _, r)| r.clone());
+
+        // How many replicas did the service want? Read it off ClusterState.
+        let desired = {
+            let Some(raft) = &self.raft else {
+                warn!("reroute requested in standalone mode — cannot re-place");
+                return;
+            };
+            let state = raft.read_state().await;
+            state
+                .services
+                .get(service_name)
+                .map_or(0, |s| s.desired_replicas)
+        };
+        if desired == 0 {
+            return;
+        }
+
+        let spec = {
+            let specs = self.service_specs.read().await;
+            specs.get(service_name).cloned()
+        };
+
+        // Build candidate nodes: drop refusers entirely. The placement
+        // algorithm will additionally filter by OS on whatever remains.
+        let mut nodes: Vec<placement::NodeState> = self
+            .build_node_states()
+            .await
+            .into_iter()
+            .filter(|n| !refused.contains(&n.id))
+            .collect();
+
+        if nodes.is_empty() {
+            // No peers left at all — service is stuck.
+            warn!(
+                service = service_name,
+                required_os, "No cluster peers remain after dropping refusers"
+            );
+            self.mark_service_unhealthy_with_reason(service_name, &required_os, &first_reason)
+                .await;
+            return;
+        }
+
+        let new_assignments = {
+            let mut ps = self.placement_state.write().await;
+            self.compute_placement(service_name, desired, &mut nodes, &mut ps, spec.as_ref())
+        };
+
+        if new_assignments.is_empty() {
+            warn!(
+                service = service_name,
+                required_os, "No capable peer found for reroute — marking service unhealthy"
+            );
+            self.mark_service_unhealthy_with_reason(service_name, &required_os, &first_reason)
+                .await;
+            return;
+        }
+
+        info!(
+            service = service_name,
+            required_os,
+            peer_count = new_assignments.len(),
+            "Rerouting workload to capable peers"
+        );
+
+        // Best effort: failures at this layer leave the service in a
+        // degraded state that the next scheduling tick will retry.
+        if let Err(e) =
+            Box::pin(self.execute_distributed_scaling(service_name, &new_assignments)).await
+        {
+            error!(
+                service = service_name,
+                error = %e,
+                "Reroute dispatch failed"
+            );
+        }
+    }
+
+    /// Record in Raft that a service could not be placed because the cluster
+    /// has no node capable of running its OS.
+    ///
+    /// The service state is flipped to `Unhealthy` and a scale event with a
+    /// human-readable reason is appended so operators can see it in the
+    /// `zlayer ps` / manager UI.
+    #[cfg(not(feature = "test-skip-http"))]
+    async fn mark_service_unhealthy_with_reason(
+        &self,
+        service_name: &str,
+        required_os: &str,
+        detail: &str,
+    ) {
+        let Some(raft) = &self.raft else {
+            return;
+        };
+        let message = format!(
+            "No cluster node can run service '{service_name}' (requires OS '{required_os}'): \
+             {detail}. Remedies: enable `--install-wsl yes` on an existing Windows node, \
+             or add a {required_os} peer to the cluster."
+        );
+        error!(
+            service = service_name,
+            required_os,
+            message = %message,
+            "Marking service unhealthy — no capable peer"
+        );
+
+        let current = raft
+            .read_state()
+            .await
+            .services
+            .get(service_name)
+            .cloned()
+            .unwrap_or_default();
+
+        let updated = raft::ServiceState {
+            health_status: raft::HealthStatus::Unhealthy,
+            ..current
+        };
+
+        if let Err(e) = raft
+            .propose(Request::UpdateServiceState {
+                service_name: service_name.to_string(),
+                state: updated,
+            })
+            .await
+        {
+            error!(
+                service = service_name,
+                error = %e,
+                "Failed to record unhealthy service state in Raft"
+            );
+        }
+
+        if let Err(e) = raft
+            .record_scale_event(
+                service_name.to_string(),
+                0,
+                0,
+                format!("reroute failed: {message}"),
+            )
+            .await
+        {
+            error!(
+                service = service_name,
+                error = %e,
+                "Failed to record reroute-failure scale event"
+            );
+        }
     }
 
     /// Apply a scaling decision.

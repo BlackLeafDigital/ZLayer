@@ -262,9 +262,11 @@ impl ImageBuilder {
             "go" => zlayer_builder::Runtime::Go,
             "deno" => zlayer_builder::Runtime::Deno,
             "bun" => zlayer_builder::Runtime::Bun,
+            "windows-nanoserver" | "nanoserver" => zlayer_builder::Runtime::WindowsNanoserver,
+            "windows-servercore" | "servercore" => zlayer_builder::Runtime::WindowsServerCore,
             _ => {
                 return Err(ZLayerError::InvalidArgument(format!(
-                    "Unknown runtime: {runtime}. Valid options: node20, node22, python312, python313, rust, go, deno, bun"
+                    "Unknown runtime: {runtime}. Valid options: node20, node22, python312, python313, rust, go, deno, bun, windows-nanoserver, windows-servercore"
                 ))
                 .into());
             }

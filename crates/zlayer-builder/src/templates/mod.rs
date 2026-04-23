@@ -25,6 +25,10 @@
 //! - **Go** (`go`): Static binary build with Alpine
 //! - **Deno** (`deno`): Official Deno runtime
 //! - **Bun** (`bun`): Official Bun runtime
+//! - **Windows Nanoserver** (`windows-nanoserver`): Minimal Windows base for
+//!   self-contained binaries; no package managers / no `PowerShell`
+//! - **Windows Server Core** (`windows-servercore`): Larger Windows base with
+//!   `PowerShell` bundled; required for chocolatey / winget / full .NET SDK
 //!
 //! # Auto-Detection
 //!
@@ -37,6 +41,11 @@
 //! - `Cargo.toml` -> Rust
 //! - `requirements.txt`, `pyproject.toml`, `setup.py` -> Python
 //! - `go.mod` -> Go
+//! - `*.sln` / `*.csproj` / `*.vcxproj` / `project.json` -> Windows Server Core
+//! - `*.exe` (with no Linux indicators) -> Windows Nanoserver
+//!
+//! Auto-detection is a *hint*. Explicit overrides (`os:` field, `--platform`
+//! CLI flag) always win — see `resolve_runtime`.
 
 mod detect;
 
@@ -65,6 +74,16 @@ pub enum Runtime {
     Deno,
     /// Bun (latest)
     Bun,
+    /// Windows Nanoserver (`mcr.microsoft.com/windows/nanoserver:ltsc2022`).
+    ///
+    /// Minimal Windows base image for self-contained binaries. No `PowerShell`,
+    /// no chocolatey, no winget.
+    WindowsNanoserver,
+    /// Windows Server Core (`mcr.microsoft.com/windows/servercore:ltsc2022`).
+    ///
+    /// Larger Windows base that bundles `PowerShell` and is compatible with
+    /// chocolatey / winget / full .NET SDK workloads.
+    WindowsServerCore,
     /// `WebAssembly` (delegates to `wasm:` build mode).
     ///
     /// The associated [`WasmTargetHint`] is a best-effort indicator of whether
@@ -156,6 +175,22 @@ impl Runtime {
                 detect_files: &["bun.lockb"],
             },
             RuntimeInfo {
+                runtime: Runtime::WindowsNanoserver,
+                name: "windows-nanoserver",
+                description:
+                    "Windows Nanoserver - Minimal Windows base (no package managers, no `PowerShell`)",
+                // Any .exe file at the context root suggests a self-contained
+                // Windows binary workload.
+                detect_files: &["*.exe"],
+            },
+            RuntimeInfo {
+                runtime: Runtime::WindowsServerCore,
+                name: "windows-servercore",
+                description:
+                    "Windows Server Core - Windows base with `PowerShell`, chocolatey/winget compatible",
+                detect_files: &["*.sln", "*.csproj", "*.vcxproj", "project.json"],
+            },
+            RuntimeInfo {
                 runtime: Runtime::Wasm(WasmTargetHint::Auto),
                 name: "wasm",
                 description: "WebAssembly - Delegates to wasm: build mode (auto-detects target)",
@@ -177,6 +212,12 @@ impl Runtime {
             "go" | "golang" => Some(Runtime::Go),
             "deno" => Some(Runtime::Deno),
             "bun" => Some(Runtime::Bun),
+            "windows-nanoserver" | "nanoserver" | "windows_nanoserver" => {
+                Some(Runtime::WindowsNanoserver)
+            }
+            "windows-servercore" | "windows-server-core" | "servercore" | "windows_servercore" => {
+                Some(Runtime::WindowsServerCore)
+            }
             "wasm" | "webassembly" => Some(Runtime::Wasm(WasmTargetHint::Auto)),
             "wasm-module" | "wasm-preview1" | "wasm-preview2" => {
                 Some(Runtime::Wasm(WasmTargetHint::Module))
@@ -227,6 +268,12 @@ impl Runtime {
             Runtime::Go => include_str!("dockerfiles/go.Dockerfile"),
             Runtime::Deno => include_str!("dockerfiles/deno.Dockerfile"),
             Runtime::Bun => include_str!("dockerfiles/bun.Dockerfile"),
+            Runtime::WindowsNanoserver => {
+                include_str!("dockerfiles/windows-nanoserver.Dockerfile")
+            }
+            Runtime::WindowsServerCore => {
+                include_str!("dockerfiles/windows-servercore.Dockerfile")
+            }
             Runtime::Wasm(hint) => Self::wasm_zimagefile(*hint),
         }
     }
@@ -455,6 +502,153 @@ mod tests {
 
         // First stage is builder
         assert_eq!(dockerfile.stages[0].name, Some("builder".to_string()));
+    }
+
+    #[test]
+    fn test_windows_nanoserver_from_name() {
+        assert_eq!(
+            Runtime::from_name("windows-nanoserver"),
+            Some(Runtime::WindowsNanoserver)
+        );
+        assert_eq!(
+            Runtime::from_name("nanoserver"),
+            Some(Runtime::WindowsNanoserver)
+        );
+        assert_eq!(
+            Runtime::from_name("Windows-Nanoserver"),
+            Some(Runtime::WindowsNanoserver)
+        );
+    }
+
+    #[test]
+    fn test_windows_servercore_from_name() {
+        assert_eq!(
+            Runtime::from_name("windows-servercore"),
+            Some(Runtime::WindowsServerCore)
+        );
+        assert_eq!(
+            Runtime::from_name("windows-server-core"),
+            Some(Runtime::WindowsServerCore)
+        );
+        assert_eq!(
+            Runtime::from_name("servercore"),
+            Some(Runtime::WindowsServerCore)
+        );
+    }
+
+    #[test]
+    fn test_windows_nanoserver_template_structure() {
+        let template = Runtime::WindowsNanoserver.template();
+        let dockerfile = Dockerfile::parse(template).expect("nanoserver template should parse");
+
+        // Single-stage minimal template.
+        assert_eq!(dockerfile.stages.len(), 1);
+
+        let stage = &dockerfile.stages[0];
+        let base = stage.base_image.to_string_ref();
+        assert!(
+            base.contains("nanoserver"),
+            "nanoserver template must FROM an mcr nanoserver image, got {base}"
+        );
+
+        // Must set USER to ContainerAdministrator (the parser preserves the
+        // argument verbatim, so trim before comparing).
+        let has_user = stage.instructions.iter().any(
+            |i| matches!(i, crate::Instruction::User(u) if u.trim() == "ContainerAdministrator"),
+        );
+        assert!(
+            has_user,
+            "nanoserver template must set USER ContainerAdministrator"
+        );
+
+        // Must set a Windows-style WORKDIR.
+        let has_windows_workdir = stage
+            .instructions
+            .iter()
+            .any(|i| matches!(i, crate::Instruction::Workdir(w) if w.trim().starts_with("C:")));
+        assert!(
+            has_windows_workdir,
+            "nanoserver template must set a Windows WORKDIR (C:\\...)"
+        );
+
+        // Must have a CMD.
+        let has_cmd = stage
+            .instructions
+            .iter()
+            .any(|i| matches!(i, crate::Instruction::Cmd(_)));
+        assert!(has_cmd, "nanoserver template must define a CMD");
+    }
+
+    #[test]
+    fn test_windows_servercore_template_structure() {
+        let template = Runtime::WindowsServerCore.template();
+        let dockerfile = Dockerfile::parse(template).expect("servercore template should parse");
+
+        assert_eq!(dockerfile.stages.len(), 1);
+
+        let stage = &dockerfile.stages[0];
+        let base = stage.base_image.to_string_ref();
+        assert!(
+            base.contains("servercore"),
+            "servercore template must FROM an mcr servercore image, got {base}"
+        );
+
+        // Servercore bundles `PowerShell` — template must SHELL into it so
+        // subsequent RUNs accept `PowerShell` syntax.
+        let has_powershell_shell = stage.instructions.iter().any(|i| {
+            matches!(
+                i,
+                crate::Instruction::Shell(argv)
+                    if argv.first().map(String::as_str) == Some("powershell")
+            )
+        });
+        assert!(
+            has_powershell_shell,
+            "servercore template must switch SHELL to powershell"
+        );
+
+        // USER + WORKDIR sanity checks (same skeleton as nanoserver); parser
+        // preserves the raw argument so we trim before comparing.
+        let has_user = stage.instructions.iter().any(
+            |i| matches!(i, crate::Instruction::User(u) if u.trim() == "ContainerAdministrator"),
+        );
+        assert!(
+            has_user,
+            "servercore template must set USER ContainerAdministrator"
+        );
+
+        let has_windows_workdir = stage
+            .instructions
+            .iter()
+            .any(|i| matches!(i, crate::Instruction::Workdir(w) if w.trim().starts_with("C:")));
+        assert!(
+            has_windows_workdir,
+            "servercore template must set a Windows WORKDIR (C:\\...)"
+        );
+    }
+
+    #[test]
+    fn test_windows_templates_listed_in_all() {
+        let names: Vec<&str> = Runtime::all().iter().map(|info| info.name).collect();
+        assert!(
+            names.contains(&"windows-nanoserver"),
+            "windows-nanoserver missing from Runtime::all()"
+        );
+        assert!(
+            names.contains(&"windows-servercore"),
+            "windows-servercore missing from Runtime::all()"
+        );
+    }
+
+    #[test]
+    fn test_get_windows_templates_by_name() {
+        let nano = get_template_by_name("windows-nanoserver");
+        assert!(nano.is_some(), "windows-nanoserver template must resolve");
+        assert!(nano.unwrap().contains("nanoserver"));
+
+        let sc = get_template_by_name("windows-servercore");
+        assert!(sc.is_some(), "windows-servercore template must resolve");
+        assert!(sc.unwrap().contains("servercore"));
     }
 
     #[test]

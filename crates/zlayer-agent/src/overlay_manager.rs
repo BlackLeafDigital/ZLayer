@@ -5,6 +5,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+#[cfg(target_os = "linux")]
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -94,6 +95,18 @@ pub struct OverlayManager {
             std::collections::HashMap<windows::core::GUID, (String, std::net::IpAddr)>,
         >,
     >,
+    /// Overlay hickory DNS server listen address, if the daemon bootstrapped
+    /// one. Used to populate the `Dns.ServerList` field on HCN endpoints so
+    /// Windows containers resolve overlay service names. `None` when the
+    /// daemon did not start a DNS server (host-network mode, bootstrap
+    /// failure, etc.).
+    dns_server_addr: Option<SocketAddr>,
+    /// DNS domain for overlay service discovery (e.g. `"overlay.local"`).
+    /// Populated alongside `dns_server_addr`. When set, HCN endpoints receive
+    /// this as their `Dns.Domain` + `Dns.Search` so short names (`svc-a`)
+    /// resolve to `svc-a.<domain>` without the container needing an explicit
+    /// search list.
+    dns_domain: Option<String>,
 }
 
 impl OverlayManager {
@@ -133,6 +146,8 @@ impl OverlayManager {
             hcn_cleanup: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            dns_server_addr: None,
+            dns_domain: None,
         })
     }
 
@@ -168,6 +183,8 @@ impl OverlayManager {
             hcn_cleanup: std::sync::Arc::new(tokio::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
+            dns_server_addr: None,
+            dns_domain: None,
         }
     }
 
@@ -176,6 +193,38 @@ impl OverlayManager {
     pub fn with_overlay_port(mut self, port: u16) -> Self {
         self.overlay_port = port;
         self
+    }
+
+    /// Record the overlay DNS server address and zone domain so attaches can
+    /// propagate them to HCN endpoint schemas (Windows) and future
+    /// per-container DNS plumbing (Linux `/etc/resolv.conf`).
+    ///
+    /// `addr` is the socket address the overlay hickory DNS server is
+    /// listening on (typically `overlay_ip:15353`). `domain` is the DNS zone
+    /// (e.g. `"overlay.local"`). Either may be omitted independently.
+    pub fn set_dns_config(&mut self, addr: Option<SocketAddr>, domain: Option<String>) {
+        self.dns_server_addr = addr;
+        self.dns_domain = domain;
+    }
+
+    /// Builder-style variant of [`OverlayManager::set_dns_config`].
+    #[must_use]
+    pub fn with_dns_config(mut self, addr: Option<SocketAddr>, domain: Option<String>) -> Self {
+        self.dns_server_addr = addr;
+        self.dns_domain = domain;
+        self
+    }
+
+    /// Returns the overlay DNS server address if the daemon bootstrapped one.
+    #[must_use]
+    pub fn dns_server_addr(&self) -> Option<SocketAddr> {
+        self.dns_server_addr
+    }
+
+    /// Returns the overlay DNS zone domain, if configured.
+    #[must_use]
+    pub fn dns_domain(&self) -> Option<&str> {
+        self.dns_domain.as_deref()
     }
 
     /// Setup the global overlay network for the deployment
@@ -321,6 +370,13 @@ impl OverlayManager {
     ///
     /// # Errors
     /// Returns an error if the container cannot be attached to the overlay network.
+    // The non-Linux branch uses an early `return`; the Linux branch below is
+    // the normal tail expression. clippy's `needless_return` /
+    // `unused_async` fire whichever branch it does not see, so allow both.
+    #[cfg_attr(
+        not(target_os = "linux"),
+        allow(clippy::needless_return, clippy::unused_async)
+    )]
     pub async fn attach_container(
         &self,
         container_pid: u32,
@@ -341,7 +397,7 @@ impl OverlayManager {
             return Ok(self.node_ip.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         }
 
-        #[allow(unreachable_code)]
+        #[cfg(target_os = "linux")]
         {
             let interfaces = self.service_interfaces.read().await;
             let service_iface = interfaces.get(service_name).ok_or_else(|| {
@@ -388,13 +444,19 @@ impl OverlayManager {
     ///
     /// 1. Allocates the next IP from the node's local /28 slice allocator.
     ///    (The caller — typically `HcsRuntime` — uses the same allocator, so the
-    ///     allocation here must match the IP the runtime already stamped into the
-    ///     HCN endpoint. Callers pass `ip_override` when the runtime has already
-    ///     reserved an IP; in that case we skip re-allocation and just register.)
+    ///    allocation here must match the IP the runtime already stamped into the
+    ///    HCN endpoint. Callers pass `ip_override` when the runtime has already
+    ///    reserved an IP; in that case we skip re-allocation and just register.)
     /// 2. Records the `namespace_id -> service_name` mapping for later autoclean.
     ///
-    /// DNS registration stays in `service.rs:254-293` where it is today — no
-    /// change here.
+    /// DNS registration into the per-service hickory zone still happens in
+    /// `service.rs` on successful attach. `dns_server` and `dns_domain` here
+    /// are the resolver + zone that the caller also staged onto the
+    /// `HcsRuntime` (via `set_next_container_dns`) so the endpoint's `Dns`
+    /// schema field is populated at creation time — this lets overlay
+    /// containers find the hickory server at namespace-attach time instead of
+    /// relying on host-inherited resolvers. Pass `None` for both to preserve
+    /// the legacy (no DNS in schema) behavior.
     ///
     /// # Errors
     ///
@@ -405,6 +467,8 @@ impl OverlayManager {
         service_name: &str,
         ip_override: Option<std::net::IpAddr>,
         autoclean: bool,
+        dns_server: Option<std::net::IpAddr>,
+        dns_domain: Option<String>,
     ) -> Result<std::net::IpAddr, AgentError> {
         let ip = match ip_override {
             Some(ip) => ip,
@@ -418,6 +482,8 @@ impl OverlayManager {
             ns = ?namespace_id,
             service = %service_name,
             ip = %ip,
+            dns_server = ?dns_server,
+            dns_domain = ?dns_domain,
             "Attached container to HCN overlay",
         );
         Ok(ip)
@@ -445,6 +511,7 @@ impl OverlayManager {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[allow(clippy::too_many_lines)]
     async fn attach_to_interface(
         &self,
@@ -551,6 +618,10 @@ impl OverlayManager {
     /// Best-effort sweep of orphan veth endpoints whose owning container
     /// process is no longer alive. Names matching `veth-<pid>-*` or
     /// `vc-<pid>-*` where `/proc/<pid>` does not exist are deleted.
+    ///
+    /// Linux-only: the caller (`attach_to_interface`) is also Linux-gated
+    /// and there is no veth concept on other platforms.
+    #[cfg(target_os = "linux")]
     async fn sweep_orphan_veths(&self) {
         let links = match crate::netlink::list_all_links().await {
             Ok(links) => links,
@@ -1236,7 +1307,7 @@ mod tests {
 
         // With an ip_override + autoclean=true, the cleanup map should gain one entry.
         let ip = om
-            .attach_container_hcn(ns, "svc-a", Some(fixed_ip), true)
+            .attach_container_hcn(ns, "svc-a", Some(fixed_ip), true, None, None)
             .await
             .expect("attach_container_hcn");
         assert_eq!(ip, fixed_ip);
@@ -1262,12 +1333,54 @@ mod tests {
 
         // autoclean=false must NOT insert into the cleanup map.
         let _ip = om
-            .attach_container_hcn(ns, "svc-b", Some(fixed_ip), false)
+            .attach_container_hcn(ns, "svc-b", Some(fixed_ip), false, None, None)
             .await
             .expect("attach without autoclean");
         {
             let map = om.hcn_cleanup.lock().await;
             assert!(map.is_empty(), "autoclean=false should not populate map");
         }
+    }
+
+    /// Default-constructed `OverlayManager` has no DNS config until the
+    /// daemon bootstraps one. Both accessors must return `None`.
+    #[tokio::test]
+    async fn dns_config_defaults_to_none() {
+        let om = OverlayManager::new("dns-default".to_string())
+            .await
+            .expect("OverlayManager::new");
+        assert!(om.dns_server_addr().is_none());
+        assert!(om.dns_domain().is_none());
+    }
+
+    /// `set_dns_config` must round-trip both values through the accessors.
+    /// Covers the J-1 contract with `attach_container_hcn` / `HcsRuntime`.
+    #[tokio::test]
+    async fn dns_config_set_and_round_trip() {
+        let mut om = OverlayManager::new("dns-roundtrip".to_string())
+            .await
+            .expect("OverlayManager::new");
+        let addr: SocketAddr = "10.200.42.1:15353".parse().unwrap();
+        om.set_dns_config(Some(addr), Some("overlay.local".to_string()));
+        assert_eq!(om.dns_server_addr(), Some(addr));
+        assert_eq!(om.dns_domain(), Some("overlay.local"));
+
+        // Clear by passing both as None.
+        om.set_dns_config(None, None);
+        assert!(om.dns_server_addr().is_none());
+        assert!(om.dns_domain().is_none());
+    }
+
+    /// Builder-style `with_dns_config` carries the same values as
+    /// `set_dns_config`.
+    #[test]
+    fn with_dns_config_preserves_values() {
+        let cluster: IpNetwork = "10.200.0.0/16".parse().unwrap();
+        let slice: IpNetwork = "10.200.42.0/28".parse().unwrap();
+        let addr: SocketAddr = "10.200.42.1:15353".parse().unwrap();
+        let om = OverlayManager::with_slice("dns-builder".to_string(), cluster, slice, 51820)
+            .with_dns_config(Some(addr), Some("overlay.local".to_string()));
+        assert_eq!(om.dns_server_addr(), Some(addr));
+        assert_eq!(om.dns_domain(), Some("overlay.local"));
     }
 }

@@ -466,6 +466,7 @@ pub fn parse_spec_file(state: &mut DeployState) {
 }
 
 /// Submit the deployment to the daemon
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub fn submit_deployment(rt: &tokio::runtime::Runtime, state: &mut DeployState) {
     let yaml = if let Some(y) = &state.spec_yaml {
         y.clone()

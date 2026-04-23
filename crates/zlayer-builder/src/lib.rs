@@ -200,6 +200,7 @@ pub mod sandbox_builder;
 pub mod templates;
 pub mod tui;
 pub mod wasm_builder;
+pub mod windows;
 pub mod zimage;
 
 // Re-export main types at crate root
@@ -213,6 +214,9 @@ pub use buildah::{
     BuildahInstallation,
     BuildahInstaller,
     CommandOutput,
+    // OS-aware Dockerfile translator, shared by the buildah backend and the
+    // Phase L-4 HCS (Windows) backend.
+    DockerfileTranslator,
     InstallError,
 };
 #[cfg(feature = "cache")]
@@ -259,7 +263,7 @@ pub use pipeline::{
 // Backend re-exports
 #[cfg(target_os = "macos")]
 pub use backend::SandboxBackend;
-pub use backend::{detect_backend, BuildBackend, BuildahBackend};
+pub use backend::{detect_backend, BuildBackend, BuildahBackend, ImageOs, ImageOsParseError};
 
 #[cfg(test)]
 mod tests {

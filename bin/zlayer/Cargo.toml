@@ -112,15 +112,23 @@ zlayer-paths.workspace = true
 # Daemon HTTP-over-UDS client + session file (extracted from this crate)
 zlayer-client.workspace = true
 
+# Cross-platform internal crates.
+#
+# `zlayer-init-actions` is pure reqwest/tokio and builds on every platform.
+# `zlayer-docker` only gates its inner `socket/` module on `cfg(unix)`; the
+# crate itself compiles on Windows (Docker over TCP works there). Both were
+# previously stranded in `[target.'cfg(unix)'.dependencies]`, which broke the
+# Windows build because the `docker-compat` feature references
+# `dep:zlayer-docker` and the serve path references `zlayer_init_actions`.
+zlayer-docker = { workspace = true, optional = true }
+zlayer-init-actions.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 # Internal crates (Unix-only -- depend on boringtun, libcontainer, etc.)
 # Enable `youki-runtime` so this binary builds with the libcontainer-backed
 # Linux runtime. The feature is a no-op on macOS (libcontainer dep is target-
 # gated to Linux) but keeps the manifest declaration uniform across Unix.
 zlayer-agent = { workspace = true, features = ["youki-runtime"] }
-zlayer-init-actions.workspace = true
-# Docker compatibility layer (optional)
-zlayer-docker = { workspace = true, optional = true }
 # Daemonization (fork, setsid) and signal handling (kill) -- Unix only
 nix = { workspace = true }
 libc = { workspace = true }
@@ -133,6 +141,11 @@ zlayer-wsl = { workspace = true, optional = true }
 # wants the full native Windows runtime embedded in the CLI. The thin-CLI
 # build (`--no-default-features --features wsl`) leaves this off.
 zlayer-agent = { workspace = true, optional = true }
+# SCM integration: `zlayer serve --service` registers with the Windows Service
+# Control Manager and responds to Stop/Shutdown control codes. See
+# `src/daemon_service.rs`. Required by I-2..I-5 (install/stop/uninstall/status
+# via SCM) so keep it unconditional on Windows.
+windows-service = "0.8"
 
 [dev-dependencies]
 tempfile = "3"
