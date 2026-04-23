@@ -393,6 +393,14 @@ pub fn is_root() -> bool {
 mod tests {
     use super::*;
 
+    // Windows tests below mutate the `PROGRAMDATA` env var to exercise
+    // platform-default path resolution. Cargo runs tests concurrently,
+    // so readers (`system_default`, `default_admin_bearer_path`) must
+    // serialize against the mutators or they race and observe a mix of
+    // pre- and post-mutation env state.
+    #[cfg(target_os = "windows")]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn subdirectories_are_relative_to_data_dir() {
         let dirs = ZLayerDirs::new("/test/data");
@@ -427,6 +435,8 @@ mod tests {
 
     #[test]
     fn system_default_uses_default_data_dir() {
+        #[cfg(target_os = "windows")]
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let dirs = ZLayerDirs::system_default();
         assert_eq!(dirs.data_dir(), ZLayerDirs::default_data_dir().as_path());
     }
@@ -442,6 +452,8 @@ mod tests {
 
     #[test]
     fn default_admin_bearer_path_matches_system_default() {
+        #[cfg(target_os = "windows")]
+        let _env_guard = ENV_LOCK.lock().unwrap();
         assert_eq!(
             default_admin_bearer_path(),
             ZLayerDirs::system_default().admin_bearer_path()
@@ -451,6 +463,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_default_data_dir_uses_program_data() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let prev = std::env::var_os("PROGRAMDATA");
         std::env::set_var("PROGRAMDATA", r"C:\TestProgramData");
 
@@ -480,6 +493,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_default_data_dir_fallback_when_env_missing() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let prev = std::env::var_os("PROGRAMDATA");
         std::env::remove_var("PROGRAMDATA");
 
