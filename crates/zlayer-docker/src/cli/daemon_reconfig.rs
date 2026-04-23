@@ -298,7 +298,7 @@ mod linux {
 
 #[cfg(target_os = "macos")]
 mod macos {
-    use super::*;
+    use super::{bail, Context, Path, PathBuf, ReconfigError, Result};
     use std::fs;
     use tokio::process::Command;
 
@@ -370,7 +370,9 @@ mod macos {
         let domain = if is_system {
             "system".to_string()
         } else {
-            format!("gui/{}", unsafe { libc::getuid() })
+            #[allow(unsafe_code)]
+            let uid = unsafe { libc::getuid() };
+            format!("gui/{uid}")
         };
         // bootout may fail if not currently loaded — tolerate.
         let _ = Command::new("launchctl")
@@ -396,7 +398,7 @@ mod macos {
 
     /// Rewrite the `<array>` under `<key>ProgramArguments</key>`.
     ///
-    /// Text-mode rewrite (no plist XML parser) — the launchd plists ZLayer
+    /// Text-mode rewrite (no plist XML parser) — the launchd plists `ZLayer`
     /// writes are compact enough for this to be safe. If the format is
     /// unexpected we bail rather than mangle it.
     pub(super) fn rewrite_program_arguments(
@@ -421,7 +423,12 @@ mod macos {
         let mut args: Vec<String> = args_block
             .split("<string>")
             .skip(1)
-            .filter_map(|chunk| chunk.split("</string>").next().map(|s| s.to_string()))
+            .filter_map(|chunk| {
+                chunk
+                    .split("</string>")
+                    .next()
+                    .map(std::string::ToString::to_string)
+            })
             .collect();
 
         let mut i = 0;

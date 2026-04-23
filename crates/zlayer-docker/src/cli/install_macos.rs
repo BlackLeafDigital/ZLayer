@@ -9,7 +9,7 @@
 //!    shell shims (fallback to `{data_dir}/bin`).
 //! 3. Write `DOCKER_HOST` + `DOCKER_BUILDKIT=0` into `~/.zlayer/env.sh`
 //!    plus a guarded block in shell rc files.
-//! 4. Offer to symlink `/var/run/docker.sock` to the ZLayer socket, but
+//! 4. Offer to symlink `/var/run/docker.sock` to the `ZLayer` socket, but
 //!    only when running as root; otherwise print guidance to re-run
 //!    with `sudo` or set `DOCKER_HOST` manually.
 
