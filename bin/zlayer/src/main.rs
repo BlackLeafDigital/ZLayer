@@ -599,8 +599,20 @@ async fn run(
             output,
             gzip,
         } => commands::registry::handle_export(&cli, image, output, *gzip).await,
-        Commands::Import { input, tag } => {
-            commands::registry::handle_import(&cli, input, tag.clone()).await
+        Commands::Import {
+            input,
+            tag,
+            username,
+            password,
+        } => {
+            commands::registry::handle_import(
+                &cli,
+                input,
+                tag.clone(),
+                username.as_deref(),
+                password.as_deref(),
+            )
+            .await
         }
         Commands::Pull { image } => {
             commands::registry::handle_pull(image, &cli.effective_data_dir()).await

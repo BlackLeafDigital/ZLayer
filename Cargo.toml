@@ -80,6 +80,9 @@ openidconnect = "3.5"
 oauth2 = "4.4"
 url = "2.5"
 
+# CIDR parsing (used by zlayer-proxy for trusted-proxy lists and Cloudflare IP matching)
+ipnet = "2"
+
 # TLS
 rustls = "0.23"
 rustls-pemfile = "2"

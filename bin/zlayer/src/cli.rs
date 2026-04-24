@@ -541,14 +541,26 @@ pub(crate) enum Commands {
     ///   zlayer import myapp.tar
     ///   zlayer import myapp.tar.gz -t myapp:imported
     ///   zlayer import /path/to/image.tar --tag myapp:v1.0
+    ///   zlayer import <https://forge.example.com/.../myapp-oci.tar>
+    ///   zlayer import <https://forge.example.com/.../myapp-oci.tar> -u user -p token
     #[command(verbatim_doc_comment, display_order = 22)]
     Import {
-        /// Input tar file path
-        input: PathBuf,
+        /// Input: either a local tar file path or an http(s):// URL to an OCI
+        /// tar archive. URL fetches support optional HTTP Basic auth via
+        /// `--username` / `--password`.
+        input: String,
 
         /// Tag to apply to imported image
         #[arg(short, long)]
         tag: Option<String>,
+
+        /// HTTP Basic auth username (URL input only)
+        #[arg(short = 'u', long)]
+        username: Option<String>,
+
+        /// HTTP Basic auth password (URL input only)
+        #[arg(short = 'p', long)]
+        password: Option<String>,
     },
 
     // ── Cluster & Infrastructure ──────────────────────────────────────

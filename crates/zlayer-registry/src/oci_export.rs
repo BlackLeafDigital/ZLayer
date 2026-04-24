@@ -481,23 +481,39 @@ pub async fn export_image(
 /// # Ok(())
 /// # }
 /// ```
-#[allow(clippy::too_many_lines)]
 pub async fn import_image(
     registry: &LocalRegistry,
     input: &Path,
     tag: Option<&str>,
     blob_cache: Option<&dyn crate::cache::BlobCacheBackend>,
 ) -> Result<ImportInfo, ImportError> {
-    // Read the archive
     let archive_data = fs::read(input).await?;
+    import_image_from_bytes(registry, archive_data, tag, blob_cache).await
+}
 
-    // Determine if it's compressed
-    let input_str = input.to_string_lossy();
-    let is_compressed =
-        input_str.ends_with(".gz") || input_str.ends_with(".tgz") || is_gzip(&archive_data);
-
-    // Decompress if needed
-    let tar_data = if is_compressed {
+/// Import an image from OCI tar archive bytes already resident in memory.
+///
+/// Same semantics as [`import_image`], but accepts an in-memory byte buffer
+/// instead of reading from disk. Used by the `zlayer import --url` code path
+/// (which fetches the archive over HTTP via [`crate::fetch_archive_from_url`])
+/// and by any other caller that already has the archive bytes in hand.
+///
+/// Compression is auto-detected from the gzip magic number — no filename is
+/// needed. Bytes may be a plain tar or a gzip-compressed tar.
+///
+/// # Errors
+///
+/// Returns [`ImportError`] on invalid OCI layout, missing/malformed manifest,
+/// unknown blob references, or local registry I/O failures.
+#[allow(clippy::too_many_lines)]
+pub async fn import_image_from_bytes(
+    registry: &LocalRegistry,
+    archive_data: Vec<u8>,
+    tag: Option<&str>,
+    blob_cache: Option<&dyn crate::cache::BlobCacheBackend>,
+) -> Result<ImportInfo, ImportError> {
+    // Decompress if gzipped (magic-number detection, no filename required)
+    let tar_data = if is_gzip(&archive_data) {
         let mut decoder = GzDecoder::new(&archive_data[..]);
         let mut decompressed = Vec::new();
         decoder.read_to_end(&mut decompressed)?;

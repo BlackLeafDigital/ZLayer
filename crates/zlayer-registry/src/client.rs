@@ -1634,10 +1634,65 @@ fn is_blob_not_found(err: &oci_client::errors::OciDistributionError) -> bool {
     }
 }
 
+/// Fetch raw bytes from an HTTP(S) URL with optional HTTP Basic authentication.
+///
+/// This is the low-level primitive used by all other `fetch_*_from_url` helpers
+/// in this module — `fetch_blob_from_url` (with digest/size verification),
+/// `fetch_archive_from_url` (non-empty archive assertion), and any future
+/// content-type-specific fetcher. It performs no validation on the response
+/// body beyond HTTP status; callers are responsible for any content-specific
+/// checks. `context` is a short human-readable label used to prefix error
+/// messages (e.g. `"foreign-layer redirect"`, `"archive fetch"`).
+///
+/// The caller is responsible for supplying an HTTPS URL when credentials are
+/// involved — TLS is never bypassed.
+///
+/// # Errors
+///
+/// Returns [`RegistryError::Cache`] on HTTP client construction failure,
+/// network error, non-2xx status code, or I/O error while reading the
+/// response body. The URL and `context` are included in the error for
+/// diagnostics.
+pub async fn fetch_from_url(
+    url: &str,
+    auth: Option<(&str, &str)>,
+    context: &str,
+) -> Result<Vec<u8>> {
+    let client = reqwest::Client::builder().build().map_err(|e| {
+        RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
+            "failed to build HTTP client for {context} {url}: {e}"
+        )))
+    })?;
+
+    let mut req = client.get(url);
+    if let Some((user, pw)) = auth {
+        req = req.basic_auth(user, Some(pw));
+    }
+
+    let response = req.send().await.map_err(|e| {
+        RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
+            "{context} GET {url} failed: {e}"
+        )))
+    })?;
+
+    if !response.status().is_success() {
+        return Err(RegistryError::Cache(crate::error::CacheError::Corrupted(
+            format!("{context} {url} returned HTTP {}", response.status()),
+        )));
+    }
+
+    let bytes = response.bytes().await.map_err(|e| {
+        RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
+            "failed to read {context} body from {url}: {e}"
+        )))
+    })?;
+
+    Ok(bytes.to_vec())
+}
+
 /// Fetch a foreign layer blob from an out-of-registry URL (e.g. MCR) and
 /// verify that its SHA-256 digest matches `expected_digest`. Size is verified
-/// against `expected_size` when the value is `Some(n)` and `n >= 0`. The caller
-/// is responsible for supplying an HTTPS URL — TLS is never bypassed.
+/// against `expected_size` when the value is `Some(n)` and `n >= 0`.
 async fn fetch_blob_from_url(
     url: &str,
     expected_digest: &str,
@@ -1645,32 +1700,7 @@ async fn fetch_blob_from_url(
 ) -> Result<Vec<u8>> {
     use sha2::{Digest, Sha256};
 
-    let client = reqwest::Client::builder().build().map_err(|e| {
-        RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
-            "failed to build HTTP client for foreign-layer redirect {url}: {e}"
-        )))
-    })?;
-
-    let response = client.get(url).send().await.map_err(|e| {
-        RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
-            "foreign-layer redirect GET {url} failed: {e}"
-        )))
-    })?;
-
-    if !response.status().is_success() {
-        return Err(RegistryError::Cache(crate::error::CacheError::Corrupted(
-            format!(
-                "foreign-layer redirect {url} returned HTTP {}",
-                response.status()
-            ),
-        )));
-    }
-
-    let bytes = response.bytes().await.map_err(|e| {
-        RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
-            "failed to read foreign-layer body from {url}: {e}"
-        )))
-    })?;
+    let bytes = fetch_from_url(url, None, "foreign-layer redirect").await?;
 
     if bytes.is_empty() {
         return Err(RegistryError::Cache(crate::error::CacheError::Corrupted(
@@ -1705,7 +1735,36 @@ async fn fetch_blob_from_url(
         )));
     }
 
-    Ok(bytes.to_vec())
+    Ok(bytes)
+}
+
+/// Fetch an OCI tar archive (or tar.gz) from a remote HTTP(S) URL with optional
+/// HTTP Basic authentication.
+///
+/// Unlike [`fetch_blob_from_url`], there is no digest verification — OCI
+/// archives are not content-addressable blobs by URL. Validation happens
+/// inside the importer via the embedded `oci-layout` + manifest digests.
+/// Only asserts the response body is non-empty so callers get a clean error
+/// message on accidental 200-with-empty-body responses from misconfigured
+/// object stores.
+///
+/// Suitable for authenticating against Forgejo / Gitea generic-package APIs,
+/// Nexus raw repositories, and similar file-blob endpoints.
+///
+/// # Errors
+///
+/// Returns [`RegistryError::Cache`] on any HTTP/network error (propagated
+/// from [`fetch_from_url`]) or when the response body is empty.
+pub async fn fetch_archive_from_url(url: &str, auth: Option<(&str, &str)>) -> Result<Vec<u8>> {
+    let bytes = fetch_from_url(url, auth, "archive fetch").await?;
+
+    if bytes.is_empty() {
+        return Err(RegistryError::Cache(crate::error::CacheError::Corrupted(
+            format!("archive fetch {url} returned empty body"),
+        )));
+    }
+
+    Ok(bytes)
 }
 
 /// Convert a [`zlayer_spec::RegistryAuth`] into the [`RegistryAuth`] shape
@@ -3044,6 +3103,43 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_archive_from_url_rejects_invalid_url() {
+        let result = fetch_archive_from_url("not-a-url", None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_archive_from_url_rejects_unreachable_host() {
+        // 127.0.0.1:1 is not bound; connect refused happens synchronously.
+        let result = fetch_archive_from_url("http://127.0.0.1:1/archive.tar", None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_archive_from_url_accepts_basic_auth_without_panic() {
+        // Auth should be forwarded to the reqwest builder; errors still surface
+        // cleanly when the host is unreachable. Regression guard for the
+        // `.basic_auth(user, Some(pw))` call path.
+        let result =
+            fetch_archive_from_url("http://127.0.0.1:1/archive.tar", Some(("user", "password")))
+                .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_from_url_surfaces_context_in_error() {
+        let result = fetch_from_url("http://127.0.0.1:1/thing", None, "test-context").await;
+        let Err(err) = result else {
+            panic!("expected connect-refused error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("test-context"),
+            "error should include context label, got: {msg}"
+        );
     }
 
     #[tokio::test]

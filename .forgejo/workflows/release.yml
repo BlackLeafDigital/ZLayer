@@ -154,6 +154,17 @@ jobs:
             "${BASE_URL}/zlayer-windows-amd64.zip"
           echo "OK zlayer-windows-amd64.zip"
 
+          # Compat alias: zlayer-windows-amd64-hcs.exe is the same binary as
+          # the one inside zlayer-windows-amd64.zip, kept for one release so
+          # anything pinning the pre-F-7a name keeps working. Remove after
+          # the next release.
+          echo "Downloading zlayer-windows-amd64-hcs.exe (compat alias)..."
+          curl -L --fail --max-time 300 --connect-timeout 30 --retry 3 --retry-delay 5 \
+            --user "$AUTH" \
+            -o "artifacts/zlayer-windows-amd64-hcs.exe" \
+            "${BASE_URL}/zlayer-windows-amd64-hcs.exe"
+          echo "OK zlayer-windows-amd64-hcs.exe"
+
       - name: Upload to Forgejo Packages
         if: steps.check.outputs.completed != 'true'
         shell: bash

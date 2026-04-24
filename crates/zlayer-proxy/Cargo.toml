@@ -34,6 +34,8 @@ async-trait = { workspace = true }
 dashmap = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+ipnet = { workspace = true }
+reqwest = { workspace = true }
 
 # Tower middleware
 tower = { workspace = true }

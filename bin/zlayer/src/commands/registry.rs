@@ -1,9 +1,19 @@
 use anyhow::{Context, Result};
 use std::path::Path;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::cli::Cli;
 use crate::util::parse_image_reference;
+
+/// Returns true when `input` looks like an http:// or https:// URL.
+///
+/// Used by `zlayer import` to decide whether to treat the input as a remote
+/// archive (fetched over HTTP) or a local file path. Deliberately simple —
+/// we don't need full URL parsing here; reqwest validates the URL on send.
+fn looks_like_url(input: &str) -> bool {
+    let lower = input.to_ascii_lowercase();
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
 
 /// Handle export command - export image to OCI tar archive
 #[allow(clippy::cast_precision_loss)]
@@ -38,10 +48,23 @@ pub(crate) async fn handle_export(cli: &Cli, image: &str, output: &Path, gzip: b
     Ok(())
 }
 
-/// Handle import command - import image from OCI tar archive
+/// Handle import command - import image from a local OCI tar archive or a
+/// remote http(s):// URL pointing at one.
+///
+/// `username` / `password` are honored only when `input` is a URL; a warning
+/// is emitted if they're supplied with a local path.
 #[allow(clippy::cast_precision_loss)]
-pub(crate) async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) -> Result<()> {
-    use zlayer_registry::{import_image, LocalRegistry, PersistentBlobCache};
+pub(crate) async fn handle_import(
+    cli: &Cli,
+    input: &str,
+    tag: Option<String>,
+    username: Option<&str>,
+    password: Option<&str>,
+) -> Result<()> {
+    use zlayer_registry::{
+        fetch_archive_from_url, import_image, import_image_from_bytes, LocalRegistry,
+        PersistentBlobCache,
+    };
 
     let registry_path = cli.effective_data_dir().join("registry");
     let registry = LocalRegistry::new(registry_path)
@@ -57,12 +80,47 @@ pub(crate) async fn handle_import(cli: &Cli, input: &Path, tag: Option<String>) 
         .await
         .context("Failed to open blob cache")?;
 
-    info!("Importing from {}", input.display());
-    println!("Importing from {}...", input.display());
+    let import_info = if looks_like_url(input) {
+        let auth = match (username, password) {
+            (Some(u), Some(p)) => Some((u, p)),
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "--username and --password must be supplied together for URL imports"
+                );
+            }
+            (None, None) => None,
+        };
 
-    let import_info = import_image(&registry, input, tag.as_deref(), Some(&blob_cache))
-        .await
-        .context("Failed to import image")?;
+        info!("Fetching archive from {}", input);
+        println!("Fetching from {input}...");
+
+        let bytes = fetch_archive_from_url(input, auth)
+            .await
+            .context("Failed to fetch archive from URL")?;
+
+        println!(
+            "Fetched {:.2} MB, importing...",
+            bytes.len() as f64 / 1024.0 / 1024.0
+        );
+
+        import_image_from_bytes(&registry, bytes, tag.as_deref(), Some(&blob_cache))
+            .await
+            .context("Failed to import image")?
+    } else {
+        if username.is_some() || password.is_some() {
+            warn!(
+                "--username / --password are only used for URL imports; ignoring for local path input"
+            );
+        }
+
+        let path = Path::new(input);
+        info!("Importing from {}", path.display());
+        println!("Importing from {}...", path.display());
+
+        import_image(&registry, path, tag.as_deref(), Some(&blob_cache))
+            .await
+            .context("Failed to import image")?
+    };
 
     println!("Imported successfully!");
     println!("  Digest: {}", import_info.digest);

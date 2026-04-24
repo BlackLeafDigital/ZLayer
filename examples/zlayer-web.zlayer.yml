@@ -2,11 +2,14 @@
 #
 # Deploys the Leptos SSR + Hydration web UI.
 #
-# Build the image first:
-#   zlayer build -f docker/ZImagefile.zlayer-web -t zlayer-web:latest .
-#
-# Then deploy:
-#   zlayer deploy -f examples/zlayer-web.zlayer.yml
+# Deploy zlayer.dev landing page:
+# 1. Fetch the published OCI tar from Forgejo:
+#      zlayer import --url https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/<VERSION>/zlayer-web-<VERSION>-oci.tar \
+#        --username zachhandley --password <FORGEJO_TOKEN>
+# 2. Drop the Cloudflare Origin Certificate pair into <data_dir>/certs/zlayer.dev.{crt,key}
+# 3. Point zlayer.dev DNS A record at this server's IP (orange-cloud ON, Full-strict)
+# 4. Deploy:
+#      zlayer deploy examples/zlayer-web.zlayer.yml
 
 version: v1
 deployment: zlayer-web
@@ -31,11 +34,12 @@ services:
       - name: http
         protocol: http
         port: 3000
+        host: zlayer.dev
         expose: public
 
     scale:
       mode: fixed
-      replicas: 2
+      replicas: 1
 
     health:
       start_grace: 15s

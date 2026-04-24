@@ -15,6 +15,9 @@ BINARIES=(
   zlayer-linux-arm64.tar.gz
   zlayer-darwin-amd64.tar.gz
   zlayer-darwin-arm64.tar.gz
+  zlayer-windows-amd64.zip
+  # Compat alias for one release post-F-7a consolidation; drop after next release.
+  zlayer-windows-amd64-hcs.exe
 )
 
 IMAGES=(

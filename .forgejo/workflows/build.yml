@@ -259,101 +259,17 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-arm64.tar.gz completions
 
+  # Single consolidated Windows build. Prior to Phase F-7a the workflow shipped
+  # two Windows variants: a "thin CLI" (--features wsl alone, proxied commands
+  # to a daemon inside WSL2) and an HCS-runtime build. After F-7a the wsl
+  # feature is a delegate runtime inside the HCS CompositeRuntime, not a
+  # standalone backend, so the thin build is obsolete. This job builds the
+  # hcs-runtime,wsl combo -- the feature set CI already validates in
+  # .forgejo/workflows/ci.yaml -- and ships it as zlayer-windows-amd64.zip.
+  # zlayer-windows-amd64-hcs.exe is also uploaded as a one-release compat
+  # alias for any downstream consumer that pinned the old name; scheduled for
+  # removal after the next release.
   build-windows-amd64:
-    needs: [check-existing]
-    if: needs.check-existing.outputs.need_build == 'true'
-    runs-on: windows-latest
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.sha }}
-      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
-      - name: Install Git Bash
-        uses: https://forge.blackleafdigital.com/Public/actions/install-git-bash@main
-      - name: Check step status
-        id: check
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: check
-          version: ${{ inputs.version }}
-          step: build-windows-amd64
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-      - name: Restore cache
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
-        with:
-          mode: restore
-          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          path: ${{ env.CARGO_HOME }}/registry ${{ env.CARGO_HOME }}/git
-          bucket: ${{ secrets.S3_BUCKET }}
-          endpoint: https://${{ secrets.S3_ENDPOINT }}
-          region: ${{ secrets.S3_REGION }}
-          access-key: ${{ secrets.S3_ACCESS_KEY }}
-          secret-key: ${{ secrets.S3_ACCESS_SECRET }}
-      - name: Install protobuf
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
-        with:
-          packages: 'protoc'
-          cross-platform: 'true'
-      - name: Export PROTOC env
-        if: steps.check.outputs.completed != 'true'
-        shell: bash
-        run: echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
-      - name: Set workspace version
-        if: steps.check.outputs.completed != 'true'
-        shell: bash
-        run: |
-          RAW="${{ inputs.version }}"
-          VERSION="${RAW#v}"
-          sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
-          grep '^version = ' Cargo.toml
-      - name: Build (thin Windows CLI)
-        if: steps.check.outputs.completed != 'true'
-        run: cargo build --release --package zlayer --no-default-features --features wsl
-      - name: Install 7zip
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
-        with:
-          packages: '7zip'
-          cross-platform: 'true'
-      - name: Generate shell completions
-        if: steps.check.outputs.completed != 'true'
-        shell: bash
-        run: |
-          # Runner and binary target are both windows-x86_64; binary runs natively.
-          mkdir -p completions
-          ./target/release/zlayer.exe completions bash > completions/zlayer.bash
-          ./target/release/zlayer.exe completions zsh > completions/_zlayer
-          ./target/release/zlayer.exe completions fish > completions/zlayer.fish
-          ./target/release/zlayer.exe completions powershell > completions/zlayer.ps1
-          ./target/release/zlayer.exe completions elvish > completions/zlayer.elv
-      - name: Package
-        if: steps.check.outputs.completed != 'true'
-        shell: bash
-        run: 7z a zlayer-windows-amd64.zip target/release/zlayer.exe completions
-      - name: Upload artifact
-        if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
-        with:
-          name: zlayer-windows-amd64
-          path: zlayer-windows-amd64.zip
-          retention-days: 1
-      - name: Mark step complete
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: mark
-          version: ${{ inputs.version }}
-          step: build-windows-amd64
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-
-  build-windows-amd64-hcs:
     needs: [check-existing]
     if: needs.check-existing.outputs.need_build == 'true'
     runs-on: windows-latest
@@ -371,7 +287,7 @@ jobs:
         with:
           mode: check
           version: ${{ inputs.version }}
-          step: build-windows-amd64-hcs
+          step: build-windows-amd64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
@@ -405,19 +321,50 @@ jobs:
           VERSION="${RAW#v}"
           sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
-      - name: Build zlayer with hcs-runtime feature
+      - name: Build
         if: steps.check.outputs.completed != 'true'
-        run: cargo build --release --package zlayer --no-default-features --features hcs-runtime
+        run: cargo build --release --package zlayer --no-default-features --features hcs-runtime,wsl
+      - name: Smoke test (binary launches)
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: ./target/release/zlayer.exe --version
       - name: Test zlayer-hcs on Windows
         if: steps.check.outputs.completed != 'true'
         run: cargo test --package zlayer-hcs --no-fail-fast
-      - name: Stage binary
+      - name: Install 7zip
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
+        with:
+          packages: '7zip'
+          cross-platform: 'true'
+      - name: Generate shell completions
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          mkdir -p completions
+          ./target/release/zlayer.exe completions bash > completions/zlayer.bash
+          ./target/release/zlayer.exe completions zsh > completions/_zlayer
+          ./target/release/zlayer.exe completions fish > completions/zlayer.fish
+          ./target/release/zlayer.exe completions powershell > completions/zlayer.ps1
+          ./target/release/zlayer.exe completions elvish > completions/zlayer.elv
+      - name: Package
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: 7z a zlayer-windows-amd64.zip target/release/zlayer.exe completions
+      - name: Stage -hcs.exe compat alias
         if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
           mkdir -p hcs-artifact
           cp target/release/zlayer.exe hcs-artifact/zlayer-windows-amd64-hcs.exe
-      - name: Upload artifact
+      - name: Upload artifact (primary)
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: zlayer-windows-amd64
+          path: zlayer-windows-amd64.zip
+          retention-days: 1
+      - name: Upload artifact (-hcs.exe compat alias)
         if: steps.check.outputs.completed != 'true'
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
@@ -430,14 +377,14 @@ jobs:
         with:
           mode: mark
           version: ${{ inputs.version }}
-          step: build-windows-amd64-hcs
+          step: build-windows-amd64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Cleanup
         if: steps.check.outputs.completed != 'true'
         shell: bash
-        run: rm -rf target hcs-artifact
+        run: rm -rf target hcs-artifact zlayer-windows-amd64.zip completions
 
   # ===========================================
   # Wave 2: Image build + macOS amd64 (2 parallel)
