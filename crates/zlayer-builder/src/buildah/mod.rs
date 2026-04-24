@@ -31,12 +31,36 @@ pub use install::{
     BuildahInstaller, InstallError,
 };
 
+use crate::backend::ImageOs;
 use crate::dockerfile::{
     AddInstruction, CopyInstruction, EnvInstruction, ExposeInstruction, HealthcheckInstruction,
     Instruction, RunInstruction, ShellOrExec,
 };
 
 use std::collections::HashMap;
+
+/// Default shell used for `RUN <cmd>` (shell form) on Linux targets.
+///
+/// Matches the historical default used by Docker / buildah and keeps the
+/// generated buildah command byte-identical to what we emitted before the
+/// OS-aware translator landed.
+const LINUX_DEFAULT_SHELL: &[&str] = &["/bin/sh", "-c"];
+
+/// Default shell used for `RUN <cmd>` (shell form) on Windows targets.
+///
+/// Matches Docker's Windows default (`cmd /S /C`) used when no `SHELL`
+/// instruction has overridden it.
+const WINDOWS_DEFAULT_SHELL: &[&str] = &["cmd.exe", "/S", "/C"];
+
+/// Return the default shell-form prefix for an OS when no `SHELL` instruction
+/// has been seen.
+fn default_shell_for(os: ImageOs) -> Vec<String> {
+    let raw: &[&str] = match os {
+        ImageOs::Linux => LINUX_DEFAULT_SHELL,
+        ImageOs::Windows => WINDOWS_DEFAULT_SHELL,
+    };
+    raw.iter().map(|s| (*s).to_string()).collect()
+}
 
 /// A buildah command ready for execution
 #[derive(Debug, Clone)]
@@ -240,17 +264,45 @@ impl BuildahCommand {
     // Run Commands
     // =========================================================================
 
-    /// Run a command in the container (shell form)
+    /// Run a command in the container (shell form) using the Linux default shell.
     ///
     /// `buildah run <container> -- /bin/sh -c "<command>"`
+    ///
+    /// For OS-aware translation (Windows targets, or honoring a `SHELL`
+    /// override), prefer [`Self::run_shell_custom`] or the stateful
+    /// [`DockerfileTranslator`].
     #[must_use]
     pub fn run_shell(container: &str, command: &str) -> Self {
-        Self::new("run")
-            .arg(container)
-            .arg("--")
-            .arg("/bin/sh")
-            .arg("-c")
-            .arg(command)
+        Self::run_shell_custom(container, LINUX_DEFAULT_SHELL, command)
+    }
+
+    /// Run a command in the container (shell form) using an explicit shell.
+    ///
+    /// `buildah run <container> -- <shell...> <command>`
+    ///
+    /// The `shell` slice is emitted verbatim before the command argument, e.g.
+    /// `["cmd.exe", "/S", "/C"]` for Windows or `["/bin/bash", "-lc"]` for a
+    /// bash-login override.
+    #[must_use]
+    pub fn run_shell_custom(
+        container: &str,
+        shell: impl IntoIterator<Item = impl AsRef<str>>,
+        command: &str,
+    ) -> Self {
+        let mut cmd = Self::new("run").arg(container).arg("--");
+        for s in shell {
+            cmd = cmd.arg(s.as_ref().to_string());
+        }
+        cmd.arg(command)
+    }
+
+    /// Run a command in the container (shell form) using the OS default shell.
+    ///
+    /// Linux → `/bin/sh -c`, Windows → `cmd.exe /S /C`.
+    #[must_use]
+    pub fn run_shell_for_os(container: &str, command: &str, os: ImageOs) -> Self {
+        let shell = default_shell_for(os);
+        Self::run_shell_custom(container, &shell, command)
     }
 
     /// Run a command in the container (exec form)
@@ -280,8 +332,25 @@ impl BuildahCommand {
     /// `buildah run [--mount=...] <container> -- <command>`
     ///
     /// This method properly orders the arguments to ensure mounts are applied.
+    ///
+    /// Uses the Linux default shell (`/bin/sh -c`) for shell-form commands.
+    /// For OS-aware translation use [`Self::run_with_mounts_shell`].
     #[must_use]
     pub fn run_with_mounts(container: &str, run: &RunInstruction) -> Self {
+        Self::run_with_mounts_shell(container, run, LINUX_DEFAULT_SHELL)
+    }
+
+    /// Run a command with mount specifications, using an explicit shell for
+    /// shell-form commands.
+    ///
+    /// Exec-form commands ignore `shell` and are emitted verbatim, matching
+    /// Docker/Buildah semantics.
+    #[must_use]
+    pub fn run_with_mounts_shell(
+        container: &str,
+        run: &RunInstruction,
+        shell: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Self {
         let mut cmd = Self::new("run");
 
         // Add --mount arguments BEFORE the container ID
@@ -293,7 +362,12 @@ impl BuildahCommand {
         cmd = cmd.arg(container).arg("--");
 
         match &run.command {
-            ShellOrExec::Shell(s) => cmd.arg("/bin/sh").arg("-c").arg(s),
+            ShellOrExec::Shell(s) => {
+                for part in shell {
+                    cmd = cmd.arg(part.as_ref().to_string());
+                }
+                cmd.arg(s)
+            }
             ShellOrExec::Exec(args) => {
                 for arg in args {
                     cmd = cmd.arg(arg);
@@ -688,72 +762,158 @@ impl BuildahCommand {
     // Convert Instruction to Commands
     // =========================================================================
 
-    /// Convert a Dockerfile instruction to buildah command(s)
+    /// Convert a Dockerfile instruction to buildah command(s) using the Linux
+    /// default shell (`/bin/sh -c`) and POSIX `mkdir -p` semantics.
     ///
-    /// Some instructions map to multiple buildah commands (e.g., multiple ENV vars)
+    /// This is a convenience wrapper around [`DockerfileTranslator`] with
+    /// `target_os = ImageOs::Linux` and no `SHELL` override. It preserves the
+    /// historical byte-for-byte behavior for every call site that existed
+    /// before OS-aware translation landed in Phase L-3.
+    ///
+    /// For Windows targets or when a Dockerfile-level `SHELL` instruction
+    /// needs to be honored across subsequent `RUN`s, construct a
+    /// [`DockerfileTranslator`] explicitly and call
+    /// [`DockerfileTranslator::translate`].
+    ///
+    /// Some instructions map to multiple buildah commands (e.g., multiple
+    /// ENV vars, or WORKDIR emitting both `mkdir` and `config --workingdir`).
+    #[must_use]
     pub fn from_instruction(container: &str, instruction: &Instruction) -> Vec<Self> {
+        DockerfileTranslator::new(ImageOs::Linux).translate(container, instruction)
+    }
+}
+
+/// Stateful translator from [`Instruction`] to [`BuildahCommand`] sequences.
+///
+/// Tracks the target OS and the most recent `SHELL` instruction so that
+/// shell-form `RUN` / `CMD` / `ENTRYPOINT` use the correct shell for the
+/// target platform:
+///
+/// - **Linux, no SHELL override** — `RUN cmd` → `buildah run -- /bin/sh -c "cmd"`
+/// - **Windows, no SHELL override** — `RUN cmd` → `buildah run -- cmd.exe /S /C "cmd"`
+/// - **Any OS with `SHELL ["pwsh", "-Command"]`** — subsequent `RUN cmd` uses
+///   `buildah run -- pwsh -Command "cmd"`
+///
+/// The translator is stateful because Dockerfile `SHELL` instructions persist
+/// across subsequent `RUN`/`CMD`/`ENTRYPOINT` translations until another
+/// `SHELL` replaces them. Callers that translate a multi-instruction stage
+/// should reuse a single translator instance across the full instruction
+/// stream.
+///
+/// This translator is designed to be shared between the buildah backend and
+/// the Phase L-4 HCS (Windows host compute service) backend, so neither needs
+/// to re-implement the shell-form / workdir branching.
+#[derive(Debug, Clone)]
+pub struct DockerfileTranslator {
+    target_os: ImageOs,
+    /// Most recent `SHELL` instruction override, if any. When `None` the
+    /// translator falls back to [`default_shell_for`] for the target OS.
+    shell_override: Option<Vec<String>>,
+}
+
+impl DockerfileTranslator {
+    /// Create a new translator for a given target OS, with no `SHELL` override.
+    #[must_use]
+    pub fn new(target_os: ImageOs) -> Self {
+        Self {
+            target_os,
+            shell_override: None,
+        }
+    }
+
+    /// Return the target OS this translator emits commands for.
+    #[must_use]
+    pub fn target_os(&self) -> ImageOs {
+        self.target_os
+    }
+
+    /// Return the current shell-form prefix: the `SHELL` override if one was
+    /// applied, else the OS default (`/bin/sh -c` on Linux, `cmd.exe /S /C` on
+    /// Windows).
+    #[must_use]
+    pub fn active_shell(&self) -> Vec<String> {
+        match &self.shell_override {
+            Some(s) => s.clone(),
+            None => default_shell_for(self.target_os),
+        }
+    }
+
+    /// Replace the translator's `SHELL` override, matching the effect of a
+    /// Dockerfile `SHELL ["…"]` instruction on subsequent RUN/CMD/ENTRYPOINT
+    /// shell-form commands.
+    pub fn set_shell_override(&mut self, shell: Vec<String>) {
+        self.shell_override = Some(shell);
+    }
+
+    /// Translate a single instruction into zero or more [`BuildahCommand`]s.
+    ///
+    /// Stateful: `SHELL` instructions update the translator's shell override,
+    /// so subsequent `RUN` / `CMD` / `ENTRYPOINT` shell-form translations pick
+    /// up the new shell. `WORKDIR` emits an OS-appropriate pre-mkdir followed
+    /// by `buildah config --workingdir`.
+    #[allow(clippy::too_many_lines)]
+    pub fn translate(&mut self, container: &str, instruction: &Instruction) -> Vec<BuildahCommand> {
         match instruction {
             Instruction::Run(run) => {
-                // Use run_with_mounts if there are any mounts, otherwise use simple run
+                let shell = self.active_shell();
                 if run.mounts.is_empty() {
-                    vec![Self::run(container, &run.command)]
+                    match &run.command {
+                        ShellOrExec::Shell(s) => {
+                            vec![BuildahCommand::run_shell_custom(container, &shell, s)]
+                        }
+                        ShellOrExec::Exec(args) => vec![BuildahCommand::run_exec(container, args)],
+                    }
                 } else {
-                    vec![Self::run_with_mounts(container, run)]
+                    vec![BuildahCommand::run_with_mounts_shell(
+                        container, run, &shell,
+                    )]
                 }
             }
 
             Instruction::Copy(copy) => {
-                vec![Self::copy_instruction(container, copy)]
+                vec![BuildahCommand::copy_instruction(container, copy)]
             }
 
             Instruction::Add(add) => {
-                vec![Self::add_instruction(container, add)]
+                vec![BuildahCommand::add_instruction(container, add)]
             }
 
-            Instruction::Env(env) => Self::config_envs(container, env),
+            Instruction::Env(env) => BuildahCommand::config_envs(container, env),
 
-            Instruction::Workdir(dir) => {
-                // Match Docker's WORKDIR semantics: create the directory in
-                // the rootfs as well as updating image metadata. `buildah
-                // config --workingdir` alone is metadata-only, which leaves
-                // containers that chdir(cwd) at init time failing with
-                // ENOENT when the path wasn't otherwise materialised by a
-                // prior RUN/COPY. mkdir -p is idempotent, so this is safe
-                // when the directory already exists.
-                vec![
-                    Self::run_exec(
-                        container,
-                        &["mkdir".to_string(), "-p".to_string(), dir.clone()],
-                    ),
-                    Self::config_workdir(container, dir),
-                ]
-            }
+            Instruction::Workdir(dir) => self.translate_workdir(container, dir),
 
             Instruction::Expose(expose) => {
-                vec![Self::config_expose(container, expose)]
+                vec![BuildahCommand::config_expose(container, expose)]
             }
 
-            Instruction::Label(labels) => Self::config_labels(container, labels),
+            Instruction::Label(labels) => BuildahCommand::config_labels(container, labels),
 
             Instruction::User(user) => {
-                vec![Self::config_user(container, user)]
+                vec![BuildahCommand::config_user(container, user)]
             }
 
             Instruction::Entrypoint(cmd) => {
-                vec![Self::config_entrypoint(container, cmd)]
+                vec![BuildahCommand::config_entrypoint(container, cmd)]
             }
 
             Instruction::Cmd(cmd) => {
-                vec![Self::config_cmd(container, cmd)]
+                vec![BuildahCommand::config_cmd(container, cmd)]
             }
 
             Instruction::Volume(paths) => paths
                 .iter()
-                .map(|p| Self::config_volume(container, p))
+                .map(|p| BuildahCommand::config_volume(container, p))
                 .collect(),
 
             Instruction::Shell(shell) => {
-                vec![Self::config_shell(container, shell)]
+                // SHELL instruction: update the translator's shell override
+                // AND emit the metadata config --shell so committed images
+                // record the user-declared shell. Both matter: the override
+                // changes how we translate subsequent RUN/CMD/ENTRYPOINT
+                // shell-form instructions in THIS build; the metadata is what
+                // tools like `docker inspect` show on the resulting image.
+                self.set_shell_override(shell.clone());
+                vec![BuildahCommand::config_shell(container, shell)]
             }
 
             Instruction::Arg(_) => {
@@ -762,17 +922,58 @@ impl BuildahCommand {
             }
 
             Instruction::Stopsignal(signal) => {
-                vec![Self::config_stopsignal(container, signal)]
+                vec![BuildahCommand::config_stopsignal(container, signal)]
             }
 
             Instruction::Healthcheck(hc) => {
-                vec![Self::config_healthcheck(container, hc)]
+                vec![BuildahCommand::config_healthcheck(container, hc)]
             }
 
             Instruction::Onbuild(_) => {
                 // ONBUILD would need special handling
                 tracing::warn!("ONBUILD instruction not supported in buildah conversion");
                 vec![]
+            }
+        }
+    }
+
+    /// Emit the commands needed to realise a `WORKDIR <dir>` instruction for
+    /// the target OS.
+    ///
+    /// # Linux
+    ///
+    /// Emits `mkdir -p <dir>` followed by `buildah config --workingdir`. This
+    /// matches Docker's WORKDIR semantics: the directory must exist in the
+    /// rootfs before a process can `chdir()` into it, and `buildah config
+    /// --workingdir` alone is metadata-only.
+    ///
+    /// # Windows
+    ///
+    /// Emits `cmd /S /C "if not exist <dir> mkdir <dir>"` before the
+    /// metadata write. Windows `mkdir` (unlike `mkdir -p`) errors out when the
+    /// directory exists, so we guard with `if not exist` to stay idempotent
+    /// across repeated WORKDIR instructions in the same Dockerfile.
+    fn translate_workdir(&self, container: &str, dir: &str) -> Vec<BuildahCommand> {
+        match self.target_os {
+            ImageOs::Linux => {
+                vec![
+                    BuildahCommand::run_exec(
+                        container,
+                        &["mkdir".to_string(), "-p".to_string(), dir.to_string()],
+                    ),
+                    BuildahCommand::config_workdir(container, dir),
+                ]
+            }
+            ImageOs::Windows => {
+                // Quote the path so paths with spaces (e.g. `C:\Program Files\app`)
+                // survive cmd.exe parsing. `cmd /S /C` strips the outer quotes
+                // before executing, so double-quote the full command and escape
+                // any inner quotes.
+                let guarded = format!(r#"if not exist "{dir}" mkdir "{dir}""#);
+                vec![
+                    BuildahCommand::run_shell_custom(container, WINDOWS_DEFAULT_SHELL, &guarded),
+                    BuildahCommand::config_workdir(container, dir),
+                ]
             }
         }
     }
@@ -1131,5 +1332,278 @@ mod tests {
     fn test_manifest_rm() {
         let cmd = BuildahCommand::manifest_rm("myapp:latest");
         assert_eq!(cmd.args, vec!["manifest", "rm", "myapp:latest"]);
+    }
+
+    // -------------------------------------------------------------------------
+    // L-3: OS-aware translation tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_run_shell_for_os_linux() {
+        let cmd = BuildahCommand::run_shell_for_os("c1", "echo hello", ImageOs::Linux);
+        assert_eq!(
+            cmd.args,
+            vec!["run", "c1", "--", "/bin/sh", "-c", "echo hello"]
+        );
+    }
+
+    #[test]
+    fn test_run_shell_for_os_windows() {
+        let cmd = BuildahCommand::run_shell_for_os("c1", "echo hello", ImageOs::Windows);
+        assert_eq!(
+            cmd.args,
+            vec!["run", "c1", "--", "cmd.exe", "/S", "/C", "echo hello"]
+        );
+    }
+
+    #[test]
+    fn test_run_shell_custom_powershell() {
+        let shell = ["powershell", "-Command"];
+        let cmd = BuildahCommand::run_shell_custom("c1", shell, "Get-Process");
+        assert_eq!(
+            cmd.args,
+            vec!["run", "c1", "--", "powershell", "-Command", "Get-Process"]
+        );
+    }
+
+    #[test]
+    fn test_translator_linux_run_shell_default() {
+        let mut t = DockerfileTranslator::new(ImageOs::Linux);
+        let instr = Instruction::Run(RunInstruction::shell("apt-get update"));
+        let cmds = t.translate("c1", &instr);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(
+            cmds[0].args,
+            vec!["run", "c1", "--", "/bin/sh", "-c", "apt-get update"]
+        );
+    }
+
+    #[test]
+    fn test_translator_windows_run_shell_default() {
+        let mut t = DockerfileTranslator::new(ImageOs::Windows);
+        let instr = Instruction::Run(RunInstruction::shell("dir C:\\"));
+        let cmds = t.translate("c1", &instr);
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(
+            cmds[0].args,
+            vec!["run", "c1", "--", "cmd.exe", "/S", "/C", "dir C:\\"]
+        );
+    }
+
+    #[test]
+    fn test_translator_shell_override_linux_bash() {
+        // SHELL ["/bin/bash", "-lc"] then RUN cmd → uses bash
+        let mut t = DockerfileTranslator::new(ImageOs::Linux);
+
+        let shell_instr = Instruction::Shell(vec!["/bin/bash".to_string(), "-lc".to_string()]);
+        let shell_cmds = t.translate("c1", &shell_instr);
+        // SHELL emits the metadata config --shell
+        assert_eq!(shell_cmds.len(), 1);
+        assert!(shell_cmds[0].args.contains(&"--shell".to_string()));
+
+        let run_instr = Instruction::Run(RunInstruction::shell("set -e; echo $SHELL"));
+        let run_cmds = t.translate("c1", &run_instr);
+        assert_eq!(run_cmds.len(), 1);
+        assert_eq!(
+            run_cmds[0].args,
+            vec!["run", "c1", "--", "/bin/bash", "-lc", "set -e; echo $SHELL"]
+        );
+    }
+
+    #[test]
+    fn test_translator_shell_override_windows_powershell() {
+        // SHELL ["powershell", "-Command"] then RUN cmd on Windows → uses
+        // powershell, not the default cmd.exe /S /C.
+        let mut t = DockerfileTranslator::new(ImageOs::Windows);
+
+        let shell_instr =
+            Instruction::Shell(vec!["powershell".to_string(), "-Command".to_string()]);
+        t.translate("c1", &shell_instr);
+
+        let run_instr = Instruction::Run(RunInstruction::shell("Get-Process"));
+        let run_cmds = t.translate("c1", &run_instr);
+        assert_eq!(run_cmds.len(), 1);
+        assert_eq!(
+            run_cmds[0].args,
+            vec!["run", "c1", "--", "powershell", "-Command", "Get-Process"]
+        );
+    }
+
+    #[test]
+    fn test_translator_shell_override_persists_across_runs() {
+        // Two RUNs after a single SHELL should both use the overridden shell.
+        let mut t = DockerfileTranslator::new(ImageOs::Linux);
+        t.translate(
+            "c1",
+            &Instruction::Shell(vec!["/bin/bash".to_string(), "-c".to_string()]),
+        );
+
+        for _ in 0..2 {
+            let cmds = t.translate("c1", &Instruction::Run(RunInstruction::shell("echo hi")));
+            assert_eq!(
+                cmds[0].args,
+                vec!["run", "c1", "--", "/bin/bash", "-c", "echo hi"]
+            );
+        }
+    }
+
+    #[test]
+    fn test_translator_exec_form_ignores_shell_override() {
+        // Exec-form RUN must not be wrapped with the shell prefix, even
+        // when a SHELL override is active — matches Docker semantics.
+        let mut t = DockerfileTranslator::new(ImageOs::Windows);
+        t.translate(
+            "c1",
+            &Instruction::Shell(vec!["powershell".to_string(), "-Command".to_string()]),
+        );
+
+        let run = Instruction::Run(RunInstruction::exec(vec![
+            "myapp.exe".to_string(),
+            "--flag".to_string(),
+        ]));
+        let cmds = t.translate("c1", &run);
+        assert_eq!(cmds[0].args, vec!["run", "c1", "--", "myapp.exe", "--flag"]);
+    }
+
+    #[test]
+    fn test_translator_workdir_linux() {
+        let mut t = DockerfileTranslator::new(ImageOs::Linux);
+        let cmds = t.translate("c1", &Instruction::Workdir("/app".to_string()));
+        assert_eq!(cmds.len(), 2);
+        assert_eq!(cmds[0].args, vec!["run", "c1", "--", "mkdir", "-p", "/app"]);
+        assert_eq!(cmds[1].args, vec!["config", "--workingdir", "/app", "c1"]);
+    }
+
+    #[test]
+    fn test_translator_workdir_windows() {
+        let mut t = DockerfileTranslator::new(ImageOs::Windows);
+        let cmds = t.translate("c1", &Instruction::Workdir("C:\\app".to_string()));
+        assert_eq!(cmds.len(), 2);
+        // Pre-mkdir guarded with `if not exist` so a repeated WORKDIR in the
+        // same Dockerfile doesn't cause Windows mkdir to error on existence.
+        assert_eq!(
+            cmds[0].args,
+            vec![
+                "run",
+                "c1",
+                "--",
+                "cmd.exe",
+                "/S",
+                "/C",
+                r#"if not exist "C:\app" mkdir "C:\app""#
+            ]
+        );
+        assert_eq!(
+            cmds[1].args,
+            vec!["config", "--workingdir", "C:\\app", "c1"]
+        );
+    }
+
+    #[test]
+    fn test_translator_workdir_windows_path_with_spaces() {
+        // Paths containing spaces (e.g. `C:\Program Files\app`) must be quoted
+        // for cmd.exe, which is why the mkdir command we emit wraps the path
+        // in double-quotes.
+        let mut t = DockerfileTranslator::new(ImageOs::Windows);
+        let cmds = t.translate(
+            "c1",
+            &Instruction::Workdir("C:\\Program Files\\app".to_string()),
+        );
+        assert_eq!(cmds.len(), 2);
+        let mkdir_cmd = &cmds[0].args[6];
+        assert_eq!(
+            mkdir_cmd,
+            r#"if not exist "C:\Program Files\app" mkdir "C:\Program Files\app""#
+        );
+    }
+
+    #[test]
+    fn test_from_instruction_preserves_linux_byte_identical_output() {
+        // Backward-compat guarantee: the legacy `from_instruction` entrypoint
+        // must emit the exact same byte-for-byte commands as it did before
+        // the translator refactor. The existing Linux callers (buildah backend)
+        // rely on this.
+        let run = Instruction::Run(RunInstruction::shell("echo hello"));
+        let legacy = BuildahCommand::from_instruction("c1", &run);
+        let via_translator = DockerfileTranslator::new(ImageOs::Linux).translate("c1", &run);
+        assert_eq!(legacy.len(), via_translator.len());
+        for (a, b) in legacy.iter().zip(via_translator.iter()) {
+            assert_eq!(a.args, b.args);
+            assert_eq!(a.program, b.program);
+        }
+
+        // WORKDIR must still emit mkdir -p + config --workingdir
+        let workdir = Instruction::Workdir("/workspace".to_string());
+        let legacy = BuildahCommand::from_instruction("c1", &workdir);
+        assert_eq!(legacy.len(), 2);
+        assert_eq!(
+            legacy[0].args,
+            vec!["run", "c1", "--", "mkdir", "-p", "/workspace"]
+        );
+        assert_eq!(
+            legacy[1].args,
+            vec!["config", "--workingdir", "/workspace", "c1"]
+        );
+    }
+
+    #[test]
+    fn test_translator_active_shell_reflects_override() {
+        let mut t = DockerfileTranslator::new(ImageOs::Linux);
+        assert_eq!(t.active_shell(), vec!["/bin/sh", "-c"]);
+
+        t.set_shell_override(vec!["/bin/bash".to_string(), "-lc".to_string()]);
+        assert_eq!(t.active_shell(), vec!["/bin/bash", "-lc"]);
+    }
+
+    #[test]
+    fn test_translator_target_os_accessor() {
+        assert_eq!(
+            DockerfileTranslator::new(ImageOs::Linux).target_os(),
+            ImageOs::Linux
+        );
+        assert_eq!(
+            DockerfileTranslator::new(ImageOs::Windows).target_os(),
+            ImageOs::Windows
+        );
+    }
+
+    #[test]
+    fn test_translator_windows_run_with_mounts_uses_cmd_exe() {
+        use crate::dockerfile::{CacheSharing, RunMount};
+
+        let mut t = DockerfileTranslator::new(ImageOs::Windows);
+        let run = RunInstruction {
+            command: ShellOrExec::Shell("echo cached".to_string()),
+            mounts: vec![RunMount::Cache {
+                target: "C:\\cache".to_string(),
+                id: Some("win-cache".to_string()),
+                sharing: CacheSharing::Shared,
+                readonly: false,
+            }],
+            network: None,
+            security: None,
+        };
+
+        let cmds = t.translate("c1", &Instruction::Run(run));
+        assert_eq!(cmds.len(), 1);
+
+        // --mount= must precede container ID
+        let mount_idx = cmds[0]
+            .args
+            .iter()
+            .position(|a| a.starts_with("--mount="))
+            .expect("mount arg present");
+        let container_idx = cmds[0]
+            .args
+            .iter()
+            .position(|a| a == "c1")
+            .expect("container ID present");
+        assert!(mount_idx < container_idx);
+
+        // Shell form must use cmd.exe /S /C, not /bin/sh -c
+        assert!(cmds[0].args.iter().any(|a| a == "cmd.exe"));
+        assert!(cmds[0].args.iter().any(|a| a == "/S"));
+        assert!(cmds[0].args.iter().any(|a| a == "/C"));
+        assert!(!cmds[0].args.iter().any(|a| a == "/bin/sh"));
     }
 }

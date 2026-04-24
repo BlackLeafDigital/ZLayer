@@ -35,12 +35,14 @@
 //! ```
 
 // Core modules
+pub mod cf_ip_list;
 pub mod config;
 pub mod error;
 pub mod network_policy;
 pub mod server;
 pub mod service;
 pub mod tls;
+pub mod trust;
 pub mod tunnel;
 
 // Load balancing and service routing
@@ -92,6 +94,29 @@ fn default_udp_session_timeout() -> Duration {
     stream::DEFAULT_UDP_SESSION_TIMEOUT
 }
 
+/// Controls whether Cloudflare's published edge IP ranges are treated as
+/// trusted proxies for the purpose of honoring `CF-Connecting-IP` /
+/// `X-Forwarded-For` request headers.
+///
+/// Cloudflare's edge rotates IPs frequently, so hardcoding them is brittle.
+/// `AutoRefresh` periodically re-fetches `https://www.cloudflare.com/ips-v4`
+/// and `…/ips-v6`; `Static` uses a baked-in fallback list only.
+#[derive(Debug, Clone, Default)]
+pub enum CloudflareTrust {
+    /// Don't treat any CF range as trusted. Safest default for servers that
+    /// are not behind Cloudflare.
+    #[default]
+    Off,
+    /// Use the baked-in fallback list of CF CIDRs without refreshing.
+    Static,
+    /// Start with the baked-in list, then re-fetch CF's published ranges on
+    /// the given interval.
+    AutoRefresh {
+        /// How often to re-fetch CF's IP list.
+        interval: std::time::Duration,
+    },
+}
+
 /// Configuration for the `ZLayer` proxy server
 ///
 /// This configuration struct controls the behavior of the proxy,
@@ -120,6 +145,15 @@ pub struct ZLayerProxyConfig {
     pub udp: Vec<stream::UdpListenerConfig>,
     /// Default UDP session timeout (default: 60 seconds)
     pub udp_session_timeout: Duration,
+    /// CIDR ranges whose peer IPs are trusted to set `CF-Connecting-IP` /
+    /// `X-Forwarded-For` headers identifying the real client. Defaults to
+    /// localhost only (`127.0.0.0/8`, `::1/128`) so a public `ZLayer` node that
+    /// accidentally receives direct requests (bypassing any upstream proxy)
+    /// cannot be tricked by spoofed headers.
+    pub trusted_proxy_cidrs: Vec<ipnet::IpNet>,
+    /// Cloudflare-specific trust policy. When enabled, CF's published edge
+    /// ranges are treated as trusted in addition to `trusted_proxy_cidrs`.
+    pub cloudflare_trust: CloudflareTrust,
 }
 
 impl Default for ZLayerProxyConfig {
@@ -139,6 +173,15 @@ impl Default for ZLayerProxyConfig {
             tcp: vec![],
             udp: vec![],
             udp_session_timeout: default_udp_session_timeout(),
+            trusted_proxy_cidrs: vec![
+                "127.0.0.0/8"
+                    .parse()
+                    .expect("hardcoded loopback CIDR is valid"),
+                "::1/128"
+                    .parse()
+                    .expect("hardcoded IPv6 loopback CIDR is valid"),
+            ],
+            cloudflare_trust: CloudflareTrust::default(),
         }
     }
 }
@@ -375,6 +418,8 @@ mod tests {
                 session_timeout: Some(Duration::from_secs(120)),
             }],
             udp_session_timeout: Duration::from_secs(90),
+            trusted_proxy_cidrs: vec![],
+            cloudflare_trust: CloudflareTrust::Off,
         };
         assert_eq!(config.http_addr, "127.0.0.1:8080");
         assert_eq!(config.https_addr, "127.0.0.1:8443");

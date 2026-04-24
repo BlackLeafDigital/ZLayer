@@ -246,6 +246,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         dns: Vec::new(),
         extra_hosts: Vec::new(),
         restart_policy: None,
+        platform: None,
     }
 }
 

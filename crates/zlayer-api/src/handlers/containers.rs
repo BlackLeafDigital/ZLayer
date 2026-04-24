@@ -955,6 +955,7 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
         privileged: false,
         node_mode: NodeMode::default(),
         node_selector: None,
+        platform: None,
         service_type: ServiceType::default(),
         wasm: None,
         logs: None,

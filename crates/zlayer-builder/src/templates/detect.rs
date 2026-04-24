@@ -34,6 +34,18 @@ pub fn detect_runtime(context_path: impl AsRef<Path>) -> Option<Runtime> {
         return Some(Runtime::Wasm(hint));
     }
 
+    // .NET / Visual Studio project files are unambiguous Windows signals.
+    // `project.json` is the legacy dotnet project format. We check these
+    // before the generic Linux-ecosystem heuristics because a .sln/.csproj
+    // next to, say, a stray `requirements.txt` for test scripts is still
+    // primarily a Windows workload.
+    //
+    // NOTE: These are hints only. `resolve_runtime` honors an explicit
+    // runtime name / `--platform` / `os:` override, which always wins.
+    if has_dotnet_project_files(path) {
+        return Some(Runtime::WindowsServerCore);
+    }
+
     // Check for Node.js ecosystem first (most common)
     if path.join("package.json").exists() {
         // Check for Bun - bun.lockb is definitive
@@ -78,7 +90,60 @@ pub fn detect_runtime(context_path: impl AsRef<Path>) -> Option<Runtime> {
         return Some(Runtime::Go);
     }
 
+    // Last resort: a standalone `.exe` at the context root with no Linux
+    // ecosystem indicators present is probably a self-contained Windows
+    // binary that just needs to be wrapped. Suggest the smallest base
+    // (nanoserver).
+    if has_windows_exe(path) {
+        return Some(Runtime::WindowsNanoserver);
+    }
+
     None
+}
+
+/// Return true when the context directory contains any `.sln`, `.csproj`,
+/// `.vcxproj`, or `project.json` file at its root.
+fn has_dotnet_project_files(path: &Path) -> bool {
+    if path.join("project.json").exists() {
+        return true;
+    }
+    dir_has_extension(path, &["sln", "csproj", "vcxproj"])
+}
+
+/// Return true when the context directory contains any `.exe` file at its
+/// root. Only checks the root (not recursive) — users with nested binary
+/// layouts should set the runtime explicitly.
+fn has_windows_exe(path: &Path) -> bool {
+    dir_has_extension(path, &["exe"])
+}
+
+/// Scan the top-level of `path` for any file whose extension matches one of
+/// `extensions` (case-insensitive, no leading dot). Returns false on I/O
+/// errors or if `path` is not a readable directory.
+fn dir_has_extension(path: &Path, extensions: &[&str]) -> bool {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if let Some((_, ext)) = name.rsplit_once('.') {
+            let ext_lower = ext.to_ascii_lowercase();
+            if extensions
+                .iter()
+                .any(|&e| e.eq_ignore_ascii_case(&ext_lower))
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Detect runtime with version hints from project files.
@@ -511,6 +576,114 @@ package = "zlayer:example"
             r#"{"dependencies":{"express":"^4"}}"#,
         )
         .unwrap();
+
+        let runtime = detect_runtime(dir.path());
+        assert_eq!(runtime, Some(Runtime::Node20));
+    }
+
+    // -- Windows detection -----------------------------------------------
+
+    #[test]
+    fn test_detect_windows_servercore_from_sln() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("MyApp.sln"), "").unwrap();
+
+        let runtime = detect_runtime(dir.path());
+        assert_eq!(runtime, Some(Runtime::WindowsServerCore));
+    }
+
+    #[test]
+    fn test_detect_windows_servercore_from_csproj() {
+        let dir = create_temp_dir();
+        fs::write(
+            dir.path().join("MyApp.csproj"),
+            r#"<Project Sdk="Microsoft.NET.Sdk" />"#,
+        )
+        .unwrap();
+
+        let runtime = detect_runtime(dir.path());
+        assert_eq!(runtime, Some(Runtime::WindowsServerCore));
+    }
+
+    #[test]
+    fn test_detect_windows_servercore_from_vcxproj() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("Native.vcxproj"), "").unwrap();
+
+        let runtime = detect_runtime(dir.path());
+        assert_eq!(runtime, Some(Runtime::WindowsServerCore));
+    }
+
+    #[test]
+    fn test_detect_windows_servercore_from_legacy_project_json() {
+        let dir = create_temp_dir();
+        // Legacy dotnet project.json — without this rule, a bare
+        // project.json with no other indicators would go undetected.
+        fs::write(dir.path().join("project.json"), "{}").unwrap();
+
+        let runtime = detect_runtime(dir.path());
+        assert_eq!(runtime, Some(Runtime::WindowsServerCore));
+    }
+
+    #[test]
+    fn test_detect_windows_nanoserver_from_standalone_exe() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("app.exe"), b"MZ\x90\x00").unwrap();
+
+        let runtime = detect_runtime(dir.path());
+        assert_eq!(runtime, Some(Runtime::WindowsNanoserver));
+    }
+
+    #[test]
+    fn test_detect_case_insensitive_exe_extension() {
+        let dir = create_temp_dir();
+        // Windows filesystems are case-insensitive; our scan should be too.
+        fs::write(dir.path().join("App.EXE"), b"MZ").unwrap();
+
+        let runtime = detect_runtime(dir.path());
+        assert_eq!(runtime, Some(Runtime::WindowsNanoserver));
+    }
+
+    #[test]
+    fn test_dotnet_wins_over_linux_python_hint() {
+        // A .sln alongside a requirements.txt (maybe Python test scripts)
+        // should still route to Windows Server Core — .sln is the primary
+        // build artifact for a .NET workload.
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("MyApp.sln"), "").unwrap();
+        fs::write(dir.path().join("requirements.txt"), "requests").unwrap();
+
+        let runtime = detect_runtime(dir.path());
+        assert_eq!(runtime, Some(Runtime::WindowsServerCore));
+    }
+
+    #[test]
+    fn test_exe_does_not_override_rust_project() {
+        // A bare .exe in a Rust project (e.g. a prebuilt test tool) should
+        // NOT demote to Windows Nanoserver — the Cargo.toml wins.
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("Cargo.toml"), "[package]").unwrap();
+        fs::write(dir.path().join("helper.exe"), b"MZ").unwrap();
+
+        let runtime = detect_runtime(dir.path());
+        assert_eq!(runtime, Some(Runtime::Rust));
+    }
+
+    #[test]
+    fn test_exe_does_not_override_go_project() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("go.mod"), "module example.com/app").unwrap();
+        fs::write(dir.path().join("helper.exe"), b"MZ").unwrap();
+
+        let runtime = detect_runtime(dir.path());
+        assert_eq!(runtime, Some(Runtime::Go));
+    }
+
+    #[test]
+    fn test_exe_does_not_override_node_project() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("package.json"), "{}").unwrap();
+        fs::write(dir.path().join("helper.exe"), b"MZ").unwrap();
 
         let runtime = detect_runtime(dir.path());
         assert_eq!(runtime, Some(Runtime::Node20));

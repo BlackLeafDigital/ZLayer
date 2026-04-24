@@ -15,6 +15,9 @@ pub(crate) async fn handle_daemon(action: &DaemonAction, data_dir: &Path) -> Res
             no_swagger,
             #[cfg(feature = "docker-compat")]
             docker_socket,
+            // `install_wsl` is parsed for forward-compatibility (Windows daemon
+            // install is a separate task); the Unix install path ignores it.
+            ..
         } => {
             install(
                 data_dir,
@@ -81,7 +84,7 @@ async fn install(
     bind: &str,
     jwt_secret: Option<&str>,
     no_swagger: bool,
-    #[cfg(feature = "docker-compat")] _docker_socket: bool,
+    #[cfg(feature = "docker-compat")] docker_socket: bool,
 ) -> Result<()> {
     use tokio::process::Command;
 
@@ -111,6 +114,13 @@ async fn install(
     }
     if no_swagger {
         args.push("        <string>--no-swagger</string>".to_string());
+    }
+    #[cfg(feature = "docker-compat")]
+    if docker_socket {
+        args.push("        <string>--docker-socket</string>".to_string());
+        let default_path = zlayer_paths::ZLayerDirs::default_docker_socket_path();
+        args.push("        <string>--docker-socket-path</string>".to_string());
+        args.push(format!("        <string>{default_path}</string>"));
     }
 
     let args_xml = args.join("\n");
@@ -227,6 +237,40 @@ async fn install(
         }
     }
 
+    #[cfg(feature = "docker-compat")]
+    if docker_socket {
+        let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
+        if !shim_dir.exists() {
+            let _ = std::fs::create_dir_all(&shim_dir);
+        }
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::install_shim(&shim_dir, name, target) {
+                Ok(zlayer_docker::shim::ShimInstalled::Fresh(p)) => {
+                    println!("Installed shim: {} -> {target}", p.display());
+                }
+                Ok(zlayer_docker::shim::ShimInstalled::ReplacedExisting { shim, backup }) => {
+                    println!(
+                        "Installed shim: {} -> {target} (backed up existing file to {})",
+                        shim.display(),
+                        backup.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimInstalled::AlreadyOurs(p)) => {
+                    println!("Shim already installed: {}", p.display());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not install {name} shim in {}: {e}",
+                        shim_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -253,6 +297,39 @@ async fn uninstall() -> Result<()> {
     } else {
         println!("No launchd plist found (checked {})", path.display());
     }
+
+    #[cfg(feature = "docker-compat")]
+    {
+        let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::uninstall_shim(&shim_dir, name, target, true) {
+                Ok(zlayer_docker::shim::ShimUninstalled::Removed(p)) => {
+                    println!("Removed shim: {}", p.display());
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::RemovedAndRestored {
+                    shim,
+                    restored_from,
+                }) => {
+                    println!(
+                        "Removed shim {} (restored backup from {})",
+                        shim.display(),
+                        restored_from.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::NotPresent) => {}
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not remove {name} shim from {}: {e}",
+                        shim_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -769,33 +846,37 @@ WantedBy=multi-user.target
         eprintln!("Warning: could not create {}: {e}", log_dir.display());
     }
 
-    // Install Docker CLI shim when docker-compat is enabled
+    // Install Docker + Docker Compose CLI shims when docker-compat is enabled
     #[cfg(feature = "docker-compat")]
     if docker_socket {
         let shim_dir = pick_system_binary_path()
             .parent()
             .unwrap_or(std::path::Path::new("/usr/local/bin"))
             .to_path_buf();
-        let shim_path = shim_dir.join("docker");
-        let shim_content = "#!/bin/sh\nexec zlayer docker \"$@\"\n";
-        match std::fs::write(&shim_path, shim_content) {
-            Ok(()) => {
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755))
-                        .ok();
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::install_shim(&shim_dir, name, target) {
+                Ok(zlayer_docker::shim::ShimInstalled::Fresh(p)) => {
+                    println!("Installed shim: {} -> {target}", p.display());
                 }
-                println!(
-                    "Installed Docker CLI shim: {} -> zlayer docker",
-                    shim_path.display()
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "Warning: could not install Docker shim at {}: {e}",
-                    shim_path.display()
-                );
+                Ok(zlayer_docker::shim::ShimInstalled::ReplacedExisting { shim, backup }) => {
+                    println!(
+                        "Installed shim: {} -> {target} (backed up existing file to {})",
+                        shim.display(),
+                        backup.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimInstalled::AlreadyOurs(p)) => {
+                    println!("Shim already installed: {}", p.display());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not install {name} shim in {}: {e}",
+                        shim_dir.display()
+                    );
+                }
             }
         }
     }
@@ -859,6 +940,46 @@ async fn uninstall() -> Result<()> {
     } else {
         println!("No systemd unit found at {}", path.display());
     }
+
+    // Remove Docker + Docker Compose CLI shims that may have been
+    // installed by `daemon install --docker-socket`.
+    #[cfg(feature = "docker-compat")]
+    {
+        let shim_dir = pick_system_binary_path()
+            .parent()
+            .unwrap_or(std::path::Path::new("/usr/local/bin"))
+            .to_path_buf();
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::uninstall_shim(&shim_dir, name, target, true) {
+                Ok(zlayer_docker::shim::ShimUninstalled::Removed(p)) => {
+                    println!("Removed shim: {}", p.display());
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::RemovedAndRestored {
+                    shim,
+                    restored_from,
+                }) => {
+                    println!(
+                        "Removed shim {} (restored backup from {})",
+                        shim.display(),
+                        restored_from.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::NotPresent) => {
+                    // nothing to do
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not remove {name} shim from {}: {e}",
+                        shim_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -976,6 +1097,556 @@ async fn status(data_dir: &Path) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Windows (SCM-managed service)
+// ---------------------------------------------------------------------------
+//
+// After I-1 (`zlayer serve --service` registers with the Service Control
+// Manager), I-2..I-5 drive the daemon entirely through SCM:
+//
+//   - `install`   — `ServiceManager::create_service` registers the daemon
+//                   under the service name `ZLayerDaemon`, then starts it
+//                   via `Service::start` unless `--no-start` is passed.
+//   - `uninstall` — best-effort SCM stop, then `Service::delete` to
+//                   deregister.  Foreground-running daemons are unaffected.
+//   - `start`     — kept around as a foreground-spawn fallback for users who
+//                   haven't run `install` yet; operators using the SCM
+//                   service should prefer `sc start ZLayerDaemon` or
+//                   (preferred) `zlayer daemon install` then start.
+//   - `stop`      — `Service::stop` sends SERVICE_CONTROL_STOP and polls
+//                   `query_status` until `Stopped` or 30s timeout.  Falls
+//                   back to a message for foreground-running daemons.
+//   - `restart`   — `stop` then `start`.
+//   - `status`    — `Service::query_status` first, falls back to a TCP
+//                   probe via `DaemonClient::try_connect` so a foreground
+//                   daemon still reports as "running (foreground)".
+
+/// Windows Win32 error code returned when an SCM operation targets a service
+/// that isn't registered.  Named to avoid a `0x424` magic number at each use
+/// site; the canonical definition lives in `winerror.h`
+/// (`ERROR_SERVICE_DOES_NOT_EXIST`).
+#[cfg(target_os = "windows")]
+const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
+
+/// Returns `true` when the given [`windows_service::Error`] wraps the Win32
+/// error indicating the target service has not been registered with SCM.
+///
+/// Callers use this to downgrade "service not found" from a hard failure to
+/// a recoverable state (fall back to TCP probe for `status`, print a helpful
+/// message for `stop`, no-op for `uninstall`).
+#[cfg(target_os = "windows")]
+fn is_service_not_found(err: &windows_service::Error) -> bool {
+    matches!(
+        err,
+        windows_service::Error::Winapi(io_err)
+            if io_err.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST)
+    )
+}
+
+/// Build the SCM launch-argument vector for `zlayer serve --service ...`.
+///
+/// Split out so it can be unit-tested without touching SCM: the exact flag
+/// set matters for I-2 (if `serve` doesn't recognize one of these, SCM will
+/// start the process and it'll exit immediately).
+///
+/// The JWT secret, if any, is propagated via `--jwt-secret <value>` on the
+/// SCM command line. This mirrors the Linux install path, which writes the
+/// secret into the systemd unit's `Environment=` line — both are readable
+/// by any local admin via `sc qc` / `systemctl cat`, so there's no extra
+/// exposure beyond what is already accepted.
+#[cfg(target_os = "windows")]
+fn build_service_launch_arguments(
+    data_dir: &Path,
+    bind: &str,
+    jwt_secret: Option<&str>,
+    no_swagger: bool,
+    #[cfg(feature = "docker-compat")] docker_socket: bool,
+) -> Vec<std::ffi::OsString> {
+    use std::ffi::OsString;
+
+    // `--data-dir` is a top-level Cli arg, so it must come BEFORE the
+    // `serve` subcommand — mirrors the Linux/macOS install paths.
+    let mut args: Vec<OsString> = vec![
+        OsString::from("--data-dir"),
+        data_dir.as_os_str().to_os_string(),
+        OsString::from("serve"),
+        OsString::from("--service"),
+        OsString::from("--bind"),
+        OsString::from(bind),
+    ];
+    if no_swagger {
+        args.push(OsString::from("--no-swagger"));
+    }
+    if let Some(secret) = jwt_secret {
+        args.push(OsString::from("--jwt-secret"));
+        args.push(OsString::from(secret));
+    }
+    #[cfg(feature = "docker-compat")]
+    if docker_socket {
+        args.push(OsString::from("--docker-socket"));
+    }
+    args
+}
+
+#[cfg(target_os = "windows")]
+#[allow(clippy::too_many_lines)]
+async fn install(
+    data_dir: &Path,
+    no_start: bool,
+    bind: &str,
+    jwt_secret: Option<&str>,
+    no_swagger: bool,
+    #[cfg(feature = "docker-compat")] docker_socket: bool,
+) -> Result<()> {
+    use std::ffi::{OsStr, OsString};
+    use windows_service::service::{
+        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceType,
+    };
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    // Pre-create the log directory so tracing-appender has a destination on
+    // first SCM start — parity with the systemd install flow.
+    let log_dir = crate::cli::default_log_dir(data_dir);
+    if let Err(e) = std::fs::create_dir_all(&log_dir) {
+        eprintln!("Warning: could not create {}: {e}", log_dir.display());
+    }
+
+    let exe = std::env::current_exe().context("Failed to resolve current executable path")?;
+
+    let launch_arguments = build_service_launch_arguments(
+        data_dir,
+        bind,
+        jwt_secret,
+        no_swagger,
+        #[cfg(feature = "docker-compat")]
+        docker_socket,
+    );
+
+    let service_info = ServiceInfo {
+        name: OsString::from(crate::daemon_service::SERVICE_NAME),
+        display_name: OsString::from("ZLayer Daemon"),
+        service_type: ServiceType::OWN_PROCESS,
+        start_type: ServiceStartType::AutoStart,
+        error_control: ServiceErrorControl::Normal,
+        executable_path: exe.clone(),
+        launch_arguments,
+        dependencies: vec![],
+        // None = LocalSystem. Matches the task spec and the Linux default
+        // (root). Enterprise installs that need a dedicated service account
+        // can `sc config` after install.
+        account_name: None,
+        account_password: None,
+    };
+
+    let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::ALL_ACCESS)
+        .context(
+            "Failed to open Service Control Manager. \
+             Run this command from an elevated (Administrator) prompt.",
+        )?;
+
+    let service = manager
+        .create_service(&service_info, ServiceAccess::ALL_ACCESS)
+        .with_context(|| {
+            format!(
+                "Failed to create Windows Service '{}'. \
+                 If the service is already registered, run `zlayer daemon uninstall` first.",
+                crate::daemon_service::SERVICE_NAME
+            )
+        })?;
+
+    // NB: `jwt_secret` is baked into the SCM command line via
+    // `build_service_launch_arguments` above — SCM does not inherit env
+    // from the installing CLI, so env-passing wouldn't work here.
+
+    println!(
+        "Registered Windows Service '{}' (display: 'ZLayer Daemon').",
+        crate::daemon_service::SERVICE_NAME
+    );
+    println!("  Binary:   {}", exe.display());
+    println!("  Data dir: {}", data_dir.display());
+    println!("  Bind:     {bind}");
+    println!("  Account:  LocalSystem");
+    println!("  Startup:  AutoStart");
+    if no_swagger {
+        println!("  Swagger:  disabled");
+    }
+
+    if !no_start {
+        service.start::<&OsStr>(&[]).with_context(|| {
+            format!(
+                "Failed to start Windows Service '{}'. \
+                 Check the Windows Event Log (Application) for startup errors.",
+                crate::daemon_service::SERVICE_NAME
+            )
+        })?;
+
+        print!("Daemon starting...");
+        // Poll the API endpoint until it's reachable — same readiness
+        // signal as the systemd/launchd paths.
+        match wait_for_daemon_ready(45).await {
+            Ok(()) => {
+                println!(" started");
+                println!("  Stop: zlayer daemon stop");
+            }
+            Err(e) => {
+                println!(" failed");
+                return Err(e);
+            }
+        }
+    }
+
+    #[cfg(feature = "docker-compat")]
+    if docker_socket {
+        let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
+        if !shim_dir.exists() {
+            let _ = std::fs::create_dir_all(&shim_dir);
+        }
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::install_shim(&shim_dir, name, target) {
+                Ok(zlayer_docker::shim::ShimInstalled::Fresh(p)) => {
+                    println!("Installed shim: {} -> {target}", p.display());
+                }
+                Ok(zlayer_docker::shim::ShimInstalled::ReplacedExisting { shim, backup }) => {
+                    println!(
+                        "Installed shim: {} -> {target} (backed up existing file to {})",
+                        shim.display(),
+                        backup.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimInstalled::AlreadyOurs(p)) => {
+                    println!("Shim already installed: {}", p.display());
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not install {name} shim in {}: {e}",
+                        shim_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn uninstall() -> Result<()> {
+    use std::ffi::OsStr;
+    use windows_service::service::ServiceAccess;
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    // Best-effort stop first so we don't leave an orphaned process after
+    // delete. Ignore errors — if it's already stopped (or not registered),
+    // `delete` below will pick up the slack.
+    let _ = stop().await;
+
+    let manager =
+        match ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT) {
+            Ok(m) => m,
+            Err(e) => {
+                return Err(e).context(
+                    "Failed to open Service Control Manager. \
+                 Run this command from an elevated (Administrator) prompt.",
+                );
+            }
+        };
+
+    let service = match manager.open_service(
+        crate::daemon_service::SERVICE_NAME,
+        ServiceAccess::DELETE | ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    ) {
+        Ok(s) => s,
+        Err(e) if is_service_not_found(&e) => {
+            println!(
+                "Windows Service '{}' is not registered; nothing to uninstall.",
+                crate::daemon_service::SERVICE_NAME
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to open Windows Service '{}'",
+                    crate::daemon_service::SERVICE_NAME
+                )
+            });
+        }
+    };
+
+    service.delete().with_context(|| {
+        format!(
+            "Failed to delete Windows Service '{}'",
+            crate::daemon_service::SERVICE_NAME
+        )
+    })?;
+
+    println!(
+        "Unregistered Windows Service '{}'.",
+        crate::daemon_service::SERVICE_NAME
+    );
+
+    #[cfg(feature = "docker-compat")]
+    {
+        let shim_dir = zlayer_paths::ZLayerDirs::default_binary_dir();
+        for (name, target) in [
+            ("docker", "zlayer docker"),
+            ("docker-compose", "zlayer docker compose"),
+        ] {
+            match zlayer_docker::shim::uninstall_shim(&shim_dir, name, target, true) {
+                Ok(zlayer_docker::shim::ShimUninstalled::Removed(p)) => {
+                    println!("Removed shim: {}", p.display());
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::RemovedAndRestored {
+                    shim,
+                    restored_from,
+                }) => {
+                    println!(
+                        "Removed shim {} (restored backup from {})",
+                        shim.display(),
+                        restored_from.display()
+                    );
+                }
+                Ok(zlayer_docker::shim::ShimUninstalled::NotPresent) => {}
+                Err(e) => {
+                    eprintln!(
+                        "Warning: could not remove {name} shim from {}: {e}",
+                        shim_dir.display()
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn start(data_dir: &Path) -> Result<()> {
+    // Kept as a foreground-spawn fallback for users who haven't registered
+    // the SCM service (e.g. during local development). For an installed
+    // service, callers should use `sc start ZLayerDaemon` or re-run
+    // `zlayer daemon install` — we don't promote `start` to an SCM call
+    // here because `install` already starts the service on registration.
+    let bind = "127.0.0.1:3669";
+    spawn_daemon_windows(data_dir, bind, None, false).await
+}
+
+#[cfg(target_os = "windows")]
+async fn stop() -> Result<()> {
+    use std::ffi::OsStr;
+    use std::time::{Duration, Instant};
+    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)
+        .context(
+            "Failed to open Service Control Manager. \
+             Run this command from an elevated (Administrator) prompt.",
+        )?;
+
+    let service = match manager.open_service(
+        crate::daemon_service::SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+    ) {
+        Ok(s) => s,
+        Err(e) if is_service_not_found(&e) => {
+            println!(
+                "Windows Service '{}' is not registered. \
+                 If a foreground `zlayer serve` is running, press Ctrl+C in its window.",
+                crate::daemon_service::SERVICE_NAME
+            );
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "Failed to open Windows Service '{}'",
+                    crate::daemon_service::SERVICE_NAME
+                )
+            });
+        }
+    };
+
+    // Send SERVICE_CONTROL_STOP. If the service is already stopped, SCM
+    // returns an error we can ignore — the subsequent poll will confirm.
+    match service.stop() {
+        Ok(_) => {}
+        Err(e) => {
+            // Already stopped (ERROR_SERVICE_NOT_ACTIVE = 1062) is a no-op;
+            // any other SCM error is worth surfacing.
+            const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
+            let already_stopped = matches!(
+                &e,
+                windows_service::Error::Winapi(io_err)
+                    if io_err.raw_os_error() == Some(ERROR_SERVICE_NOT_ACTIVE)
+            );
+            if !already_stopped {
+                return Err(e).context("Failed to send Stop control to Windows Service");
+            }
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = service
+            .query_status()
+            .context("Failed to query Windows Service status during stop")?;
+        if status.current_state == ServiceState::Stopped {
+            println!("Daemon stopped.");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            println!(
+                "Daemon did not reach Stopped state within 30s (current: {:?}). \
+                 The service may still be shutting down; check `sc query {}`.",
+                status.current_state,
+                crate::daemon_service::SERVICE_NAME
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[cfg(target_os = "windows")]
+async fn restart(data_dir: &Path) -> Result<()> {
+    stop().await.ok();
+    start(data_dir).await
+}
+
+#[cfg(target_os = "windows")]
+async fn status(_data_dir: &Path) -> Result<()> {
+    use std::ffi::OsStr;
+    use windows_service::service::{ServiceAccess, ServiceState};
+    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+
+    // Try SCM first. If the service is registered, its state is the
+    // authoritative answer — a foreground daemon on a different bind could
+    // give a false "running" via TCP probe otherwise.
+    let manager_result =
+        ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT);
+
+    if let Ok(manager) = manager_result {
+        match manager.open_service(
+            crate::daemon_service::SERVICE_NAME,
+            ServiceAccess::QUERY_STATUS,
+        ) {
+            Ok(service) => {
+                let status = service
+                    .query_status()
+                    .context("Failed to query Windows Service status")?;
+                let label = match status.current_state {
+                    ServiceState::Running => "Running",
+                    ServiceState::Stopped => "Stopped",
+                    ServiceState::StartPending => "StartPending",
+                    ServiceState::StopPending => "StopPending",
+                    ServiceState::Paused => "Paused",
+                    ServiceState::PausePending => "PausePending",
+                    ServiceState::ContinuePending => "ContinuePending",
+                };
+                println!(
+                    "Daemon: {label} (Windows Service '{}')",
+                    crate::daemon_service::SERVICE_NAME
+                );
+                if let Some(pid) = status.process_id {
+                    println!("  PID: {pid}");
+                }
+                return Ok(());
+            }
+            Err(e) if is_service_not_found(&e) => {
+                // Fall through to the TCP-probe fallback — the user may be
+                // running a foreground `zlayer serve` rather than an
+                // installed service.
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "Failed to open Windows Service '{}'",
+                        crate::daemon_service::SERVICE_NAME
+                    )
+                });
+            }
+        }
+    }
+
+    // SCM service not registered (or SCM handle unavailable to non-admin
+    // callers). Fall back to the old TCP probe, which correctly detects a
+    // foreground-running daemon.
+    match zlayer_client::DaemonClient::try_connect().await {
+        Ok(Some(_)) => {
+            println!("Daemon: running (foreground)");
+        }
+        _ => {
+            println!("Daemon: stopped");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+async fn spawn_daemon_windows(
+    data_dir: &Path,
+    bind: &str,
+    jwt_secret: Option<&str>,
+    no_swagger: bool,
+) -> Result<()> {
+    use tokio::process::Command;
+
+    let exe = std::env::current_exe().context("Failed to resolve current executable path")?;
+
+    let log_dir = crate::cli::default_log_dir(data_dir);
+    truncate_daemon_logs(&log_dir);
+
+    // Write spawner PID so the new daemon's cleanup_stale_daemon() won't
+    // kill this CLI process while we wait for readiness. Mirrors the Unix
+    // behavior in `install`/`start`.
+    let spawner_pid_path = data_dir.join("spawner.pid");
+    std::fs::write(&spawner_pid_path, std::process::id().to_string()).ok();
+
+    // --data-dir is a top-level Cli arg, so it must come BEFORE the
+    // subcommand — matches the Linux systemd unit.
+    let mut cmd = Command::new(&exe);
+    cmd.arg("--data-dir").arg(data_dir);
+    cmd.arg("serve").arg("--daemon").arg("--bind").arg(bind);
+    if no_swagger {
+        cmd.arg("--no-swagger");
+    }
+    if let Some(secret) = jwt_secret {
+        cmd.env("ZLAYER_JWT_SECRET", secret);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+    // Spawn detached — `zlayer serve` on Windows stays in the foreground
+    // of its own process (no fork/daemonize), so we must not `.status()`
+    // here or we'd block forever waiting for the daemon to exit.
+    let child = cmd
+        .spawn()
+        .with_context(|| format!("Failed to spawn daemon process: {}", exe.display()))?;
+    // Dropping the Child handle without awaiting it leaves the daemon
+    // running independently of this CLI process.
+    drop(child);
+
+    print!("Daemon starting...");
+    match wait_for_daemon_ready(45).await {
+        Ok(()) => {
+            let _ = std::fs::remove_file(&spawner_pid_path);
+            println!(" started");
+            println!("  Stop: see `zlayer daemon stop`");
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&spawner_pid_path);
+            println!(" failed");
+            return Err(e);
+        }
+    }
     Ok(())
 }
 
@@ -1135,4 +1806,158 @@ fn reset(data_dir: &Path, force: bool) -> Result<()> {
 
     println!("Daemon state reset. Start the daemon to reinitialize.");
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, target_os = "windows"))]
+mod windows_tests {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::path::PathBuf;
+
+    /// `build_service_launch_arguments` must emit `--data-dir <path>` BEFORE
+    /// the `serve` subcommand — `--data-dir` is a top-level Cli arg and the
+    /// service would fail to start if the order slipped.
+    #[test]
+    fn launch_arguments_puts_data_dir_before_serve() {
+        let data_dir = PathBuf::from(r"C:\ProgramData\zlayer");
+        let args = build_service_launch_arguments(
+            &data_dir,
+            "0.0.0.0:3669",
+            None,
+            false,
+            #[cfg(feature = "docker-compat")]
+            false,
+        );
+        let data_dir_pos = args
+            .iter()
+            .position(|a| a == OsStr::new("--data-dir"))
+            .expect("--data-dir flag present");
+        let serve_pos = args
+            .iter()
+            .position(|a| a == OsStr::new("serve"))
+            .expect("serve subcommand present");
+        assert!(
+            data_dir_pos < serve_pos,
+            "--data-dir must come before `serve` (got args: {args:?})"
+        );
+        // `--data-dir` must be immediately followed by its value.
+        assert_eq!(
+            args[data_dir_pos + 1].as_os_str(),
+            data_dir.as_os_str(),
+            "--data-dir value mismatch"
+        );
+    }
+
+    /// `--service` must be present so SCM spawn enters the Windows Service
+    /// dispatcher (I-1) rather than the foreground `serve` path.
+    #[test]
+    fn launch_arguments_includes_service_flag() {
+        let args = build_service_launch_arguments(
+            Path::new(r"C:\data"),
+            "127.0.0.1:3669",
+            None,
+            false,
+            #[cfg(feature = "docker-compat")]
+            false,
+        );
+        assert!(
+            args.iter().any(|a| a == OsStr::new("--service")),
+            "--service flag must be present (got args: {args:?})"
+        );
+    }
+
+    /// `--bind <addr>` must be forwarded verbatim.
+    #[test]
+    fn launch_arguments_forwards_bind() {
+        let args = build_service_launch_arguments(
+            Path::new(r"C:\data"),
+            "10.0.0.5:4242",
+            None,
+            false,
+            #[cfg(feature = "docker-compat")]
+            false,
+        );
+        let bind_pos = args
+            .iter()
+            .position(|a| a == OsStr::new("--bind"))
+            .expect("--bind flag present");
+        assert_eq!(args[bind_pos + 1].as_os_str(), OsStr::new("10.0.0.5:4242"));
+    }
+
+    /// `--no-swagger` is only passed through when requested.
+    #[test]
+    fn launch_arguments_no_swagger_toggle() {
+        let without = build_service_launch_arguments(
+            Path::new(r"C:\data"),
+            "127.0.0.1:3669",
+            None,
+            false,
+            #[cfg(feature = "docker-compat")]
+            false,
+        );
+        assert!(!without.iter().any(|a| a == OsStr::new("--no-swagger")));
+
+        let with = build_service_launch_arguments(
+            Path::new(r"C:\data"),
+            "127.0.0.1:3669",
+            None,
+            true,
+            #[cfg(feature = "docker-compat")]
+            false,
+        );
+        assert!(with.iter().any(|a| a == OsStr::new("--no-swagger")));
+    }
+
+    /// `--jwt-secret <value>` is forwarded verbatim when provided, and
+    /// absent otherwise. SCM does not inherit env from the CLI, so the
+    /// secret has to ride the command line.
+    #[test]
+    fn launch_arguments_jwt_secret_round_trip() {
+        let without = build_service_launch_arguments(
+            Path::new(r"C:\data"),
+            "127.0.0.1:3669",
+            None,
+            false,
+            #[cfg(feature = "docker-compat")]
+            false,
+        );
+        assert!(!without.iter().any(|a| a == OsStr::new("--jwt-secret")));
+
+        let with = build_service_launch_arguments(
+            Path::new(r"C:\data"),
+            "127.0.0.1:3669",
+            Some("super-secret-token"),
+            false,
+            #[cfg(feature = "docker-compat")]
+            false,
+        );
+        let pos = with
+            .iter()
+            .position(|a| a == OsStr::new("--jwt-secret"))
+            .expect("--jwt-secret flag present");
+        assert_eq!(with[pos + 1].as_os_str(), OsStr::new("super-secret-token"));
+    }
+
+    /// `is_service_not_found` must identify `ERROR_SERVICE_DOES_NOT_EXIST`
+    /// so the uninstall/stop/status fallbacks fire instead of erroring out.
+    #[test]
+    fn is_service_not_found_matches_1060() {
+        let io_err = std::io::Error::from_raw_os_error(ERROR_SERVICE_DOES_NOT_EXIST);
+        let err = windows_service::Error::Winapi(io_err);
+        assert!(is_service_not_found(&err));
+    }
+
+    /// Any other Win32 error must NOT be misread as "service not found".
+    #[test]
+    fn is_service_not_found_rejects_other_errors() {
+        // ERROR_ACCESS_DENIED (5) is the other common SCM error and must
+        // propagate rather than be swallowed as a no-op.
+        let io_err = std::io::Error::from_raw_os_error(5);
+        let err = windows_service::Error::Winapi(io_err);
+        assert!(!is_service_not_found(&err));
+    }
 }

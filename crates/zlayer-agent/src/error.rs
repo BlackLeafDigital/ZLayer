@@ -66,6 +66,33 @@ pub enum AgentError {
     /// Operation is not supported by this runtime
     #[error("Operation not supported by this runtime: {0}")]
     Unsupported(String),
+
+    /// The workload cannot run on this node and must be re-placed on a peer
+    /// that can satisfy `required_os`.
+    ///
+    /// Returned by [`crate::runtimes::composite::CompositeRuntime::select_for`]
+    /// when a foreign-OS workload (today: Linux on a Windows node) lands on a
+    /// node that has no suitable local runtime (e.g. no WSL2 delegate
+    /// configured). The scheduler is expected to catch this and re-dispatch
+    /// to a cluster peer whose `NodeState.os` matches `required_os`. When no
+    /// capable peer exists the scheduler marks the service failed with an
+    /// actionable message naming both remediations (enable the local WSL2
+    /// delegate, or add a Linux peer to the cluster).
+    ///
+    /// This variant is *not* a container failure: the service manager must
+    /// surface it to the scheduler and must not roll up `CreateFailed` on top
+    /// of it, otherwise the rescheduling signal is lost.
+    #[error(
+        "route-to-peer: service '{service}' requires OS '{required_os}' on another node: {reason}"
+    )]
+    RouteToPeer {
+        /// Service name that needs to be re-placed.
+        service: String,
+        /// OS the workload requires (OCI-canonical: `linux` / `windows` / `darwin`).
+        required_os: String,
+        /// Human-readable explanation (e.g. "no WSL2 delegate configured on this Windows node").
+        reason: String,
+    },
 }
 
 pub type Result<T, E = AgentError> = std::result::Result<T, E>;

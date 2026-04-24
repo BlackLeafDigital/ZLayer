@@ -206,6 +206,7 @@ async fn test_overlay_config_and_peer_config_format() {
         private_key: private_key.clone(),
         public_key: public_key.clone(),
         overlay_cidr: "10.200.0.1/16".to_string(),
+        cluster_cidr: None,
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),
@@ -293,6 +294,7 @@ async fn test_overlay_interface_lifecycle() {
         private_key,
         public_key,
         overlay_cidr: "10.250.0.1/24".to_string(),
+        cluster_cidr: None,
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),
@@ -408,6 +410,7 @@ async fn test_dual_overlay_connectivity() {
         private_key: priv_a,
         public_key: pub_a.clone(),
         overlay_cidr: format!("{ip_a}{subnet}"),
+        cluster_cidr: None,
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),
@@ -418,6 +421,7 @@ async fn test_dual_overlay_connectivity() {
         private_key: priv_b,
         public_key: pub_b.clone(),
         overlay_cidr: format!("{ip_b}{subnet}"),
+        cluster_cidr: None,
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),
@@ -564,6 +568,7 @@ async fn test_overlay_config_and_peer_config_format_ipv6() {
         private_key: private_key.clone(),
         public_key: public_key.clone(),
         overlay_cidr: "fd00:200::1/48".to_string(),
+        cluster_cidr: None,
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),
@@ -709,6 +714,7 @@ async fn test_overlay_interface_lifecycle_ipv6() {
         private_key,
         public_key,
         overlay_cidr: "fd00:250::1/48".to_string(),
+        cluster_cidr: None,
         peer_discovery_interval: Duration::from_secs(30),
         #[cfg(feature = "nat")]
         nat: zlayer_overlay::nat::NatConfig::default(),

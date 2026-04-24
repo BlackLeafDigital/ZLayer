@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
+use serde::{Deserialize, Serialize};
 use zlayer_agent::{
     ContainerSupervisor, CronScheduler, JobExecutor, OverlayManager, ProxyManager,
     ProxyManagerConfig, Runtime, RuntimeConfig, ServiceManager,
@@ -27,10 +28,99 @@ use zlayer_scheduler::{
 };
 use zlayer_secrets::{CredentialStore, KeyManager, PersistentSecretsStore};
 
-use crate::commands::node::{
-    current_timestamp, detect_local_ip, generate_node_id, load_node_config, save_node_config,
-    NodeConfig,
-};
+// ---------------------------------------------------------------------------
+// Node identity (cross-platform)
+// ---------------------------------------------------------------------------
+//
+// These types live here (rather than in `commands::node`) because the daemon
+// initialization path needs them on every platform, including Windows, while
+// `commands::node` is Unix-only. The Unix CLI handlers re-export these via
+// `crate::daemon::<type>` when needed.
+
+/// Node configuration stored on disk.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct NodeConfig {
+    /// Unique node identifier
+    pub(crate) node_id: String,
+    /// Raft node ID (numeric)
+    pub(crate) raft_node_id: u64,
+    /// Public IP address for this node
+    pub(crate) advertise_addr: String,
+    /// API server port
+    pub(crate) api_port: u16,
+    /// Raft consensus port
+    pub(crate) raft_port: u16,
+    /// Overlay network port (`WireGuard` protocol)
+    pub(crate) overlay_port: u16,
+    /// Overlay network CIDR
+    pub(crate) overlay_cidr: String,
+    /// Overlay private key (x25519)
+    pub(crate) wireguard_private_key: String,
+    /// Overlay public key (x25519)
+    pub(crate) wireguard_public_key: String,
+    /// Whether this node is the cluster leader/bootstrap node
+    pub(crate) is_leader: bool,
+    /// Timestamp when node was created
+    pub(crate) created_at: String,
+}
+
+/// Generate a unique node ID.
+pub(crate) fn generate_node_id() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
+/// Get current timestamp as ISO 8601 string.
+pub(crate) fn current_timestamp() -> String {
+    chrono::Utc::now().to_rfc3339()
+}
+
+/// Save node configuration to disk.
+pub(crate) async fn save_node_config(
+    data_dir: &std::path::Path,
+    config: &NodeConfig,
+) -> Result<()> {
+    let config_path = data_dir.join("node_config.json");
+    let content =
+        serde_json::to_string_pretty(config).context("Failed to serialize node config")?;
+    tokio::fs::write(&config_path, content)
+        .await
+        .with_context(|| format!("Failed to write node config to {}", config_path.display()))?;
+    info!(path = %config_path.display(), "Saved node configuration");
+    Ok(())
+}
+
+/// Load node configuration from disk.
+pub(crate) async fn load_node_config(data_dir: &std::path::Path) -> Result<NodeConfig> {
+    let config_path = data_dir.join("node_config.json");
+    let content = tokio::fs::read_to_string(&config_path)
+        .await
+        .with_context(|| format!("Failed to read node config from {}", config_path.display()))?;
+    let config: NodeConfig =
+        serde_json::from_str(&content).context("Failed to parse node config")?;
+    Ok(config)
+}
+
+/// Detect the local machine's outbound IP address.
+///
+/// Uses the UDP-connect trick: connect a UDP socket to an external address
+/// (no traffic is actually sent) and read back the local address the OS chose.
+/// Falls back to `0.0.0.0` if detection fails.
+pub(crate) fn detect_local_ip() -> String {
+    use std::net::UdpSocket;
+    match UdpSocket::bind("0.0.0.0:0") {
+        Ok(socket) => {
+            // Connect to a well-known public address (Google DNS).
+            // No actual traffic is sent over UDP until data is written.
+            if socket.connect("8.8.8.8:80").is_ok() {
+                if let Ok(addr) = socket.local_addr() {
+                    return addr.ip().to_string();
+                }
+            }
+            "0.0.0.0".to_string()
+        }
+        Err(_) => "0.0.0.0".to_string(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -682,7 +772,25 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
 
                     // Register the leader node in the Raft state machine so it
                     // appears in cluster state with its overlay networking metadata.
-                    let leader_overlay_ip = "10.200.0.1".to_string();
+                    //
+                    // Read the leader's own overlay IP and slice CIDR from the
+                    // live `OverlayManager` when one is available. This replaces
+                    // the legacy hardcoded `10.200.0.1` and supports slice-aware
+                    // deployments (T8). Falls back to the hardcode when the
+                    // overlay is not configured (e.g. host-networking mode).
+                    let (leader_overlay_ip, leader_slice_cidr) = if let Some(om) = &overlay {
+                        let om_guard = om.read().await;
+                        let ip = om_guard
+                            .node_ip()
+                            .map_or_else(|| "10.200.0.1".to_string(), |ip| ip.to_string());
+                        let slice = om_guard
+                            .slice_cidr()
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        (ip, slice)
+                    } else {
+                        ("10.200.0.1".to_string(), String::new())
+                    };
                     let leader_raft_addr =
                         format!("{}:{}", node_config.advertise_addr, node_config.raft_port);
                     let sys_res = crate::resources::detect_system_resources(&config.data_dir);
@@ -700,6 +808,9 @@ pub async fn init_daemon(config: &DaemonConfig) -> Result<DaemonState> {
                             disk_total: sys_res.disk_total,
                             gpus: vec![],
                             mode: "full".to_string(),
+                            os: zlayer_spec::OsKind::from_rust_os(std::env::consts::OS),
+                            arch: zlayer_spec::ArchKind::from_rust_arch(std::env::consts::ARCH),
+                            slice_cidr: leader_slice_cidr,
                         })
                         .await
                     {

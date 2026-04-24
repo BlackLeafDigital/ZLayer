@@ -462,6 +462,14 @@ pub struct ImageBuilder {
     executor: BuildahExecutor,
     /// Event sender for TUI updates
     event_tx: Option<mpsc::Sender<BuildEvent>>,
+    /// Explicit target OS for this build.
+    ///
+    /// When `Some`, the backend was (or will be) detected for this OS and
+    /// it overrides any OS inferred from the `ZImagefile` (`os:` / `platform:`)
+    /// during `build()`. When `None`, the builder uses the OS inferred from
+    /// the parsed `ZImage` via `ZImage::resolve_target_os()`, falling back to
+    /// [`ImageOs::Linux`] when the `ZImagefile` has no OS hint either.
+    target_os: Option<crate::backend::ImageOs>,
     /// Pluggable build backend (buildah, sandbox, etc.).
     ///
     /// When set, the `build()` method delegates to this backend instead of
@@ -513,6 +521,28 @@ impl ImageBuilder {
     /// ```
     #[instrument(skip_all, fields(context = %context.as_ref().display()))]
     pub async fn new(context: impl AsRef<Path>) -> Result<Self> {
+        Self::new_with_os(context, None).await
+    }
+
+    /// Create a new `ImageBuilder` with an explicit target OS.
+    ///
+    /// This is equivalent to [`ImageBuilder::new`] followed by
+    /// [`ImageBuilder::with_target_os`], but avoids the extra round-trip of
+    /// detecting a Linux backend first and throwing it away.
+    ///
+    /// Pass `None` to defer target-OS resolution to `build()` time, where
+    /// the effective OS is resolved from the `ZImagefile`'s `os:` or `platform:`
+    /// field (priority documented on [`crate::zimage::ZImage::resolve_target_os`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the context directory does not exist, or (on
+    /// Linux/Windows) if the buildah executor cannot be initialized.
+    #[instrument(skip_all, fields(context = %context.as_ref().display(), target_os = ?target_os))]
+    pub async fn new_with_os(
+        context: impl AsRef<Path>,
+        target_os: Option<crate::backend::ImageOs>,
+    ) -> Result<Self> {
         let context = context.as_ref().to_path_buf();
 
         // Verify context exists
@@ -526,8 +556,12 @@ impl ImageBuilder {
             });
         }
 
-        // Detect the best available build backend for this platform.
-        let backend = crate::backend::detect_backend().await.ok();
+        // Detect the best available build backend for this platform. When
+        // `target_os` is None (caller hasn't decided yet), probe for the Linux
+        // backend as the common case; `build()` will re-detect if the parsed
+        // ZImagefile reveals a different target OS.
+        let detection_os = target_os.unwrap_or(crate::backend::ImageOs::Linux);
+        let backend = crate::backend::detect_backend(detection_os).await.ok();
 
         // Initialize buildah executor.
         // On macOS, if buildah is not found we fall back to a default executor
@@ -550,12 +584,30 @@ impl ImageBuilder {
             options: BuildOptions::default(),
             executor,
             event_tx: None,
+            target_os,
             backend,
             #[cfg(feature = "cache")]
             cache_backend: None,
             #[cfg(feature = "local-registry")]
             local_registry: None,
         })
+    }
+
+    /// Override the target OS after construction, re-detecting the backend.
+    ///
+    /// Use this when the caller only learns the target OS *after* creating
+    /// the builder — for example, after parsing a `ZImagefile` to inspect its
+    /// `os:`/`platform:` fields. Passing the same OS that was already selected
+    /// at construction time is cheap (it still re-runs `detect_backend()`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `detect_backend(target_os)` fails for the current
+    /// host/target combination (e.g. Windows image requested on a Linux host).
+    pub async fn with_target_os(mut self, target_os: crate::backend::ImageOs) -> Result<Self> {
+        self.target_os = Some(target_os);
+        self.backend = Some(crate::backend::detect_backend(target_os).await?);
+        Ok(self)
     }
 
     /// Create an `ImageBuilder` with a custom buildah executor
@@ -590,6 +642,7 @@ impl ImageBuilder {
             options: BuildOptions::default(),
             executor,
             event_tx: None,
+            target_os: None,
             backend: Some(backend),
             #[cfg(feature = "cache")]
             cache_backend: None,
@@ -625,6 +678,7 @@ impl ImageBuilder {
             options: BuildOptions::default(),
             executor: BuildahExecutor::default(),
             event_tx: None,
+            target_os: None,
             backend: Some(backend),
             #[cfg(feature = "cache")]
             cache_backend: None,
@@ -1309,10 +1363,16 @@ impl ImageBuilder {
     /// Panics if an instruction output is missing after all retry attempts (internal invariant).
     #[instrument(skip(self), fields(context = %self.context.display()))]
     #[allow(clippy::too_many_lines)]
-    pub async fn build(self) -> Result<BuiltImage> {
+    pub async fn build(mut self) -> Result<BuiltImage> {
         let start_time = std::time::Instant::now();
 
         info!("Starting build in context: {}", self.context.display());
+
+        // 0. Resolve the effective target OS from the priority chain when the
+        //    caller did not pin one explicitly. Re-detects the backend if the
+        //    resolved OS differs from the one we initially probed (Linux). A
+        //    pinned `target_os` wins and skips this resolution entirely.
+        self.resolve_target_os_and_backend().await?;
 
         // 1. Get build output (Dockerfile IR or WASM artifact)
         let build_output = self.get_build_output().await?;
@@ -1393,6 +1453,23 @@ impl ImageBuilder {
             unreachable!("WasmArtifact case handled above");
         };
         debug!("Parsed Dockerfile with {} stages", dockerfile.stages.len());
+
+        // L-5: Static guard — catch `RUN choco install ...` /
+        // `RUN winget install ...` on a nanoserver base image before we hand
+        // the Dockerfile off to the backend. Nanoserver ships no package
+        // manager, so without this check the build fails deep inside buildah
+        // / HCS with an opaque "`choco` is not recognized" message.
+        //
+        // The validator is a pure AST walk; it runs regardless of the
+        // resolved target OS because a Dockerfile pinning a Windows base
+        // should be diagnosed the same way on a Linux build host doing a
+        // cross-OS build as on a Windows host.
+        if let Err(err) = crate::windows::deps::validate_dockerfile(&dockerfile) {
+            return Err(BuildError::InvalidInstruction {
+                instruction: "RUN".to_string(),
+                reason: err.to_string(),
+            });
+        }
 
         // Delegate the build to the backend.
         let backend = self
@@ -1481,6 +1558,65 @@ impl ImageBuilder {
         }
 
         Ok(built)
+    }
+
+    /// Resolve the effective target OS for this build and re-detect the
+    /// backend when it differs from what was probed at construction.
+    ///
+    /// Priority (highest first):
+    /// 1. `self.target_os` — explicit pin from the caller (e.g. CLI `--platform`).
+    /// 2. `ZImage::resolve_target_os()` — `os:` field, else OS parsed from
+    ///    the `platform:` field of the `ZImagefile`.
+    /// 3. [`ImageOs::Linux`] — the historical default, applied whenever the
+    ///    `ZImagefile` has neither hint and the caller didn't pin an OS.
+    ///
+    /// The runtime-template and plain-Dockerfile paths never carry an OS
+    /// hint, so they fall through to the caller's pin or the default.
+    async fn resolve_target_os_and_backend(&mut self) -> Result<()> {
+        // Explicit pin always wins: the backend was already detected for
+        // this OS by `new_with_os`/`with_target_os`. Nothing to do.
+        if self.target_os.is_some() {
+            return Ok(());
+        }
+
+        // Peek at the ZImagefile (if the caller pointed us at one, or if one
+        // lives in the context dir). We only inspect the OS-related fields so
+        // a malformed ZImagefile body defers its error to `get_build_output`.
+        let zimage_path = self.options.zimagefile.clone().or_else(|| {
+            let candidate = self.context.join("ZImagefile");
+            candidate.exists().then_some(candidate)
+        });
+
+        let Some(path) = zimage_path else {
+            // No ZImagefile — Dockerfile / runtime template paths have no OS
+            // metadata, so the initial Linux detection stands.
+            return Ok(());
+        };
+
+        // Let `get_build_output()` surface any real read / parse errors.
+        let Ok(content) = fs::read_to_string(&path).await else {
+            return Ok(());
+        };
+        let Ok(zimage) = crate::zimage::parse_zimagefile(&content) else {
+            return Ok(());
+        };
+
+        if let Some(resolved) = zimage.resolve_target_os() {
+            // Re-detect only if the resolved OS differs from the one we
+            // probed at construction. `new_with_os(None)` probes Linux, so
+            // the common Linux case short-circuits.
+            let initial = crate::backend::ImageOs::Linux;
+            if resolved != initial {
+                info!(
+                    "Re-detecting build backend for target OS {:?} (inferred from ZImagefile)",
+                    resolved
+                );
+                self.backend = Some(crate::backend::detect_backend(resolved).await?);
+            }
+            self.target_os = Some(resolved);
+        }
+
+        Ok(())
     }
 
     /// Detection order:
@@ -1829,8 +1965,10 @@ impl ImageBuilder {
             chrono_lite_timestamp()
         );
 
-        // Create nested builder.
-        let mut nested = ImageBuilder::new(&context_dir).await?;
+        // Create nested builder. Inherit the parent's target_os (if any) so
+        // a Windows top-level build doesn't silently spawn a Linux nested
+        // build for its `build:` dependency.
+        let mut nested = ImageBuilder::new_with_os(&context_dir, self.target_os).await?;
         nested = nested.tag(&tag);
 
         // Apply explicit build file if specified.
@@ -2160,6 +2298,7 @@ mod tests {
             options: BuildOptions::default(),
             executor: BuildahExecutor::with_path("/usr/bin/buildah"),
             event_tx: None,
+            target_os: None,
             backend: None,
             #[cfg(feature = "cache")]
             cache_backend: None,

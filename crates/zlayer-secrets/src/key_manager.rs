@@ -15,7 +15,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use tracing::{debug, info, warn};
+#[cfg(unix)]
+use tracing::warn;
+use tracing::{debug, info};
 
 use crate::{EncryptionKey, Result, SecretsError};
 

@@ -9,7 +9,7 @@ use std::path::Path;
 /// Name of the dedicated WSL2 distribution.
 pub const DISTRO_NAME: &str = "zlayer";
 
-/// Create the dedicated ZLayer WSL2 distro from a rootfs tarball.
+/// Create the dedicated `ZLayer` WSL2 distro from a rootfs tarball.
 ///
 /// Runs: `wsl.exe --import zlayer <install_dir> <rootfs_path> --version 2`
 ///
@@ -54,7 +54,7 @@ pub async fn create_distro(_rootfs_path: &Path, _install_dir: &Path) -> anyhow::
     anyhow::bail!("WSL2 distro management is only available on Windows")
 }
 
-/// Execute a command inside the ZLayer WSL2 distro.
+/// Execute a command inside the `ZLayer` WSL2 distro.
 ///
 /// # Errors
 ///
@@ -109,7 +109,7 @@ pub async fn distro_exists() -> bool {
     false
 }
 
-/// Unregister (delete) the ZLayer WSL2 distro.
+/// Unregister (delete) the `ZLayer` WSL2 distro.
 ///
 /// # Errors
 ///

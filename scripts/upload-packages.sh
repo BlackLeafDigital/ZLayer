@@ -92,6 +92,10 @@ done
 for artifact in "${ARTIFACTS_DIR}"/zlayer-*/*.zip "${ARTIFACTS_DIR}"/*.zip "${ARTIFACTS_DIR}"/*/*.zip; do
   [ -f "$artifact" ] && files+=("$artifact")
 done
+# Windows .exe compat alias (zlayer-windows-amd64-hcs.exe); drop after next release.
+for artifact in "${ARTIFACTS_DIR}"/zlayer-*/*.exe "${ARTIFACTS_DIR}"/*.exe "${ARTIFACTS_DIR}"/*/*.exe; do
+  [ -f "$artifact" ] && files+=("$artifact")
+done
 # Container images
 for archive in "${ARTIFACTS_DIR}"/container-images/*.tar; do
   [ -f "$archive" ] && files+=("$archive")

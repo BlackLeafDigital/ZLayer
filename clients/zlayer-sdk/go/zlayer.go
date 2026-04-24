@@ -10,7 +10,7 @@
 //
 // Usage:
 //
-//	import zlayer "github.com/zlayer/zlayer-sdk-go"
+//	import zlayer "github.com/BlackLeafDigital/ZLayer/clients/zlayer-sdk/go"
 //
 //	func init() {
 //	    zlayer.LogInfo("Plugin initializing")

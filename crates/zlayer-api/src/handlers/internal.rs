@@ -16,7 +16,7 @@ use tracing::{info, warn};
 use utoipa::ToSchema;
 
 use crate::error::{ApiError, Result};
-use zlayer_agent::ServiceManager;
+use zlayer_agent::{AgentError, ServiceManager};
 
 /// Header name for internal API authentication
 pub const INTERNAL_AUTH_HEADER: &str = "X-ZLayer-Internal-Token";
@@ -120,6 +120,13 @@ pub struct InternalScaleResponse {
     /// Optional message
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+    /// When set, this agent refused the scale because it cannot run the
+    /// workload's OS (H-7 `RouteToPeer` policy). The value is the OCI-canonical
+    /// OS string the workload requires (`linux` / `windows` / `darwin`). The
+    /// scheduler catches this and re-dispatches to a cluster peer whose
+    /// `NodeState.os` matches.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reroute_to_os: Option<String>,
 }
 
 /// Scale a service via internal scheduler request.
@@ -177,11 +184,38 @@ pub async fn scale_service_internal(
         )));
     }
 
-    // Scale the service
-    manager
+    // Scale the service. H-7: if the composite runtime reports
+    // `RouteToPeer`, surface it as a structured response (not a 500) so the
+    // scheduler can re-dispatch to a capable peer instead of treating the
+    // service as broken.
+    match manager
         .scale_service(&request.service, request.replicas)
         .await
-        .map_err(|e| ApiError::Internal(format!("Failed to scale service: {e}")))?;
+    {
+        Ok(()) => {}
+        Err(AgentError::RouteToPeer {
+            service,
+            required_os,
+            reason,
+        }) => {
+            warn!(
+                service = %service,
+                required_os = %required_os,
+                reason = %reason,
+                "this node cannot run the workload; signalling scheduler to re-place"
+            );
+            return Ok(Json(InternalScaleResponse {
+                success: false,
+                service,
+                replicas: 0,
+                message: Some(reason),
+                reroute_to_os: Some(required_os),
+            }));
+        }
+        Err(e) => {
+            return Err(ApiError::Internal(format!("Failed to scale service: {e}")));
+        }
+    }
 
     // Get updated replica count
     let actual_replicas = manager
@@ -200,6 +234,7 @@ pub async fn scale_service_internal(
         service: request.service,
         replicas: actual_replicas,
         message: None,
+        reroute_to_os: None,
     }))
 }
 
@@ -242,6 +277,7 @@ pub async fn get_replicas_internal(
         service,
         replicas,
         message: None,
+        reroute_to_os: None,
     }))
 }
 
@@ -368,6 +404,7 @@ mod tests {
             service: "web".to_string(),
             replicas: 5,
             message: None,
+            reroute_to_os: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("web"));
@@ -382,6 +419,7 @@ mod tests {
             service: "web".to_string(),
             replicas: 5,
             message: Some("Scaled successfully".to_string()),
+            reroute_to_os: None,
         };
         let json = serde_json::to_string(&response).unwrap();
         assert!(json.contains("message"));

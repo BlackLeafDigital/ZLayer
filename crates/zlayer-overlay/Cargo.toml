@@ -11,6 +11,7 @@ categories = ["network-programming"]
 readme = "README.md"
 
 [dependencies]
+async-trait = { workspace = true }
 blake2.workspace = true
 ipnet = "2.10"
 serde.workspace = true
@@ -25,14 +26,45 @@ x25519-dalek.workspace = true
 zlayer-core.workspace = true
 base64.workspace = true
 hex.workspace = true
-boringtun = { version = "0.7.0", features = ["device"] }
 rand = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true }
+
+# boringtun's `device` feature (TUN fd + UAPI + libc epoll/kqueue) only
+# builds on Unix. Windows uses `boringtun::noise::Tunn` directly and
+# owns its own Wintun + UDP loop — no `device` feature needed.
+[target.'cfg(not(windows))'.dependencies]
+boringtun = { version = "0.7.0", features = ["device"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 rtnetlink = "0.14"
 netlink-packet-route = "0.19"
 futures-util = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+# Windows native overlay networking (Phase D3):
+# - Default-feature boringtun only (no `device` — libc/Unix-only). We
+#   drive `boringtun::noise::Tunn` ourselves on Windows.
+# - Wintun adapter for the TUN device (userspace, no kernel driver install
+#   beyond wintun.dll at runtime).
+# - windows-rs IP Helper for address/route configuration via the native
+#   IP Helper API (CreateUnicastIpAddressEntry / CreateIpForwardEntry2).
+# - parking_lot / dashmap for the Windows-only per-peer Tunn state map.
+boringtun = { version = "0.7.0" }
+wintun-bindings = { version = "0.7", features = ["async", "verify_binary_signature"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_NetworkManagement_WindowsFirewall",
+    "Win32_Networking_WinSock",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+] }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+# Used by the Wintun DLL locator to find %ProgramData%\ZLayer\wintun\wintun.dll.
+zlayer-paths = { workspace = true }
 
 [features]
 default = []

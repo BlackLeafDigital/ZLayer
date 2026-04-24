@@ -259,11 +259,21 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-arm64.tar.gz completions
 
+  # Single consolidated Windows build. Prior to Phase F-7a the workflow shipped
+  # two Windows variants: a "thin CLI" (--features wsl alone, proxied commands
+  # to a daemon inside WSL2) and an HCS-runtime build. After F-7a the wsl
+  # feature is a delegate runtime inside the HCS CompositeRuntime, not a
+  # standalone backend, so the thin build is obsolete. This job builds the
+  # hcs-runtime,wsl combo -- the feature set CI already validates in
+  # .forgejo/workflows/ci.yaml -- and ships it as zlayer-windows-amd64.zip.
+  # zlayer-windows-amd64-hcs.exe is also uploaded as a one-release compat
+  # alias for any downstream consumer that pinned the old name; scheduled for
+  # removal after the next release.
   build-windows-amd64:
     needs: [check-existing]
     if: needs.check-existing.outputs.need_build == 'true'
     runs-on: windows-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         with:
@@ -311,9 +321,16 @@ jobs:
           VERSION="${RAW#v}"
           sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
-      - name: Build (thin Windows CLI)
+      - name: Build
         if: steps.check.outputs.completed != 'true'
-        run: cargo build --release --package zlayer --no-default-features --features wsl
+        run: cargo build --release --package zlayer --no-default-features --features hcs-runtime,wsl
+      - name: Smoke test (binary launches)
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: ./target/release/zlayer.exe --version
+      - name: Test zlayer-hcs on Windows
+        if: steps.check.outputs.completed != 'true'
+        run: cargo test --package zlayer-hcs --no-fail-fast
       - name: Install 7zip
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
@@ -324,7 +341,6 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
-          # Runner and binary target are both windows-x86_64; binary runs natively.
           mkdir -p completions
           ./target/release/zlayer.exe completions bash > completions/zlayer.bash
           ./target/release/zlayer.exe completions zsh > completions/_zlayer
@@ -335,12 +351,25 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         shell: bash
         run: 7z a zlayer-windows-amd64.zip target/release/zlayer.exe completions
-      - name: Upload artifact
+      - name: Stage -hcs.exe compat alias
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: |
+          mkdir -p hcs-artifact
+          cp target/release/zlayer.exe hcs-artifact/zlayer-windows-amd64-hcs.exe
+      - name: Upload artifact (primary)
         if: steps.check.outputs.completed != 'true'
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:
           name: zlayer-windows-amd64
           path: zlayer-windows-amd64.zip
+          retention-days: 1
+      - name: Upload artifact (-hcs.exe compat alias)
+        if: steps.check.outputs.completed != 'true'
+        uses: https://github.com/christopherhx/gitea-upload-artifact@v4
+        with:
+          name: zlayer-windows-amd64-hcs
+          path: hcs-artifact/zlayer-windows-amd64-hcs.exe
           retention-days: 1
       - name: Mark step complete
         if: steps.check.outputs.completed != 'true'
@@ -352,6 +381,10 @@ jobs:
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - name: Cleanup
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        run: rm -rf target hcs-artifact zlayer-windows-amd64.zip completions
 
   # ===========================================
   # Wave 2: Image build + macOS amd64 (2 parallel)
@@ -530,15 +563,19 @@ jobs:
         run: rm -rf $CARGO_TARGET_DIR zlayer-darwin-amd64.tar.gz zlayer-completions.tar.gz completions
 
   # ===========================================
-  # Wave 3: Linux arm64 (cross-compile, slowest)
+  # Wave 3: Linux arm64 (native runner)
   # ===========================================
   build-linux-arm64:
     needs: [check-existing, image-build, build-macos-amd64]
     if: needs.check-existing.outputs.need_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: arm64
     timeout-minutes: 60
-    env:
-      CROSS_TARGET_DIR: ${{ github.workspace }}/cross-target
+    # The `arm64` self-hosted label resolves to a macOS arm64 host, so apt
+    # isn't on the host PATH. `node:20-bullseye` is a multi-arch manifest list;
+    # the arm64 host pulls the arm64 variant natively (no cross-build). This
+    # matches the amd64 sibling job and the in-repo `publish-sdks.yml`
+    # arm64+container precedent.
+    container: node:20-bullseye
     steps:
       - uses: actions/checkout@v4
         with:
@@ -554,9 +591,6 @@ jobs:
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-      - name: Install cross
-        if: steps.check.outputs.completed != 'true'
-        run: cargo install cross
       - name: Restore cache
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/s3-cache@main
@@ -573,10 +607,7 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
         with:
-          packages: 'protobuf-compiler libseccomp-dev'
-      - name: Create target directory
-        if: steps.check.outputs.completed != 'true'
-        run: mkdir -p $CROSS_TARGET_DIR
+          packages: 'protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git'
       - name: Set workspace version
         if: steps.check.outputs.completed != 'true'
         shell: bash
@@ -587,24 +618,22 @@ jobs:
           grep '^version = ' Cargo.toml
       - name: Build
         if: steps.check.outputs.completed != 'true'
-        run: cross build --release --target aarch64-unknown-linux-gnu --package zlayer --target-dir $CROSS_TARGET_DIR
-      - name: Download shell completions
-        if: steps.check.outputs.completed != 'true'
-        uses: https://github.com/christopherhx/gitea-download-artifact@v4
-        with:
-          name: zlayer-completions
-      - name: Unpack completions
+        run: cargo build --release --package zlayer
+      - name: Generate shell completions
         if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
-          # Cross-compile: aarch64 binary can't run on x86_64 runner without
-          # qemu. Completion scripts are platform-agnostic so we reuse the
-          # bytes produced by build-linux-amd64.
-          tar xzf zlayer-completions.tar.gz
-          cp -r completions "$CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release/completions"
+          mkdir -p completions
+          # Native arm64 runner: the binary runs here, generate completions locally.
+          "$CARGO_TARGET_DIR/release/zlayer" completions bash > completions/zlayer.bash
+          "$CARGO_TARGET_DIR/release/zlayer" completions zsh > completions/_zlayer
+          "$CARGO_TARGET_DIR/release/zlayer" completions fish > completions/zlayer.fish
+          "$CARGO_TARGET_DIR/release/zlayer" completions powershell > completions/zlayer.ps1
+          "$CARGO_TARGET_DIR/release/zlayer" completions elvish > completions/zlayer.elv
+          cp -r completions "$CARGO_TARGET_DIR/release/completions"
       - name: Package
         if: steps.check.outputs.completed != 'true'
-        run: tar czf "zlayer-linux-arm64.tar.gz" -C "$CROSS_TARGET_DIR/aarch64-unknown-linux-gnu/release" zlayer completions
+        run: tar czf "zlayer-linux-arm64.tar.gz" -C "$CARGO_TARGET_DIR/release" zlayer completions
       - name: Upload artifact
         if: steps.check.outputs.completed != 'true'
         uses: https://github.com/christopherhx/gitea-upload-artifact@v4
@@ -624,7 +653,7 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
       - name: Cleanup
         if: steps.check.outputs.completed != 'true'
-        run: rm -rf $CROSS_TARGET_DIR zlayer-linux-arm64.tar.gz zlayer-completions.tar.gz completions
+        run: rm -rf $CARGO_TARGET_DIR zlayer-linux-arm64.tar.gz completions
 
   # ===========================================
   # Verify all builds passed

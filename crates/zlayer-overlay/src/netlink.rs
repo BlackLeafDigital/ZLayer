@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 //! Rust netlink helpers that replace shell-outs to `ip` for overlay TUN
 //! transport setup.
 //!

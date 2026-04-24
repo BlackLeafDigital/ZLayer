@@ -48,7 +48,7 @@ where
     anyhow::bail!("wsl.exe is only available on Windows")
 }
 
-/// Run a PowerShell one-liner (`-NoProfile -NonInteractive -Command <script>`).
+/// Run a `PowerShell` one-liner (`-NoProfile -NonInteractive -Command <script>`).
 ///
 /// # Errors
 ///

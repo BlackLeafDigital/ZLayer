@@ -302,6 +302,7 @@ pub async fn handle_run(args: RunArgs) -> Result<()> {
         dns: args.dns.clone(),
         extra_hosts: args.add_host.clone(),
         restart_policy: None,
+        platform: None,
     };
 
     let mut services = HashMap::new();
@@ -654,6 +655,7 @@ mod tests {
             dns: Vec::new(),
             extra_hosts: Vec::new(),
             restart_policy: None,
+            platform: None,
         };
         let mut services = HashMap::new();
         services.insert("nginx".to_string(), service);

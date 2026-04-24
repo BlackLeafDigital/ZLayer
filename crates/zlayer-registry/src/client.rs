@@ -151,65 +151,104 @@ fn parse_local_image_ref(image: &str) -> Option<(String, String)> {
     Some((image.to_string(), "latest".to_string()))
 }
 
-/// Platform resolver that works correctly on macOS.
+/// Build a `platform_resolver` closure that picks manifests matching `target`.
 ///
-/// On macOS, this performs a two-pass search:
-/// 1. First tries `darwin/{arch}` for native macOS sandbox images from the
-///    zlayer registry.
-/// 2. Falls back to `linux/{arch}` for standard Docker Hub images (which run
-///    inside a Linux VM via Docker Desktop or similar).
+/// When `target` is `Some`, the closure looks for the exact `{os}/{arch}` in
+/// the image index and ignores any host-specific fallback (the caller has
+/// asked for a specific platform, so respect that intent).
 ///
-/// On all other platforms this behaves identically to oci-client's
-/// `current_platform_resolver`: it matches `{os}/{arch}` using the runtime
-/// values (with the standard Rust-to-Go name mapping).
-fn zlayer_platform_resolver(manifests: &[ImageIndexEntry]) -> Option<String> {
-    let target_arch = go_arch_name();
+/// When `target` is `None`, the closure falls back to the process's runtime
+/// platform (via `go_os_name()` / `go_arch_name()`), preserving the previous
+/// hardcoded resolver's behavior — including the macOS-specific two-pass
+/// search that first tries `darwin/{arch}` (native zlayer sandbox images)
+/// and then `linux/{arch}` (standard Docker Hub images which run inside a
+/// Linux VM via Docker Desktop or similar).
+fn build_platform_resolver(
+    target: Option<zlayer_spec::TargetPlatform>,
+) -> impl Fn(&[ImageIndexEntry]) -> Option<String> + Send + Sync + 'static {
+    // Resolve once at construction time so env isn't read on every invocation.
+    //
+    // Windows multi-platform indexes distinguish Server/Desktop build families
+    // via `platform.os.version` (e.g. `10.0.26100.*` for Server 2025 / Win11
+    // 24H2, `10.0.20348.*` for Server 2022). When the caller pinned a target
+    // os_version, prefer manifest entries whose os.version equals the
+    // constraint OR shares the same `major.minor.build` prefix.
+    //
+    // Macos-fallback only applies when we're using the host's default
+    // (no explicit override) AND the host is macOS — an explicit
+    // `darwin/...` override from a caller should NOT silently match linux.
+    let has_target = target.is_some();
+    let (target_os, target_arch, target_os_version): (String, String, Option<String>) = match target
+    {
+        Some(tp) => (
+            tp.os.as_oci_str().to_string(),
+            tp.arch.as_oci_str().to_string(),
+            tp.os_version,
+        ),
+        None => (go_os_name().to_string(), go_arch_name().to_string(), None),
+    };
+    let use_macos_fallback = !has_target && cfg!(target_os = "macos");
 
-    // On macOS, try darwin first (for native zlayer sandbox images),
-    // then fall back to linux (for standard Docker Hub images).
-    if cfg!(target_os = "macos") {
-        // Pass 1: darwin/{arch} (native macOS images)
+    move |manifests: &[ImageIndexEntry]| -> Option<String> {
+        // Pass 1a: Windows + pinned os_version — prefer an entry whose
+        // `os.version` matches exactly or shares the requested prefix.
+        if target_os == "windows" {
+            if let Some(want_version) = target_os_version.as_deref() {
+                if let Some(entry) = manifests.iter().find(|entry| {
+                    entry.platform.as_ref().is_some_and(|p| {
+                        p.os == target_os
+                            && p.architecture == target_arch
+                            && p.os_version
+                                .as_deref()
+                                .is_some_and(|v| v == want_version || v.starts_with(want_version))
+                    })
+                }) {
+                    return Some(entry.digest.clone());
+                }
+            }
+        }
+
+        // Pass 1: exact {os}/{arch} match (os.version ignored — back-compat,
+        // and used as the fallback when no Windows os.version match was found).
         if let Some(entry) = manifests.iter().find(|entry| {
             entry
                 .platform
                 .as_ref()
-                .is_some_and(|p| p.os == "darwin" && p.architecture == target_arch)
+                .is_some_and(|p| p.os == target_os && p.architecture == target_arch)
         }) {
             return Some(entry.digest.clone());
         }
-        // Pass 2: linux/{arch} (standard container images for VM runtime)
-        return manifests
-            .iter()
-            .find(|entry| {
-                entry
-                    .platform
-                    .as_ref()
-                    .is_some_and(|p| p.os == "linux" && p.architecture == target_arch)
-            })
-            .map(|entry| entry.digest.clone());
-    }
 
-    // Non-macOS: match native platform
-    let target_os = go_os_name();
-    manifests
-        .iter()
-        .find(|entry| {
-            entry
-                .platform
-                .as_ref()
-                .is_some_and(|p| p.os == target_os && p.architecture == target_arch)
-        })
-        .map(|entry| entry.digest.clone())
+        // Pass 2: macOS-only fallback to linux/{arch} (for Docker Hub images
+        // run inside a Linux VM). Only runs when we're using host defaults.
+        if use_macos_fallback {
+            return manifests
+                .iter()
+                .find(|entry| {
+                    entry
+                        .platform
+                        .as_ref()
+                        .is_some_and(|p| p.os == "linux" && p.architecture == target_arch)
+                })
+                .map(|entry| entry.digest.clone());
+        }
+
+        None
+    }
 }
 
 /// Build a [`ClientConfig`] with the zlayer platform resolver and sensible
 /// defaults for timeouts and protocol.
-fn build_client_config() -> ClientConfig {
+///
+/// `target` overrides the platform used by the resolver; `None` preserves the
+/// historical behavior of matching the process's runtime platform (with the
+/// macOS `darwin → linux` fallback).
+fn build_client_config(target: Option<zlayer_spec::TargetPlatform>) -> ClientConfig {
     ClientConfig {
         protocol: ClientProtocol::Https,
         connect_timeout: Some(std::time::Duration::from_secs(30)),
         read_timeout: Some(std::time::Duration::from_secs(300)), // 5 minutes for large layers
-        platform_resolver: Some(Box::new(zlayer_platform_resolver)),
+        platform_resolver: Some(Box::new(build_platform_resolver(target))),
         ..Default::default()
     }
 }
@@ -224,9 +263,13 @@ pub struct ImagePuller {
 }
 
 impl ImagePuller {
-    /// Create a new image puller with any cache backend
+    /// Create a new image puller with any cache backend.
+    ///
+    /// Pulls will target the process's runtime platform (with the historical
+    /// macOS `darwin → linux` fallback). To pull a specific platform, use
+    /// [`ImagePuller::with_platform`].
     pub fn new<C: BlobCacheBackend + 'static>(cache: C) -> Self {
-        let client = oci_client::Client::new(build_client_config());
+        let client = oci_client::Client::new(build_client_config(None));
 
         Self {
             client,
@@ -237,10 +280,36 @@ impl ImagePuller {
         }
     }
 
-    /// Create a new image puller with boxed cache backend
+    /// Create a new image puller with boxed cache backend.
+    ///
+    /// Pulls will target the process's runtime platform (with the historical
+    /// macOS `darwin → linux` fallback). To pull a specific platform, use
+    /// [`ImagePuller::with_platform`].
     #[must_use]
     pub fn with_cache(cache: Arc<Box<dyn BlobCacheBackend>>) -> Self {
-        let client = oci_client::Client::new(build_client_config());
+        let client = oci_client::Client::new(build_client_config(None));
+
+        Self {
+            client,
+            cache,
+            concurrency_limit: Arc::new(Semaphore::new(3)),
+            #[cfg(feature = "local")]
+            local_registry: None,
+        }
+    }
+
+    /// Create a new image puller targeting a specific OCI platform.
+    ///
+    /// The puller's internal `oci-client` will select the manifest whose
+    /// `{os}/{arch}` matches `target` from a multi-platform image index.
+    /// Unlike [`ImagePuller::new`], no macOS `darwin → linux` fallback is
+    /// applied — an explicit target is respected exactly.
+    #[must_use]
+    pub fn with_platform(
+        cache: Arc<Box<dyn BlobCacheBackend>>,
+        target: zlayer_spec::TargetPlatform,
+    ) -> Self {
+        let client = oci_client::Client::new(build_client_config(Some(target)));
 
         Self {
             client,
@@ -305,6 +374,40 @@ impl ImagePuller {
         digest: &str,
         auth: &RegistryAuth,
     ) -> Result<Vec<u8>> {
+        self.pull_blob_with_urls(image, digest, auth, &[], None)
+            .await
+    }
+
+    /// Pull a blob, with foreign-layer `urls[]` redirect fallback on 404.
+    ///
+    /// Behaviour matches [`pull_blob`] for ordinary layers. For descriptors that
+    /// carry a non-empty `urls` list (typically Windows base layers with media
+    /// type `application/vnd.docker.image.rootfs.foreign.diff.tar.gzip` or the
+    /// OCI nondistributable layer types served by Microsoft Container Registry),
+    /// a primary-registry 404 triggers sequential `GET`s against each URL.
+    /// Each redirect response is digest-verified (and size-verified when
+    /// `expected_size` is provided); the first successful match is cached and
+    /// returned.
+    ///
+    /// At most the first `MAX_FOREIGN_LAYER_REDIRECTS` URLs are attempted; any
+    /// additional URLs are ignored to guard against circular redirect spam.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the blob cannot be pulled from the primary registry
+    /// and every `urls[]` fallback also fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the concurrency semaphore is closed.
+    pub async fn pull_blob_with_urls(
+        &self,
+        image: &str,
+        digest: &str,
+        auth: &RegistryAuth,
+        urls: &[String],
+        expected_size: Option<i64>,
+    ) -> Result<Vec<u8>> {
         // Check cache first (now async)
         if let Some(data) = self.cache.get(digest).await? {
             tracing::debug!(digest = %digest, "blob found in cache");
@@ -328,13 +431,47 @@ impl ImagePuller {
         // Vec<u8> implements AsyncWrite and oci_client's pull_blob writes directly to it.
         // Using BufWriter was causing data to not be flushed properly.
         let mut buffer = Vec::new();
-        self.client
-            .pull_blob(&reference, digest, &mut buffer)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, digest = %digest, image = %image, "failed to pull blob from registry");
-                RegistryError::Oci(e)
-            })?;
+        let primary_result = self.client.pull_blob(&reference, digest, &mut buffer).await;
+
+        let buffer = match primary_result {
+            Ok(()) => buffer,
+            Err(err) if is_blob_not_found(&err) && !urls.is_empty() => {
+                tracing::info!(
+                    digest = %digest,
+                    urls_count = urls.len(),
+                    "primary registry missed foreign layer; attempting urls[] redirects"
+                );
+                let mut last_err: Option<RegistryError> = None;
+                let mut recovered: Option<Vec<u8>> = None;
+                for url in urls.iter().take(MAX_FOREIGN_LAYER_REDIRECTS) {
+                    match fetch_blob_from_url(url, digest, expected_size).await {
+                        Ok(bytes) => {
+                            tracing::info!(url = %url, "foreign layer recovered via redirect");
+                            recovered = Some(bytes);
+                            break;
+                        }
+                        Err(e) => {
+                            tracing::warn!(url = %url, error = %e, "redirect attempt failed");
+                            last_err = Some(e);
+                        }
+                    }
+                }
+                if let Some(bytes) = recovered {
+                    bytes
+                } else {
+                    tracing::error!(
+                        digest = %digest,
+                        image = %image,
+                        "foreign layer redirect fallback exhausted"
+                    );
+                    return Err(last_err.unwrap_or(RegistryError::Oci(err)));
+                }
+            }
+            Err(err) => {
+                tracing::error!(error = %err, digest = %digest, image = %image, "failed to pull blob from registry");
+                return Err(RegistryError::Oci(err));
+            }
+        };
 
         // Validate blob data is not empty
         if buffer.is_empty() {
@@ -762,6 +899,54 @@ impl ImagePuller {
         self.pull_image_config(image, auth).await
     }
 
+    /// Fetch the operating system targeted by `image` from its OCI config blob.
+    ///
+    /// Reads the top-level `os` field (OCI-canonical lowercase, e.g.
+    /// `"linux"` / `"windows"` / `"darwin"`) from the image config and
+    /// converts it via [`zlayer_spec::OsKind::from_oci_str`]. Multi-platform
+    /// indexes are resolved by the puller's configured `platform_resolver`
+    /// (set at construction time), so the answer reflects the manifest that
+    /// would actually be pulled for this host.
+    ///
+    /// Returns:
+    /// * `Ok(Some(os))` when the config blob carries a recognized OS.
+    /// * `Ok(None)` when the `os` field is absent or holds an unknown value —
+    ///   the caller should treat this as "fall through to a platform-agnostic
+    ///   default" rather than an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the manifest or config blob cannot be fetched, or
+    /// if the config blob cannot be parsed as valid JSON.
+    pub async fn image_os(
+        &self,
+        image: &str,
+        auth: &RegistryAuth,
+    ) -> Result<Option<zlayer_spec::OsKind>> {
+        let (manifest, _digest) = self.pull_manifest(image, auth).await?;
+
+        let config_digest = &manifest.config.digest;
+        let config_blob = self.pull_blob(image, config_digest, auth).await?;
+
+        let config_root: OciImageConfigRoot =
+            serde_json::from_slice(&config_blob).map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    image = %image,
+                    config_digest = %config_digest,
+                    "failed to parse image config JSON for OS inspection"
+                );
+                RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
+                    "failed to parse image config for {image}: {e}"
+                )))
+            })?;
+
+        Ok(config_root
+            .os
+            .as_deref()
+            .and_then(zlayer_spec::OsKind::from_oci_str))
+    }
+
     /// Detect the artifact type of an image from its manifest
     ///
     /// This method pulls the manifest and determines whether the image is a
@@ -911,7 +1096,10 @@ impl ImagePuller {
                 "pulling layer"
             );
 
-            let data = self.pull_blob(image, &layer.digest, auth).await?;
+            let layer_urls: &[String] = layer.urls.as_deref().unwrap_or(&[]);
+            let data = self
+                .pull_blob_with_urls(image, &layer.digest, auth, layer_urls, Some(layer.size))
+                .await?;
 
             // Validate layer data is not empty
             if data.is_empty() {
@@ -1414,6 +1602,222 @@ impl std::fmt::Display for Image {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}/{}:{}", self.registry, self.repository, self.tag)
     }
+}
+
+/// Maximum number of `urls[]` entries consulted when a foreign layer 404s on
+/// the primary registry. Descriptors rarely carry more than one or two URLs;
+/// the cap is a defence against circular / abusive redirect lists.
+const MAX_FOREIGN_LAYER_REDIRECTS: usize = 5;
+
+/// Return `true` when an `OciDistributionError` reports that the blob does not
+/// exist on the primary registry — i.e. the conditions under which we should
+/// fall back to the descriptor's `urls[]` list.
+fn is_blob_not_found(err: &oci_client::errors::OciDistributionError) -> bool {
+    use oci_client::errors::{OciDistributionError, OciErrorCode};
+    match err {
+        OciDistributionError::ImageManifestNotFoundError(_) => true,
+        OciDistributionError::ServerError { code, .. } => *code == 404,
+        OciDistributionError::RegistryError { envelope, .. } => envelope.errors.iter().any(|e| {
+            matches!(
+                e.code,
+                OciErrorCode::BlobUnknown
+                    | OciErrorCode::ManifestBlobUnknown
+                    | OciErrorCode::ManifestUnknown
+                    | OciErrorCode::NotFound
+                    | OciErrorCode::NameUnknown
+            )
+        }),
+        OciDistributionError::RequestError(req_err) => {
+            req_err.status() == Some(reqwest::StatusCode::NOT_FOUND)
+        }
+        _ => false,
+    }
+}
+
+/// Fetch raw bytes from an HTTP(S) URL with optional HTTP Basic authentication.
+///
+/// This is the low-level primitive used by all other `fetch_*_from_url` helpers
+/// in this module — `fetch_blob_from_url` (with digest/size verification),
+/// `fetch_archive_from_url` (non-empty archive assertion), and any future
+/// content-type-specific fetcher. It performs no validation on the response
+/// body beyond HTTP status; callers are responsible for any content-specific
+/// checks. `context` is a short human-readable label used to prefix error
+/// messages (e.g. `"foreign-layer redirect"`, `"archive fetch"`).
+///
+/// The caller is responsible for supplying an HTTPS URL when credentials are
+/// involved — TLS is never bypassed.
+///
+/// # Errors
+///
+/// Returns [`RegistryError::Cache`] on HTTP client construction failure,
+/// network error, non-2xx status code, or I/O error while reading the
+/// response body. The URL and `context` are included in the error for
+/// diagnostics.
+pub async fn fetch_from_url(
+    url: &str,
+    auth: Option<(&str, &str)>,
+    context: &str,
+) -> Result<Vec<u8>> {
+    let client = reqwest::Client::builder().build().map_err(|e| {
+        RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
+            "failed to build HTTP client for {context} {url}: {e}"
+        )))
+    })?;
+
+    let mut req = client.get(url);
+    if let Some((user, pw)) = auth {
+        req = req.basic_auth(user, Some(pw));
+    }
+
+    let response = req.send().await.map_err(|e| {
+        RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
+            "{context} GET {url} failed: {e}"
+        )))
+    })?;
+
+    if !response.status().is_success() {
+        return Err(RegistryError::Cache(crate::error::CacheError::Corrupted(
+            format!("{context} {url} returned HTTP {}", response.status()),
+        )));
+    }
+
+    let bytes = response.bytes().await.map_err(|e| {
+        RegistryError::Cache(crate::error::CacheError::Corrupted(format!(
+            "failed to read {context} body from {url}: {e}"
+        )))
+    })?;
+
+    Ok(bytes.to_vec())
+}
+
+/// Fetch a foreign layer blob from an out-of-registry URL (e.g. MCR) and
+/// verify that its SHA-256 digest matches `expected_digest`. Size is verified
+/// against `expected_size` when the value is `Some(n)` and `n >= 0`.
+async fn fetch_blob_from_url(
+    url: &str,
+    expected_digest: &str,
+    expected_size: Option<i64>,
+) -> Result<Vec<u8>> {
+    use sha2::{Digest, Sha256};
+
+    let bytes = fetch_from_url(url, None, "foreign-layer redirect").await?;
+
+    if bytes.is_empty() {
+        return Err(RegistryError::Cache(crate::error::CacheError::Corrupted(
+            format!("foreign-layer redirect {url} returned empty body"),
+        )));
+    }
+
+    if let Some(expected) = expected_size {
+        if let Ok(expected_u) = u64::try_from(expected) {
+            if bytes.len() as u64 != expected_u {
+                return Err(RegistryError::Cache(crate::error::CacheError::Corrupted(
+                    format!(
+                        "foreign-layer redirect {url}: size mismatch (expected {expected}, got {})",
+                        bytes.len()
+                    ),
+                )));
+            }
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let actual = hex::encode(hasher.finalize());
+    let expected = expected_digest
+        .strip_prefix("sha256:")
+        .unwrap_or(expected_digest);
+    if !actual.eq_ignore_ascii_case(expected) {
+        return Err(RegistryError::Cache(crate::error::CacheError::Corrupted(
+            format!(
+                "foreign-layer redirect {url}: digest mismatch (expected {expected_digest}, got sha256:{actual})"
+            ),
+        )));
+    }
+
+    Ok(bytes)
+}
+
+/// Fetch an OCI tar archive (or tar.gz) from a remote HTTP(S) URL with optional
+/// HTTP Basic authentication.
+///
+/// Unlike [`fetch_blob_from_url`], there is no digest verification — OCI
+/// archives are not content-addressable blobs by URL. Validation happens
+/// inside the importer via the embedded `oci-layout` + manifest digests.
+/// Only asserts the response body is non-empty so callers get a clean error
+/// message on accidental 200-with-empty-body responses from misconfigured
+/// object stores.
+///
+/// Suitable for authenticating against Forgejo / Gitea generic-package APIs,
+/// Nexus raw repositories, and similar file-blob endpoints.
+///
+/// # Errors
+///
+/// Returns [`RegistryError::Cache`] on any HTTP/network error (propagated
+/// from [`fetch_from_url`]) or when the response body is empty.
+pub async fn fetch_archive_from_url(url: &str, auth: Option<(&str, &str)>) -> Result<Vec<u8>> {
+    let bytes = fetch_from_url(url, auth, "archive fetch").await?;
+
+    if bytes.is_empty() {
+        return Err(RegistryError::Cache(crate::error::CacheError::Corrupted(
+            format!("archive fetch {url} returned empty body"),
+        )));
+    }
+
+    Ok(bytes)
+}
+
+/// Convert a [`zlayer_spec::RegistryAuth`] into the [`RegistryAuth`] shape
+/// that the OCI client speaks. Anonymous is returned when `auth` is `None`.
+///
+/// Basic and Token map onto the same `(username, password)` shape today —
+/// the client's bearer-token path is a parsing detail handled by
+/// `oci-client` itself. The explicit match keeps us honest when a future
+/// [`zlayer_spec::RegistryAuthType`] variant lands with different semantics.
+fn spec_auth_to_oci(auth: Option<&zlayer_spec::RegistryAuth>) -> RegistryAuth {
+    let Some(a) = auth else {
+        return RegistryAuth::Anonymous;
+    };
+    match a.auth_type {
+        zlayer_spec::RegistryAuthType::Basic | zlayer_spec::RegistryAuthType::Token => {
+            RegistryAuth::Basic(a.username.clone(), a.password.clone())
+        }
+    }
+}
+
+/// Fetch the OCI operating system of `image` without pulling any layers.
+///
+/// Convenience wrapper that constructs an ephemeral [`ImagePuller`] backed by
+/// an in-memory [`BlobCache`] and calls [`ImagePuller::image_os`]. Intended
+/// for callers that need a one-shot OS inspection and don't otherwise own a
+/// long-lived puller — e.g. the agent's `CompositeRuntime` deciding which
+/// child runtime should run a freshly-pulled image. The caller's own
+/// long-lived puller has already pulled the blobs to its persistent cache;
+/// this helper only touches the ~1–5 KB config blob, so the redundant fetch
+/// is negligible.
+///
+/// Auth is the same [`zlayer_spec::RegistryAuth`] carried on the
+/// [`Runtime::pull_image_with_policy`](crate) trait; `None` maps to
+/// anonymous. The manifest is resolved for the process's runtime platform
+/// (with the historical macOS `darwin → linux` fallback) — matching the
+/// behavior of [`ImagePuller::new`].
+///
+/// # Errors
+///
+/// Returns an error if the in-memory cache cannot be initialized, or if the
+/// manifest or config blob cannot be fetched or parsed. Callers in the hot
+/// path (e.g. `CompositeRuntime::pull_image_with_policy`) should treat any
+/// error as non-fatal: the safe fall-through is "dispatch to the primary
+/// runtime" rather than failing the pull.
+pub async fn fetch_image_os(
+    image: &str,
+    auth: Option<&zlayer_spec::RegistryAuth>,
+) -> Result<Option<zlayer_spec::OsKind>> {
+    let cache = crate::cache::BlobCache::new()?;
+    let puller = ImagePuller::new(cache);
+
+    let oci_auth = spec_auth_to_oci(auth);
+    puller.image_os(image, &oci_auth).await
 }
 
 #[cfg(test)]
@@ -2624,5 +3028,245 @@ mod tests {
         assert!(!is_mutable_tag(
             "registry.example.com:5000/img@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         ));
+    }
+
+    // =========================================================================
+    // Foreign-layer redirect fallback tests (MCR urls[])
+    // =========================================================================
+
+    #[test]
+    fn is_blob_not_found_detects_404_server_error() {
+        use oci_client::errors::OciDistributionError;
+        let err = OciDistributionError::ServerError {
+            code: 404,
+            url: "https://example.com/v2/foo/blobs/sha256:abc".to_string(),
+            message: "not found".to_string(),
+        };
+        assert!(is_blob_not_found(&err));
+    }
+
+    #[test]
+    fn is_blob_not_found_detects_manifest_not_found() {
+        use oci_client::errors::OciDistributionError;
+        let err = OciDistributionError::ImageManifestNotFoundError("foo".to_string());
+        assert!(is_blob_not_found(&err));
+    }
+
+    #[test]
+    fn is_blob_not_found_detects_blob_unknown_registry_error() {
+        use oci_client::errors::{OciDistributionError, OciEnvelope, OciError, OciErrorCode};
+        let envelope = OciEnvelope {
+            errors: vec![OciError {
+                code: OciErrorCode::BlobUnknown,
+                message: "blob gone".to_string(),
+                detail: serde_json::Value::Null,
+            }],
+        };
+        let err = OciDistributionError::RegistryError {
+            envelope,
+            url: "https://example.com/v2/foo/blobs/sha256:abc".to_string(),
+        };
+        assert!(is_blob_not_found(&err));
+    }
+
+    #[test]
+    fn is_blob_not_found_rejects_non_404_server_error() {
+        use oci_client::errors::OciDistributionError;
+        let err = OciDistributionError::ServerError {
+            code: 500,
+            url: "https://example.com/v2/foo/blobs/sha256:abc".to_string(),
+            message: "boom".to_string(),
+        };
+        assert!(!is_blob_not_found(&err));
+    }
+
+    #[test]
+    fn is_blob_not_found_rejects_auth_failure() {
+        use oci_client::errors::OciDistributionError;
+        let err = OciDistributionError::AuthenticationFailure("bad creds".to_string());
+        assert!(!is_blob_not_found(&err));
+    }
+
+    #[test]
+    fn max_foreign_layer_redirects_is_capped() {
+        // Guard against silently lifting the redirect cap — the pull path uses
+        // .take(MAX_FOREIGN_LAYER_REDIRECTS) to avoid redirect spam.
+        assert_eq!(MAX_FOREIGN_LAYER_REDIRECTS, 5);
+    }
+
+    #[tokio::test]
+    async fn fetch_blob_from_url_rejects_invalid_url() {
+        let result = fetch_blob_from_url(
+            "not-a-url",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_archive_from_url_rejects_invalid_url() {
+        let result = fetch_archive_from_url("not-a-url", None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_archive_from_url_rejects_unreachable_host() {
+        // 127.0.0.1:1 is not bound; connect refused happens synchronously.
+        let result = fetch_archive_from_url("http://127.0.0.1:1/archive.tar", None).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_archive_from_url_accepts_basic_auth_without_panic() {
+        // Auth should be forwarded to the reqwest builder; errors still surface
+        // cleanly when the host is unreachable. Regression guard for the
+        // `.basic_auth(user, Some(pw))` call path.
+        let result =
+            fetch_archive_from_url("http://127.0.0.1:1/archive.tar", Some(("user", "password")))
+                .await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_from_url_surfaces_context_in_error() {
+        let result = fetch_from_url("http://127.0.0.1:1/thing", None, "test-context").await;
+        let Err(err) = result else {
+            panic!("expected connect-refused error");
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("test-context"),
+            "error should include context label, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_blob_from_url_rejects_unreachable_host() {
+        // 127.0.0.1:1 is not bound; connect refused happens synchronously.
+        let result = fetch_blob_from_url(
+            "http://127.0.0.1:1/foo",
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            None,
+        )
+        .await;
+        assert!(result.is_err());
+    }
+
+    // =========================================================================
+    // build_platform_resolver tests — Windows os.version handling
+    // =========================================================================
+
+    /// Helper: build a minimal `ImageIndexEntry` with `os` / `arch` / optional
+    /// `os.version` — all we need for resolver tests.
+    fn mk_entry(os: &str, arch: &str, os_version: Option<&str>, digest: &str) -> ImageIndexEntry {
+        ImageIndexEntry {
+            media_type: "application/vnd.oci.image.manifest.v1+json".to_string(),
+            digest: digest.to_string(),
+            size: 0,
+            platform: Some(oci_client::manifest::Platform {
+                architecture: arch.to_string(),
+                os: os.to_string(),
+                os_version: os_version.map(str::to_string),
+                os_features: None,
+                variant: None,
+                features: None,
+            }),
+            annotations: None,
+        }
+    }
+
+    #[test]
+    fn platform_resolver_windows_os_version_prefers_prefix_match() {
+        use zlayer_spec::{ArchKind, OsKind, TargetPlatform};
+        // Two windows/amd64 entries differing only by os.version. Target
+        // matches the 26100 family (Server 2025 / Win11 24H2).
+        let manifests = vec![
+            mk_entry(
+                "windows",
+                "amd64",
+                Some("10.0.20348.2113"),
+                "sha256:server2022",
+            ),
+            mk_entry(
+                "windows",
+                "amd64",
+                Some("10.0.26100.1742"),
+                "sha256:server2025",
+            ),
+        ];
+        let target =
+            TargetPlatform::new(OsKind::Windows, ArchKind::Amd64).with_os_version("10.0.26100");
+        let resolver = build_platform_resolver(Some(target));
+        assert_eq!(resolver(&manifests).as_deref(), Some("sha256:server2025"));
+    }
+
+    #[test]
+    fn platform_resolver_windows_os_version_exact_match() {
+        use zlayer_spec::{ArchKind, OsKind, TargetPlatform};
+        let manifests = vec![
+            mk_entry(
+                "windows",
+                "amd64",
+                Some("10.0.20348.2113"),
+                "sha256:server2022",
+            ),
+            mk_entry(
+                "windows",
+                "amd64",
+                Some("10.0.26100.1742"),
+                "sha256:server2025",
+            ),
+        ];
+        let target = TargetPlatform::new(OsKind::Windows, ArchKind::Amd64)
+            .with_os_version("10.0.26100.1742");
+        let resolver = build_platform_resolver(Some(target));
+        assert_eq!(resolver(&manifests).as_deref(), Some("sha256:server2025"));
+    }
+
+    #[test]
+    fn platform_resolver_windows_no_os_version_falls_back_to_first_match() {
+        use zlayer_spec::{ArchKind, OsKind, TargetPlatform};
+        // When the caller doesn't pin os_version the resolver's behavior is
+        // unchanged from Phase A: it picks the first os+arch match.
+        let manifests = vec![
+            mk_entry("windows", "amd64", Some("10.0.20348.2113"), "sha256:first"),
+            mk_entry("windows", "amd64", Some("10.0.26100.1742"), "sha256:second"),
+        ];
+        let target = TargetPlatform::new(OsKind::Windows, ArchKind::Amd64);
+        let resolver = build_platform_resolver(Some(target));
+        assert_eq!(resolver(&manifests).as_deref(), Some("sha256:first"));
+    }
+
+    #[test]
+    fn platform_resolver_windows_os_version_falls_back_when_no_version_match() {
+        use zlayer_spec::{ArchKind, OsKind, TargetPlatform};
+        // Target wants 26100 but the index only has 20348. Fall back to the
+        // any-windows/amd64 entry rather than returning None — otherwise a
+        // bootstrap image that ships a single old-build manifest is
+        // unpullable on a new host.
+        let manifests = vec![mk_entry(
+            "windows",
+            "amd64",
+            Some("10.0.20348.2113"),
+            "sha256:only",
+        )];
+        let target =
+            TargetPlatform::new(OsKind::Windows, ArchKind::Amd64).with_os_version("10.0.26100");
+        let resolver = build_platform_resolver(Some(target));
+        assert_eq!(resolver(&manifests).as_deref(), Some("sha256:only"));
+    }
+
+    #[test]
+    fn platform_resolver_non_windows_ignores_os_version() {
+        use zlayer_spec::{ArchKind, OsKind, TargetPlatform};
+        // os_version is a Windows-only concept; setting it on a Linux target
+        // must NOT accidentally filter out a valid linux/amd64 manifest.
+        let manifests = vec![mk_entry("linux", "amd64", None, "sha256:linux")];
+        let target =
+            TargetPlatform::new(OsKind::Linux, ArchKind::Amd64).with_os_version("ignored.on.linux");
+        let resolver = build_platform_resolver(Some(target));
+        assert_eq!(resolver(&manifests).as_deref(), Some("sha256:linux"));
     }
 }

@@ -20,6 +20,18 @@ default = []
 # consumers (e.g. zfunctions in Zatabase) that don't need the Linux runtime
 # leave it off.
 youki-runtime = ["dep:libcontainer"]
+# Windows HCS (Host Compute Service) native container runtime. The `zlayer-hcs`
+# dep and all Windows runtime modules are already gated on
+# `cfg(target_os = "windows")`, so this feature is primarily a user-facing
+# opt-in marker for CI / bin/zlayer configuration. Enabling it on non-Windows
+# targets is a no-op.
+hcs-runtime = []
+# WSL2 delegate runtime. When enabled on Windows targets, pulls in the
+# `zlayer-wsl` crate so `Wsl2DelegateRuntime` can shell out to `youki` inside
+# the dedicated `zlayer` WSL2 distro. Off by default; enabled explicitly by
+# `bin/zlayer` when the native Windows daemon wants Linux-container support
+# alongside HCS.
+wsl = ["dep:zlayer-wsl", "dep:anyhow"]
 docker = ["dep:bollard"]
 wasm = [
     "dep:wasmtime",
@@ -112,6 +124,35 @@ netlink-packet-route = "0.19"
 [target.'cfg(target_os = "macos")'.dependencies]
 dirs = "5"
 libloading = "0.8"
+
+# Windows-specific dependencies for HCS / WCIFS / backup-stream layer writing.
+# The `windows` crate gates each Win32 API behind a feature flag; enable only
+# what the `windows/` submodule actually calls.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+    "Win32_System_HostComputeSystem",
+] }
+zlayer-hcs = { workspace = true }
+zlayer-hns = { workspace = true }
+# Gated behind the `wsl` feature — only pulled in when the Wsl2DelegateRuntime
+# is actually compiled. Keeps the default Windows build lean.
+zlayer-wsl = { workspace = true, optional = true }
+# Windows OCI layer unpacker deps (crates/.../windows/unpacker.rs).
+# `uuid` is already in the main [dependencies] section but listing it again
+# here would be redundant; same for `sha2` (only pulled in via the `wasm`
+# feature in the main section, so we take an always-on dep here so the unpacker
+# compiles without `--features wasm` on Windows).
+tar = { workspace = true }
+flate2 = { workspace = true }
+zstd = "0.13"
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 rand = { workspace = true }

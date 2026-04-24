@@ -1,14 +1,11 @@
 //! Lifecycle command handlers: status, validate, logs, stop.
 
-#[cfg(unix)]
 use anyhow::Context;
 use anyhow::Result;
 use std::path::Path;
 use tracing::info;
-#[cfg(unix)]
 use tracing::warn;
 
-#[cfg(unix)]
 use crate::cli::Cli;
 #[cfg(unix)]
 use crate::util::discover_spec_path;
@@ -23,7 +20,6 @@ use zlayer_spec::DeploymentSpec;
 /// When the daemon is running, displays PID, API bind address, socket path,
 /// runtime type, and a summary of active deployments.  When the daemon is
 /// not running, shows helpful instructions for starting it.
-#[cfg(unix)]
 pub(crate) async fn status(cli: &Cli) -> Result<()> {
     info!("Checking daemon status");
 
@@ -128,7 +124,6 @@ pub(crate) async fn status(cli: &Cli) -> Result<()> {
 }
 
 /// Read and parse `{data_dir}/daemon.json` if it exists.
-#[cfg(unix)]
 async fn read_daemon_metadata(data_dir: &std::path::Path) -> Option<serde_json::Value> {
     let path = data_dir.join("daemon.json");
     let contents = tokio::fs::read_to_string(&path).await.ok()?;
@@ -136,7 +131,6 @@ async fn read_daemon_metadata(data_dir: &std::path::Path) -> Option<serde_json::
 }
 
 /// Extract service count and total replica count from a deployment JSON value.
-#[cfg(unix)]
 #[allow(clippy::cast_possible_truncation)]
 fn extract_deployment_counts(dep: &serde_json::Value) -> (usize, u32) {
     // The deployment response may include a nested "spec" with services
@@ -168,7 +162,6 @@ fn extract_deployment_counts(dep: &serde_json::Value) -> (usize, u32) {
 }
 
 /// Return a human-readable name for the current platform's default runtime.
-#[cfg(unix)]
 fn detect_runtime_name() -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -178,7 +171,11 @@ fn detect_runtime_name() -> &'static str {
     {
         "youki"
     }
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    #[cfg(target_os = "windows")]
+    {
+        "composite"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         "auto"
     }
@@ -207,7 +204,6 @@ pub(crate) fn validate(spec_path: &Path) -> Result<()> {
 /// When `follow` is false, fetches the last `lines` lines and prints them.
 /// When `follow` is true, opens an SSE stream to the daemon and prints log
 /// lines as they arrive in real time (until the user presses Ctrl+C).
-#[cfg(unix)]
 pub(crate) async fn logs(
     deployment: Option<&str>,
     service: &str,
@@ -265,7 +261,6 @@ pub(crate) async fn logs(
 /// `ServiceManager` (which has no knowledge of already-running containers).
 /// If a spec is found matching the deployment, it iterates over services and replicas.
 /// Also scans the state directory for any extra containers beyond the spec's replica count.
-#[cfg(unix)]
 async fn resolve_stop_deployment(hint: Option<&str>) -> Result<String> {
     let client = zlayer_client::DaemonClient::connect().await.context(
         "Failed to connect to zlayer daemon (pass <DEPLOYMENT> explicitly to skip auto-resolution)",
@@ -398,6 +393,108 @@ pub(crate) async fn stop(
 
     // Fallback: no spec available, just print message
     println!("No spec found for deployment '{deployment}'. Use the spec file path or run from the deployment directory.");
+    Ok(())
+}
+
+/// Windows variant of `stop` that routes through the daemon HTTP API
+/// instead of talking to `zlayer_agent` directly.
+///
+/// The Linux fast-path creates a runtime in-process and iterates over the
+/// spec's services/replicas to stop containers. On Windows the `zlayer_agent`
+/// crate is built for the daemon (HCS/composite runtimes), and the CLI must
+/// go through the daemon's REST API. We enumerate containers via
+/// `DaemonClient::list_containers` per service and issue
+/// `DaemonClient::stop_container` for each one.
+///
+/// The `state_dir` parameter is accepted for signature compatibility with
+/// the Unix fast-path but is unused: container state is managed by the
+/// daemon on Windows, so there is no local state dir to scan.
+#[cfg(windows)]
+pub(crate) async fn stop(
+    deployment: Option<&str>,
+    service: Option<String>,
+    force: bool,
+    timeout: u64,
+    _state_dir: &std::path::Path,
+) -> Result<()> {
+    let deployment = resolve_stop_deployment(deployment).await?;
+
+    let target = match &service {
+        Some(s) => format!("{deployment}/{s}"),
+        None => deployment.clone(),
+    };
+
+    info!(
+        target = %target,
+        force = force,
+        timeout_secs = timeout,
+        "Stopping"
+    );
+
+    if force {
+        println!("Force stopping {target}...");
+    } else {
+        println!("Gracefully stopping {target} (timeout: {timeout}s)...");
+    }
+
+    let client = zlayer_client::DaemonClient::connect()
+        .await
+        .context("Failed to connect to zlayer daemon")?;
+
+    // Determine the set of services to stop. If the user asked for a specific
+    // service, just use that; otherwise query the daemon for the deployment's
+    // full service list.
+    let service_names: Vec<String> = if let Some(s) = &service {
+        vec![s.clone()]
+    } else {
+        let services = client
+            .list_services(&deployment)
+            .await
+            .with_context(|| format!("Failed to list services for deployment '{deployment}'"))?;
+        services
+            .iter()
+            .filter_map(|svc| {
+                svc.get("name")
+                    .and_then(|v| v.as_str())
+                    .map(std::string::ToString::to_string)
+            })
+            .collect()
+    };
+
+    // `force` requests an immediate kill; otherwise honor the user-supplied
+    // graceful timeout. Pass `Some(0)` for force so the daemon skips the grace
+    // window entirely.
+    let timeout_arg: Option<u64> = if force { Some(0) } else { Some(timeout) };
+
+    let mut stopped_count: u32 = 0;
+
+    for name in &service_names {
+        let containers = match client.list_containers(&deployment, name).await {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(service = %name, error = %e, "Failed to list containers for service");
+                continue;
+            }
+        };
+
+        println!(
+            "  Stopping service: {name} ({count} container(s))",
+            count = containers.len()
+        );
+
+        for c in &containers {
+            let Some(id) = c.get("id").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if let Err(e) = client.stop_container(id, timeout_arg).await {
+                warn!(container = %id, error = %e, "Failed to stop container (may not exist)");
+            } else {
+                stopped_count += 1;
+            }
+        }
+    }
+
+    println!("Stopped {stopped_count} container(s).");
     Ok(())
 }
 

@@ -310,6 +310,65 @@ impl DnsServer {
         Ok(handle)
     }
 
+    /// Bind a second DNS listener on port 53 of `bind_ip`, sharing this
+    /// server's authority + zone so the same records answer both listeners.
+    ///
+    /// Windows containers always query DNS on port 53 — HNS endpoints do not
+    /// support setting a non-standard DNS port in the schema. The canonical
+    /// overlay listener on [`DEFAULT_DNS_PORT`] (15353) is therefore
+    /// unreachable from a Windows container; this method adds a second
+    /// listener on port 53 of the overlay IP so containers that point at
+    /// `<overlay_ip>:53` via `Dns.ServerList` can actually resolve.
+    ///
+    /// `bind_ip` is typically the node's overlay IP (e.g. `10.200.42.1`).
+    /// Binding to `0.0.0.0:53` would collide with whatever resolver the host
+    /// already runs (systemd-resolved on Linux, DNS Client on Windows). The
+    /// method itself is cross-platform; callers decide whether to invoke it
+    /// based on their workload mix.
+    ///
+    /// The bound UDP + TCP sockets live on a detached tokio task that shares
+    /// the same `Arc<InMemoryAuthority>` as the primary listener, so
+    /// `DnsHandle::add_record` / `remove_record` updates both responders
+    /// atomically. Returns a cloneable [`DnsHandle`] for convenience.
+    ///
+    /// # Errors
+    ///
+    /// Returns `DnsError::Io` when either port 53 socket (UDP or TCP) cannot
+    /// be bound — typically because another DNS resolver already owns the
+    /// address, or because the process lacks the privilege to bind below 1024
+    /// on platforms that require it. Callers should treat this as a warning
+    /// and fall back to the primary 15353 listener for non-Windows workloads.
+    #[allow(clippy::unused_async)]
+    pub async fn bind_windows_fallback(&self, bind_ip: IpAddr) -> Result<DnsHandle, DnsError> {
+        let handle = self.handle();
+        let listen_addr = SocketAddr::new(bind_ip, 53);
+        let zone_origin = self.zone_origin.clone();
+        let authority = Arc::clone(&self.authority);
+
+        // Pre-bind the sockets synchronously so binding failures surface here
+        // instead of being swallowed by the detached task. On success we hand
+        // the live sockets off to the server future on a background task.
+        let udp_socket = UdpSocket::bind(listen_addr).await?;
+        let tcp_listener = TcpListener::bind(listen_addr).await?;
+
+        tokio::spawn(async move {
+            let mut catalog = Catalog::new();
+            catalog.upsert(zone_origin.into(), Box::new(authority));
+            let mut server = ServerFuture::new(catalog);
+            server.register_socket(udp_socket);
+            server.register_listener(tcp_listener, Duration::from_secs(30));
+            tracing::info!(
+                addr = %listen_addr,
+                "Windows fallback DNS listener started on port 53",
+            );
+            if let Err(e) = server.block_until_done().await {
+                tracing::error!("Windows fallback DNS listener error: {}", e);
+            }
+        });
+
+        Ok(handle)
+    }
+
     /// Internal method to run the DNS server
     async fn run_server(
         listen_addr: SocketAddr,
@@ -781,6 +840,38 @@ mod tests {
         assert!(server.is_ok());
         let server = server.unwrap();
         assert_eq!(server.listen_addr(), addr);
+    }
+
+    /// Smoke test for the Windows-fallback port-53 listener: binding to
+    /// 127.0.0.2:53 should fail fast on hosts where that port is privileged
+    /// or already in use, but we only care that the method surfaces a clean
+    /// `DnsError` (not a panic) when the bind is contested. When the bind
+    /// succeeds on a permissive CI host, we verify the returned handle shares
+    /// the authority with the primary listener.
+    #[tokio::test]
+    async fn test_bind_windows_fallback_errors_or_shares_authority() {
+        let primary = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
+        let server = DnsServer::new(primary, "overlay.local.").unwrap();
+        let bind_ip: IpAddr = "127.0.0.2".parse().unwrap();
+
+        match server.bind_windows_fallback(bind_ip).await {
+            Ok(handle) => {
+                // Best-effort: the handle must expose the same zone as the
+                // primary server so record mutations on either propagate to
+                // both listeners.
+                assert_eq!(handle.zone_origin().to_string(), "overlay.local.");
+                handle
+                    .add_record("dual", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9)))
+                    .await
+                    .expect("add_record via fallback handle");
+            }
+            Err(DnsError::Io(_)) => {
+                // Expected on hosts that reserve port 53 or where the
+                // loopback alias is already bound. Counts as a clean error
+                // rather than a panic.
+            }
+            Err(other) => panic!("unexpected error from bind_windows_fallback: {other}"),
+        }
     }
 
     #[test]

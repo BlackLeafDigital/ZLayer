@@ -1,11 +1,16 @@
 //! Docker Engine API socket emulation.
 //!
-//! Provides a Docker-compatible HTTP API over a Unix domain socket,
-//! allowing tools like VS Code Docker extension, CI systems, and
-//! other Docker-aware tools to interact with `ZLayer`.
+//! Provides a Docker-compatible HTTP API over a Unix domain socket on
+//! Linux/macOS or a Windows named pipe, allowing tools like the VS Code
+//! Docker extension, CI systems, and other Docker-aware tools to interact
+//! with `ZLayer`.
 
 mod containers;
 mod images;
+#[cfg(unix)]
+mod listener_unix;
+#[cfg(windows)]
+mod listener_windows;
 mod networks;
 mod system;
 mod types;
@@ -28,40 +33,33 @@ pub(crate) struct SocketState {
 
 /// Start the Docker API socket server.
 ///
-/// Listens on the given Unix socket path and routes Docker Engine API
-/// requests to `ZLayer`'s runtime. Connects to the local zlayer daemon
-/// (auto-starting it if needed) so that handlers can proxy requests via
-/// [`DaemonClient`].
+/// Dispatches to the Unix-domain-socket transport on Linux/macOS or
+/// the named-pipe transport on Windows.
 ///
 /// # Errors
 ///
-/// Returns an error if the socket cannot be bound, the daemon cannot be
-/// contacted, or the server fails.
+/// Returns an error if the socket/pipe cannot be bound, the daemon
+/// cannot be contacted, or the server fails.
 pub async fn serve(socket_path: &Path) -> anyhow::Result<()> {
-    // Remove stale socket file if it exists from a previous run
-    if socket_path.exists() {
-        tokio::fs::remove_file(socket_path).await?;
-    }
-
-    // Ensure the parent directory exists
-    if let Some(parent) = socket_path.parent() {
-        tokio::fs::create_dir_all(parent).await?;
-    }
-
     let client = DaemonClient::connect().await?;
     let state = SocketState {
         client: Arc::new(client),
     };
-
     let app = router(state);
 
-    tracing::info!("Docker API socket listening on {}", socket_path.display());
-
-    let listener = tokio::net::UnixListener::bind(socket_path)?;
-
-    axum::serve(listener, app.into_make_service()).await?;
-
-    Ok(())
+    #[cfg(unix)]
+    {
+        listener_unix::serve_on(socket_path, app).await
+    }
+    #[cfg(windows)]
+    {
+        listener_windows::serve_on(socket_path, app).await
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (socket_path, app);
+        anyhow::bail!("platform not supported for Docker API server");
+    }
 }
 
 /// Build the Docker Engine API router.

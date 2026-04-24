@@ -95,16 +95,25 @@ pub struct RunCommand {
     pub timeout: Duration,
 }
 
+#[cfg(unix)]
+fn build_shell_command(cmd: &str) -> Command {
+    let mut c = Command::new("sh");
+    c.arg("-c").arg(cmd);
+    c
+}
+
+#[cfg(windows)]
+fn build_shell_command(cmd: &str) -> Command {
+    let mut c = Command::new("cmd");
+    c.arg("/C").arg(cmd);
+    c
+}
+
 impl RunCommand {
     /// # Errors
     /// Returns an error if the command fails, exits non-zero, or times out.
     pub async fn execute(&self) -> Result<()> {
-        match timeout(
-            self.timeout,
-            Command::new("sh").arg("-c").arg(&self.command).output(),
-        )
-        .await
-        {
+        match timeout(self.timeout, build_shell_command(&self.command).output()).await {
             Ok(Ok(output)) => {
                 if output.status.success() {
                     Ok(())

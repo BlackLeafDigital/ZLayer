@@ -1,0 +1,32 @@
+[package]
+name = "zlayer-hns"
+description = "Safe Rust wrapper for the Windows Host Compute Network Service (HCN v2)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_System_HostComputeNetwork",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time", "test-util"] }

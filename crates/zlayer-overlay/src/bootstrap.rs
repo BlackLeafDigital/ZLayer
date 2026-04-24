@@ -4,12 +4,14 @@
 //! including keypair generation, interface creation, and peer management.
 
 use crate::allocator::IpAllocator;
+use crate::allocator::{NodeSliceAllocator, NodeSliceAllocatorSnapshot};
 use crate::config::PeerInfo;
 use crate::dns::{peer_hostname, DnsConfig, DnsHandle, DnsServer, DEFAULT_DNS_PORT};
 use crate::error::{OverlayError, Result};
 #[cfg(feature = "nat")]
 use crate::nat::{Candidate, ConnectionType, NatTraversal, RelayServer};
 use crate::transport::OverlayTransport;
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
@@ -40,6 +42,41 @@ pub const DEFAULT_OVERLAY_CIDR_V6: &str = "fd00:200::/48";
 /// Default persistent keepalive interval (seconds)
 pub const DEFAULT_KEEPALIVE_SECS: u16 = 25;
 
+/// Default per-node slice prefix length for carving the cluster CIDR into
+/// per-node allocation slices. A `/28` gives each node 16 addresses
+/// (14 usable hosts) from the cluster `/16`, supporting up to 4096 nodes.
+pub const DEFAULT_SLICE_PREFIX: u8 = 28;
+
+/// Serde helper for `Option<IpNet>`: serialize as a CIDR string (e.g.
+/// `"10.200.7.0/28"`), so we don't depend on `ipnet`'s optional `serde`
+/// feature flag. Keeps persisted state compact and human-readable.
+mod option_ipnet_str {
+    use ipnet::IpNet;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S>(value: &Option<IpNet>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        value.map(|v| v.to_string()).serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<IpNet>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt = Option::<String>::deserialize(deserializer)?;
+        match opt {
+            None => Ok(None),
+            Some(s) => s
+                .parse::<IpNet>()
+                .map(Some)
+                .map_err(serde::de::Error::custom),
+        }
+    }
+}
+
 /// Overlay network bootstrap configuration
 ///
 /// Contains all configuration needed to initialize and manage
@@ -69,14 +106,26 @@ pub struct BootstrapConfig {
 
     /// Creation timestamp (Unix epoch seconds)
     pub created_at: u64,
+
+    /// Per-node slice of the cluster CIDR that this node draws container
+    /// IPs from. `None` for pre-slice-aware configs (back-compat). When set,
+    /// this replaces `node_ip/32` in `allowed_ip()`.
+    #[serde(default, with = "option_ipnet_str")]
+    pub slice_cidr: Option<IpNet>,
 }
 
 impl BootstrapConfig {
     /// Get the overlay IP with host prefix for allowed IPs
     ///
-    /// Returns `/32` for IPv4 addresses and `/128` for IPv6 addresses.
+    /// When `slice_cidr` is set, returns the slice CIDR string unchanged so
+    /// the overlay accepts the full per-node slice of container IPs. Otherwise
+    /// falls back to the legacy `/32` (IPv4) or `/128` (IPv6) single-host
+    /// representation of `node_ip` for back-compat with pre-slice configs.
     #[must_use]
     pub fn allowed_ip(&self) -> String {
+        if let Some(slice) = self.slice_cidr {
+            return slice.to_string();
+        }
         let prefix = match self.node_ip {
             IpAddr::V4(_) => 32,
             IpAddr::V6(_) => 128,
@@ -119,6 +168,11 @@ pub struct PeerConfig {
     #[serde(default)]
     #[cfg(feature = "nat")]
     pub connection_type: ConnectionType,
+
+    /// Peer's per-node slice CIDR. `None` on old configs; when set, used as
+    /// the peer's `allowed_ips` instead of `overlay_ip/32`.
+    #[serde(default, with = "option_ipnet_str")]
+    pub slice_cidr: Option<IpNet>,
 }
 
 impl PeerConfig {
@@ -136,6 +190,7 @@ impl PeerConfig {
             candidates: Vec::new(),
             #[cfg(feature = "nat")]
             connection_type: ConnectionType::default(),
+            slice_cidr: None,
         }
     }
 
@@ -146,7 +201,22 @@ impl PeerConfig {
         self
     }
 
+    /// Set the per-node slice CIDR for this peer.
+    ///
+    /// When set, `to_peer_info()` uses the slice CIDR as the peer's
+    /// `allowed_ips` (so the overlay accepts the peer's full slice of
+    /// container IPs) instead of the legacy single-host `overlay_ip/32`.
+    #[must_use]
+    pub fn with_slice_cidr(mut self, cidr: IpNet) -> Self {
+        self.slice_cidr = Some(cidr);
+        self
+    }
+
     /// Convert to `PeerInfo` for overlay transport configuration
+    ///
+    /// When `slice_cidr` is set, the peer's `allowed_ips` is the slice CIDR
+    /// string. Otherwise, falls back to the legacy `overlay_ip/{32,128}`
+    /// host-prefix representation for back-compat.
     ///
     /// # Errors
     ///
@@ -155,15 +225,21 @@ impl PeerConfig {
         let endpoint: SocketAddr = self.endpoint.parse()?;
         let keepalive =
             Duration::from_secs(u64::from(self.keepalive.unwrap_or(DEFAULT_KEEPALIVE_SECS)));
-        let prefix = match self.overlay_ip {
-            IpAddr::V4(_) => 32,
-            IpAddr::V6(_) => 128,
+
+        let allowed_ips = if let Some(slice) = self.slice_cidr {
+            slice.to_string()
+        } else {
+            let prefix = match self.overlay_ip {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            };
+            format!("{}/{}", self.overlay_ip, prefix)
         };
 
         Ok(PeerInfo::new(
             self.public_key.clone(),
             endpoint,
-            &format!("{}/{}", self.overlay_ip, prefix),
+            &allowed_ips,
             keepalive,
         ))
     }
@@ -181,6 +257,10 @@ pub struct BootstrapState {
     /// IP allocator state (only for leader)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allocator_state: Option<crate::allocator::IpAllocatorState>,
+
+    /// Per-node slice allocator state (only for leader).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slice_allocator_state: Option<NodeSliceAllocatorSnapshot>,
 }
 
 /// Bootstrap manager for overlay network
@@ -199,6 +279,12 @@ pub struct OverlayBootstrap {
 
     /// IP allocator (only for leader nodes)
     allocator: Option<IpAllocator>,
+
+    /// Per-node slice allocator (only for leader nodes) — carves the cluster
+    /// CIDR into `/28` slices assigned to each joining node. Added to fix the
+    /// latent IP-collision bug where every agent independently allocated
+    /// container IPs from the full cluster `/16`.
+    slice_allocator: Option<NodeSliceAllocator>,
 
     /// DNS configuration (opt-in)
     dns_config: Option<DnsConfig>,
@@ -262,11 +348,42 @@ impl OverlayBootstrap {
             .await
             .map_err(|e| OverlayError::TransportCommand(e.to_string()))?;
 
-        // Initialize IP allocator and allocate first IP for leader
+        // Initialize IP allocator (legacy flat allocator, kept in sync for
+        // back-compat with callers that still read it) and allocate its
+        // first IP so its state tracks at least the leader.
         let mut allocator = IpAllocator::new(cidr)?;
-        let node_ip = allocator.allocate_first()?;
+        let _legacy_first = allocator.allocate_first()?;
 
-        info!(node_ip = %node_ip, cidr = cidr, "Allocated leader IP");
+        // Initialize the per-node slice allocator and carve the leader's
+        // own slice. The leader's `node_ip` is taken as the first usable
+        // host of its slice so it always lives inside the slice it owns.
+        let cluster_cidr: IpNet = cidr
+            .parse()
+            .map_err(|e: ipnet::AddrParseError| OverlayError::InvalidCidr(e.to_string()))?;
+        let mut slice_allocator = NodeSliceAllocator::new(cluster_cidr, DEFAULT_SLICE_PREFIX)?;
+        let leader_slice = slice_allocator.assign("leader")?;
+        let node_ip = leader_slice.hosts().next().unwrap_or_else(|| {
+            // Fall back to network() + 1 for very small slices where
+            // `hosts()` can return empty. We still need a valid address
+            // to assign to the interface.
+            match leader_slice.network() {
+                IpAddr::V4(v4) => {
+                    let bits = u32::from(v4).saturating_add(1);
+                    IpAddr::V4(std::net::Ipv4Addr::from(bits))
+                }
+                IpAddr::V6(v6) => {
+                    let bits = u128::from(v6).saturating_add(1);
+                    IpAddr::V6(std::net::Ipv6Addr::from(bits))
+                }
+            }
+        });
+
+        info!(
+            node_ip = %node_ip,
+            cidr = cidr,
+            slice = %leader_slice,
+            "Allocated leader IP from slice"
+        );
 
         // Create config
         let config = BootstrapConfig {
@@ -278,6 +395,7 @@ impl OverlayBootstrap {
             public_key,
             is_leader: true,
             created_at: current_timestamp(),
+            slice_cidr: Some(leader_slice),
         };
 
         let bootstrap = Self {
@@ -285,6 +403,7 @@ impl OverlayBootstrap {
             peers: Vec::new(),
             data_dir: data_dir.to_path_buf(),
             allocator: Some(allocator),
+            slice_allocator: Some(slice_allocator),
             dns_config: None,
             dns_handle: None,
             transport: None,
@@ -312,11 +431,15 @@ impl OverlayBootstrap {
     /// * `leader_overlay_ip` - Leader's overlay IP address
     /// * `allocated_ip` - IP address allocated for this node by the leader
     /// * `port` - Overlay listen port for this node
+    /// * `slice_cidr` - Per-node slice assigned by the leader (if any). When
+    ///   set, the worker uses this slice as its `allowed_ip`; `None` preserves
+    ///   the legacy `allocated_ip/32` behavior for pre-slice-aware clusters.
     /// * `data_dir` - Directory for persistent state
     ///
     /// # Errors
     ///
     /// Returns an error if already initialized, key generation fails, or state cannot be saved.
+    #[allow(clippy::too_many_arguments)]
     pub async fn join(
         leader_cidr: &str,
         leader_endpoint: &str,
@@ -324,6 +447,7 @@ impl OverlayBootstrap {
         leader_overlay_ip: IpAddr,
         allocated_ip: IpAddr,
         port: u16,
+        slice_cidr: Option<IpNet>,
         data_dir: &Path,
     ) -> Result<Self> {
         // Check if already initialized
@@ -353,6 +477,7 @@ impl OverlayBootstrap {
             public_key,
             is_leader: false,
             created_at: current_timestamp(),
+            slice_cidr,
         };
 
         // Add leader as the first peer
@@ -367,6 +492,7 @@ impl OverlayBootstrap {
             candidates: Vec::new(),
             #[cfg(feature = "nat")]
             connection_type: ConnectionType::default(),
+            slice_cidr: None,
         };
 
         info!(
@@ -380,6 +506,7 @@ impl OverlayBootstrap {
             peers: vec![leader_peer],
             data_dir: data_dir.to_path_buf(),
             allocator: None, // Workers don't manage IP allocation
+            slice_allocator: None,
             dns_config: None,
             dns_handle: None,
             transport: None,
@@ -416,11 +543,18 @@ impl OverlayBootstrap {
             None
         };
 
+        let slice_allocator = if let Some(snapshot) = state.slice_allocator_state {
+            Some(NodeSliceAllocator::restore(snapshot)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             config: state.config,
             peers: state.peers,
             data_dir: data_dir.to_path_buf(),
             allocator,
+            slice_allocator,
             dns_config: None, // DNS config must be re-enabled after load
             dns_handle: None,
             transport: None,
@@ -446,6 +580,10 @@ impl OverlayBootstrap {
                 .allocator
                 .as_ref()
                 .map(super::allocator::IpAllocator::to_state),
+            slice_allocator_state: self
+                .slice_allocator
+                .as_ref()
+                .map(NodeSliceAllocator::snapshot),
         };
 
         let contents = serde_json::to_string_pretty(&state)?;
@@ -536,6 +674,7 @@ impl OverlayBootstrap {
             private_key: self.config.private_key.clone(),
             public_key: self.config.public_key.clone(),
             overlay_cidr: self.config.allowed_ip(),
+            cluster_cidr: Some(self.config.cidr.clone()),
             peer_discovery_interval: Duration::from_secs(30),
             #[cfg(feature = "nat")]
             nat: crate::nat::NatConfig::default(),
@@ -735,6 +874,38 @@ impl OverlayBootstrap {
         Ok(())
     }
 
+    /// Replay assigned slices from persisted `PeerConfig.slice_cidr` values
+    /// back into the slice allocator. Call on leader startup after `load()`
+    /// so the in-memory allocator matches what's on disk.
+    ///
+    /// No-op for workers (who have no allocator).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the snapshot rebuild fails.
+    pub fn reconcile_existing_peers(&mut self) -> Result<()> {
+        let Some(ref mut allocator) = self.slice_allocator else {
+            return Ok(());
+        };
+        // Collect into a snapshot so we can restore cleanly.
+        let mut assigned: Vec<(String, String)> = Vec::new();
+        for peer in &self.peers {
+            if let Some(slice) = peer.slice_cidr {
+                assigned.push((peer.node_id.clone(), slice.to_string()));
+            }
+        }
+        if assigned.is_empty() {
+            return Ok(());
+        }
+        let snapshot = NodeSliceAllocatorSnapshot {
+            cluster_cidr: allocator.cluster_cidr().to_string(),
+            slice_prefix: allocator.slice_prefix(),
+            assigned,
+        };
+        *allocator = NodeSliceAllocator::restore(snapshot)?;
+        Ok(())
+    }
+
     /// Add a new peer to the overlay network
     ///
     /// For leader nodes, this also allocates an IP address for the peer.
@@ -751,6 +922,17 @@ impl OverlayBootstrap {
         } else {
             peer.overlay_ip
         };
+
+        // If we're the leader and have a slice allocator, assign a /28 slice
+        // to this peer. Peers track their slice so `to_peer_info()` can emit the
+        // correct `allowed_ips`.
+        if let Some(ref mut slice_allocator) = self.slice_allocator {
+            let slice = slice_allocator.assign(&peer.node_id)?;
+            peer.slice_cidr = Some(slice);
+            // The peer's overlay_ip (reallocated above from the flat allocator)
+            // is left as-is for compatibility with callers that still read it;
+            // the authoritative routing info is `slice_cidr`.
+        }
 
         // Add peer to overlay transport via UAPI
         if let Ok(peer_info) = peer.to_peer_info() {
@@ -769,6 +951,7 @@ impl OverlayBootstrap {
                     private_key: self.config.private_key.clone(),
                     public_key: self.config.public_key.clone(),
                     overlay_cidr: self.config.allowed_ip(),
+                    cluster_cidr: Some(self.config.cidr.clone()),
                     peer_discovery_interval: Duration::from_secs(30),
                     #[cfg(feature = "nat")]
                     nat: crate::nat::NatConfig::default(),
@@ -900,6 +1083,7 @@ impl OverlayBootstrap {
                 private_key: self.config.private_key.clone(),
                 public_key: self.config.public_key.clone(),
                 overlay_cidr: self.config.allowed_ip(),
+                cluster_cidr: Some(self.config.cidr.clone()),
                 peer_discovery_interval: Duration::from_secs(30),
                 #[cfg(feature = "nat")]
                 nat: crate::nat::NatConfig::default(),
@@ -1074,6 +1258,7 @@ mod tests {
             public_key: "test_public".to_string(),
             is_leader: true,
             created_at: 0,
+            slice_cidr: None,
         };
 
         assert_eq!(config.allowed_ip(), "10.200.0.1/32");
@@ -1090,6 +1275,7 @@ mod tests {
             public_key: "test_public".to_string(),
             is_leader: true,
             created_at: 0,
+            slice_cidr: None,
         };
 
         assert_eq!(config.allowed_ip(), "fd00:200::1/128");
@@ -1175,12 +1361,14 @@ mod tests {
             public_key: "public".to_string(),
             is_leader: true,
             created_at: 1_234_567_890,
+            slice_cidr: None,
         };
 
         let state = BootstrapState {
             config,
             peers: vec![],
             allocator_state: None,
+            slice_allocator_state: None,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -1201,12 +1389,14 @@ mod tests {
             public_key: "public".to_string(),
             is_leader: true,
             created_at: 1_234_567_890,
+            slice_cidr: None,
         };
 
         let state = BootstrapState {
             config,
             peers: vec![],
             allocator_state: None,
+            slice_allocator_state: None,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -1222,5 +1412,66 @@ mod tests {
         let net: ipnet::IpNet = DEFAULT_OVERLAY_CIDR_V6.parse().unwrap();
         assert!(matches!(net, ipnet::IpNet::V6(_)));
         assert_eq!(net.prefix_len(), 48);
+    }
+
+    #[test]
+    fn test_to_peer_info_uses_slice_when_set() {
+        let peer = PeerConfig::new(
+            "node-42".to_string(),
+            "pubkey-xyz".to_string(),
+            "192.168.1.100:51820".to_string(),
+            IpAddr::V4(Ipv4Addr::new(10, 200, 42, 1)),
+        )
+        .with_slice_cidr("10.200.42.0/28".parse().unwrap());
+
+        let peer_info = peer.to_peer_info().unwrap();
+        assert_eq!(peer_info.allowed_ips, "10.200.42.0/28");
+    }
+
+    #[test]
+    fn test_to_peer_info_falls_back_to_node_ip_when_no_slice() {
+        let peer = PeerConfig::new(
+            "node-5".to_string(),
+            "pubkey-abc".to_string(),
+            "192.168.1.100:51820".to_string(),
+            "10.200.0.5".parse().unwrap(),
+        );
+
+        let peer_info = peer.to_peer_info().unwrap();
+        assert_eq!(peer_info.allowed_ips, "10.200.0.5/32");
+    }
+
+    #[test]
+    fn test_bootstrap_config_allowed_ip_prefers_slice() {
+        let config = BootstrapConfig {
+            cidr: "10.200.0.0/16".to_string(),
+            node_ip: IpAddr::V4(Ipv4Addr::new(10, 200, 7, 1)),
+            interface: DEFAULT_INTERFACE_NAME.to_string(),
+            port: DEFAULT_WG_PORT,
+            private_key: "private".to_string(),
+            public_key: "public".to_string(),
+            is_leader: false,
+            created_at: 0,
+            slice_cidr: Some("10.200.7.0/28".parse().unwrap()),
+        };
+
+        assert_eq!(config.allowed_ip(), "10.200.7.0/28");
+    }
+
+    #[test]
+    fn test_bootstrap_config_allowed_ip_falls_back_to_node_ip() {
+        let config = BootstrapConfig {
+            cidr: "10.200.0.0/16".to_string(),
+            node_ip: IpAddr::V4(Ipv4Addr::new(10, 200, 0, 9)),
+            interface: DEFAULT_INTERFACE_NAME.to_string(),
+            port: DEFAULT_WG_PORT,
+            private_key: "private".to_string(),
+            public_key: "public".to_string(),
+            is_leader: false,
+            created_at: 0,
+            slice_cidr: None,
+        };
+
+        assert_eq!(config.allowed_ip(), "10.200.0.9/32");
     }
 }

@@ -29,6 +29,8 @@ zlayer-scheduler.workspace = true
 zlayer-observability.workspace = true
 zlayer-secrets.workspace = true
 zlayer-storage.workspace = true
+# Central filesystem path resolution (admin bearer token persistence).
+zlayer-paths.workspace = true
 
 # Web framework
 axum.workspace = true

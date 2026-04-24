@@ -1,5 +1,7 @@
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
+
+use crate::ui::consent::ConsentMode;
 
 /// Return the platform-appropriate default data directory for `ZLayer`.
 ///
@@ -163,6 +165,48 @@ pub(crate) enum RuntimeType {
     MacVm,
 }
 
+/// Shared flag group controlling WSL2 auto-install consent.
+///
+/// Flattened into every subcommand that may trigger WSL2 bootstrap
+/// (`node init`, `node join`, `join <url>`, `daemon install`). The flag
+/// resolves to a [`ConsentMode`] that the handler forwards to
+/// `crate::ui::consent::wsl2_install_consent`.
+///
+/// Precedence: explicit `--install-wsl <value>` on the CLI beats
+/// `ZLAYER_INSTALL_WSL`, which beats the default (`ask`).
+#[derive(Debug, Clone, Copy, Args)]
+pub(crate) struct InstallWslArgs {
+    /// Consent policy for auto-installing WSL2 on Windows when it's missing.
+    ///
+    /// - `ask` (default): interactive Y/n prompt on the controlling terminal.
+    /// - `yes`: auto-accept (UAC prompt still appears).
+    /// - `no`: never install; hard-fail if WSL2 isn't already present.
+    ///
+    /// Only consulted on Windows — ignored on other platforms.
+    #[arg(
+        long = "install-wsl",
+        value_enum,
+        default_value_t = ConsentMode::Ask,
+        env = "ZLAYER_INSTALL_WSL",
+        global = false,
+    )]
+    pub(crate) install_wsl: ConsentMode,
+}
+
+impl InstallWslArgs {
+    /// Extract the underlying consent mode.
+    ///
+    /// Consumed by the Windows-gated handlers in
+    /// `commands::{node, join, daemon}`; kept unconditionally public so the
+    /// (currently in-flight) H-1/H-2/H-3 wiring doesn't need a separate
+    /// feature-gate dance.
+    #[must_use]
+    #[allow(dead_code)] // wired in H-1/H-2/H-3 (see task G-6 notes)
+    pub(crate) fn mode(self) -> ConsentMode {
+        self.install_wsl
+    }
+}
+
 /// CLI subcommands
 #[derive(Subcommand)]
 pub(crate) enum Commands {
@@ -224,6 +268,10 @@ pub(crate) enum Commands {
         /// Number of replicas to run on this node
         #[arg(short, long, default_value = "1")]
         replicas: u32,
+
+        /// WSL2 auto-install consent (Windows only).
+        #[command(flatten)]
+        install_wsl: InstallWslArgs,
     },
 
     /// List running deployments, services, and containers
@@ -390,6 +438,15 @@ pub(crate) enum Commands {
         /// Verbose output (show all build output)
         #[arg(long)]
         verbose_build: bool,
+
+        /// Target platform for the build (e.g. `linux`, `linux/amd64`, `windows`, `windows/amd64`).
+        ///
+        /// Selects the OS portion of the image being built and routes to the
+        /// matching builder backend (buildah on Linux, HCS on Windows). When
+        /// omitted, the OS is inferred from the `ZImagefile`'s `os:` or
+        /// `platform:` field, falling back to Linux.
+        #[arg(long, value_name = "PLATFORM")]
+        platform: Option<String>,
     },
 
     /// Build multiple images from a pipeline manifest
@@ -484,14 +541,26 @@ pub(crate) enum Commands {
     ///   zlayer import myapp.tar
     ///   zlayer import myapp.tar.gz -t myapp:imported
     ///   zlayer import /path/to/image.tar --tag myapp:v1.0
+    ///   zlayer import <https://forge.example.com/.../myapp-oci.tar>
+    ///   zlayer import <https://forge.example.com/.../myapp-oci.tar> -u user -p token
     #[command(verbatim_doc_comment, display_order = 22)]
     Import {
-        /// Input tar file path
-        input: PathBuf,
+        /// Input: either a local tar file path or an http(s):// URL to an OCI
+        /// tar archive. URL fetches support optional HTTP Basic auth via
+        /// `--username` / `--password`.
+        input: String,
 
         /// Tag to apply to imported image
         #[arg(short, long)]
         tag: Option<String>,
+
+        /// HTTP Basic auth username (URL input only)
+        #[arg(short = 'u', long)]
+        username: Option<String>,
+
+        /// HTTP Basic auth password (URL input only)
+        #[arg(short = 'p', long)]
+        password: Option<String>,
     },
 
     // ── Cluster & Infrastructure ──────────────────────────────────────
@@ -518,6 +587,13 @@ pub(crate) enum Commands {
         #[arg(long)]
         daemon: bool,
 
+        /// Run as a Windows Service under SCM (internal flag, set by the
+        /// Service Control Manager when it spawns the binary). Hidden from
+        /// normal help because it has no effect when launched from a console.
+        /// Errors on non-Windows targets.
+        #[arg(long, hide = true)]
+        service: bool,
+
         /// Unix socket path for CLI communication.
         /// Defaults to {run-dir}/zlayer.sock.
         #[arg(long)]
@@ -536,12 +612,12 @@ pub(crate) enum Commands {
 
         /// Docker API socket path
         #[cfg(feature = "docker-compat")]
-        #[arg(long, default_value = "/var/run/docker.sock")]
+        #[arg(long, default_value_t = zlayer_paths::ZLayerDirs::default_docker_socket_path())]
         docker_socket_path: String,
     },
 
-    /// Manage the zlayer background daemon
-    #[cfg(unix)]
+    /// Manage the zlayer background daemon (systemd on Linux, launchd on
+    /// macOS, SCM on Windows).
     #[command(subcommand, display_order = 32)]
     Daemon(DaemonAction),
 
@@ -605,7 +681,6 @@ pub(crate) enum Commands {
     ///   zlayer run --env prod --merge global --merge baseline -- ./bin/server
     ///   zlayer run --env dev --dry-run         # masked preview
     ///   zlayer run --env dev --dry-run --unmask  # plaintext (admin)
-    #[cfg(unix)]
     #[command(verbatim_doc_comment, display_order = 39)]
     Run {
         /// Primary environment to resolve secrets from (id or name).
@@ -646,7 +721,6 @@ pub(crate) enum Commands {
     /// Manage deployment/runtime environments (e.g. `dev`, `staging`,
     /// `prod`). Each environment is an isolated namespace for secrets and,
     /// eventually, deployments. Optionally belongs to a project.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 38)]
     Env(EnvCommands),
 
@@ -662,7 +736,6 @@ pub(crate) enum Commands {
     /// Manage plaintext key-value variables for template substitution in
     /// deployment specs. Variables are NOT encrypted (unlike secrets).
     /// They can be global or project-scoped.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 39)]
     Variable(VariableCommands),
 
@@ -670,7 +743,6 @@ pub(crate) enum Commands {
     ///
     /// Manage named runnable scripts that can be executed on demand.
     /// Tasks can be global or project-scoped.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 39)]
     Task(TaskCommands),
 
@@ -678,7 +750,6 @@ pub(crate) enum Commands {
     ///
     /// Manage named DAGs of steps that compose tasks, project builds,
     /// deploys, and sync applies. Steps run sequentially.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 39)]
     Workflow(WorkflowCommands),
 
@@ -686,7 +757,6 @@ pub(crate) enum Commands {
     ///
     /// Manage notification channels (Slack, Discord, webhook, SMTP)
     /// that fire alerts when triggered.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 39)]
     Notifier(NotifierCommands),
 
@@ -713,35 +783,30 @@ pub(crate) enum Commands {
     /// Authentication commands
     ///
     /// Log in to a `ZLayer` server, check status, or log out.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 41)]
     Auth(AuthCommands),
 
     /// User management commands
     ///
     /// Admin-only operations: create, list, update, and delete user accounts.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 43)]
     User(UserCommands),
 
     /// Group management commands
     ///
     /// Admin-only CRUD for user groups and membership management.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 44)]
     Group(GroupCommands),
 
     /// Permission management commands
     ///
     /// Admin-only: grant, list, and revoke resource-level permissions.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 44)]
     Permission(PermissionCommands),
 
     /// Audit log commands
     ///
     /// Admin-only: query the audit trail.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 44)]
     Audit(AuditCommands),
 
@@ -749,7 +814,6 @@ pub(crate) enum Commands {
     ///
     /// Create, list, update, and delete projects. Projects group
     /// deployments, credentials, and build configuration together.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 44)]
     Project(ProjectCommands),
 
@@ -757,7 +821,6 @@ pub(crate) enum Commands {
     ///
     /// Store and manage registry and git credentials. Secrets are
     /// encrypted at rest; listing only exposes metadata.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 45)]
     Credential(CredentialCommands),
 
@@ -765,7 +828,6 @@ pub(crate) enum Commands {
     ///
     /// Manage sync resources that point at git directories containing
     /// `ZLayer` resource YAMLs. Supports diff and apply (dry-run in v1).
-    #[cfg(unix)]
     #[command(subcommand, display_order = 46, name = "sync")]
     Sync(SyncCommands),
 
@@ -778,7 +840,6 @@ pub(crate) enum Commands {
     /// Job and cron job management commands
     ///
     /// List, trigger, and check the status of jobs and cron jobs.
-    #[cfg(unix)]
     #[command(subcommand, display_order = 42)]
     Job(JobCommands),
 
@@ -829,7 +890,7 @@ pub(crate) enum Commands {
 #[cfg(all(target_os = "windows", feature = "wsl"))]
 #[derive(Debug, clap::Subcommand)]
 pub enum WindowsCommands {
-    /// Compact the ZLayer WSL2 distro's `ext4.vhdx` to reclaim freed space to the host.
+    /// Compact the `ZLayer` WSL2 distro's `ext4.vhdx` to reclaim freed space to the host.
     Compact {
         /// Skip the graceful daemon-stop wait; go straight to `wsl --shutdown`.
         #[arg(long)]
@@ -838,7 +899,6 @@ pub enum WindowsCommands {
 }
 
 /// Daemon lifecycle actions
-#[cfg(unix)]
 #[derive(Subcommand)]
 pub(crate) enum DaemonAction {
     /// Install zlayer as a system service (launchd on macOS, systemd on Linux)
@@ -863,6 +923,11 @@ pub(crate) enum DaemonAction {
         #[cfg(feature = "docker-compat")]
         #[arg(long)]
         docker_socket: bool,
+
+        /// WSL2 auto-install consent (Windows only — parsed here for
+        /// forward-compatibility when `daemon install` lands on Windows).
+        #[command(flatten)]
+        install_wsl: InstallWslArgs,
     },
 
     /// Uninstall the zlayer system service
@@ -1394,7 +1459,6 @@ pub(crate) enum SecretCommands {
 /// An environment is a named, isolated namespace for secrets (and, in
 /// future phases, deployments). Environments are either global
 /// (`project_id = None`) or owned by a specific project.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum EnvCommands {
     /// List environments.
@@ -1459,7 +1523,6 @@ pub(crate) enum EnvCommands {
 /// deployment specs. Unlike secrets, variable values are NOT encrypted
 /// and are fully visible in API responses. They can be global
 /// (`scope = None`) or project-scoped.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum VariableCommands {
     /// List variables.
@@ -1509,7 +1572,6 @@ pub(crate) enum VariableCommands {
 /// Tasks are named runnable scripts that can be executed on demand.
 /// When run, the task body is executed as a subprocess and stdout/stderr
 /// are captured.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum TaskCommands {
     /// List tasks.
@@ -1566,7 +1628,6 @@ pub(crate) enum TaskCommands {
 /// Workflows are named DAGs of steps that compose tasks, project builds,
 /// deploys, and sync applies. Steps execute sequentially; if a step fails,
 /// the optional `on_failure` handler runs before aborting.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum WorkflowCommands {
     /// List workflows.
@@ -1618,7 +1679,6 @@ pub(crate) enum WorkflowCommands {
 ///
 /// Notifiers are named notification channels that send alerts to Slack,
 /// Discord, generic webhooks, or SMTP endpoints when triggered.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum NotifierCommands {
     /// List notifiers.
@@ -1663,7 +1723,6 @@ pub(crate) enum NotifierCommands {
 
 /// Projects group deployments, credentials, environments, and build
 /// configuration under a single entity.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum ProjectCommands {
     /// List all projects.
@@ -1833,7 +1892,6 @@ pub(crate) enum ProjectCommands {
 }
 
 /// Webhook management subcommands for projects.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum WebhookCommands {
     /// Show the webhook URL and secret for a project.
@@ -1855,7 +1913,6 @@ pub(crate) enum WebhookCommands {
 }
 
 /// CLI-friendly build kind. Sent as a lowercase string in the JSON body.
-#[cfg(unix)]
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub(crate) enum CliBuildKind {
     Dockerfile,
@@ -1864,7 +1921,6 @@ pub(crate) enum CliBuildKind {
     Spec,
 }
 
-#[cfg(unix)]
 impl std::fmt::Display for CliBuildKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -1881,7 +1937,6 @@ impl std::fmt::Display for CliBuildKind {
 ///
 /// Registry and git credentials are stored encrypted at rest. Only
 /// metadata (id, registry, username, kind) is exposed through listing.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum CredentialCommands {
     /// Registry credential subcommands.
@@ -1893,7 +1948,6 @@ pub(crate) enum CredentialCommands {
 }
 
 /// Registry credential subcommands.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum RegistryCredentialCommands {
     /// List registry credentials.
@@ -1933,7 +1987,6 @@ pub(crate) enum RegistryCredentialCommands {
 }
 
 /// Git credential subcommands.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum GitCredentialCommands {
     /// List git credentials.
@@ -1969,14 +2022,12 @@ pub(crate) enum GitCredentialCommands {
 }
 
 /// CLI-friendly registry auth type.
-#[cfg(unix)]
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub(crate) enum CliRegistryAuthType {
     Basic,
     Token,
 }
 
-#[cfg(unix)]
 impl std::fmt::Display for CliRegistryAuthType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -1988,14 +2039,12 @@ impl std::fmt::Display for CliRegistryAuthType {
 }
 
 /// CLI-friendly git credential kind.
-#[cfg(unix)]
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub(crate) enum CliGitCredentialKind {
     Pat,
     SshKey,
 }
 
-#[cfg(unix)]
 impl std::fmt::Display for CliGitCredentialKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -2010,7 +2059,6 @@ impl std::fmt::Display for CliGitCredentialKind {
 ///
 /// Syncs point at git directories containing `ZLayer` resource YAMLs and
 /// support diff / apply operations for `GitOps` workflows.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum SyncCommands {
     /// List all syncs.
@@ -2404,6 +2452,10 @@ pub(crate) enum NodeCommands {
         /// Overlay network CIDR
         #[arg(long, default_value = "10.200.0.0/16")]
         overlay_cidr: String,
+
+        /// WSL2 auto-install consent (Windows only).
+        #[command(flatten)]
+        install_wsl: InstallWslArgs,
     },
 
     /// Join an existing cluster as a worker node
@@ -2430,6 +2482,10 @@ pub(crate) enum NodeCommands {
         /// Services to replicate (only with --mode replicate)
         #[arg(long)]
         services: Option<Vec<String>>,
+
+        /// WSL2 auto-install consent (Windows only).
+        #[command(flatten)]
+        install_wsl: InstallWslArgs,
     },
 
     /// List all nodes in the cluster
@@ -2568,7 +2624,6 @@ pub(crate) enum TokenCommands {
 }
 
 /// Authentication subcommands
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum AuthCommands {
     /// Create the first admin user (first-run setup).
@@ -2620,14 +2675,12 @@ pub(crate) enum AuthCommands {
 }
 
 /// CLI-friendly user role. Converts into `zlayer_api::storage::UserRole`.
-#[cfg(unix)]
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub(crate) enum CliUserRole {
     Admin,
     User,
 }
 
-#[cfg(unix)]
 impl From<CliUserRole> for zlayer_api::storage::UserRole {
     fn from(r: CliUserRole) -> Self {
         match r {
@@ -2638,7 +2691,6 @@ impl From<CliUserRole> for zlayer_api::storage::UserRole {
 }
 
 /// User management subcommands (admin-only).
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum UserCommands {
     /// List all users.
@@ -2723,7 +2775,6 @@ pub(crate) enum UserCommands {
 }
 
 /// Group management subcommands.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum GroupCommands {
     /// List all groups.
@@ -2757,7 +2808,6 @@ pub(crate) enum GroupCommands {
 }
 
 /// Group member management subcommands.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum GroupMemberCommands {
     /// Add a user to a group.
@@ -2782,7 +2832,6 @@ pub(crate) enum GroupMemberCommands {
 }
 
 /// Permission management subcommands.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum PermissionCommands {
     /// List permissions for a user or group.
@@ -2826,14 +2875,12 @@ pub(crate) enum PermissionCommands {
 }
 
 /// CLI enum for subject kind.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub(crate) enum CliSubjectKind {
     User,
     Group,
 }
 
-#[cfg(unix)]
 impl From<CliSubjectKind> for zlayer_api::storage::SubjectKind {
     fn from(k: CliSubjectKind) -> Self {
         match k {
@@ -2844,7 +2891,6 @@ impl From<CliSubjectKind> for zlayer_api::storage::SubjectKind {
 }
 
 /// CLI enum for permission level.
-#[cfg(unix)]
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
 pub(crate) enum CliPermissionLevel {
     Read,
@@ -2852,7 +2898,6 @@ pub(crate) enum CliPermissionLevel {
     Execute,
 }
 
-#[cfg(unix)]
 impl From<CliPermissionLevel> for zlayer_api::storage::PermissionLevel {
     fn from(l: CliPermissionLevel) -> Self {
         match l {
@@ -2864,7 +2909,6 @@ impl From<CliPermissionLevel> for zlayer_api::storage::PermissionLevel {
 }
 
 /// Audit log subcommands.
-#[cfg(unix)]
 #[derive(Subcommand, Debug)]
 pub(crate) enum AuditCommands {
     /// Show recent audit log entries.
@@ -2986,6 +3030,7 @@ mod tests {
                 spec_dir,
                 service,
                 replicas,
+                ..
             }) => {
                 assert_eq!(token, "some-token");
                 assert!(spec_dir.is_none());
@@ -3017,6 +3062,7 @@ mod tests {
                 spec_dir,
                 service,
                 replicas,
+                ..
             }) => {
                 assert_eq!(token, "my-join-token");
                 assert_eq!(spec_dir, Some("/custom/specs".to_string()));
@@ -3452,6 +3498,47 @@ mod tests {
                 assert_eq!(format, "table");
             }
             _ => panic!("Expected Ps command"),
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // L-2: `zlayer build --platform` flag parses to Option<String> and the
+    //      downstream code (bin/zlayer/src/commands/build.rs) converts it to
+    //      `ImageOs`. We validate the CLI-side surface here; the string→ImageOs
+    //      conversion has its own coverage in `backend::mod::tests`.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_cli_build_platform_flag_linux_amd64() {
+        let cli =
+            Cli::try_parse_from(["zlayer", "build", "--platform", "linux/amd64", "."]).unwrap();
+        match cli.command {
+            Some(Commands::Build { platform, .. }) => {
+                assert_eq!(platform.as_deref(), Some("linux/amd64"));
+            }
+            _ => panic!("Expected Build command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_build_platform_flag_windows() {
+        let cli = Cli::try_parse_from(["zlayer", "build", "--platform", "windows", "."]).unwrap();
+        match cli.command {
+            Some(Commands::Build { platform, .. }) => {
+                assert_eq!(platform.as_deref(), Some("windows"));
+            }
+            _ => panic!("Expected Build command"),
+        }
+    }
+
+    #[test]
+    fn test_cli_build_platform_flag_omitted_is_none() {
+        let cli = Cli::try_parse_from(["zlayer", "build", "."]).unwrap();
+        match cli.command {
+            Some(Commands::Build { platform, .. }) => {
+                assert!(platform.is_none());
+            }
+            _ => panic!("Expected Build command"),
         }
     }
 }

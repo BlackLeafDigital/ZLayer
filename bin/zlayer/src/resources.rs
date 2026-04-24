@@ -324,6 +324,7 @@ fn macos_available_memory() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::path::PathBuf;
 
     #[test]

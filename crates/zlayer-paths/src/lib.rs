@@ -27,7 +27,9 @@ impl ZLayerDirs {
     /// - macOS: `~/.zlayer`
     /// - Linux (root): `/var/lib/zlayer`
     /// - Linux (user): `~/.zlayer`
-    /// - Windows: `%LOCALAPPDATA%\ZLayer` or `C:\ProgramData\ZLayer`
+    /// - Windows: `%ProgramData%\ZLayer` (system) or `C:\ProgramData\ZLayer`
+    ///   fallback. HCS-backed nodes run as SYSTEM so the system-wide
+    ///   `ProgramData` location is the right default.
     pub fn default_data_dir() -> PathBuf {
         #[cfg(target_os = "macos")]
         {
@@ -35,11 +37,7 @@ impl ZLayerDirs {
         }
         #[cfg(target_os = "windows")]
         {
-            if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-                PathBuf::from(local_app_data).join("ZLayer")
-            } else {
-                PathBuf::from(r"C:\ProgramData\ZLayer")
-            }
+            windows_program_data_root()
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -55,7 +53,10 @@ impl ZLayerDirs {
     ///
     /// On Linux, if not root, checks whether `/var/lib/zlayer/daemon.json`
     /// exists (indicating a system-level install) and returns
-    /// `/var/lib/zlayer` if so. Otherwise falls back to [`default_data_dir`].
+    /// `/var/lib/zlayer` if so. On Windows, probes `%ProgramData%\ZLayer`
+    /// for a `daemon.json` marker in case the caller lacks the env var but
+    /// a prior system install is present. Otherwise falls back to
+    /// [`default_data_dir`].
     pub fn detect_data_dir() -> PathBuf {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -66,6 +67,13 @@ impl ZLayerDirs {
                 }
             }
         }
+        #[cfg(target_os = "windows")]
+        {
+            let system_data = windows_program_data_root();
+            if system_data.join("daemon.json").exists() {
+                return system_data;
+            }
+        }
         Self::default_data_dir()
     }
 
@@ -73,7 +81,7 @@ impl ZLayerDirs {
     ///
     /// - Linux: `/var/run/zlayer`
     /// - macOS: `{default_data_dir}/run`
-    /// - Windows: `{default_data_dir}\run`
+    /// - Windows: `{default_data_dir}\run` (i.e. `%ProgramData%\ZLayer\run`)
     pub fn default_run_dir() -> PathBuf {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -89,7 +97,7 @@ impl ZLayerDirs {
     ///
     /// - Linux: `/var/log/zlayer`
     /// - macOS: `{default_data_dir}/logs`
-    /// - Windows: `{default_data_dir}\logs`
+    /// - Windows: `{default_data_dir}\logs` (i.e. `%ProgramData%\ZLayer\logs`)
     pub fn default_log_dir() -> PathBuf {
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
@@ -124,6 +132,48 @@ impl ZLayerDirs {
             #[cfg(not(target_os = "macos"))]
             {
                 "/var/run/zlayer.sock".to_string()
+            }
+        }
+    }
+
+    /// Default Docker-compatible API socket path.
+    ///
+    /// - Linux (root): `/var/run/zlayer/docker.sock`
+    /// - Linux (user, `XDG_RUNTIME_DIR` set): `{XDG_RUNTIME_DIR}/zlayer/docker.sock`
+    /// - Linux (user, no `XDG_RUNTIME_DIR`): `{default_data_dir}/run/docker.sock`
+    /// - macOS: `{default_data_dir}/run/docker.sock`
+    /// - Windows: `\\.\pipe\zlayer-docker`
+    pub fn default_docker_socket_path() -> String {
+        #[cfg(target_os = "windows")]
+        {
+            r"\\.\pipe\zlayer-docker".to_string()
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            #[cfg(target_os = "macos")]
+            {
+                Self::default_data_dir()
+                    .join("run")
+                    .join("docker.sock")
+                    .to_string_lossy()
+                    .into_owned()
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                if is_root() {
+                    "/var/run/zlayer/docker.sock".to_string()
+                } else if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+                    let mut p = PathBuf::from(xdg);
+                    p.push("zlayer");
+                    p.push("docker.sock");
+                    p.to_string_lossy().into_owned()
+                } else {
+                    Self::default_data_dir()
+                        .join("run")
+                        .join("docker.sock")
+                        .to_string_lossy()
+                        .into_owned()
+                }
             }
         }
     }
@@ -215,9 +265,32 @@ impl ZLayerDirs {
         self.data_dir.join("admin_password")
     }
 
+    /// Path to the persisted local-admin bearer token file.
+    ///
+    /// On Linux/macOS this file is informational — the daemon's UDS middleware
+    /// already injects the bearer into UDS-originated requests. On Windows the
+    /// `DaemonClient` reads this file on connect to authenticate against the
+    /// loopback TCP listener (which has no socket-path-based local-admin
+    /// bypass).
+    ///
+    /// Default: `<data_dir>/admin_bearer.token`
+    ///
+    /// On Windows this resolves under `%ProgramData%\ZLayer` so the file
+    /// inherits the parent ACL (SYSTEM + Administrators write, Users read),
+    /// which is adequate for the local-admin bearer.
+    #[must_use]
+    pub fn admin_bearer_path(&self) -> PathBuf {
+        self.data_dir.join("admin_bearer.token")
+    }
+
     /// Daemon metadata file path (`{data}/daemon.json`).
     pub fn daemon_json(&self) -> PathBuf {
         self.data_dir.join("daemon.json")
+    }
+
+    /// Path to the agent's local IPAM (per-node slice allocator) state file.
+    pub fn agent_ipam_state(&self) -> PathBuf {
+        self.data_dir.join("agent_ipam.json")
     }
 
     /// Logs subdirectory under data_dir (`{data}/logs`).
@@ -254,29 +327,79 @@ impl ZLayerDirs {
     }
 }
 
+/// Convenience: `ZLayerDirs::system_default().admin_bearer_path()`.
+#[must_use]
+pub fn default_admin_bearer_path() -> PathBuf {
+    ZLayerDirs::system_default().admin_bearer_path()
+}
+
 // -- Internal helpers --------------------------------------------------------
 
+#[cfg(not(target_os = "windows"))]
 fn home_dir_or_tmp() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn is_root() -> bool {
-    #[cfg(unix)]
-    {
-        nix::unistd::geteuid().is_root()
+/// Resolve the Windows system-wide ZLayer data root.
+///
+/// Uses `%ProgramData%` (typically `C:\ProgramData`) when present, falling
+/// back to the literal `C:\ProgramData\ZLayer` path when the env var is
+/// missing (as can happen under a stripped-down service account).
+#[cfg(target_os = "windows")]
+fn windows_program_data_root() -> PathBuf {
+    if let Some(program_data) = std::env::var_os("PROGRAMDATA") {
+        let mut p = PathBuf::from(program_data);
+        p.push("ZLayer");
+        p
+    } else {
+        PathBuf::from(r"C:\ProgramData\ZLayer")
     }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+}
+
+/// Returns `true` when the current process is running with superuser /
+/// Administrator privileges.
+///
+/// - Unix: true when the effective UID is `0`.
+/// - Windows: true when the current process token is a member of the
+///   built-in Administrators group (checked via `IsUserAnAdmin`).
+/// - Other targets: always returns `false`.
+#[cfg(unix)]
+#[must_use]
+pub fn is_root() -> bool {
+    // SAFETY: `geteuid` is always safe to call and is thread-safe.
+    unsafe { libc::geteuid() == 0 }
+}
+
+/// Returns `true` when the current process is running with superuser /
+/// Administrator privileges.
+#[cfg(windows)]
+#[must_use]
+pub fn is_root() -> bool {
+    use windows::Win32::UI::Shell::IsUserAnAdmin;
+    // SAFETY: `IsUserAnAdmin` has no preconditions and returns a BOOL.
+    unsafe { IsUserAnAdmin().as_bool() }
+}
+
+/// Fallback for non-unix, non-windows targets.
+#[cfg(not(any(unix, windows)))]
+#[must_use]
+pub fn is_root() -> bool {
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Windows tests below mutate the `PROGRAMDATA` env var to exercise
+    // platform-default path resolution. Cargo runs tests concurrently,
+    // so readers (`system_default`, `default_admin_bearer_path`) must
+    // serialize against the mutators or they race and observe a mix of
+    // pre- and post-mutation env state.
+    #[cfg(target_os = "windows")]
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn subdirectories_are_relative_to_data_dir() {
@@ -312,7 +435,100 @@ mod tests {
 
     #[test]
     fn system_default_uses_default_data_dir() {
+        #[cfg(target_os = "windows")]
+        let _env_guard = ENV_LOCK.lock().unwrap();
         let dirs = ZLayerDirs::system_default();
         assert_eq!(dirs.data_dir(), ZLayerDirs::default_data_dir().as_path());
+    }
+
+    #[test]
+    fn admin_bearer_path_is_under_data_dir() {
+        let dirs = ZLayerDirs::new(PathBuf::from("/tmp/zlayer-test"));
+        assert_eq!(
+            dirs.admin_bearer_path(),
+            PathBuf::from("/tmp/zlayer-test/admin_bearer.token")
+        );
+    }
+
+    #[test]
+    fn default_admin_bearer_path_matches_system_default() {
+        #[cfg(target_os = "windows")]
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        assert_eq!(
+            default_admin_bearer_path(),
+            ZLayerDirs::system_default().admin_bearer_path()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_default_data_dir_uses_program_data() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("PROGRAMDATA");
+        std::env::set_var("PROGRAMDATA", r"C:\TestProgramData");
+
+        let data = ZLayerDirs::default_data_dir();
+        assert_eq!(data, PathBuf::from(r"C:\TestProgramData\ZLayer"));
+
+        // Sub-paths should live under the ProgramData root.
+        let dirs = ZLayerDirs::system_default();
+        assert_eq!(dirs.certs(), data.join("certs"));
+        assert_eq!(dirs.secrets(), data.join("secrets"));
+        assert_eq!(dirs.logs(), data.join("logs"));
+
+        // Run/log helpers should also honour the ProgramData root.
+        assert_eq!(ZLayerDirs::default_run_dir(), data.join("run"));
+        assert_eq!(ZLayerDirs::default_log_dir(), data.join("logs"));
+
+        // Socket path on Windows is a TCP loopback endpoint, not a filesystem
+        // path.
+        assert_eq!(ZLayerDirs::default_socket_path(), "tcp://127.0.0.1:3669");
+
+        match prev {
+            Some(v) => std::env::set_var("PROGRAMDATA", v),
+            None => std::env::remove_var("PROGRAMDATA"),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_default_data_dir_fallback_when_env_missing() {
+        let _env_guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("PROGRAMDATA");
+        std::env::remove_var("PROGRAMDATA");
+
+        let data = ZLayerDirs::default_data_dir();
+        assert_eq!(data, PathBuf::from(r"C:\ProgramData\ZLayer"));
+
+        if let Some(v) = prev {
+            std::env::set_var("PROGRAMDATA", v);
+        }
+    }
+
+    #[test]
+    fn default_docker_socket_path_not_empty() {
+        let result = ZLayerDirs::default_docker_socket_path();
+        assert!(!result.is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn default_docker_socket_path_platform_shape() {
+        let result = ZLayerDirs::default_docker_socket_path();
+        assert!(result.starts_with(r"\\.\pipe"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_docker_socket_path_platform_shape() {
+        let result = ZLayerDirs::default_docker_socket_path();
+        assert!(result.ends_with("/docker.sock"));
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    #[test]
+    fn default_docker_socket_path_platform_shape() {
+        let result = ZLayerDirs::default_docker_socket_path();
+        assert!(result.ends_with("/docker.sock"));
     }
 }

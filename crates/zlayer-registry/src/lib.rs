@@ -53,8 +53,8 @@ pub use local_registry::{ImageEntry, LocalRegistry, LocalRegistryError, Registry
 
 #[cfg(feature = "local")]
 pub use oci_export::{
-    export_image, import_image, ExportError, ExportInfo, ImportError, ImportInfo, OciDescriptor,
-    OciIndex, OciLayout, OciManifest, OciPlatform,
+    export_image, import_image, import_image_from_bytes, ExportError, ExportInfo, ImportError,
+    ImportInfo, OciDescriptor, OciIndex, OciLayout, OciManifest, OciPlatform,
 };
 
 pub use wasm_export::{export_wasm_as_oci, WasmExportConfig, WasmExportError, WasmExportResult};

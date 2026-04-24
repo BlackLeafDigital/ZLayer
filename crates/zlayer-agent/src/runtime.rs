@@ -398,6 +398,22 @@ pub trait Runtime: Send + Sync {
         Ok(None)
     }
 
+    /// Get the HCN namespace GUID of a Windows container.
+    ///
+    /// Windows-only. Linux/macOS runtimes have no HCN namespace concept and
+    /// return `Ok(None)`. The `HcsRuntime` overrides this to return the
+    /// namespace GUID attached during `create_container`; `OverlayManager`
+    /// then uses the GUID to register the container's assigned overlay IP
+    /// against the right HCN compartment (analogous to how Linux uses PID
+    /// to enter the netns via `/proc/{pid}/ns/net`).
+    #[cfg(target_os = "windows")]
+    async fn get_container_namespace_id(
+        &self,
+        _id: &ContainerId,
+    ) -> Result<Option<windows::core::GUID>> {
+        Ok(None)
+    }
+
     /// Sync all named volumes associated with this container to S3.
     ///
     /// Called after a container is stopped but before it is removed, giving

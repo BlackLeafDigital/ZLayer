@@ -111,6 +111,7 @@ fn convert_service(svc_name: &str, svc: &ComposeService) -> crate::Result<Servic
         dns,
         extra_hosts: svc.extra_hosts.clone(),
         restart_policy: None,
+        platform: None,
     })
 }
 

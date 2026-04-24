@@ -76,6 +76,11 @@ pub struct ReverseProxyService {
     cert_manager: Option<Arc<CertManager>>,
     /// Optional network policy checker for access control enforcement
     network_policy_checker: Option<NetworkPolicyChecker>,
+    /// Trusted upstream proxies. Requests whose TCP peer IP is in this list
+    /// may set `CF-Connecting-IP` / `X-Forwarded-For` and be believed. When no
+    /// explicit list is provided, defaults to `TrustedProxyList::localhost_only()`
+    /// — a safe default for nodes that accidentally receive direct requests.
+    trusted_proxies: Arc<crate::trust::TrustedProxyList>,
 }
 
 impl ReverseProxyService {
@@ -100,6 +105,7 @@ impl ReverseProxyService {
             is_tls: false,
             cert_manager: None,
             network_policy_checker: None,
+            trusted_proxies: Arc::new(crate::trust::TrustedProxyList::localhost_only()),
         }
     }
 
@@ -114,6 +120,16 @@ impl ReverseProxyService {
     #[must_use]
     pub fn with_tls(mut self, is_tls: bool) -> Self {
         self.is_tls = is_tls;
+        self
+    }
+
+    /// Override the trusted-proxy list (default: `localhost_only`).
+    ///
+    /// Peers in this list are believed when they set `CF-Connecting-IP` or
+    /// `X-Forwarded-For` headers identifying the real client IP.
+    #[must_use]
+    pub fn with_trusted_proxies(mut self, trusted: Arc<crate::trust::TrustedProxyList>) -> Self {
+        self.trusted_proxies = trusted;
         self
     }
 
@@ -524,19 +540,65 @@ impl ReverseProxyService {
     fn add_forwarding_headers(&self, parts: &mut http::request::Parts) {
         let config = &self.config.headers;
 
+        // Determine whether the immediate TCP peer is a trusted upstream proxy
+        // that may dictate the real client IP via CF-Connecting-IP or XFF.
+        let peer_is_trusted = self
+            .remote_addr
+            .is_some_and(|addr| self.trusted_proxies.is_trusted(addr.ip()));
+
+        // Compute the effective client IP:
+        //   - Trusted peer + CF-Connecting-IP (parseable) -> use CF header
+        //   - Trusted peer + leftmost X-Forwarded-For (parseable) -> use XFF
+        //   - Otherwise -> fall back to the TCP peer IP
+        let effective_client_ip: Option<IpAddr> = if peer_is_trusted {
+            let cf_ip = parts
+                .headers
+                .get("cf-connecting-ip")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.trim().parse::<IpAddr>().ok());
+
+            let xff_leftmost = parts
+                .headers
+                .get("x-forwarded-for")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .and_then(|s| s.trim().parse::<IpAddr>().ok());
+
+            cf_ip
+                .or(xff_leftmost)
+                .or_else(|| self.remote_addr.map(|a| a.ip()))
+        } else {
+            self.remote_addr.map(|a| a.ip())
+        };
+
         // X-Forwarded-For
         if config.x_forwarded_for {
             if let Some(addr) = self.remote_addr {
-                let existing = parts
+                let existing_xff = parts
                     .headers
                     .get("x-forwarded-for")
                     .and_then(|h| h.to_str().ok())
-                    .map_or_else(
-                        || addr.ip().to_string(),
-                        |s| format!("{}, {}", s, addr.ip()),
-                    );
+                    .map(std::string::ToString::to_string);
 
-                if let Ok(value) = existing.parse() {
+                let new_value = if peer_is_trusted {
+                    // Trusted proxy: prepend the real client IP (from CF /
+                    // leftmost XFF / peer) to any existing chain so downstream
+                    // sees [real_client, ...upstream_chain].
+                    let real = effective_client_ip.unwrap_or_else(|| addr.ip()).to_string();
+                    match existing_xff {
+                        Some(chain) if !chain.trim().is_empty() => format!("{real}, {chain}"),
+                        _ => real,
+                    }
+                } else {
+                    // Untrusted peer: preserve existing behavior — append the
+                    // peer IP to any existing chain.
+                    match existing_xff {
+                        Some(chain) => format!("{}, {}", chain, addr.ip()),
+                        None => addr.ip().to_string(),
+                    }
+                };
+
+                if let Ok(value) = new_value.parse() {
                     parts.headers.insert("x-forwarded-for", value);
                 }
             }
@@ -559,11 +621,13 @@ impl ReverseProxyService {
             }
         }
 
-        // X-Real-IP
+        // X-Real-IP — set to the effective client IP only if the header is
+        // currently absent (conservative: do not overwrite a value set by an
+        // upstream component).
         if config.x_real_ip {
-            if let Some(addr) = self.remote_addr {
+            if let Some(ip) = effective_client_ip {
                 if parts.headers.get("x-real-ip").is_none() {
-                    if let Ok(value) = addr.ip().to_string().parse() {
+                    if let Ok(value) = ip.to_string().parse() {
                         parts.headers.insert("x-real-ip", value);
                     }
                 }
@@ -730,5 +794,122 @@ mod tests {
         let error = ProxyError::Forbidden("endpoint 'ws' is internal-only".to_string());
         let response = ReverseProxyService::error_response(&error);
         assert_eq!(response.status(), http::StatusCode::FORBIDDEN);
+    }
+
+    // --- Tests for CF-Connecting-IP / X-Forwarded-For trust handling ------
+
+    use crate::trust::TrustedProxyList;
+
+    fn build_svc(peer: SocketAddr, trusted: TrustedProxyList) -> ReverseProxyService {
+        let registry = Arc::new(ServiceRegistry::new());
+        let load_balancer = Arc::new(LoadBalancer::new());
+        let config = Arc::new(ProxyConfig::default());
+        ReverseProxyService::new(registry, load_balancer, config)
+            .with_remote_addr(peer)
+            .with_trusted_proxies(Arc::new(trusted))
+    }
+
+    fn parts_with_headers(headers: &[(&str, &str)]) -> http::request::Parts {
+        let mut builder = http::request::Builder::new().method("GET").uri("/");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        builder.body(()).unwrap().into_parts().0
+    }
+
+    #[test]
+    fn trusted_peer_cf_connecting_ip_is_honored() {
+        // Peer 203.0.113.50 is inside the trusted /24. Its CF-Connecting-IP
+        // should become X-Real-IP and be prepended to X-Forwarded-For.
+        let peer: SocketAddr = "203.0.113.50:443".parse().unwrap();
+        let trusted = TrustedProxyList::new(vec!["203.0.113.0/24".parse().unwrap()], None);
+        let svc = build_svc(peer, trusted);
+
+        let mut parts = parts_with_headers(&[("cf-connecting-ip", "198.51.100.7")]);
+        svc.add_forwarding_headers(&mut parts);
+
+        assert_eq!(parts.headers.get("x-real-ip").unwrap(), "198.51.100.7");
+        let xff = parts
+            .headers
+            .get("x-forwarded-for")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            xff.starts_with("198.51.100.7"),
+            "XFF should start with real client IP, got {xff}"
+        );
+    }
+
+    #[test]
+    fn trusted_peer_xff_leftmost_is_honored_when_no_cf_header() {
+        // Peer is trusted; no CF header but XFF chain is present. The leftmost
+        // XFF entry is treated as the real client IP.
+        let peer: SocketAddr = "203.0.113.50:443".parse().unwrap();
+        let trusted = TrustedProxyList::new(vec!["203.0.113.0/24".parse().unwrap()], None);
+        let svc = build_svc(peer, trusted);
+
+        let mut parts = parts_with_headers(&[("x-forwarded-for", "198.51.100.9, 10.0.0.1")]);
+        svc.add_forwarding_headers(&mut parts);
+
+        assert_eq!(parts.headers.get("x-real-ip").unwrap(), "198.51.100.9");
+        let xff = parts
+            .headers
+            .get("x-forwarded-for")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // Real client prepended, original chain preserved after.
+        assert!(
+            xff.starts_with("198.51.100.9"),
+            "XFF should start with leftmost real client, got {xff}"
+        );
+        assert!(
+            xff.contains("10.0.0.1"),
+            "original chain should survive: {xff}"
+        );
+    }
+
+    #[test]
+    fn untrusted_peer_cf_connecting_ip_is_ignored() {
+        // Peer 8.8.8.8 is NOT in the trusted list. The CF header must be
+        // ignored and X-Real-IP must reflect the TCP peer.
+        let peer: SocketAddr = "8.8.8.8:443".parse().unwrap();
+        let trusted = TrustedProxyList::new(vec!["203.0.113.0/24".parse().unwrap()], None);
+        let svc = build_svc(peer, trusted);
+
+        let mut parts = parts_with_headers(&[("cf-connecting-ip", "198.51.100.7")]);
+        svc.add_forwarding_headers(&mut parts);
+
+        assert_eq!(parts.headers.get("x-real-ip").unwrap(), "8.8.8.8");
+        let xff = parts
+            .headers
+            .get("x-forwarded-for")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        // Untrusted peer: XFF should end with the peer IP (append behavior).
+        assert!(
+            xff.ends_with("8.8.8.8"),
+            "XFF for untrusted peer should end with peer IP, got {xff}"
+        );
+    }
+
+    #[test]
+    fn no_headers_uses_peer_ip() {
+        // No CF, no XFF. Any peer (trusted or not) should yield X-Real-IP ==
+        // peer IP.
+        let peer: SocketAddr = "198.51.100.250:443".parse().unwrap();
+        let trusted = TrustedProxyList::localhost_only();
+        let svc = build_svc(peer, trusted);
+
+        let mut parts = parts_with_headers(&[]);
+        svc.add_forwarding_headers(&mut parts);
+
+        assert_eq!(parts.headers.get("x-real-ip").unwrap(), "198.51.100.250");
+        assert_eq!(
+            parts.headers.get("x-forwarded-for").unwrap(),
+            "198.51.100.250"
+        );
     }
 }

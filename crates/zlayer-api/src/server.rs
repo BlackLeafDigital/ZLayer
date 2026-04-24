@@ -12,6 +12,65 @@ use axum::Router;
 use crate::config::ApiConfig;
 use crate::router::build_router;
 
+/// Persist the local-admin bearer token to disk so a local `DaemonClient` can
+/// read it on connect.
+///
+/// - **Linux / macOS**: informational — the daemon's UDS middleware already
+///   injects the bearer into UDS-originated requests. Other tooling (e.g. a
+///   `zlayer` invocation that elects to skip the socket) can still use this
+///   file to authenticate against the loopback TCP listener.
+/// - **Windows**: load-bearing. The TCP listener has no peer-credential
+///   bypass, so `DaemonClient` on Windows reads this file to authenticate.
+///
+/// The stored value is the raw JWT — the `Bearer ` prefix is stripped before
+/// write so consumers can inject it into the `Authorization` header however
+/// they like.
+///
+/// Failures are logged as warnings and do NOT abort server start-up. Dev
+/// environments without write permission to `%ProgramData%` or `/var/lib`
+/// should still be able to run the daemon.
+fn persist_admin_bearer(bearer: &str) {
+    let bearer_path = zlayer_paths::default_admin_bearer_path();
+    if let Some(parent) = bearer_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!(
+                error = %e,
+                path = %parent.display(),
+                "failed to create admin bearer parent dir"
+            );
+        }
+    }
+    // Strip the "Bearer " prefix; store only the raw JWT.
+    let raw = bearer.strip_prefix("Bearer ").unwrap_or(bearer);
+    match std::fs::write(&bearer_path, raw) {
+        Ok(()) => {
+            tracing::info!(
+                path = %bearer_path.display(),
+                "persisted admin bearer for local CLI"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(e) =
+                    std::fs::set_permissions(&bearer_path, std::fs::Permissions::from_mode(0o600))
+                {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to chmod 0o600 on admin bearer file"
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                path = %bearer_path.display(),
+                "failed to persist admin bearer"
+            );
+        }
+    }
+}
+
 /// Pre-bound TCP and Unix listeners ready to be handed to [`serve_bound`].
 ///
 /// Created by [`bind_dual_with_local_auth`] so that the Unix socket file
@@ -126,6 +185,8 @@ pub async fn serve_bound(
     let bearer = listeners.local_bearer;
     let unix_path = listeners.unix_path;
 
+    persist_admin_bearer(&bearer);
+
     info!(
         tcp = %listeners.tcp_local_addr,
         unix = %unix_path.display(),
@@ -189,6 +250,106 @@ pub async fn serve_bound(
     info!("API server (dual) shut down");
 
     result.map(|_| ())
+}
+
+// ---------------------------------------------------------------------------
+// Windows variants (TCP-only)
+//
+// Unix domain sockets are not supported by the ZLayer daemon on Windows yet,
+// so the Windows flavour of `bind_dual_with_local_auth` + `serve_bound`
+// binds TCP only. The local-auth bearer is still minted so that subsequent
+// phases (F-7b) can wire it into a named-pipe or loopback-local-auth path
+// without changing the call sites here.
+// ---------------------------------------------------------------------------
+
+/// Pre-bound TCP listener ready to be handed to the Windows [`serve_bound`].
+#[cfg(windows)]
+pub struct BoundListeners {
+    /// Already-bound TCP listener.
+    pub tcp: TcpListener,
+    /// Local address the TCP listener is bound to.
+    pub tcp_local_addr: SocketAddr,
+    /// `Bearer <token>` value reserved for future loopback/local-auth paths.
+    /// Not currently injected into any request — see Phase F-7b.
+    pub local_bearer: String,
+}
+
+/// Bind a TCP listener and mint the local admin JWT token (Windows).
+///
+/// This is the Windows counterpart of the Unix `bind_dual_with_local_auth`.
+/// It binds only the TCP listener — the `ZLayer` daemon does not yet expose a
+/// named-pipe transport on Windows (tracked as Phase F-7b). The `unix_path`
+/// argument is accepted to keep the call-site signature identical, but
+/// treated as opaque: if it looks like a `tcp://host:port` URL the parsed
+/// value is logged for diagnostics; otherwise it is ignored.
+///
+/// # Errors
+///
+/// Returns an error if binding fails or the admin token cannot be minted.
+#[cfg(windows)]
+pub async fn bind_dual_with_local_auth(
+    tcp_addr: SocketAddr,
+    unix_path: impl AsRef<Path>,
+    jwt_secret: &str,
+) -> anyhow::Result<BoundListeners> {
+    // Mint a long-lived (24h) admin token. This is not yet injected into any
+    // request path on Windows (the Unix version hangs it off the Unix-socket
+    // router) but we still mint it so the value can be used by F-7b.
+    let local_token = crate::auth::create_token(
+        jwt_secret,
+        "local-admin",
+        std::time::Duration::from_secs(86400),
+        vec!["admin".to_string()],
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to mint local admin token: {e}"))?;
+
+    let local_bearer = format!("Bearer {local_token}");
+
+    let tcp = TcpListener::bind(tcp_addr).await?;
+    let tcp_local_addr = tcp.local_addr()?;
+
+    info!(
+        tcp = %tcp_local_addr,
+        hint = %unix_path.as_ref().display(),
+        "Bound TCP listener (Windows: no Unix domain socket in this phase)"
+    );
+
+    Ok(BoundListeners {
+        tcp,
+        tcp_local_addr,
+        local_bearer,
+    })
+}
+
+/// Serve the given router on a pre-bound TCP listener (Windows).
+///
+/// Windows counterpart to the Unix `serve_bound`. Runs a single axum server
+/// on [`BoundListeners::tcp`] until `shutdown` resolves.
+///
+/// # Errors
+///
+/// Returns an error if the server encounters an error during operation.
+#[cfg(windows)]
+pub async fn serve_bound(
+    listeners: BoundListeners,
+    router: Router,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    persist_admin_bearer(&listeners.local_bearer);
+    info!(
+        tcp = %listeners.tcp_local_addr,
+        "Starting API server on TCP (Windows)"
+    );
+
+    axum::serve(
+        listeners.tcp,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await?;
+
+    info!("API server (TCP) shut down");
+    Ok(())
 }
 
 /// API server

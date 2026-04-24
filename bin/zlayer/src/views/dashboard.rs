@@ -260,6 +260,7 @@ fn render_deployment_detail(
 
 /// Daemon connection status
 #[derive(Debug, Clone)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub enum DaemonStatus {
     /// Successfully connected and healthy
     Connected,
@@ -304,13 +305,13 @@ pub struct ServiceInfo {
 /// Attempt to refresh dashboard data from the daemon.
 /// Call this from the event loop with the tokio runtime.
 #[allow(clippy::cast_possible_truncation)]
+#[cfg_attr(not(unix), allow(unused_variables))]
 pub fn refresh_data(rt: &tokio::runtime::Runtime, state: &mut DashboardState) {
     state.last_refresh = Some(Instant::now());
 
     #[cfg(not(unix))]
     {
         state.daemon_status = DaemonStatus::Offline;
-        return;
     }
 
     #[cfg(unix)]
@@ -413,7 +414,6 @@ pub fn refresh_detail(
     {
         let _ = (rt, deployment_name);
         state.daemon_status = DaemonStatus::Offline;
-        return;
     }
 
     #[cfg(unix)]
@@ -495,7 +495,6 @@ pub fn start_daemon(rt: &tokio::runtime::Runtime) {
     #[cfg(not(unix))]
     {
         let _ = rt;
-        return;
     }
 
     #[cfg(unix)]

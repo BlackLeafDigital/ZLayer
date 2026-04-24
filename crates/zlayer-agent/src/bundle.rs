@@ -14,7 +14,6 @@ use oci_spec::runtime::{
     Spec, SpecBuilder, UserBuilder,
 };
 use std::collections::{HashMap, HashSet};
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -117,8 +116,10 @@ pub fn parse_memory_string(s: &str) -> std::result::Result<u64, String> {
 }
 
 /// Get major and minor device numbers from a device path
+#[cfg(unix)]
 #[allow(clippy::cast_possible_wrap)]
 fn get_device_major_minor(path: &str) -> std::io::Result<(i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::metadata(path)?;
     let rdev = metadata.rdev();
     // Major is upper 8 bits (after shifting), minor is lower 8 bits
@@ -127,7 +128,17 @@ fn get_device_major_minor(path: &str) -> std::io::Result<(i64, i64)> {
     Ok((major, minor))
 }
 
+/// Non-Unix stub: device-cgroup probes require Unix; callers use `if let Ok(..)` to skip.
+#[cfg(not(unix))]
+fn get_device_major_minor(_path: &str) -> std::io::Result<(i64, i64)> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "device-cgroup probes require Unix",
+    ))
+}
+
 /// Detect device type from path
+#[cfg(unix)]
 fn get_device_type(path: &str) -> std::io::Result<LinuxDeviceType> {
     use std::os::unix::fs::FileTypeExt;
     let metadata = std::fs::metadata(path)?;
@@ -139,6 +150,15 @@ fn get_device_type(path: &str) -> std::io::Result<LinuxDeviceType> {
     } else {
         Ok(LinuxDeviceType::U) // Unknown/other
     }
+}
+
+/// Non-Unix stub: device-cgroup probes require Unix; callers use `.unwrap_or(..)` to skip.
+#[cfg(not(unix))]
+fn get_device_type(_path: &str) -> std::io::Result<LinuxDeviceType> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "device-cgroup probes require Unix",
+    ))
 }
 
 /// Builder for OCI container bundles
@@ -367,8 +387,25 @@ impl BundleBuilder {
             let _ = fs::remove_file(&rootfs_in_bundle).await;
             let _ = fs::remove_dir(&rootfs_in_bundle).await;
 
-            // Create symlink to actual rootfs
+            // Create symlink to actual rootfs.
+            // On Unix: `tokio::fs::symlink` (unified file/dir symlink).
+            // On Windows: `tokio::fs::symlink_dir` (wraps CreateSymbolicLinkW with
+            // SYMBOLIC_LINK_FLAG_DIRECTORY) — rootfs is always an OCI layer directory.
+            #[cfg(unix)]
             tokio::fs::symlink(rootfs_path, &rootfs_in_bundle)
+                .await
+                .map_err(|e| AgentError::CreateFailed {
+                    id: container_id.to_string(),
+                    reason: format!(
+                        "failed to symlink rootfs from {} to {}: {}",
+                        rootfs_path.display(),
+                        rootfs_in_bundle.display(),
+                        e
+                    ),
+                })?;
+
+            #[cfg(windows)]
+            tokio::fs::symlink_dir(rootfs_path, &rootfs_in_bundle)
                 .await
                 .map_err(|e| AgentError::CreateFailed {
                     id: container_id.to_string(),
@@ -416,6 +453,27 @@ impl BundleBuilder {
         );
 
         Ok(self.bundle_dir.clone())
+    }
+
+    /// Render the OCI runtime spec without creating a bundle directory
+    /// or writing `config.json`.
+    ///
+    /// Used by the WSL2 delegate runtime (`runtimes/wsl2_delegate.rs`):
+    /// the Windows host renders the spec, then streams the JSON into the
+    /// WSL distro filesystem where `youki` will consume it. The bundle
+    /// path passed to `BundleBuilder::new` is purely informational in
+    /// that flow; this method never touches the filesystem.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AgentError::InvalidSpec`] if the spec generation fails.
+    pub async fn build_spec_only(
+        &self,
+        container_id: &ContainerId,
+        spec: &ServiceSpec,
+        volume_paths: &std::collections::HashMap<String, PathBuf>,
+    ) -> Result<oci_spec::runtime::Spec> {
+        self.build_oci_spec(container_id, spec, volume_paths).await
     }
 
     /// Build the OCI runtime spec from `ServiceSpec`

@@ -54,11 +54,17 @@ struct StaleDaemonMeta {
 )]
 async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind: &str) {
     let metadata_path = config.data_dir.join("daemon.json");
+    #[cfg(unix)]
     let my_pid = std::process::id();
 
     // Track whether the PID-based kill was conclusive (i.e. daemon.json existed
     // and the named PID was either dead or successfully killed).
+    // Only mutated inside the Unix branch below; the Windows branch never
+    // reaches `libc::kill`, so the `mut` is Unix-only.
+    #[cfg(unix)]
     let mut pid_kill_conclusive = false;
+    #[cfg(not(unix))]
+    let pid_kill_conclusive = false;
 
     // The port we need to verify is free before returning.  Default to the
     // port extracted from the *current* bind address; override with the port
@@ -67,6 +73,12 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 
     // -----------------------------------------------------------------------
     // 1. Read the old daemon PID and terminate it if still alive
+    //
+    // Process termination is Unix-only: the stale-daemon kill path uses
+    // `libc::kill()` with SIGTERM/SIGKILL. On Windows we still read the old
+    // api_bind to pick the right port for the port-free check below, but
+    // skip the kill — subsequent bind attempts will surface
+    // "address in use" errors if a stale daemon is still running.
     // -----------------------------------------------------------------------
     if let Ok(contents) = tokio::fs::read_to_string(&metadata_path).await {
         match serde_json::from_str::<StaleDaemonMeta>(&contents) {
@@ -80,56 +92,71 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
                     }
                 }
 
-                let old_pid = meta.pid as i32;
-                // Do not kill ourselves (pid file left over from a clean restart).
-                if old_pid as u32 == my_pid {
-                    info!(
-                        pid = old_pid,
-                        "Stale daemon PID matches current process, skipping kill"
-                    );
-                    pid_kill_conclusive = true;
-                } else if process_alive(old_pid) {
-                    warn!(
-                        pid = old_pid,
-                        "Stale daemon process detected, sending SIGTERM"
-                    );
-                    // SAFETY: we validated the PID is alive and is not us.
-                    unsafe { libc::kill(old_pid, libc::SIGTERM) };
-
-                    // Poll for up to 5 seconds waiting for graceful exit.
-                    let mut terminated = false;
-                    for _ in 0..50 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                        if !process_alive(old_pid) {
-                            terminated = true;
-                            break;
-                        }
-                    }
-
-                    if terminated {
-                        info!(pid = old_pid, "Stale daemon exited after SIGTERM");
+                #[cfg(unix)]
+                {
+                    let old_pid = meta.pid as i32;
+                    // Do not kill ourselves (pid file left over from a clean restart).
+                    if old_pid as u32 == my_pid {
+                        info!(
+                            pid = old_pid,
+                            "Stale daemon PID matches current process, skipping kill"
+                        );
                         pid_kill_conclusive = true;
-                    } else {
+                    } else if process_alive(old_pid) {
                         warn!(
                             pid = old_pid,
-                            "Stale daemon did not exit in time, sending SIGKILL"
+                            "Stale daemon process detected, sending SIGTERM"
                         );
-                        unsafe { libc::kill(old_pid, libc::SIGKILL) };
-                        // Brief wait for the kernel to reap.
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                        if process_alive(old_pid) {
-                            warn!(pid = old_pid, "Stale daemon still alive after SIGKILL");
-                        } else {
-                            info!(pid = old_pid, "Stale daemon killed with SIGKILL");
-                            pid_kill_conclusive = true;
+                        // SAFETY: we validated the PID is alive and is not us.
+                        unsafe { libc::kill(old_pid, libc::SIGTERM) };
+
+                        // Poll for up to 5 seconds waiting for graceful exit.
+                        let mut terminated = false;
+                        for _ in 0..50 {
+                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                            if !process_alive(old_pid) {
+                                terminated = true;
+                                break;
+                            }
                         }
+
+                        if terminated {
+                            info!(pid = old_pid, "Stale daemon exited after SIGTERM");
+                            pid_kill_conclusive = true;
+                        } else {
+                            warn!(
+                                pid = old_pid,
+                                "Stale daemon did not exit in time, sending SIGKILL"
+                            );
+                            unsafe { libc::kill(old_pid, libc::SIGKILL) };
+                            // Brief wait for the kernel to reap.
+                            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            if process_alive(old_pid) {
+                                warn!(pid = old_pid, "Stale daemon still alive after SIGKILL");
+                            } else {
+                                info!(pid = old_pid, "Stale daemon killed with SIGKILL");
+                                pid_kill_conclusive = true;
+                            }
+                        }
+                    } else {
+                        info!(
+                            pid = old_pid,
+                            "Previous daemon is not running, cleaning up stale files"
+                        );
+                        pid_kill_conclusive = true;
                     }
-                } else {
+                }
+                #[cfg(not(unix))]
+                {
+                    // No process-kill on Windows in this phase. If the old
+                    // daemon is still running, the TCP bind below will fail
+                    // with a clear "address already in use" error.
                     info!(
-                        pid = old_pid,
-                        "Previous daemon is not running, cleaning up stale files"
+                        pid = meta.pid,
+                        "Found stale daemon.json on Windows; skipping process kill \
+                         (not yet implemented). TCP bind will fail if the old daemon \
+                         is still running."
                     );
-                    pid_kill_conclusive = true;
                 }
             }
             Err(e) => {
@@ -152,14 +179,25 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
     }
 
     // -----------------------------------------------------------------------
-    // 1c. Remove stale unix socket
+    // 1c. Remove stale unix socket (Unix only; Windows uses TCP loopback).
     // -----------------------------------------------------------------------
-    let socket = std::path::Path::new(socket_path);
-    if socket.exists() {
-        match tokio::fs::remove_file(socket).await {
-            Ok(()) => info!(path = %socket_path, "Removed stale unix socket"),
-            Err(e) => warn!(path = %socket_path, error = %e, "Failed to remove stale unix socket"),
+    #[cfg(unix)]
+    {
+        let socket = std::path::Path::new(socket_path);
+        if socket.exists() {
+            match tokio::fs::remove_file(socket).await {
+                Ok(()) => info!(path = %socket_path, "Removed stale unix socket"),
+                Err(e) => {
+                    warn!(path = %socket_path, error = %e, "Failed to remove stale unix socket");
+                }
+            }
         }
+    }
+    #[cfg(not(unix))]
+    {
+        // `socket_path` is a TCP URI on Windows (e.g. "tcp://127.0.0.1:3669"),
+        // not a filesystem path — nothing to unlink.
+        let _ = socket_path;
     }
 
     // -----------------------------------------------------------------------
@@ -280,7 +318,12 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 
     // -----------------------------------------------------------------------
     // 4b. Wait for WireGuard UDP port to be free (DEFAULT_WG_PORT in bootstrap.rs)
+    //
+    // This block kills stale boringtun holders on Unix via libc::kill.
+    // On Windows we only do a passive poll — killing arbitrary processes
+    // that happen to hold the WG UDP port is F-7b territory.
     // -----------------------------------------------------------------------
+    #[cfg(unix)]
     {
         let wg_port = load_overlay_port(&config.data_dir);
         let wg_addr: std::net::SocketAddr = ([0, 0, 0, 0], wg_port).into();
@@ -365,6 +408,35 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
             }
         }
     }
+    #[cfg(not(unix))]
+    {
+        let wg_port = load_overlay_port(&config.data_dir);
+        let wg_addr: std::net::SocketAddr = ([0, 0, 0, 0], wg_port).into();
+        if std::net::UdpSocket::bind(wg_addr).is_err() {
+            // Passive wait — do not kill arbitrary processes on Windows in F-7a.
+            let mut wg_free = false;
+            for attempt in 1..=5 {
+                if std::net::UdpSocket::bind(wg_addr).is_ok() {
+                    if attempt > 1 {
+                        info!(
+                            port = wg_port,
+                            attempts = attempt,
+                            "WireGuard UDP port is now free"
+                        );
+                    }
+                    wg_free = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+            if !wg_free {
+                warn!(
+                    port = wg_port,
+                    "WireGuard UDP port still in use after passive wait — overlay may fail"
+                );
+            }
+        }
+    }
 
     // -----------------------------------------------------------------------
     // 5. Remove stale daemon metadata and PID files
@@ -384,6 +456,9 @@ async fn cleanup_stale_daemon(config: &DaemonConfig, socket_path: &str, api_bind
 /// Check whether a process with the given PID is still alive.
 ///
 /// Uses `kill(pid, 0)` which checks for existence without sending a signal.
+/// Unix-only: Windows process lifecycle management will arrive with the
+/// `DaemonClient` work (Phase F-7b).
+#[cfg(unix)]
 #[allow(unsafe_code)]
 fn process_alive(pid: i32) -> bool {
     // SAFETY: signal 0 is a null signal used purely for existence checking.
@@ -496,7 +571,10 @@ async fn find_udp_port_holder(port: u16) -> Option<(u32, String)> {
 }
 
 /// Start the daemon API server with full infrastructure.
-#[allow(clippy::too_many_lines)]
+///
+/// Foreground variant — uses Ctrl+C / SIGTERM for shutdown. For the
+/// Windows Service variant that also honours SCM Stop/Shutdown control
+/// codes, see [`serve_with_external_shutdown`].
 pub(crate) async fn serve(
     bind: &str,
     jwt_secret: Option<String>,
@@ -504,6 +582,43 @@ pub(crate) async fn serve(
     socket_path: &str,
     host_network: bool,
     data_dir: std::path::PathBuf,
+) -> Result<()> {
+    // Box::pin keeps the top-level future below clippy's `large_futures`
+    // threshold — `serve_with_external_shutdown` materialises the whole
+    // daemon state on the stack and its future is sizeable.
+    Box::pin(serve_with_external_shutdown(
+        bind,
+        jwt_secret,
+        no_swagger,
+        socket_path,
+        host_network,
+        data_dir,
+        None,
+    ))
+    .await
+}
+
+/// Entry point equivalent to [`serve`] but with an additional external
+/// shutdown trigger. Used by the Windows Service event loop (I-1) so the SCM
+/// control handler can signal the daemon to shut down gracefully.
+///
+/// When `external_shutdown` is `Some(rx)`, the server shuts down on *any* of:
+///
+///   * `Ctrl+C`
+///   * `SIGTERM` (Unix only)
+///   * `rx` transitioning to `true`
+///
+/// When `None`, behaves exactly like [`serve`] — foreground signal handling
+/// only.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(crate) async fn serve_with_external_shutdown(
+    bind: &str,
+    jwt_secret: Option<String>,
+    no_swagger: bool,
+    socket_path: &str,
+    host_network: bool,
+    data_dir: std::path::PathBuf,
+    external_shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<()> {
     let jwt_secret_raw = jwt_secret.unwrap_or_else(|| {
         warn!("Using default JWT secret - NOT SAFE FOR PRODUCTION");
@@ -1002,11 +1117,86 @@ pub(crate) async fn serve(
     }
 
     let ip_allocator = Arc::new(RwLock::new(ip_allocator));
+
+    // Initialize leader-side slice allocator. Carves the cluster CIDR into
+    // `/28` slices assigned to each joining node. Persists snapshots to
+    // `slice_allocator.json` next to the IP allocator state.
+    let slice_allocator_path = config.data_dir.join("slice_allocator.json");
+    let slice_allocator = {
+        let cluster_cidr: zlayer_overlay::ipnet::IpNet = node_config
+            .overlay_cidr
+            .parse()
+            .context("Invalid overlay CIDR in node config (slice allocator)")?;
+        if slice_allocator_path.exists() {
+            match tokio::fs::read_to_string(&slice_allocator_path).await {
+                Ok(contents) => match serde_json::from_str::<
+                    zlayer_overlay::NodeSliceAllocatorSnapshot,
+                >(&contents)
+                {
+                    Ok(snapshot) => match zlayer_overlay::NodeSliceAllocator::restore(snapshot) {
+                        Ok(alloc) => {
+                            info!(
+                                path = %slice_allocator_path.display(),
+                                "Loaded persisted slice allocator state"
+                            );
+                            alloc
+                        }
+                        Err(e) => {
+                            warn!(
+                                path = %slice_allocator_path.display(),
+                                error = %e,
+                                "Failed to restore slice allocator state, creating fresh"
+                            );
+                            zlayer_overlay::NodeSliceAllocator::new(
+                                cluster_cidr,
+                                zlayer_overlay::DEFAULT_SLICE_PREFIX,
+                            )
+                            .context("Failed to create slice allocator")?
+                        }
+                    },
+                    Err(e) => {
+                        warn!(
+                            path = %slice_allocator_path.display(),
+                            error = %e,
+                            "Failed to parse slice allocator snapshot, creating fresh"
+                        );
+                        zlayer_overlay::NodeSliceAllocator::new(
+                            cluster_cidr,
+                            zlayer_overlay::DEFAULT_SLICE_PREFIX,
+                        )
+                        .context("Failed to create slice allocator")?
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        path = %slice_allocator_path.display(),
+                        error = %e,
+                        "Failed to read slice allocator state, creating fresh"
+                    );
+                    zlayer_overlay::NodeSliceAllocator::new(
+                        cluster_cidr,
+                        zlayer_overlay::DEFAULT_SLICE_PREFIX,
+                    )
+                    .context("Failed to create slice allocator")?
+                }
+            }
+        } else {
+            zlayer_overlay::NodeSliceAllocator::new(
+                cluster_cidr,
+                zlayer_overlay::DEFAULT_SLICE_PREFIX,
+            )
+            .context("Failed to create slice allocator")?
+        }
+    };
+    let slice_allocator = Arc::new(RwLock::new(slice_allocator));
+
     let cluster_state = ClusterApiState::with_internal_token(
         _raft.clone(),
         Some(join_secret),
         ip_allocator,
         Some(ip_allocator_path),
+        slice_allocator,
+        Some(slice_allocator_path),
         internal_token,
         Some(config.data_dir.clone()),
     );
@@ -1081,8 +1271,12 @@ pub(crate) async fn serve(
 
     // -----------------------------------------------------------------------
     // 5. Setup graceful shutdown signal handler
+    //
+    // Awaits any of: Ctrl+C, SIGTERM (Unix), or the optional
+    // `external_shutdown` watch receiver transitioning to `true` (set by the
+    // Windows Service SCM handler — see `daemon_service::my_service_main`).
     // -----------------------------------------------------------------------
-    let shutdown = async {
+    let shutdown = async move {
         let ctrl_c = async {
             tokio::signal::ctrl_c()
                 .await
@@ -1100,9 +1294,22 @@ pub(crate) async fn serve(
         #[cfg(not(unix))]
         let terminate = std::future::pending::<()>();
 
+        let external = async move {
+            match external_shutdown {
+                Some(mut rx) => {
+                    // Returns once the watched value flips to `true`. If the
+                    // sender is dropped, the receiver yields Err(_) which we
+                    // treat as a shutdown (the supervisor is gone).
+                    let _ = rx.wait_for(|&v| v).await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+
         tokio::select! {
-            () = ctrl_c => {},
-            () = terminate => {},
+            () = ctrl_c => info!("Shutdown: Ctrl+C received"),
+            () = terminate => info!("Shutdown: SIGTERM received"),
+            () = external => info!("Shutdown: external trigger (SCM)"),
         }
 
         info!("Shutdown signal received, starting graceful shutdown");

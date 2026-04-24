@@ -131,12 +131,21 @@ impl ServiceInstance {
                 };
 
                 // Create container (no lock needed - I/O operation)
+                //
+                // RouteToPeer must propagate unchanged: the scheduler uses it
+                // to re-place the workload on a capable peer, and wrapping it
+                // in `CreateFailed` would hide the signal and mark the service
+                // dead instead of rescheduling it. All other errors are
+                // normalised to `CreateFailed` for upstream handling.
                 self.runtime
                     .create_container(&id, &self.spec)
                     .await
-                    .map_err(|e| AgentError::CreateFailed {
-                        id: id.to_string(),
-                        reason: e.to_string(),
+                    .map_err(|e| match e {
+                        AgentError::RouteToPeer { .. } => e,
+                        other => AgentError::CreateFailed {
+                            id: id.to_string(),
+                            reason: other.to_string(),
+                        },
                     })?;
 
                 // Run init actions with error policy enforcement (no lock needed)
@@ -235,77 +244,140 @@ impl ServiceInstance {
                     }
                 }
 
-                // Attach to overlay network if manager is available
+                // Attach to overlay network if manager is available.
+                //
+                // Linux uses the container PID to enter the netns and attach a
+                // veth. Windows has no PID-addressable netns — the HCN namespace
+                // GUID (obtained from `get_container_namespace_id`) is used
+                // instead, and the endpoint's IP has already been populated by
+                // `EndpointAttachment::create_overlay` during container creation.
+                // We simply register that IP with the slice allocator so host
+                // accounting stays in sync.
                 let overlay_ip = if let Some(overlay) = &self.overlay_manager {
-                    // Get container PID for network namespace attachment
-                    if let Some(pid) = container_pid {
-                        let overlay_guard = overlay.read().await;
-                        match overlay_guard
-                            .attach_container(pid, &self.service_name, true)
-                            .await
-                        {
-                            Ok(ip) => {
-                                tracing::info!(
-                                    container = %id,
-                                    overlay_ip = %ip,
-                                    "attached container to overlay network"
-                                );
-
-                                // Register DNS for service discovery
-                                if let Some(dns) = &self.dns_server {
-                                    // Register service-level hostname: {service}.service.local
-                                    let service_hostname =
-                                        format!("{}.service.local", self.service_name);
-
-                                    // Register replica-specific hostname: {replica}.{service}.service.local
-                                    let replica_hostname = format!(
-                                        "{}.{}.service.local",
-                                        id.replica, self.service_name
-                                    );
-
-                                    match dns.add_record(&service_hostname, ip).await {
-                                        Ok(()) => tracing::debug!(
-                                            hostname = %service_hostname,
-                                            ip = %ip,
-                                            "registered DNS for service"
-                                        ),
-                                        Err(e) => tracing::warn!(
-                                            hostname = %service_hostname,
-                                            error = %e,
-                                            "failed to register DNS for service"
-                                        ),
-                                    }
-
-                                    // Also register replica-specific entry
-                                    if let Err(e) = dns.add_record(&replica_hostname, ip).await {
+                    let overlay_guard = overlay.read().await;
+                    #[cfg(target_os = "windows")]
+                    let attach_result: Option<std::net::IpAddr> = {
+                        let _ = container_pid; // unused on Windows
+                        match self.runtime.get_container_namespace_id(&id).await {
+                            Ok(Some(ns_id)) => {
+                                let ip_override =
+                                    self.runtime.get_container_ip(&id).await.ok().flatten();
+                                let dns_server = overlay_guard.dns_server_addr().map(|sa| sa.ip());
+                                let dns_domain =
+                                    overlay_guard.dns_domain().map(ToString::to_string);
+                                match overlay_guard
+                                    .attach_container_hcn(
+                                        ns_id,
+                                        &self.service_name,
+                                        ip_override,
+                                        true,
+                                        dns_server,
+                                        dns_domain,
+                                    )
+                                    .await
+                                {
+                                    Ok(ip) => Some(ip),
+                                    Err(e) => {
                                         tracing::warn!(
-                                            hostname = %replica_hostname,
+                                            container = %id,
                                             error = %e,
-                                            "failed to register replica DNS"
+                                            "HCN overlay attach failed"
                                         );
-                                    } else {
-                                        tracing::debug!(
-                                            hostname = %replica_hostname,
-                                            ip = %ip,
-                                            "registered DNS for replica"
-                                        );
+                                        None
                                     }
                                 }
-
-                                Some(ip)
+                            }
+                            Ok(None) => {
+                                tracing::debug!(
+                                    container = %id,
+                                    "skipping HCN overlay attach - no namespace id available"
+                                );
+                                None
                             }
                             Err(e) => {
                                 tracing::warn!(
                                     container = %id,
                                     error = %e,
-                                    "failed to attach container to overlay network"
+                                    "failed to fetch HCN namespace id"
                                 );
                                 None
                             }
                         }
+                    };
+                    #[cfg(not(target_os = "windows"))]
+                    let attach_result: Option<std::net::IpAddr> = {
+                        if let Some(pid) = container_pid {
+                            match overlay_guard
+                                .attach_container(pid, &self.service_name, true)
+                                .await
+                            {
+                                Ok(ip) => Some(ip),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        container = %id,
+                                        error = %e,
+                                        "failed to attach container to overlay network"
+                                    );
+                                    None
+                                }
+                            }
+                        } else {
+                            // No PID available (e.g. WASM runtime) - skip overlay attachment
+                            tracing::debug!(
+                                container = %id,
+                                "skipping overlay attachment - no PID available"
+                            );
+                            None
+                        }
+                    };
+
+                    if let Some(ip) = attach_result {
+                        tracing::info!(
+                            container = %id,
+                            overlay_ip = %ip,
+                            "attached container to overlay network"
+                        );
+
+                        // Register DNS for service discovery
+                        if let Some(dns) = &self.dns_server {
+                            // Register service-level hostname: {service}.service.local
+                            let service_hostname = format!("{}.service.local", self.service_name);
+
+                            // Register replica-specific hostname: {replica}.{service}.service.local
+                            let replica_hostname =
+                                format!("{}.{}.service.local", id.replica, self.service_name);
+
+                            match dns.add_record(&service_hostname, ip).await {
+                                Ok(()) => tracing::debug!(
+                                    hostname = %service_hostname,
+                                    ip = %ip,
+                                    "registered DNS for service"
+                                ),
+                                Err(e) => tracing::warn!(
+                                    hostname = %service_hostname,
+                                    error = %e,
+                                    "failed to register DNS for service"
+                                ),
+                            }
+
+                            // Also register replica-specific entry
+                            if let Err(e) = dns.add_record(&replica_hostname, ip).await {
+                                tracing::warn!(
+                                    hostname = %replica_hostname,
+                                    error = %e,
+                                    "failed to register replica DNS"
+                                );
+                            } else {
+                                tracing::debug!(
+                                    hostname = %replica_hostname,
+                                    ip = %ip,
+                                    "registered DNS for replica"
+                                );
+                            }
+                        }
+
+                        Some(ip)
                     } else {
-                        // No PID available (e.g., WASM runtime) - skip overlay attachment
-                        tracing::debug!(container = %id, "skipping overlay attachment - no PID available");
                         None
                     }
                 } else {

@@ -23,6 +23,18 @@ pub enum WslError {
     #[error("Path translation failed: {0}")]
     PathTranslation(String),
 
+    #[error(
+        "WSL2 install declined by user. Re-run with `--install-wsl yes` to accept, or install \
+         WSL2 manually: `wsl.exe --install --no-distribution`"
+    )]
+    InstallRefused,
+
+    #[error(
+        "WSL2 installation completed but requires a system reboot. Please reboot and re-run the \
+         command."
+    )]
+    RebootRequired,
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }

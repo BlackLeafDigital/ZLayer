@@ -131,11 +131,19 @@ impl ImageConfig {
 /// Top-level OCI image configuration JSON structure.
 ///
 /// This wraps the actual container config along with rootfs and history
-/// information. We only need the `config` field for runtime defaults.
+/// information. We expose `config` for runtime defaults and the top-level
+/// `os` field for platform-aware dispatch (see
+/// [`crate::fetch_image_os`]).
 #[derive(Debug, Deserialize)]
 pub(crate) struct OciImageConfigRoot {
     /// The container runtime configuration.
     pub config: Option<ImageConfig>,
+    /// Operating system the image targets, as written by the image builder
+    /// (`"linux"` / `"windows"` / `"darwin"`). Present on any conforming OCI
+    /// image config; absent on malformed or legacy payloads, in which case
+    /// callers should fall through to a platform-agnostic default.
+    #[serde(default)]
+    pub os: Option<String>,
 }
 
 #[cfg(test)]

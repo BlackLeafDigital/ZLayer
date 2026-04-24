@@ -1,0 +1,33 @@
+[package]
+name = "zlayer-hcs"
+description = "Safe Rust wrapper for the Windows Host Compute Service (HCS)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt"] }
+tokio-stream = { workspace = true }
+futures-core = "0.3"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_HostComputeSystem",
+    "Win32_System_RemoteDesktop",
+    "Win32_System_Threading",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+tokio = { workspace = true, features = ["sync", "macros", "rt", "rt-multi-thread", "time", "test-util"] }

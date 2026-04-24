@@ -13,6 +13,7 @@ publish = false
 zlayer-spec.workspace = true
 zlayer-core.workspace = true
 zlayer-client.workspace = true
+zlayer-paths.workspace = true
 
 # Serialization
 serde.workspace = true
@@ -43,8 +44,22 @@ tower.workspace = true
 # System info
 num_cpus.workspace = true
 
+# Interactive prompts (docker install sock_symlink)
+dialoguer = { version = "0.11", default-features = false }
+
 # Optional dependencies
 zlayer-builder = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+winreg = "0.52"
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [features]
 default = ["build"]

@@ -1,3 +1,3 @@
-module github.com/zlayer/zlayer-sdk-go
+module github.com/BlackLeafDigital/ZLayer/clients/zlayer-sdk/go
 
 go 1.24

@@ -20,8 +20,23 @@ pub struct OverlayConfig {
     pub public_key: String,
 
     /// Overlay network CIDR (supports both IPv4 e.g. "10.0.0.0/8" and IPv6 e.g. "`fd00::/48`")
+    ///
+    /// Historically stores the per-node slice / host IP (e.g. `10.200.0.0/28`
+    /// or `10.200.0.1/32`) that the local TUN/Wintun adapter is assigned.
+    /// It is *not* the full cluster CIDR — use [`Self::cluster_cidr`] for that.
     #[serde(default = "OverlayConfig::default_cidr")]
     pub overlay_cidr: String,
+
+    /// Full cluster CIDR (e.g. `10.200.0.0/16`).
+    ///
+    /// Used on Windows to install a catch-all host route pointing the
+    /// entire cluster range at the Wintun adapter so traffic to remote-node
+    /// container IPs flows through the overlay (HCN auto-installs the more
+    /// specific local /28 → vSwitch route, and longest-prefix-match routes
+    /// local traffic to the vSwitch). `None` on pre-cluster-CIDR configs;
+    /// callers should fall back to skipping the route install in that case.
+    #[serde(default)]
+    pub cluster_cidr: Option<String>,
 
     /// Peer discovery interval
     #[serde(default = "OverlayConfig::default_discovery")]
@@ -54,6 +69,7 @@ impl Default for OverlayConfig {
             private_key: String::new(),
             public_key: String::new(),
             overlay_cidr: "10.0.0.0/8".to_string(),
+            cluster_cidr: None,
             peer_discovery_interval: Duration::from_secs(30),
             #[cfg(feature = "nat")]
             nat: NatConfig::default(),

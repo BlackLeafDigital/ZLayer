@@ -2241,6 +2241,7 @@ mod tests {
             dns: Vec::new(),
             extra_hosts: Vec::new(),
             restart_policy: None,
+            platform: None,
         }
     }
 

@@ -2,12 +2,13 @@
 
 pub mod cli;
 pub mod compose;
+pub mod shim;
 
-#[cfg(unix)]
 pub mod socket;
 
 pub use cli::{handle_docker_command, DockerCommands};
 pub use compose::{parse_compose, ComposeFile};
+pub use shim::{install_shim, uninstall_shim, ShimInstalled, ShimUninstalled};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DockerError {

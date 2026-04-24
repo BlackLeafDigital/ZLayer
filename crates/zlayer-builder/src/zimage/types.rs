@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::backend::ImageOs;
+
 // ---------------------------------------------------------------------------
 // Build context (for `build:` directive)
 // ---------------------------------------------------------------------------
@@ -132,6 +134,10 @@ pub struct ZImage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
 
+    /// Target OS for this image/stage. Overrides any OS inferred from `platform`. Default: inferred or Linux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<ImageOs>,
+
     // -- Mode 3: multi-stage --
     /// Named stages for multi-stage builds. Insertion order is preserved;
     /// the last stage is the output image.
@@ -189,6 +195,33 @@ pub struct ZImage {
     pub args: HashMap<String, String>,
 }
 
+impl ZImage {
+    /// Resolve the target OS for this image from the explicit `os:` field,
+    /// falling back to the OS portion of `platform:` if present, else `None`.
+    ///
+    /// Returns `None` when neither field gives a definitive answer — callers
+    /// should interpret that as "default to Linux" (i.e. the historical
+    /// behaviour for all existing `ZImagefiles`).
+    ///
+    /// A malformed `platform:` value (one that does not parse to a known
+    /// [`ImageOs`]) is ignored here on purpose: `platform:` has historically
+    /// been a free-form string and arch-only values like `"amd64"` must
+    /// continue to work. Callers wanting strict validation should use
+    /// [`ImageOs::from_str`] directly.
+    #[must_use]
+    pub fn resolve_target_os(&self) -> Option<ImageOs> {
+        if let Some(os) = self.os {
+            return Some(os);
+        }
+        if let Some(platform) = self.platform.as_deref() {
+            if let Ok(os) = platform.parse::<ImageOs>() {
+                return Some(os);
+            }
+        }
+        None
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Stage
 // ---------------------------------------------------------------------------
@@ -210,6 +243,10 @@ pub struct ZStage {
     /// Target platform override (e.g. "linux/arm64")
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+
+    /// Target OS for this image/stage. Overrides any OS inferred from `platform`. Default: inferred or Linux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<ImageOs>,
 
     /// Build arguments scoped to this stage
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -924,6 +961,110 @@ bogus: "nope"
 "#;
         let result: Result<ZStep, _> = serde_yaml::from_str(yaml);
         assert!(result.is_err(), "Should reject unknown fields on ZStep");
+    }
+
+    // -----------------------------------------------------------------------
+    // L-2: os: field + resolve_target_os priority
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_zimage_os_field_linux() {
+        let yaml = r#"
+base: "alpine:3.19"
+os: linux
+"#;
+        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(img.os, Some(ImageOs::Linux));
+        assert_eq!(img.resolve_target_os(), Some(ImageOs::Linux));
+    }
+
+    #[test]
+    fn test_zimage_os_field_windows() {
+        let yaml = r#"
+base: "mcr.microsoft.com/windows/nanoserver:ltsc2022"
+os: windows
+"#;
+        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(img.os, Some(ImageOs::Windows));
+        assert_eq!(img.resolve_target_os(), Some(ImageOs::Windows));
+    }
+
+    #[test]
+    fn test_zimage_os_missing_is_none() {
+        // With no `os:` and no `platform:`, callers should interpret None as
+        // "default to Linux". The serde-default here must stay `None` so we
+        // never silently override an explicit platform further down.
+        let yaml = r#"
+base: "alpine:3.19"
+"#;
+        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(img.os, None);
+        assert_eq!(img.resolve_target_os(), None);
+    }
+
+    #[test]
+    fn test_zimage_os_wins_over_platform() {
+        // `os:` and `platform:` can both be set. `os:` determines the target
+        // OS; `platform:` keeps its role as the full platform triple (arch
+        // info is still carried by `platform:`).
+        let yaml = r#"
+base: "mcr.microsoft.com/windows/nanoserver:ltsc2022"
+platform: "linux/amd64"
+os: windows
+"#;
+        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(img.platform.as_deref(), Some("linux/amd64"));
+        assert_eq!(img.os, Some(ImageOs::Windows));
+        assert_eq!(
+            img.resolve_target_os(),
+            Some(ImageOs::Windows),
+            "explicit os: must win over OS inferred from platform:"
+        );
+    }
+
+    #[test]
+    fn test_zimage_os_inferred_from_platform() {
+        // No explicit `os:` — fall back to the OS portion of `platform:`.
+        let yaml = r#"
+base: "alpine:3.19"
+platform: "linux/arm64"
+"#;
+        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(img.os, None);
+        assert_eq!(
+            img.resolve_target_os(),
+            Some(ImageOs::Linux),
+            "resolve_target_os must fall back to parsing platform:"
+        );
+    }
+
+    #[test]
+    fn test_zimage_os_unknown_platform_ignored() {
+        // Arch-only or unknown `platform:` values stay free-form. The OS
+        // resolver returns None and the caller defaults to Linux.
+        let yaml = r#"
+base: "alpine:3.19"
+platform: "amd64"
+"#;
+        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(img.resolve_target_os(), None);
+    }
+
+    #[test]
+    fn test_zstage_os_field() {
+        let yaml = r#"
+stages:
+  builder:
+    base: "alpine:3.19"
+    os: linux
+  runtime:
+    base: "mcr.microsoft.com/windows/nanoserver:ltsc2022"
+    os: windows
+"#;
+        let img: ZImage = serde_yaml::from_str(yaml).unwrap();
+        let stages = img.stages.as_ref().unwrap();
+        assert_eq!(stages["builder"].os, Some(ImageOs::Linux));
+        assert_eq!(stages["runtime"].os, Some(ImageOs::Windows));
     }
 
     #[test]
