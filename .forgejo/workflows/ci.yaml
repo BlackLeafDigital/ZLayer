@@ -247,11 +247,11 @@ jobs:
         shell: bash
         run: echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
 
-      - name: Check compilation (HCS + WSL composite)
+      - name: Check compilation
         if: steps.check.outputs.completed != 'true'
         run: cargo check --package zlayer --features hcs-runtime,wsl --all-targets
 
-      - name: Clippy lints (HCS + WSL composite)
+      - name: Clippy lints
         if: steps.check.outputs.completed != 'true'
         run: cargo clippy --package zlayer --features hcs-runtime,wsl --all-targets -- -D warnings
 
