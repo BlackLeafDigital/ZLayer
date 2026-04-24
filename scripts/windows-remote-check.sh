@@ -147,16 +147,14 @@ main_body() {
   fi
 
   # ---------------------------------------------------------------------------
-  # Checks (compile + clippy).
+  # Checks (compile + clippy). Only the `hcs-runtime,wsl` composite is
+  # exercised — the "default features" Windows build is a thin CLI without
+  # zlayer-agent, which `build.yml` never ships
+  # (`--no-default-features --features hcs-runtime,wsl` is the only shipped
+  # combo).
   # ---------------------------------------------------------------------------
-  run_remote_ps "cargo check (default features)" \
-    "cargo check --workspace --all-targets"
-
   run_remote_ps "cargo check (hcs-runtime,wsl composite)" \
     "cargo check --package zlayer --features hcs-runtime,wsl --all-targets"
-
-  run_remote_ps "cargo clippy (default features)" \
-    "cargo clippy --workspace --all-targets -- -D warnings"
 
   run_remote_ps "cargo clippy (hcs-runtime,wsl composite)" \
     "cargo clippy --package zlayer --features hcs-runtime,wsl --all-targets -- -D warnings"
@@ -164,14 +162,15 @@ main_body() {
   # ---------------------------------------------------------------------------
   # Tests — mirrors `.forgejo/workflows/ci.yaml::test-windows`.
   # ---------------------------------------------------------------------------
-  run_remote_ps "cargo test --workspace --lib (default features)" \
-    "cargo test --workspace --lib --no-fail-fast"
-
-  run_remote_ps "cargo test --workspace --doc (default features)" \
-    "cargo test --workspace --doc --no-fail-fast"
-
   run_remote_ps "cargo test zlayer-agent (hcs-runtime,wsl --lib)" \
     "cargo test --package zlayer-agent --features hcs-runtime,wsl --lib --no-fail-fast"
+
+  # Mirrors `.forgejo/workflows/build.yml::build-windows-amd64::Test zlayer-hcs
+  # on Windows`. Previously this script's `--workspace --lib` only covered lib
+  # unit tests, not integration-test binaries under crates/zlayer-hcs/tests/,
+  # so the build.yml step could fail while the local check stayed green.
+  run_remote_ps "cargo test --package zlayer-hcs (mirrors build.yml)" \
+    "cargo test --package zlayer-hcs --no-fail-fast"
 
   if [[ "$SKIP_E2E" == "1" ]]; then
     echo

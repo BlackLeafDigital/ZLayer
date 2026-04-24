@@ -69,6 +69,35 @@ fn skip_if_not_elevated(test_name: &str) -> bool {
     false
 }
 
+/// True when the current process runs in Windows services session 0 (where
+/// LocalSystem and every other service account lives — including the Forgejo
+/// runner when installed as a service). HCS FFI behavior with null/invalid
+/// handles differs in session 0 versus interactive sessions, so tests that
+/// poke those edges should skip here rather than crash the test process.
+fn is_session_zero() -> bool {
+    use windows::Win32::System::RemoteDesktop::ProcessIdToSessionId;
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    let mut session_id: u32 = u32::MAX;
+    unsafe {
+        let pid = GetCurrentProcessId();
+        if ProcessIdToSessionId(pid, &mut session_id).is_err() {
+            return false;
+        }
+    }
+    session_id == 0
+}
+
+fn skip_if_session_zero(test_name: &str) -> bool {
+    if is_session_zero() {
+        println!(
+            "skipping {test_name} — running in Windows services session 0; \
+             HCS null-handle behavior differs from interactive sessions"
+        );
+        return true;
+    }
+    false
+}
+
 /// Build an empty, minimally viable Hyper-V VM compute-system document.
 /// Mirrors the HCS "empty VM" completion sample — 256 MiB RAM, 1 vCPU, UEFI,
 /// no attached disks.
@@ -241,6 +270,9 @@ fn parse_statistics_fixture() {
 #[test]
 fn open_nonexistent_process_errors_cleanly() {
     if skip_if_not_elevated("open_nonexistent_process_errors_cleanly") {
+        return;
+    }
+    if skip_if_session_zero("open_nonexistent_process_errors_cleanly") {
         return;
     }
 

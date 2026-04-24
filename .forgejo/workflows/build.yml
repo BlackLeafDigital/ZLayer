@@ -570,6 +570,12 @@ jobs:
     if: needs.check-existing.outputs.need_build == 'true'
     runs-on: arm64
     timeout-minutes: 60
+    # The `arm64` self-hosted label resolves to a macOS arm64 host, so apt
+    # isn't on the host PATH. `node:20-bullseye` is a multi-arch manifest list;
+    # the arm64 host pulls the arm64 variant natively (no cross-build). This
+    # matches the amd64 sibling job and the in-repo `publish-sdks.yml`
+    # arm64+container precedent.
+    container: node:20-bullseye
     steps:
       - uses: actions/checkout@v4
         with:
@@ -601,7 +607,7 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/setup-system-deps@main
         with:
-          packages: 'protobuf-compiler libseccomp-dev'
+          packages: 'protobuf-compiler libseccomp-dev cmake build-essential pkg-config libssl-dev clang git'
       - name: Set workspace version
         if: steps.check.outputs.completed != 'true'
         shell: bash

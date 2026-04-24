@@ -198,8 +198,11 @@ jobs:
   # ===========================================
   # Check Windows (check, clippy)
   # Runs in parallel with Linux check + macOS check to catch
-  # Windows-specific compilation errors in #[cfg(target_os = "windows")] code,
-  # both the default (HCS-only) build and the composite (HCS + WSL2 delegate) build.
+  # Windows-specific compilation errors in #[cfg(target_os = "windows")] code.
+  # Only the composite (HCS + WSL2 delegate) build is validated — the "default
+  # features" Windows build is a thin CLI without zlayer-agent, which no
+  # downstream consumer ships (build.yml always uses `--no-default-features
+  # --features hcs-runtime,wsl`).
   # ===========================================
   check-windows:
     name: Check (Windows)
@@ -244,17 +247,9 @@ jobs:
         shell: bash
         run: echo "PROTOC=C:/ProgramData/chocolatey/bin/protoc.exe" >> $GITHUB_ENV
 
-      - name: Check compilation (default features)
-        if: steps.check.outputs.completed != 'true'
-        run: cargo check --workspace --all-targets
-
       - name: Check compilation (HCS + WSL composite)
         if: steps.check.outputs.completed != 'true'
         run: cargo check --package zlayer --features hcs-runtime,wsl --all-targets
-
-      - name: Clippy lints (default features)
-        if: steps.check.outputs.completed != 'true'
-        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Clippy lints (HCS + WSL composite)
         if: steps.check.outputs.completed != 'true'
@@ -328,10 +323,6 @@ jobs:
         run: |
           # MiniWindows has uv via chocolatey; this is a safety net for new runners.
           which uv || choco install uv -y
-
-      - name: Workspace unit tests (default features)
-        if: steps.check-status.outputs.completed != 'true'
-        run: uv run --python 3.12 -- cargo test --workspace --lib --no-fail-fast
 
       - name: Workspace unit tests (HCS + WSL composite)
         if: steps.check-status.outputs.completed != 'true'
