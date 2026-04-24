@@ -18,6 +18,13 @@ rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
 [target.x86_64-apple-darwin]
 rustflags = ["-C", "link-arg=-Wl,-undefined,dynamic_lookup"]
 
+# Windows MSVC: use rust-lld (bundled with rustc) instead of MSVC link.exe.
+# rust-lld is substantially faster on large link graphs, which matters for the
+# ~1,000-crate workspace on MiniWindows where link.exe was a notable bottleneck.
+# No extra component install — rust-lld ships with the pinned toolchain.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
+
 # WASM: getrandom 0.3+ requires explicit backend selection for wasm32 targets.
 # This enables the JavaScript-based RNG backend used by ahash/hashbrown/leptos.
 [target.wasm32-unknown-unknown]
