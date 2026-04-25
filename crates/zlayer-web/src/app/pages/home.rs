@@ -76,8 +76,9 @@ spec:
                             <span class="highlight">"Orchestration"</span>
                         </h1>
                         <p class="hero-description">
-                            "ZLayer brings Kubernetes-like container orchestration to any Linux environment. "
-                            "Daemonless architecture, built-in networking, and zero configuration overhead."
+                            "Lightweight Kubernetes-like container orchestration for Linux, macOS, and Windows. "
+                            "Native runtimes on every platform, encrypted overlay networking, and a single binary "
+                            "with no daemons to babysit."
                         </p>
                         <div class="hero-buttons">
                             <a href="/docs" class="btn btn-primary">
@@ -104,34 +105,34 @@ spec:
                         </div>
                         <div class="features-grid">
                             <FeatureCard
+                                icon=|| icons::monitor_icon().into_any()
+                                title="Cross-Platform Native"
+                                description="First-class support for Linux, macOS, and Windows. youki on Linux, Seatbelt on macOS, HCS native plus WSL2 delegate on Windows. No Docker Desktop required."
+                            />
+                            <FeatureCard
                                 icon=|| icons::zap_icon("24").into_any()
-                                title="Daemonless Architecture"
-                                description="No background daemons required. Each container runs as a direct child process, giving you complete control and visibility."
+                                title="Daemonless on Linux"
+                                description="On Linux, each container runs as a direct child process via libcontainer. Complete control, full visibility, no daemon to keep alive."
                             />
                             <FeatureCard
                                 icon=|| icons::hammer_icon("24").into_any()
-                                title="Built-in Builder"
-                                description="Build OCI-compliant container images directly. No need for external tools like Docker or Buildah."
+                                title="Built-in Image Builder"
+                                description="Build OCI images directly from Dockerfile or ZImagefile YAML. buildah on Linux and macOS, native HCS-backed builder on Windows. No external tools required."
                             />
                             <FeatureCard
                                 icon=|| icons::network_icon("24").into_any()
-                                title="Overlay Networks"
-                                description="Encrypted overlay networking with automatic peer discovery. Secure communication across hosts out of the box."
+                                title="Encrypted Overlay Networks"
+                                description="Mesh networking via boringtun userspace WireGuard. IP allocation, DNS service discovery, and health checking. Wintun adapter on Windows."
                             />
                             <FeatureCard
                                 icon=|| icons::shield_icon("24").into_any()
                                 title="Security First"
-                                description="Rootless containers, seccomp profiles, and namespace isolation. Defense in depth for production workloads."
+                                description="Rootless containers, seccomp profiles, and namespace isolation. OpenID Connect SSO, RBAC with users, groups, and permissions, plus an audit log of every change."
                             />
                             <FeatureCard
-                                icon=|| icons::layers_icon("24").into_any()
-                                title="Kubernetes-like API"
-                                description="Familiar YAML specifications for containers, pods, and services. Easy migration path from existing deployments."
-                            />
-                            <FeatureCard
-                                icon=|| icons::rocket_icon("24").into_any()
-                                title="Minimal Footprint"
-                                description="Single binary under 20MB. Fast startup times and low resource consumption for edge and IoT deployments."
+                                icon=|| icons::book_icon("24").into_any()
+                                title="GitOps & Multi-Tenancy"
+                                description="Project-scoped deployments with git polling, webhook receivers, environments, secrets, and credentials. Workflows compose tasks, builds, and deploys into DAGs."
                             />
                         </div>
                     </div>

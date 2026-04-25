@@ -63,7 +63,7 @@ pub fn Footer() -> impl IntoView {
 
                 <div class="footer-bottom">
                     <p class="footer-copyright">
-                        "Copyright 2025 ZLayer Contributors. Licensed under Apache-2.0."
+                        "Copyright 2026 ZLayer Contributors. Licensed under Apache-2.0."
                     </p>
                     <div class="footer-social">
                         <a href="https://github.com/BlackLeafDigital/ZLayer" target="_blank" rel="noopener noreferrer" title="GitHub">

@@ -16,15 +16,22 @@
 
 ## Overview
 
-ZLayer provides declarative container orchestration without Kubernetes complexity. It uses [libcontainer](https://github.com/youki-dev/youki) (from the youki project) for direct container management on Linux, and Seatbelt sandbox + APFS clonefile on macOS - no daemon required. Nodes form a Raft-based cluster with resource-aware scheduling, automatic failover, and distributed container placement.
+ZLayer provides declarative container orchestration without Kubernetes complexity. It runs first-class on Linux, macOS, and Windows:
+
+- **Linux** — direct container management via [libcontainer](https://github.com/youki-dev/youki) (from the youki project), no daemon required.
+- **macOS** — Seatbelt sandbox + APFS clonefile for native macOS containers, with an optional lightweight Linux VM runtime for full Linux compatibility.
+- **Windows** — native Windows Server containers via the Host Compute Service (HCS), Linux workloads via a dedicated WSL2 distro, encrypted overlay networking via Wintun, and a Service Control Manager (SCM) service for the daemon.
+
+Nodes form a Raft-based cluster with resource-aware scheduling, automatic failover, and distributed container placement.
 
 ### Key Features
 
-- **Daemonless Runtime** - Uses libcontainer directly, no containerd/Docker daemon needed
+- **Daemonless Runtime** - Uses libcontainer directly on Linux, HCS on Windows, and Seatbelt on macOS — no containerd/Docker daemon needed
+- **Cross-Platform First-Class** - Linux, macOS, and Windows are all supported as both control-plane and worker nodes
 - **WebAssembly Support** - First-class WASM runtime with WASIp1 & WASIp2 support via wasmtime
 - **Multi-Language WASM SDKs** - Build WASM workloads from Rust, Go, Python, TypeScript, C, Zig, and more
-- **Built-in Image Builder** - Dockerfile parser with buildah integration and runtime templates
-- **Encrypted Overlay Networks** - Mesh networking via boringtun (userspace WireGuard) with IP allocation, DNS service discovery, and health checking
+- **Built-in Image Builder** - Dockerfile and ZImagefile parser with buildah integration on Linux/macOS and an HCS-backed Windows native builder (nanoserver / servercore base images) on Windows
+- **Encrypted Overlay Networks** - Mesh networking via boringtun (userspace WireGuard) with IP allocation, DNS service discovery, health checking, and a Wintun adapter on Windows
 - **Smart Scheduler** - Node placement with Shared/Dedicated/Exclusive allocation modes
 - **Multi-Node Clustering** - Raft consensus, resource-aware node join with CPU/memory/disk/GPU detection, heartbeat-based health monitoring, automatic failover and rescheduling
 - **Built-in Proxy** - L7 (HTTP/HTTPS/WebSocket) and L4 (TCP/UDP) with TLS termination, load balancing on every node
@@ -35,6 +42,8 @@ ZLayer provides declarative container orchestration without Kubernetes complexit
 - **REST API** - Deploy, manage, and build images via HTTP API with streaming progress
 - **S3 Layer Persistence** - Persist container state to S3 with crash-tolerant uploads
 - **OpenTelemetry Tracing** - Distributed tracing with OTLP export and context propagation
+- **Persistent SQLite Storage** - Tasks, workflows, audit log, sync state, and RBAC permissions are persisted to an embedded SQLite database
+- **OpenID Connect SSO** - Federate authentication against any OIDC-compliant identity provider
 
 ## Architecture
 
@@ -82,12 +91,16 @@ graph TB
         LC[libcontainer Linux]
         SB[Seatbelt Sandbox macOS]
         MV[macOS VM Runtime]
+        HCS[HCS Runtime Windows]
+        WSL[WSL2 Delegate Windows]
         WT[wasmtime]
         SM[Storage Manager]
         LC --> C1[Container]
         LC --> C2[Container]
         SB --> C3[Container]
         MV --> C4[VM Container]
+        HCS --> C5[Windows Container]
+        WSL --> C6[Linux Container]
         WT --> W1[WASM Module]
         WT --> W2[WASM Module]
     end
@@ -103,12 +116,15 @@ graph TB
     subgraph Overlay[Overlay Networking]
         IP[IP Allocator]
         Boot[Bootstrap]
-        WG[Overlay Mesh]
+        WG[Overlay Mesh boringtun]
+        WIN[Wintun Adapter Windows]
         DNS[DNS Discovery]
         TUN[Tunneling]
         IP --> Boot --> WG
+        Boot --> WIN
         Boot --> DNS
         WG --> TUN
+        WIN --> TUN
     end
 
     subgraph Storage[Storage Backends]
@@ -129,24 +145,32 @@ graph TB
 
 ```
 crates/
-├── zlayer-agent/          # Container runtime (libcontainer, Seatbelt sandbox, storage manager)
+├── zlayer-agent/          # Container runtime (libcontainer, Seatbelt, HCS, WSL2 delegate, storage manager)
 ├── zlayer-api/            # REST API server with build endpoints and streaming
-├── zlayer-builder/        # Dockerfile parser, buildah integration, runtime templates
+├── zlayer-builder/        # Dockerfile/ZImagefile parser, buildah integration, HCS-backed Windows builder, runtime templates
+├── zlayer-client/         # Internal HTTP client used by the CLI to talk to the daemon
 ├── zlayer-consensus/      # Raft consensus (openraft), snapshot management, cluster state machine
 ├── zlayer-core/           # Shared types and configuration
+├── zlayer-docker/         # Docker Engine API compatibility shim (named-pipe transport on Windows, Unix socket elsewhere)
+├── zlayer-git/            # Git operations: sync polling, webhook receiver, repo cloning
+├── zlayer-hcs/            # Safe Rust wrapper for the Windows Host Compute Service (HCS v2)
+├── zlayer-hns/            # Safe Rust wrapper for the Windows Host Compute Network Service (HCN v2)
 ├── zlayer-init-actions/   # Pre-start lifecycle actions (TCP, HTTP, S3, commands)
 ├── zlayer-manager/        # Web-based management UI (Leptos SSR + WASM)
 ├── zlayer-observability/  # Metrics, logging, OpenTelemetry tracing
-├── zlayer-overlay/        # Encrypted overlay networking (boringtun), IP allocation, DNS discovery, health checks
+├── zlayer-overlay/        # Encrypted overlay networking (boringtun + Wintun on Windows), IP allocation, DNS, health checks
+├── zlayer-paths/          # Cross-platform path resolution (data dirs, sockets, run dirs)
 ├── zlayer-proxy/          # L4/L7 proxy with TLS
+├── zlayer-py/             # Python bindings (pyo3, published to PyPI as `zlayer`)
 ├── zlayer-registry/       # OCI image pulling and caching (with optional S3 backend)
 ├── zlayer-scheduler/      # Raft-based distributed scheduler with placement logic
 ├── zlayer-secrets/        # Secrets management
 ├── zlayer-spec/           # Deployment specification types
 ├── zlayer-storage/        # S3-backed layer persistence with crash-tolerant uploads
-├── zlayer-tui/            # Terminal UI components
+├── zlayer-tui/            # Interactive terminal UI dashboard
 ├── zlayer-tunnel/         # Secure tunneling for node-to-node and on-demand service access
-└── zlayer-web/            # Web frontend utilities
+├── zlayer-web/            # Web frontend (Leptos SSR + hydration)
+└── zlayer-wsl/            # WSL2 backend integration for Windows (distro management, vhd cap, exec)
 
 bin/
 └── zlayer/                # Single zlayer binary (CLI, TUI dashboard, runtime, builder)
@@ -154,32 +178,55 @@ bin/
 
 ## Requirements
 
-- **Linux** (kernel 5.4+) or **macOS** (13+ Ventura with Seatbelt sandbox support)
-- Rust 1.85+
+ZLayer runs first-class on three platforms:
+
+| Platform | Versions | Notes |
+|----------|----------|-------|
+| **Linux** | Kernel 5.4+ | Needs `libseccomp-dev`, `libssl-dev`, `pkg-config`, `cmake`, `protobuf-compiler` to build from source |
+| **macOS** | 13+ Ventura | Built-in Seatbelt sandbox + APFS clonefile; no extra build deps |
+| **Windows** | 10 21H2+, 11, Server 2019+ | HCS native runtime built in; WSL2 optional for Linux workloads |
+
+Rust 1.91+ is required to build from source.
 
 ### Linux Dependencies
 
 ```bash
 # Ubuntu/Debian
-sudo apt-get install libseccomp-dev
+sudo apt-get install -y protobuf-compiler libseccomp-dev libssl-dev pkg-config cmake
 
 # Fedora/RHEL
-sudo dnf install libseccomp-devel
+sudo dnf install -y protobuf-compiler libseccomp-devel openssl-devel pkgconfig cmake
 
 # Arch
-sudo pacman -S libseccomp
+sudo pacman -S --needed protobuf libseccomp openssl pkgconf cmake
 ```
 
 ### macOS
 
 No additional dependencies required. ZLayer uses the built-in Seatbelt sandbox and APFS clonefile for container isolation.
 
+### Windows
+
+For runtime use, no extra dependencies are required — the HCS runtime is built into the binary. WSL2 is only needed if you intend to run Linux workloads on a Windows host; the daemon will offer to install/configure it for you.
+
+For building from source on Windows:
+
+- `rustup default stable-msvc`
+- `protoc` on PATH (e.g. `choco install protoc`)
+- A working MSVC toolchain (Visual Studio Build Tools 2022 or newer)
+
 ## Installation
 
 ### Quick Install (Recommended)
 
 ```bash
+# Linux / macOS
 curl -fsSL https://zlayer.dev/install.sh | bash
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://zlayer.dev/install.ps1 | iex
 ```
 
 ### From GitHub Releases
@@ -203,6 +250,8 @@ sudo mv zlayer /usr/local/bin/
 curl -fsSL https://github.com/BlackLeafDigital/ZLayer/releases/latest/download/zlayer-darwin-amd64.tar.gz | tar xz
 sudo mv zlayer /usr/local/bin/
 ```
+
+For Windows, download `zlayer-windows-amd64.zip` from the [latest release](https://github.com/BlackLeafDigital/ZLayer/releases/latest), extract it, and add the directory containing `zlayer.exe` to `PATH`.
 
 Or pin to a specific version:
 
@@ -234,6 +283,24 @@ cargo build --release -p zlayer
 
 # Install
 sudo cp target/release/zlayer /usr/local/bin/
+```
+
+On Windows, build from source like this (PowerShell):
+
+```powershell
+# Clone
+git clone https://github.com/BlackLeafDigital/ZLayer.git
+cd ZLayer
+
+# Toolchain + protoc (one time)
+rustup default stable-msvc
+choco install protoc -y
+
+# Build with Windows-native HCS runtime + WSL2 delegate enabled
+cargo build --release -p zlayer --no-default-features --features hcs-runtime,wsl
+
+# Install (any directory on PATH works)
+Copy-Item target\release\zlayer.exe "$env:USERPROFILE\bin\zlayer.exe"
 ```
 
 ## Quick Start
@@ -346,12 +413,12 @@ Each joining node automatically detects its hardware resources (CPU, memory, dis
 
 ZLayer detects the following resources on each node at init and join time:
 
-| Resource | Linux | macOS |
-|----------|-------|-------|
-| CPU cores | `/proc/cpuinfo` | `sysctl hw.ncpu` |
-| Memory | `/proc/meminfo` | `sysctl hw.memsize` |
-| Disk | `statvfs` | `statvfs` |
-| GPUs | sysfs PCI scan + `nvidia-smi` | `system_profiler` |
+| Resource | Linux | macOS | Windows |
+|----------|-------|-------|---------|
+| CPU cores | `/proc/cpuinfo` | `sysctl hw.ncpu` | `GetLogicalProcessorInformationEx` |
+| Memory | `/proc/meminfo` | `sysctl hw.memsize` | `GlobalMemoryStatusEx` |
+| Disk | `statvfs` | `statvfs` | `GetDiskFreeSpaceEx` |
+| GPUs | sysfs PCI scan + `nvidia-smi` | `system_profiler` | DXGI (`IDXGIFactory1::EnumAdapters1`) |
 
 GPU detection identifies vendor (NVIDIA, AMD, Intel), VRAM, model name, and device paths. GPU-aware placement is available through node labels and the scheduler's resource accounting.
 
@@ -375,7 +442,7 @@ zlayer node status
 
 ## Deployment Spec
 
-See [V1_SPEC.md](./V1_SPEC.md) for the complete specification.
+The deployment spec is documented inline below and in the per-type schemas exposed by `zlayer spec dump`. The canonical Rust types live in the [`zlayer-spec`](./crates/zlayer-spec) crate.
 
 ### Resource Types
 
@@ -808,122 +875,333 @@ Detection order: runtime template > explicit `-z` path > `ZImagefile` in context
 
 ## CLI Reference
 
-The `zlayer` binary provides comprehensive command-line management:
+The `zlayer` binary provides comprehensive command-line management. Every subcommand below is defined in [`bin/zlayer/src/cli.rs`](./bin/zlayer/src/cli.rs).
 
-### Node Management
+### Lifecycle
 
 ```bash
-# Initialize a new cluster (this node becomes leader)
+# Deploy + run in the foreground (auto-discovers *.zlayer.yml). Ctrl+C to stop.
+zlayer up
+zlayer up myapp.zlayer.yml
+zlayer up -b                                    # detach after deploying
+
+# Stop everything in a deployment (auto-discovers from *.zlayer.yml)
+zlayer down
+zlayer down my-app
+
+# Deploy without running in the foreground
+zlayer deploy                                   # auto-discovers
+zlayer deploy deployment.yaml
+zlayer deploy deployment.yaml --dry-run
+
+# Join an existing deployment using a token
+zlayer join <TOKEN>
+zlayer join <TOKEN> --service web --replicas 2
+
+# List running deployments / services / containers
+zlayer ps
+zlayer ps --deployment my-app --containers --format json
+
+# Cluster-wide health snapshot
+zlayer status
+
+# Exec into a running service container
+zlayer exec web -- /bin/sh
+zlayer exec --deployment my-app --replica 2 api -- cat /etc/hosts
+
+# Stream service logs (auto-resolves deployment when unambiguous)
+zlayer logs -s web --follow
+zlayer logs -d my-app -s api -n 500
+
+# Stop a deployment or one of its services
+zlayer stop my-app
+zlayer stop my-app --service web --force
+zlayer stop --timeout 60 my-app
+
+# Run a local command with secrets injected as env vars
+zlayer run --env dev -- pnpm run dev
+zlayer run --env prod --merge global --merge baseline -- ./bin/server
+zlayer run --env dev --dry-run --unmask         # admin-only plaintext preview
+
+# Validate a spec without deploying
+zlayer validate deployment.yaml
+```
+
+### Build & Image
+
+```bash
+# Build from Dockerfile or ZImagefile (auto-detected)
+zlayer build . -t myapp:latest
+zlayer build -z ZImagefile -t myapp:latest .
+zlayer build . --runtime node22 -t myapp:latest
+zlayer build . --runtime-auto -t myapp:latest
+zlayer build . --build-arg VERSION=1.0 -t myapp:1.0.0
+zlayer build . --target production -t myapp:prod
+zlayer build . --push -t ghcr.io/me/myapp:1.0
+zlayer build . --platform windows/amd64 -t myapp:win    # HCS-backed Windows build
+zlayer build . --platform linux/amd64  -t myapp:linux
+
+# Multi-image pipeline (auto-discovers ZPipeline.yaml / zlayer-pipeline.yaml)
+zlayer pipeline
+zlayer pipeline -f my-pipeline.yaml --set VERSION=1.0 --push
+zlayer pipeline --only web,api --platform linux/amd64,linux/arm64
+
+# Runtime template list
+zlayer runtimes
+
+# Pull an image into the local cache
+zlayer pull ghcr.io/blackleafdigital/zlayer-manager:latest
+
+# Export / import OCI image tarballs (URL imports support HTTP Basic auth)
+zlayer export myapp:v1 -o myapp.tar
+zlayer export myapp:v1 -o myapp.tar.gz --gzip
+zlayer import myapp.tar
+zlayer import myapp.tar.gz --tag myapp:imported
+zlayer import https://forge.example.com/myapp-oci.tar -u user -p token
+
+# Image cache management
+zlayer image ls
+zlayer image inspect ubuntu:22.04
+zlayer image push myregistry/myimage:tag --username u --password p
+zlayer image rm myimage:tag --force
+zlayer system prune --yes                       # remove dangling cached images
+
+# WASM artifacts
+zlayer wasm build .                             # auto-detect language
+zlayer wasm build --language rust --target wasip2 --optimize ./my-rust-app
+zlayer wasm export ./app.wasm --name myapp:v1
+zlayer wasm push  ./app.wasm ghcr.io/myorg/myapp:v1
+zlayer wasm validate ./handler.wasm
+zlayer wasm info     ./handler.wasm
+```
+
+### Cluster & Node
+
+```bash
+# Bootstrap as the cluster leader
 zlayer node init --advertise-addr 10.0.0.1
 
 # Join an existing cluster
 zlayer node join 10.0.0.1:3669 --token <TOKEN> --advertise-addr 10.0.0.2
 
-# List nodes in cluster
+# Inspect / manage cluster nodes
 zlayer node list
-
-# Show node status
-zlayer node status
-
-# Add labels to nodes (for node selectors)
+zlayer node status [<node-id>]
+zlayer node remove <node-id> [--force]
+zlayer node set-mode <node-id> --mode dedicated --services api,web
 zlayer node label <node-id> gpu=true
-
-# Generate a join token for workers
 zlayer node generate-join-token -d my-deploy -a http://10.0.0.1:3669
+zlayer node force-leader                        # disaster recovery
+
+# Networks (overlay + per-deployment networks)
+zlayer network ls
+zlayer network inspect <name>
+zlayer network create <name>
+zlayer network rm <name>
+zlayer network status
+zlayer network peers
+zlayer network dns
+
+# Volumes
+zlayer volume ls
+zlayer volume rm my-volume --force
 ```
 
-### Deployment Management
+### Server & Daemon
 
 ```bash
-# Auto-discovers .zlayer.yml in current directory
-zlayer deploy
-
-# Deploy from explicit spec file
-zlayer deploy deployment.yaml
-
-# Deploy and run (foreground, streams logs, Ctrl+C to stop)
-zlayer up
-
-# Deploy and run in background
-zlayer up -b
-# or equivalently
-zlayer -b up
-
-# Deploy a specific spec file in foreground
-zlayer up my-spec.yml
-
-# Stop a running deployment (auto-discovers from .zlayer.yml)
-zlayer down
-zlayer down my-app
-
-# Validate a deployment spec
-zlayer validate deployment.yaml
-
-# View deployment status
-zlayer status
-
-# Stream logs from a service
-zlayer logs -d my-app -s web --follow
-
-# Stop a deployment
-zlayer stop my-app --service web
-```
-
-### Build Commands
-
-```bash
-# Build from Dockerfile
-zlayer build . -t myapp:latest
-
-# Build from ZImagefile (auto-detected if present)
-zlayer build . -t myapp:latest
-
-# Build from explicit ZImagefile path
-zlayer build -z path/to/ZImagefile . -t myapp:latest
-
-# Build with runtime template
-zlayer build . --runtime node22 -t myapp:latest
-
-# Auto-detect runtime from project files
-zlayer build . --runtime-auto -t myapp:latest
-
-# Build with arguments
-zlayer build . --build-arg VERSION=1.0 -t myapp:1.0.0
-
-# Multi-stage builds with target
-zlayer build . --target production -t myapp:prod
-
-# Multi-image pipeline builds
-zlayer pipeline ./pipeline.yaml
-
-# List available runtime templates
-zlayer runtimes
-```
-
-### API Server
-
-```bash
-# Start the REST API server
+# Start the API server in the foreground
 zlayer serve --bind 0.0.0.0:3669
 
-# With JWT secret
-zlayer serve --bind 0.0.0.0:3669 --jwt-secret <secret>
+# Background daemon mode
+zlayer serve --bind 0.0.0.0:3669 --daemon
+
+# Run as a Windows Service under SCM (set automatically by the SCM)
+zlayer serve --service
+
+# Override the WSL2 vhd cap (Windows + `wsl` feature only)
+zlayer serve --vhd-gb 120
+
+# Expose the Docker Engine API socket (requires `docker-compat` feature)
+zlayer serve --docker-socket --docker-socket-path /var/run/docker.sock
+
+# Manage the system service (systemd on Linux, launchd on macOS, SCM on Windows)
+zlayer daemon install [--no-start] [--bind 0.0.0.0:3669]
+zlayer daemon uninstall
+zlayer daemon start | stop | restart | status
+zlayer daemon reset --force                     # wipes Raft storage
+
+# Windows-only maintenance (compact the WSL2 distro VHDX)
+zlayer windows compact [--force]
 ```
 
-### Management UI
+### Resources
+
+```bash
+# Containers
+zlayer container ls [--output json]
+zlayer container inspect <id>
+zlayer container logs <id> [--tail 200]
+zlayer container stats <id>
+zlayer container rm <id> [--force]
+
+# Secrets (encrypted at rest, scoped to environments)
+zlayer secret ls --env dev
+zlayer secret create API_KEY --random --env dev
+zlayer secret get API_KEY --env dev --reveal
+zlayer secret set API_KEY --from-file ./key.txt --env prod
+zlayer secret rotate API_KEY --random --env prod
+zlayer secret rm API_KEY --env dev
+zlayer secret unset API_KEY --env dev
+zlayer secret import --file .env --env dev
+zlayer secret export --env prod --format env
+zlayer secret grant alice@example.com dev write
+zlayer secret revoke alice@example.com dev
+zlayer secret permissions dev
+
+# Environments (namespaces for secrets, deployments)
+zlayer env ls
+zlayer env create dev --description "Developer env"
+zlayer env show <id>
+zlayer env update <id> --name staging
+zlayer env delete <id> --yes
+
+# Plaintext variables (NOT secrets — used for template substitution)
+zlayer variable ls
+zlayer variable set APP_VERSION 1.2.3
+zlayer variable get APP_VERSION
+zlayer variable unset APP_VERSION
+
+# Tasks (runnable scripts)
+zlayer task ls
+zlayer task create --name backup --kind bash --body "tar czf /tmp/x.tar.gz /data"
+zlayer task run <id>
+zlayer task logs <id>
+
+# Workflows (DAGs of task / build / deploy / sync steps)
+zlayer workflow ls
+zlayer workflow create --name release --steps '[...]'
+zlayer workflow run <id>
+zlayer workflow logs <id>
+
+# Notifiers (Slack, Discord, webhook, SMTP)
+zlayer notifier ls
+zlayer notifier create --name oncall --kind slack --webhook-url https://...
+zlayer notifier test <id>
+
+# Jobs and cron jobs
+zlayer job ls
+zlayer job trigger backup --deployment my-app
+zlayer job status backup --deployment my-app
+zlayer job cron ls
+zlayer job cron status nightly --deployment my-app
+```
+
+### Auth & RBAC
+
+```bash
+# First-run admin bootstrap
+zlayer auth bootstrap --email admin@local --password hunter2
+
+# Sessions
+zlayer auth login --email admin@local
+zlayer auth whoami
+zlayer auth logout
+
+# JWT tokens
+zlayer token create --subject ci --hours 168 --roles admin
+zlayer token decode <token>
+zlayer token info
+zlayer token show
+
+# Users (admin)
+zlayer user ls
+zlayer user create --email dev@example.com --role user
+zlayer user set-role <id> --role admin
+zlayer user set-password --email dev@example.com --random
+zlayer user delete <id> --yes
+
+# Groups (admin)
+zlayer group list
+zlayer group create --name developers
+zlayer group member add --group <id> --user <id>
+zlayer group member remove --group <id> --user <id>
+zlayer group delete <id> --yes
+
+# Permissions
+zlayer permission list --user <id>
+zlayer permission grant --subject-kind user --subject <id> \
+    --resource-kind deployment --resource <name> --level write
+zlayer permission revoke <permission-id>
+
+# Audit log
+zlayer audit tail --limit 100 --user <id>
+```
+
+### Projects & GitOps
+
+```bash
+# Projects group deployments, credentials, environments, and build configuration
+zlayer project ls
+zlayer project create my-app --git-url https://forge.example.com/me/app \
+    --git-branch main --build-kind dockerfile --build-path ./
+zlayer project show <id>
+zlayer project update <id> --description "Frontend"
+zlayer project delete <id> --yes
+zlayer project link-deployment <id> my-app
+zlayer project unlink-deployment <id> my-app
+zlayer project list-deployments <id>
+zlayer project pull <id>                        # clone or fast-forward on the daemon
+zlayer project auto-deploy <id> --enabled true
+zlayer project poll-interval <id> --seconds 60
+zlayer project webhook show   <id>
+zlayer project webhook rotate <id>
+
+# Credentials (encrypted at rest)
+zlayer credential registry ls
+zlayer credential registry add --registry ghcr.io --username u --auth-type basic
+zlayer credential registry delete <id> --yes
+zlayer credential git ls
+zlayer credential git add --name forgejo --kind pat --value <pat>
+zlayer credential git delete <id> --yes
+
+# GitOps syncs (a sync points at a directory of resource YAMLs in a project)
+zlayer sync ls
+zlayer sync create --name infra --project <project-id> --path ./gitops --auto-apply
+zlayer sync diff  <id>
+zlayer sync apply <id>
+zlayer sync delete <id> --yes
+```
+
+### Tunneling
+
+```bash
+zlayer tunnel create --name db-access --services postgres,redis --ttl-hours 24
+zlayer tunnel list
+zlayer tunnel revoke <id>
+zlayer tunnel connect --server wss://tunnel.example.com/tunnel/v1 \
+    --token tun_xxx --service ssh:22:2222
+zlayer tunnel add jellyfin --from nas --to hetzner \
+    --local-port 8096 --remote-port 8096 --expose public
+zlayer tunnel remove jellyfin
+zlayer tunnel status
+zlayer tunnel access postgres.service.zlayer --local-port 15432 --ttl 1h
+```
+
+### Manager UI
 
 ZLayer includes a web-based management dashboard (similar to [Komodo](https://komo.do)):
 
 ```bash
-# Generate a zlayer-manager deployment spec and optionally deploy it
-zlayer manager init
+# Generate a zlayer-manager deployment spec and optionally bootstrap an admin
+zlayer manager init                              # interactive
 zlayer manager init --port 8080 --deploy
+zlayer manager init --email admin@example.com --random
+zlayer manager init --env-file /run/secrets/manager.env --no-bootstrap
 
-# Check manager status
+# Status / stop
 zlayer manager status
-
-# Stop the manager
-zlayer manager stop
+zlayer manager stop --force
 ```
 
 Features include:
@@ -936,78 +1214,69 @@ Features include:
 
 See [crates/zlayer-manager/README.md](./crates/zlayer-manager/README.md) for development details.
 
-### Token Management
-
-```bash
-# Create a JWT token for API access
-zlayer token create --subject dev --hours 24 --roles admin
-
-# Create token (quiet mode for scripting)
-zlayer token create --quiet
-
-# Decode and inspect a token
-zlayer token decode <token>
-
-# Show token system info
-zlayer token info
-```
-
 ### Spec Inspection
 
 ```bash
-# Dump parsed spec as JSON
-zlayer spec dump deployment.yaml --format json
-
-# Dump parsed spec as YAML (default)
+# Dump parsed spec as YAML (default) or JSON
 zlayer spec dump deployment.yaml
-
-# Validate a spec file
-zlayer spec validate deployment.yaml
-
-# Inspect a running deployment
-zlayer spec inspect my-deployment --format table
-zlayer spec inspect my-deployment --api http://localhost:3669 --format json
+zlayer spec dump deployment.yaml --format json
 ```
 
-### Local Development
+### Docker Compatibility (`--features docker-compat`)
+
+The Docker compatibility shim is the easiest path off Docker — point existing Docker tooling (Docker CLI, `docker-compose`, IDE integrations, CI runners) at the ZLayer daemon and they keep working. The `zlayer docker install` command configures the daemon to expose the Docker Engine API socket (named pipe on Windows, Unix socket elsewhere), drops `docker` and `docker-compose` shim binaries on `PATH`, writes `DOCKER_HOST` and `DOCKER_BUILDKIT=0` into the user's shell profile, and optionally symlinks `/var/run/docker.sock`.
 
 ```bash
-# Run a deployment locally (development mode)
-zlayer run deployment.yaml
+# Install / uninstall the compatibility shim
+zlayer docker install
+zlayer docker uninstall
 
-# Dry run - validate and show plan
-zlayer run deployment.yaml --dry-run
+# Container ops (1:1 Docker CLI parity)
+zlayer docker run --rm -it alpine sh
+zlayer docker ps
+zlayer docker stop <id>
+zlayer docker kill <id>
+zlayer docker rm <id>
+zlayer docker start <id>
+zlayer docker restart <id>
+zlayer docker exec -it <id> bash
+zlayer docker logs <id> --tail 100
 
-# With port offset for multiple instances
-zlayer run deployment.yaml --port-offset 1000
+# Image ops
+zlayer docker build -t myapp:latest .
+zlayer docker pull alpine:3.19
+zlayer docker push ghcr.io/me/app:v1
+zlayer docker images
+zlayer docker rmi <image>
+zlayer docker tag src:latest dst:latest
 
-# Production environment
-zlayer run deployment.yaml --env prod
+# Inspection / files / auth / stats
+zlayer docker inspect <id>
+zlayer docker cp <id>:/etc/hosts ./hosts
+zlayer docker login ghcr.io
+zlayer docker logout ghcr.io
+zlayer docker stats <id>
+
+# Volumes / networks / compose / system
+zlayer docker volume ls
+zlayer docker network ls
+zlayer docker compose up -f docker-compose.yaml
+zlayer docker system prune
 ```
 
-### WASM Commands
+### Tools
 
 ```bash
-# Build WASM from source (auto-detects language)
-zlayer wasm build .
-zlayer wasm build --language rust --target wasip2 --optimize ./my-rust-app
+# Launch the interactive TUI dashboard (no args = TUI by default)
+zlayer tui
+zlayer tui -c ./my-build-context
 
-# Export WASM as OCI artifact
-zlayer wasm export ./app.wasm --name myapp:v1
-zlayer wasm export ./app.wasm --name ghcr.io/myorg/myapp:latest --output ./oci-dir
-
-# Push WASM to registry
-zlayer wasm push ./app.wasm ghcr.io/myorg/myapp:v1
-zlayer wasm push ./app.wasm --username $USER --password $TOKEN registry.example.com/app:v1
-
-# Validate a WASM binary
-zlayer wasm validate ./handler.wasm
-
-# Inspect WASM binary info
-zlayer wasm info ./handler.wasm
-
-# Run a WASM image (auto-detected from registry)
-zlayer run ghcr.io/myorg/my-wasm-handler:v1
+# Generate shell completions
+zlayer completions bash       > /etc/bash_completion.d/zlayer
+zlayer completions zsh        > "${fpath[1]}/_zlayer"
+zlayer completions fish       > ~/.config/fish/completions/zlayer.fish
+zlayer completions powershell > $PROFILE.zlayer-completions.ps1
+zlayer completions elvish     > ~/.config/elvish/lib/zlayer.elv
 ```
 
 ## WebAssembly Support
@@ -1138,8 +1407,14 @@ Uses the built-in Seatbelt sandbox (`sandbox-exec`) and APFS clonefile for conta
 ### macOS VM Runtime
 Lightweight Linux VMs on macOS via the Virtualization framework. Useful when full Linux container compatibility is needed on macOS.
 
+### HCS Runtime (Default on Windows for Windows containers)
+Native Windows Server containers via the Host Compute Service (HCS v2). Activated automatically for images whose OS is Windows (e.g. `mcr.microsoft.com/windows/nanoserver:ltsc2022`, `mcr.microsoft.com/windows/servercore:ltsc2022`). Built into the binary on Windows targets via the `hcs-runtime` feature, and exposed as a Windows Service via SCM.
+
+### WSL2 Delegate Runtime (Windows, for Linux containers)
+Linux workloads on Windows hosts run via youki inside the dedicated `zlayer` WSL2 distro. The daemon manages the distro lifecycle, the ext4 VHDX, and the bridged overlay network, so Linux deployments behave identically on Windows hosts. Activated by the `wsl` feature on Windows targets.
+
 ### Docker Runtime (Cross-Platform)
-Uses the Docker daemon via bollard for cross-platform support (macOS, Windows, Linux). Enable with the `docker` feature:
+Uses the Docker daemon via bollard for cross-platform support (Linux, macOS, Windows). Enable with the `docker` feature:
 
 ```bash
 # Build with Docker runtime support
@@ -1149,9 +1424,10 @@ cargo build --release --features docker
 cargo build --release --features "docker,wasm"
 ```
 
-**Runtime Selection**:
-- Linux: Prefers youki, falls back to Docker if unavailable
-- macOS: Prefers Seatbelt sandbox, falls back to macOS VM, then Docker
+**Runtime Selection** (the `Auto` runtime — default):
+- **Linux**: Prefers youki, falls back to Docker if unavailable.
+- **macOS**: Prefers Seatbelt sandbox, falls back to macOS VM, then Docker.
+- **Windows**: Prefers HCS for Windows images, the WSL2 delegate for Linux images, falls back to Docker.
 
 ### WASM Runtime
 WebAssembly workloads via wasmtime. See [WebAssembly Support](#webassembly-support).
@@ -1161,39 +1437,53 @@ WebAssembly workloads via wasmtime. See [WebAssembly Support](#webassembly-suppo
 | Youki | Linux only | No | Production (optimal) |
 | Seatbelt Sandbox | macOS only | No | Native macOS containers |
 | macOS VM | macOS only | No | Full Linux compat on macOS |
+| HCS | Windows only | No (built-in) | Native Windows containers |
+| WSL2 Delegate | Windows only (`wsl` feature) | No (managed distro) | Linux workloads on Windows |
 | Docker | All | Yes | Development, cross-platform |
 | WASM | All | No | Lightweight, portable workloads |
 
 ## GitHub Action
 
-ZLayer is available as a GitHub Action for CI/CD workflows:
+ZLayer is available as a GitHub Action for CI/CD workflows. The action installs the latest `zlayer` binary on the runner and invokes it with the `command` you supply.
+
+### Inputs
+
+| Input | Required | Description |
+|-------|----------|-------------|
+| `command` | yes | The full `zlayer` subcommand and arguments to run (e.g. `wasm build .`, `validate deployment.yaml`, `pipeline --push`). |
+| `version` | no | Pin to a specific release (e.g. `v0.10.99`). Defaults to the latest release. |
+
+### Usage
 
 ```yaml
 - uses: BlackLeafDigital/ZLayer@v1
   with:
     command: wasm build .
-```
 
-### Quick Examples
-
-```yaml
-# Build WASM plugin
+# Build WASM plugin with explicit language/target
 - uses: BlackLeafDigital/ZLayer@v1
   with:
     command: wasm build --language rust --target wasip2
 
 # Push to registry
 - uses: BlackLeafDigital/ZLayer@v1
+  env:
+    REGISTRY_TOKEN: ${{ secrets.GHCR_TOKEN }}
   with:
     command: wasm push ./handler.wasm ghcr.io/myorg/handler:latest
 
-# Validate deployment spec
+# Validate a deployment spec on every PR
 - uses: BlackLeafDigital/ZLayer@v1
   with:
     command: validate deployment.yaml
+
+# Build and push a multi-image pipeline
+- uses: BlackLeafDigital/ZLayer@v1
+  with:
+    command: pipeline -f ZPipeline.yaml --set VERSION=${{ github.sha }} --push
 ```
 
-See [ACTION.md](./ACTION.md) for full documentation and examples.
+The action runs on `ubuntu-latest`, `macos-latest`, and `windows-latest` runners.
 
 ## Observability
 

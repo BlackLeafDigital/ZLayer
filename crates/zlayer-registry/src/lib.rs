@@ -60,4 +60,5 @@ pub use oci_export::{
 pub use wasm_export::{export_wasm_as_oci, WasmExportConfig, WasmExportError, WasmExportResult};
 
 // Re-export oci_client types that users need
+pub use oci_client::manifest::OciImageManifest;
 pub use oci_client::secrets::RegistryAuth;

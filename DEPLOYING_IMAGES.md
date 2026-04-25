@@ -55,19 +55,19 @@ services:
 |--------|-----------|------|
 | **Cold Start** | ~300ms | ~1-5ms |
 | **Image Size** | 10MB - 1GB+ | 100KB - 10MB |
-| **Isolation** | Linux namespaces/cgroups | WASM sandbox |
-| **Syscalls** | Full Linux | WASI subset |
+| **Isolation** | Linux namespaces/cgroups (Linux) or HCS silos (Windows) | WASM sandbox |
+| **Syscalls** | Full host OS (Linux or Win32) | WASI subset |
 | **exec() support** | Yes | No (single process model) |
-| **Portability** | Arch-specific (x86/ARM) | Universal bytecode |
-| **CPU/Memory Stats** | Via cgroups | Limited |
+| **Portability** | Arch- and OS-specific (Linux/Windows × x86/ARM) | Universal bytecode |
+| **CPU/Memory Stats** | Via cgroups (Linux) or job objects (Windows) | Limited |
 | **Languages** | Any (native binary) | Must compile to WASM |
 
 **Choose Containers when:**
-- Running existing Docker images
-- Need full Linux syscall support
+- Running existing Docker images (Linux or Windows)
+- Need full host syscall support (Linux or Win32)
 - Running databases or stateful services
 - Complex multi-process applications
-- Architecture-specific optimizations
+- Architecture- or OS-specific optimizations
 
 **Choose WASM when:**
 - Sub-millisecond cold starts are critical
@@ -280,6 +280,120 @@ myapp:production
 # Combined
 myapp:1.0.0-sha-abc1234
 ```
+
+### 2.4 Windows Image Building
+
+ZLayer ships a native Windows image builder that produces OCI Windows
+container images directly via the Host Compute Service (HCS) — no Docker
+Desktop, no buildah-on-WSL, no third-party daemon required. Linux images
+continue to be built with buildah on Linux/macOS hosts; Windows images are
+built with the HCS backend on Windows hosts.
+
+#### Choosing a backend (build matrix)
+
+Backend selection is automatic — `zlayer build` picks the right backend based
+on host OS and target image OS. The current matrix is:
+
+| Host / Target | Linux image                               | Windows image                             |
+|---------------|-------------------------------------------|-------------------------------------------|
+| Linux         | buildah                                   | Err — requires Windows host               |
+| macOS         | buildah (if available) else macos-sandbox | Err — requires Windows host               |
+| Windows       | Err — Linux peer required (WSL2 follow-up)| HCS-backed native Windows builder         |
+
+Today, **Windows images must be built on a Windows host**. Linux and macOS
+hosts cannot produce Windows OCI images — cross-platform Windows image
+construction is a follow-up. Likewise, building Linux images on a Windows
+host requires a Linux peer (WSL2 routing is a planned follow-up).
+
+To force a specific backend during debugging, set the `ZLAYER_BACKEND`
+environment variable to `buildah` or (on macOS) `sandbox`.
+
+#### Base image templates
+
+ZLayer ships two reference Windows Dockerfile templates under
+`crates/zlayer-builder/src/templates/dockerfiles/`:
+
+| Template          | Base image                                          | Size    | Use when                                                                  |
+|-------------------|-----------------------------------------------------|---------|---------------------------------------------------------------------------|
+| `nanoserver`      | `mcr.microsoft.com/windows/nanoserver:ltsc2022`     | ~100 MB | Self-contained binaries (Go, .NET AOT, Rust MSVC). No PowerShell, no package managers. |
+| `servercore`      | `mcr.microsoft.com/windows/servercore:ltsc2022`     | ~1.5 GB | Full Win32 surface — PowerShell, chocolatey/winget, full .NET SDK, IIS, WMI tooling.  |
+
+Pick `nanoserver` for production-grade, statically-linked Windows binaries.
+Pick `servercore` if you need PowerShell at runtime, package managers at
+build time, or any legacy Windows component.
+
+#### ZImagefile with `os: windows`
+
+The ZImagefile YAML schema accepts an `os` field. Set it to `windows` to
+produce a Windows OCI image; omit it (or set `linux`) for the default Linux
+behavior.
+
+```yaml
+# images/win-app.zlayer.yaml
+os: windows
+from: mcr.microsoft.com/windows/nanoserver:ltsc2022
+workdir: C:\app
+
+copy:
+  - src: ./app.exe
+    dest: C:\app\app.exe
+
+run:
+  - echo Building Windows image > C:\app\build.log
+
+cmd: ["C:\\app\\app.exe"]
+```
+
+Build it with the `--platform` flag:
+
+```powershell
+zlayer build --platform windows -f images/win-app.zlayer.yaml -t myapp:win
+```
+
+The `--platform` flag accepts `linux`, `linux/amd64`, `windows`, or
+`windows/amd64`. When omitted, the target OS is inferred from the
+ZImagefile's `os:` field (or defaults to Linux for plain Dockerfiles).
+
+#### Windows-aware Dockerfile translation
+
+When the target OS is Windows, ZLayer's Dockerfile translator emits Windows
+shell forms instead of POSIX ones:
+
+- `RUN <command>` becomes `cmd.exe /S /C <command>` (rather than `/bin/sh -c`).
+- The default `SHELL` is `cmd.exe` (servercore templates can override to
+  PowerShell with a `SHELL ["powershell", "-Command"]` instruction).
+
+This means a single instruction like:
+
+```dockerfile
+RUN echo hello > log.txt
+```
+
+works correctly on **both** Linux (executed via `/bin/sh -c`) and Windows
+(executed via `cmd.exe /S /C`) — the same source Dockerfile, two valid
+images, depending on `--platform`.
+
+#### Mixed-OS pipelines
+
+A `ZPipeline.yaml` can list both Linux and Windows images side by side. The
+builder routes each image to the appropriate backend based on its `os:`
+field:
+
+```yaml
+images:
+  - name: myorg/api:linux
+    file: images/api.zlayer.yaml          # os: linux
+  - name: myorg/api:windows
+    file: images/api-win.zlayer.yaml      # os: windows
+    depends_on: [myorg/api:linux]
+```
+
+On a Linux host, the Linux image builds via buildah and the Windows image
+errors out (Windows builds require a Windows host). On a Windows host, the
+Windows image builds via HCS and the Linux image errors out. To produce a
+mixed-OS pipeline today, run the pipeline twice — once per host — and
+publish each output to the same registry. Cross-host pipeline orchestration
+is a follow-up.
 
 ---
 
@@ -1514,7 +1628,7 @@ zlayer run ghcr.io/myorg/myapp:v1
 ## Additional Resources
 
 - [ZLayer Documentation](https://zlayer.dev/docs)
-- [ZLayer V1 Specification](./V1_SPEC.md)
+- [ZLayer Spec Crate](https://github.com/BlackLeafDigital/ZLayer/tree/dev/crates/zlayer-spec) — deployment spec types and YAML schema (also see `zlayer spec dump`)
 - [WASM Implementation Details](./WASM_DONE.md)
 - [Example Deployments](./examples/)
 - [WASM OCI Artifact Spec](https://tag-runtime.cncf.io/wgs/wasm/deliverables/wasm-oci-artifact/)

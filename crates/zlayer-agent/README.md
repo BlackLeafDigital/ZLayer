@@ -6,9 +6,23 @@ Container runtime agent for ZLayer, providing lifecycle management for container
 
 The agent supports multiple container runtimes through feature flags:
 
-- **youki** (default): Linux-native container runtime using libcontainer. Preferred on Linux for performance (no daemon overhead).
-- **docker**: Cross-platform runtime using Docker daemon. Works on Linux, Windows, and macOS.
+- **youki** (default on Linux): Linux-native container runtime using libcontainer. Preferred on Linux for performance (no daemon overhead).
+- **seatbelt** (default on macOS): Native macOS sandbox runtime using Seatbelt (`sandbox-exec`). Preferred for native Darwin workloads.
+- **libkrun-vm** (optional, macOS): Lightweight VM-based runtime using libkrun, used when full Linux compatibility is required on macOS.
+- **hcs-runtime** (default on Windows): Native Windows containers via the Host Compute Service (HCS) APIs.
+- **wsl** (default on Windows for Linux images): Delegates Linux-image workloads to a WSL2-hosted agent.
+- **docker**: Cross-platform fallback using the Docker daemon. Works on Linux, Windows, and macOS.
 - **wasm**: WebAssembly runtime using wasmtime for executing WASM workloads with WASI support.
+
+### Windows feature flags
+
+The canonical Windows release build enables both HCS and WSL2 delegation:
+
+```bash
+cargo build --release -p zlayer --no-default-features --features hcs-runtime,wsl
+```
+
+On Windows, the agent uses a `CompositeRuntime` (`src/runtimes/composite.rs`) that inspects the OCI image manifest's OS field and dispatches each container to the appropriate backend: `HcsRuntime` for Windows images and `Wsl2DelegateRuntime` for Linux images. Docker remains available as a fallback when neither native runtime is suitable.
 
 ## Installation
 
@@ -35,9 +49,23 @@ let runtime = create_runtime(RuntimeConfig::Auto).await?;
 ```
 
 Selection logic:
-- **Linux**: Prefers youki if available, falls back to Docker
-- **Windows/macOS**: Uses Docker directly (youki is Linux-only)
-- **WASM artifacts**: Use `RuntimeConfig::Wasm` explicitly
+- **Linux**: Prefers youki (libcontainer) if available, falls back to Docker.
+- **macOS**: Prefers the Seatbelt sandbox runtime for native Darwin workloads, uses the libkrun VM runtime when full Linux compatibility is required, and falls back to Docker.
+- **Windows**: Uses the `CompositeRuntime` to dispatch per image: `HcsRuntime` for Windows containers and `Wsl2DelegateRuntime` (requires the `wsl` feature) for Linux containers. Docker remains available as a fallback. Activated via `--features hcs-runtime,wsl`.
+- **WASM artifacts**: Use `RuntimeConfig::Wasm` explicitly (auto-detected from the OCI manifest where applicable).
+
+### Runtime matrix
+
+| Runtime | Platform | Default? |
+|---------|----------|----------|
+| youki | Linux | Yes (Linux) |
+| seatbelt | macOS | Yes (macOS) |
+| libkrun VM | macOS | Optional |
+| HCS | Windows | Yes (Windows containers) |
+| WSL2 delegate | Windows + `wsl` feature | Yes (Linux containers on Windows) |
+| composite | Windows | Auto-selected |
+| docker | All | Fallback |
+| wasm | All | Auto-detected from OCI manifest |
 
 ### Explicit Selection
 
@@ -105,16 +133,16 @@ The WASM runtime supports WASI Preview 1 (wasip1) with the following capabilitie
 
 ### WASM vs Container Runtime Comparison
 
-| Feature | Container (youki/Docker) | WASM |
-|---------|-------------------------|------|
-| Isolation | Process/cgroup | In-process sandbox |
+| Feature | Container (youki/seatbelt/libkrun/HCS/WSL2/Docker) | WASM |
+|---------|----------------------------------------------------|------|
+| Isolation | Process/cgroup, Seatbelt sandbox, VM, or HCS silo | In-process sandbox |
 | Startup time | 100ms+ | <10ms |
 | Memory overhead | Higher (full rootfs) | Lower (just module) |
 | `exec` support | Yes | No |
-| Cgroup stats | Yes | No (stub values) |
+| Cgroup stats | Yes (where the host supports it) | No (stub values) |
 | Filesystem mounts | Yes | Limited |
 | Network | Full | Limited |
-| Platform | Linux/Windows/macOS | Cross-platform |
+| Platform | Linux (youki), macOS (seatbelt/libkrun), Windows (HCS + WSL2 delegate), Docker fallback on all | Cross-platform |
 
 ### WASM Limitations
 
@@ -209,6 +237,11 @@ The WASM tests use inline WAT (WebAssembly Text Format) modules compiled at test
 - `runtime.rs`: Abstract `Runtime` trait and `ContainerState` types
 - `runtimes/`: Runtime implementations
   - `youki.rs`: Linux-native runtime using libcontainer
+  - `seatbelt.rs`: macOS Seatbelt sandbox runtime
+  - `libkrun.rs`: macOS libkrun VM runtime for full Linux compatibility (feature: `libkrun-vm`)
+  - `hcs.rs`: Windows Host Compute Service runtime for Windows containers (feature: `hcs-runtime`)
+  - `wsl2_delegate.rs`: Windows runtime that delegates Linux containers to a WSL2-hosted agent (feature: `wsl`)
+  - `composite.rs`: `CompositeRuntime` that inspects the OCI image OS and dispatches to `HcsRuntime` or `Wsl2DelegateRuntime` on Windows
   - `docker.rs`: Docker daemon runtime (feature: `docker`)
   - `wasm.rs`: WebAssembly runtime using wasmtime (feature: `wasm`)
 - `service.rs`: `ServiceManager` for higher-level orchestration
