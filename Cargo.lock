@@ -5528,50 +5528,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52ff2c0fe9bc6cb6b14a0592c2ff4fa9ceb83eea9db979b0487cd054946a2b8f"
 
 [[package]]
-name = "libcgroups"
-version = "0.6.0"
-source = "git+https://github.com/ZachHandley/youki?branch=zlayer-patches#e89e3ab9cc752e5cab44dee9a8595ab176dfeb03"
-dependencies = [
- "fixedbitset",
- "nix 0.29.0",
- "oci-spec 0.9.0",
- "pathrs",
- "procfs",
- "serde",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
-name = "libcontainer"
-version = "0.6.0"
-source = "git+https://github.com/ZachHandley/youki?branch=zlayer-patches#e89e3ab9cc752e5cab44dee9a8595ab176dfeb03"
-dependencies = [
- "caps",
- "chrono",
- "fastrand",
- "libc",
- "libcgroups",
- "libseccomp",
- "nc",
- "netlink-packet-core 0.8.1",
- "netlink-packet-route 0.26.0",
- "netlink-sys",
- "nix 0.29.0",
- "oci-spec 0.9.0",
- "pathrs",
- "prctl",
- "procfs",
- "regex",
- "rust-criu",
- "safe-path",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tracing",
-]
-
-[[package]]
 name = "libloading"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -12167,7 +12123,6 @@ dependencies = [
  "ipnetwork",
  "jsonwebtoken",
  "libc",
- "libcontainer",
  "libloading 0.8.9",
  "netlink-packet-route 0.19.0",
  "nix 0.31.2",
@@ -12199,6 +12154,7 @@ dependencies = [
  "zlayer-hcs",
  "zlayer-hns",
  "zlayer-init-actions",
+ "zlayer-libcontainer",
  "zlayer-observability",
  "zlayer-overlay",
  "zlayer-paths",
@@ -12455,6 +12411,52 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "zlayer-libcgroups"
+version = "0.6.1-zlayer.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27e77ccd94e84a1f961c248d745bd052ea47f48122e943002e6ea34193f3fb02"
+dependencies = [
+ "fixedbitset",
+ "nix 0.29.0",
+ "oci-spec 0.9.0",
+ "pathrs",
+ "procfs",
+ "serde",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
+name = "zlayer-libcontainer"
+version = "0.6.1-zlayer.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "192b8696c354f2b778c270d8bae7d031fc0195d6cd1440b6e5f902a0d9f22ee3"
+dependencies = [
+ "caps",
+ "chrono",
+ "fastrand",
+ "libc",
+ "libseccomp",
+ "nc",
+ "netlink-packet-core 0.8.1",
+ "netlink-packet-route 0.26.0",
+ "netlink-sys",
+ "nix 0.29.0",
+ "oci-spec 0.9.0",
+ "pathrs",
+ "prctl",
+ "procfs",
+ "regex",
+ "rust-criu",
+ "safe-path",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "zlayer-libcgroups",
 ]
 
 [[package]]

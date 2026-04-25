@@ -283,14 +283,10 @@ jobs:
             sed -i "s/^dynamic = .*/version = \"${VERSION}\"/" pyproject.toml
           fi
 
-      - name: Install maturin via uv
-        shell: bash
-        run: uv tool install maturin
-
       - name: Build wheel
         shell: bash
         working-directory: crates/zlayer-py
-        run: maturin build --release --out dist
+        run: uvx maturin build --release --out dist
 
       - uses: https://github.com/christopherhx/gitea-upload-artifact@v4
         with:

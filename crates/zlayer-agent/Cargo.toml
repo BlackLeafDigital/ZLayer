@@ -109,11 +109,11 @@ sha2 = { workspace = true, optional = true }
 zlayer-paths.workspace = true
 
 # Linux-specific dependencies for native container runtime (youki/libcontainer)
-# Tracking our fork's `zlayer-patches` branch: upstream main + cherry-picked
-# open PRs we need before they merge. See docs/youki-fork.md for patch list
-# and sync procedure.
+# Consuming the patched fork via `zlayer-libcontainer` published from
+# github.com/ZachHandley/youki@zlayer-patches. See docs/youki-fork.md for
+# patch list, publish workflow, and retirement criteria.
 [target.'cfg(target_os = "linux")'.dependencies]
-libcontainer = { version = "0.6.0", git = "https://github.com/ZachHandley/youki", branch = "zlayer-patches", optional = true }
+libcontainer = { package = "zlayer-libcontainer", version = "0.6.1-zlayer.1", optional = true }
 rtnetlink = "0.14"
 # Must match the version used internally by rtnetlink 0.14 so
 # RouteScope and other route-message types line up across crate boundaries.
