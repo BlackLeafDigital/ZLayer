@@ -26,6 +26,8 @@ requires real HNS endpoints and nanoserver containers).
   - Git Bash on PATH so any `shell: bash` step in CI has a real shell and does not fall back to the LocalSystem→WSL path that the Forgejo runner-as-service would otherwise trip over.
 - **Known toolchain gaps**:
   - No `x86_64-w64-mingw32-gcc` on the host. `x86_64-pc-windows-gnu` cross-builds break on `aws-lc-sys`. Stay on the host-native `x86_64-pc-windows-msvc` target, which is what `rust-ms` installs.
+- **Mandatory host provisioning** (see [section 4 step 5b](#4-adding-another-windows-runner-replication-runbook)):
+  - Windows Defender exclusions on the runner workdir, source checkout, `%CARGO_HOME%`, and `%RUSTUP_HOME%`. Without these, real-time scanning of every `.rlib` / `.exe` / `.pdb` that rustc writes can 2-3× cargo build times. MiniWindows already has these exclusions applied; any new runner must be provisioned the same way before it serves CI.
 - **Runner registration**: already registered with forgejo. Labels include `windows-latest` (matches the existing `check-windows` job in `.forgejo/workflows/ci.yaml` and the `build-windows-amd64` job in `.forgejo/workflows/build.yml`). Do **not** re-register — re-registration rotates the token and will leave existing workflows stranded until every `runs-on:` consumer is updated.
 
 ## 2. Using the runner from CI
@@ -121,6 +123,33 @@ otherwise noted.
    ```powershell
    rustup component add clippy rustfmt
    ```
+
+5b. **Add Windows Defender exclusions for the build tree** (mandatory — not optional).
+
+   Real-time scanning by Defender on every file cargo writes inflates Windows
+   builds by 2-3×. Cold `cargo check --workspace` on MiniWindows dropped from
+   ~7m to ~2m after this change (measured against `logs/run_*_log.txt`). Run
+   once, in elevated PowerShell:
+
+   ```powershell
+   Add-MpPreference -ExclusionPath `
+       "C:\ProgramData\forgejorunner\workdir", `
+       "C:\src\ZLayer", `
+       "$env:USERPROFILE\.cargo", `
+       "$env:USERPROFILE\.rustup"
+   ```
+
+   Adjust paths if your runner user differs. The first entry (`workdir`) is
+   where the forgejo runner checks out sources; the second is where the local
+   `scripts/windows-remote-check.sh` rsyncs into; the last two are rustup /
+   cargo home where compiled artifacts accumulate across runs.
+
+   Verify: `Get-MpPreference | Select-Object -ExpandProperty ExclusionPath`
+   should list all four.
+
+   This is **host-local** — it does not belong as a CI step because (a) the
+   runner-as-service account does not reliably have Defender-management
+   rights, and (b) you do not want every run toggling exclusions.
 
 6. **Install WSL2** (required for composite-runtime tests — the
    `hcs-runtime,wsl` feature combination and the

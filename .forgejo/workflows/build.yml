@@ -30,16 +30,44 @@ jobs:
     timeout-minutes: 5
     outputs:
       need_build: ${{ steps.check.outputs.need_build }}
+      version: ${{ steps.normalize.outputs.version }}
+      tag: ${{ steps.normalize.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.sha || github.sha }}
           sparse-checkout: scripts/check-existing-packages.sh
+      - name: Normalize version
+        id: normalize
+        shell: bash
+        run: |
+          # Accept v0.11.01, 0.11, v0.11, 0.11.0-rc1, etc.
+          # Cargo rejects leading zeros in components and requires X.Y.Z, so
+          # strip the optional leading "v", split off any "-suffix", coerce
+          # each numeric component through base-10 arithmetic to drop leading
+          # zeros, default missing parts to 0, then re-assemble.
+          RAW="${{ inputs.version }}"
+          RAW="${RAW#v}"
+          if [[ "$RAW" == *-* ]]; then
+            CORE="${RAW%%-*}"
+            SUFFIX="-${RAW#*-}"
+          else
+            CORE="$RAW"
+            SUFFIX=""
+          fi
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CORE"
+          MAJOR=$((10#${MAJOR:-0}))
+          MINOR=$((10#${MINOR:-0}))
+          PATCH=$((10#${PATCH:-0}))
+          VERSION="${MAJOR}.${MINOR}.${PATCH}${SUFFIX}"
+          echo "Normalized '${{ inputs.version }}' -> ${VERSION}"
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "tag=v${VERSION}" >> $GITHUB_OUTPUT
       - name: Check for existing release artifacts
         id: check
         shell: bash
         run: |
-          VERSION=$(echo "${{ inputs.version }}" | grep -oP '\d+\.\d+\.\d+' || echo "${{ inputs.version }}")
+          VERSION="${{ steps.normalize.outputs.version }}"
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
           chmod +x scripts/check-existing-packages.sh
           NEED_BUILD=$(./scripts/check-existing-packages.sh "$VERSION" "$AUTH" | tail -1)
@@ -53,14 +81,14 @@ jobs:
         run: |
           echo "## Build Skipped" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "All artifacts already exist for version **${{ inputs.version }}**." >> $GITHUB_STEP_SUMMARY
+          echo "All artifacts already exist for version **${{ steps.normalize.outputs.version }}**." >> $GITHUB_STEP_SUMMARY
           echo "Use \`force: true\` to rebuild." >> $GITHUB_STEP_SUMMARY
       - name: Purge stale ci-status markers
         if: steps.check.outputs.need_build == 'true'
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: purge-version
-          version: ${{ inputs.version }}
+          version: ${{ steps.normalize.outputs.version }}
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
           keep-markers: ''
@@ -85,7 +113,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: build-linux-amd64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -111,8 +139,7 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
-          RAW="${{ inputs.version }}"
-          VERSION="${RAW#v}"
+          VERSION="${{ needs.check-existing.outputs.version }}"
           sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
       - name: Build
@@ -155,7 +182,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: build-linux-amd64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -181,7 +208,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: build-macos-arm64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -214,8 +241,7 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
-          RAW="${{ inputs.version }}"
-          VERSION="${RAW#v}"
+          VERSION="${{ needs.check-existing.outputs.version }}"
           sed -i '' "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
       - name: Build
@@ -250,7 +276,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: build-macos-arm64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -279,6 +305,14 @@ jobs:
         with:
           ref: ${{ inputs.sha || github.sha }}
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
+        with:
+          sccache: true
+          sccache-s3-bucket: ${{ secrets.S3_BUCKET }}
+          sccache-s3-endpoint: https://${{ secrets.S3_ENDPOINT }}
+          sccache-s3-region: ${{ secrets.S3_REGION }}
+          sccache-s3-access-key-id: ${{ secrets.S3_ACCESS_KEY }}
+          sccache-s3-secret-access-key: ${{ secrets.S3_ACCESS_SECRET }}
+          sccache-key-prefix: sccache-windows
       - name: Install Git Bash
         uses: https://forge.blackleafdigital.com/Public/actions/install-git-bash@main
       - name: Check step status
@@ -286,7 +320,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: build-windows-amd64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -317,8 +351,7 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
-          RAW="${{ inputs.version }}"
-          VERSION="${RAW#v}"
+          VERSION="${{ needs.check-existing.outputs.version }}"
           sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
       - name: Build
@@ -376,7 +409,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: build-windows-amd64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -405,7 +438,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: image-build
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -463,7 +496,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: image-build
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -486,7 +519,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: build-macos-amd64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -516,8 +549,7 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
-          RAW="${{ inputs.version }}"
-          VERSION="${RAW#v}"
+          VERSION="${{ needs.check-existing.outputs.version }}"
           sed -i '' "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
       - name: Build
@@ -553,7 +585,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: build-macos-amd64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -586,7 +618,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: build-linux-arm64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -612,8 +644,7 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
-          RAW="${{ inputs.version }}"
-          VERSION="${RAW#v}"
+          VERSION="${{ needs.check-existing.outputs.version }}"
           sed -i "s/0\.0\.0-dev/${VERSION}/g" Cargo.toml
           grep '^version = ' Cargo.toml
       - name: Build
@@ -646,7 +677,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: build-linux-arm64
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -674,7 +705,7 @@ jobs:
   # Upload artifacts to temp Forgejo Packages
   # ===========================================
   upload-temp-packages:
-    needs: [verify]
+    needs: [check-existing, verify]
     if: needs.verify.outputs.success == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -691,7 +722,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: upload-temp-packages
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -727,7 +758,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: upload-temp-packages
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -747,7 +778,7 @@ jobs:
   # the push fails loudly rather than silently rewriting history.
   # ===========================================
   auto-tag:
-    needs: [verify, upload-temp-packages]
+    needs: [check-existing, verify, upload-temp-packages]
     if: needs.verify.outputs.success == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -764,7 +795,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: check
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: auto-tag
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -774,12 +805,7 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         shell: bash
         run: |
-          # Normalize: inputs.version may come in as "v1.2.3" or "1.2.3".
-          RAW="${{ inputs.version }}"
-          case "$RAW" in
-            v*) TAG="$RAW" ;;
-            *)  TAG="v$RAW" ;;
-          esac
+          TAG="${{ needs.check-existing.outputs.tag }}"
           SHA="${{ inputs.sha || github.sha }}"
 
           git config user.name "Zach Handley"
@@ -806,7 +832,7 @@ jobs:
         uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
         with:
           mode: mark
-          version: ${{ inputs.version }}
+          version: ${{ needs.check-existing.outputs.version }}
           step: auto-tag
           base-url: https://forge.blackleafdigital.com
           owner: BlackLeafDigital
@@ -816,7 +842,7 @@ jobs:
   # Dispatch Release workflow (after tag exists)
   # ===========================================
   dispatch-release:
-    needs: [verify, upload-temp-packages, auto-tag]
+    needs: [check-existing, verify, upload-temp-packages, auto-tag]
     if: needs.verify.outputs.success == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -830,7 +856,7 @@ jobs:
             -d '{
               "ref": "${{ github.ref }}",
               "inputs": {
-                "version": "${{ inputs.version }}",
+                "version": "${{ needs.check-existing.outputs.version }}",
                 "sha": "${{ inputs.sha || github.sha }}",
                 "artifact_base_url": "${{ needs.upload-temp-packages.outputs.package_base_url }}"
               }
@@ -840,7 +866,7 @@ jobs:
         run: |
           echo "## Build Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- **Version**: ${{ inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Version**: ${{ needs.check-existing.outputs.version }}" >> $GITHUB_STEP_SUMMARY
           echo "- **SHA**: ${{ inputs.sha || github.sha }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Artifacts**: ${{ needs.upload-temp-packages.outputs.package_base_url }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY

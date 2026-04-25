@@ -500,16 +500,16 @@ jobs:
             url="${PKG_URL}/${file}"
             local_size=$(stat -c%s "$file")
 
-            # Check if already fully uploaded
+            # Version-pinned OCI archives are immutable. The previous
+            # size-match check kept triggering a DELETE + re-PUT on re-runs
+            # because buildah's OCI tar output isn't byte-reproducible
+            # (embedded layer timestamps). Forgejo's 409 on the re-PUT was
+            # the visible symptom. Treat any existing remote file as done.
             remote_size=$(curl -sI --user "$AUTH" "$url" 2>/dev/null \
               | grep -i content-length | tail -1 | tr -dc '0-9') || true
-            if [ -n "$remote_size" ] && [ "$remote_size" = "$local_size" ]; then
-              echo "= Skipping $file (already uploaded, ${local_size} bytes)"
+            if [ -n "$remote_size" ] && [ "$remote_size" -gt 0 ]; then
+              echo "= Skipping $file (already uploaded, ${remote_size} bytes remote vs ${local_size} bytes local — treating as immutable)"
               continue
-            elif [ -n "$remote_size" ]; then
-              echo "~ Size mismatch for $file, re-uploading..."
-              curl -s -X DELETE --user "$AUTH" "$url" || true
-              sleep 1
             fi
 
             echo "Uploading $file (${local_size} bytes)..."

@@ -136,36 +136,6 @@ try {
         Write-Host "Then open a new terminal." -ForegroundColor Yellow
     }
 
-    # --- Download WSL2 support files (optional) ---
-    Write-Host ""
-    Write-Host "Downloading Linux binary for WSL2 backend support..."
-    $LinuxArtifact = "$Binary-$VersionNum-linux-amd64.tar.gz"
-    $LinuxUrl = "https://github.com/$Repo/releases/download/$Tag/$LinuxArtifact"
-    $LinuxArchivePath = Join-Path $TempDir "linux-archive.tar.gz"
-    $LinuxTargetPath = Join-Path $InstallDir "zlayer-linux"
-
-    try {
-        Invoke-WebRequest -Uri $LinuxUrl -OutFile $LinuxArchivePath -UseBasicParsing
-
-        # Extract tar.gz - use tar which is available on Windows 10+
-        $LinuxExtractDir = Join-Path $TempDir "linux-extracted"
-        New-Item -ItemType Directory -Path $LinuxExtractDir -Force | Out-Null
-        tar -xzf $LinuxArchivePath -C $LinuxExtractDir 2>$null
-
-        $LinuxBin = Get-ChildItem -Path $LinuxExtractDir -Filter $Binary -Recurse -File | Select-Object -First 1
-        if ($LinuxBin) {
-            Copy-Item -Path $LinuxBin.FullName -Destination $LinuxTargetPath -Force
-            Write-Host "  Installed zlayer-linux for WSL2 backend support"
-        }
-        else {
-            Write-Host "  Warning: Could not find linux binary in archive (WSL2 support skipped)" -ForegroundColor Yellow
-        }
-    }
-    catch {
-        Write-Host "  Note: Linux binary download skipped (WSL2 backend support unavailable)" -ForegroundColor Yellow
-        Write-Host "  This is optional and does not affect Windows functionality."
-    }
-
     # --- Add to PATH if needed ---
     $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
     $PathEntries = $UserPath -split ";"
@@ -179,6 +149,61 @@ try {
         Write-Host ""
         Write-Host "Added $InstallDir to your user PATH."
         Write-Host "  Note: Open a new terminal for the PATH change to take effect in other sessions."
+    }
+
+    # --- WSL2 bootstrap (required for Linux containers on Windows) ---
+    # zlayer's Linux-workload path runs containers under `youki` inside a
+    # WSL2 distro (Wsl2DelegateRuntime in zlayer-agent). WSL2 itself is a
+    # Windows Optional Feature, so `wsl --install` has to happen once before
+    # the runtime can bring up Linux workloads.
+    #
+    # We fire `wsl --install --no-distribution` unconditionally when WSL2
+    # isn't already present — UAC is the consent gate. If the user declines
+    # the elevation prompt, we print the manual command and move on without
+    # failing the install; Windows-native containers (HCS) still work.
+    Write-Host ""
+    Write-Host "Checking for WSL2..."
+    $WslAvailable = $false
+    if (Get-Command wsl.exe -ErrorAction SilentlyContinue) {
+        try {
+            $null = wsl.exe --status 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                $WslAvailable = $true
+            }
+        }
+        catch {
+            # wsl.exe exists but failed — treat as not-available.
+        }
+    }
+
+    if ($WslAvailable) {
+        Write-Host "  WSL2 detected." -ForegroundColor Green
+    }
+    else {
+        Write-Host "  WSL2 not installed. Running 'wsl --install --no-distribution' (UAC prompt will appear)..."
+        try {
+            $Proc = Start-Process -FilePath "wsl.exe" `
+                -ArgumentList "--install", "--no-distribution" `
+                -Verb RunAs -Wait -PassThru -ErrorAction Stop
+            switch ($Proc.ExitCode) {
+                0 {
+                    Write-Host "  WSL2 installed. A reboot may be required before first use." -ForegroundColor Green
+                }
+                3010 {
+                    Write-Host "  WSL2 installed; reboot required to complete setup." -ForegroundColor Yellow
+                }
+                default {
+                    Write-Host "  'wsl --install' exited with code $($Proc.ExitCode)." -ForegroundColor Yellow
+                    Write-Host "  Retry manually in an elevated shell: wsl --install --no-distribution"
+                }
+            }
+        }
+        catch {
+            # Most common path: user clicked No on the UAC prompt.
+            Write-Host "  WSL2 install was cancelled or failed: $_" -ForegroundColor Yellow
+            Write-Host "  Retry later with 'wsl --install --no-distribution' in an elevated shell,"
+            Write-Host "  or run 'zlayer node init --install-wsl yes' to be prompted again."
+        }
     }
 
     # --- Install PowerShell completions (fail-soft) ---

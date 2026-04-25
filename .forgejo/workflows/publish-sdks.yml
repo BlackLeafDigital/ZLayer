@@ -40,16 +40,11 @@ jobs:
           config-path: .forgejo/build-config.yaml
           check-registry: 'true'
           version: ${{ inputs.version }}
-      - name: Purge stale ci-status markers
-        if: steps.detect.outputs.services-to-release-flat != '[]'
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: purge-version
-          version: ${{ inputs.version }}
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          keep-markers: ''
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      # NB: we intentionally do NOT purge ci-status markers here. Re-dispatching
+      # the same version should resume from whatever finished last time — not
+      # wipe state and retry publishes that would then 409/conflict against
+      # an already-published artifact. If markers ever genuinely need clearing,
+      # do it manually via `ci-step-status` with `mode: purge-version`.
 
   # ===========================================
   # zlayer-py (Python binding) -> PyPI as `zlayer`
@@ -66,6 +61,11 @@ jobs:
     container: quay.io/pypa/manylinux_2_28_x86_64
     timeout-minutes: 30
     steps:
+      - name: Bootstrap Node.js for actions (manylinux)
+        run: |
+          curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+          yum install -y nodejs
+
       - uses: actions/checkout@v4
 
       - name: Install system deps (yum, inside manylinux)
@@ -111,6 +111,11 @@ jobs:
     container: quay.io/pypa/manylinux_2_28_aarch64
     timeout-minutes: 45
     steps:
+      - name: Bootstrap Node.js for actions (manylinux)
+        run: |
+          curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -
+          yum install -y nodejs
+
       - uses: actions/checkout@v4
 
       - name: Install system deps (yum, inside manylinux)
@@ -247,6 +252,12 @@ jobs:
 
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
 
+      # MiniWindows runner runs as LocalSystem. Without Git Bash, every
+      # `shell: bash` step below resolves to `wsl.exe bash` and fails with
+      # `WSL_E_LOCAL_SYSTEM_NOT_SUPPORTED`. Same pattern `check-windows` /
+      # `build-windows-amd64` use in `ci.yaml` / `build.yml`.
+      - uses: https://forge.blackleafdigital.com/Public/actions/install-git-bash@main
+
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
         with:
           python-version: '3.12'
@@ -295,6 +306,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+
+      # `uvx maturin sdist` invokes `cargo metadata` to validate the workspace,
+      # which makes rustup try to install the pinned toolchain into
+      # /var/lib/forgejo-runner/.rustup. On this runner that dir is owned by
+      # root and the job runs as a different user — perms blow up. setup-rust
+      # drops rustup + cargo into the per-job HOME instead.
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-rust@main
 
       - uses: https://forge.blackleafdigital.com/Public/actions/setup-python@main
 
@@ -509,16 +527,22 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           INPUT_VERSION="${{ inputs.version }}"
-          LATEST_TAG=$(git tag -l "rust-sdk-v*" | grep -oP '\d+\.\d+\.\d+' | sort -V | tail -n1 || echo "0.0.0")
-          if [[ "$LATEST_TAG" == "" ]] || [[ "$(printf '%s\n' "$INPUT_VERSION" "$LATEST_TAG" | sort -V | head -n1)" != "$INPUT_VERSION" ]]; then
-            echo "Setting zlayer-sdk version to ${INPUT_VERSION}..."
-            sed -i "s/^version = .*/version = \"${INPUT_VERSION}\"/" Cargo.toml
-            echo "Publishing rust-sdk ${INPUT_VERSION}..."
-            cargo publish --allow-dirty
+          echo "Setting zlayer-sdk version to ${INPUT_VERSION}..."
+          sed -i "s/^version = .*/version = \"${INPUT_VERSION}\"/" Cargo.toml
+          echo "Publishing rust-sdk ${INPUT_VERSION}..."
+          # Try publish; if crates.io says this exact version is already there
+          # (e.g. a prior run published but the ci-step-status marker didn't
+          # land), treat as success. Any OTHER error is still fatal. cargo
+          # doesn't have a `--skip-existing` flag, so we pattern-match stderr.
+          if cargo publish --allow-dirty 2>&1 | tee /tmp/rust-sdk-publish.log; then
+            echo "Published rust-sdk ${INPUT_VERSION}"
+          elif grep -q "already exists on crates.io index" /tmp/rust-sdk-publish.log; then
+            echo "rust-sdk ${INPUT_VERSION} already on crates.io — treating as success"
           else
-            echo "Skipping rust-sdk (already at or above $INPUT_VERSION)"
+            echo "cargo publish failed for a reason other than 'already exists'"
+            exit 1
           fi
       - name: Mark step complete
         if: steps.check.outputs.completed != 'true'
@@ -751,17 +775,20 @@ jobs:
           TARBALL="zlayer-sdk-c-v${VERSION}.tar.gz"
           AUTH="zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}"
           URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer-sdk-c/${VERSION}/${TARBALL}"
-          # If the exact tarball already exists skip; otherwise re-upload.
           local_size=$(stat -c%s "${TARBALL}")
+          # Version-pinned artifacts are supposed to be immutable — if ANY file
+          # is already uploaded at this URL, treat it as "done" rather than
+          # comparing sizes. Size comparison would be reliable only if `tar`
+          # produced byte-identical archives, and it doesn't (mtime, ownership,
+          # and the gzip header all shift run-to-run). The previous size-match
+          # approach therefore hit the DELETE branch on every re-run, and
+          # Forgejo's generic-package DELETE is racy enough that the follow-up
+          # PUT landed a 409. Immutable-by-version is the correct contract.
           remote_size=$(curl -sI --user "${AUTH}" "${URL}" 2>/dev/null \
             | grep -i content-length | tail -1 | tr -dc '0-9') || true
-          if [ -n "${remote_size}" ] && [ "${remote_size}" = "${local_size}" ]; then
-            echo "= Skipping ${TARBALL} (already uploaded, ${local_size} bytes)"
+          if [ -n "${remote_size}" ] && [ "${remote_size}" -gt 0 ]; then
+            echo "= Skipping ${TARBALL} (already uploaded at ${URL}, ${remote_size} bytes remote vs ${local_size} bytes local — treating as immutable)"
             exit 0
-          elif [ -n "${remote_size}" ]; then
-            echo "~ Size mismatch, re-uploading..."
-            curl -s -X DELETE --user "${AUTH}" "${URL}" || true
-            sleep 1
           fi
           echo "Uploading ${TARBALL} (${local_size} bytes)..."
           curl --fail --max-time 600 --connect-timeout 30 --retry 3 --retry-delay 10 \
