@@ -10,7 +10,23 @@
 ./scripts/run_dev.sh         # all of the above (check → build → test)
 ```
 
-The script detects macOS vs Linux automatically and runs the right tests for your platform.
+The script detects macOS vs Linux automatically and runs the right tests for your platform. Windows hosts have their own incantations — see the Windows section below.
+
+---
+
+## CI Matrix
+
+The standard CI matrix that contributors are expected to keep green:
+
+| Target          | OS / Arch          | Notes                                                                  |
+|-----------------|--------------------|------------------------------------------------------------------------|
+| Linux amd64     | x86_64-unknown-linux-gnu | Default native; full workspace + youki/libcontainer E2E         |
+| Linux arm64     | aarch64-unknown-linux-gnu | Self-hosted native runner (no cross-builds — see CONTRIBUTING) |
+| macOS arm64     | aarch64-apple-darwin | Apple Silicon; Seatbelt sandbox + MPS GPU smoke tests                |
+| macOS amd64     | x86_64-apple-darwin | Intel Mac; Seatbelt sandbox (no MPS smoke)                            |
+| Windows amd64   | x86_64-pc-windows-msvc | HCS runtime + WSL2 backend; built `--no-default-features --features hcs-runtime,wsl` |
+
+All five targets must build and pass their platform-specific test suites before a release tag is cut.
 
 ---
 
@@ -120,6 +136,69 @@ make test-e2e
 # or single test:
 make test-e2e-single TEST=test_cleanup_state_directory
 ```
+
+### Windows (HCS runtime + WSL2 backend)
+
+Windows uses the HCS (Host Compute Service) runtime for native containers and a WSL2 backend for Linux workloads. Default features are Linux-oriented, so Windows builds and tests **must** disable defaults and opt into `hcs-runtime,wsl`.
+
+#### Build incantation
+
+```powershell
+cargo build --release -p zlayer --no-default-features --features hcs-runtime,wsl
+```
+
+This is the same invocation used by `.forgejo/workflows/build.yml::build-windows-amd64`.
+
+#### Running tests locally on a Windows host
+
+Run the suite with the same feature gates as the build:
+
+```powershell
+# Agent — composite dispatch + Windows overlay/cluster E2E
+cargo test --no-default-features --features hcs-runtime,wsl -p zlayer-agent
+
+# Builder — Windows Dockerfile templates + HCS build E2E
+cargo test --no-default-features --features hcs-runtime,wsl -p zlayer-builder
+
+# HCS wrapper integration tests
+cargo test --no-default-features --features hcs-runtime,wsl -p zlayer-hcs
+```
+
+Some tests touch HCS, the Windows firewall, or `netsh` and require an **elevated (Administrator) PowerShell**. Launch the shell with "Run as administrator" before invoking `cargo test` for the agent or HCS suites.
+
+#### Remote-check workflow (MiniWindows CI host)
+
+Most contributors do not have a Windows host handy. The repo ships a remote-check script that rsyncs the workspace to the MiniWindows CI host over SSH and runs the suite there:
+
+```bash
+bash scripts/windows-remote-check.sh
+```
+
+For the operational runbook (host setup, toolchain notes, troubleshooting LocalSystem vs user-session issues, rsync `/cygdrive/c/...` quirks), see [`docs/windows-ci-runner.md`](docs/windows-ci-runner.md).
+
+#### Windows-specific tests
+
+| Test file                                                                | Coverage                                                                          |
+|--------------------------------------------------------------------------|-----------------------------------------------------------------------------------|
+| `crates/zlayer-agent/tests/composite_dispatch_e2e.rs`                    | Composite runtime dispatch (HCS + WSL routing on a single host)                   |
+| `crates/zlayer-agent/tests/windows_overlay_e2e.rs`                       | Windows overlay networking E2E — userspace WireGuard on Windows                   |
+| `crates/zlayer-agent/tests/windows_cluster_join_e2e.rs`                  | Windows cluster join E2E — node bootstrap, scheduler handshake                    |
+| `crates/zlayer-builder/tests/windows_templates.rs`                       | Cross-platform parsing of Windows Dockerfile templates (runs on any host)         |
+| `crates/zlayer-builder/tests/windows_build_e2e.rs`                       | HCS build E2E — gated `#[ignore]`, requires a real Windows host with HCS enabled  |
+| `crates/zlayer-hcs/tests/integration.rs`                                 | HCS wrapper integration tests against the live HCS API                            |
+
+HCS-gated tests are either compiled out on non-Windows hosts via `#[cfg(target_os = "windows")]` or marked `#[ignore]` so CI can schedule them only on the Windows runner. Running `cargo test` on Linux/macOS will **not** execute them — that is by design.
+
+#### Windows clippy / fmt
+
+The pre-commit hook runs the Linux feature set. For Windows-only validation (catches `cfg(windows)` paths that the default lint pass skips), run:
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets --no-default-features --features hcs-runtime,wsl -- -D warnings
+```
+
+Always lint the entire workspace with `--workspace`. Never use `-p <crate>` for clippy — it skips cross-crate warnings.
 
 ---
 

@@ -30,6 +30,7 @@ import tempfile
 import textwrap
 import threading
 import time
+import zipfile
 
 # typing imports compatible with 3.8
 from typing import Any, Dict, List, Optional, Tuple
@@ -627,12 +628,7 @@ class Platform:
         elif self.system == "darwin":
             return "darwin"
         elif self.system == "windows":
-            fatal(
-                "Windows is not directly supported.\n"
-                "  Please use WSL (Windows Subsystem for Linux):\n"
-                "  https://learn.microsoft.com/en-us/windows/wsl/install"
-            )
-            return ""
+            return "windows"
         else:
             fatal("Unsupported operating system: {}".format(self.system))
             return ""
@@ -652,6 +648,18 @@ class Platform:
     def artifact_suffix(self) -> str:
         """Return the platform suffix for artifact filenames (e.g. linux-amd64)."""
         return "{}-{}".format(self.os_name, self.arch)
+
+    @property
+    def is_windows(self) -> bool:
+        return self.os_name == "windows"
+
+    def archive_extension(self) -> str:
+        """Return the archive extension used for this platform's release artifact."""
+        return "zip" if self.is_windows else "tar.gz"
+
+    def binary_filename(self, binary_name: str) -> str:
+        """Return the on-disk filename for a binary on this platform."""
+        return "{}.exe".format(binary_name) if self.is_windows else binary_name
 
     def __str__(self) -> str:
         return "{}-{}".format(self.os_name, self.arch)
@@ -800,17 +808,61 @@ def _safe_extractall(tf: tarfile.TarFile, dest_dir: str) -> None:
         tf.extractall(dest_dir)
 
 
-def extract_binary(archive_path: str, binary_name: str, dest_dir: str) -> str:
-    """Extract a specific binary from a tar.gz archive.
+def _safe_extractall_zip(zf: zipfile.ZipFile, dest_dir: str) -> None:
+    """Extract a zipfile safely, guarding against path traversal."""
+    abs_dest = os.path.realpath(dest_dir)
+    for member in zf.namelist():
+        member_path = os.path.join(dest_dir, member)
+        abs_member = os.path.realpath(member_path)
+        if not abs_member.startswith(abs_dest + os.sep) and abs_member != abs_dest:
+            raise RuntimeError(
+                "Refusing to extract '{}': path traversal detected".format(member)
+            )
+    zf.extractall(dest_dir)
+
+
+def extract_binary(archive_path: str, binary_filename: str, dest_dir: str) -> str:
+    """Extract a specific binary from a release archive (tar.gz or zip).
 
     Args:
-        archive_path: Path to the .tar.gz file.
-        binary_name: Name of the binary to find inside.
+        archive_path: Path to the archive file.
+        binary_filename: On-disk filename of the binary to find inside (e.g.
+            ``zlayer`` on Linux/macOS, ``zlayer.exe`` on Windows).
         dest_dir: Temporary extraction directory.
 
     Returns:
         Path to the extracted binary.
     """
+    is_zip = archive_path.lower().endswith(".zip")
+
+    if is_zip:
+        try:
+            with zipfile.ZipFile(archive_path, "r") as zf:
+                members = zf.namelist()
+                target = None
+                for member_name in members:
+                    basename = os.path.basename(member_name)
+                    if basename == binary_filename:
+                        target = member_name
+                        break
+
+                _safe_extractall_zip(zf, dest_dir)
+                if target is not None:
+                    return os.path.join(dest_dir, target)
+
+                # Fall back to walking the extracted tree.
+                for root, _dirs, files in os.walk(dest_dir):
+                    if binary_filename in files:
+                        return os.path.join(root, binary_filename)
+
+                raise RuntimeError(
+                    "Binary '{}' not found in archive. Contents: {}".format(
+                        binary_filename, ", ".join(members)
+                    )
+                )
+        except zipfile.BadZipFile as e:
+            raise RuntimeError("Failed to extract zip archive: {}".format(e))
+
     try:
         with tarfile.open(archive_path, "r:gz") as tf:
             # List members and find the binary
@@ -818,7 +870,7 @@ def extract_binary(archive_path: str, binary_name: str, dest_dir: str) -> str:
             target = None
             for member_name in members:
                 basename = os.path.basename(member_name)
-                if basename == binary_name:
+                if basename == binary_filename:
                     target = member_name
                     break
 
@@ -826,11 +878,11 @@ def extract_binary(archive_path: str, binary_name: str, dest_dir: str) -> str:
                 # Try extracting all and searching
                 _safe_extractall(tf, dest_dir)
                 for root, dirs, files in os.walk(dest_dir):
-                    if binary_name in files:
-                        return os.path.join(root, binary_name)
+                    if binary_filename in files:
+                        return os.path.join(root, binary_filename)
                 raise RuntimeError(
                     "Binary '{}' not found in archive. Contents: {}".format(
-                        binary_name, ", ".join(members)
+                        binary_filename, ", ".join(members)
                     )
                 )
 
@@ -846,7 +898,14 @@ def extract_binary(archive_path: str, binary_name: str, dest_dir: str) -> str:
 # ---------------------------------------------------------------------------
 
 def needs_sudo(path: str) -> bool:
-    """Check if writing to path requires elevated privileges."""
+    """Check if writing to path requires elevated privileges.
+
+    Always returns False on Windows; UAC elevation is not modelled here, and
+    the default Windows install dir (%LOCALAPPDATA%\\ZLayer\\bin) is in the
+    user's profile and never requires elevation.
+    """
+    if platform.system().lower() == "windows":
+        return False
     path = os.path.expanduser(path)
     if os.path.exists(path):
         return not os.access(path, os.W_OK)
@@ -856,14 +915,24 @@ def needs_sudo(path: str) -> bool:
     return True
 
 
+def _windows_default_install_dir() -> str:
+    """Return the default Windows install directory (%LOCALAPPDATA%\\ZLayer\\bin)."""
+    base = os.environ.get("LOCALAPPDATA")
+    if not base:
+        # Fallback if LOCALAPPDATA isn't set for some reason.
+        base = str(os.path.join(os.path.expanduser("~"), "AppData", "Local"))
+    return os.path.join(base, "ZLayer", "bin")
+
+
 def install_binary(src: str, install_dir: str, binary_name: str, use_sudo: bool = False) -> str:
     """Install a binary to the target directory.
 
     Args:
         src: Source binary path.
         install_dir: Target directory.
-        binary_name: Name for the installed binary.
-        use_sudo: Whether to use sudo for the copy.
+        binary_name: On-disk filename for the installed binary (e.g.
+            ``zlayer`` or ``zlayer.exe``).
+        use_sudo: Whether to use sudo for the copy. Ignored on Windows.
 
     Returns:
         Full path to the installed binary.
@@ -871,14 +940,25 @@ def install_binary(src: str, install_dir: str, binary_name: str, use_sudo: bool 
     install_dir = os.path.expanduser(install_dir)
     dest = os.path.join(install_dir, binary_name)
 
+    is_windows = platform.system().lower() == "windows"
+
     # Ensure directory exists
     if not os.path.exists(install_dir):
-        if use_sudo:
+        if use_sudo and not is_windows:
             _run_sudo(["mkdir", "-p", install_dir])
         else:
             os.makedirs(install_dir, exist_ok=True)
 
-    if use_sudo:
+    if is_windows:
+        # Windows has no chmod and no sudo; just copy. If the destination
+        # is held open by a running zlayer process, retry once after a brief
+        # delay so the user sees a clearer error if it persists.
+        try:
+            shutil.copy2(src, dest)
+        except PermissionError:
+            time.sleep(0.5)
+            shutil.copy2(src, dest)
+    elif use_sudo:
         _run_sudo(["cp", src, dest])
         _run_sudo(["chmod", "755", dest])
     else:
@@ -1117,7 +1197,17 @@ def is_on_path(directory: str) -> bool:
     """Check if a directory is on the current PATH."""
     directory = os.path.expanduser(directory)
     path_dirs = os.environ.get("PATH", "").split(os.pathsep)
-    return any(os.path.realpath(d) == os.path.realpath(directory) for d in path_dirs if d)
+    is_windows = platform.system().lower() == "windows"
+
+    def _norm(p: str) -> str:
+        try:
+            real = os.path.realpath(p)
+        except OSError:
+            real = p
+        return real.lower() if is_windows else real
+
+    target = _norm(directory)
+    return any(_norm(d) == target for d in path_dirs if d)
 
 
 def detect_shell() -> str:
@@ -1130,16 +1220,112 @@ def detect_shell() -> str:
     return "bash"
 
 
+def _add_to_path_windows(directory: str) -> List[str]:
+    """Append a directory to the user's PATH via the Windows registry.
+
+    Writes to HKEY_CURRENT_USER\\Environment and broadcasts WM_SETTINGCHANGE
+    so newly-spawned processes pick up the change without requiring a logout.
+    Returns a list with a single human-readable description on success, or an
+    empty list if nothing was modified (already on PATH or the write failed).
+    """
+    try:
+        import winreg  # noqa: F401  (imported lazily; not available on POSIX)
+    except ImportError:
+        warn("winreg is unavailable; cannot update PATH automatically.")
+        info("Add this directory to your PATH manually:")
+        info("  {}".format(directory))
+        return []
+
+    directory = os.path.normpath(os.path.expandvars(os.path.expanduser(directory)))
+
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            "Environment",
+            0,
+            winreg.KEY_READ | winreg.KEY_WRITE,
+        ) as key:
+            try:
+                current_value, current_type = winreg.QueryValueEx(key, "Path")
+            except FileNotFoundError:
+                current_value = ""
+                current_type = winreg.REG_EXPAND_SZ
+
+            entries = [e for e in (current_value or "").split(";") if e]
+            normalised = [os.path.normpath(e.rstrip("\\")) for e in entries]
+            target = directory.rstrip("\\")
+            if any(e.lower() == target.lower() for e in normalised):
+                return []
+
+            new_value = ";".join([directory] + entries) if entries else directory
+            # Preserve REG_EXPAND_SZ if the existing key used it; otherwise set
+            # REG_EXPAND_SZ ourselves so %VAR% references in PATH still expand.
+            value_type = current_type if current_type in (
+                winreg.REG_SZ, winreg.REG_EXPAND_SZ,
+            ) else winreg.REG_EXPAND_SZ
+            winreg.SetValueEx(key, "Path", 0, value_type, new_value)
+    except OSError as e:
+        warn("Failed to update user PATH in registry: {}".format(e))
+        info("Add this directory to your PATH manually:")
+        info("  {}".format(directory))
+        return []
+
+    # Update the current process so a follow-up `verify_binary` call succeeds.
+    existing = os.environ.get("PATH", "")
+    if directory.lower() not in existing.lower():
+        os.environ["PATH"] = (
+            "{};{}".format(directory, existing) if existing else directory
+        )
+
+    # Broadcast WM_SETTINGCHANGE so newly-spawned processes (Explorer, new
+    # shells, etc.) pick up the change without a logout.
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        HWND_BROADCAST = 0xFFFF
+        WM_SETTINGCHANGE = 0x001A
+        SMTO_ABORTIFHUNG = 0x0002
+
+        SendMessageTimeoutW = ctypes.windll.user32.SendMessageTimeoutW
+        SendMessageTimeoutW.argtypes = [
+            wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPCWSTR,
+            wintypes.UINT, wintypes.UINT, ctypes.POINTER(wintypes.DWORD),
+        ]
+        SendMessageTimeoutW.restype = wintypes.LPARAM
+
+        result = wintypes.DWORD(0)
+        SendMessageTimeoutW(
+            HWND_BROADCAST,
+            WM_SETTINGCHANGE,
+            0,
+            "Environment",
+            SMTO_ABORTIFHUNG,
+            5000,
+            ctypes.byref(result),
+        )
+    except Exception:
+        # Broadcast failure is non-fatal; the registry write already succeeded
+        # and new shells will pick it up regardless.
+        pass
+
+    return ["HKEY_CURRENT_USER\\Environment (Path)"]
+
+
 def add_to_path(directory: str, auto: bool = False) -> List[str]:
-    """Add a directory to shell RC files.
+    """Add a directory to shell RC files (POSIX) or the user PATH registry
+    key (Windows).
 
     Args:
         directory: Directory to add.
         auto: If True, don't ask for confirmation.
 
     Returns:
-        List of files that were modified.
+        List of files (or registry keys) that were modified.
     """
+    if platform.system().lower() == "windows":
+        return _add_to_path_windows(directory)
+
     directory = os.path.expanduser(directory)
     shell = detect_shell()
     rc_files = SHELL_RC_FILES.get(shell, [".bashrc"])
@@ -1346,7 +1532,11 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--dir",
         type=str,
         default=None,
-        help="Installation directory (default: /usr/local/bin or ~/.local/bin).",
+        help=(
+            "Installation directory "
+            "(default: /usr/local/bin or ~/.local/bin on POSIX, "
+            "%%LOCALAPPDATA%%\\ZLayer\\bin on Windows)."
+        ),
     )
     parser.add_argument(
         "--version",
@@ -1437,9 +1627,35 @@ def _resolve_binaries(args: argparse.Namespace) -> List[str]:
 
 def _resolve_install_dir(args: argparse.Namespace) -> Tuple[str, bool]:
     """Determine install directory. Returns (path, use_sudo)."""
+    is_windows = platform.system().lower() == "windows"
+
     if args.dir:
         d = os.path.expanduser(args.dir)
+        # Windows accepts environment-variable expansion in user-supplied paths.
+        if is_windows:
+            d = os.path.expandvars(d)
         return d, needs_sudo(d)
+
+    if is_windows:
+        # Windows has a single canonical user-local install location; mirror
+        # install.ps1 by defaulting to %LOCALAPPDATA%\ZLayer\bin.
+        default_dir = _windows_default_install_dir()
+        if args.yes or not _is_interactive():
+            return default_dir, False
+        write()
+        write("  {}{}? Install location{}".format(S.bold, S.green, S.reset))
+        write()
+        options = [
+            (default_dir, "User-local (recommended)"),
+            ("Custom path...", "Enter a custom directory"),
+        ]
+        idx = select_option(options)
+        if idx == 0:
+            return default_dir, False
+        write()
+        custom = prompt_text("Enter install directory", default=default_dir)
+        custom = os.path.expandvars(os.path.expanduser(custom))
+        return custom, needs_sudo(custom)
 
     if args.yes or not _is_interactive():
         # Default: try /usr/local/bin, fall back to ~/.local/bin
@@ -1535,21 +1751,22 @@ def _construct_download_url(binary_name: str, tag: str, version: str, plat: Plat
     back to the constructed URL pattern.
     """
     # The current naming convention from the release workflow:
-    #   zlayer-{version}-{os}-{arch}.tar.gz    (for the main zlayer binary)
+    #   zlayer-{version}-{os}-{arch}.tar.gz    (Linux/macOS)
+    #   zlayer-{version}-windows-{arch}.zip    (Windows, matches install.ps1)
     # For multiple binaries, the expected pattern is:
-    #   {binary_name}-{version}-{os}-{arch}.tar.gz
+    #   {binary_name}-{version}-{os}-{arch}.{ext}
     # But the current release only packages "zlayer". We'll try both patterns.
 
     suffix = plat.artifact_suffix()
+    ext = plat.archive_extension()
 
-    # Pattern 1: {binary}-{version}-{os}-{arch}.tar.gz
-    filename_with_binary = "{}-{}-{}.tar.gz".format(binary_name, version, suffix)
-    # Pattern 2: zlayer-{version}-{os}-{arch}.tar.gz (historical, single binary)
-    filename_legacy = "zlayer-{}-{}.tar.gz".format(version, suffix)
+    # Pattern 1: {binary}-{version}-{os}-{arch}.{ext}
+    filename_with_binary = "{}-{}-{}.{}".format(binary_name, version, suffix, ext)
+    # Pattern 2: zlayer-{version}-{os}-{arch}.{ext} (historical, single binary)
+    filename_legacy = "zlayer-{}-{}.{}".format(version, suffix, ext)
 
     # Check release assets for exact match
     assets = release_data.get("assets", [])
-    asset_names = [a.get("name", "") for a in assets]
 
     for pattern in [filename_with_binary, filename_legacy]:
         for asset in assets:
@@ -1560,10 +1777,6 @@ def _construct_download_url(binary_name: str, tag: str, version: str, plat: Plat
                     return url
 
     # Fallback: construct the URL directly
-    for filename in [filename_with_binary, filename_legacy]:
-        url = GITHUB_DOWNLOAD.format(repo=GITHUB_REPO, tag=tag, filename=filename)
-        return url
-
     return GITHUB_DOWNLOAD.format(repo=GITHUB_REPO, tag=tag, filename=filename_with_binary)
 
 
@@ -1635,6 +1848,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 
         # Build download URL
         url = _construct_download_url(binary_name, tag, version, plat, release_data)
+        binary_filename = plat.binary_filename(binary_name)
 
         archive_name = os.path.basename(url)
         archive_path = os.path.join(tmpdir, archive_name)
@@ -1644,6 +1858,13 @@ def main(argv: Optional[List[str]] = None) -> None:
             download_file(url, archive_path, label=binary_name)
         except RuntimeError as e:
             error("Failed to download {}: {}".format(binary_name, e))
+            if plat.is_windows and plat.arch != "amd64":
+                warn(
+                    "Note: Windows {} builds may not be published for every release. "
+                    "Try {} or use the amd64 build under emulation.".format(
+                        plat.arch, "v" + version,
+                    )
+                )
             write()
             fatal("Download failed. Check your internet connection and try again.")
 
@@ -1663,7 +1884,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         spinner = Spinner("Extracting {}...".format(binary_name))
         spinner.start()
         try:
-            binary_path = extract_binary(archive_path, binary_name, extract_dir)
+            binary_path = extract_binary(archive_path, binary_filename, extract_dir)
             spinner.stop("  {}{}{}  Extracted {}".format(S.green, CHECK, S.reset, binary_name))
         except RuntimeError as e:
             spinner.stop()
@@ -1674,7 +1895,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         spinner = Spinner("Installing {}...".format(binary_name))
         spinner.start()
         try:
-            installed_path = install_binary(binary_path, install_dir, binary_name, use_sudo=use_sudo)
+            installed_path = install_binary(binary_path, install_dir, binary_filename, use_sudo=use_sudo)
             spinner.stop("  {}{}{}  Installed {} to {}{}{}".format(
                 S.green, CHECK, S.reset,
                 binary_name,
@@ -1684,7 +1905,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         except RuntimeError as e:
             spinner.stop()
             error("Installation failed: {}".format(e))
-            if "sudo" in str(e).lower() or "permission" in str(e).lower():
+            if not plat.is_windows and ("sudo" in str(e).lower() or "permission" in str(e).lower()):
                 warn("Try installing to ~/.local/bin instead:")
                 warn("  python3 install.py --dir ~/.local/bin")
             continue
@@ -1728,28 +1949,44 @@ def main(argv: Optional[List[str]] = None) -> None:
             if modified:
                 for f in modified:
                     success("Added to PATH in {}".format(f))
+                if plat.is_windows:
+                    info("Open a new terminal (or run 'refreshenv' if you use chocolatey) to pick up the change.")
             else:
                 warn("{} is not on your PATH.".format(install_dir))
                 info("Add it manually:")
-                info('  export PATH="{}:$PATH"'.format(install_dir))
+                if plat.is_windows:
+                    info('  setx Path "{};%Path%"'.format(install_dir))
+                else:
+                    info('  export PATH="{}:$PATH"'.format(install_dir))
         else:
             if prompt_confirm("Add {} to your PATH?".format(install_dir)):
                 modified = add_to_path(install_dir)
                 if modified:
                     for f in modified:
-                        success("Added to PATH in {}".format(os.path.basename(f)))
+                        success("Added to PATH in {}".format(os.path.basename(f) if not plat.is_windows else f))
                     write()
-                    shell = detect_shell()
-                    shell_rc = SHELL_RC_FILES.get(shell, [".bashrc"])[0]
-                    info("Run: {}source ~/{}{}".format(S.bold, shell_rc, S.reset))
+                    if plat.is_windows:
+                        info("Open a new terminal (or run 'refreshenv' if you use chocolatey) to pick up the change.")
+                    else:
+                        shell = detect_shell()
+                        shell_rc = SHELL_RC_FILES.get(shell, [".bashrc"])[0]
+                        info("Run: {}source ~/{}{}".format(S.bold, shell_rc, S.reset))
                 else:
-                    warn("Could not modify any shell RC files.")
-                    info("Add manually:")
-                    info('  export PATH="{}:$PATH"'.format(install_dir))
+                    if plat.is_windows:
+                        warn("Could not update the user PATH registry value.")
+                        info("Add manually:")
+                        info('  setx Path "{};%Path%"'.format(install_dir))
+                    else:
+                        warn("Could not modify any shell RC files.")
+                        info("Add manually:")
+                        info('  export PATH="{}:$PATH"'.format(install_dir))
             else:
                 write()
                 info("To add to PATH later:")
-                info('  export PATH="{}:$PATH"'.format(install_dir))
+                if plat.is_windows:
+                    info('  setx Path "{};%Path%"'.format(install_dir))
+                else:
+                    info('  export PATH="{}:$PATH"'.format(install_dir))
 
     # Final summary
     write()
@@ -1771,6 +2008,12 @@ def main(argv: Optional[List[str]] = None) -> None:
         S.bold, S.reset, S.dim, S.reset
     ))
     write()
+
+    if plat.is_windows:
+        info(
+            "For Linux containers on Windows, optionally install WSL2: "
+            "{}wsl --install --no-distribution{}".format(S.bold, S.reset)
+        )
 
     info("Documentation: {}https://zlayer.dev{}".format(S.underline, S.reset))
     info("Issues: {}https://github.com/{}/issues{}".format(S.underline, GITHUB_REPO, S.reset))

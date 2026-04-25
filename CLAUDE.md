@@ -17,11 +17,18 @@ crates/
   zlayer-agent/    # Container runtime (libcontainer integration, storage manager)
   zlayer-api/      # REST API server with build endpoints and streaming
   zlayer-builder/  # Dockerfile/ZImagefile parsing, buildah integration, runtime templates
+  zlayer-client/   # Internal HTTP client used by the CLI to talk to the daemon
+  zlayer-consensus/ # Raft consensus library (openraft)
   zlayer-core/     # Shared types and configuration
+  zlayer-docker/   # Docker Engine API compatibility shim (named-pipe transport on Windows, Unix socket elsewhere)
+  zlayer-git/      # git operations: sync polling, webhook receiver
+  zlayer-hcs/      # Safe Rust wrapper for Windows Host Compute Service
+  zlayer-hns/      # Safe Rust wrapper for Windows Host Compute Network Service (HCN v2)
   zlayer-init-actions/  # Pre-start lifecycle actions (TCP, HTTP, S3, commands)
   zlayer-manager/  # Web-based management UI (Leptos SSR + WASM)
   zlayer-observability/ # Metrics, logging, OpenTelemetry tracing
   zlayer-overlay/  # Encrypted overlay networking (boringtun), IP allocation, DNS discovery
+  zlayer-paths/    # Cross-platform path resolution helpers
   zlayer-proxy/    # L4/L7 proxy with TLS
   zlayer-py/       # Python bindings
   zlayer-registry/ # OCI image pulling and caching
@@ -29,8 +36,10 @@ crates/
   zlayer-secrets/  # Secrets management
   zlayer-spec/     # Deployment specification types
   zlayer-storage/  # Storage backends (local, S3)
+  zlayer-tui/      # Interactive terminal UI dashboard
   zlayer-tunnel/   # Secure tunneling for node-to-node access
   zlayer-web/      # Web frontend (Leptos SSR + hydration)
+  zlayer-wsl/      # WSL2 backend integration for Windows
 
 images/            # Container build files (Dockerfiles, ZImagefiles)
 examples/          # Example deployments and ZImagefiles
@@ -48,6 +57,8 @@ The `zlayer` CLI — single binary for orchestration and image building. Provide
 - WASM runtime via wasmtime
 - Image building: `build`, `pipeline`, `runtimes`, `validate` (plus an interactive TUI)
 - Deployment/service/job/cron subcommands: `deploy`, `logs`, `exec`, `stop`, `ps`, `status`, etc.
+
+The full subcommand list is defined in `bin/zlayer/src/cli.rs`, and individual subcommand implementations live in `bin/zlayer/src/commands/`.
 
 CLI subcommands talk to the running daemon over a Unix socket via `DaemonClient`.
 
@@ -193,7 +204,8 @@ Read the diff. Write a test for the exact thing that changed. Run it. If it touc
 
 ## Important Notes
 
-- Linux, macOS, and Windows supported (Windows uses WSL2 backend)
+- Linux, macOS, and Windows supported. Windows uses HCS native runtime for Windows containers and a WSL2 delegate for Linux workloads.
 - Requires `libseccomp-dev` for building on Linux
 - Buildah required for image building (auto-installed if missing)
 - Minimum Rust version: 1.91
+- See `docs/windows-ci-runner.md` for the Windows test harness operational runbook (MiniWindows CI host setup, toolchain notes, and rsync paths).

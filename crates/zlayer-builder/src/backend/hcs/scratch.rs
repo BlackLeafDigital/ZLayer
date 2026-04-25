@@ -19,12 +19,11 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
-use oci_client::secrets::RegistryAuth;
 use zlayer_agent::windows::scratch::WritableLayer;
 use zlayer_agent::windows::unpacker::{self, ResolvedLayerDescriptor, UnpackedImage};
 use zlayer_agent::windows::wclayer::LayerChain;
 use zlayer_registry::image_config::ImageConfig;
-use zlayer_registry::ImagePuller;
+use zlayer_registry::{ImagePuller, OciImageManifest, RegistryAuth};
 
 /// Everything the builder needs to know about a pulled Windows base image:
 /// the parent chain (ready for [`WritableLayer`] construction), the compressed
@@ -205,7 +204,7 @@ async fn fetch_base_config_and_version(
     puller: &ImagePuller,
     image: &str,
     auth: &RegistryAuth,
-    manifest: &oci_client::manifest::OciImageManifest,
+    manifest: &OciImageManifest,
 ) -> io::Result<(Option<ImageConfig>, Option<String>)> {
     // `manifest.config` is a plain descriptor. Pull the blob, parse the
     // top-level JSON object, look for both the inner `config` block and the

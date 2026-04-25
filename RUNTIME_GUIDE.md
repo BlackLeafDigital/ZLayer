@@ -2,7 +2,7 @@
 
 ## What ZLayer Is
 
-A Rust-based container orchestration platform — 19 crates, 5 container runtimes, Raft consensus, overlay networking, L4/L7 proxy, WebAssembly support. The goal: `docker compose` simplicity with Kubernetes-level capabilities, zero daemon overhead on Linux (libcontainer direct), native macOS support via Seatbelt sandbox + APFS.
+A Rust-based container orchestration platform — 26 crates, 7 container runtimes (youki, macOS sandbox, macOS VM, Docker, WASM, Windows HCS, WSL2 delegate), Raft consensus, overlay networking, L4/L7 proxy, WebAssembly support. The goal: `docker compose` simplicity with Kubernetes-level capabilities, zero daemon overhead on Linux (libcontainer direct), native macOS support via Seatbelt sandbox + APFS, and native Windows support via the Host Compute Service with a WSL2 delegate for Linux workloads.
 
 ---
 
@@ -57,6 +57,14 @@ User
 | `zlayer-web` | Alternative web UI | Exists |
 | `zlayer-tui` | TUI widgets (ratatui) | Exists |
 | `zlayer-py` | Python bindings (PyO3) | Exists |
+| `zlayer-client` | Internal Rust HTTP client used by the CLI to call the daemon API | Working |
+| `zlayer-docker` | Docker Engine API compatibility shim (`docker run`/`compose`/...) | Working |
+| `zlayer-git` | Git operations: sync polling, webhook receiver | Working |
+| `zlayer-hcs` | Safe Rust wrapper for Windows Host Compute Service | Working |
+| `zlayer-hns` | Safe Rust wrapper for Windows Host Compute Network Service (HCN v2) | Working |
+| `zlayer-paths` | Cross-platform path resolution helpers | Working |
+| `zlayer-wsl` | WSL2 backend integration for Windows | Working |
+| `zlayer-consensus` | Shared Raft consensus library (openraft 0.9) | Working |
 
 ---
 
@@ -361,9 +369,12 @@ services:
 
 ```rust
 // Automatic selection in create_runtime():
-// Linux:  youki (libcontainer) → Docker fallback
-// macOS:  SandboxRuntime → VmRuntime → Docker fallback
-// Windows: Docker only
+// Linux:   youki (libcontainer) → Docker fallback
+// macOS:   SandboxRuntime → VmRuntime → Docker fallback
+// Windows: CompositeRuntime { primary: HcsRuntime, delegate: Wsl2DelegateRuntime } → Docker fallback
+//          - Windows-OS images dispatch to HcsRuntime (native Host Compute Service)
+//          - Linux-OS images dispatch to Wsl2DelegateRuntime (youki inside the `zlayer` WSL2 distro)
+//          - Docker is used only if neither HCS nor WSL2 is available
 
 // Manual selection via RuntimeConfig enum:
 RuntimeConfig::Youki(YoukiConfig { ... })
@@ -371,9 +382,30 @@ RuntimeConfig::Docker
 RuntimeConfig::Sandbox(MacSandboxConfig { ... })
 RuntimeConfig::Vm(VmConfig { ... })
 RuntimeConfig::Wasm(WasmConfig { ... })
+RuntimeConfig::Hcs(HcsConfig { ... })            // Windows native containers
+RuntimeConfig::Wsl2Delegate(Wsl2Config { ... })  // Linux workloads on Windows hosts
+RuntimeConfig::Composite(CompositeConfig { ... }) // Per-container dispatch on Windows
 ```
 
 WASM is auto-detected from OCI manifest media types — if the image contains WASM artifacts, the WASM runtime is used regardless of platform.
+
+### Windows runtime stack
+
+Three runtimes implement the Windows story, all under `crates/zlayer-agent/src/runtimes/`:
+
+- **`HcsRuntime`** (`hcs.rs`) — native Windows containers via the Host Compute Service. Backed by the safe `zlayer-hcs` wrapper. Runs Windows-OS OCI images directly on the host without Docker Desktop.
+- **`Wsl2DelegateRuntime`** (`wsl2_delegate.rs`) — runs Linux OCI images on Windows hosts by delegating to youki inside the dedicated `zlayer` WSL2 distro. Gated behind the `wsl` Cargo feature.
+- **`CompositeRuntime`** (`composite.rs`) — the runtime that's actually selected on Windows. Inspects each container's image OS and dispatches: Windows images → `HcsRuntime`, Linux images → `Wsl2DelegateRuntime`. Falls back to `DockerRuntime` only when neither native path is available.
+
+Dispatch policy: HCS for Windows images → WSL2 delegate for Linux images → Docker fallback.
+
+Build incantation that ships in CI:
+
+```bash
+cargo build --release -p zlayer --features hcs-runtime,wsl
+```
+
+The `hcs-runtime` feature pulls in `HcsRuntime` + `zlayer-hcs` + `zlayer-hns`; the `wsl` feature pulls in `Wsl2DelegateRuntime` + `zlayer-wsl`. Both together activate the Composite dispatcher.
 
 ---
 
@@ -382,7 +414,7 @@ WASM is auto-detected from OCI manifest media types — if the image contains WA
 ### Test Suites
 | Suite | File | Tests | Status |
 |-------|------|-------|--------|
-| macOS Sandbox E2E | `tests/macos_sandbox_e2e.rs` | 28 | 5 hanging (see MAC_FAILING.md) |
+| macOS Sandbox E2E | `tests/macos_sandbox_e2e.rs` | 28 | 5 hanging |
 | macOS MPS GPU | `tests/macos_mps_smoke.rs` | 4 | All pass |
 | Scheduler | `crates/zlayer-scheduler/` | 86 | All pass |
 | Full workspace | `cargo test` | 2,551 | All pass |
