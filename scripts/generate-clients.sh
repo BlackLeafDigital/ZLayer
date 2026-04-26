@@ -99,11 +99,15 @@ generate_go() {
         -i "$OPENAPI_SPEC" \
         -g go \
         -o "$CLIENTS_DIR/go" \
-        --additional-properties=packageName=zlayer,packageVersion=0.1.0,isGoSubmodule=true
+        --additional-properties=packageName=zlayer,packageVersion=0.0.0-dev,isGoSubmodule=true,gitUserId=BlackLeafDigital,gitRepoId=ZLayer/clients/go
 
-    # Add go.mod
+    # Add go.mod (the 'github.com/BlackLeafDigital/ZLayer/clients/go' subpath
+    # mirrors the plugin-SDK pattern — consumers `go get` it via a tag of the
+    # form `clients/go/v<VERSION>` pushed by `.forgejo/workflows/publish-sdks.yml`.
+    # `0.0.0-dev` in packageVersion is a sentinel stamped to the real version
+    # by the publish-openapi-go job before tagging.)
     cat > "$CLIENTS_DIR/go/go.mod" << 'EOF'
-module github.com/BlackLeafDigital/zlayer-go
+module github.com/BlackLeafDigital/ZLayer/clients/go
 
 go 1.21
 EOF

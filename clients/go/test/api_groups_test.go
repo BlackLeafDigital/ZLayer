@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"testing"
-	openapiclient "github.com/BlackLeafDigital/zlayer-go"
+	openapiclient "github.com/BlackLeafDigital/ZLayer/clients/go"
 )
 
 func Test_zlayer_GroupsAPIService(t *testing.T) {

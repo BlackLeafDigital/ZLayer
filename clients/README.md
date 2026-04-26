@@ -129,7 +129,7 @@ package main
 import (
     "context"
     "fmt"
-    zlayer "github.com/BlackLeafDigital/zlayer-go"
+    zlayer "github.com/BlackLeafDigital/ZLayer/clients/go"
 )
 
 func main() {
@@ -174,7 +174,7 @@ func main() {
 
 **Installation:**
 ```bash
-go get github.com/BlackLeafDigital/zlayer-go
+go get github.com/BlackLeafDigital/ZLayer/clients/go
 ```
 
 ### Rust

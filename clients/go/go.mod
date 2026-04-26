@@ -1,4 +1,4 @@
-module github.com/BlackLeafDigital/zlayer-go
+module github.com/BlackLeafDigital/ZLayer/clients/go
 
 go 1.23
 
