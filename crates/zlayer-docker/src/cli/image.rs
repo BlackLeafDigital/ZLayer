@@ -367,7 +367,8 @@ pub async fn handle_images(args: ImagesArgs) -> anyhow::Result<()> {
     // Apply optional repository filter (prefix match on `name` part).
     if let Some(filter) = args.repository.as_deref() {
         images.retain(|info| {
-            let (repo, _) = split_reference(&info.reference);
+            let ref_str = info.reference.to_string();
+            let (repo, _) = split_reference(&ref_str);
             repo == filter
         });
     }
@@ -375,7 +376,7 @@ pub async fn handle_images(args: ImagesArgs) -> anyhow::Result<()> {
     if args.quiet {
         for info in &images {
             let id = info.digest.as_deref().map_or_else(
-                || truncate_id(&info.reference, args.no_trunc),
+                || truncate_id(&info.reference.to_string(), args.no_trunc),
                 |d| truncate_id(d, args.no_trunc),
             );
             println!("{id}");
@@ -389,7 +390,8 @@ pub async fn handle_images(args: ImagesArgs) -> anyhow::Result<()> {
         "REPOSITORY", "TAG", "IMAGE ID", "CREATED", "SIZE"
     );
     for info in &images {
-        let (repo, tag) = split_reference(&info.reference);
+        let ref_str = info.reference.to_string();
+        let (repo, tag) = split_reference(&ref_str);
         let id = info
             .digest
             .as_deref()

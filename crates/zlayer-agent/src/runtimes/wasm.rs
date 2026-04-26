@@ -551,7 +551,7 @@ impl WasmRuntime {
         let mut args = Vec::new();
 
         // Module name as argv[0]
-        args.push(spec.image.name.clone());
+        args.push(spec.image.name.to_string());
 
         // Add entrypoint args if present
         if let Some(entrypoint) = &spec.command.entrypoint {
@@ -1032,7 +1032,7 @@ impl Runtime for WasmRuntime {
     )]
     async fn create_container(&self, id: &ContainerId, spec: &ServiceSpec) -> Result<()> {
         let instance_id = self.instance_id(id);
-        let image = &spec.image.name;
+        let image = spec.image.name.to_string();
 
         tracing::info!(
             instance = %instance_id,
@@ -1066,9 +1066,9 @@ impl Runtime for WasmRuntime {
             (bytes, detected_version)
         } else {
             // Pull from registry - get WASI version from manifest
-            let auth = self.auth_resolver.resolve(image);
+            let auth = self.auth_resolver.resolve(&image);
             let (wasm_bytes, wasm_info) =
-                self.registry.pull_wasm(image, &auth).await.map_err(|e| {
+                self.registry.pull_wasm(&image, &auth).await.map_err(|e| {
                     AgentError::CreateFailed {
                         id: instance_id.clone(),
                         reason: format!("failed to pull WASM: {e}"),

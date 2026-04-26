@@ -16,4 +16,9 @@ pub mod session;
 
 mod daemon_client;
 
-pub use daemon_client::{default_socket_path, BuildHandle, BuildSpec, DaemonClient};
+pub use daemon_client::{default_socket_path, DaemonClient};
+
+// Re-export the wire DTOs (now defined in `zlayer-types`) at the crate
+// root so downstream callers using `zlayer_client::{Session, BuildSpec,
+// BuildHandle}` keep working.
+pub use zlayer_types::client::{BuildHandle, BuildSpec, Session};

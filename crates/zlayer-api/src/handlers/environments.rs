@@ -16,8 +16,8 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+
+pub use zlayer_types::api::environments::*;
 
 use crate::error::{ApiError, Result};
 use crate::handlers::secrets::{env_scope, SecretsState};
@@ -54,44 +54,6 @@ impl EnvironmentsRouterState {
     pub fn new(envs: EnvironmentsState, secrets: SecretsState) -> Self {
         Self { envs, secrets }
     }
-}
-
-// ---- Request/response types ----
-
-/// Query for `GET /api/v1/environments`.
-///
-/// `project` selects the namespace:
-///   - omitted → list global environments only (`project_id IS NULL`).
-///   - `*` → list every environment across all projects + global.
-///   - any other value → list environments owned by that project id.
-#[derive(Debug, Deserialize, Default)]
-pub struct ListEnvironmentsQuery {
-    #[serde(default)]
-    pub project: Option<String>,
-}
-
-/// Body for `POST /api/v1/environments`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CreateEnvironmentRequest {
-    /// Display name. Must be unique within the chosen `project_id` namespace.
-    pub name: String,
-    /// Owning project id. `None` = global environment.
-    #[serde(default)]
-    pub project_id: Option<String>,
-    /// Free-form description shown in the UI.
-    #[serde(default)]
-    pub description: Option<String>,
-}
-
-/// Body for `PATCH /api/v1/environments/{id}`. All fields are optional.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct UpdateEnvironmentRequest {
-    /// New display name. Will be re-checked for uniqueness.
-    #[serde(default)]
-    pub name: Option<String>,
-    /// New description. Pass `Some("")` to clear, omit to leave unchanged.
-    #[serde(default)]
-    pub description: Option<String>,
 }
 
 // ---- Endpoints ----

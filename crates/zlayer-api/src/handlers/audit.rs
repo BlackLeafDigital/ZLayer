@@ -12,9 +12,8 @@
 use std::sync::Arc;
 
 use axum::{extract::State, Json};
-use chrono::{DateTime, Utc};
-use serde::Deserialize;
-use utoipa::IntoParams;
+
+pub use zlayer_types::api::audit::*;
 
 use crate::error::{ApiError, Result};
 use crate::handlers::users::AuthActor;
@@ -33,28 +32,6 @@ impl AuditState {
     pub fn new(store: Arc<dyn AuditStorage>) -> Self {
         Self { store }
     }
-}
-
-/// Query parameters for `GET /api/v1/audit`.
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct AuditQuery {
-    /// Filter by user id.
-    #[serde(default)]
-    pub user: Option<String>,
-    /// Filter by resource kind.
-    #[serde(default)]
-    pub resource_kind: Option<String>,
-    /// Only entries at or after this timestamp (RFC 3339).
-    #[serde(default)]
-    #[param(value_type = Option<String>)]
-    pub since: Option<DateTime<Utc>>,
-    /// Only entries at or before this timestamp (RFC 3339).
-    #[serde(default)]
-    #[param(value_type = Option<String>)]
-    pub until: Option<DateTime<Utc>>,
-    /// Maximum number of entries to return (default 100).
-    #[serde(default)]
-    pub limit: Option<usize>,
 }
 
 // ---- Endpoint ----

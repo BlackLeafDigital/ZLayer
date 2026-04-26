@@ -38,6 +38,7 @@ web-sys = { version = "0.3", features = ["Window", "Document", "Element", "Stora
 zlayer-agent = { workspace = true, optional = true }
 zlayer-api = { workspace = true, optional = true }
 zlayer-spec = { workspace = true, optional = true }
+zlayer-types = { workspace = true, optional = true }
 
 [lints]
 workspace = true
@@ -80,6 +81,7 @@ ssr = [
     "dep:zlayer-api",
     "dep:zlayer-agent",
     "dep:zlayer-spec",
+    "dep:zlayer-types",
 ]
 
 # Hydrate feature for client-side hydration (WASM binary)

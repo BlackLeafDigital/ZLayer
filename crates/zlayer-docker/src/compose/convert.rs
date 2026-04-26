@@ -222,7 +222,11 @@ fn warn_unsupported_fields(svc_name: &str, svc: &ComposeService) {
 fn convert_image(svc_name: &str, svc: &ComposeService) -> crate::Result<ImageSpec> {
     if let Some(ref image) = svc.image {
         Ok(ImageSpec {
-            name: image.clone(),
+            name: image.parse().map_err(|e| {
+                DockerError::Conversion(format!(
+                    "service '{svc_name}' has invalid image reference '{image}': {e}"
+                ))
+            })?,
             pull_policy: PullPolicy::IfNotPresent,
         })
     } else if svc.build.is_some() {
@@ -232,7 +236,11 @@ fn convert_image(svc_name: &str, svc: &ComposeService) -> crate::Result<ImageSpe
              Using placeholder image name '{svc_name}:latest'"
         );
         Ok(ImageSpec {
-            name: format!("{svc_name}:latest"),
+            name: format!("{svc_name}:latest").parse().map_err(|e| {
+                DockerError::Conversion(format!(
+                    "failed to build placeholder image reference for service '{svc_name}': {e}"
+                ))
+            })?,
             pull_policy: PullPolicy::IfNotPresent,
         })
     } else {
@@ -711,7 +719,7 @@ volumes:
         assert_eq!(spec.services.len(), 2);
 
         let web = &spec.services["web"];
-        assert_eq!(web.image.name, "nginx:latest");
+        assert_eq!(web.image.name.to_string(), "docker.io/library/nginx:latest");
         assert_eq!(web.endpoints.len(), 1);
         assert_eq!(web.endpoints[0].port, 8080);
         assert_eq!(web.endpoints[0].target_port, Some(80));
@@ -719,7 +727,7 @@ volumes:
         assert_eq!(web.env.get("FOO").unwrap(), "bar");
 
         let db = &spec.services["db"];
-        assert_eq!(db.image.name, "postgres:16");
+        assert_eq!(db.image.name.to_string(), "docker.io/library/postgres:16");
         assert_eq!(db.endpoints.len(), 1);
         assert_eq!(db.endpoints[0].port, 5432);
         assert_eq!(db.endpoints[0].protocol, Protocol::Tcp);
@@ -750,7 +758,7 @@ services:
         let spec = compose_to_deployment(&compose, "build-test").unwrap();
 
         let app = &spec.services["app"];
-        assert_eq!(app.image.name, "app:latest");
+        assert_eq!(app.image.name.to_string(), "docker.io/library/app:latest");
         assert_eq!(app.image.pull_policy, PullPolicy::IfNotPresent);
     }
 

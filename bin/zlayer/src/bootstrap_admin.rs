@@ -93,8 +93,9 @@ mod tests {
     use super::*;
     use serial_test::serial;
     use std::io::Write;
-    use zlayer_api::storage::{InMemoryUserStore, StoredUser, UserStorage};
+    use zlayer_api::storage::{InMemoryUserStore, UserStorage};
     use zlayer_secrets::{CredentialStore, EncryptionKey, PersistentSecretsStore};
+    use zlayer_types::storage::StoredUser;
 
     fn clear_envs() {
         std::env::remove_var(ENV_EMAIL);

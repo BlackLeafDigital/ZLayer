@@ -4,6 +4,9 @@
 //! `zlayer image ls`, `zlayer image rm`, and `zlayer system prune` CLI
 //! subcommands can operate against a remote daemon.
 
+pub use zlayer_types::api::images::*;
+
+use std::str::FromStr;
 use std::sync::Arc;
 
 use axum::{
@@ -11,13 +14,12 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
-use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
 use zlayer_agent::runtime::{ImageInfo, PruneResult, Runtime};
 use zlayer_spec::PullPolicy;
+use zlayer_types::ImageReference;
 
 /// State for image-management endpoints.
 ///
@@ -62,90 +64,41 @@ impl ImageState {
     }
 }
 
-/// Serializable wrapper for [`ImageInfo`] so we can attach `ToSchema` here
-/// (the underlying type in `zlayer-agent` can't depend on `utoipa`).
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ImageInfoDto {
-    /// Canonical image reference (e.g. `zachhandley/zlayer-manager:latest`).
-    pub reference: String,
-    /// Content-addressed digest (`sha256:...`) if known.
-    pub digest: Option<String>,
-    /// Size in bytes if known.
-    pub size_bytes: Option<u64>,
-}
-
-impl From<ImageInfo> for ImageInfoDto {
-    fn from(info: ImageInfo) -> Self {
-        Self {
-            reference: info.reference,
-            digest: info.digest,
-            size_bytes: info.size_bytes,
-        }
+/// Build an [`ImageInfoDto`] DTO from a runtime [`ImageInfo`].
+///
+/// Free function (rather than `impl From<ImageInfo> for ImageInfoDto`) because
+/// both types are foreign to this crate, which would violate the orphan rule.
+///
+/// # Panics
+///
+/// Panics if the hardcoded fallback reference `"docker.io/library/unknown"`
+/// fails to parse — which cannot happen in practice.
+#[must_use]
+pub fn image_info_dto_from(info: ImageInfo) -> ImageInfoDto {
+    // The runtime returns a string reference; parse it into the
+    // canonical OCI form. Fall back to a docker.io/library lookup if
+    // parsing fails (should not happen in practice — runtime-emitted
+    // references are always well-formed).
+    let reference = ImageReference::from_str(&info.reference)
+        .unwrap_or_else(|_| ImageReference::from_str("docker.io/library/unknown").unwrap());
+    ImageInfoDto {
+        reference,
+        digest: info.digest,
+        size_bytes: info.size_bytes,
     }
 }
 
-/// Serializable wrapper for [`PruneResult`].
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, Default)]
-pub struct PruneResultDto {
-    /// Image references or digests that were removed.
-    pub deleted: Vec<String>,
-    /// Bytes reclaimed from the cache.
-    pub space_reclaimed: u64,
-}
-
-impl From<PruneResult> for PruneResultDto {
-    fn from(result: PruneResult) -> Self {
-        Self {
-            deleted: result.deleted,
-            space_reclaimed: result.space_reclaimed,
-        }
+/// Build a [`PruneResultDto`] DTO from a runtime [`PruneResult`].
+///
+/// Free function (rather than `impl From<PruneResult> for PruneResultDto`)
+/// because both types are foreign to this crate, which would violate the
+/// orphan rule.
+#[must_use]
+pub fn prune_result_dto_from(result: PruneResult) -> PruneResultDto {
+    PruneResultDto {
+        deleted: result.deleted,
+        space_reclaimed: result.space_reclaimed,
     }
-}
-
-/// Request body for [`pull_image_handler`]. Blocking pull of an OCI image.
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct PullImageRequest {
-    /// OCI image reference to pull, e.g. `docker.io/library/nginx:latest`.
-    pub reference: String,
-    /// Pull policy override. Accepts `"always"`, `"if_not_present"`, or
-    /// `"never"`. Defaults to `"always"` when omitted.
-    #[serde(default)]
-    pub pull_policy: Option<String>,
-    // -- §3.10: registry auth -----------------------------------------------
-    /// Id of a persisted registry credential (from
-    /// `POST /api/v1/credentials/registry`) to use for this pull. Ignored
-    /// when [`Self::registry_auth`] is also supplied (inline auth wins).
-    /// Requires the daemon to be configured with a credential store.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry_credential_id: Option<String>,
-    /// Inline Docker/OCI registry credentials used for this pull only. Not
-    /// persisted, never logged, never echoed back on a response. Takes
-    /// precedence over `registry_credential_id`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry_auth: Option<zlayer_spec::RegistryAuth>,
-}
-
-/// Response body for [`pull_image_handler`]. Reports the pulled reference
-/// and, when the backend exposes it via `list_images`, the resolved digest
-/// and on-disk size.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
-pub struct PullImageResponse {
-    /// Canonical reference that was pulled.
-    pub reference: String,
-    /// Content-addressed digest (`sha256:...`) if the runtime reports one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub digest: Option<String>,
-    /// On-disk size in bytes if the runtime reports one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub size_bytes: Option<u64>,
-}
-
-/// Query parameters for [`remove_image_handler`].
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct RemoveImageQuery {
-    /// Force removal even if the image is referenced by containers.
-    #[serde(default)]
-    pub force: bool,
 }
 
 /// Resolve inline or stored registry credentials for the `/images/pull`
@@ -196,17 +149,6 @@ async fn resolve_pull_auth(
     }))
 }
 
-/// Request body for [`tag_image_handler`]. Matches Docker-compat
-/// `docker tag` semantics: create a new reference (`target`) pointing at an
-/// already-cached image (`source`).
-#[derive(Debug, Clone, Deserialize, ToSchema)]
-pub struct TagImageRequest {
-    /// Existing image reference to tag (e.g. `myapp:latest`).
-    pub source: String,
-    /// New reference to create (e.g. `registry.example.com/myapp:v1`).
-    pub target: String,
-}
-
 /// List all cached images known to the runtime.
 ///
 /// # Errors
@@ -234,7 +176,7 @@ pub async fn list_images_handler(
         .list_images()
         .await
         .map_err(|e| ApiError::Internal(format!("failed to list images: {e}")))?;
-    Ok(Json(images.into_iter().map(ImageInfoDto::from).collect()))
+    Ok(Json(images.into_iter().map(image_info_dto_from).collect()))
 }
 
 /// Remove an image from the runtime's cache.
@@ -299,7 +241,7 @@ pub async fn prune_images_handler(
         .prune_images()
         .await
         .map_err(|e| ApiError::Internal(format!("failed to prune images: {e}")))?;
-    Ok(Json(PruneResultDto::from(result)))
+    Ok(Json(prune_result_dto_from(result)))
 }
 
 /// Pull an OCI image into the runtime's local cache.
@@ -335,7 +277,8 @@ pub async fn pull_image_handler(
 ) -> Result<Json<PullImageResponse>> {
     user.require_role("operator")?;
 
-    if request.reference.trim().is_empty() {
+    let reference_str = request.reference.to_string();
+    if reference_str.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "reference is required and cannot be empty".to_string(),
         ));
@@ -357,7 +300,7 @@ pub async fn pull_image_handler(
 
     state
         .runtime
-        .pull_image_with_policy(&request.reference, policy, resolved_auth.as_ref())
+        .pull_image_with_policy(&reference_str, policy, resolved_auth.as_ref())
         .await
         .map_err(|e| ApiError::Internal(format!("failed to pull image: {e}")))?;
 
@@ -366,7 +309,7 @@ pub async fn pull_image_handler(
     let (digest, size_bytes) = match state.runtime.list_images().await {
         Ok(images) => images
             .into_iter()
-            .find(|info| info.reference == request.reference)
+            .find(|info| info.reference == reference_str)
             .map_or((None, None), |info| (info.digest, info.size_bytes)),
         Err(_) => (None, None),
     };
@@ -414,7 +357,9 @@ pub async fn tag_image_handler(
 ) -> Result<StatusCode> {
     user.require_role("operator")?;
 
-    if request.source.trim().is_empty() || request.target.trim().is_empty() {
+    let source_str = request.source.to_string();
+    let target_str = request.target.to_string();
+    if source_str.trim().is_empty() || target_str.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "source and target must be non-empty image references".to_string(),
         ));
@@ -422,7 +367,7 @@ pub async fn tag_image_handler(
 
     state
         .runtime
-        .tag_image(&request.source, &request.target)
+        .tag_image(&source_str, &target_str)
         .await
         .map_err(|e| match e {
             zlayer_agent::AgentError::NotFound { reason, .. } => {

@@ -18,12 +18,12 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+
+pub use zlayer_types::api::tasks::*;
 
 use crate::error::{ApiError, Result};
 use crate::handlers::users::AuthActor;
-use crate::storage::{StoredTask, TaskKind, TaskRun, TaskStorage};
+use crate::storage::{StoredTask, TaskRun, TaskStorage};
 
 /// State for task endpoints.
 #[derive(Clone)]
@@ -38,31 +38,6 @@ impl TasksState {
     pub fn new(store: Arc<dyn TaskStorage>) -> Self {
         Self { store }
     }
-}
-
-// ---- Request/response types ----
-
-/// Query for `GET /api/v1/tasks`.
-#[derive(Debug, Deserialize, Default)]
-pub struct ListTasksQuery {
-    /// Filter by project id. When omitted, all tasks (global + project-scoped)
-    /// are returned.
-    #[serde(default)]
-    pub project_id: Option<String>,
-}
-
-/// Body for `POST /api/v1/tasks`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CreateTaskRequest {
-    /// Task name.
-    pub name: String,
-    /// Script type.
-    pub kind: TaskKind,
-    /// The script/command body.
-    pub body: String,
-    /// Project id scope. `None` = global task.
-    #[serde(default)]
-    pub project_id: Option<String>,
 }
 
 // ---- Endpoints ----
@@ -356,34 +331,7 @@ async fn execute_task(task: &StoredTask) -> Result<TaskRun> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_create_request_deserialize_minimum() {
-        let req: CreateTaskRequest =
-            serde_json::from_str(r#"{"name":"build","kind":"bash","body":"cargo build"}"#).unwrap();
-        assert_eq!(req.name, "build");
-        assert_eq!(req.kind, TaskKind::Bash);
-        assert_eq!(req.body, "cargo build");
-        assert!(req.project_id.is_none());
-    }
-
-    #[test]
-    fn test_create_request_deserialize_full() {
-        let req: CreateTaskRequest = serde_json::from_str(
-            r#"{"name":"build","kind":"bash","body":"cargo build","project_id":"proj-1"}"#,
-        )
-        .unwrap();
-        assert_eq!(req.name, "build");
-        assert_eq!(req.kind, TaskKind::Bash);
-        assert_eq!(req.body, "cargo build");
-        assert_eq!(req.project_id.as_deref(), Some("proj-1"));
-    }
-
-    #[test]
-    fn test_list_query_default_is_empty() {
-        let q = ListTasksQuery::default();
-        assert!(q.project_id.is_none());
-    }
+    use crate::storage::TaskKind;
 
     #[test]
     fn test_task_kind_serde_roundtrip() {

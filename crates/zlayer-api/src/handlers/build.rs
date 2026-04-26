@@ -7,6 +7,8 @@
 //! - Querying build status and logs
 //! - Listing available runtime templates
 
+pub use zlayer_types::api::build::*;
+
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -20,12 +22,10 @@ use axum::{
     Json, Router,
 };
 use futures_util::Stream;
-use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use tracing::{debug, error, info, warn};
-use utoipa::ToSchema;
 use uuid::Uuid;
 
 use zlayer_builder::{list_templates, BuildEvent, ImageBuilder, Runtime, RuntimeInfo};
@@ -185,178 +185,99 @@ impl BuildManager {
 // Request/Response Types
 // ============================================================================
 
-/// Build request for JSON API
-#[derive(Debug, Default, Deserialize, ToSchema)]
-pub struct BuildRequest {
-    /// Use runtime template instead of Dockerfile
-    #[serde(default)]
-    pub runtime: Option<String>,
-    /// Build arguments (ARG values)
-    #[serde(default)]
-    pub build_args: HashMap<String, String>,
-    /// Target stage for multi-stage builds
-    #[serde(default)]
-    pub target: Option<String>,
-    /// Tags to apply to the image
-    #[serde(default)]
-    pub tags: Vec<String>,
-    /// Disable cache
-    #[serde(default)]
-    pub no_cache: bool,
-    /// Push to registry after build
-    #[serde(default)]
-    pub push: bool,
-}
-
-/// Build status response
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct BuildStatus {
-    /// Unique build ID
-    pub id: String,
-    /// Current build status
-    pub status: BuildStateEnum,
-    /// Image ID (if completed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub image_id: Option<String>,
-    /// Error message (if failed)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    /// When the build started (ISO 8601)
-    pub started_at: String,
-    /// When the build completed (ISO 8601)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<String>,
-}
-
-/// Build state enumeration
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum BuildStateEnum {
-    /// Build is queued
-    Pending,
-    /// Build is running
-    Running,
-    /// Build completed successfully
-    Complete,
-    /// Build failed
-    Failed,
-}
-
-/// Runtime template information
-#[derive(Debug, Serialize, ToSchema)]
-pub struct TemplateInfo {
-    /// Template name (e.g., "node20")
-    pub name: String,
-    /// Human-readable description
-    pub description: String,
-    /// Files that indicate this runtime should be used
-    pub detect_files: Vec<String>,
-}
-
-impl From<&RuntimeInfo> for TemplateInfo {
-    fn from(info: &RuntimeInfo) -> Self {
-        Self {
-            name: info.name.to_string(),
-            description: info.description.to_string(),
-            detect_files: info.detect_files.iter().map(|s| (*s).to_string()).collect(),
-        }
+/// Build a [`TemplateInfo`] from a [`RuntimeInfo`].
+///
+/// Free function (rather than `impl From<&RuntimeInfo> for TemplateInfo`)
+/// because both types are foreign to this crate, which would violate the
+/// orphan rule.
+#[must_use]
+pub fn template_info_from_runtime(info: &RuntimeInfo) -> TemplateInfo {
+    TemplateInfo {
+        name: info.name.to_string(),
+        description: info.description.to_string(),
+        detect_files: info.detect_files.iter().map(|s| (*s).to_string()).collect(),
     }
 }
 
-/// Trigger build response
-#[derive(Debug, Serialize, ToSchema)]
-pub struct TriggerBuildResponse {
-    /// Unique build ID for tracking
-    pub build_id: String,
-    /// Human-readable message
-    pub message: String,
-}
-
-/// Build event wrapper for SSE serialization
-#[derive(Debug, Clone, Serialize)]
-pub struct BuildEventWrapper {
-    /// Event type
-    #[serde(rename = "type")]
-    pub event_type: String,
-    /// Event data
-    pub data: serde_json::Value,
-}
-
-impl From<BuildEvent> for BuildEventWrapper {
-    fn from(event: BuildEvent) -> Self {
-        match event {
-            BuildEvent::BuildStarted {
-                total_stages,
-                total_instructions,
-            } => BuildEventWrapper {
-                event_type: "build_started".to_string(),
-                data: serde_json::json!({
-                    "total_stages": total_stages,
-                    "total_instructions": total_instructions,
-                }),
-            },
-            BuildEvent::StageStarted {
-                index,
-                name,
-                base_image,
-            } => BuildEventWrapper {
-                event_type: "stage_started".to_string(),
-                data: serde_json::json!({
-                    "index": index,
-                    "name": name,
-                    "base_image": base_image,
-                }),
-            },
-            BuildEvent::InstructionStarted {
-                stage,
-                index,
-                instruction,
-            } => BuildEventWrapper {
-                event_type: "instruction_started".to_string(),
-                data: serde_json::json!({
-                    "stage": stage,
-                    "index": index,
-                    "instruction": instruction,
-                }),
-            },
-            BuildEvent::Output { line, is_stderr } => BuildEventWrapper {
-                event_type: "output".to_string(),
-                data: serde_json::json!({
-                    "line": line,
-                    "is_stderr": is_stderr,
-                }),
-            },
-            BuildEvent::InstructionComplete {
-                stage,
-                index,
-                cached,
-            } => BuildEventWrapper {
-                event_type: "instruction_complete".to_string(),
-                data: serde_json::json!({
-                    "stage": stage,
-                    "index": index,
-                    "cached": cached,
-                }),
-            },
-            BuildEvent::StageComplete { index } => BuildEventWrapper {
-                event_type: "stage_complete".to_string(),
-                data: serde_json::json!({
-                    "index": index,
-                }),
-            },
-            BuildEvent::BuildComplete { image_id } => BuildEventWrapper {
-                event_type: "build_complete".to_string(),
-                data: serde_json::json!({
-                    "image_id": image_id,
-                }),
-            },
-            BuildEvent::BuildFailed { error } => BuildEventWrapper {
-                event_type: "build_failed".to_string(),
-                data: serde_json::json!({
-                    "error": error,
-                }),
-            },
-        }
+/// Build a [`BuildEventWrapper`] from a [`BuildEvent`].
+///
+/// Free function (rather than `impl From<BuildEvent> for BuildEventWrapper`)
+/// because both types are foreign to this crate, which would violate the
+/// orphan rule.
+#[must_use]
+pub fn build_event_to_wrapper(event: BuildEvent) -> BuildEventWrapper {
+    match event {
+        BuildEvent::BuildStarted {
+            total_stages,
+            total_instructions,
+        } => BuildEventWrapper {
+            event_type: "build_started".to_string(),
+            data: serde_json::json!({
+                "total_stages": total_stages,
+                "total_instructions": total_instructions,
+            }),
+        },
+        BuildEvent::StageStarted {
+            index,
+            name,
+            base_image,
+        } => BuildEventWrapper {
+            event_type: "stage_started".to_string(),
+            data: serde_json::json!({
+                "index": index,
+                "name": name,
+                "base_image": base_image,
+            }),
+        },
+        BuildEvent::InstructionStarted {
+            stage,
+            index,
+            instruction,
+        } => BuildEventWrapper {
+            event_type: "instruction_started".to_string(),
+            data: serde_json::json!({
+                "stage": stage,
+                "index": index,
+                "instruction": instruction,
+            }),
+        },
+        BuildEvent::Output { line, is_stderr } => BuildEventWrapper {
+            event_type: "output".to_string(),
+            data: serde_json::json!({
+                "line": line,
+                "is_stderr": is_stderr,
+            }),
+        },
+        BuildEvent::InstructionComplete {
+            stage,
+            index,
+            cached,
+        } => BuildEventWrapper {
+            event_type: "instruction_complete".to_string(),
+            data: serde_json::json!({
+                "stage": stage,
+                "index": index,
+                "cached": cached,
+            }),
+        },
+        BuildEvent::StageComplete { index } => BuildEventWrapper {
+            event_type: "stage_complete".to_string(),
+            data: serde_json::json!({
+                "index": index,
+            }),
+        },
+        BuildEvent::BuildComplete { image_id } => BuildEventWrapper {
+            event_type: "build_complete".to_string(),
+            data: serde_json::json!({
+                "image_id": image_id,
+            }),
+        },
+        BuildEvent::BuildFailed { error } => BuildEventWrapper {
+            event_type: "build_failed".to_string(),
+            data: serde_json::json!({
+                "error": error,
+            }),
+        },
     }
 }
 
@@ -543,44 +464,6 @@ pub async fn start_build_json(
     ))
 }
 
-/// Build request with server-side context path
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct BuildRequestWithContext {
-    /// Path to the build context on the server
-    pub context_path: String,
-    /// Use runtime template instead of Dockerfile
-    #[serde(default)]
-    pub runtime: Option<String>,
-    /// Build arguments
-    #[serde(default)]
-    pub build_args: HashMap<String, String>,
-    /// Target stage
-    #[serde(default)]
-    pub target: Option<String>,
-    /// Tags to apply
-    #[serde(default)]
-    pub tags: Vec<String>,
-    /// Disable cache
-    #[serde(default)]
-    pub no_cache: bool,
-    /// Push after build
-    #[serde(default)]
-    pub push: bool,
-}
-
-impl From<BuildRequestWithContext> for BuildRequest {
-    fn from(req: BuildRequestWithContext) -> Self {
-        Self {
-            runtime: req.runtime,
-            build_args: req.build_args,
-            target: req.target,
-            tags: req.tags,
-            no_cache: req.no_cache,
-            push: req.push,
-        }
-    }
-}
-
 /// GET /api/v1/build/{id}
 /// Get build status.
 ///
@@ -743,7 +626,7 @@ pub async fn list_builds(
 pub async fn list_runtime_templates() -> Json<Vec<TemplateInfo>> {
     let templates: Vec<TemplateInfo> = list_templates()
         .into_iter()
-        .map(std::convert::Into::into)
+        .map(template_info_from_runtime)
         .collect();
 
     Json(templates)
@@ -859,7 +742,7 @@ async fn run_build(
     let event_forwarder = tokio::task::spawn_blocking(move || {
         while let Ok(event) = builder_rx.recv() {
             // Forward to SSE
-            let wrapper = BuildEventWrapper::from(event.clone());
+            let wrapper = build_event_to_wrapper(event.clone());
             let _ = event_tx_clone.send(wrapper);
 
             // Log output lines
@@ -988,7 +871,7 @@ mod tests {
             name: Some("builder".to_string()),
             base_image: "node:20".to_string(),
         };
-        let wrapper = BuildEventWrapper::from(event);
+        let wrapper = build_event_to_wrapper(event);
         assert_eq!(wrapper.event_type, "stage_started");
         assert_eq!(wrapper.data["index"], 0);
         assert_eq!(wrapper.data["name"], "builder");
@@ -999,7 +882,7 @@ mod tests {
     fn test_template_info_from_runtime_info() {
         let templates = list_templates();
         let first = templates.first().unwrap();
-        let info: TemplateInfo = (*first).into();
+        let info: TemplateInfo = template_info_from_runtime(first);
         assert!(!info.name.is_empty());
         assert!(!info.description.is_empty());
     }

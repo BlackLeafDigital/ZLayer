@@ -8,7 +8,7 @@
 //! (`GET/POST/PATCH/DELETE /api/v1/variables[/id]`) via [`DaemonClient`].
 
 use anyhow::{Context, Result};
-use zlayer_api::storage::StoredVariable;
+use zlayer_types::storage::StoredVariable;
 
 use zlayer_client::DaemonClient;
 

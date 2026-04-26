@@ -3,8 +3,8 @@
 //! Admin-only operations for granting/revoking resource-level permissions.
 
 use anyhow::{Context, Result};
-use zlayer_api::storage::{PermissionLevel, StoredPermission, SubjectKind};
 use zlayer_api::GrantPermissionRequest;
+use zlayer_types::storage::{PermissionLevel, StoredPermission, SubjectKind};
 
 use zlayer_client::DaemonClient;
 

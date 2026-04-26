@@ -10,13 +10,12 @@ use axum::{
     http::{header::HeaderValue, request::Parts},
     Json,
 };
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{info, warn};
-use utoipa::ToSchema;
 
 use crate::error::{ApiError, Result};
 use zlayer_agent::{AgentError, ServiceManager};
+pub use zlayer_types::api::internal::*;
 
 /// Header name for internal API authentication
 pub const INTERNAL_AUTH_HEADER: &str = "X-ZLayer-Internal-Token";
@@ -97,36 +96,6 @@ where
 
         Ok(InternalAuth)
     }
-}
-
-/// Request to scale a service
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct InternalScaleRequest {
-    /// Service name to scale
-    pub service: String,
-    /// Target replica count
-    pub replicas: u32,
-}
-
-/// Response from internal scale operation
-#[derive(Debug, Serialize, ToSchema)]
-pub struct InternalScaleResponse {
-    /// Whether the operation succeeded
-    pub success: bool,
-    /// Service name that was scaled
-    pub service: String,
-    /// New replica count
-    pub replicas: u32,
-    /// Optional message
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
-    /// When set, this agent refused the scale because it cannot run the
-    /// workload's OS (H-7 `RouteToPeer` policy). The value is the OCI-canonical
-    /// OS string the workload requires (`linux` / `windows` / `darwin`). The
-    /// scheduler catches this and re-dispatches to a cluster peer whose
-    /// `NodeState.os` matches.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reroute_to_os: Option<String>,
 }
 
 /// Scale a service via internal scheduler request.
@@ -279,31 +248,6 @@ pub async fn get_replicas_internal(
         message: None,
         reroute_to_os: None,
     }))
-}
-
-/// Request to add a `WireGuard` peer to the local overlay transport.
-///
-/// Sent by the leader to existing nodes when a new node joins the cluster,
-/// so that all nodes learn about the new peer without waiting for periodic
-/// reconciliation.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct InternalAddPeerRequest {
-    /// New peer's `WireGuard` public key (base64)
-    pub wg_public_key: String,
-    /// New peer's overlay IP (e.g. "10.200.0.3")
-    pub overlay_ip: String,
-    /// New peer's `WireGuard` endpoint (e.g. "203.0.113.5:51820")
-    pub endpoint: String,
-}
-
-/// Response from internal add-peer operation
-#[derive(Debug, Serialize, ToSchema)]
-pub struct InternalAddPeerResponse {
-    /// Whether the operation succeeded
-    pub success: bool,
-    /// Optional message
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message: Option<String>,
 }
 
 /// Add a `WireGuard` peer to the local overlay transport.

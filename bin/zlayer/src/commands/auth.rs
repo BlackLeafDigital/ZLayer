@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use chrono::{Duration, Utc};
 use dialoguer::{Confirm, Password};
 use tracing::info;
-use zlayer_api::handlers::auth::BootstrapRequest;
+use zlayer_types::api::auth::BootstrapRequest;
 
 use zlayer_client::session::{self, Session};
 use zlayer_client::DaemonClient;

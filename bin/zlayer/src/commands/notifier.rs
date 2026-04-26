@@ -7,7 +7,7 @@
 //! (`GET/POST/PATCH/DELETE /api/v1/notifiers[/id[/test]]`) via [`DaemonClient`].
 
 use anyhow::{Context, Result};
-use zlayer_api::storage::{NotifierConfig, NotifierKind, StoredNotifier};
+use zlayer_types::storage::{NotifierConfig, NotifierKind, StoredNotifier};
 
 use zlayer_client::DaemonClient;
 

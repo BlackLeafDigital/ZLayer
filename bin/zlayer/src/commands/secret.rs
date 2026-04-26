@@ -22,9 +22,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
-use zlayer_api::handlers::secrets::SecretMetadataResponse;
-use zlayer_api::storage::{PermissionLevel, SubjectKind};
 use zlayer_api::GrantPermissionRequest;
+use zlayer_types::api::secrets::SecretMetadataResponse;
+use zlayer_types::storage::{PermissionLevel, SubjectKind};
 
 use crate::cli::{Cli, SecretCommands};
 use zlayer_client::DaemonClient;

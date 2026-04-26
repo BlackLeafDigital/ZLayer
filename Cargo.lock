@@ -12100,6 +12100,7 @@ dependencies = [
  "zlayer-storage",
  "zlayer-tui",
  "zlayer-tunnel",
+ "zlayer-types",
  "zlayer-wsl",
 ]
 
@@ -12164,6 +12165,7 @@ dependencies = [
  "zlayer-secrets",
  "zlayer-spec",
  "zlayer-storage",
+ "zlayer-types",
  "zlayer-wsl",
  "zstd",
 ]
@@ -12231,6 +12233,7 @@ dependencies = [
  "zlayer-secrets",
  "zlayer-spec",
  "zlayer-storage",
+ "zlayer-types",
 ]
 
 [[package]]
@@ -12296,6 +12299,7 @@ dependencies = [
  "tracing",
  "zlayer-api",
  "zlayer-paths",
+ "zlayer-types",
 ]
 
 [[package]]
@@ -12326,6 +12330,7 @@ dependencies = [
  "tracing",
  "zlayer-paths",
  "zlayer-spec",
+ "zlayer-types",
 ]
 
 [[package]]
@@ -12495,6 +12500,7 @@ dependencies = [
  "zlayer-agent",
  "zlayer-api",
  "zlayer-spec",
+ "zlayer-types",
 ]
 
 [[package]]
@@ -12701,16 +12707,7 @@ dependencies = [
 name = "zlayer-spec"
 version = "0.0.0-dev"
 dependencies = [
- "chrono",
- "cron",
- "humantime",
- "regex",
- "serde",
- "serde_json",
- "serde_yaml",
- "thiserror 2.0.18",
- "utoipa",
- "validator",
+ "zlayer-types",
 ]
 
 [[package]]
@@ -12773,8 +12770,18 @@ dependencies = [
 name = "zlayer-types"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "cron",
+ "humantime",
  "oci-client",
+ "regex",
  "serde",
+ "serde_json",
+ "serde_yaml",
+ "thiserror 2.0.18",
+ "utoipa",
+ "uuid",
+ "validator",
 ]
 
 [[package]]

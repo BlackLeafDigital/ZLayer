@@ -41,6 +41,7 @@ docker-compat = ["dep:zlayer-docker"]
 [dependencies]
 # Internal crates (cross-platform)
 zlayer-spec.workspace = true
+zlayer-types = { workspace = true }
 zlayer-observability.workspace = true
 zlayer-builder = { workspace = true, features = ["cache", "cache-persistent", "local-registry"] }
 zlayer-core.workspace = true

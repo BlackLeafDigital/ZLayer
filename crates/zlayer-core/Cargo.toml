@@ -20,6 +20,7 @@ thiserror.workspace = true
 tracing = "0.1"
 zlayer-paths.workspace = true
 zlayer-spec.workspace = true
+zlayer-types = { path = "../zlayer-types" }
 
 [lints]
 workspace = true

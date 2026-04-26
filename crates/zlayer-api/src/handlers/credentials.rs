@@ -15,8 +15,8 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+
+pub use zlayer_types::api::credentials::*;
 
 use crate::error::{ApiError, Result};
 use crate::handlers::users::AuthActor;
@@ -50,106 +50,46 @@ impl CredentialState {
     }
 }
 
-// ---- OpenAPI-compatible response types ----
-//
-// The `zlayer_secrets` types do not derive `ToSchema`, so we define local
-// response structs that mirror them and can be registered in `openapi.rs`.
+// ---- Conversions from `zlayer_secrets` records to wire DTOs ----
 
-/// Registry credential metadata (returned by list/create; no password).
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct RegistryCredentialResponse {
-    /// Unique identifier.
-    pub id: String,
-    /// Registry hostname, e.g. `"docker.io"`, `"ghcr.io"`.
-    pub registry: String,
-    /// Username for authentication.
-    pub username: String,
-    /// Authentication method.
-    pub auth_type: RegistryAuthTypeSchema,
-}
-
-impl From<zlayer_secrets::RegistryCredential> for RegistryCredentialResponse {
-    fn from(c: zlayer_secrets::RegistryCredential) -> Self {
-        Self {
-            id: c.id,
-            registry: c.registry,
-            username: c.username,
-            auth_type: match c.auth_type {
-                zlayer_secrets::RegistryAuthType::Basic => RegistryAuthTypeSchema::Basic,
-                zlayer_secrets::RegistryAuthType::Token => RegistryAuthTypeSchema::Token,
-            },
-        }
+/// Build a [`RegistryCredentialResponse`] DTO from a stored
+/// [`zlayer_secrets::RegistryCredential`].
+///
+/// Free function (rather than
+/// `impl From<zlayer_secrets::RegistryCredential> for RegistryCredentialResponse`)
+/// because both types are foreign to this crate, which would violate the
+/// orphan rule.
+#[must_use]
+pub fn registry_credential_response_from(
+    c: zlayer_secrets::RegistryCredential,
+) -> RegistryCredentialResponse {
+    RegistryCredentialResponse {
+        id: c.id,
+        registry: c.registry,
+        username: c.username,
+        auth_type: match c.auth_type {
+            zlayer_secrets::RegistryAuthType::Basic => RegistryAuthTypeSchema::Basic,
+            zlayer_secrets::RegistryAuthType::Token => RegistryAuthTypeSchema::Token,
+        },
     }
 }
 
-/// Authentication method for a registry credential (`OpenAPI` schema).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum RegistryAuthTypeSchema {
-    /// HTTP Basic authentication (username + password).
-    Basic,
-    /// Bearer token authentication.
-    Token,
-}
-
-/// Git credential metadata (returned by list/create; no secret value).
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct GitCredentialResponse {
-    /// Unique identifier.
-    pub id: String,
-    /// Human-readable display label.
-    pub name: String,
-    /// Credential kind.
-    pub kind: GitCredentialKindSchema,
-}
-
-impl From<zlayer_secrets::GitCredential> for GitCredentialResponse {
-    fn from(c: zlayer_secrets::GitCredential) -> Self {
-        Self {
-            id: c.id,
-            name: c.name,
-            kind: match c.kind {
-                zlayer_secrets::GitCredentialKind::Pat => GitCredentialKindSchema::Pat,
-                zlayer_secrets::GitCredentialKind::SshKey => GitCredentialKindSchema::SshKey,
-            },
-        }
+/// Build a [`GitCredentialResponse`] DTO from a stored
+/// [`zlayer_secrets::GitCredential`].
+///
+/// Free function (rather than
+/// `impl From<zlayer_secrets::GitCredential> for GitCredentialResponse`) because
+/// both types are foreign to this crate, which would violate the orphan rule.
+#[must_use]
+pub fn git_credential_response_from(c: zlayer_secrets::GitCredential) -> GitCredentialResponse {
+    GitCredentialResponse {
+        id: c.id,
+        name: c.name,
+        kind: match c.kind {
+            zlayer_secrets::GitCredentialKind::Pat => GitCredentialKindSchema::Pat,
+            zlayer_secrets::GitCredentialKind::SshKey => GitCredentialKindSchema::SshKey,
+        },
     }
-}
-
-/// Kind of git credential (`OpenAPI` schema).
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum GitCredentialKindSchema {
-    /// Personal access token.
-    Pat,
-    /// SSH private key.
-    SshKey,
-}
-
-// ---- Request types ----
-
-/// Body for `POST /api/v1/credentials/registry`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CreateRegistryCredentialRequest {
-    /// Registry hostname (e.g. `"docker.io"`).
-    pub registry: String,
-    /// Username for authentication.
-    pub username: String,
-    /// Password or token value (stored encrypted, never returned).
-    pub password: String,
-    /// Authentication method.
-    pub auth_type: RegistryAuthTypeSchema,
-}
-
-/// Body for `POST /api/v1/credentials/git`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CreateGitCredentialRequest {
-    /// Human-readable label (e.g. `"GitHub PAT for ci"`).
-    pub name: String,
-    /// PAT or SSH key content (stored encrypted, never returned).
-    pub value: String,
-    /// Credential kind.
-    pub kind: GitCredentialKindSchema,
 }
 
 // ---- Endpoints: Registry credentials ----
@@ -178,7 +118,12 @@ pub async fn list_registry_credentials(
         .list()
         .await
         .map_err(|e| ApiError::Internal(format!("Registry credential store: {e}")))?;
-    Ok(Json(creds.into_iter().map(Into::into).collect()))
+    Ok(Json(
+        creds
+            .into_iter()
+            .map(registry_credential_response_from)
+            .collect(),
+    ))
 }
 
 /// Create a new registry credential. Admin only.
@@ -230,7 +175,10 @@ pub async fn create_registry_credential(
         .await
         .map_err(|e| ApiError::Internal(format!("Registry credential store: {e}")))?;
 
-    Ok((StatusCode::CREATED, Json(cred.into())))
+    Ok((
+        StatusCode::CREATED,
+        Json(registry_credential_response_from(cred)),
+    ))
 }
 
 /// Delete a registry credential. Admin only.
@@ -296,7 +244,12 @@ pub async fn list_git_credentials(
         .list()
         .await
         .map_err(|e| ApiError::Internal(format!("Git credential store: {e}")))?;
-    Ok(Json(creds.into_iter().map(Into::into).collect()))
+    Ok(Json(
+        creds
+            .into_iter()
+            .map(git_credential_response_from)
+            .collect(),
+    ))
 }
 
 /// Create a new git credential. Admin only.
@@ -347,7 +300,10 @@ pub async fn create_git_credential(
         .await
         .map_err(|e| ApiError::Internal(format!("Git credential store: {e}")))?;
 
-    Ok((StatusCode::CREATED, Json(cred.into())))
+    Ok((
+        StatusCode::CREATED,
+        Json(git_credential_response_from(cred)),
+    ))
 }
 
 /// Delete a git credential. Admin only.

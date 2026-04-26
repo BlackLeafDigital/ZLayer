@@ -1,0 +1,36 @@
+// API DTO modules. Populated in Phase 2.
+
+pub mod audit;
+pub mod auth;
+pub mod build;
+pub mod container_networks;
+pub mod containers;
+pub mod credentials;
+pub mod cron;
+pub mod deployments;
+pub mod environments;
+pub mod events;
+pub mod groups;
+pub mod health;
+pub mod images;
+pub mod internal;
+pub mod jobs;
+pub mod networks;
+pub mod nodes;
+pub mod notifiers;
+pub mod oidc;
+pub mod overlay;
+pub mod permissions;
+pub mod projects;
+pub mod proxy;
+pub mod secrets;
+pub mod services;
+pub mod storage;
+pub mod syncs;
+pub mod tasks;
+pub mod tunnels;
+pub mod users;
+pub mod variables;
+pub mod volumes;
+pub mod webhooks;
+pub mod workflows;

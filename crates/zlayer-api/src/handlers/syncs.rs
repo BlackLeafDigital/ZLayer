@@ -31,8 +31,8 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+
+pub use zlayer_types::api::syncs::*;
 
 use crate::error::{ApiError, Result};
 use crate::storage::{DeploymentStorage, StoredDeployment, StoredSync, SyncStorage};
@@ -77,140 +77,33 @@ impl SyncState {
     }
 }
 
-// ---- Request/response types ----
+// ---- Local conversions ----
 
-/// Body for `POST /api/v1/syncs`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CreateSyncRequest {
-    /// Display name for this sync.
-    pub name: String,
-    /// Linked project id.
-    #[serde(default)]
-    pub project_id: Option<String>,
-    /// Path within the project's checkout to scan for resource YAMLs.
-    pub git_path: String,
-    /// Whether the sync should automatically apply on pull.
-    #[serde(default)]
-    pub auto_apply: Option<bool>,
-    /// Whether `apply` should delete resources on the API that are missing
-    /// from the manifest directory. Defaults to `false` (the safer choice).
-    #[serde(default)]
-    pub delete_missing: Option<bool>,
-}
-
-/// Result of reconciling a single resource during apply.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SyncResourceResult {
-    /// The source manifest path (or remote resource name for deletions).
-    pub resource: String,
-    /// Resource kind: `"deployment"`, `"job"`, `"cron"`, or other.
-    pub kind: String,
-    /// Action taken: `"create"`, `"update"`, `"delete"`, or `"skip"`.
-    pub action: String,
-    /// Outcome status: `"ok"` or `"error"`.
-    pub status: String,
-    /// Optional error message (`status == "error"`) or skip reason
-    /// (`action == "skip"`). Omitted on successful `"ok"` results.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-impl SyncResourceResult {
-    fn ok(resource: &str, kind: &str, action: &str) -> Self {
-        Self {
-            resource: resource.to_string(),
-            kind: kind.to_string(),
-            action: action.to_string(),
-            status: "ok".to_string(),
-            error: None,
-        }
-    }
-
-    fn err(resource: &str, kind: &str, action: &str, message: String) -> Self {
-        Self {
-            resource: resource.to_string(),
-            kind: kind.to_string(),
-            action: action.to_string(),
-            status: "error".to_string(),
-            error: Some(message),
-        }
-    }
-
-    fn skip(resource: &str, kind: &str, message: String) -> Self {
-        Self {
-            resource: resource.to_string(),
-            kind: kind.to_string(),
-            action: "skip".to_string(),
-            status: "ok".to_string(),
-            error: Some(message),
-        }
-    }
-}
-
-/// Response for a real apply. Reports per-resource outcomes, the current
-/// commit SHA the sync was applied at (when known), and a short human-readable
-/// summary for CLI display.
+/// Convert the internal git-sync diff into the wire response shape.
 ///
-/// NOTE: This is a breaking change from the previous dry-run-only
-/// `{ diff, message }` shape. Clients inspecting the apply response directly
-/// must be updated — callers that only consumed the HTTP status stay working.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct SyncApplyResponse {
-    /// Per-resource reconcile results.
-    pub results: Vec<SyncResourceResult>,
-    /// Commit SHA the sync was applied against (when resolvable).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub applied_sha: Option<String>,
-    /// Aggregate summary suitable for CLI output, e.g.
-    /// `"3 created, 2 updated, 1 deleted, 0 skipped"`.
-    pub summary: String,
-}
-
-/// JSON-friendly wrapper around [`SyncDiff`].
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct SyncDiffResponse {
-    /// Resources to create.
-    pub to_create: Vec<SyncResourceResponse>,
-    /// Resources to update.
-    pub to_update: Vec<SyncResourceResponse>,
-    /// Resource names to delete.
-    pub to_delete: Vec<String>,
-}
-
-/// A single resource in the diff output.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct SyncResourceResponse {
-    /// Source file name.
-    pub file_path: String,
-    /// Resource kind.
-    pub kind: String,
-    /// Resource name.
-    pub name: String,
-}
-
-impl From<SyncDiff> for SyncDiffResponse {
-    fn from(diff: SyncDiff) -> Self {
-        Self {
-            to_create: diff
-                .to_create
-                .into_iter()
-                .map(|r| SyncResourceResponse {
-                    file_path: r.file_path,
-                    kind: r.kind,
-                    name: r.name,
-                })
-                .collect(),
-            to_update: diff
-                .to_update
-                .into_iter()
-                .map(|r| SyncResourceResponse {
-                    file_path: r.file_path,
-                    kind: r.kind,
-                    name: r.name,
-                })
-                .collect(),
-            to_delete: diff.to_delete,
-        }
+/// Lives here (not in `zlayer-types`) because `SyncDiff` is defined in
+/// `zlayer-git`, which the types crate does not depend on.
+fn sync_diff_to_response(diff: SyncDiff) -> SyncDiffResponse {
+    SyncDiffResponse {
+        to_create: diff
+            .to_create
+            .into_iter()
+            .map(|r| SyncResourceResponse {
+                file_path: r.file_path,
+                kind: r.kind,
+                name: r.name,
+            })
+            .collect(),
+        to_update: diff
+            .to_update
+            .into_iter()
+            .map(|r| SyncResourceResponse {
+                file_path: r.file_path,
+                kind: r.kind,
+                name: r.name,
+            })
+            .collect(),
+        to_delete: diff.to_delete,
     }
 }
 
@@ -324,7 +217,7 @@ pub async fn diff_sync(
     let remote_names: Vec<String> = remote.into_iter().map(|d| d.name).collect();
 
     let diff = compute_diff(&local, &remote_names);
-    Ok(Json(diff.into()))
+    Ok(Json(sync_diff_to_response(diff)))
 }
 
 /// Apply a sync — real reconcile against the API.

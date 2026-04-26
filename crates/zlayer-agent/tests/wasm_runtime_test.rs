@@ -212,7 +212,7 @@ fn create_wasm_spec(image: &str) -> ServiceSpec {
         rtype: ResourceType::Service,
         schedule: None,
         image: ImageSpec {
-            name: image.to_string(),
+            name: image.parse().expect("valid image reference"),
             pull_policy: PullPolicy::Never, // We're using local WASM files
         },
         resources: ResourcesSpec::default(),
@@ -455,7 +455,7 @@ mod lifecycle_tests {
 
         // Write minimal WASM to cache
         let wasm_bytes = compile_wat(MINIMAL_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:minimal", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:minimal", &wasm_bytes);
 
         let id = unique_container_id("create");
         let spec = create_wasm_spec(&image);
@@ -486,7 +486,7 @@ mod lifecycle_tests {
 
         // Write minimal WASM to cache
         let wasm_bytes = compile_wat(MINIMAL_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:start", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:start", &wasm_bytes);
 
         let id = unique_container_id("start");
         let spec = create_wasm_spec(&image);
@@ -516,7 +516,7 @@ mod lifecycle_tests {
 
         // Write compute WASM to cache (takes a bit longer to run)
         let wasm_bytes = compile_wat(COMPUTE_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:stop", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:stop", &wasm_bytes);
 
         let id = unique_container_id("stop");
         let spec = create_wasm_spec(&image);
@@ -549,7 +549,7 @@ mod lifecycle_tests {
 
         // Write minimal WASM to cache
         let wasm_bytes = compile_wat(MINIMAL_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:remove", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:remove", &wasm_bytes);
 
         let id = unique_container_id("remove");
         let spec = create_wasm_spec(&image);
@@ -583,7 +583,7 @@ mod lifecycle_tests {
 
         // Write minimal WASM to cache
         let wasm_bytes = compile_wat(MINIMAL_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:lifecycle", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:lifecycle", &wasm_bytes);
 
         let id = unique_container_id("lifecycle");
         let spec = create_wasm_spec(&image);
@@ -645,7 +645,7 @@ mod state_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:pending", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:pending", &wasm_bytes);
 
         let id = unique_container_id("pending");
         let spec = create_wasm_spec(&image);
@@ -676,7 +676,7 @@ mod state_tests {
 
         // Use compute WASM which takes a tiny bit longer
         let wasm_bytes = compile_wat(COMPUTE_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:running", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:running", &wasm_bytes);
 
         let id = unique_container_id("running");
         let spec = create_wasm_spec(&image);
@@ -715,7 +715,7 @@ mod state_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:exited", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:exited", &wasm_bytes);
 
         let id = unique_container_id("exited");
         let spec = create_wasm_spec(&image);
@@ -750,7 +750,7 @@ mod state_tests {
         );
 
         let wasm_bytes = compile_wat(EXIT_CODE_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:exitcode", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:exitcode", &wasm_bytes);
 
         let id = unique_container_id("exitcode");
         let spec = create_wasm_spec(&image);
@@ -785,7 +785,7 @@ mod state_tests {
         );
 
         let wasm_bytes = compile_wat(NO_ENTRY_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:noentry", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:noentry", &wasm_bytes);
 
         let id = unique_container_id("noentry");
         let spec = create_wasm_spec(&image);
@@ -845,7 +845,7 @@ mod logs_stats_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:logs-empty", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:logs-empty", &wasm_bytes);
 
         let id = unique_container_id("logs-empty");
         let spec = create_wasm_spec(&image);
@@ -873,7 +873,7 @@ mod logs_stats_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:loglines", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:loglines", &wasm_bytes);
 
         let id = unique_container_id("loglines");
         let spec = create_wasm_spec(&image);
@@ -900,7 +900,7 @@ mod logs_stats_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:stats", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:stats", &wasm_bytes);
 
         let id = unique_container_id("stats");
         let spec = create_wasm_spec(&image);
@@ -959,7 +959,7 @@ mod exec_tests {
         );
 
         let wasm_bytes = compile_wat(COMPUTE_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:exec", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:exec", &wasm_bytes);
 
         let id = unique_container_id("exec");
         let spec = create_wasm_spec(&image);
@@ -1003,7 +1003,7 @@ mod wait_tests {
         );
 
         let wasm_bytes = compile_wat(MINIMAL_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:wait-success", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:wait-success", &wasm_bytes);
 
         let id = unique_container_id("wait-success");
         let spec = create_wasm_spec(&image);
@@ -1031,7 +1031,7 @@ mod wait_tests {
         );
 
         let wasm_bytes = compile_wat(EXIT_CODE_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:wait-42", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:wait-42", &wasm_bytes);
 
         let id = unique_container_id("wait-42");
         let spec = create_wasm_spec(&image);
@@ -1059,7 +1059,7 @@ mod wait_tests {
         );
 
         let wasm_bytes = compile_wat(COMPUTE_WASM);
-        let image = write_wasm_to_cache(&cache_dir, "test:compute", &wasm_bytes);
+        let image = write_wasm_to_cache(&cache_dir, "localhost/test:compute", &wasm_bytes);
 
         let id = unique_container_id("compute");
         let spec = create_wasm_spec(&image);

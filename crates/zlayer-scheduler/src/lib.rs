@@ -430,7 +430,7 @@ impl Scheduler {
             rtype: zlayer_spec::ResourceType::Service,
             schedule: None,
             image: zlayer_spec::ImageSpec {
-                name: "unknown:latest".to_string(),
+                name: "unknown:latest".parse().expect("valid image reference"),
                 pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
             },
             resources: zlayer_spec::ResourcesSpec::default(),

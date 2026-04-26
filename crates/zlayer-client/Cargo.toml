@@ -37,6 +37,9 @@ tokio-stream = { workspace = true }
 # Typed request/response structs used by the daemon API.
 zlayer-api.workspace = true
 
+# Shared wire DTOs (Session, BuildSpec, BuildHandle).
+zlayer-types = { path = "../zlayer-types" }
+
 [dev-dependencies]
 tempfile = "3"
 

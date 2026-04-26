@@ -2674,18 +2674,18 @@ pub(crate) enum AuthCommands {
     Whoami,
 }
 
-/// CLI-friendly user role. Converts into `zlayer_api::storage::UserRole`.
+/// CLI-friendly user role. Converts into `zlayer_types::storage::UserRole`.
 #[derive(Copy, Clone, Debug, ValueEnum)]
 pub(crate) enum CliUserRole {
     Admin,
     User,
 }
 
-impl From<CliUserRole> for zlayer_api::storage::UserRole {
+impl From<CliUserRole> for zlayer_types::storage::UserRole {
     fn from(r: CliUserRole) -> Self {
         match r {
-            CliUserRole::Admin => zlayer_api::storage::UserRole::Admin,
-            CliUserRole::User => zlayer_api::storage::UserRole::User,
+            CliUserRole::Admin => zlayer_types::storage::UserRole::Admin,
+            CliUserRole::User => zlayer_types::storage::UserRole::User,
         }
     }
 }
@@ -2881,11 +2881,11 @@ pub(crate) enum CliSubjectKind {
     Group,
 }
 
-impl From<CliSubjectKind> for zlayer_api::storage::SubjectKind {
+impl From<CliSubjectKind> for zlayer_types::storage::SubjectKind {
     fn from(k: CliSubjectKind) -> Self {
         match k {
-            CliSubjectKind::User => zlayer_api::storage::SubjectKind::User,
-            CliSubjectKind::Group => zlayer_api::storage::SubjectKind::Group,
+            CliSubjectKind::User => zlayer_types::storage::SubjectKind::User,
+            CliSubjectKind::Group => zlayer_types::storage::SubjectKind::Group,
         }
     }
 }
@@ -2898,12 +2898,12 @@ pub(crate) enum CliPermissionLevel {
     Execute,
 }
 
-impl From<CliPermissionLevel> for zlayer_api::storage::PermissionLevel {
+impl From<CliPermissionLevel> for zlayer_types::storage::PermissionLevel {
     fn from(l: CliPermissionLevel) -> Self {
         match l {
-            CliPermissionLevel::Read => zlayer_api::storage::PermissionLevel::Read,
-            CliPermissionLevel::Write => zlayer_api::storage::PermissionLevel::Write,
-            CliPermissionLevel::Execute => zlayer_api::storage::PermissionLevel::Execute,
+            CliPermissionLevel::Read => zlayer_types::storage::PermissionLevel::Read,
+            CliPermissionLevel::Write => zlayer_types::storage::PermissionLevel::Write,
+            CliPermissionLevel::Execute => zlayer_types::storage::PermissionLevel::Execute,
         }
     }
 }

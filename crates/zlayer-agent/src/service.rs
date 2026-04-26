@@ -116,11 +116,12 @@ impl ServiceInstance {
         // Phase 2: Scale up - create new containers (no lock held during I/O)
         if replicas > current_replicas {
             // Pull image ONCE before creating any replicas (cached layers are reused)
+            let image_str = self.spec.image.name.to_string();
             self.runtime
-                .pull_image_with_policy(&self.spec.image.name, self.spec.image.pull_policy, None)
+                .pull_image_with_policy(&image_str, self.spec.image.pull_policy, None)
                 .await
                 .map_err(|e| AgentError::PullFailed {
-                    image: self.spec.image.name.clone(),
+                    image: self.spec.image.name.to_string(),
                     reason: e.to_string(),
                 })?;
 

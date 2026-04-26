@@ -9,7 +9,6 @@
 //! and wait with exponential backoff until the socket / TCP port becomes
 //! available.
 
-use std::collections::HashMap;
 #[cfg(unix)]
 use std::future::Future;
 #[cfg(windows)]
@@ -31,18 +30,18 @@ use hyper::Uri;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
-use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tracing::{debug, info};
-use zlayer_api::handlers::auth::{BootstrapRequest, LoginRequest, LoginResponse, UserView};
-use zlayer_api::handlers::containers::ContainerExecResponse;
-use zlayer_api::handlers::images::{ImageInfoDto, PruneResultDto, PullImageResponse};
-use zlayer_api::handlers::secrets::{
+use zlayer_types::api::auth::{BootstrapRequest, LoginRequest, LoginResponse, UserView};
+use zlayer_types::api::containers::ContainerExecResponse;
+use zlayer_types::api::images::{ImageInfoDto, PruneResultDto, PullImageResponse};
+use zlayer_types::api::secrets::{
     RevealAllSecretsResponse, RotateSecretResponse, SecretMetadataResponse,
 };
-use zlayer_api::handlers::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
-use zlayer_api::storage::{StoredEnvironment, StoredVariable};
+use zlayer_types::api::users::{CreateUserRequest, SetPasswordRequest, UpdateUserRequest};
+use zlayer_types::client::{BuildHandle, BuildSpec};
+use zlayer_types::storage::{StoredEnvironment, StoredVariable};
 
 /// Default daemon endpoint.
 ///
@@ -2480,7 +2479,7 @@ impl DaemonClient {
     pub async fn list_tasks(
         &self,
         project_id: Option<&str>,
-    ) -> Result<Vec<zlayer_api::StoredTask>> {
+    ) -> Result<Vec<zlayer_types::storage::StoredTask>> {
         let path = match project_id {
             Some(pid) => format!("/api/v1/tasks?project_id={}", urlencoding(pid)),
             None => "/api/v1/tasks".to_string(),
@@ -2499,7 +2498,7 @@ impl DaemonClient {
         kind: &str,
         body_script: &str,
         project_id: Option<&str>,
-    ) -> Result<zlayer_api::StoredTask> {
+    ) -> Result<zlayer_types::storage::StoredTask> {
         let payload = serde_json::json!({
             "name": name,
             "kind": kind,
@@ -2517,7 +2516,7 @@ impl DaemonClient {
     /// Fetch a single task by id.
     ///
     /// `GET /api/v1/tasks/{id}`.
-    pub async fn get_task(&self, id: &str) -> Result<zlayer_api::StoredTask> {
+    pub async fn get_task(&self, id: &str) -> Result<zlayer_types::storage::StoredTask> {
         let path = format!("/api/v1/tasks/{}", urlencoding(id));
         let (status, body) = self.get(&path).await?;
         Self::check_status(status, &body)?;
@@ -2527,7 +2526,7 @@ impl DaemonClient {
     /// Execute a task synchronously.
     ///
     /// `POST /api/v1/tasks/{id}/run`.
-    pub async fn run_task(&self, id: &str) -> Result<zlayer_api::TaskRun> {
+    pub async fn run_task(&self, id: &str) -> Result<zlayer_types::storage::TaskRun> {
         let path = format!("/api/v1/tasks/{}/run", urlencoding(id));
         let (status, body) = self.post_json(&path, "{}").await?;
         Self::check_status(status, &body)?;
@@ -2537,7 +2536,7 @@ impl DaemonClient {
     /// List past runs for a task.
     ///
     /// `GET /api/v1/tasks/{id}/runs`.
-    pub async fn list_task_runs(&self, id: &str) -> Result<Vec<zlayer_api::TaskRun>> {
+    pub async fn list_task_runs(&self, id: &str) -> Result<Vec<zlayer_types::storage::TaskRun>> {
         let path = format!("/api/v1/tasks/{}/runs", urlencoding(id));
         let (status, body) = self.get(&path).await?;
         Self::check_status(status, &body)?;
@@ -2561,7 +2560,7 @@ impl DaemonClient {
     /// List all workflows.
     ///
     /// `GET /api/v1/workflows`
-    pub async fn list_workflows(&self) -> Result<Vec<zlayer_api::StoredWorkflow>> {
+    pub async fn list_workflows(&self) -> Result<Vec<zlayer_types::storage::StoredWorkflow>> {
         let (status, body) = self.get("/api/v1/workflows").await?;
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
@@ -2577,7 +2576,7 @@ impl DaemonClient {
         name: &str,
         steps_json: &str,
         project_id: Option<&str>,
-    ) -> Result<zlayer_api::StoredWorkflow> {
+    ) -> Result<zlayer_types::storage::StoredWorkflow> {
         // Parse the steps JSON to validate it before sending
         let steps: serde_json::Value =
             serde_json::from_str(steps_json).context("Invalid JSON for --steps")?;
@@ -2598,7 +2597,7 @@ impl DaemonClient {
     /// Execute a workflow synchronously.
     ///
     /// `POST /api/v1/workflows/{id}/run`.
-    pub async fn run_workflow(&self, id: &str) -> Result<zlayer_api::WorkflowRun> {
+    pub async fn run_workflow(&self, id: &str) -> Result<zlayer_types::storage::WorkflowRun> {
         let path = format!("/api/v1/workflows/{}/run", urlencoding(id));
         let (status, body) = self.post_json(&path, "{}").await?;
         Self::check_status(status, &body)?;
@@ -2608,7 +2607,10 @@ impl DaemonClient {
     /// List past runs for a workflow.
     ///
     /// `GET /api/v1/workflows/{id}/runs`.
-    pub async fn list_workflow_runs(&self, id: &str) -> Result<Vec<zlayer_api::WorkflowRun>> {
+    pub async fn list_workflow_runs(
+        &self,
+        id: &str,
+    ) -> Result<Vec<zlayer_types::storage::WorkflowRun>> {
         let path = format!("/api/v1/workflows/{}/runs", urlencoding(id));
         let (status, body) = self.get(&path).await?;
         Self::check_status(status, &body)?;
@@ -2632,7 +2634,7 @@ impl DaemonClient {
     /// List all notifiers.
     ///
     /// `GET /api/v1/notifiers`
-    pub async fn list_notifiers(&self) -> Result<Vec<zlayer_api::StoredNotifier>> {
+    pub async fn list_notifiers(&self) -> Result<Vec<zlayer_types::storage::StoredNotifier>> {
         let (status, body) = self.get("/api/v1/notifiers").await?;
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
@@ -2644,9 +2646,9 @@ impl DaemonClient {
     pub async fn create_notifier(
         &self,
         name: &str,
-        kind: zlayer_api::NotifierKind,
-        config: &zlayer_api::NotifierConfig,
-    ) -> Result<zlayer_api::StoredNotifier> {
+        kind: zlayer_types::storage::NotifierKind,
+        config: &zlayer_types::storage::NotifierConfig,
+    ) -> Result<zlayer_types::storage::StoredNotifier> {
         let payload = serde_json::json!({
             "name": name,
             "kind": kind,
@@ -2663,7 +2665,10 @@ impl DaemonClient {
     /// Send a test notification through a notifier.
     ///
     /// `POST /api/v1/notifiers/{id}/test`.
-    pub async fn test_notifier(&self, id: &str) -> Result<zlayer_api::TestNotifierResponse> {
+    pub async fn test_notifier(
+        &self,
+        id: &str,
+    ) -> Result<zlayer_types::api::notifiers::TestNotifierResponse> {
         let path = format!("/api/v1/notifiers/{}/test", urlencoding(id));
         let (status, body) = self.post_json(&path, "{}").await?;
         Self::check_status(status, &body)?;
@@ -2687,7 +2692,7 @@ impl DaemonClient {
     /// List all groups.
     ///
     /// `GET /api/v1/groups`
-    pub async fn list_groups(&self) -> Result<Vec<zlayer_api::storage::StoredUserGroup>> {
+    pub async fn list_groups(&self) -> Result<Vec<zlayer_types::storage::StoredUserGroup>> {
         let (status, body) = self.get("/api/v1/groups").await?;
         Self::check_status(status, &body)?;
         Self::parse_json(&body)
@@ -2698,8 +2703,8 @@ impl DaemonClient {
     /// `POST /api/v1/groups`
     pub async fn create_group(
         &self,
-        req: &zlayer_api::CreateGroupRequest,
-    ) -> Result<zlayer_api::storage::StoredUserGroup> {
+        req: &zlayer_types::api::groups::CreateGroupRequest,
+    ) -> Result<zlayer_types::storage::StoredUserGroup> {
         let body = serde_json::to_string(req).context("Failed to serialise CreateGroupRequest")?;
         let (status, resp_body) = self.post_json("/api/v1/groups", &body).await?;
         Self::check_status(status, &resp_body)?;
@@ -2720,7 +2725,7 @@ impl DaemonClient {
     ///
     /// `POST /api/v1/groups/{id}/members`
     pub async fn add_group_member(&self, group_id: &str, user_id: &str) -> Result<()> {
-        let req = zlayer_api::AddMemberRequest {
+        let req = zlayer_types::api::groups::AddMemberRequest {
             user_id: user_id.to_string(),
         };
         let body = serde_json::to_string(&req).context("Failed to serialise AddMemberRequest")?;
@@ -2755,7 +2760,7 @@ impl DaemonClient {
         &self,
         user: Option<&str>,
         group: Option<&str>,
-    ) -> Result<Vec<zlayer_api::storage::StoredPermission>> {
+    ) -> Result<Vec<zlayer_types::storage::StoredPermission>> {
         let mut path = "/api/v1/permissions".to_string();
         if let Some(uid) = user {
             path = format!("{path}?user={}", urlencoding(uid));
@@ -2772,8 +2777,8 @@ impl DaemonClient {
     /// `POST /api/v1/permissions`
     pub async fn grant_permission(
         &self,
-        req: &zlayer_api::GrantPermissionRequest,
-    ) -> Result<zlayer_api::storage::StoredPermission> {
+        req: &zlayer_types::api::permissions::GrantPermissionRequest,
+    ) -> Result<zlayer_types::storage::StoredPermission> {
         let body =
             serde_json::to_string(req).context("Failed to serialise GrantPermissionRequest")?;
         let (status, resp_body) = self.post_json("/api/v1/permissions", &body).await?;
@@ -2801,7 +2806,7 @@ impl DaemonClient {
         &self,
         resource_kind: &str,
         resource_id: Option<&str>,
-    ) -> Result<Vec<zlayer_api::storage::StoredPermission>> {
+    ) -> Result<Vec<zlayer_types::storage::StoredPermission>> {
         use std::fmt::Write as _;
         let mut path = format!(
             "/api/v1/permissions/by-resource?kind={}",
@@ -2871,54 +2876,6 @@ impl DaemonClient {
         Self::check_status(status, &resp)?;
         Self::parse_json(&resp)
     }
-}
-
-// ---------------------------------------------------------------------------
-// Build DTOs (client-side mirrors of zlayer-api build request/response shapes)
-// ---------------------------------------------------------------------------
-
-/// Specification sent to the daemon's `POST /api/v1/build/json` endpoint to
-/// start an image build against a server-side context path.
-///
-/// Mirrors `zlayer_api::handlers::build::BuildRequestWithContext` on the
-/// wire; the server-side type is `Deserialize`-only so we carry a
-/// `Serialize` mirror here.
-#[derive(Debug, Clone, Default, Serialize)]
-pub struct BuildSpec {
-    /// Path to the build context on the daemon host. Must already exist.
-    pub context_path: String,
-    /// Runtime template name (e.g. `"node20"`) to use instead of a Dockerfile.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub runtime: Option<String>,
-    /// Build arguments (Dockerfile `ARG` values).
-    #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub build_args: HashMap<String, String>,
-    /// Target stage for multi-stage Dockerfiles.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub target: Option<String>,
-    /// Tags to apply to the resulting image.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
-    /// Disable the buildah layer cache.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub no_cache: bool,
-    /// Push the resulting image to its registry after the build succeeds.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub push: bool,
-}
-
-/// Handle returned by [`DaemonClient::start_build`]. Mirrors the wire shape
-/// of `zlayer_api::handlers::build::TriggerBuildResponse` (which is
-/// `Serialize`-only, so we carry a `Deserialize` mirror here).
-///
-/// The `build_id` can be fed to `GET /api/v1/build/{id}`,
-/// `GET /api/v1/build/{id}/stream`, and `GET /api/v1/build/{id}/logs`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct BuildHandle {
-    /// Unique build ID for tracking.
-    pub build_id: String,
-    /// Human-readable message from the daemon.
-    pub message: String,
 }
 
 // ---------------------------------------------------------------------------

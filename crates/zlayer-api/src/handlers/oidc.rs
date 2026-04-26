@@ -15,13 +15,13 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
 use axum_extra::extract::cookie::CookieJar;
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 
 use crate::auth::AuthState;
 use crate::error::{ApiError, Result};
 use crate::handlers::auth::issue_session;
 use crate::oidc::OidcProviderPublic;
+
+pub use zlayer_types::api::oidc::*;
 
 /// `GET /auth/oidc/providers`.
 #[utoipa::path(
@@ -87,30 +87,6 @@ pub async fn start(
         })?,
     );
     Ok((StatusCode::FOUND, headers))
-}
-
-/// Query params on the callback URL — the provider appends `?code=...&state=...`
-/// on success, or `?error=...&error_description=...` on user denial.
-#[derive(Debug, Deserialize)]
-pub struct CallbackParams {
-    #[serde(default)]
-    pub code: Option<String>,
-    #[serde(default)]
-    pub state: Option<String>,
-    #[serde(default)]
-    pub error: Option<String>,
-    #[serde(default)]
-    pub error_description: Option<String>,
-}
-
-/// Callback response body (returned as JSON unless the operator prefers a
-/// redirect; initial integration keeps JSON so the Manager UI can show a
-/// welcome screen post-exchange).
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct OidcCallbackResponse {
-    pub user: crate::handlers::auth::UserView,
-    pub csrf_token: String,
-    pub provider: String,
 }
 
 /// `GET /auth/oidc/:provider/callback`.

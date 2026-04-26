@@ -147,8 +147,8 @@ impl ServiceSpec {
 
     /// The container image name
     #[getter]
-    fn image(&self) -> &str {
-        &self.inner.image.name
+    fn image(&self) -> String {
+        self.inner.image.name.to_string()
     }
 
     /// Environment variables
@@ -597,7 +597,9 @@ pub fn create_service_spec(
         rtype: zlayer_spec::ResourceType::Service,
         schedule: None,
         image: zlayer_spec::ImageSpec {
-            name: image.to_string(),
+            name: image.parse().map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("invalid image reference: {e}"))
+            })?,
             pull_policy: zlayer_spec::PullPolicy::IfNotPresent,
         },
         resources: zlayer_spec::ResourcesSpec::default(),

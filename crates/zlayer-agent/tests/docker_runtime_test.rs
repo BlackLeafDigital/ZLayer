@@ -73,7 +73,7 @@ fn create_test_spec(image: &str) -> ServiceSpec {
         rtype: ResourceType::Service,
         schedule: None,
         image: ImageSpec {
-            name: image.to_string(),
+            name: image.parse().expect("valid image reference"),
             pull_policy: PullPolicy::IfNotPresent,
         },
         resources: ResourcesSpec::default(),

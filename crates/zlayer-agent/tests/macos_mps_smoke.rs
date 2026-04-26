@@ -296,6 +296,13 @@ fn compile_swift(source: &str, binary_name: &str) -> PathBuf {
 }
 
 /// Prepare a rootfs containing the compiled test binary.
+///
+/// The `image_name` argument MUST be the canonical form of the image
+/// reference (i.e. `spec.image.name.to_string()`), not the raw YAML string.
+/// `oci_client::Reference` canonicalizes bare names by adding the default
+/// registry (`docker.io/...`), and the runtime resolves the rootfs path
+/// using the canonical form. Passing the raw YAML string here would write
+/// the rootfs to a different directory than the runtime later looks up.
 async fn prepare_gpu_rootfs(
     runtime: &SandboxRuntime,
     image_name: &str,
@@ -408,7 +415,12 @@ services:
             .remove("metal-dev")
             .expect("Missing service");
 
-        prepare_gpu_rootfs(&runtime, image_name, &binary).await;
+        // Use the canonical form of the image reference so the rootfs path
+        // matches what the runtime computes via `spec.image.name.to_string()`.
+        // `oci_client::Reference` canonicalizes bare names like
+        // `macos-native/foo:latest` into `docker.io/macos-native/foo:latest`.
+        let canonical_image = spec.image.name.to_string();
+        prepare_gpu_rootfs(&runtime, &canonical_image, &binary).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -491,7 +503,12 @@ services:
             .remove("mps-compute")
             .expect("Missing service");
 
-        prepare_gpu_rootfs(&runtime, image_name, &binary).await;
+        // Use the canonical form of the image reference so the rootfs path
+        // matches what the runtime computes via `spec.image.name.to_string()`.
+        // `oci_client::Reference` canonicalizes bare names like
+        // `macos-native/foo:latest` into `docker.io/macos-native/foo:latest`.
+        let canonical_image = spec.image.name.to_string();
+        prepare_gpu_rootfs(&runtime, &canonical_image, &binary).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -574,7 +591,12 @@ services:
             .remove("shader-compile")
             .expect("Missing service");
 
-        prepare_gpu_rootfs(&runtime, image_name, &binary).await;
+        // Use the canonical form of the image reference so the rootfs path
+        // matches what the runtime computes via `spec.image.name.to_string()`.
+        // `oci_client::Reference` canonicalizes bare names like
+        // `macos-native/foo:latest` into `docker.io/macos-native/foo:latest`.
+        let canonical_image = spec.image.name.to_string();
+        prepare_gpu_rootfs(&runtime, &canonical_image, &binary).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 
@@ -662,7 +684,12 @@ services:
             .remove("gpu-denied")
             .expect("Missing service");
 
-        prepare_gpu_rootfs(&runtime, image_name, &binary).await;
+        // Use the canonical form of the image reference so the rootfs path
+        // matches what the runtime computes via `spec.image.name.to_string()`.
+        // `oci_client::Reference` canonicalizes bare names like
+        // `macos-native/foo:latest` into `docker.io/macos-native/foo:latest`.
+        let canonical_image = spec.image.name.to_string();
+        prepare_gpu_rootfs(&runtime, &canonical_image, &binary).await;
 
         let _guard = ContainerGuard::new(runtime.clone(), id.clone());
 

@@ -132,9 +132,8 @@ pub struct NodeSelector {
 ///
 /// Mirrors the OS half of an OCI platform descriptor. Canonical wire strings
 /// match Go's `GOOS` values (e.g. `"linux"`, `"windows"`, `"darwin"`).
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum OsKind {
     Linux,
@@ -183,9 +182,8 @@ impl OsKind {
 }
 
 /// CPU architecture a service needs. Mirrors the arch half of an OCI platform.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum ArchKind {
     Amd64,
@@ -218,9 +216,8 @@ impl ArchKind {
 //
 // NOTE: no `Copy`. `os_version: Option<String>` rules it out. `OsKind` / `ArchKind`
 // are still `Copy`, so field-level borrows stay ergonomic.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct TargetPlatform {
     pub os: OsKind,
     pub arch: ArchKind,
@@ -651,11 +648,11 @@ impl Default for ApiSpec {
 #[serde(deny_unknown_fields)]
 pub struct DeploymentSpec {
     /// Spec version (must be "v1")
-    #[validate(custom(function = "crate::validate::validate_version_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_version_wrapper"))]
     pub version: String,
 
     /// Deployment name (used for overlays, DNS)
-    #[validate(custom(function = "crate::validate::validate_deployment_name_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_deployment_name_wrapper"))]
     pub deployment: String,
 
     /// Service definitions
@@ -799,7 +796,7 @@ pub struct ServiceSpec {
     ///   - "0 */5 * * * * *" (every 5 minutes)
     ///   - "0 0 12 * * MON-FRI *" (weekdays at noon)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[validate(custom(function = "crate::validate::validate_schedule_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_schedule_wrapper"))]
     pub schedule: Option<String>,
 
     /// Container image specification
@@ -835,7 +832,7 @@ pub struct ServiceSpec {
 
     /// Scaling configuration
     #[serde(default)]
-    #[validate(custom(function = "crate::validate::validate_scale_spec"))]
+    #[validate(custom(function = "crate::spec::validate::validate_scale_spec"))]
     pub scale: ScaleSpec,
 
     /// Dependency specifications
@@ -996,8 +993,8 @@ pub enum ResourceType {
 #[serde(deny_unknown_fields)]
 pub struct ImageSpec {
     /// Image name (e.g., "ghcr.io/org/api:latest")
-    #[validate(custom(function = "crate::validate::validate_image_name_wrapper"))]
-    pub name: String,
+    #[serde(with = "crate::image_ref_serde")]
+    pub name: crate::ImageReference,
 
     /// When to pull the image
     #[serde(default = "default_pull_policy")]
@@ -1105,12 +1102,12 @@ pub enum StorageSpec {
 pub struct ResourcesSpec {
     /// CPU limit (cores, e.g., 0.5, 1, 2)
     #[serde(default)]
-    #[validate(custom(function = "crate::validate::validate_cpu_option_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_cpu_option_wrapper"))]
     pub cpu: Option<f64>,
 
     /// Memory limit (e.g., "512Mi", "1Gi", "2Gi")
     #[serde(default)]
-    #[validate(custom(function = "crate::validate::validate_memory_option_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_memory_option_wrapper"))]
     pub memory: Option<String>,
 
     /// GPU resource request
@@ -1361,7 +1358,7 @@ pub struct EndpointSpec {
     pub protocol: Protocol,
 
     /// Proxy listen port (external-facing port)
-    #[validate(custom(function = "crate::validate::validate_port_wrapper"))]
+    #[validate(custom(function = "crate::spec::validate::validate_port_wrapper"))]
     pub port: u16,
 
     /// Container port the service actually listens on.
@@ -1904,7 +1901,8 @@ pub enum AccessAction {
 // different concept (access-control groups).
 
 /// A user-defined bridge or overlay network that containers can attach to.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct BridgeNetwork {
     /// Opaque server-generated identifier (UUID v4).
     pub id: String,
@@ -1930,12 +1928,13 @@ pub struct BridgeNetwork {
     pub internal: bool,
 
     /// Creation timestamp (UTC, RFC 3339).
-    #[schema(value_type = String, format = "date-time")]
+    #[cfg_attr(feature = "utoipa", schema(value_type = String, format = "date-time"))]
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Backing driver for a [`BridgeNetwork`].
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
 pub enum BridgeNetworkDriver {
     /// Linux bridge on the local host (single-host, default).
@@ -1946,7 +1945,8 @@ pub enum BridgeNetworkDriver {
 }
 
 /// A container attached to a [`BridgeNetwork`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct BridgeNetworkAttachment {
     /// Runtime-provided container id.
     pub container_id: String,
@@ -1984,7 +1984,8 @@ pub struct BridgeNetworkAttachment {
 /// long-lived services. Use this inline form for one-off pulls (e.g. CI
 /// runners fetching a private image for a single job) where persisting a
 /// credential is undesirable.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 pub struct RegistryAuth {
     /// Username for the registry (for basic auth) or a placeholder
     /// identifier when `auth_type == Token`.
@@ -1998,7 +1999,8 @@ pub struct RegistryAuth {
 }
 
 /// Authentication scheme for a [`RegistryAuth`].
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum RegistryAuthType {
     /// HTTP Basic authentication (username + password). Default.
@@ -2030,7 +2032,8 @@ pub fn default_registry_auth_type() -> RegistryAuthType {
 /// Maps onto Docker's `HostConfig.RestartPolicy`. Distinct from
 /// [`PanicPolicy`], which governs what `ZLayer` does in response to an
 /// application panic (it does not set a Docker restart policy).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct ContainerRestartPolicy {
     /// Which restart policy to apply.
@@ -2050,7 +2053,8 @@ pub struct ContainerRestartPolicy {
 }
 
 /// Which flavor of container restart policy to apply.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum ContainerRestartKind {
     /// Never restart (Docker's `"no"`).
@@ -2070,7 +2074,8 @@ pub enum ContainerRestartKind {
 // ==========================================================================
 
 /// Transport protocol for a published container port.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum PortProtocol {
     /// TCP (default).
@@ -2110,7 +2115,8 @@ fn default_host_ip() -> String {
 /// When `host_port` is `None` (or explicitly `Some(0)`), the container runtime
 /// assigns an ephemeral host port. `host_ip` defaults to `"0.0.0.0"` to bind
 /// on all interfaces.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "utoipa", derive(utoipa::ToSchema))]
 #[serde(rename_all = "snake_case")]
 pub struct PortMapping {
     /// Host port. `None` (or zero) means "assign an ephemeral port".

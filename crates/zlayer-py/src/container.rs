@@ -158,8 +158,9 @@ impl Container {
             drop(inner);
 
             // Pull image
+            let image_str = spec.image.name.to_string();
             runtime
-                .pull_image(&spec.image.name)
+                .pull_image(&image_str)
                 .await
                 .map_err(ZLayerError::from)?;
 

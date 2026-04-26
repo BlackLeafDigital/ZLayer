@@ -183,7 +183,13 @@ impl CompositeRuntime {
             return Ok(target);
         }
 
-        if let Some(os) = self.image_os.read().await.get(&spec.image.name).copied() {
+        if let Some(os) = self
+            .image_os
+            .read()
+            .await
+            .get(&spec.image.name.to_string())
+            .copied()
+        {
             return match os {
                 OsKind::Linux => {
                     if self.delegate.is_some() {

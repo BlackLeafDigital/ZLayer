@@ -11,16 +11,7 @@ categories = ["config", "parsing"]
 readme = "README.md"
 
 [dependencies]
-chrono.workspace = true
-cron.workspace = true
-humantime = "2.3.0"
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
-serde_yaml.workspace = true
-thiserror.workspace = true
-utoipa.workspace = true
-validator.workspace = true
-regex = "1"
+zlayer-types = { workspace = true, features = ["utoipa"] }
 
 [lints]
 workspace = true

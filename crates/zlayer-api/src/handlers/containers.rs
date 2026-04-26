@@ -18,10 +18,8 @@ use axum::{
     Json,
 };
 use futures_util::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
-use utoipa::{IntoParams, ToSchema};
 
 use crate::auth::AuthUser;
 use crate::error::{ApiError, Result};
@@ -32,6 +30,8 @@ use zlayer_agent::runtime::{
     NetworkAttachmentDetail, Runtime,
 };
 use zlayer_spec::BridgeNetworkAttachment;
+
+pub use zlayer_types::api::containers::*;
 
 // ---------------------------------------------------------------------------
 // State
@@ -146,56 +146,6 @@ impl ContainerApiState {
 // Request / Response types
 // ---------------------------------------------------------------------------
 
-/// Resource limits for a container
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct ContainerResourceLimits {
-    /// CPU limit in cores (e.g., 0.5, 1.0, 2.0)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cpu: Option<f64>,
-    /// Memory limit (e.g., "256Mi", "1Gi")
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub memory: Option<String>,
-}
-
-/// Volume mount kind discriminator.
-///
-/// Selects which [`zlayer_spec::StorageSpec`] variant [`VolumeMount`] is
-/// translated into by [`build_service_spec`]. When omitted on the wire,
-/// defaults to [`VolumeMountType::Bind`] (legacy behavior).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum VolumeMountType {
-    /// Host-path bind mount. `source` is an absolute host path.
-    Bind,
-    /// Named persistent volume. `source` is the volume name (managed by
-    /// `/api/v1/volumes`), not a host path.
-    Volume,
-    /// Memory-backed tmpfs mount. `source` must be empty/omitted.
-    Tmpfs,
-}
-
-/// Volume mount specification.
-///
-/// The `type` field (a Docker-compatible discriminator) selects how `source`
-/// is interpreted:
-/// - `"bind"` (default): `source` is an absolute host path.
-/// - `"volume"`: `source` is a named-volume identifier.
-/// - `"tmpfs"`: no `source`; a memory-backed mount is provisioned.
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct VolumeMount {
-    /// Mount kind. Omit (or `"bind"`) for legacy host-path binds.
-    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
-    pub mount_type: Option<VolumeMountType>,
-    /// Host path (bind), volume name (volume), or unused (tmpfs).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source: Option<String>,
-    /// Container mount path
-    pub target: String,
-    /// Mount as read-only
-    #[serde(default)]
-    pub readonly: bool,
-}
-
 /// Validate a volume name against the same rules enforced by the `/volumes`
 /// handler. Kept as a local copy to avoid cross-module coupling (see
 /// `handlers/volumes.rs::validate_volume_name`).
@@ -227,132 +177,89 @@ fn validate_volume_name_local(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Container health check request.
+/// Translate the wire-format [`HealthCheckRequest`] into the internal
+/// [`zlayer_spec::HealthSpec`].
 ///
-/// Mirrors the on-disk `HealthCheck` enum (see `zlayer_spec::HealthCheck`) as a
-/// discriminated union keyed on `type`. Translated to `zlayer_spec::HealthSpec`
-/// by `HealthCheckRequest::to_health_spec`. Durations are humantime strings
-/// (for example `"10s"`, `"500ms"`, `"1m"`).
+/// Free function (rather than `impl HealthCheckRequest`) because
+/// `HealthCheckRequest` is foreign to this crate, which would violate the
+/// orphan rule.
 ///
-/// ## Variants
-/// - `type: "tcp"` — requires `port` (1-65535).
-/// - `type: "http"` — requires `url`; `expect_status` defaults to 200.
-/// - `type: "command"` — requires `command` (array of argv tokens; joined with
-///   spaces and passed to `sh -c` by the health monitor, matching the existing
-///   compose-to-ZLayer conversion in `zlayer-docker`).
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct HealthCheckRequest {
-    /// Check variant: `"tcp"`, `"http"`, or `"command"`.
-    #[serde(rename = "type")]
-    pub check_type: String,
-    /// TCP port (required when `type == "tcp"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub port: Option<u16>,
-    /// HTTP URL (required when `type == "http"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub url: Option<String>,
-    /// HTTP status code expected from `url` (defaults to 200).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub expect_status: Option<u16>,
-    /// Command argv (required when `type == "command"`). Joined with spaces
-    /// and passed to `sh -c`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<Vec<String>>,
-    /// Interval between checks, humantime format (e.g. `"30s"`). Defaults to 30s.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub interval: Option<String>,
-    /// Timeout per individual check, humantime format.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub timeout: Option<String>,
-    /// Number of consecutive failures before marking unhealthy. Defaults to 3.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub retries: Option<u32>,
-    /// Grace period before the first check runs, humantime format. Maps to
-    /// `HealthSpec::start_grace`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub start_period: Option<String>,
-}
+/// # Errors
+/// Returns `ApiError::BadRequest` for:
+/// - Unknown `type` (must be `"tcp"`, `"http"`, or `"command"`).
+/// - Missing required fields per variant (e.g. `port == 0` for tcp, empty `url`
+///   for http, missing/empty `command` for command).
+/// - Malformed humantime strings on `interval`, `timeout`, or `start_period`.
+pub fn health_request_to_spec(req: &HealthCheckRequest) -> Result<zlayer_spec::HealthSpec> {
+    use zlayer_spec::{HealthCheck, HealthSpec};
 
-impl HealthCheckRequest {
-    /// Translate the wire-format request into the internal `HealthSpec`.
-    ///
-    /// # Errors
-    /// Returns `ApiError::BadRequest` for:
-    /// - Unknown `type` (must be `"tcp"`, `"http"`, or `"command"`).
-    /// - Missing required fields per variant (e.g. `port == 0` for tcp, empty `url`
-    ///   for http, missing/empty `command` for command).
-    /// - Malformed humantime strings on `interval`, `timeout`, or `start_period`.
-    pub fn to_health_spec(&self) -> Result<zlayer_spec::HealthSpec> {
-        use zlayer_spec::{HealthCheck, HealthSpec};
-
-        let check = match self.check_type.as_str() {
-            "tcp" => {
-                let port = self.port.ok_or_else(|| {
+    let check = match req.check_type.as_str() {
+        "tcp" => {
+            let port = req.port.ok_or_else(|| {
+                ApiError::BadRequest(
+                    "health_check.port is required when type == \"tcp\"".to_string(),
+                )
+            })?;
+            if port == 0 {
+                return Err(ApiError::BadRequest(
+                    "health_check.port must be between 1 and 65535".to_string(),
+                ));
+            }
+            HealthCheck::Tcp { port }
+        }
+        "http" => {
+            let url = req
+                .url
+                .as_ref()
+                .filter(|u| !u.is_empty())
+                .ok_or_else(|| {
                     ApiError::BadRequest(
-                        "health_check.port is required when type == \"tcp\"".to_string(),
+                        "health_check.url is required when type == \"http\"".to_string(),
+                    )
+                })?
+                .clone();
+            let expect_status = req.expect_status.unwrap_or(200);
+            HealthCheck::Http { url, expect_status }
+        }
+        "command" => {
+            let argv = req
+                .command
+                .as_ref()
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| {
+                    ApiError::BadRequest(
+                        "health_check.command is required and must be non-empty when type == \"command\""
+                            .to_string(),
                     )
                 })?;
-                if port == 0 {
-                    return Err(ApiError::BadRequest(
-                        "health_check.port must be between 1 and 65535".to_string(),
-                    ));
-                }
-                HealthCheck::Tcp { port }
+            // Join argv tokens with spaces; the health monitor passes the
+            // result to `sh -c`. Matches the compose-to-ZLayer convention
+            // in `zlayer-docker/src/compose/convert.rs`.
+            HealthCheck::Command {
+                command: argv.join(" "),
             }
-            "http" => {
-                let url = self
-                    .url
-                    .as_ref()
-                    .filter(|u| !u.is_empty())
-                    .ok_or_else(|| {
-                        ApiError::BadRequest(
-                            "health_check.url is required when type == \"http\"".to_string(),
-                        )
-                    })?
-                    .clone();
-                let expect_status = self.expect_status.unwrap_or(200);
-                HealthCheck::Http { url, expect_status }
-            }
-            "command" => {
-                let argv = self
-                    .command
-                    .as_ref()
-                    .filter(|v| !v.is_empty())
-                    .ok_or_else(|| {
-                        ApiError::BadRequest(
-                            "health_check.command is required and must be non-empty when type == \"command\""
-                                .to_string(),
-                        )
-                    })?;
-                // Join argv tokens with spaces; the health monitor passes the
-                // result to `sh -c`. Matches the compose-to-ZLayer convention
-                // in `zlayer-docker/src/compose/convert.rs`.
-                HealthCheck::Command {
-                    command: argv.join(" "),
-                }
-            }
-            other => {
-                return Err(ApiError::BadRequest(format!(
-                    "health_check.type must be one of \"tcp\", \"http\", \"command\"; got {other:?}"
-                )))
-            }
-        };
+        }
+        other => {
+            return Err(ApiError::BadRequest(format!(
+                "health_check.type must be one of \"tcp\", \"http\", \"command\"; got {other:?}"
+            )))
+        }
+    };
 
-        let interval = parse_optional_duration(self.interval.as_deref(), "health_check.interval")?
-            .or_else(|| Some(Duration::from_secs(30)));
-        let timeout = parse_optional_duration(self.timeout.as_deref(), "health_check.timeout")?;
-        let start_grace =
-            parse_optional_duration(self.start_period.as_deref(), "health_check.start_period")?;
-        let retries = self.retries.unwrap_or(3);
+    let interval = parse_optional_duration(req.interval.as_deref(), "health_check.interval")?
+        .or_else(|| Some(Duration::from_secs(30)));
+    let timeout = parse_optional_duration(req.timeout.as_deref(), "health_check.timeout")?;
+    let start_grace =
+        parse_optional_duration(req.start_period.as_deref(), "health_check.start_period")?;
+    let retries = req.retries.unwrap_or(3);
 
-        Ok(HealthSpec {
-            start_grace,
-            interval,
-            timeout,
-            retries,
-            check,
-        })
-    }
+    Ok(HealthSpec {
+        start_grace,
+        interval,
+        timeout,
+        retries,
+        check,
+    })
 }
 
 /// Parse an optional humantime duration string, producing a consistent
@@ -421,361 +328,41 @@ fn validate_extra_hosts(entries: &[String]) -> Result<()> {
     Ok(())
 }
 
-/// Request to create and start a container
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateContainerRequest {
-    /// OCI image reference (e.g., "nginx:latest", "ubuntu:22.04")
-    pub image: String,
-    /// Optional human-readable name
-    #[serde(default)]
-    pub name: Option<String>,
-    /// Image pull policy: "always", "`if_not_present`", or "never"
-    #[serde(default)]
-    pub pull_policy: Option<String>,
-    /// Environment variables
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    /// Command to run (overrides image entrypoint)
-    #[serde(default)]
-    pub command: Option<Vec<String>>,
-    /// Labels for filtering and grouping
-    #[serde(default)]
-    pub labels: HashMap<String, String>,
-    /// Resource limits (CPU, memory)
-    #[serde(default)]
-    pub resources: Option<ContainerResourceLimits>,
-    /// Volume mounts
-    #[serde(default)]
-    pub volumes: Vec<VolumeMount>,
-    /// Published ports (Docker's `-p host:container/proto`). When omitted,
-    /// the container is created without any host port publishing.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ports: Vec<zlayer_spec::PortMapping>,
-    /// Working directory inside the container
-    #[serde(default)]
-    pub work_dir: Option<String>,
-    /// Optional health check. When omitted, the daemon installs a no-op
-    /// placeholder (`HealthCheck::Tcp { port: 0 }`) matching the current
-    /// default; the health monitor treats `port == 0` as "skip".
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub health_check: Option<HealthCheckRequest>,
-    /// Optional container hostname (maps to Docker's `--hostname`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hostname: Option<String>,
-    /// Additional DNS servers (maps to Docker's `--dns`). Each entry must be
-    /// a plausible IPv4 or IPv6 address.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub dns: Vec<String>,
-    /// Extra `hostname:ip` entries appended to `/etc/hosts` (maps to Docker's
-    /// `--add-host`). The special literal `host-gateway` is accepted as the
-    /// `ip` half.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub extra_hosts: Vec<String>,
-    /// Container restart policy (Docker-style). When omitted, the runtime
-    /// applies no explicit restart policy (Docker default: `"no"`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restart_policy: Option<zlayer_spec::ContainerRestartPolicy>,
-    /// User-defined bridge/overlay networks to attach the newly-created
-    /// container to. Each entry references a network by id or name and is
-    /// attached after the container is successfully started. If any
-    /// attachment fails, the partially-started container is rolled back
-    /// (stopped + removed) and the request is failed.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub networks: Vec<NetworkAttachmentRequest>,
-    // -- §3.10: registry auth ------------------------------------------------
-    /// Id of a persisted registry credential (from
-    /// `POST /api/v1/credentials/registry`) to use when pulling the image.
-    /// Ignored when [`Self::registry_auth`] is also supplied (inline auth
-    /// wins). Requires the daemon to be configured with a credential store
-    /// — otherwise the request is rejected with `400`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry_credential_id: Option<String>,
-    /// Inline Docker/OCI registry credentials used for this pull only. Not
-    /// persisted, never logged, never echoed back on a response. When both
-    /// `registry_credential_id` and `registry_auth` are set, this field
-    /// takes precedence.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub registry_auth: Option<zlayer_spec::RegistryAuth>,
-}
-
-/// A request to attach a freshly-created container to a user-defined bridge
-/// or overlay network, mirroring the wire-shape used by `POST
-/// /api/v1/container-networks/{id_or_name}/connect`.
+/// Build a [`NetworkAttachmentInfo`] from a runtime [`NetworkAttachmentDetail`].
 ///
-/// Included on [`CreateContainerRequest::networks`] so callers can wire up
-/// every attachment in a single call instead of issuing a separate connect
-/// request per network after container create.
-#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
-pub struct NetworkAttachmentRequest {
-    /// Bridge-network id or name to attach to.
-    pub network: String,
-    /// Optional DNS aliases for this container on the network.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aliases: Vec<String>,
-    /// Optional static IPv4 to pin this container to. Validated as
-    /// [`std::net::Ipv4Addr`] before the runtime is called.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ipv4_address: Option<String>,
-}
-
-/// Container information returned by the API
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ContainerInfo {
-    /// Container identifier
-    pub id: String,
-    /// Human-readable name (if set)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    /// OCI image reference
-    pub image: String,
-    /// Container state (pending, running, exited, failed)
-    pub state: String,
-    /// Labels
-    pub labels: HashMap<String, String>,
-    /// Creation timestamp (ISO 8601)
-    pub created_at: String,
-    /// Process ID (if running)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub pid: Option<u32>,
-    // -- §3.15: rich inspect fields -----------------------------------------
-    /// Published port mappings (container → host). Populated from the
-    /// runtime's inspect response; empty when the runtime doesn't expose
-    /// port-level detail or the container has no published ports.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub ports: Vec<zlayer_spec::PortMapping>,
-    /// Networks this container is attached to, with per-network aliases
-    /// and IPv4. Empty when the runtime doesn't surface network detail.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub networks: Vec<NetworkAttachmentInfo>,
-    /// Primary IPv4 address (first non-empty IP across attached networks).
-    /// Docker's `bridge` network is preferred when present.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ipv4: Option<String>,
-    /// Runtime-native health status, when the container image declares a
-    /// `HEALTHCHECK` (or equivalent). `None` when the runtime doesn't track
-    /// health for this container.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub health: Option<ContainerHealthInfo>,
-    /// Most-recent exit code. `None` for containers still running and for
-    /// containers that have never exited.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub exit_code: Option<i32>,
-}
-
-/// Per-network attachment entry on [`ContainerInfo::networks`].
-///
-/// Populated from the runtime's inspect response — mirrors the subset of
-/// bollard's `EndpointSettings` that API clients need to correlate a container
-/// with its `container_networks` entries.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct NetworkAttachmentInfo {
-    /// Network name as reported by the runtime. Matches the `name` field on
-    /// entries returned by `GET /api/v1/container-networks`.
-    pub network: String,
-    /// DNS aliases the container answers to on this network.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub aliases: Vec<String>,
-    /// Assigned IPv4 on this network, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ipv4: Option<String>,
-}
-
-/// Runtime-native health snapshot on [`ContainerInfo::health`].
-///
-/// Sourced from bollard's `ContainerState.health` for Docker-backed
-/// containers. The internal `HealthMonitor` in
-/// `crates/zlayer-agent/src/health.rs` drives service-level health events
-/// against user-configured health specs; for standalone containers the API
-/// reports the runtime-native status instead so images with a baked-in
-/// `HEALTHCHECK` still surface correctly.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
-pub struct ContainerHealthInfo {
-    /// One of `"none"`, `"starting"`, `"healthy"`, `"unhealthy"` (Docker
-    /// `HealthStatusEnum`). Empty / missing upstream values normalise to
-    /// `"none"`.
-    pub status: String,
-    /// Consecutive failing probe count, when the runtime tracks it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub failing_streak: Option<u32>,
-    /// Output from the most recent failing probe, when available.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_output: Option<String>,
-}
-
-impl From<NetworkAttachmentDetail> for NetworkAttachmentInfo {
-    fn from(d: NetworkAttachmentDetail) -> Self {
-        Self {
-            network: d.network,
-            aliases: d.aliases,
-            ipv4: d.ipv4,
-        }
+/// Free function (rather than
+/// `impl From<NetworkAttachmentDetail> for NetworkAttachmentInfo`) because both
+/// types are foreign to this crate, which would violate the orphan rule.
+#[must_use]
+pub fn network_attachment_info_from_detail(d: NetworkAttachmentDetail) -> NetworkAttachmentInfo {
+    NetworkAttachmentInfo {
+        network: d.network,
+        aliases: d.aliases,
+        ipv4: d.ipv4,
     }
 }
 
-impl From<HealthDetail> for ContainerHealthInfo {
-    fn from(d: HealthDetail) -> Self {
-        Self {
-            status: d.status,
-            failing_streak: d.failing_streak,
-            last_output: d.last_output,
-        }
+/// Build a [`ContainerHealthInfo`] from a runtime [`HealthDetail`].
+///
+/// Free function (rather than `impl From<HealthDetail> for ContainerHealthInfo`)
+/// because both types are foreign to this crate, which would violate the
+/// orphan rule.
+#[must_use]
+pub fn container_health_info_from_detail(d: HealthDetail) -> ContainerHealthInfo {
+    ContainerHealthInfo {
+        status: d.status,
+        failing_streak: d.failing_streak,
+        last_output: d.last_output,
     }
 }
 
-/// Query parameters for listing containers
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct ListContainersQuery {
-    /// Filter by label (key=value format)
-    #[serde(default)]
-    pub label: Option<String>,
-}
-
-/// Query parameters for container logs
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct ContainerLogQuery {
-    /// Number of tail lines to return
-    #[serde(default = "default_tail")]
-    pub tail: usize,
-    /// Follow logs (SSE stream)
-    #[serde(default)]
-    pub follow: bool,
-}
-
-fn default_tail() -> usize {
-    100
-}
-
-/// Exec request for running a command in a container
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ContainerExecRequest {
-    /// Command and arguments to execute
-    pub command: Vec<String>,
-}
-
-/// Query parameters for the exec endpoint.
+/// Clamp the requested interval into `[1, 60]` seconds, defaulting to 2.
 ///
-/// When `stream=true` the handler returns a Server-Sent Events stream with
-/// one `stdout` / `stderr` event per line of output and a final `exit` event
-/// carrying the exit code as JSON. When `stream=false` (the default) the
-/// handler buffers the whole output and returns a single JSON
-/// [`ContainerExecResponse`] body.
-#[derive(Debug, Default, Deserialize, IntoParams)]
-pub struct ExecQuery {
-    /// Stream exec events as SSE instead of returning a buffered JSON body.
-    #[serde(default)]
-    pub stream: bool,
-}
-
-/// Exec response with command output
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ContainerExecResponse {
-    /// Exit code from the command
-    pub exit_code: i32,
-    /// Standard output
-    pub stdout: String,
-    /// Standard error
-    pub stderr: String,
-}
-
-/// Request body for stopping a container. Matches the Docker-compat
-/// `POST /containers/{id}/stop` shape.
-#[derive(Debug, Default, Deserialize, ToSchema)]
-pub struct StopContainerRequest {
-    /// Graceful shutdown timeout in seconds before the runtime force-kills
-    /// the container. Defaults to 30 seconds when omitted.
-    #[serde(default)]
-    pub timeout: Option<u64>,
-}
-
-/// Request body for restarting a container. Matches the Docker-compat
-/// `POST /containers/{id}/restart` shape.
-#[derive(Debug, Default, Deserialize, ToSchema)]
-pub struct RestartContainerRequest {
-    /// Graceful shutdown timeout in seconds before the runtime force-kills
-    /// the container. Defaults to 30 seconds when omitted.
-    #[serde(default)]
-    pub timeout: Option<u64>,
-}
-
-/// Request body for killing (sending a signal to) a container. Matches the
-/// Docker-compat `POST /containers/{id}/kill` shape.
-#[derive(Debug, Default, Deserialize, ToSchema)]
-pub struct KillContainerRequest {
-    /// Signal name to send (e.g. `"SIGTERM"`, `"SIGINT"`). Accepts both the
-    /// `SIG`-prefixed and bare forms. When omitted, defaults to `SIGKILL`.
-    #[serde(default)]
-    pub signal: Option<String>,
-}
-
-/// Wait response with container exit code plus optional classification
-/// fields (added in §3.12 of the SDK-fixes spec).
-///
-/// The three optional fields (`reason`, `signal`, `finished_at`) are
-/// additive — clients that only read `exit_code` keep working unchanged.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ContainerWaitResponse {
-    /// Container identifier
-    pub id: String,
-    /// Exit code (0 = success). When the container was killed by signal
-    /// `N`, this is typically `128 + N`.
-    pub exit_code: i32,
-    /// Classification of the exit. One of `"exited"`, `"signal"`,
-    /// `"oom_killed"`, or `"runtime_error"`. Absent when the runtime
-    /// didn't classify the exit.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
-    /// Signal name when `reason == "signal"`, e.g. `"SIGKILL"`. Absent
-    /// when the runtime couldn't determine it (or the exit wasn't a
-    /// signal death).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub signal: Option<String>,
-    /// RFC3339 timestamp of when the container exited, if reported by
-    /// the runtime.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub finished_at: Option<String>,
-}
-
-/// Container resource statistics
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ContainerStatsResponse {
-    /// Container identifier
-    pub id: String,
-    /// CPU usage in microseconds
-    pub cpu_usage_usec: u64,
-    /// Current memory usage in bytes
-    pub memory_bytes: u64,
-    /// Memory limit in bytes (`u64::MAX` if unlimited)
-    pub memory_limit: u64,
-    /// Memory usage as percentage of limit
-    pub memory_percent: f64,
-}
-
-/// Query parameters for container stats.
-///
-/// When `stream=false` (default), the handler returns a single JSON
-/// [`ContainerStatsResponse`]. When `stream=true`, the handler switches to
-/// Server-Sent Events and emits one `ContainerStatsResponse` sample per
-/// `interval` seconds until the container exits or the client disconnects.
-///
-/// `interval` is clamped to `[1, 60]` seconds. Default interval is `2`.
-#[derive(Debug, Default, Deserialize, IntoParams)]
-pub struct StatsQuery {
-    /// Stream periodic samples as SSE events instead of a one-shot JSON
-    /// response.
-    #[serde(default)]
-    pub stream: bool,
-    /// Sample cadence in seconds (only used when `stream=true`). Clamped to
-    /// `[1, 60]`. Defaults to `2` seconds.
-    #[serde(default, alias = "interval_seconds")]
-    pub interval: Option<u32>,
-}
-
-impl StatsQuery {
-    /// Clamp the requested interval into `[1, 60]` seconds, defaulting to 2.
-    fn clamped_interval(&self) -> Duration {
-        let secs = self.interval.unwrap_or(2).clamp(1, 60);
-        Duration::from_secs(u64::from(secs))
-    }
+/// Free function (rather than `impl StatsQuery`) because `StatsQuery` is
+/// foreign to this crate, which would violate the orphan rule.
+fn stats_query_clamped_interval(query: &StatsQuery) -> Duration {
+    let secs = query.interval.unwrap_or(2).clamp(1, 60);
+    Duration::from_secs(u64::from(secs))
 }
 
 // ---------------------------------------------------------------------------
@@ -917,7 +504,7 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
     // health monitor treats `HealthCheck::Tcp { port: 0 }` as "skip",
     // matching the crate-wide default in `default_health()`.
     let health = match &request.health_check {
-        Some(hc) => hc.to_health_spec()?,
+        Some(hc) => health_request_to_spec(hc)?,
         None => HealthSpec {
             start_grace: None,
             interval: None,
@@ -931,7 +518,9 @@ fn build_service_spec(request: &CreateContainerRequest) -> Result<zlayer_spec::S
         rtype: ResourceType::Service,
         schedule: None,
         image: ImageSpec {
-            name: request.image.clone(),
+            name: request.image.parse().map_err(|e| {
+                ApiError::BadRequest(format!("invalid image reference {:?}: {e}", request.image))
+            })?,
             pull_policy: match request.pull_policy.as_deref() {
                 Some("always") => PullPolicy::Always,
                 Some("never") => PullPolicy::Never,
@@ -1083,10 +672,10 @@ impl From<ContainerInspectDetails> for InspectFields {
             ports,
             networks: networks
                 .into_iter()
-                .map(NetworkAttachmentInfo::from)
+                .map(network_attachment_info_from_detail)
                 .collect(),
             ipv4,
-            health: health.map(ContainerHealthInfo::from),
+            health: health.map(container_health_info_from_detail),
             exit_code,
         }
     }
@@ -2423,7 +2012,7 @@ pub async fn get_container_stats(
     if query.stream {
         // SSE streaming mode: emit one sample per tick until the container
         // exits or the runtime returns an error.
-        let interval = query.clamped_interval();
+        let interval = stats_query_clamped_interval(&query);
         let stream =
             container_stats_follow_stream(state.runtime.clone(), container_id, id, interval);
         let sse = Sse::new(stream).keep_alive(
@@ -2900,7 +2489,7 @@ mod tests {
         let query: StatsQuery = serde_json::from_str("{}").unwrap();
         assert!(!query.stream);
         assert!(query.interval.is_none());
-        assert_eq!(query.clamped_interval(), Duration::from_secs(2));
+        assert_eq!(stats_query_clamped_interval(&query), Duration::from_secs(2));
     }
 
     #[test]
@@ -2910,14 +2499,14 @@ mod tests {
             serde_json::from_str(r#"{"stream": true, "interval": 5}"#).expect("parse stats query");
         assert!(query.stream);
         assert_eq!(query.interval, Some(5));
-        assert_eq!(query.clamped_interval(), Duration::from_secs(5));
+        assert_eq!(stats_query_clamped_interval(&query), Duration::from_secs(5));
 
         // Legacy `interval_seconds` alias is honored by serde.
         let alias: StatsQuery = serde_json::from_str(r#"{"stream": true, "interval_seconds": 7}"#)
             .expect("parse stats query alias");
         assert!(alias.stream);
         assert_eq!(alias.interval, Some(7));
-        assert_eq!(alias.clamped_interval(), Duration::from_secs(7));
+        assert_eq!(stats_query_clamped_interval(&alias), Duration::from_secs(7));
     }
 
     #[test]
@@ -2927,14 +2516,14 @@ mod tests {
             stream: true,
             interval: Some(0),
         };
-        assert_eq!(low.clamped_interval(), Duration::from_secs(1));
+        assert_eq!(stats_query_clamped_interval(&low), Duration::from_secs(1));
 
         // Above the ceiling clamps down to 60s.
         let high = StatsQuery {
             stream: true,
             interval: Some(9_999),
         };
-        assert_eq!(high.clamped_interval(), Duration::from_secs(60));
+        assert_eq!(stats_query_clamped_interval(&high), Duration::from_secs(60));
     }
 
     #[test]
@@ -3009,7 +2598,7 @@ mod tests {
             networks: Vec::new(),
         };
         let spec = build_service_spec(&request).expect("minimal spec should build");
-        assert_eq!(spec.image.name, "alpine:latest");
+        assert_eq!(spec.image.name.whole(), "docker.io/library/alpine:latest");
         assert!(spec.env.is_empty());
         assert!(spec.storage.is_empty());
         // With no health_check, the spec falls back to the no-op placeholder.
@@ -3050,7 +2639,7 @@ mod tests {
             networks: Vec::new(),
         };
         let spec = build_service_spec(&request).expect("full spec should build");
-        assert_eq!(spec.image.name, "node:20");
+        assert_eq!(spec.image.name.whole(), "docker.io/library/node:20");
         assert_eq!(spec.env.get("NODE_ENV").unwrap(), "production");
         assert_eq!(
             spec.command.entrypoint.as_deref(),
@@ -3079,7 +2668,7 @@ mod tests {
             retries: Some(5),
             start_period: Some("30s".to_string()),
         };
-        let spec = req.to_health_spec().expect("valid tcp spec");
+        let spec = health_request_to_spec(&req).expect("valid tcp spec");
         assert!(matches!(
             spec.check,
             zlayer_spec::HealthCheck::Tcp { port: 5432 }
@@ -3103,7 +2692,7 @@ mod tests {
             retries: None,
             start_period: None,
         };
-        let spec = req.to_health_spec().expect("valid http spec");
+        let spec = health_request_to_spec(&req).expect("valid http spec");
         match spec.check {
             zlayer_spec::HealthCheck::Http { url, expect_status } => {
                 assert_eq!(url, "http://localhost:8080/health");
@@ -3133,7 +2722,7 @@ mod tests {
             retries: None,
             start_period: None,
         };
-        let spec = req.to_health_spec().expect("valid command spec");
+        let spec = health_request_to_spec(&req).expect("valid command spec");
         match spec.check {
             zlayer_spec::HealthCheck::Command { command } => {
                 assert_eq!(command, "pg_isready -U postgres");
@@ -3155,7 +2744,7 @@ mod tests {
             retries: None,
             start_period: None,
         };
-        let err = req.to_health_spec().expect_err("unknown type must error");
+        let err = health_request_to_spec(&req).expect_err("unknown type must error");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("bogus"),
@@ -3176,7 +2765,7 @@ mod tests {
             retries: None,
             start_period: None,
         };
-        assert!(req.to_health_spec().is_err());
+        assert!(health_request_to_spec(&req).is_err());
     }
 
     #[test]
@@ -3192,7 +2781,7 @@ mod tests {
             retries: None,
             start_period: None,
         };
-        assert!(req.to_health_spec().is_err());
+        assert!(health_request_to_spec(&req).is_err());
     }
 
     #[test]
@@ -3208,7 +2797,7 @@ mod tests {
             retries: None,
             start_period: None,
         };
-        assert!(req.to_health_spec().is_err());
+        assert!(health_request_to_spec(&req).is_err());
     }
 
     #[test]
@@ -3224,9 +2813,7 @@ mod tests {
             retries: None,
             start_period: None,
         };
-        let err = req
-            .to_health_spec()
-            .expect_err("invalid humantime must error");
+        let err = health_request_to_spec(&req).expect_err("invalid humantime must error");
         let msg = format!("{err:?}");
         assert!(
             msg.contains("not-a-duration"),

@@ -28,9 +28,9 @@ use axum::{
     Json,
 };
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use tracing::info;
-use utoipa::ToSchema;
+
+pub use zlayer_types::api::workflows::*;
 
 use crate::error::{ApiError, Result};
 use crate::handlers::build::{BuildManager, BuildRequest, BuildStateEnum};
@@ -121,20 +121,6 @@ impl WorkflowsState {
         self.git_creds = Some(git_creds);
         self
     }
-}
-
-// ---- Request/response types ----
-
-/// Body for `POST /api/v1/workflows`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct CreateWorkflowRequest {
-    /// Workflow name.
-    pub name: String,
-    /// Ordered list of steps.
-    pub steps: Vec<WorkflowStep>,
-    /// Optional project scope.
-    #[serde(default)]
-    pub project_id: Option<String>,
 }
 
 // ---- Endpoints ----

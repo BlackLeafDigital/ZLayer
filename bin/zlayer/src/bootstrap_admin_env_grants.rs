@@ -21,9 +21,10 @@ use anyhow::{Context, Result};
 use tracing::{info, warn};
 
 use zlayer_api::storage::{
-    AuditEntry, AuditFilter, AuditStorage, EnvironmentStorage, PermissionLevel, PermissionStorage,
-    ProjectStorage, StoredPermission, SubjectKind, UserRole, UserStorage,
+    AuditEntry, AuditFilter, AuditStorage, EnvironmentStorage, PermissionStorage, ProjectStorage,
+    UserStorage,
 };
+use zlayer_types::storage::{PermissionLevel, StoredPermission, SubjectKind, UserRole};
 
 const MIGRATION_ACTION: &str = "env_admin_grants_migrated";
 const MIGRATION_RESOURCE_KIND: &str = "migration";
@@ -147,8 +148,9 @@ mod tests {
     use super::*;
     use zlayer_api::storage::{
         InMemoryAuditStore, InMemoryEnvironmentStore, InMemoryPermissionStore,
-        InMemoryProjectStore, InMemoryUserStore, StoredEnvironment, StoredProject, StoredUser,
+        InMemoryProjectStore, InMemoryUserStore,
     };
+    use zlayer_types::storage::{StoredEnvironment, StoredProject, StoredUser};
 
     struct Stores {
         users: Arc<dyn UserStorage>,
