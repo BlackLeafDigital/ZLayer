@@ -27,20 +27,24 @@ OUTPUT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "public", "maps"
 )
 
-# Hand-curated mappings applied last, overriding anything Repology produces.
-# Use these for entries Repology can't resolve (no effname join with homebrew)
-# or where we want a stable canonical formula regardless of which versioned
-# alias Repology happens to surface first (`openssl@3` vs `openssl@3.5`).
+# Hand-curated overrides applied last, overriding anything Repology produces.
+# Use these only for entries Repology can't resolve (no effname join with
+# homebrew), or to force the unversioned canonical when Repology only surfaces
+# versioned aliases. NEVER pin to a specific version here — pinning behind the
+# user's back defeats the point of letting Homebrew (and the user's own formula
+# dependencies) drive version selection. If a caller wants e.g. `openssl@3`
+# they can ask for it explicitly; the unversioned apt input (`libssl-dev`,
+# `python3`) means "current default", which apt itself uses.
 OVERRIDES = {
-    "libssl-dev": "openssl@3",
-    "libssl3": "openssl@3",
-    "openssl-dev": "openssl@3",
-    "python3": "python@3",
-    "python3-dev": "python@3",
-    "python3-devel": "python@3",
-    "nodejs": "node",
-    "default-jdk": "openjdk",
-    "default-jre": "openjdk",
+    "libssl-dev":    "openssl",
+    "libssl3":       "openssl",
+    "openssl-dev":   "openssl",
+    "python3":       "python",
+    "python3-dev":   "python",
+    "python3-devel": "python",
+    "nodejs":        "node",
+    "default-jdk":   "openjdk",
+    "default-jre":   "openjdk",
 }
 
 # Shard set used to split large per-distro maps into reviewable chunks.
@@ -494,13 +498,6 @@ def main():
                         distro_dir, repo, shards_written, total_after, generated_at
                     )
                     total += total_after
-
-                    # Drop the legacy monolithic file if it survives from a
-                    # pre-sharding run. Only the in-tree resolver consumes
-                    # this data and it ships in lockstep — no external readers.
-                    legacy_path = os.path.join(OUTPUT_DIR, f"{repo}.json")
-                    if os.path.exists(legacy_path):
-                        os.remove(legacy_path)
 
             print(f"\nTotal: {total} mappings across {len(repos)} repos")
             print("Done!")
