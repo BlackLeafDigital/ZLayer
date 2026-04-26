@@ -12246,6 +12246,7 @@ dependencies = [
  "dockerfile-parser",
  "flate2",
  "hex",
+ "hmac",
  "humantime",
  "indexmap 2.13.0",
  "nix 0.31.2",

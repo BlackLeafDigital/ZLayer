@@ -1,0 +1,90 @@
+name: Verify RepoSources
+
+# Drift detector for the macOS package-name maps published at
+# https://zachhandley.github.io/RepoSources/maps/{distro}.json. Runs daily
+# (2h after the Sunday regenerator cron in update-package-maps.yml) and on
+# manual dispatch. Asserts the canonical brew formulas are returned for the
+# names ZLayer's macOS resolver actually requests (per the OVERRIDES dict in
+# scripts/generate-package-maps.py and the distro list in
+# crates/zlayer-builder/src/sandbox_builder.rs::extract_package_install_packages).
+# Also asserts the published map is no more than 14 days old — catches a
+# stuck regenerator before it silently feeds stale data into builds.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    container:
+      image: alpine:3.20
+    steps:
+      - name: Install curl + jq
+        run: apk add --no-cache curl jq
+
+      - name: Verify each distro's package map
+        run: |
+          set -euo pipefail
+          BASE="https://zachhandley.github.io/RepoSources/maps"
+          DISTROS="debian_12 alpine_3_20 centos_8 fedora_42"
+
+          # Maximum acceptable age in seconds (14 days) — catches a stuck
+          # weekly regenerator. The generator runs Sundays at 04:00 UTC, so
+          # in steady state the file should be at most 7 days old.
+          MAX_AGE=$((14 * 24 * 3600))
+          NOW=$(date -u +%s)
+
+          fail=0
+          for d in $DISTROS; do
+            echo "=== $d ==="
+            url="$BASE/$d.json"
+            tmp=$(mktemp)
+            if ! curl -fsSL "$url" -o "$tmp"; then
+              echo "  FAIL: could not fetch $url"
+              fail=1
+              continue
+            fi
+
+            # Freshness
+            generated_at=$(jq -r '.metadata.generated_at' "$tmp")
+            generated_epoch=$(date -u -d "$generated_at" +%s 2>/dev/null || echo 0)
+            age=$((NOW - generated_epoch))
+            if [ "$generated_epoch" -eq 0 ] || [ "$age" -gt "$MAX_AGE" ]; then
+              echo "  FAIL: $d generated_at=$generated_at is older than 14 days (age=${age}s)"
+              fail=1
+            else
+              echo "  OK: generated_at=$generated_at (age=${age}s)"
+            fi
+
+            # Known-good mappings from OVERRIDES — these must be present in
+            # every distro file regardless of what Repology surfaced.
+            for kv in \
+                'libssl-dev=openssl@3' \
+                'libssl3=openssl@3' \
+                'openssl-dev=openssl@3' \
+                'nodejs=node' \
+                'python3=python@3' \
+                'python3-dev=python@3' \
+                'default-jdk=openjdk'; do
+              key="${kv%%=*}"
+              expected="${kv##*=}"
+              actual=$(jq -r --arg k "$key" '.mappings[$k] // "(missing)"' "$tmp")
+              if [ "$actual" = "$expected" ]; then
+                echo "  OK: $key -> $actual"
+              else
+                echo "  FAIL: $key -> $actual (expected $expected)"
+                fail=1
+              fi
+            done
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            echo
+            echo "RepoSources verification FAILED — see assertions above."
+            echo "Re-dispatch update-package-maps.yml after fixing the generator."
+            exit 1
+          fi
+          echo
+          echo "All distros verified."

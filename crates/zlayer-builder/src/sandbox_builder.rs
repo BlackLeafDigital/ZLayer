@@ -1346,20 +1346,22 @@ impl SandboxImageBuilder {
                     &self.data_dir.join("cache"),
                 )
                 .await;
-                for (formula, skipped) in &mapped {
+                for (linux_pkg, formula, skipped) in &mapped {
                     if *skipped {
-                        debug!("Skipping Linux-only package: {}", formula);
+                        debug!("Skipping Linux-only package: {}", linux_pkg);
                         continue;
                     }
-                    info!("Installing {} via Homebrew bottle", formula);
-                    match crate::macos_image_resolver::install_with_deps(
-                        formula, rootfs_dir, tmp_dir,
-                    )
-                    .await
-                    {
-                        Ok(()) => info!("Installed {} successfully", formula),
-                        Err(e) => warn!("Failed to install {}: {} (continuing)", formula, e),
-                    }
+                    info!("Installing {} ({}) via Homebrew bottle", linux_pkg, formula);
+                    crate::macos_image_resolver::install_with_deps(formula, rootfs_dir, tmp_dir)
+                        .await
+                        .map_err(|e| BuildError::RegistryError {
+                            message: format!(
+                                "Linux package '{linux_pkg}' resolved to Homebrew formula \
+                             '{formula}' which is not available; check RepoSources mapping \
+                             for {distro}: {e}"
+                            ),
+                        })?;
+                    info!("Installed {} ({}) successfully", linux_pkg, formula);
                 }
                 // Still run the translated command (which will be "true"/no-op)
                 // so the RUN instruction completes successfully

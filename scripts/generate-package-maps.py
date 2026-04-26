@@ -13,6 +13,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import urllib.request
 from datetime import datetime, timezone
 
 sys.stdout.reconfigure(line_buffering=True)
@@ -20,10 +21,27 @@ sys.stderr.reconfigure(line_buffering=True)
 
 DUMP_URL = "https://dumps.repology.org/repology-database-dump-latest.sql.zst"
 HOMEBREW_REPO = "homebrew"
+HOMEBREW_FORMULA_API = "https://formulae.brew.sh/api/formula.json"
 
 OUTPUT_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "public", "maps"
 )
+
+# Hand-curated mappings applied last, overriding anything Repology produces.
+# Use these for entries Repology can't resolve (no effname join with homebrew)
+# or where we want a stable canonical formula regardless of which versioned
+# alias Repology happens to surface first (`openssl@3` vs `openssl@3.5`).
+OVERRIDES = {
+    "libssl-dev": "openssl@3",
+    "libssl3": "openssl@3",
+    "openssl-dev": "openssl@3",
+    "python3": "python@3",
+    "python3-dev": "python@3",
+    "python3-devel": "python@3",
+    "nodejs": "node",
+    "default-jdk": "openjdk",
+    "default-jre": "openjdk",
+}
 
 
 def run(cmd, **kwargs):
@@ -186,6 +204,73 @@ def diagnose(tmpdir, port):
         print(f"  Available tables: {all_tables}")
 
 
+def fetch_homebrew_alias_index():
+    """Fetch the Homebrew formula API once and build an alias→canonical map.
+
+    Each entry maps a formula's `full_name`, every entry in `aliases`, and every
+    entry in `oldnames` to the formula's canonical `full_name`. This lets us
+    prefer the alias-canonical formula when Repology surfaces multiple matches
+    for the same Linux package (e.g. `openssl@3.5` vs `openssl@3`, where
+    `openssl@3.aliases` contains `openssl` and `openssl@3.6`).
+
+    On failure (network/parse error) returns an empty dict; the tiebreak then
+    degrades to the version-suffix heuristic in `pick_winner`.
+    """
+    print(f"Fetching {HOMEBREW_FORMULA_API}...")
+    try:
+        with urllib.request.urlopen(HOMEBREW_FORMULA_API, timeout=60) as resp:
+            data = json.load(resp)
+    except Exception as e:
+        print(f"  WARN: failed to fetch homebrew API ({e}); alias-aware tiebreak disabled")
+        return {}
+
+    a2c = {}
+    for f in data:
+        canonical = f.get("full_name") or f.get("name")
+        if not canonical:
+            continue
+        a2c[canonical] = canonical
+        for alias in f.get("aliases", []) or []:
+            a2c[alias] = canonical
+        for old in f.get("oldnames", []) or []:
+            a2c[old] = canonical
+    print(f"  Indexed {len(a2c)} alias entries from {len(data)} formulas")
+    return a2c
+
+
+def pick_winner(candidates, linux_name, alias_to_canonical):
+    """Choose the best Homebrew formula for a Linux package name.
+
+    Tiebreak order:
+      1. If the Linux name is itself a known Homebrew alias and that alias's
+         canonical formula is among the candidates, use it. This catches cases
+         like `openssl → openssl@3` (since `openssl@3.aliases = ['openssl', ...]`).
+      2. Among candidates, prefer one whose name has no `@` (unversioned base
+         formula like `node` over `node@24`).
+      3. Among `@`-versioned candidates, prefer fewer dotted components
+         (`openssl@3` over `openssl@3.5` over `openssl@3.5.6`).
+      4. Lexicographic.
+    """
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    # Rule 1: alias-canonical match
+    canonical = alias_to_canonical.get(linux_name)
+    if canonical and canonical in candidates:
+        return canonical
+
+    # Rules 2-4: version-suffix preference, then lex
+    def sort_key(name):
+        if "@" not in name:
+            return (0, len(name), name)
+        suffix = name.split("@", 1)[1]
+        return (1 + suffix.count("."), len(name), name)
+
+    return sorted(candidates, key=sort_key)[0]
+
+
 def get_all_distro_repos(tmpdir, port):
     """Get all non-homebrew repos that have packages also in homebrew."""
     result = psql(tmpdir, port, """
@@ -202,11 +287,14 @@ def get_all_distro_repos(tmpdir, port):
     return [r.strip() for r in result.split("\n") if r.strip()]
 
 
-def extract_mappings(tmpdir, port, distro_repo):
+def extract_mappings(tmpdir, port, distro_repo, alias_to_canonical):
     """Extract distro→homebrew mappings for a single repo.
 
     Captures all name variants: visiblename, srcname, binname, and
-    individual entries from the binnames array.
+    individual entries from the binnames array. When a Linux package has
+    multiple Homebrew candidates (different versioned aliases sharing an
+    `effname`), uses `pick_winner` to choose the canonical one rather than
+    accepting whichever PostgreSQL emits first.
     """
     result = psql_query(tmpdir, port, f"""
         SELECT DISTINCT d_name, h.visiblename
@@ -230,16 +318,21 @@ def extract_mappings(tmpdir, port, distro_repo):
         ORDER BY d_name;
     """)
 
-    mappings = {}
+    candidates = {}
     for line in result.split("\n"):
         if "|" in line:
             parts = line.split("|", 1)
             if len(parts) == 2 and parts[0].strip() and parts[1].strip():
                 linux_name = parts[0].strip()
                 brew_name = parts[1].strip()
-                if linux_name not in mappings:
-                    mappings[linux_name] = brew_name
-    return mappings
+                bucket = candidates.setdefault(linux_name, [])
+                if brew_name not in bucket:
+                    bucket.append(brew_name)
+
+    return {
+        linux_name: pick_winner(cands, linux_name, alias_to_canonical)
+        for linux_name, cands in candidates.items()
+    }
 
 
 def write_map_file(filepath, distro_repo, mappings):
@@ -249,7 +342,7 @@ def write_map_file(filepath, distro_repo, mappings):
         with open(filepath) as f:
             existing = json.load(f).get("mappings", {})
 
-    merged = {**existing, **mappings}
+    merged = {**existing, **mappings, **OVERRIDES}
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     doc = {
@@ -282,6 +375,9 @@ def main():
             load_dump(sock_dir, port)
             diagnose(sock_dir, port)
 
+            # Fetch the Homebrew alias index once; reused across every distro.
+            alias_to_canonical = fetch_homebrew_alias_index()
+
             # Get ALL distro repos that have homebrew equivalents
             print("\nFinding all distro repos with Homebrew mappings...")
             repos = get_all_distro_repos(sock_dir, port)
@@ -297,7 +393,7 @@ def main():
 
             total = 0
             for repo in repos:
-                mappings = extract_mappings(sock_dir, port, repo)
+                mappings = extract_mappings(sock_dir, port, repo, alias_to_canonical)
                 if mappings:
                     filepath = os.path.join(OUTPUT_DIR, f"{repo}.json")
                     write_map_file(filepath, repo, mappings)

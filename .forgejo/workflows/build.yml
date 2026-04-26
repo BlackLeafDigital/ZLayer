@@ -765,84 +765,14 @@ jobs:
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
   # ===========================================
-  # Auto Tag — only after every platform build has succeeded.
+  # Dispatch Release workflow.
   #
-  # The tag never exists speculatively: by the time this job runs, verify
-  # has confirmed all platform archives built and upload-temp-packages has
-  # staged them. Creating the tag here means a tag's existence always
-  # implies "this version has been successfully built on every platform."
-  #
-  # Uses --force-with-lease semantics by checking for existing tag first;
-  # if the tag is already present at the same SHA (e.g. re-run of this
-  # job), it's a no-op. If the tag exists pointing at a DIFFERENT SHA,
-  # the push fails loudly rather than silently rewriting history.
-  # ===========================================
-  auto-tag:
-    needs: [check-existing, verify, upload-temp-packages]
-    if: needs.verify.outputs.success == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout (full history)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.sha || github.sha }}
-          fetch-depth: 0
-          token: ${{ secrets.FORGEJO_TOKEN }}
-
-      - name: Check step status
-        id: check
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: check
-          version: ${{ needs.check-existing.outputs.version }}
-          step: auto-tag
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-
-      - name: Create and push tag
-        if: steps.check.outputs.completed != 'true'
-        shell: bash
-        run: |
-          TAG="${{ needs.check-existing.outputs.tag }}"
-          SHA="${{ inputs.sha || github.sha }}"
-
-          git config user.name "Zach Handley"
-          git config user.email "zachhandley@gmail.com"
-
-          # If the tag already points at this SHA, nothing to do (re-run safety).
-          if git rev-parse --verify "refs/tags/${TAG}" >/dev/null 2>&1; then
-            EXISTING=$(git rev-list -n 1 "refs/tags/${TAG}")
-            if [ "$EXISTING" = "$SHA" ]; then
-              echo "Tag ${TAG} already points at ${SHA} — skipping."
-              exit 0
-            else
-              echo "ERROR: tag ${TAG} exists at ${EXISTING} but this build is for ${SHA}." >&2
-              echo "Refusing to move the tag." >&2
-              exit 1
-            fi
-          fi
-
-          git tag -a "$TAG" "$SHA" -m "Auto-tagged after successful multi-platform build: $TAG"
-          git push origin "$TAG"
-
-      - name: Mark step complete
-        if: steps.check.outputs.completed != 'true'
-        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
-        with:
-          mode: mark
-          version: ${{ needs.check-existing.outputs.version }}
-          step: auto-tag
-          base-url: https://forge.blackleafdigital.com
-          owner: BlackLeafDigital
-          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
-
-  # ===========================================
-  # Dispatch Release workflow (after tag exists)
+  # Permanent v{VERSION} tags are NOT created here. release.yml's
+  # create-forgejo-release cuts the tag at the temp/v{VERSION} branch HEAD
+  # only after every publish step succeeds, then deletes the temp branch.
   # ===========================================
   dispatch-release:
-    needs: [check-existing, verify, upload-temp-packages, auto-tag]
+    needs: [check-existing, verify, upload-temp-packages]
     if: needs.verify.outputs.success == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5

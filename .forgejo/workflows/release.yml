@@ -188,7 +188,10 @@ jobs:
   # Merge to main (after binaries uploaded)
   # ===========================================
   merge-to-main:
-    needs: [detect, upload-binaries]
+    # Depends on create-forgejo-release because that's the step that cuts
+    # the permanent v{VERSION} tag from the temp branch HEAD. Without it,
+    # the GitHub tag push below has nothing to push.
+    needs: [detect, upload-binaries, create-forgejo-release]
     if: needs.detect.outputs.binary == 'true' || needs.detect.outputs.is_major == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -215,12 +218,44 @@ jobs:
           git config user.name "Forgejo CI"
           git config user.email "ci@forge.blackleafdigital.com"
 
+      # Compute the tag to operate on. For auto-release dispatches the
+      # github.ref_name is `temp/vX.Y.Z` (the in-flight branch name), which
+      # is NOT the tag we want to push. Resolve the canonical tag name from
+      # inputs.version / detect.outputs.version, falling back to
+      # github.ref_name only for the manual SDK-tag dispatch paths
+      # (spec-v*, core-v*, etc.) where the trigger ref IS the tag.
+      - name: Compute triggering tag
+        id: tagname
+        if: steps.check.outputs.completed != 'true'
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME:      ${{ github.ref_name }}
+          DETECT_VER:    ${{ needs.detect.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_VERSION" ]; then
+            case "$INPUT_VERSION" in
+              v[0-9]*|major-v[0-9]*|docker-v[0-9]*|\
+              spec-v[0-9]*|core-v[0-9]*|registry-v[0-9]*|obs-v[0-9]*|builder-v[0-9]*|\
+              overlay-v[0-9]*|init-v[0-9]*|scheduler-v[0-9]*|storage-v[0-9]*|\
+              tunnel-v[0-9]*|tui-v[0-9]*|consensus-v[0-9]*|build-v[0-9]*|\
+              rust-sdk-v[0-9]*|py-sdk-v[0-9]*|ts-sdk-v[0-9]*|go-sdk-v[0-9]*|c-sdk-v[0-9]*)
+                echo "tag=${INPUT_VERSION}" >> "$GITHUB_OUTPUT" ;;
+              *)
+                # Bare digits / non-prefixed — assume general release.
+                echo "tag=v${DETECT_VER}" >> "$GITHUB_OUTPUT" ;;
+            esac
+          else
+            echo "tag=${REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Merge dev into main
         if: steps.check.outputs.completed != 'true'
         run: |
           git checkout main
           # Use -X theirs to prefer dev changes on conflicts
-          git merge origin/dev --no-ff -X theirs -m "Merge dev into main for release ${{ github.ref_name }}"
+          git merge origin/dev --no-ff -X theirs -m "Merge dev into main for release ${{ steps.tagname.outputs.tag }}"
           git push origin main
 
       # Forgejo→GitHub push mirror is disabled so proprietary refs can't leak.
@@ -246,7 +281,7 @@ jobs:
         if: steps.check.outputs.completed != 'true'
         env:
           GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
-          TRIGGERING_TAG: ${{ github.ref_name }}
+          TRIGGERING_TAG: ${{ steps.tagname.outputs.tag }}
         run: |
           set -euo pipefail
           # Hard allowlist — only the tag prefixes release.yml already dispatches on.
@@ -259,6 +294,8 @@ jobs:
             *) echo "tag '$TRIGGERING_TAG' not on allowlist — skipping GitHub tag push"; exit 0 ;;
           esac
           case "$TRIGGERING_TAG" in *zdb*|*ZDB*) echo "refusing: zdb tag"; exit 1 ;; esac
+          # Tag was just cut by create-forgejo-release; pull it locally.
+          git fetch origin --tags
           # `github` remote was added by the previous step.
           git push github "refs/tags/${TRIGGERING_TAG}:refs/tags/${TRIGGERING_TAG}"
 
@@ -557,11 +594,60 @@ jobs:
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
-      - name: Create Forgejo Release
+      # Resolve the temp/v{VERSION} branch HEAD so the release tag is created
+      # at the exact commit that produced the published artifacts. If the
+      # branch is gone (a previous run already cut the tag), fall back to
+      # the existing tag's SHA for idempotency.
+      - name: Resolve temp branch SHA
+        id: tempsha
+        if: steps.check.outputs.completed != 'true'
+        shell: bash
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          REPO: ${{ github.repository }}
+          AUTH: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+        run: |
+          set -euo pipefail
+          BR="temp/v${VERSION}"
+          TAG="v${VERSION}"
+          API="https://forge.blackleafdigital.com/api/v1/repos/${REPO}"
+
+          BR_RESP=$(curl -s -u "$AUTH" -w '\n%{http_code}' "${API}/branches/${BR}")
+          BR_CODE=$(printf '%s' "$BR_RESP" | tail -n1)
+          BR_BODY=$(printf '%s' "$BR_RESP" | sed '$d')
+          if [ "$BR_CODE" = "200" ]; then
+            SHA=$(printf '%s' "$BR_BODY" | jq -r '.commit.id')
+            if [ -z "$SHA" ] || [ "$SHA" = "null" ]; then
+              echo "::error::branch ${BR} returned 200 but no commit.id"
+              exit 1
+            fi
+            echo "Found temp branch ${BR} at ${SHA}"
+            echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+            echo "branch_present=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          TAG_RESP=$(curl -s -u "$AUTH" -w '\n%{http_code}' "${API}/tags/${TAG}")
+          TAG_CODE=$(printf '%s' "$TAG_RESP" | tail -n1)
+          TAG_BODY=$(printf '%s' "$TAG_RESP" | sed '$d')
+          if [ "$TAG_CODE" = "200" ]; then
+            SHA=$(printf '%s' "$TAG_BODY" | jq -r '.commit.sha // .id')
+            echo "temp branch missing; tag ${TAG} already exists at ${SHA}"
+            echo "sha=${SHA}" >> "$GITHUB_OUTPUT"
+            echo "branch_present=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "::error::Cannot resolve a SHA for ${TAG}: branch ${BR} not found (HTTP ${BR_CODE}) and tag not found (HTTP ${TAG_CODE})."
+          exit 1
+
+      - name: Create Forgejo Release (cuts permanent tag)
         if: steps.check.outputs.completed != 'true'
         run: |
+          set -euo pipefail
           VERSION="${{ needs.detect.outputs.version }}"
           TAG="v${VERSION}"
+          SHA="${{ steps.tempsha.outputs.sha }}"
           PACKAGES_URL="https://forge.blackleafdigital.com/api/packages/BlackLeafDigital/generic/zlayer/${VERSION}"
 
           # Create release body
@@ -644,17 +730,41 @@ jobs:
           sed -i "s/\${VERSION}/${VERSION}/g" release_body.md
           sed -i "s|\${PACKAGES_URL}|${PACKAGES_URL}|g" release_body.md
 
-          # Create release via Forgejo API
-          curl -X POST \
+          # Create release via Forgejo API. tag_name + target_commitish creates
+          # the tag at the named SHA atomically. If the release already exists
+          # at the same SHA, Forgejo accepts the call; if at a different SHA,
+          # it errors — we treat that as success (a prior partial run already
+          # cut the tag, the duplicate POST is idempotent).
+          curl --fail -sS -X POST \
             -H "Authorization: token ${{ secrets.FORGEJO_TOKEN }}" \
             -H "Content-Type: application/json" \
             "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases" \
             -d "$(jq -n \
               --arg tag "$TAG" \
+              --arg sha "$SHA" \
               --arg name "ZLayer $VERSION" \
               --arg body "$(cat release_body.md)" \
-              '{tag_name: $tag, name: $name, body: $body, draft: false, prerelease: false}'
-            )"
+              '{tag_name: $tag, target_commitish: $sha, name: $name, body: $body, draft: false, prerelease: false}'
+            )" || {
+              echo "::warning::Release POST failed; assuming it already exists at this SHA."
+            }
+
+      - name: Delete temp/v{VERSION} branch
+        if: steps.check.outputs.completed != 'true' && steps.tempsha.outputs.branch_present == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ needs.detect.outputs.version }}
+          REPO: ${{ github.repository }}
+          AUTH: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+        run: |
+          set -euo pipefail
+          BR="temp/v${VERSION}"
+          API="https://forge.blackleafdigital.com/api/v1/repos/${REPO}/branches/${BR}"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE -u "$AUTH" "$API")
+          case "$CODE" in
+            204|404) echo "temp branch ${BR} deleted (HTTP ${CODE})" ;;
+            *) echo "::warning::Failed to delete ${BR} (HTTP ${CODE}); manual cleanup may be needed" ;;
+          esac
 
       - name: Mark step complete
         if: steps.check.outputs.completed != 'true'
