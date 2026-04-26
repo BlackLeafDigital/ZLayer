@@ -40,6 +40,9 @@ services:
       plugin-sdk-go:
         paths:
           - clients/zlayer-sdk/go/**
+      openapi-go:
+        paths:
+          - clients/go/**
       plugin-sdk-c:
         paths:
           - clients/zlayer-sdk/c/**

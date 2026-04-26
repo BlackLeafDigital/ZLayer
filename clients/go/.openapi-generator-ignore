@@ -21,3 +21,10 @@
 #docs/*.md
 # Then explicitly reverse the ignore rule for a single file:
 #!docs/README.md
+
+# git_push.sh is a generator-emitted helper for pushing a generated client to
+# its own standalone git repo. We publish via a tag of the form
+# `clients/go/v<VERSION>` on the parent ZLayer repo (see
+# `.forgejo/workflows/publish-sdks.yml::publish-openapi-go`), so this script
+# would only mislead readers. Suppress regeneration.
+git_push.sh

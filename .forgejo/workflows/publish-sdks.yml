@@ -719,6 +719,95 @@ jobs:
           owner: BlackLeafDigital
           auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
 
+  # OpenAPI Go client publish (mirrors publish-plugin-sdk-go pattern).
+  # The committed `clients/go/` tree carries `0.0.0-dev` as a sentinel
+  # `packageVersion` (baked into UserAgent + README headers by openapi-generator);
+  # this job seds it to the real `inputs.version`, makes a one-off commit on
+  # detached HEAD, tags `clients/go/v<VERSION>` against that stamped commit,
+  # and pushes only the tag (Forgejo + GitHub mirror). The branch never moves;
+  # `go get github.com/BlackLeafDigital/ZLayer/clients/go@v<VERSION>` resolves
+  # the tag directly so the consumer-visible UserAgent string carries the real
+  # release version, not the dev sentinel.
+  publish-openapi-go:
+    needs: [detect]
+    if: contains(fromJson(needs.detect.outputs.services-to-release-flat), 'sdks/openapi-go')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.FORGEJO_TOKEN }}
+      - name: Check step status
+        id: check
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: check
+          version: ${{ inputs.version }}
+          step: publish-openapi-go
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+      - uses: https://forge.blackleafdigital.com/Public/actions/setup-go@main
+        if: steps.check.outputs.completed != 'true'
+        with:
+          go-version: '1.24'
+      - name: Verify Go module
+        if: steps.check.outputs.completed != 'true'
+        working-directory: clients/go
+        run: go mod verify
+      - name: Stamp version into committed sources
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          set -euo pipefail
+          VER='${{ inputs.version }}'
+          # Limit substitution to the openapi-go tree so we never touch unrelated
+          # `0.0.0-dev` strings elsewhere in the repo.
+          find clients/go -type f \( -name '*.go' -o -name '*.md' \) \
+            -exec sed -i "s|0\.0\.0-dev|${VER}|g" {} +
+          # Sanity: confirm the stamp actually landed in UserAgent.
+          grep -q "OpenAPI-Generator/${VER}/go" clients/go/configuration.go
+          # Build to catch any syntax fallout from the substitution.
+          (cd clients/go && go vet ./...)
+      - name: Tag and push OpenAPI Go release
+        if: steps.check.outputs.completed != 'true'
+        run: |
+          set -euo pipefail
+          TAG="clients/go/v${{ inputs.version }}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "Tag ${TAG} already exists — skipping."
+            exit 0
+          fi
+          git config user.name "Forgejo CI"
+          git config user.email "ci@forge.blackleafdigital.com"
+          # Commit the stamped tree on detached HEAD; tag references this commit
+          # only — never pushed to a branch.
+          git add clients/go
+          git commit -m "openapi-go: stamp v${{ inputs.version }}"
+          git tag -a "${TAG}" -m "openapi-go ${{ inputs.version }}"
+          # Push only the tag. The stamped commit lives solely as the tag's target.
+          git push origin "refs/tags/${TAG}"
+      - name: Push openapi-go tag to GitHub
+        if: steps.check.outputs.completed != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="clients/go/v${{ inputs.version }}"
+          case "$TAG" in *zdb*|*ZDB*) echo "refusing: tag matches zdb"; exit 1 ;; esac
+          git remote remove github 2>/dev/null || true
+          git remote add github "https://x-access-token:${GH_TOKEN}@github.com/BlackLeafDigital/ZLayer.git"
+          git push github "refs/tags/${TAG}:refs/tags/${TAG}"
+      - name: Mark step complete
+        if: steps.check.outputs.completed != 'true'
+        uses: https://forge.blackleafdigital.com/Public/actions/ci-step-status@main
+        with:
+          mode: mark
+          version: ${{ inputs.version }}
+          step: publish-openapi-go
+          base-url: https://forge.blackleafdigital.com
+          owner: BlackLeafDigital
+          auth: zachhandley:${{ secrets.FORGEJO_ACTIONS_TOKEN }}
+
   # C SDK is shipped as a source tarball uploaded to Forgejo generic
   # packages. Consumers download, extract, and build with cmake themselves.
   publish-plugin-sdk-c:
