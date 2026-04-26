@@ -43,7 +43,9 @@ jobs:
         run: |
           git clone --depth=1 https://x-access-token:${GH_TOKEN}@github.com/ZachHandley/RepoSources.git /tmp/repo
           mkdir -p public/maps
-          cp -f /tmp/repo/public/maps/*.json public/maps/ 2>/dev/null || true
+          # Recursive copy so per-distro shard subdirs and their {a..z,_misc}.json
+          # + index.json are seeded. Trailing `/.` copies hidden files too.
+          cp -rf /tmp/repo/public/maps/. public/maps/ 2>/dev/null || true
 
       - name: Generate maps from Repology dump
         env:
@@ -56,7 +58,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_ACCESS_TOKEN }}
         run: |
           mkdir -p /tmp/repo/public/maps
-          cp -f public/maps/*.json /tmp/repo/public/maps/
+          # Mirror the entire sharded layout (per-distro dirs with {shard}.json
+          # + index.json). Generator writes shards via tmp-then-rename so partial
+          # state is impossible; git diff --cached --quiet still gates correctly.
+          cp -rf public/maps/. /tmp/repo/public/maps/
           cd /tmp/repo
           git config user.name "ZLayer Bot"
           git config user.email "bot@blackleafdigital.com"

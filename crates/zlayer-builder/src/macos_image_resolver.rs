@@ -58,6 +58,10 @@ struct PackageMapMetadata {
     generated_at: String,
     source: String,
     distro: String,
+    /// Shard letter (`a`-`z` or `_misc`) for sharded files. `None` for
+    /// hand-written test fixtures or pre-sharding archives.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shard: Option<String>,
     total_mappings: usize,
 }
 

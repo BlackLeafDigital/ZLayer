@@ -43,6 +43,26 @@ OVERRIDES = {
     "default-jre": "openjdk",
 }
 
+# Shard set used to split large per-distro maps into reviewable chunks.
+# `_misc` catches anything whose first character isn't an ASCII a-z letter
+# (digits, plus signs, etc.).
+SHARDS = [chr(c) for c in range(ord("a"), ord("z") + 1)] + ["_misc"]
+
+
+def shard_key(name: str) -> str:
+    """Return the shard letter for a Linux package name.
+
+    Lowercase first ASCII letter for `a`-`z` names; `_misc` for anything else
+    (digits, `+`, etc.). The resolver uses the same function — keep them in
+    sync.
+    """
+    if not name:
+        return "_misc"
+    first = name[0].lower()
+    if "a" <= first <= "z":
+        return first
+    return "_misc"
+
 
 def run(cmd, **kwargs):
     print(f"  $ {cmd if isinstance(cmd, str) else ' '.join(cmd)}")
@@ -335,31 +355,100 @@ def extract_mappings(tmpdir, port, distro_repo, alias_to_canonical):
     }
 
 
-def write_map_file(filepath, distro_repo, mappings):
-    # Merge with existing mappings so packages only grow, never shrink
-    existing = {}
-    if os.path.exists(filepath):
-        with open(filepath) as f:
-            existing = json.load(f).get("mappings", {})
+def write_sharded_map_files(distro_dir, distro_repo, mappings, generated_at):
+    """Write per-shard JSON files under {distro_dir}/{shard}.json.
 
-    merged = {**existing, **mappings, **OVERRIDES}
+    Each shard contains only the entries whose first letter belongs to that
+    shard. OVERRIDES are applied to the shard their key belongs to so the
+    final per-shard file already reflects the override.
 
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    Atomicity: each shard is written to `.tmp-{shard}.json` and renamed to
+    `{shard}.json`. A crash mid-loop leaves prior shards intact and at most
+    one tmp file behind, never a half-written shard.
+
+    Returns the list of shard letters that were written (i.e. had at least
+    one entry after merge with existing).
+    """
+    # Bucket new mappings by shard
+    new_buckets = {s: {} for s in SHARDS}
+    for name, brew in mappings.items():
+        new_buckets[shard_key(name)][name] = brew
+    # Apply OVERRIDES per-shard
+    for name, brew in OVERRIDES.items():
+        new_buckets[shard_key(name)][name] = brew
+
+    written = []
+    total_new = 0
+    total_after = 0
+    for shard in SHARDS:
+        shard_path = os.path.join(distro_dir, f"{shard}.json")
+
+        # Read existing entries for this shard so packages only grow, never shrink
+        existing = {}
+        if os.path.exists(shard_path):
+            with open(shard_path) as f:
+                existing = json.load(f).get("mappings", {})
+
+        new_for_shard = new_buckets[shard]
+        # Existing first, new second so new wins on conflict
+        merged = {**existing, **new_for_shard}
+        # Re-apply OVERRIDES so they always win even over existing on-disk data
+        for name, brew in OVERRIDES.items():
+            if shard_key(name) == shard:
+                merged[name] = brew
+
+        if not merged:
+            # Nothing to write; remove any pre-existing empty shard so the
+            # index reflects reality
+            continue
+
+        doc = {
+            "metadata": {
+                "generated_at": generated_at,
+                "source": "repology-dump",
+                "distro": distro_repo,
+                "shard": shard,
+                "total_mappings": len(merged),
+            },
+            "mappings": dict(sorted(merged.items())),
+        }
+
+        tmp_path = os.path.join(distro_dir, f".tmp-{shard}.json")
+        with open(tmp_path, "w") as f:
+            json.dump(doc, f, indent=2)
+        os.rename(tmp_path, shard_path)
+
+        written.append(shard)
+        total_new += len(new_for_shard)
+        total_after += len(merged)
+
+    print(
+        f"  {distro_repo}: {total_after} mappings across {len(written)} shards "
+        f"({total_new} from this run)"
+    )
+    return written, total_after
+
+
+def write_distro_index(distro_dir, distro_repo, shards_written, total_mappings, generated_at):
+    """Write {distro_dir}/index.json after all shards are in place.
+
+    Always called *after* `write_sharded_map_files` so a verifier reading
+    `index.json` sees a complete shard set or the previous run's index.
+    """
     doc = {
         "metadata": {
-            "generated_at": now,
+            "generated_at": generated_at,
             "source": "repology-dump",
             "distro": distro_repo,
-            "total_mappings": len(merged),
-        },
-        "mappings": dict(sorted(merged.items())),
+            "shards": shards_written,
+            "total_mappings": total_mappings,
+        }
     }
-    os.makedirs(os.path.dirname(filepath), exist_ok=True)
-    with open(filepath, "w") as f:
+    index_path = os.path.join(distro_dir, "index.json")
+    tmp_path = os.path.join(distro_dir, ".tmp-index.json")
+    with open(tmp_path, "w") as f:
         json.dump(doc, f, indent=2)
-    size_kb = os.path.getsize(filepath) / 1024
-    added = len(merged) - len(existing)
-    print(f"  {distro_repo}: {len(merged)} mappings ({added:+d} new, {size_kb:.1f} KB)")
+    os.rename(tmp_path, index_path)
 
 
 def main():
@@ -391,13 +480,27 @@ def main():
             print(f"\nExtracting mappings for {len(repos)} repos...")
             os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+            generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             total = 0
             for repo in repos:
                 mappings = extract_mappings(sock_dir, port, repo, alias_to_canonical)
                 if mappings:
-                    filepath = os.path.join(OUTPUT_DIR, f"{repo}.json")
-                    write_map_file(filepath, repo, mappings)
-                    total += len(mappings)
+                    distro_dir = os.path.join(OUTPUT_DIR, repo)
+                    os.makedirs(distro_dir, exist_ok=True)
+                    shards_written, total_after = write_sharded_map_files(
+                        distro_dir, repo, mappings, generated_at
+                    )
+                    write_distro_index(
+                        distro_dir, repo, shards_written, total_after, generated_at
+                    )
+                    total += total_after
+
+                    # Drop the legacy monolithic file if it survives from a
+                    # pre-sharding run. Only the in-tree resolver consumes
+                    # this data and it ships in lockstep — no external readers.
+                    legacy_path = os.path.join(OUTPUT_DIR, f"{repo}.json")
+                    if os.path.exists(legacy_path):
+                        os.remove(legacy_path)
 
             print(f"\nTotal: {total} mappings across {len(repos)} repos")
             print("Done!")

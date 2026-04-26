@@ -156,9 +156,11 @@ jobs:
           fi
 
           # Bump past anything in burned-versions.txt + this run's abandoned.
+          # awk 'NF' is empty-file safe (always exits 0); grep -v under
+          # set -euo pipefail returns 1 on no matches and kills the script.
           BURNED=""
           if [ -f .forgejo/burned-versions.txt ]; then
-            BURNED=$(grep -v '^[[:space:]]*$' .forgejo/burned-versions.txt | tr '\n' ',' | sed 's/,$//')
+            BURNED=$(awk 'NF' .forgejo/burned-versions.txt | paste -sd, -)
           fi
           if [ -n "$ABANDONED" ]; then
             BURNED="${BURNED:+${BURNED},}${ABANDONED}"
